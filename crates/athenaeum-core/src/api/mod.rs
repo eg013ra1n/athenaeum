@@ -3,9 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-pub mod scan_roots;
-pub mod files;
 pub mod calibration;
+pub mod files;
+pub mod scan_roots;
 // Sky-map spatial queries (imaging locations, rectangular selection). Ungated:
 // db/models only.
 pub mod spatial;
@@ -37,9 +37,9 @@ pub mod collab_exchange;
 pub mod analysis;
 pub mod compute;
 #[cfg(feature = "render")]
-pub mod masters;
-#[cfg(feature = "render")]
 pub mod lights;
+#[cfg(feature = "render")]
+pub mod masters;
 // Stage-II collaboration orchestration (slice 3, Task 4): linking, ranked
 // suggestions, per-frame gate report, portal deep-link intents. Render-gated
 // because it imports `api::lights` internals (`frame_cal_status`); the
@@ -77,20 +77,26 @@ pub enum ApiError {
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApiError::NotFound(m) | ApiError::Invalid(m) | ApiError::Conflict(m)
-            | ApiError::Forbidden(m) | ApiError::Internal(m) | ApiError::SignedOut(m) => {
-                f.write_str(m)
-            }
+            ApiError::NotFound(m)
+            | ApiError::Invalid(m)
+            | ApiError::Conflict(m)
+            | ApiError::Forbidden(m)
+            | ApiError::Internal(m)
+            | ApiError::SignedOut(m) => f.write_str(m),
         }
     }
 }
 impl std::error::Error for ApiError {}
 
 impl From<rusqlite::Error> for ApiError {
-    fn from(e: rusqlite::Error) -> Self { ApiError::Internal(e.to_string()) }
+    fn from(e: rusqlite::Error) -> Self {
+        ApiError::Internal(e.to_string())
+    }
 }
 impl From<anyhow::Error> for ApiError {
-    fn from(e: anyhow::Error) -> Self { ApiError::Internal(format!("{e:#}")) }
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::Internal(format!("{e:#}"))
+    }
 }
 
 /// Transport-specific path sandboxing policy for api handlers.
@@ -124,7 +130,8 @@ impl PathPolicy {
                     Ok(())
                 } else {
                     Err(ApiError::Forbidden(format!(
-                        "path {} is outside the allowed roots", p.display()
+                        "path {} is outside the allowed roots",
+                        p.display()
                     )))
                 }
             }
@@ -143,7 +150,9 @@ impl PathPolicy {
 /// `.conn()` guard) across an `.await` point — acquire, use, drop before
 /// awaiting, or the future may fail Send/borrow checks.
 pub fn db(ctx: &crate::services::ServiceContext) -> Result<&crate::db::Database, ApiError> {
-    ctx.db.get().ok_or_else(|| ApiError::Internal("Database not initialized".into()))
+    ctx.db
+        .get()
+        .ok_or_else(|| ApiError::Internal("Database not initialized".into()))
 }
 
 #[cfg(test)]
@@ -160,7 +169,10 @@ mod tests {
     fn path_policy_allows_and_forbids() {
         let p = PathPolicy::AllowedRoots(vec!["/data/astro".into()]);
         assert!(p.check(Path::new("/data/astro/lights")).is_ok());
-        assert!(matches!(p.check(Path::new("/etc/passwd")), Err(ApiError::Forbidden(_))));
+        assert!(matches!(
+            p.check(Path::new("/etc/passwd")),
+            Err(ApiError::Forbidden(_))
+        ));
         assert!(PathPolicy::AllowAll.check(Path::new("/anything")).is_ok());
     }
 

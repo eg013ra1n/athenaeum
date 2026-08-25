@@ -23,7 +23,9 @@ pub(crate) fn cancel_on(queue: &ComputeQueue, job_id: i64) -> Result<(), ApiErro
     if queue.cancel(job_id) {
         Ok(())
     } else {
-        Err(ApiError::NotFound(format!("no compute job with id {job_id}")))
+        Err(ApiError::NotFound(format!(
+            "no compute job with id {job_id}"
+        )))
     }
 }
 
@@ -40,7 +42,9 @@ pub fn cancel_compute_job(ctx: &ServiceContext, job_id: i64) -> Result<(), ApiEr
 /// a heavy-job admission queue.
 pub(crate) fn validate_max_concurrent(n: usize) -> Result<(), ApiError> {
     if n == 0 || n > 8 {
-        return Err(ApiError::Invalid("compute.max_concurrent must be 1..=8".into()));
+        return Err(ApiError::Invalid(
+            "compute.max_concurrent must be 1..=8".into(),
+        ));
     }
     Ok(())
 }
@@ -92,13 +96,22 @@ mod tests {
             .acquire(ComputeJobKind::Analysis, "held", flag.clone())
             .unwrap();
         assert!(cancel_on(&queue, job_id).is_ok());
-        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "cancel flag flipped");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "cancel flag flipped"
+        );
     }
 
     #[test]
     fn validate_max_concurrent_rejects_zero_and_above_eight() {
-        assert!(matches!(validate_max_concurrent(0), Err(ApiError::Invalid(_))));
-        assert!(matches!(validate_max_concurrent(9), Err(ApiError::Invalid(_))));
+        assert!(matches!(
+            validate_max_concurrent(0),
+            Err(ApiError::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_max_concurrent(9),
+            Err(ApiError::Invalid(_))
+        ));
         assert!(validate_max_concurrent(1).is_ok());
         assert!(validate_max_concurrent(8).is_ok());
     }

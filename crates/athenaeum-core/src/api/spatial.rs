@@ -56,7 +56,9 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
     // Query both organized frame sets AND unorganized frames
     // This enables users to see all frames with coordinates immediately,
     // without needing to auto-generate frame sets first
-    let mut stmt = conn.prepare("
+    let mut stmt = conn
+        .prepare(
+            "
         -- Organized locations: Frames in frame sets
         SELECT
             fs.id as frame_set_id,
@@ -133,88 +135,92 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
         -- pathological 100K+ frame catalog would ship a multi-MB JSON
         -- payload to the frontend in one hit. T1-9.
         LIMIT 5000
-    ").map_err(|e| anyhow!("Failed to prepare query: {}", e))?;
+    ",
+        )
+        .map_err(|e| anyhow!("Failed to prepare query: {}", e))?;
 
-    let locations = stmt.query_map([], |row| {
-        let frame_set_id: Option<i64> = row.get(0)?;
-        let object_name: Option<String> = row.get(1)?;
-        let ra: f64 = row.get(2)?;
-        let dec: f64 = row.get(3)?;
-        let frame_count: i32 = row.get(4)?;
-        let total_exposure: f64 = row.get(5)?;
-        let filters_str: Option<String> = row.get(6)?;
-        let first_date: Option<String> = row.get(7)?;
-        let last_date: Option<String> = row.get(8)?;
-        let avg_xpixsz: Option<f64> = row.get(9)?;
-        let avg_ypixsz: Option<f64> = row.get(10)?;
-        let avg_focallen: Option<f64> = row.get(11)?;
-        let avg_naxis1: Option<f64> = row.get(12)?;
-        let avg_naxis2: Option<f64> = row.get(13)?;
-        let avg_xbinning: Option<f64> = row.get(14)?;
-        let avg_ybinning: Option<f64> = row.get(15)?;
-        let location_type: String = row.get(16)?;
-        let cameras_str: Option<String> = row.get(17)?;
-        let focal_lengths_str: Option<String> = row.get(18)?;
-        let is_custom: i64 = row.get(19)?;
-        let avg_sin_rot: Option<f64> = row.get(20)?;
-        let avg_cos_rot: Option<f64> = row.get(21)?;
+    let locations = stmt
+        .query_map([], |row| {
+            let frame_set_id: Option<i64> = row.get(0)?;
+            let object_name: Option<String> = row.get(1)?;
+            let ra: f64 = row.get(2)?;
+            let dec: f64 = row.get(3)?;
+            let frame_count: i32 = row.get(4)?;
+            let total_exposure: f64 = row.get(5)?;
+            let filters_str: Option<String> = row.get(6)?;
+            let first_date: Option<String> = row.get(7)?;
+            let last_date: Option<String> = row.get(8)?;
+            let avg_xpixsz: Option<f64> = row.get(9)?;
+            let avg_ypixsz: Option<f64> = row.get(10)?;
+            let avg_focallen: Option<f64> = row.get(11)?;
+            let avg_naxis1: Option<f64> = row.get(12)?;
+            let avg_naxis2: Option<f64> = row.get(13)?;
+            let avg_xbinning: Option<f64> = row.get(14)?;
+            let avg_ybinning: Option<f64> = row.get(15)?;
+            let location_type: String = row.get(16)?;
+            let cameras_str: Option<String> = row.get(17)?;
+            let focal_lengths_str: Option<String> = row.get(18)?;
+            let is_custom: i64 = row.get(19)?;
+            let avg_sin_rot: Option<f64> = row.get(20)?;
+            let avg_cos_rot: Option<f64> = row.get(21)?;
 
-        // Compute circular mean of rotation angles via atan2(mean_sin, mean_cos)
-        let avg_rotation: Option<f64> = match (avg_sin_rot, avg_cos_rot) {
-            (Some(s), Some(c)) => Some(s.atan2(c).to_degrees()),
-            _ => None,
-        };
+            // Compute circular mean of rotation angles via atan2(mean_sin, mean_cos)
+            let avg_rotation: Option<f64> = match (avg_sin_rot, avg_cos_rot) {
+                (Some(s), Some(c)) => Some(s.atan2(c).to_degrees()),
+                _ => None,
+            };
 
-        // Parse filters from comma-separated string
-        let filters: Vec<String> = filters_str
-            .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
-            .unwrap_or_default();
+            // Parse filters from comma-separated string
+            let filters: Vec<String> = filters_str
+                .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
+                .unwrap_or_default();
 
-        // Calculate FOV using actual sensor dimensions from FITS metadata
-        let fov_width = calculate_fov(
-            avg_xpixsz,
-            avg_focallen,
-            avg_naxis1.map(|n| n.round() as i32),
-            avg_xbinning.map(|b| b.round() as i32),
-        );
+            // Calculate FOV using actual sensor dimensions from FITS metadata
+            let fov_width = calculate_fov(
+                avg_xpixsz,
+                avg_focallen,
+                avg_naxis1.map(|n| n.round() as i32),
+                avg_xbinning.map(|b| b.round() as i32),
+            );
 
-        let fov_height = calculate_fov(
-            avg_ypixsz.or(avg_xpixsz),
-            avg_focallen,
-            avg_naxis2.map(|n| n.round() as i32),
-            avg_ybinning.map(|b| b.round() as i32),
-        );
+            let fov_height = calculate_fov(
+                avg_ypixsz.or(avg_xpixsz),
+                avg_focallen,
+                avg_naxis2.map(|n| n.round() as i32),
+                avg_ybinning.map(|b| b.round() as i32),
+            );
 
-        // Use a deterministic ID based on location for clusters
-        let id = if let Some(fs_id) = frame_set_id {
-            fs_id
-        } else {
-            // Create a pseudo-ID for clusters based on coordinates
-            ((ra.to_bits() as i64) ^ (dec.to_bits() as i64)).abs()
-        };
+            // Use a deterministic ID based on location for clusters
+            let id = if let Some(fs_id) = frame_set_id {
+                fs_id
+            } else {
+                // Create a pseudo-ID for clusters based on coordinates
+                ((ra.to_bits() as i64) ^ (dec.to_bits() as i64)).abs()
+            };
 
-        Ok(ImagingLocation {
-            id,
-            ra,
-            dec,
-            object_name,
-            frame_count,
-            total_exposure,
-            filters,
-            date_range: (
-                first_date.unwrap_or_default(),
-                last_date.unwrap_or_default()
-            ),
-            frame_set_id,
-            fov_width,
-            fov_height,
-            location_type,
-            cameras: cameras_str,
-            focal_lengths: focal_lengths_str,
-            is_custom: is_custom != 0,
-            rotation: avg_rotation,
+            Ok(ImagingLocation {
+                id,
+                ra,
+                dec,
+                object_name,
+                frame_count,
+                total_exposure,
+                filters,
+                date_range: (
+                    first_date.unwrap_or_default(),
+                    last_date.unwrap_or_default(),
+                ),
+                frame_set_id,
+                fov_width,
+                fov_height,
+                location_type,
+                cameras: cameras_str,
+                focal_lengths: focal_lengths_str,
+                is_custom: is_custom != 0,
+                rotation: avg_rotation,
+            })
         })
-    }).map_err(|e| anyhow!("Failed to query imaging locations: {}", e))?;
+        .map_err(|e| anyhow!("Failed to query imaging locations: {}", e))?;
 
     let result: Vec<ImagingLocation> = locations
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -222,8 +228,14 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
 
     tracing::debug!(
         count = result.len(),
-        framesets = result.iter().filter(|l| l.location_type == "frameset").count(),
-        clusters = result.iter().filter(|l| l.location_type == "cluster").count(),
+        framesets = result
+            .iter()
+            .filter(|l| l.location_type == "frameset")
+            .count(),
+        clusters = result
+            .iter()
+            .filter(|l| l.location_type == "cluster")
+            .count(),
         "imaging locations queried"
     );
 
@@ -246,7 +258,9 @@ pub fn query_frames_in_bounds(
     bounds: SelectionBounds,
 ) -> Result<SelectionCandidates> {
     // Handle RA wrap-around at 0°/360° boundary
-    let ra_wrap_around = bounds.crosses_meridian.unwrap_or_else(|| bounds.ra_min > bounds.ra_max);
+    let ra_wrap_around = bounds
+        .crosses_meridian
+        .unwrap_or_else(|| bounds.ra_min > bounds.ra_max);
 
     tracing::debug!(
         ra_min = bounds.ra_min,
@@ -267,9 +281,7 @@ pub fn query_frames_in_bounds(
          AND ra BETWEEN ?1 AND ?2 AND dec BETWEEN ?3 AND ?4"
     };
 
-    let mut stmt = conn
-        .prepare(query)
-        .map_err(|e| anyhow!("{}", e))?;
+    let mut stmt = conn.prepare(query).map_err(|e| anyhow!("{}", e))?;
 
     let candidates: Vec<SelectionCandidate> = stmt
         .query_map(
@@ -330,7 +342,11 @@ mod tests {
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format)
              VALUES (?1, ?2, ?3, 1024, '2026-01-01T00:00:00Z', 'FITS')",
-            params![id, format!("/tmp/frame_{id}.fits"), format!("frame_{id}.fits")],
+            params![
+                id,
+                format!("/tmp/frame_{id}.fits"),
+                format!("frame_{id}.fits")
+            ],
         )
         .unwrap();
         conn.execute(
@@ -352,7 +368,11 @@ mod tests {
 
         let locations = get_imaging_locations(&conn).unwrap();
 
-        assert_eq!(locations.len(), 1, "same object + same rounded coords = one cluster");
+        assert_eq!(
+            locations.len(),
+            1,
+            "same object + same rounded coords = one cluster"
+        );
         let loc = &locations[0];
         assert_eq!(loc.location_type, "cluster");
         assert_eq!(loc.frame_set_id, None);
@@ -417,7 +437,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(wrapped.count, 2, "straddling frames found across the 0°/360° seam");
+        assert_eq!(
+            wrapped.count, 2,
+            "straddling frames found across the 0°/360° seam"
+        );
         let mut ids: Vec<i64> = wrapped.candidates.iter().map(|c| c.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2]);

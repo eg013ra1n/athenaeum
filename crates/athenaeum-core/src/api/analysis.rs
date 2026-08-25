@@ -166,16 +166,21 @@ pub fn analyze_frame_set(
     {
         let analyses = ctx.active_analyses.lock().unwrap();
         if analyses.contains_key(&frame_set_id) {
-            return Err(ApiError::Conflict("Analysis already in progress for this frame set".to_string()));
+            return Err(ApiError::Conflict(
+                "Analysis already in progress for this frame set".to_string(),
+            ));
         }
     }
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut analyses = ctx.active_analyses.lock().unwrap();
-        analyses.insert(frame_set_id, crate::services::AnalysisHandle {
-            cancel_flag: cancel_flag.clone(),
-        });
+        analyses.insert(
+            frame_set_id,
+            crate::services::AnalysisHandle {
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
     }
 
     // Global compute-queue admission: heavy jobs run one-at-a-time (default)
@@ -192,16 +197,24 @@ pub fn analyze_frame_set(
             let mut analyses = ctx.active_analyses.lock().unwrap();
             analyses.remove(&frame_set_id);
             drop(analyses);
-            emit_event(emitter, "analysis-complete", &AnalysisCompleteEvent {
-                frame_set_id,
+            emit_event(
+                emitter,
+                "analysis-complete",
+                &AnalysisCompleteEvent {
+                    frame_set_id,
+                    analyzed: 0,
+                    skipped: 0,
+                    failed: 0,
+                    errors: Vec::new(),
+                    cancelled: true,
+                },
+            );
+            return Ok(AnalyzeFrameSetResult {
                 analyzed: 0,
                 skipped: 0,
                 failed: 0,
                 errors: Vec::new(),
                 cancelled: true,
-            });
-            return Ok(AnalyzeFrameSetResult {
-                analyzed: 0, skipped: 0, failed: 0, errors: Vec::new(), cancelled: true,
             });
         }
     };
@@ -222,13 +235,13 @@ pub fn analyze_frame_set(
              INNER JOIN sessions s ON s.id = sm.session_id
              INNER JOIN imaging_nights n ON n.id = s.imaging_night_id
              WHERE n.frames_set_id = ?1
-               AND f.imagetyp = 'Light'"
+               AND f.imagetyp = 'Light'",
         )?;
 
-        let frame_rows: Vec<(i64, i64, String)> = stmt.query_map(
-            rusqlite::params![frame_set_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        )?
+        let frame_rows: Vec<(i64, i64, String)> = stmt
+            .query_map(rusqlite::params![frame_set_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -236,14 +249,15 @@ pub fn analyze_frame_set(
         let frames_to_analyze: Vec<(i64, i64, String)> = if force {
             frame_rows
         } else {
-            frame_rows.into_iter().filter(|(frame_id, _, _)| {
-                match db_analysis::get_frame_analysis(&conn, *frame_id) {
-                    Ok(Some(existing)) => {
-                        existing.config_hash.as_deref() != Some(&config_hash)
+            frame_rows
+                .into_iter()
+                .filter(|(frame_id, _, _)| {
+                    match db_analysis::get_frame_analysis(&conn, *frame_id) {
+                        Ok(Some(existing)) => existing.config_hash.as_deref() != Some(&config_hash),
+                        _ => true,
                     }
-                    _ => true,
-                }
-            }).collect()
+                })
+                .collect()
         };
 
         (analysis_config, frames_to_analyze)
@@ -263,7 +277,9 @@ pub fn analyze_frame_set(
     let cap = thread_budget.max(1);
     let concurrency = if analysis_config.batch_concurrency == 0 {
         // Auto: ~1 worker per 3 pool threads
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         (cores / 3).max(2).min(cap)
     } else {
         (analysis_config.batch_concurrency as usize).clamp(1, cap)
@@ -280,40 +296,50 @@ pub fn analyze_frame_set(
 
     std::thread::scope(|s| {
         for _ in 0..concurrency {
-            s.spawn(|| {
-                loop {
-                    if cancel_flag_worker.load(Ordering::Relaxed) { break; }
-                    let item = work.lock().unwrap().next();
-                    let Some((frame_id, file_id, path)) = item else { break };
+            s.spawn(|| loop {
+                if cancel_flag_worker.load(Ordering::Relaxed) {
+                    break;
+                }
+                let item = work.lock().unwrap().next();
+                let Some((frame_id, file_id, path)) = item else {
+                    break;
+                };
 
-                    let result = match analyzer::analyze_frame(&path, &img_analyzer, &config_hash) {
-                        Ok((mut analysis, stars, _flip)) => {
-                            analysis.frame_id = frame_id;
-                            analysis.file_id = file_id;
-                            Ok((frame_id, analysis, stars))
-                        }
-                        Err(e) => {
-                            let msg = format!("{}: {}", path, e);
-                            tracing::warn!(frame_id, path = %path, error = %e, "frame analysis failed");
-                            Err(msg)
-                        }
-                    };
+                let result = match analyzer::analyze_frame(&path, &img_analyzer, &config_hash) {
+                    Ok((mut analysis, stars, _flip)) => {
+                        analysis.frame_id = frame_id;
+                        analysis.file_id = file_id;
+                        Ok((frame_id, analysis, stars))
+                    }
+                    Err(e) => {
+                        let msg = format!("{}: {}", path, e);
+                        tracing::warn!(frame_id, path = %path, error = %e, "frame analysis failed");
+                        Err(msg)
+                    }
+                };
 
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let filename = std::path::Path::new(&path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.clone());
-                    emit_event(emitter, "analysis-progress", &AnalysisProgressEvent {
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let filename = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone());
+                emit_event(
+                    emitter,
+                    "analysis-progress",
+                    &AnalysisProgressEvent {
                         frame_set_id,
                         current: done,
                         total,
                         current_file: filename,
-                        percent: if total > 0 { (done as f64 / total as f64) * 100.0 } else { 100.0 },
-                    });
+                        percent: if total > 0 {
+                            (done as f64 / total as f64) * 100.0
+                        } else {
+                            100.0
+                        },
+                    },
+                );
 
-                    results_lock.lock().unwrap().push(result);
-                }
+                results_lock.lock().unwrap().push(result);
             });
         }
     });
@@ -375,14 +401,18 @@ pub fn analyze_frame_set(
     // ends, rather than waiting on event serialization.
     drop(queue_permit);
 
-    emit_event(emitter, "analysis-complete", &AnalysisCompleteEvent {
-        frame_set_id,
-        analyzed,
-        skipped,
-        failed,
-        errors: errors.clone(),
-        cancelled: was_cancelled,
-    });
+    emit_event(
+        emitter,
+        "analysis-complete",
+        &AnalysisCompleteEvent {
+            frame_set_id,
+            analyzed,
+            skipped,
+            failed,
+            errors: errors.clone(),
+            cancelled: was_cancelled,
+        },
+    );
 
     Ok(AnalyzeFrameSetResult {
         analyzed,
@@ -402,15 +432,23 @@ pub fn cancel_analysis(ctx: &ServiceContext, frame_set_id: i64) -> Result<(), Ap
         handle.cancel_flag.store(true, Ordering::SeqCst);
         Ok(())
     } else {
-        Err(ApiError::NotFound("No active analysis for this frame set".to_string()))
+        Err(ApiError::NotFound(
+            "No active analysis for this frame set".to_string(),
+        ))
     }
 }
 
 /// Get all stored analysis results for a frame set.
-pub fn get_analysis_for_frame_set(ctx: &ServiceContext, frame_set_id: i64) -> Result<Vec<FrameAnalysis>, ApiError> {
+pub fn get_analysis_for_frame_set(
+    ctx: &ServiceContext,
+    frame_set_id: i64,
+) -> Result<Vec<FrameAnalysis>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)?)
+    Ok(db_analysis::get_frame_analyses_for_frame_set(
+        &conn,
+        frame_set_id,
+    )?)
 }
 
 /// Delegates to the central orientation helper — see
@@ -431,7 +469,10 @@ fn detect_flip_vertical(path: &str) -> bool {
 /// shared function. The `Database` connection guard is dropped before the
 /// `.await` per `api::db`'s doc-comment precondition (mirrors
 /// pre-conversion's explicit `drop(conn); let _ = db;`).
-pub async fn get_frame_star_metrics(ctx: &ServiceContext, frame_id: i64) -> Result<StarMetricsResponse, ApiError> {
+pub async fn get_frame_star_metrics(
+    ctx: &ServiceContext,
+    frame_id: i64,
+) -> Result<StarMetricsResponse, ApiError> {
     // Named `db_handle` (not `db`) throughout this fn — a local binding
     // named `db` would shadow the `db(ctx)` helper fn for the rest of this
     // scope, breaking the second acquisition below (after the on-demand
@@ -443,13 +484,15 @@ pub async fn get_frame_star_metrics(ctx: &ServiceContext, frame_id: i64) -> Resu
     let current_hash = analysis_config.config_hash();
 
     // Always need the file path for flip_vertical detection and possible on-demand analysis
-    let (file_id, path): (i64, String) = conn.query_row(
-        "SELECT fi.id, fi.path FROM frames f
+    let (file_id, path): (i64, String) = conn
+        .query_row(
+            "SELECT fi.id, fi.path FROM frames f
          INNER JOIN files fi ON fi.id = f.file_id
          WHERE f.id = ?1",
-        rusqlite::params![frame_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|e| ApiError::NotFound(format!("Frame not found: {}", e)))?;
+            rusqlite::params![frame_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| ApiError::NotFound(format!("Frame not found: {}", e)))?;
 
     let flip_vertical = detect_flip_vertical(&path);
 
@@ -481,9 +524,10 @@ pub async fn get_frame_star_metrics(ctx: &ServiceContext, frame_id: i64) -> Resu
 
     let (mut analysis, mut stars, flip_vertical) = tokio::task::spawn_blocking(move || {
         analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
-    }).await
-        .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?
-        .map_err(|e| ApiError::Internal(format!("Analysis failed: {}", e)))?;
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Analysis panicked: {}", e)))?
+    .map_err(|e| ApiError::Internal(format!("Analysis failed: {}", e)))?;
 
     analysis.frame_id = frame_id;
     analysis.file_id = file_id;
@@ -522,7 +566,7 @@ pub async fn compute_flat_contour_plot(
     file_id: i64,
     opts: FlatContourOpts,
 ) -> Result<FlatContourPlotResponse, ApiError> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     // Resolve file path under the DB lock, then drop it before the (slow)
     // pixel work to avoid holding the connection across an await.
@@ -533,14 +577,15 @@ pub async fn compute_flat_contour_plot(
             "SELECT path FROM files WHERE id = ?1",
             rusqlite::params![file_id],
             |row| row.get::<_, String>(0),
-        ).map_err(|e| ApiError::NotFound(format!("File not found (id={}): {}", file_id, e)))?
+        )
+        .map_err(|e| ApiError::NotFound(format!("File not found (id={}): {}", file_id, e)))?
     };
 
-    let result = tokio::task::spawn_blocking(move || {
-        flat_analysis::compute_flat_contour_plot(&path, opts)
-    }).await
-        .map_err(|e| ApiError::Internal(format!("Flat contour analysis panicked: {}", e)))?
-        .map_err(|e| ApiError::Internal(format!("Flat contour analysis failed: {}", e)))?;
+    let result =
+        tokio::task::spawn_blocking(move || flat_analysis::compute_flat_contour_plot(&path, opts))
+            .await
+            .map_err(|e| ApiError::Internal(format!("Flat contour analysis panicked: {}", e)))?
+            .map_err(|e| ApiError::Internal(format!("Flat contour analysis failed: {}", e)))?;
 
     let pixels_b64 = STANDARD.encode(&result.pixels);
 

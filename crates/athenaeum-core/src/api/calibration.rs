@@ -39,7 +39,10 @@ pub fn get_equipment_cameras(ctx: &ServiceContext) -> Result<Vec<CameraStats>, A
     Ok(crate::db::get_all_cameras(&conn)?)
 }
 
-pub fn get_dark_library(ctx: &ServiceContext, instrume: String) -> Result<Vec<CalibrationSetDetail>, ApiError> {
+pub fn get_dark_library(
+    ctx: &ServiceContext,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::get_camera_dark_library(&conn, &instrume)?)
@@ -51,7 +54,10 @@ pub fn has_dark_library(ctx: &ServiceContext, instrume: String) -> Result<bool, 
     Ok(crate::db::has_dark_library(&conn, &instrume)?)
 }
 
-pub fn get_master_dark_library(ctx: &ServiceContext, instrume: String) -> Result<Vec<CalibrationSetDetail>, ApiError> {
+pub fn get_master_dark_library(
+    ctx: &ServiceContext,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::get_camera_master_dark_library(&conn, &instrume)?)
@@ -63,7 +69,10 @@ pub fn has_master_dark_library(ctx: &ServiceContext, instrume: String) -> Result
     Ok(crate::db::has_master_dark_library(&conn, &instrume)?)
 }
 
-pub fn get_master_flat_library(ctx: &ServiceContext, instrume: String) -> Result<Vec<CalibrationSetDetail>, ApiError> {
+pub fn get_master_flat_library(
+    ctx: &ServiceContext,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::get_camera_master_flat_library(&conn, &instrume)?)
@@ -75,16 +84,24 @@ pub fn has_master_flat_library(ctx: &ServiceContext, instrume: String) -> Result
     Ok(crate::db::has_master_flat_library(&conn, &instrume)?)
 }
 
-pub fn get_calibration_set_frames(ctx: &ServiceContext, set_id: i64) -> Result<Vec<FileWithFrame>, ApiError> {
+pub fn get_calibration_set_frames(
+    ctx: &ServiceContext,
+    set_id: i64,
+) -> Result<Vec<FileWithFrame>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::get_frames_for_calibration_set(&conn, set_id)?)
 }
 
-pub fn get_calibration_set_consumers(ctx: &ServiceContext, set_id: i64) -> Result<Vec<CalibrationSetConsumer>, ApiError> {
+pub fn get_calibration_set_consumers(
+    ctx: &ServiceContext,
+    set_id: i64,
+) -> Result<Vec<CalibrationSetConsumer>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(crate::db::calibration_links::get_calibration_set_consumers(&conn, set_id)?)
+    Ok(crate::db::calibration_links::get_calibration_set_consumers(
+        &conn, set_id,
+    )?)
 }
 
 // ===== CALIBRATION FINDER COMMANDS =====
@@ -118,9 +135,15 @@ pub fn find_calibration_for_frame_set(
         .prepare("SELECT flat_pattern, date_obs_start, date_obs_end FROM frames_set WHERE id = ?1")
         .map_err(|e| ApiError::Internal(format!("Failed to prepare frame set query: {}", e)))?;
 
-    let (stored_flat_pattern, _date_obs_start, _date_obs_end): (Option<String>, Option<String>, Option<String>) =
-        stmt.query_row([frame_set_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| ApiError::Internal(format!("Frame set not found: {}", e)))?;
+    let (stored_flat_pattern, _date_obs_start, _date_obs_end): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = stmt
+        .query_row([frame_set_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| ApiError::Internal(format!("Frame set not found: {}", e)))?;
 
     // Use provided flat_pattern or fall back to stored pattern
     let final_flat_pattern = flat_pattern.or(stored_flat_pattern);
@@ -129,14 +152,24 @@ pub fn find_calibration_for_frame_set(
     let config = crate::calibration::configurable_matcher::load_config(&conn);
 
     // Get flat calibration settings from config
-    let max_age_days = config.clustering.get("flat").map(|c| c.max_age_days).unwrap_or(30);
-    let time_cluster_minutes = config.clustering.get("flat").map(|c| c.time_cluster_minutes).unwrap_or(30);
+    let max_age_days = config
+        .clustering
+        .get("flat")
+        .map(|c| c.max_age_days)
+        .unwrap_or(30);
+    let time_cluster_minutes = config
+        .clustering
+        .get("flat")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(30);
     let temp_weight = config.scoring.temperature_match_weight;
 
     // Build tolerance from parameters, config warnings, or defaults
     let tolerance = CalibrationTolerance {
-        flat_date_warning_days: flat_date_warning_days.unwrap_or(config.warnings.flat_date_warning_days),
-        dark_date_warning_days: dark_date_warning_days.unwrap_or(config.warnings.dark_date_warning_days),
+        flat_date_warning_days: flat_date_warning_days
+            .unwrap_or(config.warnings.flat_date_warning_days),
+        dark_date_warning_days: dark_date_warning_days
+            .unwrap_or(config.warnings.dark_date_warning_days),
     };
 
     tracing::debug!(
@@ -187,7 +220,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
 // ========== Calibration Matching Config Commands ==========
 
 /// Get the current calibration matching configuration.
-pub fn get_calibration_matching_config(ctx: &ServiceContext) -> Result<CalibrationMatchingConfig, ApiError> {
+pub fn get_calibration_matching_config(
+    ctx: &ServiceContext,
+) -> Result<CalibrationMatchingConfig, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -209,22 +244,27 @@ pub fn get_calibration_matching_config(ctx: &ServiceContext) -> Result<Calibrati
 /// the bare `String`. `ApiError::Invalid` (-> 400 via `api_err`) preserves
 /// both platforms' exact pre-conversion behavior — not a rule-2 case, both
 /// sides already agreed this is a client error.
-pub fn set_calibration_matching_config(ctx: &ServiceContext, config: CalibrationMatchingConfig) -> Result<(), ApiError> {
+pub fn set_calibration_matching_config(
+    ctx: &ServiceContext,
+    config: CalibrationMatchingConfig,
+) -> Result<(), ApiError> {
     config.validate().map_err(ApiError::Invalid)?;
 
     let db = db(ctx)?;
     let conn = db.conn();
 
-    let json = config
-        .to_json()
-        .map_err(|e| ApiError::Internal(format!("Failed to serialize calibration config: {}", e)))?;
+    let json = config.to_json().map_err(|e| {
+        ApiError::Internal(format!("Failed to serialize calibration config: {}", e))
+    })?;
 
     crate::db::set_setting(&conn, CALIBRATION_CONFIG_KEY, &json)?;
     Ok(())
 }
 
 /// Reset calibration matching configuration to defaults.
-pub fn reset_calibration_matching_config(ctx: &ServiceContext) -> Result<CalibrationMatchingConfig, ApiError> {
+pub fn reset_calibration_matching_config(
+    ctx: &ServiceContext,
+) -> Result<CalibrationMatchingConfig, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -241,7 +281,10 @@ pub fn reset_calibration_matching_config(ctx: &ServiceContext) -> Result<Calibra
 // ========== Manual Calibration Selection Commands ==========
 
 /// Get average parameters of light frames for manual selection display.
-pub fn get_light_frame_parameters(ctx: &ServiceContext, frame_ids: Vec<i64>) -> Result<LightFrameParameters, ApiError> {
+pub fn get_light_frame_parameters(
+    ctx: &ServiceContext,
+    frame_ids: Vec<i64>,
+) -> Result<LightFrameParameters, ApiError> {
     use crate::db::calibration_links::get_links_for_frame;
 
     let db = db(ctx)?;
@@ -261,7 +304,10 @@ pub fn get_light_frame_parameters(ctx: &ServiceContext, frame_ids: Vec<i64>) -> 
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = frame_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
 
     let mut rows = stmt.query(params.as_slice())?;
 
@@ -301,9 +347,17 @@ pub fn get_light_frame_parameters(ctx: &ServiceContext, frame_ids: Vec<i64>) -> 
     let filter = most_common_option(&filters);
 
     // Calculate averages and ranges
-    let avg_ccd_temp = if temps.is_empty() { None } else { Some(temps.iter().sum::<f64>() / temps.len() as f64) };
+    let avg_ccd_temp = if temps.is_empty() {
+        None
+    } else {
+        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    };
 
-    let avg_exptime = if exptimes.is_empty() { None } else { Some(exptimes.iter().sum::<f64>() / exptimes.len() as f64) };
+    let avg_exptime = if exptimes.is_empty() {
+        None
+    } else {
+        Some(exptimes.iter().sum::<f64>() / exptimes.len() as f64)
+    };
 
     let exptime_range = if exptimes.is_empty() {
         None
@@ -318,16 +372,28 @@ pub fn get_light_frame_parameters(ctx: &ServiceContext, frame_ids: Vec<i64>) -> 
     } else {
         let mut sorted = dates.clone();
         sorted.sort();
-        Some((sorted.first().unwrap().clone(), sorted.last().unwrap().clone()))
+        Some((
+            sorted.first().unwrap().clone(),
+            sorted.last().unwrap().clone(),
+        ))
     };
 
     // Get current calibration links for first frame (representative)
     let first_frame_id = frame_ids[0];
     let links = get_links_for_frame(&conn, first_frame_id)?;
 
-    let current_flat_set_id = links.iter().find(|l| l.calibration_type == "Flat").map(|l| l.calibration_set_id);
-    let current_dark_set_id = links.iter().find(|l| l.calibration_type == "Dark").map(|l| l.calibration_set_id);
-    let current_bias_set_id = links.iter().find(|l| l.calibration_type == "Bias").map(|l| l.calibration_set_id);
+    let current_flat_set_id = links
+        .iter()
+        .find(|l| l.calibration_type == "Flat")
+        .map(|l| l.calibration_set_id);
+    let current_dark_set_id = links
+        .iter()
+        .find(|l| l.calibration_type == "Dark")
+        .map(|l| l.calibration_set_id);
+    let current_bias_set_id = links
+        .iter()
+        .find(|l| l.calibration_type == "Bias")
+        .map(|l| l.calibration_set_id);
 
     Ok(LightFrameParameters {
         instrume,
@@ -373,7 +439,12 @@ pub fn get_calibration_sets_for_manual_selection(
     // Validate calibration_type up front for a clear error message.
     match calibration_type.to_lowercase().as_str() {
         "flat" | "dark" | "bias" | "darkflat" => {}
-        _ => return Err(ApiError::Invalid(format!("Invalid calibration type: {}", calibration_type))),
+        _ => {
+            return Err(ApiError::Invalid(format!(
+                "Invalid calibration type: {}",
+                calibration_type
+            )))
+        }
     };
 
     let config = load_config(&conn);
@@ -392,8 +463,12 @@ pub fn get_calibration_sets_for_manual_selection(
         _ => "",
     };
     let current_link_set_id: Option<i64> = if !frame_ids.is_empty() && !cal_type_key.is_empty() {
-        let links = crate::db::calibration_links::get_links_for_frame(&conn, frame_ids[0]).unwrap_or_default();
-        links.iter().find(|l| l.calibration_type == cal_type_key).map(|l| l.calibration_set_id)
+        let links = crate::db::calibration_links::get_links_for_frame(&conn, frame_ids[0])
+            .unwrap_or_default();
+        links
+            .iter()
+            .find(|l| l.calibration_type == cal_type_key)
+            .map(|l| l.calibration_set_id)
     } else {
         None
     };
@@ -435,7 +510,8 @@ pub fn get_calibration_sets_for_manual_selection(
     if let (false, Some(cur_id)) = (current_seen, current_link_set_id) {
         let placeholder = crate::calibration::finder::CalibrationCandidate {
             set_id: cur_id,
-            imagetyp: crate::models::ImageType::from_str(cal_type_key).unwrap_or(crate::models::ImageType::Dark),
+            imagetyp: crate::models::ImageType::from_str(cal_type_key)
+                .unwrap_or(crate::models::ImageType::Dark),
             match_score: 0.0,
             date_diff_days: 0,
             temp_diff: None,
@@ -472,7 +548,10 @@ pub fn manual_assign_calibration(
     // Validate calibration_type
     let valid_types = ["Flat", "Dark", "Bias", "DarkFlat"];
     if !valid_types.contains(&calibration_type.as_str()) {
-        return Err(ApiError::Invalid(format!("Invalid calibration type: {}", calibration_type)));
+        return Err(ApiError::Invalid(format!(
+            "Invalid calibration type: {}",
+            calibration_type
+        )));
     }
 
     let mut assigned_count = 0;
@@ -527,7 +606,11 @@ pub fn clear_manual_calibration_override(
 
     let deleted = clear_manual_override(&conn, &frame_ids, calibration_type.as_deref())?;
 
-    tracing::info!(count = deleted, frames = frame_ids.len(), "cleared manual calibration override(s)");
+    tracing::info!(
+        count = deleted,
+        frames = frame_ids.len(),
+        "cleared manual calibration override(s)"
+    );
 
     Ok(deleted)
 }
@@ -538,7 +621,10 @@ fn most_common_option(values: &[Option<String>]) -> Option<String> {
         *counts.entry(v).or_insert(0) += 1;
     }
 
-    counts.into_iter().max_by_key(|(_, count)| *count).map(|(v, _)| v.clone())
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(v, _)| v.clone())
 }
 
 fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
@@ -550,7 +636,10 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
         entry.1 += 1;
     }
 
-    counts.into_iter().max_by_key(|(_, (_, count))| *count).map(|(_, (v, _))| v)
+    counts
+        .into_iter()
+        .max_by_key(|(_, (_, count))| *count)
+        .map(|(_, (v, _))| v)
 }
 
 // ========== Refresh Calibration Library Command ==========
@@ -569,7 +658,10 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
 /// Split into a conn-taking `refresh_calibration_library_inner` so the
 /// superseded-set / trigger-suspension semantics can be pinned by unit tests
 /// without constructing a full `ServiceContext`.
-pub fn refresh_calibration_library_for_camera(ctx: &ServiceContext, instrume: String) -> Result<CalibrationScanResult, ApiError> {
+pub fn refresh_calibration_library_for_camera(
+    ctx: &ServiceContext,
+    instrume: String,
+) -> Result<CalibrationScanResult, ApiError> {
     let db = db(ctx)?;
     let mut conn = db.conn();
     refresh_calibration_library_inner(&mut conn, &instrume)
@@ -617,7 +709,10 @@ pub(crate) fn refresh_calibration_library_inner(
     )
     .map_err(|e| ApiError::Internal(format!("Failed to reset frame counts: {}", e)))?;
 
-    tracing::debug!(instrume, "cleared existing frame memberships (sets preserved for ID stability)");
+    tracing::debug!(
+        instrume,
+        "cleared existing frame memberships (sets preserved for ID stability)"
+    );
 
     // Step 2: Query all calibration frame IDs for this camera
     let flat_frame_ids = query_frame_ids_by_type(&tx, instrume, "FLAT")
@@ -636,10 +731,17 @@ pub(crate) fn refresh_calibration_library_inner(
         .map_err(|e| ApiError::Internal(format!("Failed to query master flat frames: {}", e)))?;
     let master_bias_ids = query_frame_ids_by_type(&tx, instrume, "MASTERBIAS")
         .map_err(|e| ApiError::Internal(format!("Failed to query master bias frames: {}", e)))?;
-    let master_darkflat_ids = query_frame_ids_by_type(&tx, instrume, "MASTERDARKFLAT")
-        .map_err(|e| ApiError::Internal(format!("Failed to query master darkflat frames: {}", e)))?;
+    let master_darkflat_ids =
+        query_frame_ids_by_type(&tx, instrume, "MASTERDARKFLAT").map_err(|e| {
+            ApiError::Internal(format!("Failed to query master darkflat frames: {}", e))
+        })?;
 
-    let master_frame_ids = MasterFrameIds { master_dark_ids, master_flat_ids, master_bias_ids, master_darkflat_ids };
+    let master_frame_ids = MasterFrameIds {
+        master_dark_ids,
+        master_flat_ids,
+        master_bias_ids,
+        master_darkflat_ids,
+    };
 
     tracing::debug!(
         flats = flat_frame_ids.len(),
@@ -690,7 +792,11 @@ pub(crate) fn refresh_calibration_library_inner(
     tx.commit()
         .map_err(|e| ApiError::Internal(format!("Failed to commit refresh transaction: {}", e)))?;
 
-    tracing::info!(instrume, sets_created = result.sets_created, "calibration library refresh complete");
+    tracing::info!(
+        instrume,
+        sets_created = result.sets_created,
+        "calibration library refresh complete"
+    );
 
     Ok(result)
 }
@@ -698,7 +804,11 @@ pub(crate) fn refresh_calibration_library_inner(
 /// Query frame IDs for a specific camera and image type (case-insensitive).
 /// Members of superseded sets are excluded: those frames are frozen
 /// provenance history, already represented in matching by the built master.
-fn query_frame_ids_by_type(conn: &rusqlite::Connection, instrume: &str, imagetyp: &str) -> Result<Vec<i64>, rusqlite::Error> {
+fn query_frame_ids_by_type(
+    conn: &rusqlite::Connection,
+    instrume: &str,
+    imagetyp: &str,
+) -> Result<Vec<i64>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id FROM frames
          WHERE instrume = ?1 AND UPPER(imagetyp) = UPPER(?2)
@@ -710,7 +820,9 @@ fn query_frame_ids_by_type(conn: &rusqlite::Connection, instrume: &str, imagetyp
            )",
     )?;
 
-    let ids: Vec<i64> = stmt.query_map([instrume, imagetyp], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+    let ids: Vec<i64> = stmt
+        .query_map([instrume, imagetyp], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ids)
 }
@@ -718,7 +830,10 @@ fn query_frame_ids_by_type(conn: &rusqlite::Connection, instrume: &str, imagetyp
 // ========== Sub-Calibration Selection Commands ==========
 
 /// Get parameters of a calibration set for sub-calibration selection display.
-pub fn get_calibration_set_parameters(ctx: &ServiceContext, set_id: i64) -> Result<CalibrationSetParameters, ApiError> {
+pub fn get_calibration_set_parameters(
+    ctx: &ServiceContext,
+    set_id: i64,
+) -> Result<CalibrationSetParameters, ApiError> {
     use crate::db::calibration_links::get_links_for_calibration_set;
 
     let db = db(ctx)?;
@@ -731,7 +846,19 @@ pub fn get_calibration_set_parameters(ctx: &ServiceContext, set_id: i64) -> Resu
          FROM calibration_set WHERE id = ?1",
     )?;
 
-    let (imagetyp, instrume, binning, gain, offset, exptime, filter, ccd_temp, date_start, date_end, frame_count): (
+    let (
+        imagetyp,
+        instrume,
+        binning,
+        gain,
+        offset,
+        exptime,
+        filter,
+        ccd_temp,
+        date_start,
+        date_end,
+        frame_count,
+    ): (
         String,
         Option<String>,
         Option<String>,
@@ -764,9 +891,18 @@ pub fn get_calibration_set_parameters(ctx: &ServiceContext, set_id: i64) -> Resu
     // Get current sub-calibration links
     let links = get_links_for_calibration_set(&conn, set_id)?;
 
-    let current_dark_set_id = links.iter().find(|l| l.calibration_type == "Dark").map(|l| l.calibration_set_id);
-    let current_darkflat_set_id = links.iter().find(|l| l.calibration_type == "DarkFlat").map(|l| l.calibration_set_id);
-    let current_bias_set_id = links.iter().find(|l| l.calibration_type == "Bias").map(|l| l.calibration_set_id);
+    let current_dark_set_id = links
+        .iter()
+        .find(|l| l.calibration_type == "Dark")
+        .map(|l| l.calibration_set_id);
+    let current_darkflat_set_id = links
+        .iter()
+        .find(|l| l.calibration_type == "DarkFlat")
+        .map(|l| l.calibration_set_id);
+    let current_bias_set_id = links
+        .iter()
+        .find(|l| l.calibration_type == "Bias")
+        .map(|l| l.calibration_set_id);
 
     Ok(CalibrationSetParameters {
         set_id,
@@ -807,7 +943,12 @@ pub fn get_subcalibration_sets_for_manual_selection(
     // Validate up front.
     match calibration_type.to_lowercase().as_str() {
         "dark" | "darkflat" | "bias" => {}
-        _ => return Err(ApiError::Invalid(format!("Invalid calibration type for sub-calibration: {}", calibration_type))),
+        _ => {
+            return Err(ApiError::Invalid(format!(
+                "Invalid calibration type for sub-calibration: {}",
+                calibration_type
+            )))
+        }
     };
 
     // Master sets are already calibrated — they have no sub-cal.
@@ -833,8 +974,12 @@ pub fn get_subcalibration_sets_for_manual_selection(
     };
     // Always include the currently-linked sub-cal set, regardless of score.
     let current_link_set_id: Option<i64> = if !cal_type_key.is_empty() {
-        let links = crate::db::calibration_links::get_links_for_calibration_set(&conn, set_id).unwrap_or_default();
-        links.iter().find(|l| l.calibration_type == cal_type_key).map(|l| l.calibration_set_id)
+        let links = crate::db::calibration_links::get_links_for_calibration_set(&conn, set_id)
+            .unwrap_or_default();
+        links
+            .iter()
+            .find(|l| l.calibration_type == cal_type_key)
+            .map(|l| l.calibration_set_id)
     } else {
         None
     };
@@ -867,7 +1012,8 @@ pub fn get_subcalibration_sets_for_manual_selection(
     if let (false, Some(cur_id)) = (current_seen, current_link_set_id) {
         let placeholder = crate::calibration::finder::CalibrationCandidate {
             set_id: cur_id,
-            imagetyp: crate::models::ImageType::from_str(cal_type_key).unwrap_or(crate::models::ImageType::Dark),
+            imagetyp: crate::models::ImageType::from_str(cal_type_key)
+                .unwrap_or(crate::models::ImageType::Dark),
             match_score: 0.0,
             date_diff_days: 0,
             temp_diff: None,
@@ -900,7 +1046,10 @@ pub fn manual_assign_subcalibration(
     // Validate calibration_type
     let valid_types = ["Dark", "DarkFlat", "Bias"];
     if !valid_types.contains(&calibration_type.as_str()) {
-        return Err(ApiError::Invalid(format!("Invalid sub-calibration type: {}", calibration_type)));
+        return Err(ApiError::Invalid(format!(
+            "Invalid sub-calibration type: {}",
+            calibration_type
+        )));
     }
 
     // Create the calibration link with source_type = 'calibration_set'
@@ -917,7 +1066,8 @@ pub fn manual_assign_subcalibration(
         is_manual_override: true,
     };
 
-    insert_calibration_link(&conn, &link).map_err(|e| ApiError::Internal(format!("Failed to assign sub-calibration: {}", e)))?;
+    insert_calibration_link(&conn, &link)
+        .map_err(|e| ApiError::Internal(format!("Failed to assign sub-calibration: {}", e)))?;
 
     tracing::info!(
         calibration_type = %calibration_type,
@@ -951,7 +1101,11 @@ pub fn clear_subcalibration_override(
         )?,
     };
 
-    tracing::info!(count = deleted, set_id = source_set_id, "cleared sub-calibration link(s)");
+    tracing::info!(
+        count = deleted,
+        set_id = source_set_id,
+        "cleared sub-calibration link(s)"
+    );
 
     Ok(deleted)
 }
@@ -993,7 +1147,11 @@ pub fn bulk_update_calibration_metadata(
     for set_id in &set_ids {
         // First, check if we already have originals saved for this set
         let has_originals: bool = conn
-            .query_row("SELECT COUNT(*) > 0 FROM calibration_set_originals WHERE set_id = ?1", [set_id], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM calibration_set_originals WHERE set_id = ?1",
+                [set_id],
+                |row| row.get(0),
+            )
             .unwrap_or(false);
 
         // If no originals exist, save current values before editing
@@ -1021,29 +1179,55 @@ pub fn bulk_update_calibration_metadata(
         }
 
         if let Some(gain) = edits.gain {
-            conn.execute("UPDATE calibration_set SET gain = ?1 WHERE id = ?2", rusqlite::params![gain, set_id])
-                .map_err(|e| ApiError::Internal(format!("Failed to update gain for set {}: {}", set_id, e)))?;
+            conn.execute(
+                "UPDATE calibration_set SET gain = ?1 WHERE id = ?2",
+                rusqlite::params![gain, set_id],
+            )
+            .map_err(|e| {
+                ApiError::Internal(format!("Failed to update gain for set {}: {}", set_id, e))
+            })?;
             any_update = true;
             tracing::debug!(set_id, gain, "updated calibration set field");
         }
 
         if let Some(offset) = edits.offset {
-            conn.execute("UPDATE calibration_set SET offset = ?1 WHERE id = ?2", rusqlite::params![offset, set_id])
-                .map_err(|e| ApiError::Internal(format!("Failed to update offset for set {}: {}", set_id, e)))?;
+            conn.execute(
+                "UPDATE calibration_set SET offset = ?1 WHERE id = ?2",
+                rusqlite::params![offset, set_id],
+            )
+            .map_err(|e| {
+                ApiError::Internal(format!("Failed to update offset for set {}: {}", set_id, e))
+            })?;
             any_update = true;
             tracing::debug!(set_id, offset, "updated calibration set field");
         }
 
         if let Some(ref binning) = edits.binning {
-            conn.execute("UPDATE calibration_set SET binning = ?1 WHERE id = ?2", rusqlite::params![binning, set_id])
-                .map_err(|e| ApiError::Internal(format!("Failed to update binning for set {}: {}", set_id, e)))?;
+            conn.execute(
+                "UPDATE calibration_set SET binning = ?1 WHERE id = ?2",
+                rusqlite::params![binning, set_id],
+            )
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "Failed to update binning for set {}: {}",
+                    set_id, e
+                ))
+            })?;
             any_update = true;
             tracing::debug!(set_id, binning = %binning, "updated calibration set field");
         }
 
         if let Some(exptime) = edits.exptime {
-            conn.execute("UPDATE calibration_set SET exptime = ?1 WHERE id = ?2", rusqlite::params![exptime, set_id])
-                .map_err(|e| ApiError::Internal(format!("Failed to update exptime for set {}: {}", set_id, e)))?;
+            conn.execute(
+                "UPDATE calibration_set SET exptime = ?1 WHERE id = ?2",
+                rusqlite::params![exptime, set_id],
+            )
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "Failed to update exptime for set {}: {}",
+                    set_id, e
+                ))
+            })?;
             any_update = true;
             tracing::debug!(set_id, exptime, "updated calibration set field");
         }
@@ -1102,7 +1286,12 @@ pub fn bulk_update_calibration_metadata(
             all_values.push(rusqlite::types::Value::Integer(*set_id));
             let n = conn
                 .execute(&sql, rusqlite::params_from_iter(all_values.iter()))
-                .map_err(|e| ApiError::Internal(format!("Failed to propagate edits to frames for set {}: {}", set_id, e)))?;
+                .map_err(|e| {
+                    ApiError::Internal(format!(
+                        "Failed to propagate edits to frames for set {}: {}",
+                        set_id, e
+                    ))
+                })?;
             tracing::debug!(set_id, count = n, "propagated edits to member frames");
         }
 
@@ -1117,7 +1306,10 @@ pub fn bulk_update_calibration_metadata(
 }
 
 /// Bulk restore calibration set metadata from originals.
-pub fn bulk_restore_calibration_metadata(ctx: &ServiceContext, set_ids: Vec<i64>) -> Result<usize, ApiError> {
+pub fn bulk_restore_calibration_metadata(
+    ctx: &ServiceContext,
+    set_ids: Vec<i64>,
+) -> Result<usize, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -1146,20 +1338,34 @@ pub fn bulk_restore_calibration_metadata(ctx: &ServiceContext, set_ids: Vec<i64>
 
         if rows_affected > 0 {
             // Delete the originals entry after successful restore
-            conn.execute("DELETE FROM calibration_set_originals WHERE set_id = ?1", rusqlite::params![set_id])
-                .map_err(|e| ApiError::Internal(format!("Failed to delete originals for set {}: {}", set_id, e)))?;
+            conn.execute(
+                "DELETE FROM calibration_set_originals WHERE set_id = ?1",
+                rusqlite::params![set_id],
+            )
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "Failed to delete originals for set {}: {}",
+                    set_id, e
+                ))
+            })?;
 
             restored_count += 1;
         }
     }
 
-    tracing::info!(count = restored_count, "restored original calibration set metadata");
+    tracing::info!(
+        count = restored_count,
+        "restored original calibration set metadata"
+    );
 
     Ok(restored_count)
 }
 
 /// Get all set IDs that have custom metadata edits for a given camera.
-pub fn get_custom_metadata_set_ids(ctx: &ServiceContext, instrume: String) -> Result<Vec<i64>, ApiError> {
+pub fn get_custom_metadata_set_ids(
+    ctx: &ServiceContext,
+    instrume: String,
+) -> Result<Vec<i64>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -1169,7 +1375,10 @@ pub fn get_custom_metadata_set_ids(ctx: &ServiceContext, instrume: String) -> Re
          WHERE cs.instrume = ?1",
     )?;
 
-    let ids: Vec<i64> = stmt.query_map([&instrume], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+    let ids: Vec<i64> = stmt
+        .query_map([&instrume], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(ids)
 }
@@ -1284,7 +1493,8 @@ mod tests {
     #[test]
     fn refresh_skips_superseded_sets() {
         let mut conn = seed_db();
-        let (raw_id, raw_frames) = seed_raw_dark_set(&conn, "2026-06-01", &["20:00:00", "20:10:00"]);
+        let (raw_id, raw_frames) =
+            seed_raw_dark_set(&conn, "2026-06-01", &["20:00:00", "20:10:00"]);
         let master_id = seed_master_set(&conn);
         supersede(&conn, raw_id, master_id);
         let (live_id, _) = seed_raw_dark_set(&conn, "2026-06-15", &["21:00:00", "21:10:00"]);
@@ -1298,20 +1508,39 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(superseded_by, Some(master_id), "supersede pointer must survive");
+        assert_eq!(
+            superseded_by,
+            Some(master_id),
+            "supersede pointer must survive"
+        );
         assert_eq!(count, 2, "frozen membership must not be cleared");
         for fid in &raw_frames {
             let set_of: i64 = conn
-                .query_row("SELECT set_id FROM calibration_set_frames WHERE frame_id = ?1", [fid], |r| r.get(0))
+                .query_row(
+                    "SELECT set_id FROM calibration_set_frames WHERE frame_id = ?1",
+                    [fid],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(set_of, raw_id, "superseded member must not be re-clustered into a live set");
+            assert_eq!(
+                set_of, raw_id,
+                "superseded member must not be re-clustered into a live set"
+            );
         }
         let prov: i64 = conn
-            .query_row("SELECT COUNT(*) FROM master_provenance WHERE source_set_id = ?1", [raw_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE source_set_id = ?1",
+                [raw_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(prov, 1, "provenance row must survive");
         let live: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = ?1", [live_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [live_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(live, 1, "live set must survive the refresh");
     }
@@ -1349,7 +1578,11 @@ mod tests {
         refresh_calibration_library_inner(&mut conn, "TestCam").unwrap();
 
         let count: i64 = conn
-            .query_row("SELECT frame_count FROM calibration_set WHERE id = ?1", [live_id], |r| r.get(0))
+            .query_row(
+                "SELECT frame_count FROM calibration_set WHERE id = ?1",
+                [live_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 2, "set must be refilled under its original id");
         let link: i64 = conn

@@ -42,15 +42,17 @@ pub fn auto_generate_frame_sets(
     threshold_deg: Option<f64>,
     emitter: &dyn ProgressEmitter,
 ) -> Result<AutoGenerateResult> {
-    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let db = ctx
+        .db
+        .get()
+        .ok_or_else(|| anyhow!("Database not initialized"))?;
     let conn = db.conn();
 
     // Use provided threshold or get from settings
     let threshold_deg = if let Some(custom_threshold) = threshold_deg {
         custom_threshold
     } else {
-        ctx.settings
-            .get_grouping_threshold_deg(&conn)?
+        ctx.settings.get_grouping_threshold_deg(&conn)?
     };
 
     // Fetch all LIGHT frames
@@ -58,7 +60,8 @@ pub fn auto_generate_frame_sets(
 
     // Get all frame IDs that are already in any set
     let existing_member_ids = db::get_all_frames_set_member_ids(&conn)?;
-    let existing_members_set: std::collections::HashSet<i64> = existing_member_ids.into_iter().collect();
+    let existing_members_set: std::collections::HashSet<i64> =
+        existing_member_ids.into_iter().collect();
 
     // Filter out frames that are already in sets
     let mut frames_already_in_sets = 0;
@@ -99,7 +102,8 @@ pub fn auto_generate_frame_sets(
     let mut frames_clustered = 0;
 
     // Get session gap threshold from settings
-    let gap_threshold_hours: f64 = ctx.settings
+    let gap_threshold_hours: f64 = ctx
+        .settings
         .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
@@ -146,7 +150,9 @@ pub fn auto_generate_frame_sets(
                         );
                     }
                     Ok(_) => {}
-                    Err(err) => tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed"),
+                    Err(err) => {
+                        tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed")
+                    }
                 }
             }
         }
@@ -159,12 +165,8 @@ pub fn auto_generate_frame_sets(
 
         // Create imaging nights and sessions
         for night in detected_nights {
-            let night_id = db::create_imaging_night(
-                &conn,
-                set_id,
-                &night.start_time,
-                &night.end_time,
-            )?;
+            let night_id =
+                db::create_imaging_night(&conn, set_id, &night.start_time, &night.end_time)?;
 
             for session in night.sessions {
                 let session_id = db::create_session(
@@ -209,9 +211,9 @@ mod tests {
         use crate::services::operation_queue::OperationQueue;
         use crate::settings::SettingsManager;
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex, OnceLock};
         #[cfg(all(feature = "render", feature = "solver"))]
         use std::sync::RwLock;
+        use std::sync::{Arc, Mutex, OnceLock};
 
         let tmp = tempfile::tempdir().unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
@@ -235,7 +237,12 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -256,7 +263,11 @@ mod tests {
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format)
              VALUES (?1, ?2, ?3, 1024, '2026-01-01T00:00:00Z', 'FITS')",
-            params![id, format!("/tmp/frame_{id}.fits"), format!("frame_{id}.fits")],
+            params![
+                id,
+                format!("/tmp/frame_{id}.fits"),
+                format!("frame_{id}.fits")
+            ],
         )
         .unwrap();
         conn.execute(
@@ -278,10 +289,38 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
         {
             let conn = ctx.db.get().unwrap().conn();
-            insert_light(&conn, 1, "M31", "2026-03-05T22:10:00+00:00", Some(10.00), Some(41.00));
-            insert_light(&conn, 2, "M31", "2026-03-05T22:20:00+00:00", Some(10.01), Some(41.01));
-            insert_light(&conn, 3, "M31", "2026-03-05T22:30:00+00:00", Some(10.02), Some(41.02));
-            insert_light(&conn, 4, "NoCoords", "2026-03-05T22:40:00+00:00", None, None);
+            insert_light(
+                &conn,
+                1,
+                "M31",
+                "2026-03-05T22:10:00+00:00",
+                Some(10.00),
+                Some(41.00),
+            );
+            insert_light(
+                &conn,
+                2,
+                "M31",
+                "2026-03-05T22:20:00+00:00",
+                Some(10.01),
+                Some(41.01),
+            );
+            insert_light(
+                &conn,
+                3,
+                "M31",
+                "2026-03-05T22:30:00+00:00",
+                Some(10.02),
+                Some(41.02),
+            );
+            insert_light(
+                &conn,
+                4,
+                "NoCoords",
+                "2026-03-05T22:40:00+00:00",
+                None,
+                None,
+            );
         }
 
         let result =
@@ -310,7 +349,10 @@ mod tests {
         let members: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_members", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(members, 3, "session detection put all three lights in sessions");
+        assert_eq!(
+            members, 3,
+            "session detection put all three lights in sessions"
+        );
     }
 
     /// A second run finds every LIGHT already in a set: no new sets, and the
@@ -320,12 +362,25 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
         {
             let conn = ctx.db.get().unwrap().conn();
-            insert_light(&conn, 1, "M31", "2026-03-05T22:10:00+00:00", Some(10.00), Some(41.00));
-            insert_light(&conn, 2, "M31", "2026-03-05T22:20:00+00:00", Some(10.01), Some(41.01));
+            insert_light(
+                &conn,
+                1,
+                "M31",
+                "2026-03-05T22:10:00+00:00",
+                Some(10.00),
+                Some(41.00),
+            );
+            insert_light(
+                &conn,
+                2,
+                "M31",
+                "2026-03-05T22:20:00+00:00",
+                Some(10.01),
+                Some(41.01),
+            );
         }
 
-        let first =
-            auto_generate_frame_sets(&ctx, Some(1), None, &NullEmitter).expect("first run");
+        let first = auto_generate_frame_sets(&ctx, Some(1), None, &NullEmitter).expect("first run");
         assert_eq!(first.sets_created, 1);
 
         let second =

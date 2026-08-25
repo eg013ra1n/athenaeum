@@ -553,10 +553,7 @@ pub(crate) fn current_calibration_links(
 /// vacuous by construction, while the staleness checks it cares about — link
 /// changes, master rebuilds, engine-version bumps — stay fully live. No tracking
 /// row → [`LightCalStatus::NotCalibrated`].
-pub(crate) fn frame_cal_status(
-    conn: &Connection,
-    frame_id: i64,
-) -> anyhow::Result<LightCalStatus> {
+pub(crate) fn frame_cal_status(conn: &Connection, frame_id: i64) -> anyhow::Result<LightCalStatus> {
     let Some(row) = get_light_calibration_for_frame(conn, frame_id)? else {
         return Ok(LightCalStatus::NotCalibrated);
     };
@@ -764,7 +761,14 @@ fn compute_export_readiness(
         }
     }
 
-    tracing::debug!(set_id, total, calibrated, stale, missing, "export readiness computed");
+    tracing::debug!(
+        set_id,
+        total,
+        calibrated,
+        stale,
+        missing,
+        "export readiness computed"
+    );
     Ok(ExportReadiness {
         total,
         calibrated,
@@ -814,7 +818,10 @@ fn master_filename(conn: &Connection, set_id: Option<i64>) -> Option<String> {
     match resolved {
         Ok(Some(name)) => Some(name),
         Ok(None) => {
-            tracing::debug!(set_id, "no master file to name for light-cal details (empty/dangling set)");
+            tracing::debug!(
+                set_id,
+                "no master file to name for light-cal details (empty/dangling set)"
+            );
             None
         }
         Err(error) => {
@@ -869,7 +876,11 @@ fn compute_details(
         });
     }
 
-    tracing::debug!(set_id, reported = out.len() as i64, "light calibration details computed");
+    tracing::debug!(
+        set_id,
+        reported = out.len() as i64,
+        "light calibration details computed"
+    );
     Ok(out)
 }
 
@@ -1188,10 +1199,7 @@ fn append_bayer_cards_from_columns(
 ///
 /// `ROWORDER` is deliberately not folded in: `BAYERPAT` describes the mosaic in
 /// FILE row order (see [`CfaGeometry`]'s own rustdoc, which ratifies this).
-fn resolve_cfa_geometry(
-    conn: &Connection,
-    frame_id: i64,
-) -> Result<Option<CfaGeometry>, ApiError> {
+fn resolve_cfa_geometry(conn: &Connection, frame_id: i64) -> Result<Option<CfaGeometry>, ApiError> {
     let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
         .query_row(
             "SELECT bayerpat, xbayroff, ybayroff FROM frames WHERE id = ?1",
@@ -1220,7 +1228,11 @@ fn resolve_cfa_geometry(
         (None, None) => Some("xbayroff,ybayroff"),
     };
     if let Some(field) = assumed {
-        tracing::debug!(frame_id, field, "cfa phase not declared — per-channel flat scaling assumes 0");
+        tracing::debug!(
+            frame_id,
+            field,
+            "cfa phase not declared — per-channel flat scaling assumes 0"
+        );
     }
     Ok(Some(CfaGeometry {
         pattern,
@@ -1283,7 +1295,9 @@ fn resolve_frame_inputs(
         )
         .optional()?;
     let Some((uuid, object, instrume, date_obs, file_id, path, filename, format_str)) = row else {
-        return Err(ApiError::NotFound(format!("light frame {frame_id} not found")));
+        return Err(ApiError::NotFound(format!(
+            "light frame {frame_id} not found"
+        )));
     };
 
     let format = if format_str.eq_ignore_ascii_case("XISF") {
@@ -1419,7 +1433,10 @@ fn calibrate_one_inner(
         }
         let existing_output =
             get_light_calibration_for_frame(&conn, frame_id)?.map(|r| r.output_path);
-        (resolve_frame_inputs(&conn, frame_id, flat_norm)?, existing_output)
+        (
+            resolve_frame_inputs(&conn, frame_id, flat_norm)?,
+            existing_output,
+        )
     };
 
     // Best-effort policy: never write a meaningless raw-scale copy. If nothing
@@ -1469,25 +1486,35 @@ fn calibrate_one_inner(
     // once so the stamped ATH_CSCL card and the value the engine divides by are
     // the same number. An unreadable / decode-and-spill source yields None and
     // keeps the historic 16-bit divisor.
-    let scale_divisor =
-        scale_divisor_for_bitpix(crate::integration::banded::probe_bitpix(&resolved.light_path));
+    let scale_divisor = scale_divisor_for_bitpix(crate::integration::banded::probe_bitpix(
+        &resolved.light_path,
+    ));
 
     let card_inputs = LightCalCardInputs {
         source_uuid: resolved.source_uuid.clone().unwrap_or_default(),
         source_filename: resolved.source_filename.clone(),
         calstat: calstat.clone(),
         dark: if dark_applied {
-            resolved.dark.as_ref().map(|m| (m.uuid.clone(), m.path.clone()))
+            resolved
+                .dark
+                .as_ref()
+                .map(|m| (m.uuid.clone(), m.path.clone()))
         } else {
             None
         },
         flat: if flat_applied {
-            resolved.flat.as_ref().map(|m| (m.uuid.clone(), m.path.clone()))
+            resolved
+                .flat
+                .as_ref()
+                .map(|m| (m.uuid.clone(), m.path.clone()))
         } else {
             None
         },
         bias: if bias_applied {
-            resolved.bias.as_ref().map(|m| (m.uuid.clone(), m.path.clone()))
+            resolved
+                .bias
+                .as_ref()
+                .map(|m| (m.uuid.clone(), m.path.clone()))
         } else {
             None
         },
@@ -1861,7 +1888,11 @@ fn run_light_cal(
                 );
             }
             FrameOutcome::Skipped => {
-                tracing::debug!(set_id, frame_id, "light already calibrated — skipped (only_stale)");
+                tracing::debug!(
+                    set_id,
+                    frame_id,
+                    "light already calibrated — skipped (only_stale)"
+                );
             }
             FrameOutcome::Failed(reason) => {
                 tracing::warn!(set_id, frame_id, %reason, "light frame calibration failed — continuing batch");
@@ -1936,7 +1967,13 @@ fn run_light_cal_thread(
     };
 
     ctx.active_light_cal.lock().unwrap().remove(&set_id);
-    tracing::info!(set_id, outcome, ok_count, failed = failed.len(), "light calibration batch finished");
+    tracing::info!(
+        set_id,
+        outcome,
+        ok_count,
+        failed = failed.len(),
+        "light calibration batch finished"
+    );
     emit_event(
         emitter.as_ref(),
         "calibration-finished",
@@ -2237,7 +2274,12 @@ mod orchestration_tests {
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -2251,7 +2293,14 @@ mod orchestration_tests {
     }
 
     /// Write a constant-valued 32-bit FITS plane to `dir/name`, return its path.
-    fn write_plane(dir: &Path, name: &str, w: usize, h: usize, val: f32, cards: &[Card]) -> PathBuf {
+    fn write_plane(
+        dir: &Path,
+        name: &str,
+        w: usize,
+        h: usize,
+        val: f32,
+        cards: &[Card],
+    ) -> PathBuf {
         let data = vec![val; w * h];
         let p = dir.join(name);
         write_fits_f32(&p, w, h, 1, &data, cards).unwrap();
@@ -2339,7 +2388,12 @@ mod orchestration_tests {
     }
     impl CollectingEmitter {
         fn count(&self, name: &str) -> usize {
-            self.events.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| n == name)
+                .count()
         }
         fn first(&self, name: &str) -> serde_json::Value {
             self.events
@@ -2369,7 +2423,13 @@ mod orchestration_tests {
     /// Dark + master Flat (also on disk), a configured calibration-library
     /// output dir, and a `ServiceContext`. Returns the tempdir guard (keep it
     /// alive), the ctx, the library dir, the frame-set id, and the light ids.
-    fn build_smoke_fixture() -> (tempfile::TempDir, Arc<ServiceContext>, PathBuf, i64, Vec<i64>) {
+    fn build_smoke_fixture() -> (
+        tempfile::TempDir,
+        Arc<ServiceContext>,
+        PathBuf,
+        i64,
+        Vec<i64>,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -2453,7 +2513,10 @@ mod orchestration_tests {
             "finished must fire exactly once"
         );
         let finished = emitter.first("calibration-finished");
-        assert_eq!(finished["outcome"], "success", "finished payload: {finished}");
+        assert_eq!(
+            finished["outcome"], "success",
+            "finished payload: {finished}"
+        );
         assert_eq!(finished["ok_count"], light_ids.len() as u64);
         assert_eq!(finished["failed"].as_array().unwrap().len(), 0);
 
@@ -2477,7 +2540,10 @@ mod orchestration_tests {
                 row.output_path
             );
             assert_eq!(row.calstat, "BDF", "dark subtraction + flat division");
-            assert!(row.flat_norm_applied, "flat present and flat_norm requested");
+            assert!(
+                row.flat_norm_applied,
+                "flat present and flat_norm requested"
+            );
         }
 
         // Handle removed at the single exit path.
@@ -2505,7 +2571,10 @@ mod orchestration_tests {
         let out = {
             let conn = db_handle.conn();
             PathBuf::from(
-                get_light_calibration_for_frame(&conn, light_ids[0]).unwrap().unwrap().output_path,
+                get_light_calibration_for_frame(&conn, light_ids[0])
+                    .unwrap()
+                    .unwrap()
+                    .output_path,
             )
         };
 
@@ -2637,15 +2706,30 @@ mod orchestration_tests {
         let (_f, text) = crate::fits_parser::parse_fits_with_header(&out, 0).unwrap();
         let keys = parse_stored_header_keys(FileFormat::FITS, &text);
         assert_eq!(
-            keys.get("ATH_CCFA").map(|s| s.trim().trim_matches('\'').trim().to_string()),
+            keys.get("ATH_CCFA")
+                .map(|s| s.trim().trim_matches('\'').trim().to_string()),
             Some("T".to_string()),
             "ATH_CCFA must be stamped T"
         );
-        for (kw, want) in [("ATH_CFNR", 2000.0), ("ATH_CFNG", 4000.0), ("ATH_CFNB", 1000.0)] {
-            let got: f64 = keys.get(kw).unwrap_or_else(|| panic!("{kw} card")).trim().parse().unwrap();
+        for (kw, want) in [
+            ("ATH_CFNR", 2000.0),
+            ("ATH_CFNG", 4000.0),
+            ("ATH_CFNB", 1000.0),
+        ] {
+            let got: f64 = keys
+                .get(kw)
+                .unwrap_or_else(|| panic!("{kw} card"))
+                .trim()
+                .parse()
+                .unwrap();
             assert!((got - want).abs() < 1e-6, "{kw} = {got}, want {want}");
         }
-        let fnm: f64 = keys.get("ATH_CFNM").expect("ATH_CFNM card").trim().parse().unwrap();
+        let fnm: f64 = keys
+            .get("ATH_CFNM")
+            .expect("ATH_CFNM card")
+            .trim()
+            .parse()
+            .unwrap();
         assert!(
             (fnm - 2750.0).abs() < 1e-6,
             "ATH_CFNM must be the mosaic-weighted blend (R+2G+B)/4, got {fnm}"
@@ -2770,8 +2854,15 @@ mod orchestration_tests {
             // dark-subtracted light verbatim and a phase error shows up as
             // swapped colour levels rather than as a rounding difference.
             let dark_path = src.join("master_dark.fits");
-            write_fits_f32(&dark_path, w, h, 1, &vec![100.0f32; w * h], &osc_bayer_cards())
-                .unwrap();
+            write_fits_f32(
+                &dark_path,
+                w,
+                h,
+                1,
+                &vec![100.0f32; w * h],
+                &osc_bayer_cards(),
+            )
+            .unwrap();
             let flat_path = src.join("master_flat.fits");
             write_fits_f32(
                 &flat_path,
@@ -2929,9 +3020,9 @@ mod orchestration_tests {
         // RGGB at phase (0, 0): the element declares no offsets, so the engine
         // assumes 0 — the mosaic is laid out to match that assumption.
         let cell = |x: usize, y: usize| match (x % 2 == 0, y % 2 == 0) {
-            (true, true) => 0usize,  // R
-            (false, false) => 2,     // B
-            _ => 1,                  // G
+            (true, true) => 0usize, // R
+            (false, false) => 2,    // B
+            _ => 1,                 // G
         };
         let mut samples = vec![0u16; w * h];
         for y in 0..h {
@@ -3072,10 +3163,16 @@ mod orchestration_tests {
             let names = list_calibrated(&leaf);
             (out_paths, leaf, names)
         };
-        assert_eq!(count_before.len(), light_ids.len(), "one output per light after run 1");
+        assert_eq!(
+            count_before.len(),
+            light_ids.len(),
+            "one output per light after run 1"
+        );
         // A bug (unconditional resolve_collision) would mint c_light_1_2.fits.
         assert!(
-            count_before.iter().all(|n| !n.contains("_2.fits") || n == "c_light_2.fits"),
+            count_before
+                .iter()
+                .all(|n| !n.contains("_2.fits") || n == "c_light_2.fits"),
             "no collision suffix expected after the first run: {count_before:?}"
         );
 
@@ -3132,8 +3229,14 @@ mod orchestration_tests {
             "finished must fire exactly once even with a failing frame"
         );
         let finished = emitter.first("calibration-finished");
-        assert_eq!(finished["outcome"], "partial", "one failure among successes: {finished}");
-        assert_eq!(finished["ok_count"], 2u64, "the two linked lights still succeed");
+        assert_eq!(
+            finished["outcome"], "partial",
+            "one failure among successes: {finished}"
+        );
+        assert_eq!(
+            finished["ok_count"], 2u64,
+            "the two linked lights still succeed"
+        );
         let failed = finished["failed"].as_array().unwrap();
         assert_eq!(failed.len(), 1, "exactly the unlinked light failed");
         assert_eq!(failed[0]["frame_id"], 3u64);
@@ -3179,7 +3282,10 @@ mod orchestration_tests {
         assert_eq!(r.object, "M31");
         assert_eq!(r.instrume, "TestCam");
         assert_eq!(r.date_obs_date, "2026-07-05");
-        assert!(r.source_uuid.is_some(), "light frame uuid populated by trigger");
+        assert!(
+            r.source_uuid.is_some(),
+            "light frame uuid populated by trigger"
+        );
     }
 
     #[test]
@@ -3229,7 +3335,10 @@ mod orchestration_tests {
             LightCalParams::default(),
         )
         .unwrap_err();
-        assert!(matches!(err, ApiError::Conflict(_)), "expected Conflict, got {err:?}");
+        assert!(
+            matches!(err, ApiError::Conflict(_)),
+            "expected Conflict, got {err:?}"
+        );
 
         // The pre-existing handle is untouched — the rejected call must not
         // remove or replace it.
@@ -3302,14 +3411,19 @@ mod orchestration_tests {
         {
             let conn = db.conn();
             assert!(
-                get_light_calibration_for_frame(&conn, light_id).unwrap().is_none(),
+                get_light_calibration_for_frame(&conn, light_id)
+                    .unwrap()
+                    .is_none(),
                 "skipFrame must not write a tracking row"
             );
         }
         let has_output = std::fs::read_dir(&library_dir)
             .map(|rd| rd.flatten().next().is_some())
             .unwrap_or(false);
-        assert!(!has_output, "skipFrame must not write any output under the library dir");
+        assert!(
+            !has_output,
+            "skipFrame must not write any output under the library dir"
+        );
 
         // subtractBias (default) → the same light calibrates to CALSTAT 'BF'.
         let outcome2 = calibrate_one(
@@ -3323,12 +3437,23 @@ mod orchestration_tests {
             &scratch,
             &cancel,
         );
-        assert!(matches!(outcome2, FrameOutcome::Done), "subtractBias must calibrate the light");
+        assert!(
+            matches!(outcome2, FrameOutcome::Done),
+            "subtractBias must calibrate the light"
+        );
         {
             let conn = db.conn();
-            let row = get_light_calibration_for_frame(&conn, light_id).unwrap().unwrap();
-            assert_eq!(row.calstat, "B", "bias-only subtraction, no flat linked → 'B'");
-            assert!(Path::new(&row.output_path).exists(), "output must exist under subtractBias");
+            let row = get_light_calibration_for_frame(&conn, light_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.calstat, "B",
+                "bias-only subtraction, no flat linked → 'B'"
+            );
+            assert!(
+                Path::new(&row.output_path).exists(),
+                "output must exist under subtractBias"
+            );
         }
     }
 
@@ -3405,14 +3530,15 @@ mod orchestration_tests {
 
         // ── Pick a cluster: a LIGHT frame set whose lights link to a RAW dark
         //    set AND a RAW flat set, with the member FITS present on disk. ─────
-        let query_paths = |conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]| -> Vec<String> {
-            let mut stmt = conn.prepare(sql).unwrap();
-            stmt.query_map(p, |r| r.get::<_, String>(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .filter(|path| Path::new(path).exists())
-                .collect()
-        };
+        let query_paths =
+            |conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+                let mut stmt = conn.prepare(sql).unwrap();
+                stmt.query_map(p, |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .filter(|path| Path::new(path).exists())
+                    .collect()
+            };
 
         let mut candidates = real
             .prepare(
@@ -3477,7 +3603,9 @@ mod orchestration_tests {
         }
         drop(candidates);
         let Some((real_fs, real_dark_set, real_flat_set, lights, darks, flats)) = chosen else {
-            eprintln!("[b5-e2e] SKIP: no reachable real cluster (raw dark+flat with files on disk)");
+            eprintln!(
+                "[b5-e2e] SKIP: no reachable real cluster (raw dark+flat with files on disk)"
+            );
             return;
         };
         eprintln!(
@@ -3536,7 +3664,10 @@ mod orchestration_tests {
                 let mut stmt = conn
                     .prepare("SELECT id FROM frames WHERE imagetyp='Light' ORDER BY id")
                     .unwrap();
-                stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+                stmt.query_map([], |r| r.get(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
             };
             assert!(light_ids.len() >= 2, "scanned lights: {}", light_ids.len());
 
@@ -3589,7 +3720,9 @@ mod orchestration_tests {
         .unwrap();
         eprintln!(
             "[b5-e2e] readiness: ready={} raw={} missing={} to_build={:?}",
-            readiness.ready_count, readiness.raw_set_count, readiness.missing_count,
+            readiness.ready_count,
+            readiness.raw_set_count,
+            readiness.missing_count,
             readiness.raw_set_ids_to_build
         );
         assert!(
@@ -3621,18 +3754,28 @@ mod orchestration_tests {
         // at max_concurrent=1, then the light job). Generous cap for real frames.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
         loop {
-            let running = ctx.active_light_cal.lock().unwrap().contains_key(&frame_set_id);
+            let running = ctx
+                .active_light_cal
+                .lock()
+                .unwrap()
+                .contains_key(&frame_set_id);
             if !running {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "light calibration timed out");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "light calibration timed out"
+            );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
         // ── Assert the run outcome ───────────────────────────────────────────
         let finished = emitter.first("calibration-finished");
         eprintln!("[b5-e2e] finished: {finished}");
-        assert_eq!(finished["outcome"], "success", "finished payload: {finished}");
+        assert_eq!(
+            finished["outcome"], "success",
+            "finished payload: {finished}"
+        );
         assert_eq!(finished["ok_count"], light_frame_ids.len() as u64);
 
         let db_ref = db(&ctx).unwrap();
@@ -3640,7 +3783,10 @@ mod orchestration_tests {
         // Masters: raw sets superseded, master-library sets + provenance exist.
         {
             let conn = db_ref.conn();
-            let master_sets = count(&conn, "SELECT COUNT(*) FROM calibration_set WHERE is_master_library=1");
+            let master_sets = count(
+                &conn,
+                "SELECT COUNT(*) FROM calibration_set WHERE is_master_library=1",
+            );
             let provenance = count(&conn, "SELECT COUNT(*) FROM master_provenance");
             let superseded = count(
                 &conn,
@@ -3660,7 +3806,9 @@ mod orchestration_tests {
         let mut first_output: Option<String> = None;
         for &fid in &light_frame_ids {
             let conn = db_ref.conn();
-            let row = get_light_calibration_for_frame(&conn, fid).unwrap().unwrap();
+            let row = get_light_calibration_for_frame(&conn, fid)
+                .unwrap()
+                .unwrap();
             assert_eq!(row.calstat, "BDF", "frame {fid} calstat");
             assert!(row.flat_norm_applied, "frame {fid} flat_norm_applied");
             let out = PathBuf::from(&row.output_path);
@@ -3669,8 +3817,14 @@ mod orchestration_tests {
 
             // Header vocabulary (§7).
             let keys = header_keys(&out);
-            for k in ["CALSTAT", "ATH_CSRC", "ATH_CSRN", "ATH_CSCL", "ATH_CFNM", "ATH_CVER"] {
-                assert!(keys.contains_key(k), "output {} missing card {k}", row.output_path);
+            for k in [
+                "CALSTAT", "ATH_CSRC", "ATH_CSRN", "ATH_CSCL", "ATH_CFNM", "ATH_CVER",
+            ] {
+                assert!(
+                    keys.contains_key(k),
+                    "output {} missing card {k}",
+                    row.output_path
+                );
             }
             assert_eq!(keys.get("CALSTAT").map(String::as_str), Some("BDF"));
 
@@ -3716,20 +3870,25 @@ mod orchestration_tests {
             let mean = opix.iter().map(|&v| v as f64).sum::<f64>() / opix.len() as f64;
             eprintln!(
                 "[b5-e2e] frame {fid}: out={} {ow}x{oh} mean={mean:.6} fnrm={fnrm:.2}",
-                Path::new(&row.output_path).file_name().unwrap().to_string_lossy()
+                Path::new(&row.output_path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
             );
-            assert!(mean > 0.0 && mean < 1.0, "background mean {mean} out of (0,1)");
+            assert!(
+                mean > 0.0 && mean < 1.0,
+                "background mean {mean} out of (0,1)"
+            );
 
             // Spot-check the §2 formula on a spread of pixels. The scale
             // divisor follows the real light's own bit depth, so it is probed
             // here exactly as the engine's caller probes it.
-            let scale_divisor = scale_divisor_for_bitpix(
-                crate::integration::banded::probe_bitpix(Path::new(&light_path)),
-            );
+            let scale_divisor = scale_divisor_for_bitpix(crate::integration::banded::probe_bitpix(
+                Path::new(&light_path),
+            ));
             let n = opix.len();
             for i in [0usize, n / 4, n / 2, (3 * n) / 4, n - 1] {
-                let expect = (((lpix[i] as f64) - (dpix[i] as f64))
-                    / ((fpix[i] as f64) / fnrm))
+                let expect = (((lpix[i] as f64) - (dpix[i] as f64)) / ((fpix[i] as f64) / fnrm))
                     / scale_divisor;
                 let got = opix[i] as f64;
                 let tol = 1e-4 * expect.abs().max(1e-6);
@@ -3758,9 +3917,16 @@ mod orchestration_tests {
             );
             assert_eq!(frames_before, frames_after, "rescan must add no frames");
             assert_eq!(cal_before, cal_after, "rescan must add no tracking rows");
-            assert!(sr.calibrated_duplicates.is_empty(), "known paths are not duplicates");
+            assert!(
+                sr.calibrated_duplicates.is_empty(),
+                "known paths are not duplicates"
+            );
             let out0 = first_output.clone().unwrap();
-            assert_eq!(files_count(&conn, &out0), 0, "calibrated output never registered as a file");
+            assert_eq!(
+                files_count(&conn, &out0),
+                0,
+                "calibrated output never registered as a file"
+            );
         }
 
         // (b) move one output → rescan repairs output_path.
@@ -3768,7 +3934,10 @@ mod orchestration_tests {
             let moved_fid = light_frame_ids[0];
             let (old_path, moved_path) = {
                 let conn = db_ref.conn();
-                let old = get_light_calibration_for_frame(&conn, moved_fid).unwrap().unwrap().output_path;
+                let old = get_light_calibration_for_frame(&conn, moved_fid)
+                    .unwrap()
+                    .unwrap()
+                    .output_path;
                 let moved = format!("{old}.moved.fits");
                 std::fs::rename(&old, &moved).unwrap();
                 (old, moved)
@@ -3776,10 +3945,19 @@ mod orchestration_tests {
             let conn = db_ref.conn();
             let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
             assert!(sr.errors.is_empty(), "move-rescan errors: {:?}", sr.errors);
-            let repaired = get_light_calibration_for_frame(&conn, moved_fid).unwrap().unwrap().output_path;
+            let repaired = get_light_calibration_for_frame(&conn, moved_fid)
+                .unwrap()
+                .unwrap()
+                .output_path;
             eprintln!("[b5-e2e] move(b): {old_path} -> {repaired}");
-            assert_eq!(repaired, moved_path, "output_path must be repaired to the new location");
-            assert!(sr.calibrated_duplicates.is_empty(), "a move is not a duplicate");
+            assert_eq!(
+                repaired, moved_path,
+                "output_path must be repaired to the new location"
+            );
+            assert!(
+                sr.calibrated_duplicates.is_empty(),
+                "a move is not a duplicate"
+            );
         }
 
         // (c) copy one output → rescan reports a duplicate; row untouched.
@@ -3787,7 +3965,10 @@ mod orchestration_tests {
             let dup_fid = light_frame_ids[1];
             let (kept_path, dup_path) = {
                 let conn = db_ref.conn();
-                let kept = get_light_calibration_for_frame(&conn, dup_fid).unwrap().unwrap().output_path;
+                let kept = get_light_calibration_for_frame(&conn, dup_fid)
+                    .unwrap()
+                    .unwrap()
+                    .output_path;
                 let dup = format!("{kept}.copy.fits");
                 std::fs::copy(&kept, &dup).unwrap();
                 (kept, dup)
@@ -3797,12 +3978,19 @@ mod orchestration_tests {
             assert!(sr.errors.is_empty(), "copy-rescan errors: {:?}", sr.errors);
             eprintln!("[b5-e2e] copy(c): dups={:?}", sr.calibrated_duplicates);
             assert!(
-                sr.calibrated_duplicates.iter().any(|d| d.duplicate_path == dup_path),
+                sr.calibrated_duplicates
+                    .iter()
+                    .any(|d| d.duplicate_path == dup_path),
                 "duplicate copy must be reported: {:?}",
                 sr.calibrated_duplicates
             );
-            let row = get_light_calibration_for_frame(&conn, dup_fid).unwrap().unwrap();
-            assert_eq!(row.output_path, kept_path, "tracking row untouched by a duplicate");
+            let row = get_light_calibration_for_frame(&conn, dup_fid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.output_path, kept_path,
+                "tracking row untouched by a duplicate"
+            );
         }
 
         eprintln!("[b5-e2e] PASS: real-data end-to-end light calibration verified");
@@ -3913,7 +4101,8 @@ mod tests {
         seed_light(&conn, 1, session);
         // A colour frame with a normalized flat — every condition the CFA
         // staleness arm needs in order to fire.
-        conn.execute("UPDATE frames SET bayerpat = 'RGGB' WHERE id = 1", []).unwrap();
+        conn.execute("UPDATE frames SET bayerpat = 'RGGB' WHERE id = 1", [])
+            .unwrap();
         seed_masters(&conn);
         add_link(&conn, 1, 101, "Flat");
 
@@ -3946,7 +4135,10 @@ mod tests {
         // itself, it is consistent whatever the local default happens to be.
         row.cfa_scaling_applied = Some(true);
         upsert_light_calibration(&conn, &row).unwrap();
-        assert_eq!(frame_cal_status(&conn, 1).unwrap(), LightCalStatus::Calibrated);
+        assert_eq!(
+            frame_cal_status(&conn, 1).unwrap(),
+            LightCalStatus::Calibrated
+        );
 
         // …while the dialog-driven path (caller's wanted params) DOES see the
         // difference — that is the policy split this test guards.
@@ -3958,7 +4150,10 @@ mod tests {
                 &links,
                 true,
                 FlatNormMode::CentralThird,
-                &LightCalParams { cfa_flat_scaling: false, ..LightCalParams::default() },
+                &LightCalParams {
+                    cfa_flat_scaling: false,
+                    ..LightCalParams::default()
+                },
             )
             .unwrap(),
             LightCalStatus::Stale,
@@ -4022,25 +4217,44 @@ mod tests {
         add_link(&conn, 3, 100, "Dark");
         add_link(&conn, 3, 102, "Bias");
 
-        let r = compute_readiness(&conn, 1, false, FlatNormMode::CentralThird, LightCalParams::default()).unwrap();
+        let r = compute_readiness(
+            &conn,
+            1,
+            false,
+            FlatNormMode::CentralThird,
+            LightCalParams::default(),
+        )
+        .unwrap();
         assert_eq!(r.frames.len(), 3);
 
         let f1 = &r.frames[0];
         assert_eq!(f1.frame_id, 1);
         assert_eq!(f1.filename, "light_1.fits");
-        assert_eq!((f1.dark.as_str(), f1.flat.as_str(), f1.bias.as_str()), (MASTER, MASTER, MASTER));
+        assert_eq!(
+            (f1.dark.as_str(), f1.flat.as_str(), f1.bias.as_str()),
+            (MASTER, MASTER, MASTER)
+        );
         assert!(f1.raw_set_ids.is_empty());
-        assert_eq!(f1.status, "calibrated", "fresh tracking row that matches links is calibrated");
+        assert_eq!(
+            f1.status, "calibrated",
+            "fresh tracking row that matches links is calibrated"
+        );
 
         let f2 = &r.frames[1];
         assert_eq!(f2.frame_id, 2);
-        assert_eq!((f2.dark.as_str(), f2.flat.as_str(), f2.bias.as_str()), (RAW_SET, MASTER, MASTER));
+        assert_eq!(
+            (f2.dark.as_str(), f2.flat.as_str(), f2.bias.as_str()),
+            (RAW_SET, MASTER, MASTER)
+        );
         assert_eq!(f2.raw_set_ids, vec![200]);
         assert_eq!(f2.status, "notCalibrated", "no tracking row yet");
 
         let f3 = &r.frames[2];
         assert_eq!(f3.frame_id, 3);
-        assert_eq!((f3.dark.as_str(), f3.flat.as_str(), f3.bias.as_str()), (MASTER, MISSING, MASTER));
+        assert_eq!(
+            (f3.dark.as_str(), f3.flat.as_str(), f3.bias.as_str()),
+            (MASTER, MISSING, MASTER)
+        );
         assert!(f3.raw_set_ids.is_empty());
     }
 
@@ -4073,7 +4287,14 @@ mod tests {
         seed_light(&conn, 4, session);
         add_link(&conn, 4, 300, "Dark");
 
-        let r = compute_readiness(&conn, 1, false, FlatNormMode::CentralThird, LightCalParams::default()).unwrap();
+        let r = compute_readiness(
+            &conn,
+            1,
+            false,
+            FlatNormMode::CentralThird,
+            LightCalParams::default(),
+        )
+        .unwrap();
 
         assert_eq!(r.frames.len(), 4);
         assert_eq!(r.ready_count, 1, "only light 1 is fully ready");
@@ -4150,8 +4371,14 @@ mod tests {
     }
 
     fn readiness_for(conn: &Connection, set_id: i64) -> LightCalReadiness {
-        compute_readiness(conn, set_id, true, FlatNormMode::CentralThird, LightCalParams::default())
-            .unwrap()
+        compute_readiness(
+            conn,
+            set_id,
+            true,
+            FlatNormMode::CentralThird,
+            LightCalParams::default(),
+        )
+        .unwrap()
     }
 
     /// The finding this advisory closes: a MONO master flat divides an OSC
@@ -4172,7 +4399,12 @@ mod tests {
         add_link(&conn, 1, 101, "Flat");
 
         let r = readiness_for(&conn, 1);
-        assert_eq!(r.cfa_warnings.len(), 1, "only the flat mismatches: {:?}", r.cfa_warnings);
+        assert_eq!(
+            r.cfa_warnings.len(),
+            1,
+            "only the flat mismatches: {:?}",
+            r.cfa_warnings
+        );
         let w = &r.cfa_warnings[0];
         assert!(w.contains("Flat master"), "names the offending master: {w}");
         assert!(w.contains("mono"), "says the master is mono: {w}");
@@ -4298,7 +4530,10 @@ mod tests {
         assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
         let w = &r.cfa_warnings[0];
         assert!(w.contains("more than one"), "{w}");
-        assert!(w.contains("RGGB") && w.contains("mono"), "lists both layouts: {w}");
+        assert!(
+            w.contains("RGGB") && w.contains("mono"),
+            "lists both layouts: {w}"
+        );
     }
 
     /// A raw, unbuilt set has no master to compare against yet — its layout is
@@ -4311,12 +4546,18 @@ mod tests {
         seed_light(&conn, 1, session);
         set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
         seed_master_with_file(&conn, 200, "Flat", "flat_001.fits"); // mono member
-        conn.execute("UPDATE calibration_set SET is_master_library = 0 WHERE id = 200", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET is_master_library = 0 WHERE id = 200",
+            [],
+        )
+        .unwrap();
         add_link(&conn, 1, 200, "Flat");
 
         let r = readiness_for(&conn, 1);
-        assert_eq!(r.frames[0].flat, RAW_SET, "precondition: an unbuilt raw link");
+        assert_eq!(
+            r.frames[0].flat, RAW_SET,
+            "precondition: an unbuilt raw link"
+        );
         assert!(r.cfa_warnings.is_empty(), "{:?}", r.cfa_warnings);
     }
 
@@ -4335,7 +4576,11 @@ mod tests {
 
         let r = readiness_for(&conn, 1);
         assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
-        assert!(r.cfa_warnings[0].contains("Flat master"), "{}", r.cfa_warnings[0]);
+        assert!(
+            r.cfa_warnings[0].contains("Flat master"),
+            "{}",
+            r.cfa_warnings[0]
+        );
     }
 
     /// spec §12.1: details report the tracking-row recipe (calstat, master
@@ -4467,7 +4712,10 @@ mod tests {
 
         let cancelled = wait_for_preflight_builds(&active, &[7], &cancel);
         canceller.join().unwrap();
-        assert!(cancelled, "cancel must break the wait even with a build handle still present");
+        assert!(
+            cancelled,
+            "cancel must break the wait even with a build handle still present"
+        );
     }
 
     /// No preflight builds → immediate no-op, never cancelled.
@@ -4504,17 +4752,23 @@ mod tests {
     }
 
     fn card_str(cards: &[Card], keyword: &str) -> Option<String> {
-        cards.iter().find(|c| c.keyword == keyword).and_then(|c| match &c.value {
-            Some(CardValue::Str(s)) => Some(s.clone()),
-            _ => None,
-        })
+        cards
+            .iter()
+            .find(|c| c.keyword == keyword)
+            .and_then(|c| match &c.value {
+                Some(CardValue::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
     }
 
     fn card_int(cards: &[Card], keyword: &str) -> Option<i64> {
-        cards.iter().find(|c| c.keyword == keyword).and_then(|c| match &c.value {
-            Some(CardValue::Integer(i)) => Some(*i),
-            _ => None,
-        })
+        cards
+            .iter()
+            .find(|c| c.keyword == keyword)
+            .and_then(|c| match &c.value {
+                Some(CardValue::Integer(i)) => Some(*i),
+                _ => None,
+            })
     }
 
     /// An XISF whose CFA is declared only by the `<ColorFilterArray>` element
@@ -4540,7 +4794,11 @@ mod tests {
 
         let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::FITS).unwrap();
         assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("RGGB"));
-        assert_eq!(card_int(&cards, "XBAYROFF"), Some(0), "phase 0 is a real value, not absence");
+        assert_eq!(
+            card_int(&cards, "XBAYROFF"),
+            Some(0),
+            "phase 0 is a real value, not absence"
+        );
         assert_eq!(card_int(&cards, "YBAYROFF"), Some(1));
         assert!(
             !cards.iter().any(|c| c.keyword == "ROWORDER"),
@@ -4607,7 +4865,11 @@ mod tests {
         assert_eq!(card_int(&cards, "XBAYROFF"), Some(0));
         assert_eq!(card_int(&cards, "YBAYROFF"), Some(1));
         assert_eq!(card_str(&cards, "ROWORDER").as_deref(), Some("TOP-DOWN"));
-        assert_eq!(cards.len(), 4, "only the derived cards — nothing to copy through");
+        assert_eq!(
+            cards.len(),
+            4,
+            "only the derived cards — nothing to copy through"
+        );
     }
 
     /// …and with nothing in the columns either, a missing blob really does mean

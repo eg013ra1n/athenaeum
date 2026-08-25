@@ -51,7 +51,9 @@ impl AccountConfig {
     /// keychain-stored token from a prior release run is simply not seen by a
     /// dev build (one re-login when switching), never migrated or deleted.
     fn token_store(&self) -> TokenStore {
-        let file = self.account_dir.join(format!("token_{}", sanitize(&self.hub_host)));
+        let file = self
+            .account_dir
+            .join(format!("token_{}", sanitize(&self.hub_host)));
         if cfg!(debug_assertions) {
             return TokenStore::file_only(self.hub_host.clone(), file);
         }
@@ -69,7 +71,10 @@ fn resolve_config(ctx: &ServiceContext) -> Result<AccountConfig, ApiError> {
             .get_with_precedence(&conn, keys::ACCOUNT_HUB_URL, defaults::ACCOUNT_HUB_URL)?
     };
     let db_path = db.path().to_path_buf();
-    let parent = db_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let parent = db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
     Ok(AccountConfig {
         hub_host: hub_host(&hub_url),
         hub_url,
@@ -92,7 +97,13 @@ fn hub_host(url: &str) -> String {
 /// Filesystem-safe token-file discriminator.
 fn sanitize(host: &str) -> String {
     host.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -432,14 +443,19 @@ mod tests {
     /// (list_devices/revoke/set_role) still reads as SignedOut.
     #[test]
     fn generic_401_still_maps_to_signed_out() {
-        assert!(matches!(map_client_err(AccountClientError::Unauthorized), ApiError::SignedOut(_)));
+        assert!(matches!(
+            map_client_err(AccountClientError::Unauthorized),
+            ApiError::SignedOut(_)
+        ));
     }
 
     /// Cross-account pubkey conflict on verify still surfaces as a conflict,
     /// carrying the hub's message.
     #[test]
     fn verify_409_maps_to_conflict_with_message() {
-        let err = map_verify_err(AccountClientError::DeviceConflict("device public key already registered".into()));
+        let err = map_verify_err(AccountClientError::DeviceConflict(
+            "device public key already registered".into(),
+        ));
         match err {
             ApiError::Conflict(msg) => assert_eq!(msg, "device public key already registered"),
             other => panic!("expected ApiError::Conflict, got {other:?}"),
@@ -457,16 +473,21 @@ mod tests {
         use crate::services::operation_queue::OperationQueue;
         use crate::settings::SettingsManager;
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex, OnceLock};
         #[cfg(all(feature = "render", feature = "solver"))]
         use std::sync::RwLock;
+        use std::sync::{Arc, Mutex, OnceLock};
 
         let tmp = tempfile::tempdir().unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
         {
             let conn = database.conn();
             crate::db::set_setting(&conn, keys::SYNC_CACHED_PEER, &"aa".repeat(32)).unwrap();
-            crate::db::set_setting(&conn, keys::SYNC_CACHED_RELAYS, "https://relay1.example.org").unwrap();
+            crate::db::set_setting(
+                &conn,
+                keys::SYNC_CACHED_RELAYS,
+                "https://relay1.example.org",
+            )
+            .unwrap();
         }
         let db_cell = OnceLock::new();
         let _ = db_cell.set(database);
@@ -488,7 +509,12 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),

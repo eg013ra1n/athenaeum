@@ -164,30 +164,46 @@ impl AppRetentionConfig {
             Ok(ctx.settings.get_with_precedence(&conn, key, default)?)
         };
         let policy_str = get(keys::SYNC_RETENTION_POLICY, defaults::SYNC_RETENTION_POLICY)?;
-        let keep_days = get(keys::SYNC_RETENTION_KEEP_DAYS, defaults::SYNC_RETENTION_KEEP_DAYS)?
-            .parse::<u32>()
-            .ok()
-            .filter(|d| *d >= 1)
-            .unwrap_or_else(|| defaults::SYNC_RETENTION_KEEP_DAYS.parse().unwrap_or(30));
-        let disk_max_pct = get(keys::SYNC_RETENTION_DISK_MAX_PCT, defaults::SYNC_RETENTION_DISK_MAX_PCT)?
-            .parse::<u8>()
-            .ok()
-            .filter(|p| (1..=100).contains(p))
-            .unwrap_or_else(|| defaults::SYNC_RETENTION_DISK_MAX_PCT.parse().unwrap_or(90));
-        let raw_dry_run =
-            parse_dry_run(&get(keys::SYNC_RETENTION_DRY_RUN, defaults::SYNC_RETENTION_DRY_RUN)?);
-        let live_confirmed =
-            get(keys::SYNC_RETENTION_LIVE_CONFIRMED, defaults::SYNC_RETENTION_LIVE_CONFIRMED)?
-                .eq_ignore_ascii_case("true");
+        let keep_days = get(
+            keys::SYNC_RETENTION_KEEP_DAYS,
+            defaults::SYNC_RETENTION_KEEP_DAYS,
+        )?
+        .parse::<u32>()
+        .ok()
+        .filter(|d| *d >= 1)
+        .unwrap_or_else(|| defaults::SYNC_RETENTION_KEEP_DAYS.parse().unwrap_or(30));
+        let disk_max_pct = get(
+            keys::SYNC_RETENTION_DISK_MAX_PCT,
+            defaults::SYNC_RETENTION_DISK_MAX_PCT,
+        )?
+        .parse::<u8>()
+        .ok()
+        .filter(|p| (1..=100).contains(p))
+        .unwrap_or_else(|| defaults::SYNC_RETENTION_DISK_MAX_PCT.parse().unwrap_or(90));
+        let raw_dry_run = parse_dry_run(&get(
+            keys::SYNC_RETENTION_DRY_RUN,
+            defaults::SYNC_RETENTION_DRY_RUN,
+        )?);
+        let live_confirmed = get(
+            keys::SYNC_RETENTION_LIVE_CONFIRMED,
+            defaults::SYNC_RETENTION_LIVE_CONFIRMED,
+        )?
+        .eq_ignore_ascii_case("true");
 
         let policy = match policy_str.as_str() {
             "on_confirm" => RetentionPolicy::OnConfirm,
             "keep_days" => RetentionPolicy::KeepDays(keep_days),
-            "disk_pct" => RetentionPolicy::DiskPct { max_pct: disk_max_pct },
+            "disk_pct" => RetentionPolicy::DiskPct {
+                max_pct: disk_max_pct,
+            },
             // "keep_everything" and any unknown value → the safe default.
             _ => RetentionPolicy::KeepEverything,
         };
-        Ok(Self { policy, raw_dry_run, live_confirmed })
+        Ok(Self {
+            policy,
+            raw_dry_run,
+            live_confirmed,
+        })
     }
 }
 
@@ -225,7 +241,11 @@ fn retention_probe_path(ctx: &ServiceContext) -> PathBuf {
 /// (uuid/object/filename) and the peer from the still-present catalog / outbound
 /// rows; falls back to the path basename when the catalog row is already gone, so
 /// there is always a persistable row (a degraded audit beats none).
-fn build_source_history_row(conn: &Connection, package_ref: &str, src: &SyncSourceRow) -> HistoryRow {
+fn build_source_history_row(
+    conn: &Connection,
+    package_ref: &str,
+    src: &SyncSourceRow,
+) -> HistoryRow {
     let (filename, frame_uuid, object) = src
         .file_id
         .and_then(|fid| {
@@ -332,7 +352,9 @@ fn delete_one_source(conn: &Connection, package_ref: &str, src: &SyncSourceRow) 
     //   - no file_id / row already gone  → reclaim the disk file only
     let catalog_path: Option<String> = match src.file_id {
         Some(fid) => conn
-            .query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| r.get(0))
+            .query_row("SELECT path FROM files WHERE id = ?1", params![fid], |r| {
+                r.get(0)
+            })
             .optional()
             .context("resolve current catalog path for retention")?,
         None => None,
@@ -404,7 +426,10 @@ fn delete_one_source(conn: &Connection, package_ref: &str, src: &SyncSourceRow) 
 /// All work runs on the store's single locked connection — [`SyncStore::confirmed`]
 /// has already released it before the deleter is called, so there is no re-entrant
 /// lock.
-fn app_retention_delete_package(store: &CatalogSyncStore, package_ref: &Path) -> Result<DeleteOutcome> {
+fn app_retention_delete_package(
+    store: &CatalogSyncStore,
+    package_ref: &Path,
+) -> Result<DeleteOutcome> {
     let conn = store.lock_conn();
     let pkg_ref = package_ref.to_string_lossy();
 
@@ -505,7 +530,10 @@ pub fn run_app_retention_once(
 /// keep-everything device — safe to spawn unconditionally at host start. Never
 /// fails the host; every error is logged and the loop continues.
 pub async fn run_app_retention_loop(ctx: Arc<ServiceContext>, interval: Duration) {
-    tracing::info!(interval_secs = interval.as_secs(), "app retention loop armed");
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "app retention loop armed"
+    );
     loop {
         tokio::time::sleep(interval).await;
         let ctx = Arc::clone(&ctx);
@@ -517,7 +545,9 @@ pub async fn run_app_retention_loop(ctx: Arc<ServiceContext>, interval: Duration
         .await;
         match res {
             Ok(Ok(Some(_outcome))) => {}
-            Ok(Ok(None)) => tracing::debug!("retention tick skipped (signed out or keep_everything)"),
+            Ok(Ok(None)) => {
+                tracing::debug!("retention tick skipped (signed out or keep_everything)")
+            }
             Ok(Err(error)) => tracing::error!(error = %error, "retention tick failed"),
             Err(error) => tracing::error!(%error, "retention tick task panicked"),
         }
@@ -545,9 +575,9 @@ mod tests {
         use crate::services::operation_queue::OperationQueue;
         use crate::settings::SettingsManager;
         use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
         #[cfg(all(feature = "render", feature = "solver"))]
         use std::sync::RwLock;
+        use std::sync::{Mutex, OnceLock};
 
         let tmp = tempfile::tempdir().unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
@@ -571,7 +601,12 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -652,7 +687,11 @@ mod tests {
         init_db(&conn).unwrap();
         let (file_id, size, mtime_ms) = insert_catalog_file(&conn, &src);
 
-        let package_ref = tmp.path().join("packages/pkg-1").to_string_lossy().to_string();
+        let package_ref = tmp
+            .path()
+            .join("packages/pkg-1")
+            .to_string_lossy()
+            .to_string();
         conn.execute(
             "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at, confirmed_at)
              VALUES (?1, ?2, ?3, 0, '2026-07-06T00:00:00.000Z', ?4)",
@@ -664,19 +703,39 @@ mod tests {
             ],
         )
         .unwrap();
-        crate::sync::insert_sync_source(&conn, &package_ref, Some(file_id), &src.to_string_lossy(), size, mtime_ms)
-            .unwrap();
+        crate::sync::insert_sync_source(
+            &conn,
+            &package_ref,
+            Some(file_id),
+            &src.to_string_lossy(),
+            size,
+            mtime_ms,
+        )
+        .unwrap();
 
-        Fixture { _tmp: tmp, db_path, src, file_id, package_ref }
+        Fixture {
+            _tmp: tmp,
+            db_path,
+            src,
+            file_id,
+            package_ref,
+        }
     }
 
     fn cfg(policy: RetentionPolicy, dry_run: bool, live: bool) -> AppRetentionConfig {
-        AppRetentionConfig { policy, raw_dry_run: dry_run, live_confirmed: live }
+        AppRetentionConfig {
+            policy,
+            raw_dry_run: dry_run,
+            live_confirmed: live,
+        }
     }
 
     fn history_outcome_count(store: &CatalogSyncStore, outcome: &str) -> usize {
         store
-            .search_history(HistoryQuery { limit: 1000, ..Default::default() })
+            .search_history(HistoryQuery {
+                limit: 1000,
+                ..Default::default()
+            })
             .unwrap()
             .iter()
             .filter(|h| h.outcome == outcome)
@@ -685,14 +744,22 @@ mod tests {
 
     fn frame_count(store: &CatalogSyncStore, file_id: i64) -> i64 {
         let conn = store.lock_conn();
-        conn.query_row("SELECT COUNT(*) FROM frames WHERE file_id = ?1", params![file_id], |r| r.get(0))
-            .unwrap()
+        conn.query_row(
+            "SELECT COUNT(*) FROM frames WHERE file_id = ?1",
+            params![file_id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     fn file_count(store: &CatalogSyncStore, file_id: i64) -> i64 {
         let conn = store.lock_conn();
-        conn.query_row("SELECT COUNT(*) FROM files WHERE id = ?1", params![file_id], |r| r.get(0))
-            .unwrap()
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE id = ?1",
+            params![file_id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     // ── effective dry-run (the app soak opt-in) ──────────────────────────────
@@ -702,8 +769,14 @@ mod tests {
     /// hard invariant hold no matter how settings are written.
     #[test]
     fn effective_dry_run_requires_both_flags() {
-        assert!(cfg(RetentionPolicy::OnConfirm, true, true).effective_dry_run(), "dry_run=true wins");
-        assert!(cfg(RetentionPolicy::OnConfirm, true, false).effective_dry_run(), "default");
+        assert!(
+            cfg(RetentionPolicy::OnConfirm, true, true).effective_dry_run(),
+            "dry_run=true wins"
+        );
+        assert!(
+            cfg(RetentionPolicy::OnConfirm, true, false).effective_dry_run(),
+            "default"
+        );
         assert!(
             cfg(RetentionPolicy::OnConfirm, false, false).effective_dry_run(),
             "dry_run=false without the opt-in must STILL be dry-run"
@@ -730,7 +803,10 @@ mod tests {
         assert!(parse_dry_run("garbage"), "garbage stays dry-run");
         assert!(parse_dry_run("flase"), "a typo of false stays dry-run");
         assert!(parse_dry_run("0"), "a numeric 0 stays dry-run");
-        assert!(parse_dry_run(" false "), "untrimmed 'false' stays dry-run (not an exact match)");
+        assert!(
+            parse_dry_run(" false "),
+            "untrimmed 'false' stays dry-run (not an exact match)"
+        );
     }
 
     // ── BRD B6: catalog-consistent delete + two searchable events ────────────
@@ -765,15 +841,36 @@ mod tests {
             .unwrap();
         }
 
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::OnConfirm, false, true), Utc::now(), &|| 0u8)
-            .unwrap();
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::OnConfirm, false, true),
+            Utc::now(),
+            &|| 0u8,
+        )
+        .unwrap();
 
         assert_eq!(outcome.deleted.len(), 1, "the confirmed source is deleted");
         assert!(!fx.src.exists(), "the file is removed from disk");
-        assert_eq!(file_count(&store, fx.file_id), 0, "the files row is deleted");
-        assert_eq!(frame_count(&store, fx.file_id), 0, "the frames row is CASCADE-deleted");
-        assert_eq!(history_outcome_count(&store, "sent"), 1, "the transfer event survives");
-        assert_eq!(history_outcome_count(&store, "retention_deleted"), 1, "the deletion event is recorded");
+        assert_eq!(
+            file_count(&store, fx.file_id),
+            0,
+            "the files row is deleted"
+        );
+        assert_eq!(
+            frame_count(&store, fx.file_id),
+            0,
+            "the frames row is CASCADE-deleted"
+        );
+        assert_eq!(
+            history_outcome_count(&store, "sent"),
+            1,
+            "the transfer event survives"
+        );
+        assert_eq!(
+            history_outcome_count(&store, "retention_deleted"),
+            1,
+            "the deletion event is recorded"
+        );
     }
 
     // ── deleter contract: audit-before-delete ────────────────────────────────
@@ -790,12 +887,27 @@ mod tests {
             conn.execute("DROP TABLE sync_history", []).unwrap();
         }
 
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::OnConfirm, false, true), Utc::now(), &|| 0u8)
-            .unwrap();
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::OnConfirm, false, true),
+            Utc::now(),
+            &|| 0u8,
+        )
+        .unwrap();
 
-        assert!(outcome.deleted.is_empty(), "an unpersistable audit must refuse the delete");
-        assert!(fx.src.exists(), "the file survives when the audit can't be written");
-        assert_eq!(file_count(&store, fx.file_id), 1, "the catalog row survives too");
+        assert!(
+            outcome.deleted.is_empty(),
+            "an unpersistable audit must refuse the delete"
+        );
+        assert!(
+            fx.src.exists(),
+            "the file survives when the audit can't be written"
+        );
+        assert_eq!(
+            file_count(&store, fx.file_id),
+            1,
+            "the catalog row survives too"
+        );
     }
 
     // ── deleter contract: TOCTOU stat guard ──────────────────────────────────
@@ -810,13 +922,29 @@ mod tests {
         // Rewrite the source with different content (size changes → stat mismatch).
         std::fs::write(&fx.src, b"brand-new-unconfirmed-content").unwrap();
 
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::OnConfirm, false, true), Utc::now(), &|| 0u8)
-            .unwrap();
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::OnConfirm, false, true),
+            Utc::now(),
+            &|| 0u8,
+        )
+        .unwrap();
 
-        assert!(outcome.deleted.is_empty(), "a stat-mismatched source is never deleted");
+        assert!(
+            outcome.deleted.is_empty(),
+            "a stat-mismatched source is never deleted"
+        );
         assert!(fx.src.exists(), "the rewritten content survives");
-        assert_eq!(file_count(&store, fx.file_id), 1, "the catalog row is untouched");
-        assert_eq!(history_outcome_count(&store, "retention_deleted"), 0, "no audit for a skipped delete");
+        assert_eq!(
+            file_count(&store, fx.file_id),
+            1,
+            "the catalog row is untouched"
+        );
+        assert_eq!(
+            history_outcome_count(&store, "retention_deleted"),
+            0,
+            "no audit for a skipped delete"
+        );
     }
 
     // ── deleter contract: honest DeleteOutcome (already-handled no-op) ────────
@@ -833,13 +961,32 @@ mod tests {
             mark_sync_source_deleted(&conn, &fx.package_ref, &fx.src.to_string_lossy()).unwrap();
         }
 
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::OnConfirm, false, true), Utc::now(), &|| 0u8)
-            .unwrap();
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::OnConfirm, false, true),
+            Utc::now(),
+            &|| 0u8,
+        )
+        .unwrap();
 
-        assert_eq!(outcome.eligible.len(), 1, "still a genuine confirmed candidate");
-        assert!(outcome.deleted.is_empty(), "an already-handled package is never recounted as deleted");
-        assert!(fx.src.exists(), "the file — logically already gone — is left untouched");
-        assert_eq!(history_outcome_count(&store, "retention_deleted"), 0, "no duplicate audit row");
+        assert_eq!(
+            outcome.eligible.len(),
+            1,
+            "still a genuine confirmed candidate"
+        );
+        assert!(
+            outcome.deleted.is_empty(),
+            "an already-handled package is never recounted as deleted"
+        );
+        assert!(
+            fx.src.exists(),
+            "the file — logically already gone — is left untouched"
+        );
+        assert_eq!(
+            history_outcome_count(&store, "retention_deleted"),
+            0,
+            "no duplicate audit row"
+        );
     }
 
     // ── A8 invariant suite over the app deleter ──────────────────────────────
@@ -861,9 +1008,19 @@ mod tests {
 
         assert!(outcome.eligible.is_empty(), "unconfirmed is never eligible");
         assert!(outcome.deleted.is_empty());
-        assert!(outcome.would_warn_disk_pressure, "full disk + nothing to free warns");
-        assert!(fx.src.exists(), "the unconfirmed source survives a full disk in live mode");
-        assert_eq!(file_count(&store, fx.file_id), 1, "its catalog row survives too");
+        assert!(
+            outcome.would_warn_disk_pressure,
+            "full disk + nothing to free warns"
+        );
+        assert!(
+            fx.src.exists(),
+            "the unconfirmed source survives a full disk in live mode"
+        );
+        assert_eq!(
+            file_count(&store, fx.file_id),
+            1,
+            "its catalog row survives too"
+        );
     }
 
     /// `keep_everything` deletes nothing even with a confirmed source and a full
@@ -873,8 +1030,13 @@ mod tests {
         let fx = make_fixture(true);
         let store = CatalogSyncStore::open(&fx.db_path).unwrap();
 
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::KeepEverything, false, true), Utc::now(), &|| 99u8)
-            .unwrap();
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::KeepEverything, false, true),
+            Utc::now(),
+            &|| 99u8,
+        )
+        .unwrap();
 
         assert!(outcome.eligible.is_empty());
         assert!(outcome.deleted.is_empty());
@@ -890,15 +1052,24 @@ mod tests {
         let store = CatalogSyncStore::open(&fx.db_path).unwrap();
 
         // dry_run=false but NO opt-in → effective dry-run (the safety net).
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::OnConfirm, false, false), Utc::now(), &|| 0u8)
-            .unwrap();
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::OnConfirm, false, false),
+            Utc::now(),
+            &|| 0u8,
+        )
+        .unwrap();
 
         assert!(outcome.dry_run, "no opt-in → effective dry-run");
         assert_eq!(outcome.eligible.len(), 1, "reports the confirmed candidate");
         assert!(outcome.deleted.is_empty(), "dry-run deletes nothing");
         assert!(fx.src.exists(), "the file remains on disk");
         assert_eq!(file_count(&store, fx.file_id), 1, "the catalog row remains");
-        assert_eq!(history_outcome_count(&store, "retention_deleted"), 0, "no audit in dry-run");
+        assert_eq!(
+            history_outcome_count(&store, "retention_deleted"),
+            0,
+            "no audit in dry-run"
+        );
     }
 
     /// The deleter is invoked exactly for the confirmed candidate and reports an
@@ -911,15 +1082,24 @@ mod tests {
         let calls = Cell::new(0usize);
 
         // Wrap evaluate's real deleter path but observe the outcome count.
-        let outcome = evaluate(&store, &cfg(RetentionPolicy::OnConfirm, false, true), Utc::now(), &|| {
-            calls.set(calls.get() + 1);
-            0u8
-        })
+        let outcome = evaluate(
+            &store,
+            &cfg(RetentionPolicy::OnConfirm, false, true),
+            Utc::now(),
+            &|| {
+                calls.set(calls.get() + 1);
+                0u8
+            },
+        )
         .unwrap();
         // disk_probe isn't consulted by OnConfirm, so calls stays 0 — the honest
         // signal is the deleted count.
         assert_eq!(calls.get(), 0, "OnConfirm never probes disk");
-        assert_eq!(outcome.deleted.len(), 1, "exactly the one confirmed source removed");
+        assert_eq!(
+            outcome.deleted.len(),
+            1,
+            "exactly the one confirmed source removed"
+        );
         assert!(!fx.src.exists());
     }
 }

@@ -66,9 +66,9 @@ fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
     use crate::services::compute_queue::ComputeQueue;
     use crate::services::operation_queue::OperationQueue;
     use crate::settings::SettingsManager;
-    use std::sync::{Mutex, OnceLock};
     #[cfg(all(feature = "render", feature = "solver"))]
     use std::sync::RwLock;
+    use std::sync::{Mutex, OnceLock};
 
     let tmp = tempfile::tempdir().unwrap();
     let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
@@ -92,7 +92,12 @@ fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
         star_cache: Arc::new(RwLock::new(None)),
         #[cfg(feature = "solver")]
         bright_cache: Arc::new(RwLock::new(None)),
-        image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+        image_pool: Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        ),
         operation_queue: OperationQueue::start(),
         compute_queue: ComputeQueue::new(),
         iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -133,7 +138,12 @@ fn own_node_for(ctx: &ServiceContext) -> NodeId {
 
 /// One `SnapshotMember` entry (camelCase), listing every device pubkey in
 /// `nodes` (a member may carry both its device node and a wire endpoint node).
-fn member_json(display: &str, data_role: &str, coordinator: bool, nodes: &[NodeId]) -> serde_json::Value {
+fn member_json(
+    display: &str,
+    data_role: &str,
+    coordinator: bool,
+    nodes: &[NodeId],
+) -> serde_json::Value {
     let nodes_b64: Vec<String> = nodes.iter().map(|n| B64.encode(n)).collect();
     serde_json::json!({
         "accountId": format!("acc-{display}"),
@@ -403,12 +413,22 @@ async fn publish_seeds_pending_smoke() {
 
     let sender = SyncSenderRuntime::new();
     let seed_net = LoopbackNetwork::new();
-    let (_n, engine) =
-        start_collab_engine(&sender, &seed_net, tmp.path().join("smoke_send.db"), coord_seed, None)
-            .await;
+    let (_n, engine) = start_collab_engine(
+        &sender,
+        &seed_net,
+        tmp.path().join("smoke_send.db"),
+        coord_seed,
+        None,
+    )
+    .await;
 
-    let result = publish_collab_frames(&ctx, &sender, PROJECT, None).await.unwrap();
-    assert_eq!(result.state, "pending", "require-approval publish is pending");
+    let result = publish_collab_frames(&ctx, &sender, PROJECT, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.state, "pending",
+        "require-approval publish is pending"
+    );
     assert_eq!(result.frame_count, 2);
     assert_eq!(
         result.seed_target.as_deref(),
@@ -462,7 +482,12 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     let members = serde_json::json!([
         member_json("Coord", "send_receive", true, &[coord_recv_node]),
         member_json("Contrib", "send", false, &[contrib_device]),
-        member_json("Processor", "send_receive", false, &[proc_device, proc_node]),
+        member_json(
+            "Processor",
+            "send_receive",
+            false,
+            &[proc_device, proc_node]
+        ),
     ])
     .to_string();
 
@@ -582,7 +607,10 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
         proc_sync_dir.clone(),
         proc_incoming,
         allow_all_peers(),
-        ProjectReceiveHooks { gate: Some(proc_gate), ..Default::default() },
+        ProjectReceiveHooks {
+            gate: Some(proc_gate),
+            ..Default::default()
+        },
         Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&proc_ep) as Arc<dyn SharingTransport>,
         Arc::new(crate::events::NullEmitter),
@@ -634,7 +662,10 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     let result = publish_collab_frames(&contrib_ctx, &contrib_sender, PROJECT, None)
         .await
         .unwrap();
-    assert_eq!(result.state, "pending", "require-approval publish is pending");
+    assert_eq!(
+        result.state, "pending",
+        "require-approval publish is pending"
+    );
     assert_eq!(result.frame_count, 2, "both gate-passing lights published");
     assert_eq!(
         result.seed_target.as_deref(),
@@ -664,7 +695,11 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     // receivers verify the served bytes against it.
     let anchor = {
         let conn = db(&contrib_ctx).unwrap().conn();
-        get_package(&conn, &pkg).unwrap().unwrap().manifest_xxh3.unwrap()
+        get_package(&conn, &pkg)
+            .unwrap()
+            .unwrap()
+            .manifest_xxh3
+            .unwrap()
     };
 
     // ═══ Step 4 (brief): COORD ingests the push-seed; moderation queue lists it. ═
@@ -697,8 +732,16 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     {
         // The review copy landed as two contributions — never into the catalog.
         let conn = db(&coord_ctx).unwrap().conn();
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0, "coord catalog untouched");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 0, "coord catalog untouched");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM files"),
+            0,
+            "coord catalog untouched"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM frames"),
+            0,
+            "coord catalog untouched"
+        );
         assert_eq!(
             contributions_for_package(&conn, &pkg).unwrap().len(),
             2,
@@ -719,7 +762,9 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     );
 
     // ═══ Step 5 (brief): COORD approves → local state published. ═══════════════
-    decide_announcement(&coord_ctx, ANN, true, None).await.unwrap();
+    decide_announcement(&coord_ctx, ANN, true, None)
+        .await
+        .unwrap();
     {
         let conn = db(&coord_ctx).unwrap().conn();
         let row = get_package(&conn, &pkg).unwrap().unwrap();
@@ -782,7 +827,11 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     let export = export_project_for_wbpp(&proc_ctx, PROJECT, &out.to_string_lossy(), false, None)
         .await
         .unwrap();
-    assert!(export.success, "project export succeeded: {:?}", export.error);
+    assert!(
+        export.success,
+        "project export succeeded: {:?}",
+        export.error
+    );
     assert_eq!(export.files_organized, 2, "two received frames organized");
 
     // <out>/<title>/<publisher>/camera_<instrume>/lights/<name>, byte-identical
@@ -794,7 +843,9 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
         .join(format!("camera_{}", sanitize_folder_name("ASI2600MM")))
         .join("lights");
     let mut exported: HashMap<String, Vec<u8>> = HashMap::new();
-    for entry in std::fs::read_dir(&lights_dir).unwrap_or_else(|e| panic!("read {lights_dir:?}: {e}")) {
+    for entry in
+        std::fs::read_dir(&lights_dir).unwrap_or_else(|e| panic!("read {lights_dir:?}: {e}"))
+    {
         let p = entry.unwrap().path();
         exported.insert(
             p.file_name().unwrap().to_string_lossy().to_string(),
@@ -819,8 +870,16 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     // §11 catalog isolation: contributions never enter PROC's catalog.
     {
         let conn = db(&proc_ctx).unwrap().conn();
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0, "PROC files stay empty");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 0, "PROC frames stay empty");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM files"),
+            0,
+            "PROC files stay empty"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM frames"),
+            0,
+            "PROC frames stay empty"
+        );
     }
 
     // ═══ Step 8 (brief): teardown — stop the engines (receivers stop on drop). ═

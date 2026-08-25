@@ -207,7 +207,10 @@ fn set_center(conn: &Connection, frames_set_id: i64) -> Option<(f64, f64)> {
     ) {
         (Ok(ra), Ok(dec)) => Some((ra, dec)),
         _ => {
-            tracing::warn!(frames_set_id, "frame set center did not parse — treating as no center");
+            tracing::warn!(
+                frames_set_id,
+                "frame set center did not parse — treating as no center"
+            );
             None
         }
     }
@@ -449,7 +452,12 @@ pub fn unlink_frame_set(
     let conn = db.conn();
     let removed =
         crate::db::collab::unlink_set(&conn, project_id, frames_set_id).map_err(internal)?;
-    tracing::info!(project_id, frames_set_id, removed, "unlinked frame set from project");
+    tracing::info!(
+        project_id,
+        frames_set_id,
+        removed,
+        "unlinked frame set from project"
+    );
     Ok(())
 }
 
@@ -472,7 +480,9 @@ pub fn list_link_suggestions(
         .prepare("SELECT id, name FROM frames_set WHERE is_archived = 0 ORDER BY id DESC")
         .map_err(|e| internal(e.into()))?;
     let sets = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+        .query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })
         .map_err(|e| internal(e.into()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| internal(e.into()))?;
@@ -519,7 +529,9 @@ pub fn evaluate_project_gate(
     let project = crate::db::collab::get_project(&conn, project_id)
         .map_err(internal)?
         .ok_or_else(|| {
-            ApiError::NotFound(format!("project {project_id} is not cached — refresh first"))
+            ApiError::NotFound(format!(
+                "project {project_id} is not cached — refresh first"
+            ))
         })?;
 
     let target = ProjectTarget {
@@ -716,7 +728,9 @@ pub fn list_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, ApiError>
         let conn = db.conn();
         crate::db::collab::list_projects(&conn).map_err(internal)?
     };
-    rows.into_iter().map(|row| card_from_row(ctx, row)).collect()
+    rows.into_iter()
+        .map(|row| card_from_row(ctx, row))
+        .collect()
 }
 
 /// A [`LinkedSetView`] per frame set currently linked to the project.
@@ -735,8 +749,8 @@ fn linked_set_views(
             .map_err(|e| internal(e.into()))?
             .flatten();
         let center = set_center(conn, set_id);
-        let distance_deg =
-            center.map(|(ra, dec)| angular_distance(ra, dec, row.target_ra_deg, row.target_dec_deg));
+        let distance_deg = center
+            .map(|(ra, dec)| angular_distance(ra, dec, row.target_ra_deg, row.target_dec_deg));
         out.push(LinkedSetView {
             frames_set_id: set_id,
             name,
@@ -762,7 +776,9 @@ pub fn get_project_detail(
         let row = crate::db::collab::get_project(&conn, project_id)
             .map_err(internal)?
             .ok_or_else(|| {
-                ApiError::NotFound(format!("project {project_id} is not cached — refresh first"))
+                ApiError::NotFound(format!(
+                    "project {project_id} is not cached — refresh first"
+                ))
             })?;
         let links = linked_set_views(&conn, project_id, &row)?;
         let portal_base = ctx.settings.get_with_precedence(
@@ -854,7 +870,8 @@ async fn fetch_one_project(
         serde_json::to_string(&verified.members).map_err(|e| FetchError::Transport(e.into()))?;
     let (thresholds_version, thresholds_rules_json) = match thresholds.current {
         Some(set) => {
-            let rules = serde_json::to_string(&set.rules).map_err(|e| FetchError::Transport(e.into()))?;
+            let rules =
+                serde_json::to_string(&set.rules).map_err(|e| FetchError::Transport(e.into()))?;
             (Some(set.version), Some(rules))
         }
         None => (None, None),
@@ -962,7 +979,11 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
         match fetch_one_project(&client, &token, &pinned, p).await {
             Ok(row) => {
                 if !previous_ids.contains(&row.project_id) {
-                    new_targets.push((row.project_id.clone(), row.target_ra_deg, row.target_dec_deg));
+                    new_targets.push((
+                        row.project_id.clone(),
+                        row.target_ra_deg,
+                        row.target_dec_deg,
+                    ));
                 }
                 let db = db(ctx)?;
                 let conn = db.conn();
@@ -1137,14 +1158,18 @@ pub async fn publish_collab_frames(
         let project = crate::db::collab::get_project(&conn, project_id)
             .map_err(internal)?
             .ok_or_else(|| {
-                ApiError::NotFound(format!("project {project_id} is not cached — refresh first"))
+                ApiError::NotFound(format!(
+                    "project {project_id} is not cached — refresh first"
+                ))
             })?;
 
         let ids: Vec<i64> = publishable.iter().map(|r| r.frame_id).collect();
-        let rows = crate::db::get_frames_with_files_by_ids(&conn, &ids)
-            .map_err(|e| internal(e.into()))?;
-        let frame_by_id: HashMap<i64, crate::models::Frame> =
-            rows.into_iter().map(|(_, _, fr)| (fr.id.unwrap_or_default(), fr)).collect();
+        let rows =
+            crate::db::get_frames_with_files_by_ids(&conn, &ids).map_err(|e| internal(e.into()))?;
+        let frame_by_id: HashMap<i64, crate::models::Frame> = rows
+            .into_iter()
+            .map(|(_, _, fr)| (fr.id.unwrap_or_default(), fr))
+            .collect();
         let analysis_by_id: HashMap<i64, FrameAnalysis> = get_frame_analyses_by_ids(&conn, &ids)
             .map_err(|e| internal(e.into()))?
             .into_iter()
@@ -1154,9 +1179,13 @@ pub async fn publish_collab_frames(
         let mut frames: Vec<PublishFrame> = Vec::with_capacity(publishable.len());
         let mut skipped: Vec<i64> = Vec::new();
         for row in &publishable {
-            let Some(cal) = get_light_calibration_for_frame(&conn, row.frame_id).map_err(internal)?
+            let Some(cal) =
+                get_light_calibration_for_frame(&conn, row.frame_id).map_err(internal)?
             else {
-                tracing::warn!(frame_id = row.frame_id, "publish: no light-calibration row — skipping");
+                tracing::warn!(
+                    frame_id = row.frame_id,
+                    "publish: no light-calibration row — skipping"
+                );
                 skipped.push(row.frame_id);
                 continue;
             };
@@ -1170,7 +1199,10 @@ pub async fn publish_collab_frames(
                 continue;
             }
             let Some(frame) = frame_by_id.get(&row.frame_id).cloned() else {
-                tracing::warn!(frame_id = row.frame_id, "publish: frame row vanished — skipping");
+                tracing::warn!(
+                    frame_id = row.frame_id,
+                    "publish: frame row vanished — skipping"
+                );
                 skipped.push(row.frame_id);
                 continue;
             };
@@ -1196,7 +1228,10 @@ pub async fn publish_collab_frames(
         ));
     }
     if !skipped_missing.is_empty() {
-        tracing::warn!(count = skipped_missing.len(), "publish: skipped frames with missing artifacts");
+        tracing::warn!(
+            count = skipped_missing.len(),
+            "publish: skipped frames with missing artifacts"
+        );
     }
 
     // ── 2. Mint the HUB package uuid FIRST; stamp each artifact into staging ──
@@ -1208,9 +1243,12 @@ pub async fn publish_collab_frames(
 
     let hub_package_id = uuid::Uuid::new_v4().to_string();
     let pub_dir = sync_dir.join("collab_pub").join(&hub_package_id);
-    let staging = sync_dir.join("collab_pub").join(format!("{hub_package_id}.staging"));
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| ApiError::Internal(format!("create publish staging {}: {e}", staging.display())))?;
+    let staging = sync_dir
+        .join("collab_pub")
+        .join(format!("{hub_package_id}.staging"));
+    std::fs::create_dir_all(&staging).map_err(|e| {
+        ApiError::Internal(format!("create publish staging {}: {e}", staging.display()))
+    })?;
 
     let stamp_card = Card::new("ATH_PRJ", CardValue::Str(project_id.to_string()))
         .map_err(|e| ApiError::Internal(format!("build ATH_PRJ card: {e}")))?;
@@ -1389,7 +1427,10 @@ pub async fn publish_collab_frames(
             }
         }
         if !integ.is_empty() {
-            stats.insert("integrationSecondsByFilter".into(), serde_json::json!(integ));
+            stats.insert(
+                "integrationSecondsByFilter".into(),
+                serde_json::json!(integ),
+            );
         }
         serde_json::Value::Object(stats)
     };
@@ -1398,7 +1439,8 @@ pub async fn publish_collab_frames(
     let supersedes = {
         let db = db(ctx)?;
         let conn = db.conn();
-        own_active_announcement_ids_for_uuids(&conn, project_id, &published_uuids).map_err(internal)?
+        own_active_announcement_ids_for_uuids(&conn, project_id, &published_uuids)
+            .map_err(internal)?
     };
 
     // ── 6. Hub announce (anchored on the pre-minted hub uuid) ────────────────
@@ -1408,9 +1450,12 @@ pub async fn publish_collab_frames(
     // deleted dir is a permanent seed every GET fails on — the same phantom-holder
     // shape the supersede-reclaim unseed exists to prevent.
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
-        node.unseed_project_package(project_id, &hub_package_id).await;
+        node.unseed_project_package(project_id, &hub_package_id)
+            .await;
         let _ = std::fs::remove_dir_all(&pub_dir);
-        return Err(ApiError::SignedOut("Sign in to publish to a project.".into()));
+        return Err(ApiError::SignedOut(
+            "Sign in to publish to a project.".into(),
+        ));
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
     let req = AnnounceRequest {
@@ -1427,7 +1472,8 @@ pub async fn publish_collab_frames(
             // A closed/duplicate (409), 403, or network failure leaves nothing
             // published — stop seeding it, then drop the retained dir so a retry
             // starts clean (F5, see the note above).
-            node.unseed_project_package(project_id, &hub_package_id).await;
+            node.unseed_project_package(project_id, &hub_package_id)
+                .await;
             let _ = std::fs::remove_dir_all(&pub_dir);
             return Err(client_err(e));
         }
@@ -1515,7 +1561,8 @@ pub async fn publish_collab_frames(
     // under that dir, so a seed left pinned over a deleted publication is a
     // holder the hub advertises and every GET fails on.
     for old_package_id in &reclaimed {
-        node.unseed_project_package(project_id, old_package_id).await;
+        node.unseed_project_package(project_id, old_package_id)
+            .await;
     }
 
     // ── 8. Push-seed the first receive-capable member (Д8) ───────────────────
@@ -1839,9 +1886,9 @@ mod tests {
         use crate::services::operation_queue::OperationQueue;
         use crate::settings::SettingsManager;
         use std::collections::HashMap;
-        use std::sync::{Arc, Mutex, OnceLock};
         #[cfg(all(feature = "render", feature = "solver"))]
         use std::sync::RwLock;
+        use std::sync::{Arc, Mutex, OnceLock};
 
         let tmp = tempfile::tempdir().unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
@@ -1865,7 +1912,12 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -2012,19 +2064,38 @@ mod tests {
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
         assert_eq!(report.total, 2, "both LIGHT frames are candidates");
         assert_eq!(report.rows.len(), 2);
-        assert_eq!(report.publishable, 0, "no light_calibrations rows → not calibrated");
+        assert_eq!(
+            report.publishable, 0,
+            "no light_calibrations rows → not calibrated"
+        );
 
         // Frame 0: blocked only by calibration. Frame 1: calibration + trailed.
-        let row0 = report.rows.iter().find(|r| r.frame_id == frames[0]).unwrap();
-        assert!(row0.failures.iter().any(|f| f.contains("not calibrated")), "{:?}", row0.failures);
+        let row0 = report
+            .rows
+            .iter()
+            .find(|r| r.frame_id == frames[0])
+            .unwrap();
+        assert!(
+            row0.failures.iter().any(|f| f.contains("not calibrated")),
+            "{:?}",
+            row0.failures
+        );
         assert!(!row0.failures.iter().any(|f| f.contains("trailed")));
         assert_eq!(row0.stars_detected, Some(400));
         // 2.0 px × ~0.776 ″/px (header fallback, no binning multiply).
         let scale = ((3.76f64 / 1000.0) / 1000.0).atan().to_degrees() * 3600.0;
         assert!((row0.fwhm_arcsec.unwrap() - 2.0 * scale).abs() < 1e-6);
 
-        let row1 = report.rows.iter().find(|r| r.frame_id == frames[1]).unwrap();
-        assert!(row1.failures.iter().any(|f| f.contains("trailed")), "{:?}", row1.failures);
+        let row1 = report
+            .rows
+            .iter()
+            .find(|r| r.frame_id == frames[1])
+            .unwrap();
+        assert!(
+            row1.failures.iter().any(|f| f.contains("trailed")),
+            "{:?}",
+            row1.failures
+        );
 
         unlink_frame_set(&ctx, "p-1", set_id).unwrap();
         assert_eq!(evaluate_project_gate(&ctx, "p-1").unwrap().total, 0);
@@ -2062,8 +2133,15 @@ mod tests {
             // frames.ra/dec are deliberately FAR off target (100, 10) so a
             // center taken from the frame row would fail the radius check; the
             // solve's crval sits on target.
-            let (set_id, frames) =
-                seed_set(&conn, "Off-header set", "06:40:00", "+10:00:00", 100.0, 10.0, 1);
+            let (set_id, frames) = seed_set(
+                &conn,
+                "Off-header set",
+                "06:40:00",
+                "+10:00:00",
+                100.0,
+                10.0,
+                1,
+            );
             // Solve: scale 1.5″/px (≠ the ~0.776″/px header fallback), center
             // on target (210.8, +54.35).
             seed_plate_solve(&conn, frames[0], 1.5, 210.8, 54.35);
@@ -2073,7 +2151,11 @@ mod tests {
 
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
         assert_eq!(report.total, 1);
-        let row = report.rows.iter().find(|r| r.frame_id == frames[0]).unwrap();
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.frame_id == frames[0])
+            .unwrap();
 
         // Scale from the solve: 2.0 px × 1.5 ″/px = 3.0″ (NOT 2.0 × ~0.776).
         assert!(
@@ -2084,7 +2166,9 @@ mod tests {
         // Center from crval (on target) → no radius failure, even though
         // frames.ra/dec (100, 10) is far outside the 1.5° radius.
         assert!(
-            !row.failures.iter().any(|f| f.contains("outside target radius")),
+            !row.failures
+                .iter()
+                .any(|f| f.contains("outside target radius")),
             "center should come from crval, not frames.ra/dec: {:?}",
             row.failures
         );
@@ -2133,7 +2217,10 @@ mod tests {
         link_frame_set(&ctx, "p-1", set_b).unwrap();
 
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
-        assert_eq!(report.total, 1, "the shared frame is counted once (union dedup)");
+        assert_eq!(
+            report.total, 1,
+            "the shared frame is counted once (union dedup)"
+        );
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.rows[0].frame_id, frame_id);
     }
@@ -2152,7 +2239,10 @@ mod tests {
 
         let suggestions = list_link_suggestions(&ctx, "p-1").unwrap();
         assert_eq!(suggestions.len(), 2);
-        assert_eq!(suggestions[0].frames_set_id, near, "within-radius set ranks first");
+        assert_eq!(
+            suggestions[0].frames_set_id, near,
+            "within-radius set ranks first"
+        );
         assert!(suggestions[0].within_radius);
         assert_eq!(suggestions[0].light_count, 1);
         assert!(!suggestions[0].already_linked);
@@ -2210,11 +2300,15 @@ mod tests {
         assert_eq!(matches[0].project_id, "p-1");
 
         // A point far outside the radius matches nothing.
-        assert!(find_matching_projects(&conn, 10.0, 10.0, set_id).unwrap().is_empty());
+        assert!(find_matching_projects(&conn, 10.0, 10.0, set_id)
+            .unwrap()
+            .is_empty());
 
         // Once linked, the project stops being suggested for that set.
         crate::db::collab::link_set(&conn, "p-1", set_id).unwrap();
-        assert!(find_matching_projects(&conn, 210.8, 54.35, set_id).unwrap().is_empty());
+        assert!(find_matching_projects(&conn, 210.8, 54.35, set_id)
+            .unwrap()
+            .is_empty());
     }
 
     /// End-to-end hub poll (wiremock): a fresh refresh fetches the page + a REAL
@@ -2260,10 +2354,12 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/me/projects"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                "id": "p-1", "slug": "m101", "title": "M 101", "dataRole": "send_receive",
-                "coordinator": true, "requireApproval": false, "pendingAnnouncements": 0
-            }])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": "p-1", "slug": "m101", "title": "M 101", "dataRole": "send_receive",
+                    "coordinator": true, "requireApproval": false, "pendingAnnouncements": 0
+                }])),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2321,14 +2417,18 @@ mod tests {
         let cards = refresh_projects(&ctx).await.unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].project_id, "p-1");
-        assert_eq!(cards[0].linked_sets, 1, "the intent auto-linked the source set");
+        assert_eq!(
+            cards[0].linked_sets, 1,
+            "the intent auto-linked the source set"
+        );
 
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
-            let row = crate::db::collab::get_project(&conn, "p-1").unwrap().unwrap();
+            let row = crate::db::collab::get_project(&conn, "p-1")
+                .unwrap()
+                .unwrap();
             assert_eq!(row.membership_version, 7);
-            let members: Vec<ProjectMemberView> =
-                serde_json::from_str(&row.members_json).unwrap();
+            let members: Vec<ProjectMemberView> = serde_json::from_str(&row.members_json).unwrap();
             assert_eq!(members.len(), 1);
             assert_eq!(members[0].display_name, "Vilen");
             assert!(members[0].coordinator);
@@ -2348,7 +2448,9 @@ mod tests {
                 crate::db::collab::linked_set_ids(&conn, "p-1").unwrap(),
                 vec![set_id]
             );
-            assert!(crate::db::collab::list_link_intents(&conn).unwrap().is_empty());
+            assert!(crate::db::collab::list_link_intents(&conn)
+                .unwrap()
+                .is_empty());
         }
 
         // Second refresh: membership now signed by a DIFFERENT key → the pinned
@@ -2368,7 +2470,9 @@ mod tests {
         assert_eq!(cards2.len(), 1);
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
-            let row = crate::db::collab::get_project(&conn, "p-1").unwrap().unwrap();
+            let row = crate::db::collab::get_project(&conn, "p-1")
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 row.membership_version, 7,
                 "stale row kept after pin mismatch"
@@ -2418,7 +2522,12 @@ mod tests {
     }
 
     /// One member entry as slice-3 caches it (camelCase `SnapshotMember`).
-    fn member_json(display: &str, data_role: &str, coordinator: bool, node: &NodeId) -> serde_json::Value {
+    fn member_json(
+        display: &str,
+        data_role: &str,
+        coordinator: bool,
+        node: &NodeId,
+    ) -> serde_json::Value {
         serde_json::json!({
             "accountId": format!("acc-{display}"),
             "displayName": display,
@@ -2547,7 +2656,9 @@ mod tests {
     /// Mount a single announce responder returning `{id, state}`.
     async fn mount_announce(server: &MockServer, project_id: &str, id: &str, state: &str) {
         Mock::given(wm_method("POST"))
-            .and(wm_path(format!("/api/v1/projects/{project_id}/announcements")))
+            .and(wm_path(format!(
+                "/api/v1/projects/{project_id}/announcements"
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": id, "state": state
             })))
@@ -2565,9 +2676,7 @@ mod tests {
         peer: NodeId,
     ) -> std::sync::Arc<crate::sync::StandaloneSyncStore> {
         use crate::sharing::SharingTransport;
-        use crate::sync::{
-            node_id_hex, StandaloneSyncStore, StartedSender, SyncEngine, SyncStore,
-        };
+        use crate::sync::{node_id_hex, StandaloneSyncStore, StartedSender, SyncEngine, SyncStore};
 
         let net = crate::sharing::loopback::LoopbackNetwork::new();
         let a_ep = net.endpoint();
@@ -2632,24 +2741,45 @@ mod tests {
         let sender = crate::sync::SyncSenderRuntime::new();
         let store = insert_loopback_engine(&sender, _tmp.path(), "a", BOB).await;
 
-        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.state, "published");
         assert_eq!(result.announcement_id, "ann-a");
         assert_eq!(result.frame_count, 2);
         assert!(result.byte_size > 0);
         assert!(result.superseded_announcements.is_empty());
-        assert_eq!(result.seed_target.as_deref(), Some("Bob"), "the send_receive member is seeded");
+        assert_eq!(
+            result.seed_target.as_deref(),
+            Some("Bob"),
+            "the send_receive member is seeded"
+        );
 
         // Retained pub dir with a stamped payload (ATH_PRJ in the header).
-        let pub_dir = _tmp.path().join("sync").join("collab_pub").join(&result.package_id);
+        let pub_dir = _tmp
+            .path()
+            .join("sync")
+            .join("collab_pub")
+            .join(&result.package_id);
         assert!(pub_dir.join(crate::package::MANIFEST_FILENAME).exists());
         let payload = pub_dir.join("c_uuid-a-1.fits");
-        assert!(payload.exists(), "stamped payload retained under its rel_path");
+        assert!(
+            payload.exists(),
+            "stamped payload retained under its rel_path"
+        );
         let head = String::from_utf8_lossy(&std::fs::read(&payload).unwrap()).to_string();
-        assert!(head.contains("ATH_PRJ"), "payload header carries the project stamp card");
+        assert!(
+            head.contains("ATH_PRJ"),
+            "payload header carries the project stamp card"
+        );
         // Staging scratch dir cleaned.
-        assert!(!_tmp.path().join("sync").join("collab_pub").join(format!("{}.staging", result.package_id)).exists());
+        assert!(!_tmp
+            .path()
+            .join("sync")
+            .join("collab_pub")
+            .join(format!("{}.staging", result.package_id))
+            .exists());
 
         // Local package row: origin=mine, complete, retained manifest bytes.
         {
@@ -2670,14 +2800,20 @@ mod tests {
         let bodies = announce_bodies(&server).await;
         assert_eq!(bodies.len(), 1);
         assert_eq!(
-            bodies[0]["aggregateStats"]["manifestXxh3"].as_str().unwrap().len(),
+            bodies[0]["aggregateStats"]["manifestXxh3"]
+                .as_str()
+                .unwrap()
+                .len(),
             16
         );
         assert_eq!(bodies[0]["supersedes"], serde_json::json!([]));
         assert_eq!(bodies[0]["rootHash"].as_str().unwrap().len(), 64);
 
         // The seed reached the loopback engine (outbound row created on enqueue).
-        assert!(store.get_outbound(1).unwrap().is_some(), "push-seed enqueued to the member engine");
+        assert!(
+            store.get_outbound(1).unwrap().is_some(),
+            "push-seed enqueued to the member engine"
+        );
     }
 
     /// (b) Re-publishing the same source uuids supersedes the first announcement:
@@ -2724,12 +2860,19 @@ mod tests {
         link_frame_set(&ctx, "p-1", set_id).unwrap();
 
         let sender = crate::sync::SyncSenderRuntime::new();
-        let first = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let first = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
         assert_eq!(first.announcement_id, "ann-1");
         assert!(first.superseded_announcements.is_empty());
-        assert!(first.seed_target.is_none(), "a send-only member is not a seed target");
+        assert!(
+            first.seed_target.is_none(),
+            "a send-only member is not a seed target"
+        );
 
-        let second = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let second = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
         assert_eq!(second.announcement_id, "ann-2");
         assert_eq!(
             second.superseded_announcements,
@@ -2743,7 +2886,10 @@ mod tests {
             let first_row = crate::db::collab_exchange::get_package(&conn, &first.package_id)
                 .unwrap()
                 .unwrap();
-            assert!(first_row.superseded, "first package row flipped superseded=1");
+            assert!(
+                first_row.superseded,
+                "first package row flipped superseded=1"
+            );
         }
 
         // The second announce body carried the first announcement id in supersedes.
@@ -2789,7 +2935,9 @@ mod tests {
         insert_loopback_engine(&sender, _tmp.path(), "c_coord", COORD).await;
         insert_loopback_engine(&sender, _tmp.path(), "c_bob", BOB).await;
 
-        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
         assert_eq!(result.state, "pending");
         assert_eq!(
             result.seed_target.as_deref(),
@@ -2821,16 +2969,23 @@ mod tests {
         link_frame_set(&ctx, "p-1", set_id).unwrap();
 
         let sender = crate::sync::SyncSenderRuntime::new();
-        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
 
         assert_eq!(result.state, "published");
-        assert!(result.seed_target.is_none(), "no receive-capable member ⇒ no seed target");
+        assert!(
+            result.seed_target.is_none(),
+            "no receive-capable member ⇒ no seed target"
+        );
         assert!(!sender.is_started().await, "nothing was enqueued");
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
-            assert!(crate::db::collab_exchange::get_package(&conn, &result.package_id)
-                .unwrap()
-                .is_some());
+            assert!(
+                crate::db::collab_exchange::get_package(&conn, &result.package_id)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 
@@ -2859,12 +3014,17 @@ mod tests {
         link_frame_set(&ctx, "p-1", set_id).unwrap();
 
         let sender = crate::sync::SyncSenderRuntime::new();
-        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
 
         // Independent oracle: import the retained pub dir into a fresh store.
-        let pub_dir = _tmp.path().join("sync").join("collab_pub").join(&result.package_id);
-        let oracle_store: iroh_blobs::api::Store =
-            iroh_blobs::store::mem::MemStore::new().into();
+        let pub_dir = _tmp
+            .path()
+            .join("sync")
+            .join("collab_pub")
+            .join(&result.package_id);
+        let oracle_store: iroh_blobs::api::Store = iroh_blobs::store::mem::MemStore::new().into();
         let (expected, _entries) = crate::sharing::iroh::blobs::import_package_collection(
             &oracle_store,
             &pub_dir,
@@ -2901,7 +3061,12 @@ mod tests {
         }
 
         // Publishing seeded the package: the node holds it under the reserved tag.
-        let node = ctx.iroh_node.lock().await.take().expect("publish bound the node");
+        let node = ctx
+            .iroh_node
+            .lock()
+            .await
+            .take()
+            .expect("publish bound the node");
         assert!(
             node.store()
                 .tags()
@@ -2946,13 +3111,21 @@ mod tests {
             .await
             .expect_err("a 409 announce fails the publish");
 
-        let node = ctx.iroh_node.lock().await.take().expect("publish bound the node");
+        let node = ctx
+            .iroh_node
+            .lock()
+            .await
+            .take()
+            .expect("publish bound the node");
         let mut seeded = Vec::new();
         let mut stream = node.store().tags().list_prefix(b"project/").await.unwrap();
         while let Some(entry) = stream.next().await {
             seeded.push(String::from_utf8_lossy(entry.unwrap().name.as_ref()).to_string());
         }
-        assert!(seeded.is_empty(), "a failed publish seeds nothing, got {seeded:?}");
+        assert!(
+            seeded.is_empty(),
+            "a failed publish seeds nothing, got {seeded:?}"
+        );
 
         // …and the dir those blobs would have referenced is gone with it.
         let pub_root = _tmp.path().join("sync").join("collab_pub");
@@ -3060,23 +3233,56 @@ mod tests {
         let conn = crate::api::db(&ctx).unwrap().conn();
 
         // Pending + fully landed: one frame with analysis, one without.
-        seed_moderation_package(&conn, "p-1", "pkg-pend", "ann-pend", "pending", "complete", 2);
+        seed_moderation_package(
+            &conn, "p-1", "pkg-pend", "ann-pend", "pending", "complete", 2,
+        );
         let analysis = serde_json::json!({
             "stars_detected": 400, "median_fwhm": 2.0,
             "median_eccentricity": 0.4, "median_snr": 10.0
         })
         .to_string();
-        add_contribution(&conn, "p-1", "pkg-pend", "u-1", "/land/u-1.fits", Some(analysis));
+        add_contribution(
+            &conn,
+            "p-1",
+            "pkg-pend",
+            "u-1",
+            "/land/u-1.fits",
+            Some(analysis),
+        );
         add_contribution(&conn, "p-1", "pkg-pend", "u-2", "/land/u-2.fits", None);
 
         // Pending but still downloading (review copy incomplete).
-        seed_moderation_package(&conn, "p-1", "pkg-dl", "ann-dl", "pending", "downloading", 1);
+        seed_moderation_package(
+            &conn,
+            "p-1",
+            "pkg-dl",
+            "ann-dl",
+            "pending",
+            "downloading",
+            1,
+        );
         add_contribution(&conn, "p-1", "pkg-dl", "u-3", "/land/u-3.fits", None);
 
         // Published — never in the moderation queue.
-        seed_moderation_package(&conn, "p-1", "pkg-pub", "ann-pub", "published", "complete", 1);
+        seed_moderation_package(
+            &conn,
+            "p-1",
+            "pkg-pub",
+            "ann-pub",
+            "published",
+            "complete",
+            1,
+        );
         // Pending, but a DIFFERENT project — excluded by scope.
-        seed_moderation_package(&conn, "p-2", "pkg-other", "ann-other", "pending", "complete", 1);
+        seed_moderation_package(
+            &conn,
+            "p-2",
+            "pkg-other",
+            "ann-other",
+            "pending",
+            "complete",
+            1,
+        );
 
         let queue = list_moderation_queue(&ctx, "p-1").unwrap();
         assert_eq!(queue.len(), 2, "only p-1's pending packages");
@@ -3088,7 +3294,11 @@ mod tests {
         assert_eq!(complete.byte_size, 4096);
         assert_eq!(complete.frames.len(), 2);
 
-        let f1 = complete.frames.iter().find(|f| f.frame_uuid == "u-1").unwrap();
+        let f1 = complete
+            .frames
+            .iter()
+            .find(|f| f.frame_uuid == "u-1")
+            .unwrap();
         assert_eq!(f1.fwhm, Some(2.0));
         assert_eq!(f1.eccentricity, Some(0.4));
         assert_eq!(f1.stars, Some(400));
@@ -3096,14 +3306,21 @@ mod tests {
         assert_eq!(f1.landed_path.as_deref(), Some("/land/u-1.fits"));
         assert_eq!(f1.byte_size, 2048);
 
-        let f2 = complete.frames.iter().find(|f| f.frame_uuid == "u-2").unwrap();
+        let f2 = complete
+            .frames
+            .iter()
+            .find(|f| f.frame_uuid == "u-2")
+            .unwrap();
         assert_eq!(f2.fwhm, None, "absent analysis ⇒ metrics stay None");
         assert_eq!(f2.eccentricity, None);
         assert_eq!(f2.stars, None);
         assert_eq!(f2.snr, None);
 
         let incomplete = queue.iter().find(|m| m.package_id == "pkg-dl").unwrap();
-        assert!(!incomplete.review_copy_complete, "still downloading ⇒ not complete");
+        assert!(
+            !incomplete.review_copy_complete,
+            "still downloading ⇒ not complete"
+        );
     }
 
     /// Approve → hub approve (200) then the local package flips to `published`.
@@ -3125,10 +3342,14 @@ mod tests {
             seed_moderation_package(&conn, "p-1", "pkg-a", "ann-a", "pending", "complete", 1);
         }
 
-        decide_announcement(&ctx, "ann-a", true, None).await.unwrap();
+        decide_announcement(&ctx, "ann-a", true, None)
+            .await
+            .unwrap();
 
         let conn = crate::api::db(&ctx).unwrap().conn();
-        let row = get_package_by_announcement(&conn, "ann-a").unwrap().unwrap();
+        let row = get_package_by_announcement(&conn, "ann-a")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, "published", "approve flips local state");
         assert!(row.decided_at.is_some(), "decided_at stamped");
     }
@@ -3205,7 +3426,9 @@ mod tests {
         assert!(!f2.exists(), "landed file removed");
         let conn = crate::api::db(&ctx).unwrap().conn();
         assert!(
-            get_package_by_announcement(&conn, "ann-r").unwrap().is_none(),
+            get_package_by_announcement(&conn, "ann-r")
+                .unwrap()
+                .is_none(),
             "package row deleted"
         );
         assert!(
@@ -3297,12 +3520,16 @@ mod tests {
         link_frame_set(&ctx, "p-1", set_id).unwrap();
 
         let sender = crate::sync::SyncSenderRuntime::new();
-        let first = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let first = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
         // A neighbouring project's seed, which nothing here may touch.
         let node = seed_package_on_node(&ctx, _tmp.path(), "p-other", "pkg-other").await;
         assert!(seed_tag_present(&node, "p-1", &first.package_id).await);
 
-        let second = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        let second = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .unwrap();
         assert_eq!(second.superseded_announcements, vec!["ann-1".to_string()]);
 
         assert!(
@@ -3396,8 +3623,24 @@ mod tests {
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
             seed_publish_project(&conn, "p-gone", "[]");
-            seed_moderation_package(&conn, "p-gone", "pkg-a", "ann-a", "published", "complete", 1);
-            seed_moderation_package(&conn, "p-gone", "pkg-b", "ann-b", "published", "complete", 1);
+            seed_moderation_package(
+                &conn,
+                "p-gone",
+                "pkg-a",
+                "ann-a",
+                "published",
+                "complete",
+                1,
+            );
+            seed_moderation_package(
+                &conn,
+                "p-gone",
+                "pkg-b",
+                "ann-b",
+                "published",
+                "complete",
+                1,
+            );
         }
         let node = seed_package_on_node(&ctx, _tmp.path(), "p-gone", "pkg-a").await;
         seed_package_on_node(&ctx, _tmp.path(), "p-gone", "pkg-b").await;
@@ -3453,12 +3696,17 @@ mod tests {
         let err = decide_announcement(&ctx, "ann-x", false, Some("too soft".into()))
             .await
             .unwrap_err();
-        assert!(matches!(err, ApiError::Conflict(_)), "409 ⇒ Conflict, got {err:?}");
+        assert!(
+            matches!(err, ApiError::Conflict(_)),
+            "409 ⇒ Conflict, got {err:?}"
+        );
 
         // Local review copy untouched.
         assert!(f1.exists(), "landed file NOT removed on 409");
         let conn = crate::api::db(&ctx).unwrap().conn();
-        let row = get_package_by_announcement(&conn, "ann-x").unwrap().unwrap();
+        let row = get_package_by_announcement(&conn, "ann-x")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, "pending", "local row untouched on 409");
         assert_eq!(
             crate::db::collab_exchange::contributions_for_package(&conn, "pkg-x")

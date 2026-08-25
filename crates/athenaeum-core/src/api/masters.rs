@@ -982,7 +982,8 @@ fn run_build(
         }
         if out.all_bad_pixels > 0 {
             tracing::warn!(
-                set_id, count = out.all_bad_pixels,
+                set_id,
+                count = out.all_bad_pixels,
                 "pixels with no valid sample written as 0"
             );
         }
@@ -1884,8 +1885,8 @@ pub fn delete_master(
 
     let tx = conn.unchecked_transaction()?;
 
-    let summary = crate::db::master_unregister::unregister_master_set(&tx, master_set_id)
-        .map_err(|e| {
+    let summary =
+        crate::db::master_unregister::unregister_master_set(&tx, master_set_id).map_err(|e| {
             tracing::error!(master_set_id, error = %e, "master unregister failed");
             ApiError::Internal(format!("{e:#}"))
         })?;
@@ -3503,7 +3504,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(target, raw_set, "the consumer link came back to the raw set");
+        assert_eq!(
+            target, raw_set,
+            "the consumer link came back to the raw set"
+        );
         assert_eq!(manual, 1, "the manual-override flag rode along");
 
         let raw_files: i64 = conn
@@ -3590,11 +3594,7 @@ mod tests {
         struct Seen(Arc<Mutex<Vec<(String, String)>>>);
         struct Message(String);
         impl tracing::field::Visit for Message {
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
                     self.0 = format!("{value:?}");
                 }
@@ -3690,7 +3690,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(frame_id, reg.master_frame_id, "rebuild must preserve frames.id");
+        assert_eq!(
+            frame_id, reg.master_frame_id,
+            "rebuild must preserve frames.id"
+        );
         assert_eq!(bayerpat.as_deref(), Some("GRBG"));
         assert_eq!(xbayroff, Some(1));
         assert_eq!(ybayroff, Some(0));
@@ -3714,7 +3717,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(header_rows, 1, "the refresh must not duplicate the blob row");
+        assert_eq!(
+            header_rows, 1,
+            "the refresh must not duplicate the blob row"
+        );
 
         // files row: size follows disk — that is what makes the next library
         // scan classify the rebuilt master as unchanged instead of re-parsing.
@@ -3739,7 +3745,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(member, 1, "the master's calibration_set membership survives");
+        assert_eq!(
+            member, 1,
+            "the master's calibration_set membership survives"
+        );
         let prov = crate::db::master_provenance::get(&conn, reg.master_set_id)
             .unwrap()
             .unwrap();
@@ -3872,7 +3881,10 @@ mod tests {
         let after = crate::db::master_provenance::get(&conn, reg.master_set_id)
             .unwrap()
             .unwrap();
-        assert_eq!(after.member_hash, before.member_hash, "provenance rolled back");
+        assert_eq!(
+            after.member_hash, before.member_hash,
+            "provenance rolled back"
+        );
         assert_eq!(after.recipe_json, before.recipe_json);
         assert_eq!(after.created_at, before.created_at);
 
@@ -3941,7 +3953,10 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
             image_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap(),
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
             ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),

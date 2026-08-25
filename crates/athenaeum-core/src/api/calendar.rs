@@ -104,15 +104,15 @@ pub fn get_calendar_month_data(
     for row_result in frame_set_rows {
         let (obs_date, frame_set) = row_result.map_err(|e| anyhow!("Failed to read row: {}", e))?;
 
-        let event = events_by_date.entry(obs_date.clone()).or_insert_with(|| {
-            CalendarDayEvent {
+        let event = events_by_date
+            .entry(obs_date.clone())
+            .or_insert_with(|| CalendarDayEvent {
                 date: obs_date,
                 frame_sets: Vec::new(),
                 unorganized_groups: Vec::new(),
                 total_frame_count: 0,
                 total_exposure_seconds: 0.0,
-            }
-        });
+            });
 
         event.total_frame_count += frame_set.frame_count;
         event.total_exposure_seconds += frame_set.total_exposure_seconds;
@@ -175,7 +175,12 @@ pub fn get_calendar_month_data(
 
             // Create a pseudo-ID based on date and location status
             let id = if avg_ra.is_some() {
-                format!("{}_{:.1}_{:.1}", obs_date, avg_ra.unwrap_or(0.0), avg_dec.unwrap_or(0.0))
+                format!(
+                    "{}_{:.1}_{:.1}",
+                    obs_date,
+                    avg_ra.unwrap_or(0.0),
+                    avg_dec.unwrap_or(0.0)
+                )
             } else {
                 format!("{}_unlocated", obs_date)
             };
@@ -200,15 +205,15 @@ pub fn get_calendar_month_data(
         let (obs_date, unorganized_group) =
             row_result.map_err(|e| anyhow!("Failed to read row: {}", e))?;
 
-        let event = events_by_date.entry(obs_date.clone()).or_insert_with(|| {
-            CalendarDayEvent {
+        let event = events_by_date
+            .entry(obs_date.clone())
+            .or_insert_with(|| CalendarDayEvent {
                 date: obs_date,
                 frame_sets: Vec::new(),
                 unorganized_groups: Vec::new(),
                 total_frame_count: 0,
                 total_exposure_seconds: 0.0,
-            }
-        });
+            });
 
         event.total_frame_count += unorganized_group.frame_count;
         event.total_exposure_seconds += unorganized_group.total_exposure_seconds;
@@ -248,7 +253,11 @@ mod tests {
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format)
              VALUES (?1, ?2, ?3, 1024, '2026-01-01T00:00:00Z', 'FITS')",
-            params![id, format!("/tmp/frame_{id}.fits"), format!("frame_{id}.fits")],
+            params![
+                id,
+                format!("/tmp/frame_{id}.fits"),
+                format!("frame_{id}.fits")
+            ],
         )
         .unwrap();
         conn.execute(
@@ -272,7 +281,11 @@ mod tests {
 
         assert_eq!(data.year, 2026);
         assert_eq!(data.month, 3);
-        assert_eq!(data.days.len(), 2, "one entry per imaging date in the month");
+        assert_eq!(
+            data.days.len(),
+            2,
+            "one entry per imaging date in the month"
+        );
         assert_eq!(data.total_frame_count, 2);
         assert_eq!(data.total_exposure_seconds, 420.0);
 

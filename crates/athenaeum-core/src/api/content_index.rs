@@ -640,9 +640,7 @@ mod tests {
     impl ProgressEmitter for CancelOnFirstProgress {
         fn emit_json(&self, event_name: &str, _payload: serde_json::Value) {
             use std::sync::atomic::Ordering;
-            if event_name != "content-index-progress"
-                || self.fired.swap(true, Ordering::SeqCst)
-            {
+            if event_name != "content-index-progress" || self.fired.swap(true, Ordering::SeqCst) {
                 return;
             }
             let job = self

@@ -669,7 +669,9 @@ fn holder_online(h: &HolderWire, now: chrono::DateTime<chrono::Utc>) -> bool {
     h.last_seen_at
         .as_deref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().abs() <= HOLDER_ONLINE_WINDOW_SECS)
+        .map(|t| {
+            (now - t.with_timezone(&chrono::Utc)).num_seconds().abs() <= HOLDER_ONLINE_WINDOW_SECS
+        })
         .unwrap_or(false)
 }
 
@@ -858,7 +860,10 @@ fn kick_auto_sync_if_changed(changes: &[PackageStateChange]) -> bool {
     // pass is running is not lost — the next wait consumes it immediately — and
     // several kicks in one window collapse into a single follow-up pass.
     auto_sync_kick().notify_one();
-    tracing::debug!(count = changes.len(), "collab auto-sync kicked by a package-set change");
+    tracing::debug!(
+        count = changes.len(),
+        "collab auto-sync kicked by a package-set change"
+    );
     true
 }
 
@@ -1202,7 +1207,10 @@ pub async fn seed_approved_announcement(ctx: &ServiceContext, announcement_id: &
         match crate::db::collab_exchange::get_package_by_announcement(&conn, announcement_id) {
             Ok(Some(row)) => row.package_id,
             Ok(None) => {
-                tracing::debug!(announcement_id, "approved-package seed skipped: no local package row");
+                tracing::debug!(
+                    announcement_id,
+                    "approved-package seed skipped: no local package row"
+                );
                 return;
             }
             Err(e) => {
@@ -1645,7 +1653,9 @@ pub async fn download_project_package(
     // ── Fresh poll: upsert the row AND read the package's current holders. ────
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
         set_download_failed(ctx, project_id, package_id, None);
-        return Err(ApiError::SignedOut("Sign in to download a project package.".into()));
+        return Err(ApiError::SignedOut(
+            "Sign in to download a project package.".into(),
+        ));
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
     let anns = match client.list_announcements(&token, project_id).await {
@@ -1663,7 +1673,11 @@ pub async fn download_project_package(
 
     // The freshly-polled announcement for this package (keyed by hub uuid).
     let Some(ann) = anns.into_iter().find(|a| a.package_id == package_id) else {
-        tracing::warn!(project_id, package_id, "download: hub no longer lists this package");
+        tracing::warn!(
+            project_id,
+            package_id,
+            "download: hub no longer lists this package"
+        );
         set_download_failed(ctx, project_id, package_id, None);
         return Ok(());
     };
@@ -1683,7 +1697,11 @@ pub async fn download_project_package(
         .collect();
 
     if holders.is_empty() {
-        tracing::warn!(project_id, package_id, "download: no other holder to pull from");
+        tracing::warn!(
+            project_id,
+            package_id,
+            "download: no other holder to pull from"
+        );
         set_download_failed(ctx, project_id, package_id, None);
         return Ok(());
     }
@@ -1722,9 +1740,13 @@ pub async fn download_project_package(
     // without one the trait's default bails, which no retry can change).
     let mut swarm_attempt: Option<SwarmStage> = None;
     let swarm_transport_capable = node.is_some();
-    if let Some(providers) =
-        swarm_fetch_plan(&holders, own_node, swarm_capable, &swarm_unfit_snapshot(), package_id)
-    {
+    if let Some(providers) = swarm_fetch_plan(
+        &holders,
+        own_node,
+        swarm_capable,
+        &swarm_unfit_snapshot(),
+        package_id,
+    ) {
         // The swarm rides the COLLAB role handle when a node is bound (its
         // in-flight tag then lands under `in-flight/collab/pkg/…`, outside the
         // prefix the receiver's B7 orphan sweep reclaims — see the role note on
@@ -1824,11 +1846,13 @@ pub async fn download_project_package(
         // any direct addrs (S1). A loopback runtime (no bound node) routes
         // in-process and needs no hint.
         if let Some(node) = &node {
-            let reported = holder_relay.as_ref().map(|url| crate::account::EndpointAddrReport {
-                home_relay_url: Some(url.clone()),
-                direct_addrs: Vec::new(),
-                reported_at: None,
-            });
+            let reported = holder_relay
+                .as_ref()
+                .map(|url| crate::account::EndpointAddrReport {
+                    home_relay_url: Some(url.clone()),
+                    direct_addrs: Vec::new(),
+                    reported_at: None,
+                });
             match pairing::peer_dial_addr(*holder_node, reported.as_ref(), &relay_urls, true) {
                 Ok(addr) => node.add_peer(addr),
                 Err(e) => {
@@ -1898,10 +1922,18 @@ pub async fn download_project_package(
     let detail = if probe_failures.is_empty() {
         None
     } else {
-        Some(format!("no holder delivered — {}", probe_failures.join("; ")))
+        Some(format!(
+            "no holder delivered — {}",
+            probe_failures.join("; ")
+        ))
     };
     set_download_failed(ctx, project_id, package_id, detail);
-    tracing::warn!(project_id, package_id, holders = holders.len(), "download failed: no holder delivered");
+    tracing::warn!(
+        project_id,
+        package_id,
+        holders = holders.len(),
+        "download failed: no holder delivered"
+    );
     Ok(())
 }
 
@@ -1946,11 +1978,13 @@ async fn try_swarm_download(
     // the fetch — the others still serve.
     if let Some(node) = node {
         for (holder, relay) in providers {
-            let reported = relay.as_ref().map(|url| crate::account::EndpointAddrReport {
-                home_relay_url: Some(url.clone()),
-                direct_addrs: Vec::new(),
-                reported_at: None,
-            });
+            let reported = relay
+                .as_ref()
+                .map(|url| crate::account::EndpointAddrReport {
+                    home_relay_url: Some(url.clone()),
+                    direct_addrs: Vec::new(),
+                    reported_at: None,
+                });
             match pairing::peer_dial_addr(*holder, reported.as_ref(), relay_urls, true) {
                 Ok(addr) => node.add_peer(addr),
                 Err(e) => tracing::warn!(
@@ -1971,7 +2005,10 @@ async fn try_swarm_download(
     let _receive_permit = match sync.inbound_control().await {
         Some(control) => Some(control.receive_gate.acquire().await),
         None => {
-            tracing::debug!(package_id, "swarm download: no receiver started; no receive permit");
+            tracing::debug!(
+                package_id,
+                "swarm download: no receiver started; no receive permit"
+            );
             None
         }
     };
@@ -1989,7 +2026,13 @@ async fn try_swarm_download(
             },
         );
     }
-    tracing::info!(project_id, package_id, sources, root_hash, "swarm download attempt");
+    tracing::info!(
+        project_id,
+        package_id,
+        sources,
+        root_hash,
+        "swarm download attempt"
+    );
 
     // Per-provider journal. There is no collab-side `sync_events` journal to
     // write to — that table is keyed by a transfer's `batch_key` and a project
@@ -2583,7 +2626,10 @@ pub async fn run_collab_auto_sync_loop(
     emitter: Option<Arc<dyn ProgressEmitter>>,
     interval: std::time::Duration,
 ) {
-    tracing::info!(interval_secs = interval.as_secs(), "collab auto-sync loop armed");
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "collab auto-sync loop armed"
+    );
     auto_sync_loop_inner(
         COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval),
         interval,
@@ -2767,7 +2813,9 @@ pub async fn export_project_for_wbpp(
             .map_err(|e| ApiError::Internal(format!("active_exports lock poisoned: {e}")))?;
         exports.insert(
             SENTINEL,
-            crate::services::ExportHandle { cancel_flag: cancel_flag.clone() },
+            crate::services::ExportHandle {
+                cancel_flag: cancel_flag.clone(),
+            },
         );
     }
 
@@ -3067,8 +3115,7 @@ mod tests {
         payload: &[u8],
     ) -> Vec<u8> {
         let rel_path = "L_0001.fits";
-        let (manifest_bytes, anchor, rec) =
-            one_frame_manifest(rel_path, payload, project_id, hub);
+        let (manifest_bytes, anchor, rec) = one_frame_manifest(rel_path, payload, project_id, hub);
         let landed = landing.join(hub).join(rel_path);
         std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
         std::fs::write(&landed, payload).unwrap();
@@ -3180,8 +3227,15 @@ mod tests {
         let conn = test_conn();
         let landing = tmp.path().join("land");
         let payload = b"the-frame-payload-bytes";
-        let manifest_bytes =
-            seed_received_package(&conn, &landing, "p-1", "hub-1", "Alice", "published", payload);
+        let manifest_bytes = seed_received_package(
+            &conn,
+            &landing,
+            "p-1",
+            "hub-1",
+            "Alice",
+            "published",
+            payload,
+        );
 
         let sync_dir = tmp.path().join("sync");
         let dir = reconstruct_serve_dir(&conn, &sync_dir, "hub-1").unwrap();
@@ -3189,7 +3243,10 @@ mod tests {
 
         // Manifest byte-exact.
         let got = std::fs::read(dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
-        assert_eq!(got, manifest_bytes, "manifest.ndjson byte-identical to the retained bytes");
+        assert_eq!(
+            got, manifest_bytes,
+            "manifest.ndjson byte-identical to the retained bytes"
+        );
 
         // Payload present, correct content, and HARD-LINKED to the landed file.
         let served = dir.join("L_0001.fits");
@@ -3197,7 +3254,11 @@ mod tests {
         let landed = landing.join("hub-1").join("L_0001.fits");
         let m_served = std::fs::metadata(&served).unwrap();
         let m_landed = std::fs::metadata(&landed).unwrap();
-        assert_eq!(m_served.ino(), m_landed.ino(), "serve payload is a hard link (same inode)");
+        assert_eq!(
+            m_served.ino(),
+            m_landed.ino(),
+            "serve payload is a hard link (same inode)"
+        );
         assert_eq!(m_served.dev(), m_landed.dev());
         assert!(m_landed.nlink() >= 2, "landed file now has >=2 links");
 
@@ -3214,7 +3275,15 @@ mod tests {
         let conn = test_conn();
         let landing = tmp.path().join("land");
         let payload = b"payload-xyz";
-        seed_received_package(&conn, &landing, "p-1", "hub-1", "Alice", "published", payload);
+        seed_received_package(
+            &conn,
+            &landing,
+            "p-1",
+            "hub-1",
+            "Alice",
+            "published",
+            payload,
+        );
         let sync_dir = tmp.path().join("sync");
 
         let dir1 = reconstruct_serve_dir(&conn, &sync_dir, "hub-1").unwrap();
@@ -3222,7 +3291,10 @@ mod tests {
         let dir2 = reconstruct_serve_dir(&conn, &sync_dir, "hub-1").unwrap();
         assert_eq!(dir1, dir2);
         let ino2 = std::fs::metadata(dir2.join("L_0001.fits")).unwrap().ino();
-        assert_eq!(ino1, ino2, "idempotent — payload untouched on the second call");
+        assert_eq!(
+            ino1, ino2,
+            "idempotent — payload untouched on the second call"
+        );
         crate::package::validate_package(&dir2).unwrap();
     }
 
@@ -3234,7 +3306,11 @@ mod tests {
         let conn = test_conn();
         let pub_dir = tmp.path().join("collab_pub").join("hub-mine");
         std::fs::create_dir_all(&pub_dir).unwrap();
-        std::fs::write(pub_dir.join(crate::package::MANIFEST_FILENAME), b"retained-manifest\n").unwrap();
+        std::fs::write(
+            pub_dir.join(crate::package::MANIFEST_FILENAME),
+            b"retained-manifest\n",
+        )
+        .unwrap();
 
         let mut row = base_package("hub-mine", "p-1", "Me");
         row.own = true;
@@ -3245,7 +3321,10 @@ mod tests {
         let sync_dir = tmp.path().join("sync");
         let dir = reconstruct_serve_dir(&conn, &sync_dir, "hub-mine").unwrap();
         assert_eq!(dir, pub_dir, "origin=mine returns the retained local_dir");
-        assert!(!sync_dir.join("collab_serve").exists(), "mine never materializes a serve dir");
+        assert!(
+            !sync_dir.join("collab_serve").exists(),
+            "mine never materializes a serve dir"
+        );
         assert_eq!(
             std::fs::read(pub_dir.join(crate::package::MANIFEST_FILENAME)).unwrap(),
             b"retained-manifest\n",
@@ -3269,8 +3348,14 @@ mod tests {
         let sink = CollabCleanupSink;
         sink.on_terminal(&serve);
         sink.on_terminal(&pubd);
-        assert!(!serve.exists(), "a reconstructed collab_serve dir is cleaned on terminal");
-        assert!(pubd.exists(), "a retained collab_pub publication survives (Д4)");
+        assert!(
+            !serve.exists(),
+            "a reconstructed collab_serve dir is cleaned on terminal"
+        );
+        assert!(
+            pubd.exists(),
+            "a retained collab_pub publication survives (Д4)"
+        );
         // Idempotent — a second terminal on the already-gone serve dir is a no-op.
         sink.on_terminal(&serve);
     }
@@ -3285,15 +3370,29 @@ mod tests {
         let conn = test_conn();
         seed_project(&conn, "p-1", &members_json());
         let landing = tmp.path().join("land");
-        seed_received_package(&conn, &landing, "p-1", "hub-1", "Alice", "published", b"payload");
+        seed_received_package(
+            &conn,
+            &landing,
+            "p-1",
+            "hub-1",
+            "Alice",
+            "published",
+            b"payload",
+        );
         let sync_dir = tmp.path().join("sync");
 
         let auth = |node: &NodeId| {
             authorize_and_reconstruct_serve(&conn, &sync_dir, node, "p-1", "hub-1").unwrap()
         };
         assert!(auth(&NODE_COORD).is_some(), "coordinator is served");
-        assert!(auth(&NODE_SR).is_some(), "send_receive member is served a published package");
-        assert!(auth(&NODE_SEND_ONLY).is_none(), "send-only contributor is refused");
+        assert!(
+            auth(&NODE_SR).is_some(),
+            "send_receive member is served a published package"
+        );
+        assert!(
+            auth(&NODE_SEND_ONLY).is_none(),
+            "send-only contributor is refused"
+        );
         assert!(auth(&STRANGER).is_none(), "a non-member is refused");
     }
 
@@ -3304,15 +3403,26 @@ mod tests {
         let conn = test_conn();
         seed_project(&conn, "p-1", &members_json());
         let landing = tmp.path().join("land");
-        seed_received_package(&conn, &landing, "p-1", "hub-p", "Alice", "pending", b"payload");
+        seed_received_package(
+            &conn, &landing, "p-1", "hub-p", "Alice", "pending", b"payload",
+        );
         let sync_dir = tmp.path().join("sync");
 
         let auth = |node: &NodeId| {
             authorize_and_reconstruct_serve(&conn, &sync_dir, node, "p-1", "hub-p").unwrap()
         };
-        assert!(auth(&NODE_COORD).is_some(), "pending → coordinator is served");
-        assert!(auth(&NODE_SR).is_none(), "pending → send_receive non-coordinator refused");
-        assert!(auth(&NODE_SEND_ONLY).is_none(), "pending → send-only refused");
+        assert!(
+            auth(&NODE_COORD).is_some(),
+            "pending → coordinator is served"
+        );
+        assert!(
+            auth(&NODE_SR).is_none(),
+            "pending → send_receive non-coordinator refused"
+        );
+        assert!(
+            auth(&NODE_SEND_ONLY).is_none(),
+            "pending → send-only refused"
+        );
     }
 
     /// Unknown / incomplete / project-mismatch requests are refused as Ok(None).
@@ -3325,26 +3435,54 @@ mod tests {
         let landing = tmp.path().join("land");
 
         // Unknown package row.
-        assert!(authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-1", "nope")
-            .unwrap()
-            .is_none());
+        assert!(
+            authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-1", "nope")
+                .unwrap()
+                .is_none()
+        );
 
         // Received but NOT complete.
-        seed_received_package(&conn, &landing, "p-1", "hub-inc", "Alice", "published", b"payload");
+        seed_received_package(
+            &conn,
+            &landing,
+            "p-1",
+            "hub-inc",
+            "Alice",
+            "published",
+            b"payload",
+        );
         crate::db::collab_exchange::set_local_status(&conn, "hub-inc", "downloading").unwrap();
-        assert!(authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-1", "hub-inc")
-            .unwrap()
-            .is_none());
+        assert!(
+            authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-1", "hub-inc")
+                .unwrap()
+                .is_none()
+        );
 
         // Complete, but the request names a DIFFERENT project than the package's.
-        seed_received_package(&conn, &landing, "p-1", "hub-ok", "Alice", "published", b"payload2");
-        assert!(authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-OTHER", "hub-ok")
-            .unwrap()
-            .is_none());
+        seed_received_package(
+            &conn,
+            &landing,
+            "p-1",
+            "hub-ok",
+            "Alice",
+            "published",
+            b"payload2",
+        );
+        assert!(authorize_and_reconstruct_serve(
+            &conn,
+            &sync_dir,
+            &NODE_COORD,
+            "p-OTHER",
+            "hub-ok"
+        )
+        .unwrap()
+        .is_none());
         // Sanity: the same package with the correct project id is served.
-        assert!(authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-1", "hub-ok")
-            .unwrap()
-            .is_some());
+        assert!(
+            authorize_and_reconstruct_serve(&conn, &sync_dir, &NODE_COORD, "p-1", "hub-ok")
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A refused request through `handle_project_request` returns Ok and never
@@ -3358,14 +3496,32 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             seed_project(&conn, "p-1", &members_json());
-            seed_received_package(&conn, &tmp.path().join("land"), "p-1", "hub-1", "Alice", "published", b"payload");
+            seed_received_package(
+                &conn,
+                &tmp.path().join("land"),
+                "p-1",
+                "hub-1",
+                "Alice",
+                "published",
+                b"payload",
+            );
         }
         let sender = SyncSenderRuntime::new();
         // A send-only contributor's request is silently refused.
-        handle_project_request(&ctx, &sender, NODE_SEND_ONLY, "p-1".into(), "hub-1".into(), None)
-            .await
-            .unwrap();
-        assert!(!sender.is_started().await, "a refused request never starts a collab engine");
+        handle_project_request(
+            &ctx,
+            &sender,
+            NODE_SEND_ONLY,
+            "p-1".into(),
+            "hub-1".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !sender.is_started().await,
+            "a refused request never starts a collab engine"
+        );
         assert!(sender.started_peers().await.is_empty());
     }
 
@@ -3397,7 +3553,10 @@ mod tests {
 
         let views = list_project_packages(&ctx, "p-1").unwrap();
         assert_eq!(
-            views.iter().map(|v| v.package_id.as_str()).collect::<Vec<_>>(),
+            views
+                .iter()
+                .map(|v| v.package_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["hub-2", "hub-1"],
             "newest announcement first, scoped to p-1"
         );
@@ -3444,7 +3603,10 @@ mod tests {
         assert_eq!(views[0].frame_uuid, "u-1");
         assert_eq!(views[0].publisher, "Alice");
         assert_eq!(views[0].byte_size, 2048);
-        assert!(!views[0].created_at.is_empty(), "created_at defaulted by SQL");
+        assert!(
+            !views[0].created_at.is_empty(),
+            "created_at defaulted by SQL"
+        );
         assert!(list_contributions(&ctx, "p-none").unwrap().is_empty());
     }
 
@@ -3495,7 +3657,15 @@ mod tests {
         let a_landing = tmp.path().join("a_land");
         let manifest_bytes = {
             let c = a_db.conn();
-            seed_received_package(&c, &a_landing, PROJECT_ID, HUB, PUBLISHER, "published", payload)
+            seed_received_package(
+                &c,
+                &a_landing,
+                PROJECT_ID,
+                HUB,
+                PUBLISHER,
+                "published",
+                payload,
+            )
         };
         let anchor = hash_bytes(&manifest_bytes);
         let a_sync_dir = tmp.path().join("a_sync");
@@ -3538,7 +3708,10 @@ mod tests {
             tmp.path().join("b_stage"),
             Arc::new(move || b_incoming.clone()),
             allow_all_peers(),
-            ProjectReceiveHooks { gate: Some(gate), ..Default::default() },
+            ProjectReceiveHooks {
+                gate: Some(gate),
+                ..Default::default()
+            },
             Arc::new(crate::sync::InboundControl::new()),
             Arc::clone(&b_ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
@@ -3573,8 +3746,16 @@ mod tests {
         // served bytes.
         let rows = {
             let c = b_db.conn();
-            assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 0, "contributions never enter files");
-            assert_eq!(count(&c, "SELECT COUNT(*) FROM frames"), 0, "contributions never enter frames");
+            assert_eq!(
+                count(&c, "SELECT COUNT(*) FROM files"),
+                0,
+                "contributions never enter files"
+            );
+            assert_eq!(
+                count(&c, "SELECT COUNT(*) FROM frames"),
+                0,
+                "contributions never enter frames"
+            );
             contributions_for_package(&c, HUB).unwrap()
         };
         assert_eq!(rows.len(), 1, "B landed the served frame as a contribution");
@@ -3607,9 +3788,9 @@ mod tests {
         use crate::services::operation_queue::OperationQueue;
         use crate::settings::SettingsManager;
         use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
         #[cfg(all(feature = "render", feature = "solver"))]
         use std::sync::RwLock;
+        use std::sync::{Mutex, OnceLock};
 
         let tmp = tempfile::tempdir().unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
@@ -3633,7 +3814,12 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -3700,8 +3886,24 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p-1/announcements"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-f", "pkg-foreign", false, "published", &[], None, serde_json::json!([])),
-                ann_json("ann-mine", "pkg-mine", true, "published", &[], None, serde_json::json!([])),
+                ann_json(
+                    "ann-f",
+                    "pkg-foreign",
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([])
+                ),
+                ann_json(
+                    "ann-mine",
+                    "pkg-mine",
+                    true,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([])
+                ),
             ])))
             .mount(&server)
             .await;
@@ -3710,7 +3912,11 @@ mod tests {
         wire_hub(&ctx, &server.uri());
 
         let changes = refresh_project_packages(&ctx, "p-1").await.unwrap();
-        assert_eq!(changes.len(), 1, "only the foreign published package is a newPackage");
+        assert_eq!(
+            changes.len(),
+            1,
+            "only the foreign published package is a newPackage"
+        );
         assert_eq!(changes[0].kind, "newPackage");
         assert_eq!(changes[0].package_id, "pkg-foreign");
         assert_eq!(changes[0].project_id, "p-1");
@@ -3737,9 +3943,17 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p-1/announcements"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-p", "pkg-pending", false, "pending", &[], None, serde_json::json!([])),
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([ann_json(
+                    "ann-p",
+                    "pkg-pending",
+                    false,
+                    "pending",
+                    &[],
+                    None,
+                    serde_json::json!([])
+                ),])),
+            )
             .mount(&server)
             .await;
 
@@ -3747,7 +3961,11 @@ mod tests {
         wire_hub(&ctx, &server.uri());
 
         let changes = refresh_project_packages(&ctx, "p-1").await.unwrap();
-        assert_eq!(changes.len(), 1, "a foreign pending row is one awaitingApproval change");
+        assert_eq!(
+            changes.len(),
+            1,
+            "a foreign pending row is one awaitingApproval change"
+        );
         assert_eq!(changes[0].kind, "awaitingApproval");
         assert_eq!(changes[0].package_id, "pkg-pending");
         assert_eq!(changes[0].project_id, "p-1");
@@ -3758,7 +3976,10 @@ mod tests {
 
         // Second poll: the row is now known and still pending → no diff.
         let again = refresh_project_packages(&ctx, "p-1").await.unwrap();
-        assert!(again.is_empty(), "a known pending row raises nothing on re-poll");
+        assert!(
+            again.is_empty(),
+            "a known pending row raises nothing on re-poll"
+        );
     }
 
     /// An own package moving `pending → published` across two polls diffs as
@@ -3774,22 +3995,47 @@ mod tests {
         let server1 = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p-1/announcements"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-1", "pkg-own", true, "pending", &[], None, serde_json::json!([]))
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([ann_json(
+                    "ann-1",
+                    "pkg-own",
+                    true,
+                    "pending",
+                    &[],
+                    None,
+                    serde_json::json!([])
+                )])),
+            )
             .mount(&server1)
             .await;
         wire_hub(&ctx, &server1.uri());
-        assert!(refresh_project_packages(&ctx, "p-1").await.unwrap().is_empty());
-        assert_eq!(get_package(&db(&ctx).unwrap().conn(), "pkg-own").unwrap().unwrap().state, "pending");
+        assert!(refresh_project_packages(&ctx, "p-1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            get_package(&db(&ctx).unwrap().conn(), "pkg-own")
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
 
         // Poll 2: the same package is now published → approved.
         let server2 = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p-1/announcements"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-1", "pkg-own", true, "published", &[], None, serde_json::json!([]))
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([ann_json(
+                    "ann-1",
+                    "pkg-own",
+                    true,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([])
+                )])),
+            )
             .mount(&server2)
             .await;
         wire_hub(&ctx, &server2.uri());
@@ -3800,7 +4046,10 @@ mod tests {
 
         // Idempotent: a third identical poll raises nothing (already published).
         let changes2 = refresh_project_packages(&ctx, "p-1").await.unwrap();
-        assert!(changes2.is_empty(), "re-polling a published row does not re-approve");
+        assert!(
+            changes2.is_empty(),
+            "re-polling a published row does not re-approve"
+        );
     }
 
     /// A known package moving to `rejected` diffs as `rejected` carrying the hub
@@ -3824,9 +4073,17 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p-1/announcements"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-r", "pkg-r", true, "rejected", &[], Some("FWHM too high"), serde_json::json!([]))
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([ann_json(
+                    "ann-r",
+                    "pkg-r",
+                    true,
+                    "rejected",
+                    &[],
+                    Some("FWHM too high"),
+                    serde_json::json!([])
+                )])),
+            )
             .mount(&server)
             .await;
         wire_hub(&ctx, &server.uri());
@@ -3835,7 +4092,9 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, "rejected");
         assert_eq!(changes[0].detail.as_deref(), Some("FWHM too high"));
-        let row = get_package(&db(&ctx).unwrap().conn(), "pkg-r").unwrap().unwrap();
+        let row = get_package(&db(&ctx).unwrap().conn(), "pkg-r")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, "rejected");
         assert_eq!(row.reject_reason.as_deref(), Some("FWHM too high"));
     }
@@ -3871,18 +4130,27 @@ mod tests {
         {
             let conn = db(&ctx).unwrap().conn();
             let old = get_package(&conn, "pkg-old").unwrap().unwrap();
-            assert!(old.superseded, "pkg-old is superseded by ann-new's supersedes list");
+            assert!(
+                old.superseded,
+                "pkg-old is superseded by ann-new's supersedes list"
+            );
             let new = get_package(&conn, "pkg-new").unwrap().unwrap();
             assert!(!new.superseded, "pkg-new is not superseded");
             assert_eq!(new.holder_count, 2, "holder_count = holders.len()");
-            assert_eq!(new.online_count, 1, "only the recently-seen holder counts as online");
+            assert_eq!(
+                new.online_count, 1,
+                "only the recently-seen holder counts as online"
+            );
         }
 
         // Re-poll: every upsert rewrote superseded=0, but the comprehensive
         // re-mark restores it (T3 hazard).
         refresh_project_packages(&ctx, "p-1").await.unwrap();
         assert!(
-            get_package(&db(&ctx).unwrap().conn(), "pkg-old").unwrap().unwrap().superseded,
+            get_package(&db(&ctx).unwrap().conn(), "pkg-old")
+                .unwrap()
+                .unwrap()
+                .superseded,
             "own supersede flag survives a re-poll"
         );
     }
@@ -3903,8 +4171,13 @@ mod tests {
             seed_project(&conn, "p-1", &members);
         }
         let sync = crate::sync::SyncRuntime::new();
-        let err = download_project_package(&ctx, &sync, "p-1", "pkg-x", None).await.unwrap_err();
-        assert!(matches!(err, ApiError::Invalid(_)), "send-only is fail-closed Invalid, got {err:?}");
+        let err = download_project_package(&ctx, &sync, "p-1", "pkg-x", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(_)),
+            "send-only is fail-closed Invalid, got {err:?}"
+        );
     }
 
     /// F3: a download whose holders are exhausted lands `failed` AND buffers a
@@ -3934,18 +4207,31 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p-1/announcements"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-x", "pkg-x", false, "published", &[], None, serde_json::json!([]))
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([ann_json(
+                    "ann-x",
+                    "pkg-x",
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([])
+                )])),
+            )
             .mount(&server)
             .await;
         wire_hub(&ctx, &server.uri());
 
         let sync = crate::sync::SyncRuntime::new();
         // Role passes, poll finds the package, no other holder to pull from ⇒ failed.
-        download_project_package(&ctx, &sync, "p-1", "pkg-x", None).await.unwrap();
+        download_project_package(&ctx, &sync, "p-1", "pkg-x", None)
+            .await
+            .unwrap();
         assert_eq!(
-            get_package(&db(&ctx).unwrap().conn(), "pkg-x").unwrap().unwrap().local_status,
+            get_package(&db(&ctx).unwrap().conn(), "pkg-x")
+                .unwrap()
+                .unwrap()
+                .local_status,
             "failed",
             "an exhausted download lands failed"
         );
@@ -3959,7 +4245,11 @@ mod tests {
             .iter()
             .filter(|c| c.kind == "downloadFailed" && c.package_id == "pkg-x")
             .collect();
-        assert_eq!(dl_failed.len(), 1, "exactly one buffered downloadFailed drained");
+        assert_eq!(
+            dl_failed.len(),
+            1,
+            "exactly one buffered downloadFailed drained"
+        );
         assert_eq!(dl_failed[0].project_id, "p-1");
 
         // Drained exactly once — a second refresh surfaces no more.
@@ -4061,7 +4351,10 @@ mod tests {
         set_download_failed(&ctx, "p-1", "pkg-done", Some("no holder delivered".into()));
 
         assert_eq!(
-            get_package(&db(&ctx).unwrap().conn(), "pkg-done").unwrap().unwrap().local_status,
+            get_package(&db(&ctx).unwrap().conn(), "pkg-done")
+                .unwrap()
+                .unwrap()
+                .local_status,
             "complete",
             "a landed package keeps its status"
         );
@@ -4083,14 +4376,26 @@ mod tests {
         broken.local_status = "failed".to_string();
         upsert_package(&conn, &broken).unwrap();
 
-        assert!(!rearm_for_fallback(&conn, "pkg-done").unwrap(), "complete is left alone");
+        assert!(
+            !rearm_for_fallback(&conn, "pkg-done").unwrap(),
+            "complete is left alone"
+        );
         assert_eq!(
-            get_package(&conn, "pkg-done").unwrap().unwrap().local_status,
+            get_package(&conn, "pkg-done")
+                .unwrap()
+                .unwrap()
+                .local_status,
             "complete"
         );
-        assert!(rearm_for_fallback(&conn, "pkg-broken").unwrap(), "a failed row re-arms");
+        assert!(
+            rearm_for_fallback(&conn, "pkg-broken").unwrap(),
+            "a failed row re-arms"
+        );
         assert_eq!(
-            get_package(&conn, "pkg-broken").unwrap().unwrap().local_status,
+            get_package(&conn, "pkg-broken")
+                .unwrap()
+                .unwrap()
+                .local_status,
             "downloading"
         );
     }
@@ -4123,7 +4428,15 @@ mod tests {
         let a_db = crate::db::Database::new(a_tmp.path().join("a_catalog.db")).unwrap();
         let manifest_bytes = {
             let c = a_db.conn();
-            seed_received_package(&c, &a_tmp.path().join("a_land"), PROJECT, HUB, "Alice", "published", payload)
+            seed_received_package(
+                &c,
+                &a_tmp.path().join("a_land"),
+                PROJECT,
+                HUB,
+                "Alice",
+                "published",
+                payload,
+            )
         };
         // The hub-anchored manifest hash the receiver verifies the served bytes
         // against — must be the REAL anchor of A's manifest, not a placeholder.
@@ -4166,7 +4479,8 @@ mod tests {
                         .await;
                 });
             });
-        let a_recv_store = Arc::new(CatalogSyncStore::open(a_tmp.path().join("a_recv.db")).unwrap());
+        let a_recv_store =
+            Arc::new(CatalogSyncStore::open(a_tmp.path().join("a_recv.db")).unwrap());
         let a_incoming: crate::sync::receiver::IncomingResolver = {
             let p = a_tmp.path().join("a_incoming");
             Arc::new(move || p.clone())
@@ -4176,7 +4490,10 @@ mod tests {
             a_tmp.path().join("a_stage"),
             a_incoming,
             allow_all_peers(),
-            ProjectReceiveHooks { request_handler: Some(request_handler), ..Default::default() },
+            ProjectReceiveHooks {
+                request_handler: Some(request_handler),
+                ..Default::default()
+            },
             Arc::new(crate::sync::InboundControl::new()),
             Arc::new(a_recv_ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
@@ -4218,7 +4535,10 @@ mod tests {
             d_sync_dir.clone(),
             d_incoming,
             allow_all_peers(),
-            ProjectReceiveHooks { gate: Some(gate), ..Default::default() },
+            ProjectReceiveHooks {
+                gate: Some(gate),
+                ..Default::default()
+            },
             Arc::new(crate::sync::InboundControl::new()),
             Arc::clone(&d_ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
@@ -4228,33 +4548,39 @@ mod tests {
 
         let runtime = SyncRuntime::new();
         runtime
-            .set_started_for_test(Arc::clone(&d_ep) as Arc<dyn SharingTransport>, d_handle, "ticket".into())
+            .set_started_for_test(
+                Arc::clone(&d_ep) as Arc<dyn SharingTransport>,
+                d_handle,
+                "ticket".into(),
+            )
             .await;
 
         // ── Hub: list the package with A (recv node) as its holder + accept have. ─
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/api/v1/projects/{PROJECT}/announcements")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                "id": "ann-hub",
-                "packageId": HUB,
-                "publisherDisplayName": "Alice",
-                "own": false,
-                "rootHash": "a".repeat(64),
-                "byteSize": payload.len(),
-                "frameCount": 1,
-                // The REAL manifest anchor — the receiver verifies against it.
-                "aggregateStats": { "manifestXxh3": anchor },
-                "supersedes": [],
-                "state": "published",
-                "rejectReason": null,
-                "createdAt": "2026-07-13T00:00:00Z",
-                "decidedAt": null,
-                "holders": [
-                    { "pubkey": B64.encode(a_recv_node), "displayName": "Alice",
-                      "lastSeenAt": chrono::Utc::now().to_rfc3339() }
-                ],
-            }])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": "ann-hub",
+                    "packageId": HUB,
+                    "publisherDisplayName": "Alice",
+                    "own": false,
+                    "rootHash": "a".repeat(64),
+                    "byteSize": payload.len(),
+                    "frameCount": 1,
+                    // The REAL manifest anchor — the receiver verifies against it.
+                    "aggregateStats": { "manifestXxh3": anchor },
+                    "supersedes": [],
+                    "state": "published",
+                    "rejectReason": null,
+                    "createdAt": "2026-07-13T00:00:00Z",
+                    "decidedAt": null,
+                    "holders": [
+                        { "pubkey": B64.encode(a_recv_node), "displayName": "Alice",
+                          "lastSeenAt": chrono::Utc::now().to_rfc3339() }
+                    ],
+                }])),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -4266,7 +4592,9 @@ mod tests {
         wire_hub(&ctx, &server.uri());
 
         // ── Drive the download. ────────────────────────────────────────────────
-        download_project_package(&ctx, &runtime, PROJECT, HUB, None).await.unwrap();
+        download_project_package(&ctx, &runtime, PROJECT, HUB, None)
+            .await
+            .unwrap();
 
         // D holds the package: local_status complete, one landed contribution
         // (never into files/frames), and the hub was told we now have it.
@@ -4276,7 +4604,11 @@ mod tests {
             "complete",
             "the download loop observed the ingest"
         );
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0, "contributions never enter files");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM files"),
+            0,
+            "contributions never enter files"
+        );
         let landed = contributions_for_package(&conn, HUB).unwrap();
         assert_eq!(landed.len(), 1, "the served frame landed as a contribution");
         assert_eq!(std::fs::read(&landed[0].landed_path).unwrap(), payload);
@@ -4349,9 +4681,15 @@ mod tests {
     #[test]
     fn collection_hash_shape_is_64_hex() {
         assert!(looks_like_collection_hash(&"a".repeat(64)));
-        assert!(looks_like_collection_hash(&"F".repeat(64)), "case-insensitive");
+        assert!(
+            looks_like_collection_hash(&"F".repeat(64)),
+            "case-insensitive"
+        );
         assert!(!looks_like_collection_hash(""));
-        assert!(!looks_like_collection_hash("rh"), "the pre-D3 placeholder value");
+        assert!(
+            !looks_like_collection_hash("rh"),
+            "the pre-D3 placeholder value"
+        );
         assert!(!looks_like_collection_hash(&"a".repeat(63)));
         assert!(!looks_like_collection_hash(&"a".repeat(65)));
         assert!(!looks_like_collection_hash(&"g".repeat(64)), "not hex");
@@ -4475,7 +4813,11 @@ mod tests {
         .unwrap();
         let runtime = SyncRuntime::new();
         runtime
-            .set_started_for_test(Arc::clone(&ep) as Arc<dyn SharingTransport>, handle, "t".into())
+            .set_started_for_test(
+                Arc::clone(&ep) as Arc<dyn SharingTransport>,
+                handle,
+                "t".into(),
+            )
             .await;
 
         // The hub lists ONE holder that is not on the loopback network at all, so
@@ -4484,24 +4826,37 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/api/v1/projects/{PROJECT}/announcements")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                ann_json("ann-fb", HUB, false, "published", &[], None, serde_json::json!([
-                    { "pubkey": B64.encode(ghost), "displayName": "Ghost",
-                      "lastSeenAt": chrono::Utc::now().to_rfc3339() }
-                ]))
-            ])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([ann_json(
+                    "ann-fb",
+                    HUB,
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([
+                        { "pubkey": B64.encode(ghost), "displayName": "Ghost",
+                          "lastSeenAt": chrono::Utc::now().to_rfc3339() }
+                    ])
+                )])),
+            )
             .mount(&server)
             .await;
         wire_hub(&ctx, &server.uri());
 
-        download_project_package(&ctx, &runtime, PROJECT, HUB, None).await.unwrap();
+        download_project_package(&ctx, &runtime, PROJECT, HUB, None)
+            .await
+            .unwrap();
 
         assert!(
             swarm_unfit_snapshot().contains(HUB),
             "the failed swarm attempt cached a swarm-unfit verdict"
         );
         assert_eq!(
-            get_package(&db(&ctx).unwrap().conn(), HUB).unwrap().unwrap().local_status,
+            get_package(&db(&ctx).unwrap().conn(), HUB)
+                .unwrap()
+                .unwrap()
+                .local_status,
             "failed",
             "the call fell through to the sequential loop and exhausted it"
         );
@@ -4529,12 +4884,10 @@ mod tests {
     ) -> Arc<crate::sharing::iroh::node::SharedIrohNode> {
         let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx).unwrap();
         std::fs::create_dir_all(&sync_dir).unwrap();
-        let node = crate::sharing::iroh::node::SharedIrohNode::bind(
-            &sync_dir,
-            iroh::RelayMode::Disabled,
-        )
-        .await
-        .expect("bind relay-disabled node");
+        let node =
+            crate::sharing::iroh::node::SharedIrohNode::bind(&sync_dir, iroh::RelayMode::Disabled)
+                .await
+                .expect("bind relay-disabled node");
         *ctx.iroh_node.lock().await = Some(Arc::clone(&node));
         node
     }
@@ -4605,7 +4958,15 @@ mod tests {
         let landing = tmp.path().join("land");
         {
             let conn = db(&ctx).unwrap().conn();
-            seed_received_package(&conn, &landing, PROJECT, HUB, "Alice", "published", &payload);
+            seed_received_package(
+                &conn,
+                &landing,
+                PROJECT,
+                HUB,
+                "Alice",
+                "published",
+                &payload,
+            );
         }
         let node = bind_node_into(&ctx).await;
 
@@ -4617,7 +4978,10 @@ mod tests {
         // The seed target is NOT the serve dir.
         let (sync_dir, _db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
         let seed_dir = sync_dir.join(SEED_DIR).join(HUB);
-        assert!(seed_dir.join("L_0001.fits").exists(), "the seed dir holds the payload");
+        assert!(
+            seed_dir.join("L_0001.fits").exists(),
+            "the seed dir holds the payload"
+        );
 
         // Now do what a push-serve does: reconstruct the serve dir and let the
         // real cleanup sink take it at terminal.
@@ -4625,9 +4989,15 @@ mod tests {
             let conn = db(&ctx).unwrap().conn();
             reconstruct_serve_dir(&conn, &sync_dir, HUB).unwrap()
         };
-        assert_ne!(serve_dir, seed_dir, "the serve dir and the seed dir are separate trees");
+        assert_ne!(
+            serve_dir, seed_dir,
+            "the serve dir and the seed dir are separate trees"
+        );
         CollabCleanupSink.on_terminal(&serve_dir);
-        assert!(!serve_dir.exists(), "the serve dir is gone (the cleanup really ran)");
+        assert!(
+            !serve_dir.exists(),
+            "the serve dir is gone (the cleanup really ran)"
+        );
 
         // The seed is untouched and still servable.
         let out = tmp.path().join("exported");
@@ -4858,7 +5228,10 @@ mod tests {
             )
             .expect("B ingests the fetched package")
         };
-        assert!(outcome.failed.is_empty(), "every frame ingested: {outcome:?}");
+        assert!(
+            outcome.failed.is_empty(),
+            "every frame ingested: {outcome:?}"
+        );
         remove_swarm_staging(&staging);
         b_collab
             .release(&PackageId(root.to_hex().to_string()))
@@ -4931,10 +5304,7 @@ mod tests {
         c_node.shutdown().await;
     }
 
-    async fn tag_present_on(
-        node: &crate::sharing::iroh::node::SharedIrohNode,
-        name: &str,
-    ) -> bool {
+    async fn tag_present_on(node: &crate::sharing::iroh::node::SharedIrohNode, name: &str) -> bool {
         node.store()
             .tags()
             .get(name.as_bytes())
@@ -5063,10 +5433,15 @@ mod tests {
             // Give any concurrent caller a real chance to observe the overlap.
             tokio::task::yield_now().await;
             let fails = self.fail.lock().unwrap().contains(&package_id);
-            self.calls.lock().unwrap().push((project_id, package_id.clone()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((project_id, package_id.clone()));
             self.in_flight.store(false, Ordering::SeqCst);
             if fails {
-                return Err(ApiError::Internal(format!("download {package_id} exploded")));
+                return Err(ApiError::Internal(format!(
+                    "download {package_id} exploded"
+                )));
             }
             Ok(())
         }
@@ -5074,8 +5449,13 @@ mod tests {
         /// Downloaded package ids, sorted (the row order is `list_packages`'s, not
         /// this seam's contract).
         fn package_ids(&self) -> Vec<String> {
-            let mut ids: Vec<String> =
-                self.calls.lock().unwrap().iter().map(|(_, p)| p.clone()).collect();
+            let mut ids: Vec<String> = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, p)| p.clone())
+                .collect();
             ids.sort();
             ids
         }
@@ -5155,8 +5535,24 @@ mod tests {
             &server,
             "p-auto",
             vec![
-                ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([])),
-                ann_json("ann-2", "pkg-2", false, "published", &[], None, serde_json::json!([])),
+                ann_json(
+                    "ann-1",
+                    "pkg-1",
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([]),
+                ),
+                ann_json(
+                    "ann-2",
+                    "pkg-2",
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([]),
+                ),
             ],
             1,
         )
@@ -5173,7 +5569,10 @@ mod tests {
         let outcome = pass_with(&ctx, &rec, None, false).await;
 
         assert_eq!(rec.package_ids(), vec!["pkg-1", "pkg-2"]);
-        assert!(!rec.overlapped(), "packages download one at a time (spec §3.3)");
+        assert!(
+            !rec.overlapped(),
+            "packages download one at a time (spec §3.3)"
+        );
         assert_eq!(outcome.projects, 1);
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.failed, 0);
@@ -5185,8 +5584,15 @@ mod tests {
     #[tokio::test]
     async fn auto_pass_skips_send_role_and_disabled_projects() {
         let server = wiremock::MockServer::start().await;
-        let anns =
-            vec![ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([]))];
+        let anns = vec![ann_json(
+            "ann-1",
+            "pkg-1",
+            false,
+            "published",
+            &[],
+            None,
+            serde_json::json!([]),
+        )];
         mock_announcements(&server, "p-send", anns.clone(), 0).await;
         mock_announcements(&server, "p-off", anns, 0).await;
 
@@ -5215,8 +5621,24 @@ mod tests {
             &server,
             "p-auto",
             vec![
-                ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([])),
-                ann_json("ann-2", "pkg-2", false, "published", &[], None, serde_json::json!([])),
+                ann_json(
+                    "ann-1",
+                    "pkg-1",
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([]),
+                ),
+                ann_json(
+                    "ann-2",
+                    "pkg-2",
+                    false,
+                    "published",
+                    &[],
+                    None,
+                    serde_json::json!([]),
+                ),
             ],
             1,
         )
@@ -5232,7 +5654,11 @@ mod tests {
         let rec = Arc::new(DownloadRecorder::failing(&["pkg-2"]));
         let outcome = pass_with(&ctx, &rec, None, false).await;
 
-        assert_eq!(rec.package_ids(), vec!["pkg-1", "pkg-2"], "both were attempted");
+        assert_eq!(
+            rec.package_ids(),
+            vec!["pkg-1", "pkg-2"],
+            "both were attempted"
+        );
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.failed, 1);
     }
@@ -5245,14 +5671,30 @@ mod tests {
         mock_announcements(
             &server,
             "p-off",
-            vec![ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([]))],
+            vec![ann_json(
+                "ann-1",
+                "pkg-1",
+                false,
+                "published",
+                &[],
+                None,
+                serde_json::json!([]),
+            )],
             1,
         )
         .await;
         mock_announcements(
             &server,
             "p-other",
-            vec![ann_json("ann-2", "pkg-2", false, "published", &[], None, serde_json::json!([]))],
+            vec![ann_json(
+                "ann-2",
+                "pkg-2",
+                false,
+                "published",
+                &[],
+                None,
+                serde_json::json!([]),
+            )],
             0,
         )
         .await;
@@ -5268,7 +5710,11 @@ mod tests {
         let rec = Arc::new(DownloadRecorder::default());
         let outcome = pass_with(&ctx, &rec, Some("p-off"), true).await;
 
-        assert_eq!(rec.package_ids(), vec!["pkg-1"], "only the named project syncs");
+        assert_eq!(
+            rec.package_ids(),
+            vec!["pkg-1"],
+            "only the named project syncs"
+        );
         assert_eq!(outcome.projects, 1);
     }
 
@@ -5343,7 +5789,11 @@ mod tests {
         }
 
         let drained = drain_pending_package_changes(&known);
-        assert_eq!(drained.len(), MAX_PENDING_PACKAGE_CHANGES, "the buffer is capped");
+        assert_eq!(
+            drained.len(),
+            MAX_PENDING_PACKAGE_CHANGES,
+            "the buffer is capped"
+        );
         assert_eq!(
             drained.first().unwrap().package_id,
             format!("pkg-{:04}", 50),
@@ -5409,7 +5859,10 @@ mod tests {
     /// instead of the 20-minute interval it is designed around.
     #[test]
     fn only_a_real_package_set_change_kicks_the_worker() {
-        assert!(!kick_auto_sync_if_changed(&[]), "a no-op refresh kicks nobody");
+        assert!(
+            !kick_auto_sync_if_changed(&[]),
+            "a no-op refresh kicks nobody"
+        );
         assert!(
             kick_auto_sync_if_changed(&[PackageStateChange {
                 project_id: "p-1".into(),
@@ -5434,23 +5887,27 @@ mod tests {
         let task = tokio::spawn({
             let passes = Arc::clone(&passes);
             async move {
-                auto_sync_loop_inner(
-                    Duration::ZERO,
-                    Duration::from_secs(3600),
-                    move || {
-                        let passes = Arc::clone(&passes);
-                        async move {
-                            passes.fetch_add(1, Ordering::SeqCst);
-                        }
-                    },
-                )
+                auto_sync_loop_inner(Duration::ZERO, Duration::from_secs(3600), move || {
+                    let passes = Arc::clone(&passes);
+                    async move {
+                        passes.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
                 .await
             }
         });
 
-        wait_until(|| passes.load(Ordering::SeqCst) >= 1, Duration::from_secs(5)).await;
+        wait_until(
+            || passes.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
         auto_sync_kick().notify_one();
-        wait_until(|| passes.load(Ordering::SeqCst) >= 2, Duration::from_secs(5)).await;
+        wait_until(
+            || passes.load(Ordering::SeqCst) >= 2,
+            Duration::from_secs(5),
+        )
+        .await;
         task.abort();
     }
 

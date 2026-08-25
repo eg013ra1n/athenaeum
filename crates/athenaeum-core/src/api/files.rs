@@ -73,11 +73,17 @@ pub struct BrowseDirectoriesResponse {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-pub fn get_files(ctx: &ServiceContext, limit: Option<usize>) -> Result<Vec<FileWithFrame>, ApiError> {
+pub fn get_files(
+    ctx: &ServiceContext,
+    limit: Option<usize>,
+) -> Result<Vec<FileWithFrame>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     let files = crate::db::get_files(&conn, limit)?;
-    Ok(files.into_iter().map(|(file, frame)| FileWithFrame { file, frame }).collect())
+    Ok(files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file, frame })
+        .collect())
 }
 
 pub fn get_files_by_directory(
@@ -88,7 +94,10 @@ pub fn get_files_by_directory(
     let db = db(ctx)?;
     let conn = db.conn();
     let files = crate::db::get_files_by_directory(&conn, &directory_path, limit)?;
-    Ok(files.into_iter().map(|(file, frame)| FileWithFrame { file, frame }).collect())
+    Ok(files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file, frame })
+        .collect())
 }
 
 /// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
@@ -98,7 +107,9 @@ pub fn get_frames_with_missing_metadata(
 ) -> Result<Vec<MissingMetadataRow>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(crate::db::get_frames_with_missing_metadata(&conn, &category)?)
+    Ok(crate::db::get_frames_with_missing_metadata(
+        &conn, &category,
+    )?)
 }
 
 /// Bulk-update metadata fields (camera / date_obs / imagetyp / is_master) on
@@ -111,7 +122,9 @@ pub fn bulk_update_frame_metadata(
 ) -> Result<usize, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(crate::db::bulk_update_frame_metadata(&conn, &frame_ids, &edits)?)
+    Ok(crate::db::bulk_update_frame_metadata(
+        &conn, &frame_ids, &edits,
+    )?)
 }
 
 /// Re-decode the originally-scanned header values for the given frames out
@@ -147,7 +160,9 @@ pub fn count_frame_metadata_relations(
 ) -> Result<crate::db::FrameMetadataRelations, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(crate::db::count_frame_metadata_relations(&conn, &frame_ids)?)
+    Ok(crate::db::count_frame_metadata_relations(
+        &conn, &frame_ids,
+    )?)
 }
 
 /// Distinct non-empty INSTRUME values from the `frames` table, alphabetically
@@ -171,7 +186,10 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
     let db = db(ctx)?;
     let conn = db.conn();
 
-    let use_content_hash = ctx.settings.get_duplicates_use_content_hash(&conn).unwrap_or(false);
+    let use_content_hash = ctx
+        .settings
+        .get_duplicates_use_content_hash(&conn)
+        .unwrap_or(false);
 
     if crate::db::has_duplicate_cache(&conn, use_content_hash).unwrap_or(false) {
         return Ok(crate::db::get_cached_duplicates(&conn, use_content_hash)?);
@@ -180,7 +198,10 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
 }
 
 /// Get directory contents (subdirectories and files).
-pub fn get_directory_contents(ctx: &ServiceContext, directory_path: String) -> Result<DirectoryContents, ApiError> {
+pub fn get_directory_contents(
+    ctx: &ServiceContext,
+    directory_path: String,
+) -> Result<DirectoryContents, ApiError> {
     use std::fs;
 
     let path = Path::new(&directory_path);
@@ -197,14 +218,19 @@ pub fn get_directory_contents(ctx: &ServiceContext, directory_path: String) -> R
         }
         Err(e) => {
             tracing::error!(path = %directory_path, error = %e, "directory read failed");
-            return Err(ApiError::Internal(format!("Could not read directory: {}", e)));
+            return Err(ApiError::Internal(format!(
+                "Could not read directory: {}",
+                e
+            )));
         }
     };
 
     for entry in entries {
         let entry = entry.map_err(|e| ApiError::Internal(e.to_string()))?;
         let entry_path = entry.path();
-        let metadata = entry.metadata().map_err(|e| ApiError::Internal(e.to_string()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
 
         if metadata.is_dir() {
             subdirectories.push(entry_path.to_string_lossy().to_string());
@@ -215,12 +241,17 @@ pub fn get_directory_contents(ctx: &ServiceContext, directory_path: String) -> R
     let conn = db.conn();
 
     let db_files = crate::db::get_files_by_directory(&conn, &directory_path, None)?;
-    let files_in_dir: Vec<FileWithFrame> =
-        db_files.into_iter().map(|(file, frame)| FileWithFrame { file, frame }).collect();
+    let files_in_dir: Vec<FileWithFrame> = db_files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file, frame })
+        .collect();
 
     subdirectories.sort();
 
-    Ok(DirectoryContents { subdirectories, files: files_in_dir })
+    Ok(DirectoryContents {
+        subdirectories,
+        files: files_in_dir,
+    })
 }
 
 /// Resolve the on-disk path for the file backing a frame, for
@@ -273,7 +304,10 @@ pub fn get_files_with_frames_by_ids(
 
     Ok(frames
         .into_iter()
-        .map(|(_file_id, file, frame)| FileWithFrame { file, frame: Some(frame) })
+        .map(|(_file_id, file, frame)| FileWithFrame {
+            file,
+            frame: Some(frame),
+        })
         .collect())
 }
 
@@ -295,7 +329,10 @@ pub fn get_log_path() -> Result<String, ApiError> {
 }
 
 /// Get all distinct directory paths containing files for a given camera.
-pub fn get_camera_directories(ctx: &ServiceContext, instrume: String) -> Result<Vec<String>, ApiError> {
+pub fn get_camera_directories(
+    ctx: &ServiceContext,
+    instrume: String,
+) -> Result<Vec<String>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::get_camera_directories(&conn, &instrume)?)
@@ -320,19 +357,26 @@ pub fn get_camera_directory_contents(
         }
         Err(e) => {
             tracing::error!(path = %directory_path, error = %e, "directory read failed");
-            return Err(ApiError::Internal(format!("Could not read directory: {}", e)));
+            return Err(ApiError::Internal(format!(
+                "Could not read directory: {}",
+                e
+            )));
         }
     };
 
     for entry in entries {
         let entry = entry.map_err(|e| ApiError::Internal(e.to_string()))?;
         let entry_path = entry.path();
-        let metadata = entry.metadata().map_err(|e| ApiError::Internal(e.to_string()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
 
         if metadata.is_dir() {
             let subdir_str = entry_path.to_string_lossy().to_string();
             // Include this subdir if any camera directory starts with it or equals it
-            let is_relevant = camera_directories.iter().any(|cam_dir| cam_dir.starts_with(&subdir_str));
+            let is_relevant = camera_directories
+                .iter()
+                .any(|cam_dir| cam_dir.starts_with(&subdir_str));
             if is_relevant {
                 subdirectories.push(subdir_str);
             }
@@ -342,13 +386,19 @@ pub fn get_camera_directory_contents(
     let db = db(ctx)?;
     let conn = db.conn();
 
-    let db_files = crate::db::get_files_by_directory_for_camera(&conn, &directory_path, &instrume, None)?;
-    let files_in_dir: Vec<FileWithFrame> =
-        db_files.into_iter().map(|(file, frame)| FileWithFrame { file, frame }).collect();
+    let db_files =
+        crate::db::get_files_by_directory_for_camera(&conn, &directory_path, &instrume, None)?;
+    let files_in_dir: Vec<FileWithFrame> = db_files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file, frame })
+        .collect();
 
     subdirectories.sort();
 
-    Ok(DirectoryContents { subdirectories, files: files_in_dir })
+    Ok(DirectoryContents {
+        subdirectories,
+        files: files_in_dir,
+    })
 }
 
 // ============================================================================
@@ -387,10 +437,14 @@ pub fn enqueue_move_operation<E: ProgressEmitter + 'static>(
     use crate::services::ArchiveHandle;
     use std::sync::atomic::AtomicBool;
 
-    let dest_candidate = Path::new(&dest_dir).canonicalize().unwrap_or_else(|_| PathBuf::from(&dest_dir));
+    let dest_candidate = Path::new(&dest_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&dest_dir));
     policy.check(&dest_candidate)?;
     for s in &sources {
-        let src_candidate = Path::new(s).canonicalize().unwrap_or_else(|_| PathBuf::from(s));
+        let src_candidate = Path::new(s)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(s));
         policy.check(&src_candidate)?;
     }
 
@@ -412,7 +466,13 @@ pub fn enqueue_move_operation<E: ProgressEmitter + 'static>(
     // dequeue — desktop's pre-conversion order registered it after.
     {
         let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+        map.insert(
+            op_id,
+            ArchiveHandle {
+                operation_id: op_id,
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
     }
 
     let ctx_for_worker = ctx.clone();
@@ -607,9 +667,9 @@ fn map_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogSearchHit>
 pub(crate) fn resolve_mkdir_target(path: &str, policy: &PathPolicy) -> Result<PathBuf, ApiError> {
     let target = PathBuf::from(path);
 
-    let final_component = target
-        .file_name()
-        .ok_or_else(|| ApiError::Invalid(format!("'{}' has no valid final path component", path)))?;
+    let final_component = target.file_name().ok_or_else(|| {
+        ApiError::Invalid(format!("'{}' has no valid final path component", path))
+    })?;
     let final_str = final_component.to_string_lossy();
     if final_str.is_empty()
         || final_str == "."
@@ -617,7 +677,10 @@ pub(crate) fn resolve_mkdir_target(path: &str, policy: &PathPolicy) -> Result<Pa
         || final_str.contains('/')
         || final_str.contains('\\')
     {
-        return Err(ApiError::Invalid(format!("'{}' is not a valid directory name", path)));
+        return Err(ApiError::Invalid(format!(
+            "'{}' is not a valid directory name",
+            path
+        )));
     }
 
     let parent = target
@@ -639,7 +702,11 @@ pub(crate) fn resolve_mkdir_target(path: &str, policy: &PathPolicy) -> Result<Pa
 /// Path sandboxing (web: `AllowedRoots`; desktop: `AllowAll` no-op) is a
 /// rule-1 fold-in, checked (via `resolve_mkdir_target`) before the scan-root
 /// containment check below (matches pre-conversion web ordering).
-pub fn mkdir_in_scan_root(ctx: &ServiceContext, path: String, policy: &PathPolicy) -> Result<(), ApiError> {
+pub fn mkdir_in_scan_root(
+    ctx: &ServiceContext,
+    path: String,
+    policy: &PathPolicy,
+) -> Result<(), ApiError> {
     let target = resolve_mkdir_target(&path, policy)?;
 
     let db = db(ctx)?;
@@ -652,7 +719,10 @@ pub fn mkdir_in_scan_root(ctx: &ServiceContext, path: String, policy: &PathPolic
         target.starts_with(&rc)
     });
     if !inside_root {
-        return Err(ApiError::Invalid(format!("'{}' is not inside any scan root", path)));
+        return Err(ApiError::Invalid(format!(
+            "'{}' is not inside any scan root",
+            path
+        )));
     }
     std::fs::create_dir_all(&target).map_err(|e| {
         tracing::error!(path = %path, error = %e, "mkdir failed");
@@ -728,7 +798,9 @@ pub fn rename_path(
     policy: &PathPolicy,
 ) -> Result<(), ApiError> {
     if new_name.contains('/') || new_name.contains('\\') || new_name.trim().is_empty() {
-        return Err(ApiError::Invalid("new name must be a single path component".into()));
+        return Err(ApiError::Invalid(
+            "new name must be a single path component".into(),
+        ));
     }
 
     let old_path = crate::db::normalize_separators(&old_path);
@@ -747,7 +819,10 @@ pub fn rename_path(
         .to_path_buf();
     let new = parent.join(&new_name);
     if new.exists() && !is_same_file_case_variant(&old, &new) {
-        return Err(ApiError::Conflict(format!("target already exists: {}", new.display())));
+        return Err(ApiError::Conflict(format!(
+            "target already exists: {}",
+            new.display()
+        )));
     }
 
     // Validate inside scan root.
@@ -759,7 +834,10 @@ pub fn rename_path(
         oc.starts_with(&rc)
     });
     if !inside_root {
-        return Err(ApiError::Invalid(format!("'{}' is not inside any scan root", old_path)));
+        return Err(ApiError::Invalid(format!(
+            "'{}' is not inside any scan root",
+            old_path
+        )));
     }
 
     let is_dir = old.is_dir();
@@ -800,7 +878,10 @@ pub fn rename_path(
 /// `ServiceContext` equivalent (mirrors how `set_scan_root_monitor_enabled`
 /// in Task 9 took an extra non-`ServiceContext` param for state that lives
 /// alongside, not inside, the shared context).
-pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Result<BrowseDirectoriesResponse, ApiError> {
+pub fn browse_directories(
+    path: Option<String>,
+    root_paths: &[PathBuf],
+) -> Result<BrowseDirectoriesResponse, ApiError> {
     let path_str = path.unwrap_or_default();
 
     // If no path provided, return root paths as top-level entries
@@ -811,18 +892,27 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
             .map(|p| {
                 let s = p.to_string_lossy().to_string();
                 BrowseDirectoryEntry {
-                    name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| s.clone()),
+                    name: p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| s.clone()),
                     path: s,
                 }
             })
             .collect();
 
-        return Ok(BrowseDirectoriesResponse { current: "/".to_string(), parent: None, directories });
+        return Ok(BrowseDirectoriesResponse {
+            current: "/".to_string(),
+            parent: None,
+            directories,
+        });
     }
 
     let target = PathBuf::from(&path_str);
     let canonical = crate::api::scan_roots::normalize_path(
-        &target.canonicalize().map_err(|e| ApiError::Invalid(format!("Invalid path: {}", e)))?,
+        &target
+            .canonicalize()
+            .map_err(|e| ApiError::Invalid(format!("Invalid path: {}", e)))?,
     );
 
     // Security: validate path is within scope roots (both sides normalized —
@@ -836,7 +926,9 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
     });
 
     if !is_allowed {
-        return Err(ApiError::Forbidden("Path is outside allowed directories".to_string()));
+        return Err(ApiError::Forbidden(
+            "Path is outside allowed directories".to_string(),
+        ));
     }
 
     if !canonical.is_dir() {
@@ -849,7 +941,9 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
 
     for entry in entries {
         let entry = entry.map_err(|e| ApiError::Internal(e.to_string()))?;
-        let metadata = entry.metadata().map_err(|e| ApiError::Internal(e.to_string()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
         if metadata.is_dir() {
             let entry_path = entry.path();
             directories.push(BrowseDirectoryEntry {
@@ -877,7 +971,11 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
         }
     });
 
-    Ok(BrowseDirectoriesResponse { current: canonical.to_string_lossy().to_string(), parent, directories })
+    Ok(BrowseDirectoriesResponse {
+        current: canonical.to_string_lossy().to_string(),
+        parent,
+        directories,
+    })
 }
 
 #[cfg(test)]
