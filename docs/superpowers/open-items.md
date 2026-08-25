@@ -40,6 +40,23 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Code-debt cleanup — 2026-08-25
+
+Dead enum variants deleted (`WarningType` ×3, `SkipReason` ×2, `StepStatus::RolledBack`
+in both `file_op` and `archive` — git history confirms none was ever constructed, so no
+DB row can hold the removed strings), `api/` rustfmt pass, and a **Rebuild master**
+button in the provenance block of `CalibrationSetTable`.
+
+- Rebuild a built master from the library UI: progress rides the raw set's building
+  state, one "Master created" notification at the end, provenance block refreshes
+  (new Created timestamp) without collapsing the row.
+- The button is disabled with a "restore originals first" hint on a master whose
+  originals are archived and gone from disk; Restore originals → Rebuild works.
+- An imported master shows no Rebuild button at all (provenance block says
+  "imported master").
+- Export warnings panel still renders temperature/age/missing warnings after the
+  `WarningType` trim.
+
 ### Big-catalog performance — committed 2026-08-22, authored 2026-08-11
 
 Unindexed foreign-key child columns, `IN (…)` lists past SQLite's bind-parameter
@@ -155,14 +172,12 @@ cycle, so anything from them that matters later belongs here or in a plan.
 - **The archive banner wedge.** Banner buttons are disabled for as long as the resume/rollback widget lives, so a lost terminal event — a narrow listen-registration race, or a worker panic — wedges the banner until reload. No data is lost. Accept it, or add a bounded escape that re-enables the controls on a timeout.
 - **Auto-link deselect semantics**, and whether a "manual block" concept is wanted.
 - **`frames.is_master` without `is_master_library`** — what shape that takes in the archive.
-- **Dead variants with live handlers.** `WarningType` and `SkipReason` carry variants nothing constructs, while the frontend still has cases for them: delete both halves, or build the producer.
-- **`rebuild_master`** is complete in the backend and has no UI button. Left deliberately for now.
-- **`file_op::models::StepStatus::RolledBack`** is unconstructed and unparsed — a pure dead variant, and the archive twin is unconstructed too.
 
 ---
 
 ## Release notes owed at the next tag
 
-Paid in full on 2026-08-24: every line below the fold went into `RELEASE_NOTES.md`
-for v0.5.1 (the seed comment block included). Nothing is owed until the next cycle
-lands and adds its lines here.
+- Rebuild master from the library: masters built in Athenaeum can be re-integrated
+  in place from their original source frames (Equipment → expanded master row).
+
+(v0.5.1 lines were paid in full on 2026-08-24.)
