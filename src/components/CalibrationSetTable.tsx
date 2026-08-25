@@ -722,6 +722,8 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
   const [restoreStartError, setRestoreStartError] = useState<string | null>(null);
   const [forgetBusy, setForgetBusy] = useState(false);
   const [forgetError, setForgetError] = useState<string | null>(null);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
 
   const fetchProvenance = useCallback(() => {
     let gone = false;
@@ -736,6 +738,15 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
     return fetchProvenance();
   }, [fetchProvenance]);
 
+  // A finished (re)build fires 'library-updated' (useMasterBuilds) — re-fetch
+  // without blanking the block so recipe/created reflect the rewritten master,
+  // and drop the rebuild busy flag.
+  useEffect(() => {
+    const h = () => { setRebuildBusy(false); fetchProvenance(); };
+    window.addEventListener('library-updated', h);
+    return () => window.removeEventListener('library-updated', h);
+  }, [fetchProvenance]);
+
   if (prov === 'loading') return null;
   if (prov === null) {
     return (
@@ -744,6 +755,22 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
       </div>
     );
   }
+
+  // Re-integrate the master in place from its original source frames. The
+  // invoke returns as soon as the build thread is spawned; progress and the
+  // completion notification ride the same master-build events as a fresh
+  // build, and completion fires 'library-updated' (handled above).
+  const startRebuild = async () => {
+    setRebuildError(null);
+    setRebuildBusy(true);
+    try {
+      await api.invoke('rebuild_master', { masterSetId: setId });
+    } catch (e) {
+      console.error('Failed to start master rebuild:', e);
+      setRebuildError(String(e));
+      setRebuildBusy(false);
+    }
+  };
 
   const startArchive = async () => {
     if (prov.sourceSetId == null) return;
@@ -800,6 +827,19 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
       <div><span className="text-content-muted">Source set:</span> <span className="text-content">#{prov.sourceSetId ?? '—'} ({prov.memberCount} frames)</span></div>
       <div><span className="text-content-muted">Recipe:</span> <span className="text-content" title={prov.recipeJson}>{describeRecipeJson(prov.recipeJson)}</span></div>
       <div><span className="text-content-muted">Created:</span> <span className="text-content">{prov.createdAt}</span></div>
+      <div className="mt-1">
+        <button
+          onClick={(e) => { e.stopPropagation(); void startRebuild(); }}
+          disabled={rebuildBusy || !prov.sourceFramesOnDisk}
+          title={prov.sourceFramesOnDisk
+            ? 'Re-integrate this master in place from its original source frames'
+            : 'Source frames are not on disk — restore originals first'}
+          className="px-2 py-0.5 bg-surface-hover hover:brightness-110 rounded text-content disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {rebuildBusy ? 'Rebuilding…' : 'Rebuild master'}
+        </button>
+        {rebuildError && <div className="text-error mt-1">{rebuildError}</div>}
+      </div>
       <div>
         <span className="text-content-muted">Originals:</span>{' '}
         {prov.originalsArchived ? (
