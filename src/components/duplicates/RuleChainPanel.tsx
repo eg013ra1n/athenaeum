@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Plus, RotateCcw, Settings } from 'lucide-react';
 import type { Rule, RuleChain, RuleKind, ScanRootWithAvailability } from '../../types/helpers';
-import { RULE_KIND_META, defaultRuleChain } from './keepRules';
+import { RULE_KIND_META, defaultRuleChain, ruleName } from './keepRules';
 import { RuleRow } from './rules/RuleRow';
 
 interface Props {
@@ -33,7 +33,7 @@ function newRuleOfKind(kind: RuleKind): Rule {
       return {
         kind: 'path_contains',
         enabled: true,
-        config: { patterns: [], caseSensitive: false },
+        config: { patterns: [], caseSensitive: false, negate: false },
       };
     case 'oldest_mtime':
       return { kind: 'oldest_mtime', enabled: true, config: {} };
@@ -65,7 +65,7 @@ export const RuleChainPanel: React.FC<Props> = ({
     const parts: string[] = [];
     for (const r of chain) {
       if (!r.enabled) continue;
-      let label = RULE_KIND_META[r.kind].name;
+      let label = ruleName(r);
       if (
         r.kind === 'path_contains' &&
         r.config.patterns.length > 0

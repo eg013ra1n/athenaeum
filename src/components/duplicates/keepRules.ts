@@ -44,6 +44,31 @@ export const RULE_KIND_META: Record<RuleKind, RuleKindMeta> = {
   },
 };
 
+/** Name and description for `path_contains` when its `negate` flag is on. The
+ *  flag reverses which files the rule marks, so the panel must not keep showing
+ *  the "contains" wording — a stale sentence beside an inverted rule reads as a
+ *  promise the rule does not keep. */
+export const PATH_CONTAINS_NEGATED_NAME = 'Path NOT contains';
+export const PATH_CONTAINS_NEGATED_DESCRIPTION =
+  'Delete files whose path contains NONE of the listed substrings (i.e. keep only the copies that match).';
+
+/** Display name for a rule as configured — same as `RULE_KIND_META[kind].name`
+ *  except for an inverted `path_contains`. */
+export function ruleName(rule: Rule): string {
+  if (rule.kind === 'path_contains' && rule.config.negate) {
+    return PATH_CONTAINS_NEGATED_NAME;
+  }
+  return RULE_KIND_META[rule.kind].name;
+}
+
+/** Description for a rule as configured. See `ruleName`. */
+export function ruleDescription(rule: Rule): string {
+  if (rule.kind === 'path_contains' && rule.config.negate) {
+    return PATH_CONTAINS_NEGATED_DESCRIPTION;
+  }
+  return RULE_KIND_META[rule.kind].description;
+}
+
 /** Build a fresh, default rule chain. The other rule kinds (oldest_mtime,
  *  shortest_path) can be added later from the panel's "Add rule" menu. */
 export function defaultRuleChain(masterRootId: number | null = null): RuleChain {
@@ -52,7 +77,7 @@ export function defaultRuleChain(masterRootId: number | null = null): RuleChain 
     {
       kind: 'path_contains',
       enabled: true,
-      config: { patterns: [], caseSensitive: false },
+      config: { patterns: [], caseSensitive: false, negate: false },
     },
   ];
 }
@@ -99,9 +124,13 @@ function evalPathContains(
   const cleaned = rule.config.patterns
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
+  // Abstain on an empty pattern list, and do it BEFORE the negate flip below.
+  // Inverted, "no patterns" would otherwise mean "no file contains any of
+  // them" — marking the whole group. The chain's wipe-guard would catch that,
+  // but silently: the rule would just look broken to the user.
   if (cleaned.length === 0) return new Set();
 
-  const caseSensitive = rule.config.caseSensitive;
+  const { caseSensitive, negate } = rule.config;
   const normalizedPatterns = cleaned
     .map(normalizeSeparators)
     .map((p) => (caseSensitive ? p : p.toLowerCase()));
@@ -110,9 +139,9 @@ function evalPathContains(
   for (const f of files) {
     const folded = normalizeSeparators(f.path);
     const haystack = caseSensitive ? folded : folded.toLowerCase();
-    if (normalizedPatterns.some((p) => haystack.includes(p))) {
-      out.add(f.fileId);
-    }
+    const hit = normalizedPatterns.some((p) => haystack.includes(p));
+    // `negate` off: mark the files that match. On: mark the ones that don't.
+    if (hit !== negate) out.add(f.fileId);
   }
   return out;
 }
@@ -295,10 +324,13 @@ function sanitiseRule(raw: unknown): Rule | null {
         : [];
       const caseSensitive =
         typeof cfg.caseSensitive === 'boolean' ? cfg.caseSensitive : false;
+      // Chains saved before the inverse flag existed carry no `negate` — they
+      // load as the non-inverted rule they were, no migration needed.
+      const negate = typeof cfg.negate === 'boolean' ? cfg.negate : false;
       return {
         kind: 'path_contains',
         enabled,
-        config: { patterns, caseSensitive },
+        config: { patterns, caseSensitive, negate },
       };
     }
     case 'oldest_mtime':

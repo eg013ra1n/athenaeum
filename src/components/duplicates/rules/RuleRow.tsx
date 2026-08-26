@@ -1,7 +1,7 @@
 import React from 'react';
 import { ArrowDown, ArrowUp, Trash2 } from 'lucide-react';
 import type { Rule, ScanRootWithAvailability } from '../../../types/helpers';
-import { RULE_KIND_META } from '../keepRules';
+import { ruleDescription, ruleName } from '../keepRules';
 import { MasterRootConfig } from './MasterRootConfig';
 import { PathContainsConfig } from './PathContainsConfig';
 
@@ -29,7 +29,6 @@ export const RuleRow: React.FC<Props> = ({
   onMoveUp,
   onMoveDown,
 }) => {
-  const meta = RULE_KIND_META[rule.kind];
   const disabled = !rule.enabled;
 
   return (
@@ -82,7 +81,7 @@ export const RuleRow: React.FC<Props> = ({
               className="rounded border-border focus:ring-accent"
             />
             <span className="text-xs font-semibold text-content">
-              {meta.name}
+              {ruleName(rule)}
             </span>
           </label>
           {rule.enabled && pickedGroups != null && pickedGroups > 0 && (
@@ -94,7 +93,7 @@ export const RuleRow: React.FC<Props> = ({
             </span>
           )}
           <span className="text-[11px] text-content-muted">
-            {meta.description}
+            {ruleDescription(rule)}
           </span>
         </div>
 
@@ -113,6 +112,7 @@ export const RuleRow: React.FC<Props> = ({
           <PathContainsConfig
             patterns={rule.config.patterns}
             caseSensitive={rule.config.caseSensitive}
+            negate={rule.config.negate}
             disabled={disabled}
             onChange={(cfg) => onUpdate({ ...rule, config: cfg })}
           />

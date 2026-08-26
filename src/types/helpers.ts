@@ -98,7 +98,9 @@ export interface MasterRootRule extends BaseRule {
 
 export interface PathContainsRule extends BaseRule {
   kind: 'path_contains';
-  config: { patterns: string[]; caseSensitive: boolean };
+  /** `negate` flips the rule: with it on, the deletion set is the files whose
+   *  path contains NONE of the patterns. */
+  config: { patterns: string[]; caseSensitive: boolean; negate: boolean };
 }
 
 export interface OldestMtimeRule extends BaseRule {

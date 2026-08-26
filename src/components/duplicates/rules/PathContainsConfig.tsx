@@ -4,13 +4,20 @@ import { Plus, X } from 'lucide-react';
 interface Props {
   patterns: string[];
   caseSensitive: boolean;
-  onChange: (next: { patterns: string[]; caseSensitive: boolean }) => void;
+  /** Inverted rule — mark the files that match NONE of the patterns. */
+  negate: boolean;
+  onChange: (next: {
+    patterns: string[];
+    caseSensitive: boolean;
+    negate: boolean;
+  }) => void;
   disabled?: boolean;
 }
 
 export const PathContainsConfig: React.FC<Props> = ({
   patterns,
   caseSensitive,
+  negate,
   onChange,
   disabled,
 }) => {
@@ -23,18 +30,19 @@ export const PathContainsConfig: React.FC<Props> = ({
       setDraft('');
       return;
     }
-    onChange({ patterns: [...patterns, trimmed], caseSensitive });
+    onChange({ patterns: [...patterns, trimmed], caseSensitive, negate });
     setDraft('');
-  }, [draft, patterns, caseSensitive, onChange]);
+  }, [draft, patterns, caseSensitive, negate, onChange]);
 
   const removePattern = useCallback(
     (pattern: string) => {
       onChange({
         patterns: patterns.filter((p) => p !== pattern),
         caseSensitive,
+        negate,
       });
     },
-    [patterns, caseSensitive, onChange],
+    [patterns, caseSensitive, negate, onChange],
   );
 
   const handleKeyDown = useCallback(
@@ -87,7 +95,9 @@ export const PathContainsConfig: React.FC<Props> = ({
           disabled={disabled}
           placeholder={
             patterns.length === 0
-              ? 'e.g. Backup, _copy, (1) — Enter to add'
+              ? negate
+                ? 'e.g. Master, Originals — Enter to add (these are KEPT)'
+                : 'e.g. Backup, _copy, (1) — Enter to add'
               : 'Add… (Enter)'
           }
           className="flex-1 min-w-[120px] bg-transparent text-xs focus:outline-none placeholder:text-content-muted disabled:opacity-50 disabled:cursor-not-allowed"
@@ -119,12 +129,33 @@ export const PathContainsConfig: React.FC<Props> = ({
           type="checkbox"
           checked={caseSensitive}
           onChange={(e) =>
-            onChange({ patterns, caseSensitive: e.target.checked })
+            onChange({ patterns, caseSensitive: e.target.checked, negate })
           }
           disabled={disabled}
           className="rounded border-border focus:ring-accent"
         />
         <span className="font-semibold text-xs">Aa</span>
+      </label>
+      <label
+        title={
+          negate
+            ? 'Inverted — deletes the copies whose path contains NONE of the patterns, keeping the ones that match'
+            : 'Deletes the copies whose path contains a pattern — click to invert'
+        }
+        className={`inline-flex items-center gap-1.5 h-7 flex-shrink-0 select-none cursor-pointer transition-colors ${
+          negate ? 'text-warning' : 'text-content-muted hover:text-content'
+        } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+      >
+        <input
+          type="checkbox"
+          checked={negate}
+          onChange={(e) =>
+            onChange({ patterns, caseSensitive, negate: e.target.checked })
+          }
+          disabled={disabled}
+          className="rounded border-border focus:ring-accent"
+        />
+        <span className="font-semibold text-xs">NOT</span>
       </label>
     </div>
   );
