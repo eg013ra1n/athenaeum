@@ -30,7 +30,12 @@ dist-ssr
 *.db
 *.db-shm
 *.db-wal
-builds/
+
+# GitLab Runner leftovers. The runner service's --working-directory points at
+# this repo, so without an absolute builds_dir/cache_dir in its config.toml it
+# drops its checkouts and its local cache straight into the working tree.
+/builds/
+/cache/
 
 # Agent-session build dir + local brainstorm/SDD scratch
 /target-agent/
