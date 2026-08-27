@@ -42,6 +42,31 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Deep verify banks its reads, and survives a rules change — 2026-08-27
+
+Two fixes in one pass. (1) The verify loop now carries a run-generation token:
+changing the keep rules or refreshing the view mid-verify actually stops the
+loop instead of hiding the UI while the disks kept grinding and a phantom
+"done" summary resurfaced minutes later (reset also un-cancelled a pending
+cancel). (2) `verify_duplicate_pair` (both backends) replaces the path-based
+compare for the Duplicates view: an identical pair's full-content hash is
+computed DURING the byte compare (zero extra I/O — one stream feeds xxh3, and
+equal bytes share the digest) and banked into `files.strong_hash` for every
+row still current on disk; the next verify of that pair is decided from the
+stored hashes without reading either file. A mismatch still early-exits and
+stores nothing. Staleness contract shared with the master-hash pass
+(`disk_matches_row`); its unreachable-volume log dropped warn→debug.
+
+- Start verify, change a keep rule mid-run: the progress UI disappears AND
+  the logs go quiet (no further `verify_duplicate_pair` spans) — previously
+  they streamed on for the whole queue.
+- Verify a large selection twice: the second run finishes near-instantly
+  (stored-hash path), and `SELECT COUNT(*) FROM files WHERE strong_hash IS
+  NOT NULL` grows after the first run by roughly the verified-files count.
+- Cancel mid-run still lands the `cancelled` summary with partial counts.
+- A verified pair, then one file re-saved (mtime drift): the next verify of
+  that pair falls back to reading bytes (stale row disqualifies the shortcut).
+
 ### Duplicate detection keyed on header identity — 2026-08-27
 
 The cheap duplicate key stopped being `files.metadata_hash`
@@ -236,6 +261,9 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 - Duplicate detection now recognises copies whose timestamps changed in
   transit — moving a night between drives no longer hides its duplicates.
+- Deep verify remembers its work: files proven byte-identical keep their
+  full-content hash, so re-verifying them is instant — and changing the keep
+  rules mid-verify now actually stops the run.
   Masters and processed files are compared by their full contents, so two
   different stacks that share a header are never mistaken for copies.
 - Rebuild master from the library: masters built in Athenaeum can be re-integrated
