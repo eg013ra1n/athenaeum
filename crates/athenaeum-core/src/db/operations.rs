@@ -2112,9 +2112,16 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
     };
     let (root_predicate, root_values) = scan_root_prefix_predicate("f.path", &roots);
 
+    // Column 5 is the key's third grouping component (`files.filename` for the
+    // header key), selected as a literal NULL for the keys that have none so
+    // the row shape stays the same for every key. It is what lets this
+    // function return the SAME `content_hash` the cache stores — see the
+    // comment on that field below.
+    let group_extra_col = key.group_extra("f");
     let query = format!(
         "SELECT {hash}, f.size, COUNT(DISTINCT f.id) as count,
-                GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
+                GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids,
+                {extra_select}
          FROM files f
          {joins}
          WHERE {usable}
@@ -2131,8 +2138,9 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
         usable = key.hash_is_usable("f"),
         eligibility = key.eligibility(),
         roots = root_predicate,
-        group_extra = key
-            .group_extra("f")
+        extra_select = group_extra_col.clone().unwrap_or_else(|| "NULL".to_string()),
+        group_extra = group_extra_col
+            .as_ref()
             .map(|col| format!(", {col}"))
             .unwrap_or_default(),
     );
@@ -2158,16 +2166,38 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
                 }
             }
 
+            // For a key with a third grouping component this is the SAME
+            // composite `rebuild_duplicate_groups_cache` writes —
+            // `fingerprint || '|' || filename`. It has to be: a group served
+            // from this path has `id: None`, and the frontend then identifies
+            // it as `hash:${content_hash}:${size}`
+            // (`src/components/duplicates/keepRules.ts::groupKey`). With the
+            // bare fingerprint, two header name-groups sharing one
+            // (fingerprint, size) collapse onto one key — one group's keep
+            // plan overwrites the other's, the deletion count under-reports
+            // and React sees duplicate keys. Guaranteed reachable: the
+            // cache-table migration drops the cache, so the first Duplicates
+            // open after an upgrade runs THIS query, not the cached one.
+            let hash: String = row.get(0)?;
+            let group_extra: Option<String> = row.get(5)?;
+            let content_hash = match group_extra.as_deref() {
+                Some(extra) => format!("{hash}|{extra}"),
+                None => hash,
+            };
+
             Ok(DuplicateGroup {
                 id: None,
                 size: row.get(1)?,
                 // Field name predates the enum: it carries whichever hash
-                // `key` selected, a header fingerprint or a content hash. Left
-                // as `content_hash` deliberately — it is a serde/ts-rs
-                // contract field (`src/types/models.ts::DuplicateGroup`) and
-                // no frontend code reads it, so renaming would churn the TS
+                // `key` selected — a header fingerprint (composite, above) or
+                // a content hash. Left as `content_hash` deliberately: it is a
+                // serde/ts-rs contract field
+                // (`src/types/models.ts::DuplicateGroup`), read by
+                // `keepRules.ts::groupKey` as the group identity when there is
+                // no DB id and displayed truncated to 8 characters by
+                // `DuplicateGroupCard.tsx` — so renaming it would churn the TS
                 // contract for no user-visible gain.
-                content_hash: row.get(0)?,
+                content_hash,
                 file_count: row.get(2)?,
                 file_paths,
                 file_ids,
@@ -8403,6 +8433,45 @@ mod tests {
             cached.iter().filter(|g| g.file_count == 2).count(),
             2,
             "neither group may collect the other's files"
+        );
+
+        // The live path must report the SAME `content_hash` as the cache. A
+        // live group has `id: None`, so the frontend identifies it by
+        // `hash:${content_hash}:${size}` (`keepRules.ts::groupKey`): a bare
+        // fingerprint here would collapse these two name-groups onto one key
+        // and let one group's keep plan overwrite the other's. This is the
+        // path the FIRST Duplicates open after an upgrade takes — the cache
+        // migration has just dropped the tables.
+        let live = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        let fingerprint = crate::fingerprint::compute_header_fingerprint("HDR-LUM");
+        let identity = |groups: &[DuplicateGroup]| {
+            let mut rows: Vec<(String, Vec<i64>)> = groups
+                .iter()
+                .map(|g| {
+                    let mut ids = g.file_ids.clone();
+                    ids.sort_unstable();
+                    (g.content_hash.clone(), ids)
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            identity(&live),
+            identity(&cached),
+            "live and cached groups must agree on (content_hash, file_ids)"
+        );
+        assert_eq!(
+            identity(&live),
+            vec![
+                (format!("{fingerprint}|Lum.xisf"), vec![1, 2]),
+                (format!("{fingerprint}|Lum_GraXpert.xisf"), vec![3, 4]),
+            ],
+            "the header key's content_hash is the composite fingerprint|filename"
+        );
+        assert_ne!(
+            live[0].content_hash, live[1].content_hash,
+            "the two name-groups must carry DISTINCT content_hash values"
         );
     }
 }
