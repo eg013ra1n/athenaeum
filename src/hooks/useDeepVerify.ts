@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { api } from '../api';
-import type { DuplicateGroup } from '../types/models';
+import type { DuplicateGroup, VerifyPairResult } from '../types/models';
 import { groupKey } from '../components/duplicates/keepRules';
 
 /** Per-file verification outcome. */
@@ -83,18 +83,30 @@ export function useDeepVerify() {
 
   // A simple flag the async loop reads to know if it should stop.
   const cancelledRef = useRef(false);
+  // Run-generation token. `start` captures the value it incremented to; any
+  // later `reset`/`cancel`/`start` bumps it, which tells the still-draining
+  // loop of the PREVIOUS run to stop scheduling comparisons and to drop its
+  // state updates. Without this, changing the keep rules mid-verify hid the
+  // progress UI (reset -> phase 'idle') while the loop kept reading disks for
+  // the rest of the queue and finally resurrected a 'done' summary for a run
+  // the user had discarded - and reset's old `cancelledRef.current = false`
+  // even un-cancelled a cancel pressed just before it.
+  const runIdRef = useRef(0);
 
   const cancel = useCallback(() => {
     cancelledRef.current = true;
   }, []);
 
   const reset = useCallback(() => {
+    runIdRef.current += 1;
     cancelledRef.current = false;
     setState({ phase: 'idle', progress: null, results: new Map(), summary: null });
   }, []);
 
   const start = useCallback(
     async (groups: DuplicateGroup[]) => {
+      const runId = ++runIdRef.current;
+      const stale = () => runIdRef.current !== runId;
       cancelledRef.current = false;
 
       // Build the work list: for every group with ≥ 2 files, pick files[0]
@@ -102,6 +114,7 @@ export function useDeepVerify() {
       type WorkItem = {
         fileId: number;
         path: string;
+        anchorFileId: number;
         anchorPath: string;
         groupKeyStr: string;
       };
@@ -112,12 +125,14 @@ export function useDeepVerify() {
         if (group.files.length < 2) continue;
 
         const key = groupKey(group);
+        const anchorFileId = group.files[0].fileId;
         const anchorPath = group.files[0].path;
 
         for (const f of group.files.slice(1)) {
           workItems.push({
             fileId: f.fileId,
             path: f.path,
+            anchorFileId,
             anchorPath,
             groupKeyStr: key,
           });
@@ -163,11 +178,12 @@ export function useDeepVerify() {
 
       async function runSlot() {
         while (cursor < workItems.length) {
-          if (cancelledRef.current) break;
+          if (cancelledRef.current || stale()) break;
 
           const item = workItems[cursor++];
 
           // Mark as running.
+          if (stale()) break;
           setState((prev) => {
             const next = new Map(prev.results);
             next.set(item.fileId, { ...next.get(item.fileId)!, status: 'running' });
@@ -187,11 +203,14 @@ export function useDeepVerify() {
           let errorMessage: string | undefined;
 
           try {
-            const identical = await api.invoke<boolean>('verify_files_byte_identical', {
-              path1: item.anchorPath,
-              path2: item.path,
+            // Backend banks an identical pair's full-content hash into
+            // files.strong_hash, so re-verifying a pair whose rows are still
+            // current on disk is decided from the column without reading.
+            const result = await api.invoke<VerifyPairResult>('verify_duplicate_pair', {
+              fileA: item.anchorFileId,
+              fileB: item.fileId,
             });
-            status = identical ? 'verified' : 'mismatch';
+            status = result.identical ? 'verified' : 'mismatch';
           } catch (err) {
             status = 'error';
             errorMessage =
@@ -204,6 +223,7 @@ export function useDeepVerify() {
           else if (status === 'mismatch') mismatchCount += 1;
           else errorCount += 1;
 
+          if (stale()) break;
           setState((prev) => {
             const next = new Map(prev.results);
             next.set(item.fileId, {
@@ -231,6 +251,10 @@ export function useDeepVerify() {
         runSlot(),
       );
       await Promise.all(slots);
+
+      // A reset (rule change, refresh) or a newer run owns the state now -
+      // this run's summary must not resurrect a UI the user discarded.
+      if (stale()) return;
 
       const phase: VerifyPhase = cancelledRef.current ? 'cancelled' : 'done';
 
