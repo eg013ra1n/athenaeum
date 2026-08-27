@@ -189,7 +189,9 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
     // Content mode is a single explicit key over every file. Otherwise the
     // view is Header (raw sub-frames, decided by their stored header) plus
     // Master (everything else, decided by a full-file hash) — the two
-    // eligibility clauses are exact complements, so no file is decided twice.
+    // eligibility clauses are complements over the CLASSIFIED files, so no
+    // file is decided twice (an unclassified `imagetyp IS NULL` frame is
+    // deliberately in neither — see `DuplicateKey::eligibility`).
     let keys: &[crate::db::DuplicateKey] = if ctx
         .settings
         .get_duplicates_use_content_hash(&conn)

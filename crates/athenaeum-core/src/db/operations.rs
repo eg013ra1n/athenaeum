@@ -247,6 +247,30 @@ impl DuplicateKey {
     /// imagetyp is excluded by default, and exclusion is a miss rather than a
     /// deletion. On the owner's catalog this costs nothing measurable — zero
     /// duplicate groups involve a blank imagetyp.
+    ///
+    /// # The two keys partition the CLASSIFIED files, not the whole catalog
+    ///
+    /// `Header` and `Master` are complements over every row whose `imagetyp`
+    /// is one of the five known values — but NOT over a row where it is NULL.
+    /// Under SQL's three-valued logic both `imagetyp IN (…)` and
+    /// `imagetyp NOT IN (…)` evaluate to NULL when the column is NULL, and a
+    /// `WHERE` clause keeps only rows that evaluate TRUE. So a frame the
+    /// scanner could not classify (unrecognized IMAGETYP ⇒ NULL) is rejected
+    /// by BOTH keys and appears in neither.
+    ///
+    /// That is deliberate, and it is the allowlist rationale above applied to
+    /// its own boundary: an unclassified file is a fail-safe MISS — never a
+    /// wrong group, never a file offered for deletion on an identity nobody
+    /// verified. It was measured to affect zero duplicate groups on the
+    /// owner's production catalog, and content mode
+    /// ([`Self::Content`], which has no eligibility clause at all) still
+    /// covers those files for anyone who wants them.
+    ///
+    /// **Do not "fix" this by widening either clause** (`COALESCE(fr.imagetyp,
+    /// '')`, an `OR fr.imagetyp IS NULL`, and friends). Widening `Master` would
+    /// push every unparsed file into the full-file hash pass for
+    /// measured-zero benefit. Pinned by
+    /// `null_imagetyp_files_are_deliberately_in_neither_key`.
     fn eligibility(self) -> &'static str {
         match self {
             Self::Header => {
@@ -254,10 +278,13 @@ impl DuplicateKey {
                  AND fr.imagetyp IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat')"
             }
             Self::Content => "",
-            // The exact complement of `Header`'s allowlist (¬A ∨ ¬B against
-            // its A ∧ B), so the two keys partition the catalog: nothing is
-            // decided twice and nothing falls between them. Pinned by
-            // `header_and_master_keys_partition_the_catalog`.
+            // The complement of `Header`'s allowlist (¬A ∨ ¬B against its
+            // A ∧ B) OVER THE CLASSIFIED ROWS: nothing classified is decided
+            // twice, and nothing classified falls between the two keys. A
+            // NULL `imagetyp` satisfies neither clause (3VL — see the doc
+            // comment above) and is deliberately in neither key. Pinned by
+            // `header_and_master_keys_partition_the_catalog` and
+            // `null_imagetyp_files_are_deliberately_in_neither_key`.
             Self::Master => {
                 "AND (COALESCE(fr.is_master, 0) = 1 \
                       OR fr.imagetyp NOT IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat'))"
@@ -7852,9 +7879,15 @@ mod tests {
             .is_empty());
     }
 
-    /// The two keys partition the catalog: a raw sub-frame never reaches the
-    /// Master key, and a master never reaches the Header key. Nothing is decided
-    /// twice, and nothing falls between them.
+    /// The two keys partition the CLASSIFIED files: a raw sub-frame never
+    /// reaches the Master key, and a master never reaches the Header key.
+    /// Nothing classified is decided twice, and nothing classified falls
+    /// between them.
+    ///
+    /// Every frame here carries a known `imagetyp`. The unclassified case —
+    /// `imagetyp IS NULL`, which under 3VL is rejected by both keys — is the
+    /// separate, deliberate gap pinned by
+    /// `null_imagetyp_files_are_deliberately_in_neither_key`.
     #[test]
     fn header_and_master_keys_partition_the_catalog() {
         let conn = Connection::open_in_memory().unwrap();
@@ -7920,6 +7953,106 @@ mod tests {
         assert!(
             !master[0].file_ids.contains(&1),
             "a raw frame must not be decided twice"
+        );
+    }
+
+    /// A frame the scanner could not classify (`imagetyp IS NULL`) is in
+    /// NEITHER key — not the header key, not the master key — even when it is
+    /// a perfect duplicate by both identities.
+    ///
+    /// The mechanism is SQL's three-valued logic: `imagetyp IN (…)` and
+    /// `imagetyp NOT IN (…)` BOTH evaluate to NULL against a NULL column, and
+    /// `WHERE` keeps only TRUE. So the Header allowlist and the Master
+    /// complement reject the row alike, and the two keys partition the
+    /// classified files rather than the whole catalog.
+    ///
+    /// This is the deliberate ruling, not an oversight: excluding an
+    /// unclassified file is a fail-safe MISS — never a wrong group, never a
+    /// deletion offered on an identity nobody verified. Measured impact on the
+    /// owner's production catalog: zero duplicate groups. Content mode has no
+    /// eligibility clause at all and still covers these files. Widening either
+    /// clause would send every unparsed file into the full-file hash pass for
+    /// no measured gain — so this test exists to make such a "fix" fail loudly.
+    #[test]
+    fn null_imagetyp_files_are_deliberately_in_neither_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        // Two byte-identical copies of one unclassified file: same header
+        // fingerprint (so the header key WOULD group them) and the same
+        // strong hash (so the master key WOULD too), differing only in path.
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/mystery.fits",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-N",
+            "Light",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/mystery.fits",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-N",
+            "Light",
+            0,
+        );
+        set_strong_hash(&conn, 1, "same-bytes");
+        set_strong_hash(&conn, 2, "same-bytes");
+
+        // Now make them unclassified, exactly as the scanner stores an
+        // unrecognized IMAGETYP. `is_master` stays 0, so neither the
+        // `is_master = 1` half of the Master clause nor anything else can
+        // rescue the row — only the imagetyp comparison is left, and it is
+        // NULL on both sides.
+        conn.execute("UPDATE frames SET imagetyp = NULL WHERE id IN (1, 2)", [])
+            .unwrap();
+
+        // Sanity: the rows really are duplicates by both identities, so an
+        // empty result below is the eligibility clause talking and not a
+        // broken fixture.
+        let paired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files f
+                 JOIN fits_header fh ON fh.file_id = f.id
+                 WHERE f.strong_hash = 'same-bytes'
+                   AND fh.header_fingerprint = (
+                       SELECT header_fingerprint FROM fits_header WHERE file_id = 1
+                   )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(paired, 2, "fixture: both copies share both identities");
+
+        assert!(
+            find_duplicate_groups(&conn, DuplicateKey::Header)
+                .unwrap()
+                .is_empty(),
+            "the header allowlist rejects a NULL imagetyp (3VL)"
+        );
+        assert!(
+            find_duplicate_groups(&conn, DuplicateKey::Master)
+                .unwrap()
+                .is_empty(),
+            "the master complement rejects it too — NOT IN is NULL against NULL"
+        );
+
+        // Content mode has no eligibility clause, so it is the escape hatch
+        // for anyone who does want these files considered.
+        conn.execute(
+            "UPDATE files SET content_hash = 'same-bytes' WHERE id IN (1, 2)",
+            [],
+        )
+        .unwrap();
+        let content = find_duplicate_groups(&conn, DuplicateKey::Content).unwrap();
+        assert_eq!(
+            content.len(),
+            1,
+            "content mode still covers unclassified files"
         );
     }
 
@@ -7989,10 +8122,18 @@ mod tests {
         assert_eq!(cached_master.len(), 1);
         let mut ids = cached_master[0].file_ids.clone();
         ids.sort_unstable();
-        assert_eq!(ids, vec![3, 4], "the cache serves what the live query finds");
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "the cache serves what the live query finds"
+        );
 
         let cached_header = get_cached_duplicates(&conn, DuplicateKey::Header).unwrap();
-        assert_eq!(cached_header.len(), 1, "the header cache survived untouched");
+        assert_eq!(
+            cached_header.len(),
+            1,
+            "the header cache survived untouched"
+        );
         assert!(cached_header[0].file_ids.contains(&1));
     }
 }

@@ -284,6 +284,13 @@ pub fn run_content_index(
 /// Takes `&Connection`, not `&Database`: the caller is the scanner's phase 4,
 /// which already holds the connection for the whole scan, so there is no
 /// pool slot to give back.
+///
+/// The `is_master` / `imagetyp` predicate below is a hand-copy of
+/// [`DuplicateKey::Master::eligibility`](crate::db::DuplicateKey) and must stay
+/// identical to it — including its treatment of a NULL `imagetyp`, which under
+/// SQL's three-valued logic `NOT IN` rejects. An unclassified file is
+/// deliberately hashed by neither this pass nor decided by either key; see that
+/// method's doc comment for why widening it would be wrong.
 pub fn fill_master_strong_hashes(
     conn: &Connection,
     emitter: &dyn ProgressEmitter,

@@ -68,7 +68,8 @@ fn no_db() -> (StatusCode, String) {
 /// The `duplicates.use_content_hash` setting selects the `DuplicateKey`s:
 /// content hashes when on; when off, the union of the header key (raw
 /// sub-frames) and the master key (masters and processed files, decided by a
-/// full-file hash), whose eligibility clauses are exact complements. Serves
+/// full-file hash), whose eligibility clauses are complements over the
+/// classified files. Serves
 /// from the warm cache of EACH key when available; otherwise computes
 /// on-the-fly (slow path, used before the first scan populates the cache).
 #[tracing::instrument(skip_all, err(Debug))]
@@ -82,7 +83,9 @@ pub async fn get_duplicates(
     // Content mode is a single explicit key over every file. Otherwise the
     // view is Header (raw sub-frames, decided by their stored header) plus
     // Master (everything else, decided by a full-file hash) — the two
-    // eligibility clauses are exact complements, so no file is decided twice.
+    // eligibility clauses are complements over the CLASSIFIED files, so no
+    // file is decided twice (an unclassified `imagetyp IS NULL` frame is
+    // deliberately in neither — see `DuplicateKey::eligibility`).
     let keys: &[athenaeum_core::db::DuplicateKey] = if state
         .ctx
         .settings
