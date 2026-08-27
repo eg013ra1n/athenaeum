@@ -166,6 +166,147 @@ pub(crate) fn prune_orphaned_calibration_sets(conn: &Connection) -> rusqlite::Re
     Ok(plain_orphans + ghost_masters)
 }
 
+/// Keep the denormalized membership counters (`calibration_set.frame_count`,
+/// `sessions.frame_count` / `sessions.total_exp_time`) equal to what their
+/// junction tables actually hold, on EVERY path that changes membership.
+///
+/// Both counters used to be written only where members are *added* — the
+/// grouping/scan-integration writers for `calibration_set`, the frame-set
+/// rebuild for `sessions`. Removal has no such site: deleting a file cascades
+/// `files` -> `frames` -> `calibration_set_frames` / `session_members`, and
+/// nothing recomputed the parent's count afterwards. The Equipment page reads
+/// the stored `cs.frame_count` (`db/equipment.rs`), so a set the user had
+/// half-deduplicated kept advertising its pre-deletion size forever — the
+/// owner-reported symptom on sets 546/547 (20 shown / 10 real) and 628
+/// (80 / 40). Object sets look immune only because `frames_set` carries no
+/// such column at all and counts live through a join; `sessions`, which does
+/// carry one, drifted exactly the same way (42 stale rows in the same catalog).
+///
+/// A trigger rather than another call site because the deletions arrive by FK
+/// cascade, where there is no application code to hook: SQLite fires a child
+/// table's own row triggers for cascaded deletes (verified — this does not
+/// need `recursive_triggers`), so this catches black-hole/void, scan-root
+/// delete, the metadata-edit cascade, archive paths and anything added later,
+/// uniformly.
+///
+/// `COUNT(*)`/`SUM()` over the survivors rather than `count ± 1`: a recompute
+/// is self-healing where an increment silently accumulates whatever drift any
+/// other writer introduces. Both scans are keyed on the junction PK's leftmost
+/// column, so they touch one set's members and nothing else.
+///
+/// Interaction with [`create_calibration_set_empty_prune_trigger`]: when the
+/// last member goes, one of the two fires first and the other becomes a no-op
+/// (either the count is set to 0 on a row that is then deleted, or the row is
+/// already gone and the `UPDATE` matches nothing). Order is irrelevant.
+///
+/// DROP + CREATE, like the neighbouring trigger DDL, so a catalog carrying an
+/// older definition picks up the current one on the next start.
+pub(crate) fn create_membership_count_sync_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    for (name, table, event, body) in [
+        (
+            "calibration_set_frames_count_ins",
+            "calibration_set_frames",
+            "AFTER INSERT",
+            "UPDATE calibration_set
+                SET frame_count = (SELECT COUNT(*) FROM calibration_set_frames
+                                    WHERE set_id = NEW.set_id)
+              WHERE id = NEW.set_id;",
+        ),
+        (
+            "calibration_set_frames_count_del",
+            "calibration_set_frames",
+            "AFTER DELETE",
+            "UPDATE calibration_set
+                SET frame_count = (SELECT COUNT(*) FROM calibration_set_frames
+                                    WHERE set_id = OLD.set_id)
+              WHERE id = OLD.set_id;",
+        ),
+        (
+            "session_members_count_ins",
+            "session_members",
+            "AFTER INSERT",
+            "UPDATE sessions
+                SET frame_count = (SELECT COUNT(*) FROM session_members
+                                    WHERE session_id = NEW.session_id),
+                    total_exp_time = COALESCE((SELECT SUM(fr.exptime)
+                                                 FROM session_members sm
+                                                 JOIN frames fr ON fr.id = sm.frame_id
+                                                WHERE sm.session_id = NEW.session_id), 0.0)
+              WHERE id = NEW.session_id;",
+        ),
+        (
+            "session_members_count_del",
+            "session_members",
+            "AFTER DELETE",
+            "UPDATE sessions
+                SET frame_count = (SELECT COUNT(*) FROM session_members
+                                    WHERE session_id = OLD.session_id),
+                    total_exp_time = COALESCE((SELECT SUM(fr.exptime)
+                                                 FROM session_members sm
+                                                 JOIN frames fr ON fr.id = sm.frame_id
+                                                WHERE sm.session_id = OLD.session_id), 0.0)
+              WHERE id = OLD.session_id;",
+        ),
+    ] {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {name}"), [])?;
+        conn.execute(
+            &format!("CREATE TRIGGER {name} {event} ON {table} FOR EACH ROW BEGIN {body} END"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whole-table counterpart to [`create_membership_count_sync_triggers`]: bring
+/// every already-drifted counter back in line with its junction table.
+///
+/// Runs on every start rather than once behind a `settings` flag. It is two
+/// `UPDATE`s over a table of set/session rows (~1_000 and ~400 on the owner's
+/// production catalog) and each is a no-op after the first pass, because the
+/// `WHERE` clause only matches rows whose stored value actually differs — which
+/// also keeps the `*_touch` triggers from bumping `updated_at` on rows that did
+/// not change and pushing phantom edits into sync. Cheap and self-healing beats
+/// flag-gated: if any future path ever slips past the triggers, the next start
+/// silently corrects it instead of freezing the drift behind a stamped flag.
+///
+/// Returns the number of rows corrected, so a start that finds drift can say so.
+pub(crate) fn resync_membership_counts(conn: &Connection) -> rusqlite::Result<usize> {
+    let sets = conn.execute(
+        "UPDATE calibration_set
+            SET frame_count = (SELECT COUNT(*) FROM calibration_set_frames
+                                WHERE set_id = calibration_set.id)
+          WHERE frame_count IS NOT (SELECT COUNT(*) FROM calibration_set_frames
+                                     WHERE set_id = calibration_set.id)",
+        [],
+    )?;
+
+    let sessions = conn.execute(
+        "UPDATE sessions
+            SET frame_count = (SELECT COUNT(*) FROM session_members
+                                WHERE session_id = sessions.id),
+                total_exp_time = COALESCE((SELECT SUM(fr.exptime)
+                                             FROM session_members sm
+                                             JOIN frames fr ON fr.id = sm.frame_id
+                                            WHERE sm.session_id = sessions.id), 0.0)
+          WHERE frame_count IS NOT (SELECT COUNT(*) FROM session_members
+                                     WHERE session_id = sessions.id)
+             OR total_exp_time IS NOT COALESCE((SELECT SUM(fr.exptime)
+                                                  FROM session_members sm
+                                                  JOIN frames fr ON fr.id = sm.frame_id
+                                                 WHERE sm.session_id = sessions.id), 0.0)",
+        [],
+    )?;
+
+    if sets + sessions > 0 {
+        tracing::info!(
+            calibration_sets = sets,
+            sessions = sessions,
+            "membership counters resynced from junction tables"
+        );
+    }
+    Ok(sets + sessions)
+}
+
 fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -1789,6 +1930,12 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // the same exemptions the trigger applies (see helper doc).
     prune_orphaned_calibration_sets(conn)?;
 
+    // Same shape one level down: the junction tables lose rows by FK cascade,
+    // so the parents' denormalized counters need a trigger plus a startup
+    // sweep for the drift that pre-dates it (see helper docs).
+    create_membership_count_sync_triggers(conn)?;
+    resync_membership_counts(conn)?;
+
     // archive_operations: frames_set_id nullable + calibration_set_id.
     // SQLite can't drop NOT NULL via ALTER — rebuild once, detected by the
     // absence of the calibration_set_id column.
@@ -2218,6 +2365,284 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod membership_count_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// A calibration set with `n` member frames, its `frame_count` stamped to
+    /// whatever the writers would have stamped at creation time.
+    fn seed_set(conn: &Connection, n: i64, stamped: i64) -> (i64, Vec<i64>) {
+        conn.execute(
+            "INSERT INTO calibration_set
+             (imagetyp, exptime, instrume, date, date_start, date_end, frame_count)
+             VALUES ('Flat', 1.25, 'TestCam', '2025-08-22',
+                     '2025-08-22T20:00:00Z', '2025-08-22T20:10:00Z', ?1)",
+            rusqlite::params![stamped],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+
+        let mut frame_ids = Vec::new();
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES ('/t/f' || ?1 || '.fits', 'f.fits', 1, '2025-08-22T20:00:00+00:00', 'FITS')",
+                rusqlite::params![format!("{set_id}_{i}")],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, instrume, exptime)
+                 VALUES (?1, 'Flat', 'TestCam', 1.25)",
+                rusqlite::params![file_id],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            )
+            .unwrap();
+            frame_ids.push(frame_id);
+        }
+        (set_id, frame_ids)
+    }
+
+    fn stored_count(conn: &Connection, set_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT frame_count FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The owner-reported symptom, in miniature: deleting half a calibration
+    /// set's files (the de-duplication pass) cascades the junction rows away
+    /// but used to leave `frame_count` at its pre-deletion value, which is what
+    /// the Equipment page renders. Sets 546/547 showed 20 with 10 members left;
+    /// 628 showed 80 with 40.
+    #[test]
+    fn deleting_member_files_updates_calibration_frame_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (set_id, frames) = seed_set(&conn, 20, 20);
+        assert_eq!(stored_count(&conn, set_id), 20);
+
+        // Delete the files of half the members — the black-hole/void path's
+        // shape: `DELETE FROM files`, everything below it by FK cascade.
+        for frame_id in frames.iter().take(10) {
+            conn.execute(
+                "DELETE FROM files WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
+                [frame_id],
+            )
+            .unwrap();
+        }
+
+        let links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(links, 10, "FK cascade should have removed 10 junction rows");
+        assert_eq!(
+            stored_count(&conn, set_id),
+            10,
+            "frame_count must follow the junction table, not the creation-time stamp"
+        );
+    }
+
+    /// Adding members keeps the counter honest too — the existing writers
+    /// already did this, and the trigger must not fight them.
+    #[test]
+    fn linking_more_frames_updates_calibration_frame_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (set_id, _) = seed_set(&conn, 3, 3);
+
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/t/extra.fits', 'extra.fits', 1, '2025-08-22T20:00:00+00:00', 'FITS')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Flat')",
+            [file_id],
+        )
+        .unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![set_id, frame_id],
+        )
+        .unwrap();
+
+        assert_eq!(stored_count(&conn, set_id), 4);
+    }
+
+    /// Losing the last member still hands the row to
+    /// `calibration_set_empty_prune`; the count trigger must not resurrect it
+    /// or abort the delete, whichever of the two fires first.
+    #[test]
+    fn losing_the_last_member_still_prunes_the_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (set_id, frames) = seed_set(&conn, 1, 1);
+
+        conn.execute(
+            "DELETE FROM files WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
+            [&frames[0]],
+        )
+        .unwrap();
+
+        let alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive, 0, "empty set must still be pruned");
+    }
+
+    /// `sessions` carries the same denormalized pair and drifted the same way
+    /// (42 stale rows in the owner's catalog). Object sets themselves look
+    /// immune only because `frames_set` has no such column.
+    #[test]
+    fn deleting_session_member_files_updates_session_counters() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute("INSERT INTO frames_set (name) VALUES ('M31')", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (?1, '2025-08-22T20:00:00Z', '2025-08-23T04:00:00Z')",
+            [set_id],
+        )
+        .unwrap();
+        let night_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume, frame_count, total_exp_time)
+             VALUES (?1, 'TestCam', 2, 600.0)",
+            [night_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        let mut frame_ids = Vec::new();
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES ('/t/l' || ?1 || '.fits', 'l.fits', 1, '2025-08-22T20:00:00+00:00', 'FITS')",
+                rusqlite::params![i],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, exptime) VALUES (?1, 'Light', 300.0)",
+                [file_id],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session_id, frame_id],
+            )
+            .unwrap();
+            frame_ids.push(frame_id);
+        }
+
+        conn.execute(
+            "DELETE FROM files WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
+            [&frame_ids[0]],
+        )
+        .unwrap();
+
+        let (count, exp): (i64, f64) = conn
+            .query_row(
+                "SELECT frame_count, total_exp_time FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!((exp - 300.0).abs() < 1e-6, "total_exp_time was {exp}");
+    }
+
+    /// Pins the startup sweep: a catalog that drifted BEFORE the triggers
+    /// existed is corrected by `init_db` alone, with no membership change to
+    /// fire a trigger. Deleting the `resync_membership_counts` call in
+    /// `init_db` leaves every test above green — only this one goes red.
+    #[test]
+    fn init_db_resyncs_counters_that_drifted_before_the_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (set_id, _) = seed_set(&conn, 10, 10);
+
+        // Reproduce the pre-fix state exactly: junction table already halved,
+        // counter still carrying the old value. Dropping the triggers first is
+        // what makes this "drift that pre-dates them" rather than a delete the
+        // triggers would have caught.
+        conn.execute(
+            "DROP TRIGGER IF EXISTS calibration_set_frames_count_del",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM calibration_set_frames
+              WHERE set_id = ?1
+                AND frame_id IN (SELECT frame_id FROM calibration_set_frames
+                                  WHERE set_id = ?1 LIMIT 5)",
+            [set_id],
+        )
+        .unwrap();
+        assert_eq!(stored_count(&conn, set_id), 10, "drift staged");
+
+        init_db(&conn).unwrap();
+
+        assert_eq!(
+            stored_count(&conn, set_id),
+            5,
+            "init_db must resync counters that drifted before the triggers existed"
+        );
+    }
+
+    /// The sweep must not churn `updated_at` on rows that were already correct
+    /// — that would push phantom edits into sync on every start.
+    #[test]
+    fn resync_leaves_correct_rows_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (set_id, _) = seed_set(&conn, 4, 4);
+
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(resync_membership_counts(&conn).unwrap(), 0);
+
+        let after: String = conn
+            .query_row(
+                "SELECT updated_at FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after, "an in-sync row must not be rewritten");
+    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,26 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Membership counters follow deletions — 2026-08-27
+
+`calibration_set.frame_count` and `sessions.frame_count`/`total_exp_time` were written
+only where members are *added*; a deletion arrives by FK cascade, where there was no
+call site to hook, so the counters froze at their creation-time value. Owner report:
+sets 546/547 showing 20 with 10 members left, 628 showing 80 with 40. Fixed with
+`AFTER INSERT`/`AFTER DELETE` triggers on both junction tables plus a startup resync
+sweep in `init_db` (`db/schema.rs::create_membership_count_sync_triggers` /
+`resync_membership_counts`). On the owner's production catalog the sweep corrects 868
+calibration sets and 42 sessions — verified on a copy, not yet run in the app.
+
+- Launch on the production catalog: Equipment page shows real member counts on
+  546/547 (10) and 628 (40); the log line `membership counters resynced from junction
+  tables` reports `calibration_sets=868 sessions=42`, and a second launch reports
+  nothing (the sweep only rewrites rows that actually differ).
+- Delete calibration frames through the Black Hole → void: the owning set's count
+  drops immediately, and a set that loses its last member is still pruned.
+- Object-set session rows show frame counts and integration times matching their
+  members after a deletion.
+
 ### Code-debt cleanup — 2026-08-25
 
 Dead enum variants deleted (`WarningType` ×3, `SkipReason` ×2, `StepStatus::RolledBack`
@@ -178,5 +198,7 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 - Rebuild master from the library: masters built in Athenaeum can be re-integrated
   in place from their original source frames (Equipment → expanded master row).
+- Calibration sets and sessions no longer keep counting frames that were deleted;
+  existing catalogs are corrected once on startup.
 
 (v0.5.1 lines were paid in full on 2026-08-24.)
