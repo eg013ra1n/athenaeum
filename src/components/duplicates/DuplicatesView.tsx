@@ -634,6 +634,15 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
             </p>
           </div>
         )}
+
+        {duplicates.length > 0 && (
+          <p className="text-xs text-content-muted px-1 pb-2">
+            Raw sub-frames are matched by their stored header. Masters and processed
+            files are matched by their full contents instead — a processing tool can
+            copy one image's header onto another, so a header does not identify them
+            — and they appear here after the scan that hashes them.
+          </p>
+        )}
       </div>
 
       {/* Error banner */}
