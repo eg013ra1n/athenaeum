@@ -482,6 +482,10 @@ export type ComputeQueueEntry = { jobId: number, kind: ComputeJobKind, label: st
 
 export type ContentIndexProgress = { done: number, total: number, updated: number, skipped: number, };
 
+export type VerifyMethod = "bytes" | "storedHash";
+
+export type VerifyPairResult = { identical: boolean, method: VerifyMethod, };
+
 export type ContentIndexFinished = { updated: number, skipped: number, cancelled: boolean, 
 /**
  * The pass could not enumerate its work (locked DB, schema mismatch,

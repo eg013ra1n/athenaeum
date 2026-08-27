@@ -144,4 +144,132 @@ pub fn verify_byte_identical(path1: &Path, path2: &Path) -> Result<bool> {
     }
 }
 
+/// How [`crate::api::files::verify_duplicate_pair`] reached its verdict.
+///
+/// `Bytes` — both files were read now, in lockstep, and compared
+/// byte-for-byte. `StoredHash` — both catalog rows carried a current
+/// `files.strong_hash` (full-content xxh3, staleness-checked against the
+/// disk's size/mtime), so the verdict came from the column without reading
+/// either file. Hash inequality is sound in both directions here: equal
+/// bytes cannot hash differently, and the equality direction carries the
+/// same 64-bit trust the Master duplicate key already stakes deletions on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum VerifyMethod {
+    Bytes,
+    StoredHash,
+}
+
+/// Outcome of one duplicate-pair verification.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyPairResult {
+    pub identical: bool,
+    pub method: VerifyMethod,
+}
+
+/// [`verify_byte_identical`], but the read is not wasted: while comparing,
+/// the first file's bytes feed an incremental XXH3 — so an identical pair
+/// returns the full-content digest both files share, in exactly
+/// [`compute_full_xxhash`]'s format (streaming xxh3 is buffer-size
+/// independent), ready to be banked into `files.strong_hash`.
+///
+/// A mismatch still early-exits on the first differing chunk and returns
+/// `None`: any digest computed by then would describe a prefix, not the
+/// file, and finishing both reads just to hash two files that are NOT
+/// copies of each other would spend the I/O this shortcut exists to save.
+pub fn verify_byte_identical_hashing(
+    path1: &Path,
+    path2: &Path,
+) -> Result<(bool, Option<String>)> {
+    use std::io::Read;
+
+    let file1 = File::open(path1)?;
+    let file2 = File::open(path2)?;
+
+    let mut reader1 = BufReader::new(file1);
+    let mut reader2 = BufReader::new(file2);
+
+    let mut buffer1 = vec![0; 8192];
+    let mut buffer2 = vec![0; 8192];
+    let mut hasher = Xxh3::new();
+
+    loop {
+        let bytes1 = reader1.read(&mut buffer1)?;
+        let bytes2 = reader2.read(&mut buffer2)?;
+
+        if bytes1 != bytes2 {
+            return Ok((false, None));
+        }
+
+        if bytes1 == 0 {
+            return Ok((true, Some(format!("{:016x}", hasher.digest()))));
+        }
+
+        if buffer1[..bytes1] != buffer2[..bytes2] {
+            return Ok((false, None));
+        }
+
+        hasher.update(&buffer1[..bytes1]);
+    }
+}
+
 use crate::models::DuplicateGroup;
+
+#[cfg(test)]
+mod verify_hashing_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn write_file(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        File::create(&p).unwrap().write_all(body).unwrap();
+        p
+    }
+
+    /// Identical files: the compare must return the full-content hash it
+    /// already paid to read, and that hash must be byte-for-byte the one
+    /// `compute_full_xxhash` would produce — `files.strong_hash` stores the
+    /// latter, so a differing format would poison the master key's column.
+    #[test]
+    fn identical_files_yield_the_stored_hash_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Larger than one 8 KiB compare buffer, so the incremental hash is
+        // proven across chunk boundaries, not just on a single read.
+        let body = vec![0xA7u8; 50_000];
+        let a = write_file(tmp.path(), "a.fits", &body);
+        let b = write_file(tmp.path(), "b.fits", &body);
+
+        let (identical, digest) = verify_byte_identical_hashing(&a, &b).unwrap();
+        assert!(identical);
+        assert_eq!(digest.as_deref(), Some(compute_full_xxhash(&a).unwrap().as_str()));
+    }
+
+    /// Different files: no digest — the compare early-exits on the first
+    /// differing chunk, so any digest it could return would describe a
+    /// prefix, not the file. None is the only honest answer.
+    #[test]
+    fn different_files_yield_no_digest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = write_file(tmp.path(), "a.fits", &vec![1u8; 50_000]);
+        let mut body = vec![1u8; 50_000];
+        body[10_000] = 2; // differs inside the second compare chunk
+        let b = write_file(tmp.path(), "b.fits", &body);
+
+        let (identical, digest) = verify_byte_identical_hashing(&a, &b).unwrap();
+        assert!(!identical);
+        assert!(digest.is_none());
+    }
+
+    /// Same bytes, different lengths: not identical (the shorter is a prefix).
+    #[test]
+    fn prefix_files_are_not_identical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = write_file(tmp.path(), "a.fits", &vec![7u8; 20_000]);
+        let b = write_file(tmp.path(), "b.fits", &vec![7u8; 20_001]);
+
+        let (identical, digest) = verify_byte_identical_hashing(&a, &b).unwrap();
+        assert!(!identical);
+        assert!(digest.is_none());
+    }
+}

@@ -331,6 +331,7 @@ pub fn run() {
             commands::send_all_to_void,
             commands::get_duplicate_folders,
             commands::verify_files_byte_identical,
+            commands::verify_duplicate_pair,
             commands::relink_scan_root,
             commands::check_all_scan_roots_availability,
             commands::check_missing_files_in_scan_root,

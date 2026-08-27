@@ -1180,3 +1180,233 @@ mod duplicate_key_tests {
         );
     }
 }
+
+/// Verify two catalog files are byte-identical, banking the work.
+///
+/// The deep-verify button's backend. Three-tier economy:
+///
+/// 1. **Stored-hash shortcut** — when BOTH rows carry a non-empty
+///    `files.strong_hash` and BOTH files still match their rows'
+///    `(size, modified_at)` on disk ([`crate::duplicates::backfill::disk_matches_row`],
+///    the same staleness contract as the master-hash pass), the verdict is
+///    the hash comparison: zero bytes read. Inequality is sound (equal bytes
+///    cannot hash differently); equality carries the same 64-bit xxh3 trust
+///    the Master duplicate key already stakes deletions on.
+/// 2. **Byte compare with free hashing** — otherwise both files are read in
+///    lockstep and compared byte-for-byte
+///    ([`crate::duplicates::verify_byte_identical_hashing`]). An identical
+///    pair yields the full-content digest the read already paid for, which
+///    is banked into `files.strong_hash` for every row still current on
+///    disk — so the NEXT verify of this pair, and the master-hash pass, and
+///    any future decide-by-bytes consumer, never pay this read again.
+/// 3. **Mismatch stores nothing** — the compare early-exits, so no honest
+///    full-content digest exists.
+pub fn verify_duplicate_pair(
+    ctx: &ServiceContext,
+    file_a: i64,
+    file_b: i64,
+) -> Result<crate::duplicates::VerifyPairResult, ApiError> {
+    use crate::duplicates::{VerifyMethod, VerifyPairResult};
+
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    let load = |id: i64| -> Result<(String, i64, String, Option<String>), ApiError> {
+        conn.query_row(
+            "SELECT path, size, modified_at, strong_hash FROM files WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|e| {
+            tracing::error!(file_id = id, error = %e, "verify pair: file row not found");
+            ApiError::from(anyhow::anyhow!("file {id} not found: {e}"))
+        })
+    };
+    let (path_a, size_a, mtime_a, hash_a) = load(file_a)?;
+    let (path_b, size_b, mtime_b, hash_b) = load(file_b)?;
+
+    let a_current = crate::duplicates::backfill::disk_matches_row(
+        std::path::Path::new(&path_a), size_a, &mtime_a);
+    let b_current = crate::duplicates::backfill::disk_matches_row(
+        std::path::Path::new(&path_b), size_b, &mtime_b);
+
+    let usable = |h: &Option<String>| h.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
+    if a_current && b_current {
+        if let (Some(ha), Some(hb)) = (usable(&hash_a), usable(&hash_b)) {
+            tracing::debug!(file_a, file_b, identical = (ha == hb),
+                "verify pair: decided from stored hashes");
+            return Ok(VerifyPairResult { identical: ha == hb, method: VerifyMethod::StoredHash });
+        }
+    }
+
+    let (identical, digest) = crate::duplicates::verify_byte_identical_hashing(
+        std::path::Path::new(&path_a),
+        std::path::Path::new(&path_b),
+    )
+    .map_err(|e| {
+        tracing::error!(file_a, file_b, error = %e, "verify pair: byte compare failed");
+        ApiError::from(e)
+    })?;
+
+    if let (true, Some(d)) = (identical, digest) {
+        // Bank the digest — but only into rows the disk still vouches for
+        // (checked BEFORE the read, same stance as the master-hash pass); a
+        // stale row is the scanner's to refresh, not ours to overwrite.
+        for (id, current) in [(file_a, a_current), (file_b, b_current)] {
+            if !current {
+                continue;
+            }
+            if let Err(e) = conn.execute(
+                "UPDATE files SET strong_hash = ?2 WHERE id = ?1",
+                rusqlite::params![id, d],
+            ) {
+                // The verdict stands either way — losing the banked hash
+                // costs a re-read later, never a wrong answer now.
+                tracing::error!(file_id = id, error = %e, "verify pair: strong_hash write failed");
+            }
+        }
+        tracing::debug!(file_a, file_b, "verify pair: identical, hashes banked");
+    }
+
+    Ok(VerifyPairResult { identical, method: VerifyMethod::Bytes })
+}
+
+#[cfg(test)]
+mod verify_pair_tests {
+    use crate::duplicates::{compute_full_xxhash, VerifyMethod};
+    use crate::services::ServiceContext;
+    use std::io::Write as _;
+
+    /// files + frames rows for one on-disk file, carrying its REAL
+    /// (size, modified_at) so the staleness guard sees a current row.
+    fn seed_file(conn: &rusqlite::Connection, id: i64, path: &std::path::Path) {
+        let meta = std::fs::metadata(path).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'FITS')",
+            rusqlite::params![
+                id,
+                path.to_str().unwrap(),
+                path.file_name().unwrap().to_str().unwrap(),
+                meta.len() as i64,
+                chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn stored_hash(conn: &rusqlite::Connection, id: i64) -> Option<String> {
+        conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn setup(bodies: &[(&str, &[u8])]) -> (tempfile::TempDir, ServiceContext, Vec<std::path::PathBuf>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let mut paths = Vec::new();
+        {
+            let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+            let conn = db.conn();
+            for (i, (name, body)) in bodies.iter().enumerate() {
+                let p = tmp.path().join(name);
+                std::fs::File::create(&p).unwrap().write_all(body).unwrap();
+                seed_file(&conn, (i + 1) as i64, &p);
+                paths.push(p);
+            }
+        }
+        (tmp, ctx, paths)
+    }
+
+    /// First verify of an identical pair pays the byte compare — and banks
+    /// the full-content hash into BOTH rows, in `compute_full_xxhash`'s
+    /// format, so the read is never paid twice.
+    #[test]
+    fn identical_pair_stores_the_hash_for_both_files() {
+        let body = vec![0x42u8; 30_000];
+        let (tmp, ctx, paths) = setup(&[("a.fits", &body), ("b.fits", &body)]);
+
+        let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
+        assert!(r.identical);
+        assert_eq!(r.method, VerifyMethod::Bytes);
+
+        let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let conn = db.conn();
+        let expect = compute_full_xxhash(&paths[0]).unwrap();
+        assert_eq!(stored_hash(&conn, 1).as_deref(), Some(expect.as_str()));
+        assert_eq!(stored_hash(&conn, 2).as_deref(), Some(expect.as_str()));
+    }
+
+    /// Second verify of the same pair never reads the files: both rows carry
+    /// a current stored hash, and equality is decided from the column.
+    #[test]
+    fn second_verify_decides_from_the_stored_hashes() {
+        let body = vec![0x42u8; 30_000];
+        let (_tmp, ctx, _paths) = setup(&[("a.fits", &body), ("b.fits", &body)]);
+
+        assert_eq!(super::verify_duplicate_pair(&ctx, 1, 2).unwrap().method, VerifyMethod::Bytes);
+        let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
+        assert!(r.identical);
+        assert_eq!(r.method, VerifyMethod::StoredHash);
+    }
+
+    /// Differing stored hashes on current rows prove the bytes differ —
+    /// hash inequality is sound (equal bytes cannot hash differently), so
+    /// the mismatch verdict needs no read either.
+    #[test]
+    fn differing_stored_hashes_decide_mismatch_without_reading() {
+        let (tmp, ctx, _paths) = setup(&[("a.fits", &vec![1u8; 9_000]), ("b.fits", &vec![2u8; 9_000])]);
+        {
+            let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+            let conn = db.conn();
+            conn.execute("UPDATE files SET strong_hash = 'aaaa' WHERE id = 1", []).unwrap();
+            conn.execute("UPDATE files SET strong_hash = 'bbbb' WHERE id = 2", []).unwrap();
+        }
+
+        let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
+        assert!(!r.identical);
+        assert_eq!(r.method, VerifyMethod::StoredHash);
+    }
+
+    /// A stale catalog row (its recorded size no longer matches the disk)
+    /// disqualifies the shortcut AND the write-back for that row: the bytes
+    /// are compared, the current row banks the hash, the stale row is left
+    /// for the scanner to refresh.
+    #[test]
+    fn a_stale_row_falls_back_to_bytes_and_is_not_written() {
+        let body = vec![0x42u8; 30_000];
+        let (tmp, ctx, _paths) = setup(&[("a.fits", &body), ("b.fits", &body)]);
+        {
+            let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+            let conn = db.conn();
+            // Row 1 lies about its size — and carries a hash that would win
+            // the shortcut if staleness were ignored.
+            conn.execute("UPDATE files SET size = 1, strong_hash = 'stale' WHERE id = 1", []).unwrap();
+            conn.execute("UPDATE files SET strong_hash = 'stale' WHERE id = 2", []).unwrap();
+        }
+
+        let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
+        assert!(r.identical);
+        assert_eq!(r.method, VerifyMethod::Bytes, "stale row must disqualify the shortcut");
+
+        let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let conn = db.conn();
+        assert_eq!(stored_hash(&conn, 1).as_deref(), Some("stale"), "stale row must not be rewritten");
+        assert_ne!(stored_hash(&conn, 2).as_deref(), Some("stale"), "current row banks the fresh hash");
+    }
+
+    /// A mismatching pair stores nothing: the compare early-exits, so no
+    /// full-content digest exists to store.
+    #[test]
+    fn a_mismatching_pair_stores_nothing() {
+        let (tmp, ctx, _paths) = setup(&[("a.fits", &vec![1u8; 9_000]), ("b.fits", &vec![2u8; 9_000])]);
+
+        let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
+        assert!(!r.identical);
+        assert_eq!(r.method, VerifyMethod::Bytes);
+
+        let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let conn = db.conn();
+        assert_eq!(stored_hash(&conn, 1), None);
+        assert_eq!(stored_hash(&conn, 2), None);
+    }
+}

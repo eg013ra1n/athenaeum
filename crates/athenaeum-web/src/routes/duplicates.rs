@@ -302,6 +302,27 @@ pub async fn set_scan_root_unique_camera_flag(
     Ok(Json(()))
 }
 
+/// Deep-verify two CATALOG files, banking the read (mirror of the Tauri
+/// `verify_duplicate_pair`): an identical pair's full-content hash lands in
+/// `files.strong_hash`, and a later verify of the same pair is decided from
+/// the stored hashes without reading either file.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyDuplicatePairArgs {
+    pub file_a: i64,
+    pub file_b: i64,
+}
+
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn verify_duplicate_pair(
+    State(state): State<WebAppState>,
+    Json(args): Json<VerifyDuplicatePairArgs>,
+) -> Result<Json<athenaeum_core::duplicates::VerifyPairResult>, (StatusCode, String)> {
+    athenaeum_core::api::files::verify_duplicate_pair(&state.ctx, args.file_a, args.file_b)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// Deep-verify two files are byte-identical. Opt-in safety net before
 /// destructive operations on duplicates — `compute_xxhash` only samples
 /// 3×512 KiB regions, so two genuinely different large files can collide.

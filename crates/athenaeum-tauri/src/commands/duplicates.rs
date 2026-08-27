@@ -169,6 +169,21 @@ pub async fn get_duplicate_folders(
 /// before destructive operations on duplicates — `compute_xxhash` only
 /// samples 3×512 KiB regions of a file, so two genuinely different large
 /// files can collide in the sampled hash.
+/// Deep-verify two CATALOG files, banking the read: an identical pair's
+/// full-content hash lands in `files.strong_hash`, and a later verify of the
+/// same pair is decided from the stored hashes without reading either file.
+/// Fired per-file by the Duplicates view's verify loop — debug-level span.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn verify_duplicate_pair(
+    file_a: i64,
+    file_b: i64,
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::duplicates::VerifyPairResult, String> {
+    athenaeum_core::api::files::verify_duplicate_pair(&state.ctx, file_a, file_b)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn verify_files_byte_identical(

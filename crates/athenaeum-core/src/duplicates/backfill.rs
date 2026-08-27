@@ -197,19 +197,7 @@ pub fn run_content_index(
             // wrongly report "already on peer" for content the catalog has never
             // described. Skip — the next scan's reparse rewrites hash AND
             // metadata together.
-            let on_disk = std::fs::metadata(p).ok().map(|m| {
-                let size = m.len() as i64;
-                let modified = m
-                    .modified()
-                    .ok()
-                    .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
-                (size, modified)
-            });
-            let matches_row = matches!(
-                on_disk.as_ref(),
-                Some((s, Some(m))) if s == db_size && m == db_modified
-            );
-            if !matches_row {
+            if !disk_matches_row(p, *db_size, db_modified) {
                 skipped += 1;
                 tracing::debug!(file_id = id, path = %path, "content index: missing or drifted on disk; left for the next scan");
                 continue;
@@ -291,6 +279,25 @@ pub fn run_content_index(
 /// SQL's three-valued logic `NOT IN` rejects. An unclassified file is
 /// deliberately hashed by neither this pass nor decided by either key; see that
 /// method's doc comment for why widening it would be wrong.
+/// True when the file at `path` still matches its catalog row's
+/// `(size, modified_at)` — the shared staleness contract of every
+/// `strong_hash`/`content_hash` write: drifted metadata means the row
+/// describes different bytes, and stamping a fresh-content hash onto a stale
+/// row would let a later reader trust a hash the scanner never vouched for.
+/// A missing file or unreadable mtime counts as "does not match".
+pub(crate) fn disk_matches_row(path: &std::path::Path, size: i64, modified_at: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let on_disk_mtime = m
+                .modified()
+                .ok()
+                .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
+            m.len() as i64 == size && on_disk_mtime.as_deref() == Some(modified_at)
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn fill_master_strong_hashes(
     conn: &Connection,
     emitter: &dyn ProgressEmitter,
@@ -343,24 +350,13 @@ pub fn fill_master_strong_hashes(
         }
 
         let p = std::path::Path::new(&path);
-        // Stale-row check: hash only what the catalog still describes.
-        match std::fs::metadata(p) {
-            Ok(m) => {
-                let on_disk_mtime = chrono::DateTime::<Utc>::from(
-                    m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                )
-                .to_rfc3339();
-                if m.len() as i64 != size || on_disk_mtime != modified_at {
-                    tracing::debug!(file_id = id, path = %path,
-                        "master strong-hash: row is stale, skipping");
-                    continue;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(file_id = id, path = %path, error = %e,
-                    "master strong-hash: stat failed, skipping");
-                continue;
-            }
+        // Stale-row check: hash only what the catalog still describes. An
+        // unreachable file (unmounted volume) logs at debug, not warn — this
+        // pass repeats every scan, and the owner runs detachable archives.
+        if !disk_matches_row(p, size, &modified_at) {
+            tracing::debug!(file_id = id, path = %path,
+                "master strong-hash: row is stale or unreachable, skipping");
+            continue;
         }
 
         let hash = match crate::duplicates::compute_full_xxhash(p) {

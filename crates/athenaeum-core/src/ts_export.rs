@@ -152,6 +152,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::services::compute_queue::ComputeJobState,
             crate::services::compute_queue::ComputeQueueEntry,
             crate::duplicates::backfill::ContentIndexProgress,
+            crate::duplicates::VerifyMethod,
+            crate::duplicates::VerifyPairResult,
             crate::duplicates::backfill::ContentIndexFinished,
             crate::duplicates::backfill::MasterHashProgress,
             crate::api::content_index::ContentIndexStatus,
