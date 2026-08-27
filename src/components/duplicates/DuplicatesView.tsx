@@ -620,7 +620,7 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
               {hiddenGroupCount > 0
                 ? `; ${hiddenGroupCount} group${hiddenGroupCount === 1 ? '' : 's'} no longer have duplicates and were hidden.`
                 : '.'}
-              {' '}These files match the sampling hash but differ in content — they are <strong>not</strong> true duplicates.
+              {' '}These files matched the grouping key but differ in content — they are <strong>not</strong> true duplicates.
             </p>
           </div>
         )}
@@ -633,6 +633,15 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
               All {deepVerify.state.summary?.total} file{deepVerify.state.summary?.total === 1 ? '' : 's'} verified byte-identical. Safe to move to Black Hole.
             </p>
           </div>
+        )}
+
+        {duplicates.length > 0 && (
+          <p className="text-xs text-content-muted px-1 pb-2">
+            Raw sub-frames are matched by their stored header. Masters and processed
+            files are matched by their full contents instead — a processing tool can
+            copy one image's header onto another, so a header does not identify them
+            — and they appear here after the scan that hashes them.
+          </p>
         )}
       </div>
 

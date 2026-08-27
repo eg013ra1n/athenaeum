@@ -65,8 +65,12 @@ fn no_db() -> (StatusCode, String) {
 
 /// Return duplicate file groups.
 ///
-/// Checks the settings to determine whether content hashes or metadata hashes
-/// are used.  Serves from the warm cache when available; otherwise computes
+/// The `duplicates.use_content_hash` setting selects the `DuplicateKey`s:
+/// content hashes when on; when off, the union of the header key (raw
+/// sub-frames) and the master key (masters and processed files, decided by a
+/// full-file hash), whose eligibility clauses are complements over the
+/// classified files. Serves
+/// from the warm cache of EACH key when available; otherwise computes
 /// on-the-fly (slow path, used before the first scan populates the cache).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_duplicates(
@@ -76,23 +80,39 @@ pub async fn get_duplicates(
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    let use_content_hash = state
+    // Content mode is a single explicit key over every file. Otherwise the
+    // view is Header (raw sub-frames, decided by their stored header) plus
+    // Master (everything else, decided by a full-file hash) — the two
+    // eligibility clauses are complements over the CLASSIFIED files, so no
+    // file is decided twice (an unclassified `imagetyp IS NULL` frame is
+    // deliberately in neither — see `DuplicateKey::eligibility`).
+    let keys: &[athenaeum_core::db::DuplicateKey] = if state
         .ctx
         .settings
         .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false);
+        .unwrap_or(false)
+    {
+        &[athenaeum_core::db::DuplicateKey::Content]
+    } else {
+        &[
+            athenaeum_core::db::DuplicateKey::Header,
+            athenaeum_core::db::DuplicateKey::Master,
+        ]
+    };
 
-    // Fast path: warm cache.
-    if athenaeum_core::db::has_duplicate_cache(&conn, use_content_hash).unwrap_or(false) {
-        let groups = athenaeum_core::db::get_cached_duplicates(&conn, use_content_hash)
-            .map_err(db_err)?;
-        return Ok(Json(groups));
+    let mut all = Vec::new();
+    for &key in keys {
+        let groups = if athenaeum_core::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
+            // Fast path: warm cache.
+            athenaeum_core::db::get_cached_duplicates(&conn, key).map_err(db_err)?
+        } else {
+            // Slow path: compute now.
+            athenaeum_core::db::find_duplicate_groups(&conn, key).map_err(db_err)?
+        };
+        all.extend(groups);
     }
-
-    // Slow path: compute now.
-    let groups = athenaeum_core::db::find_duplicate_groups(&conn, use_content_hash)
-        .map_err(db_err)?;
-    Ok(Json(groups))
+    all.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(b.size.cmp(&a.size)));
+    Ok(Json(all))
 }
 
 /// Soft-delete a file by adding it to the black hole.

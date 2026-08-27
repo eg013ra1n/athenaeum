@@ -417,11 +417,39 @@ pub fn find_duplicate_folders(
     // Get all unique folder paths from files
     let mut folder_files: HashMap<String, Vec<(i64, String, i64)>> = HashMap::new();
 
+    // Same identity the Duplicates view uses (`DuplicateKey::Header`): folder
+    // similarity is the Duplicates question asked one directory at a time, so
+    // keying it differently would make the two screens disagree about the same
+    // pair of folders. Raw sub-frames only, for the reason in
+    // `DuplicateKey::eligibility`. `DISTINCT` because neither `fits_header`
+    // nor `frames` has a `UNIQUE(file_id)`, and a duplicated child row would
+    // otherwise put one file into a folder's list twice and inflate its
+    // similarity score.
+    //
+    // `fh.header <> ''` guards the source blob as well as the fingerprint, for
+    // the reason spelled out in `DuplicateKey::hash_is_usable`:
+    // `compute_header_fingerprint("")` is a well-formed 16-hex hash, so
+    // `header_fingerprint <> ''` never fires on an empty header — and
+    // sync-ingest really does insert empty `fits_header` rows. Without it
+    // every header-less file in a folder would match every header-less file in
+    // every other folder and manufacture similarity out of nothing.
+    //
+    // The comparison key below is the header key's full triple — fingerprint,
+    // size AND filename (`DuplicateKey::group_extra`) — not the fingerprint
+    // alone. A processed derivative keeps its source's header verbatim (our
+    // XISF parser drops PixInsight's `comment` history), so on fingerprint
+    // alone a folder of `*_GraXpert.xisf` outputs reads as a near-perfect copy
+    // of the folder it was processed from.
     let mut stmt = conn.prepare(
-        "SELECT id, path, metadata_hash, size
-         FROM files
-         WHERE metadata_hash IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)"
+        "SELECT DISTINCT f.id, f.path, fh.header_fingerprint, f.size, f.filename
+         FROM files f
+         JOIN fits_header fh ON fh.file_id = f.id
+         JOIN frames fr ON fr.file_id = f.id
+         WHERE fh.header_fingerprint IS NOT NULL AND fh.header_fingerprint <> ''
+         AND fh.header <> ''
+         AND COALESCE(fr.is_master, 0) = 0
+         AND fr.imagetyp IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat')
+         AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -430,17 +458,22 @@ pub fn find_duplicate_folders(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
 
     for row in rows {
-        let (id, path, hash, size) = row?;
+        let (id, path, fingerprint, size, filename) = row?;
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let folder = parent.to_string_lossy().to_string();
+            // One string carrying the whole comparison key, so the map lookup
+            // below stays a plain equality on the identity the Duplicates view
+            // uses.
+            let key = format!("{fingerprint}|{size}|{filename}");
             folder_files
                 .entry(folder)
                 .or_insert_with(Vec::new)
-                .push((id, hash, size));
+                .push((id, key, size));
         }
     }
 
@@ -456,16 +489,17 @@ pub fn find_duplicate_folders(
             let files_a = &folder_files[folder_a];
             let files_b = &folder_files[folder_b];
 
-            // Find common hashes
-            let hashes_a: HashMap<_, _> = files_a.iter().map(|(id, hash, size)| (hash.clone(), (*id, *size))).collect();
-            let hashes_b: HashMap<_, _> = files_b.iter().map(|(id, hash, size)| (hash.clone(), (*id, *size))).collect();
+            // Find files present in both folders under the same identity
+            // (fingerprint + size + filename, built above).
+            let keys_a: HashMap<_, _> = files_a.iter().map(|(id, key, size)| (key.clone(), (*id, *size))).collect();
+            let keys_b: HashMap<_, _> = files_b.iter().map(|(id, key, size)| (key.clone(), (*id, *size))).collect();
 
             let mut shared_count = 0;
             let mut shared_size = 0i64;
             let mut shared_file_ids = Vec::new();
 
-            for (hash, (id_a, size)) in &hashes_a {
-                if hashes_b.contains_key(hash) {
+            for (key, (id_a, size)) in &keys_a {
+                if keys_b.contains_key(key) {
                     shared_count += 1;
                     shared_size += size;
                     shared_file_ids.push(*id_a);
@@ -1274,5 +1308,146 @@ mod tests {
         let tx = conn.unchecked_transaction().unwrap();
         rebuild_folder_similarity_cache(&conn, 50.0).unwrap();
         tx.commit().unwrap();
+    }
+
+    /// Folder similarity grouped on `metadata_hash` too, so it was blind in
+    /// exactly the same way the Duplicates view was: two folders holding the same
+    /// twenty flats scored 0 % similar because one side came off an exFAT volume.
+    #[test]
+    fn folder_similarity_sees_copies_whose_mtime_drifted() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (id, path, mtime) in [
+            (1i64, "/vol/a/f0.fits", "2024-10-05T04:21:46+00:00"),
+            (2, "/vol/a/f1.fits", "2024-10-05T04:21:50+00:00"),
+            (3, "/vol/b/f0.fits", "2024-10-05T04:21:44.307+00:00"),
+            (4, "/vol/b/f1.fits", "2024-10-05T04:21:49.223+00:00"),
+        ] {
+            // Per-file metadata_hash, so the OLD key finds nothing and this test
+            // is red before the change.
+            let header = if path.ends_with("f0.fits") {
+                "HDR-0"
+            } else {
+                "HDR-1"
+            };
+            // The filename is part of the comparison key now, so store the
+            // real basename rather than a placeholder: `f0.fits` pairs with
+            // `f0.fits`, `f1.fits` with `f1.fits`.
+            let filename = path.rsplit('/').next().unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
+                 VALUES (?1, ?2, ?3, 100, ?4, 'FITS', ?5)",
+                params![id, path, filename, mtime, format!("meta-{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'Flat', 0)",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
+                params![
+                    id,
+                    header,
+                    crate::fingerprint::compute_header_fingerprint(header)
+                ],
+            )
+            .unwrap();
+        }
+
+        let sims = find_duplicate_folders(&conn, 50.0).unwrap();
+        assert_eq!(
+            sims.len(),
+            1,
+            "the two folders are full copies, got {sims:#?}"
+        );
+        assert_eq!(sims[0].shared_files, 2);
+        assert!((sims[0].similarity_percent - 100.0).abs() < 1e-6);
+    }
+
+    /// A master must not make two folders look alike — same exclusion as the
+    /// Duplicates view, for the same measured reason (spec §2.4).
+    #[test]
+    fn folder_similarity_ignores_masters() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (id, path) in [(1i64, "/vol/a/m.xisf"), (2, "/vol/b/m.xisf")] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
+                 VALUES (?1, ?2, 'm.xisf', 100, '2024-01-01T00:00:00+00:00', 'XISF', ?3)",
+                params![id, path, format!("meta-{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master)
+                 VALUES (?1, ?1, 'MasterLight', 1)",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'HDR', ?2)",
+                params![id, crate::fingerprint::compute_header_fingerprint("HDR")],
+            )
+            .unwrap();
+        }
+
+        let sims = find_duplicate_folders(&conn, 50.0).unwrap();
+        assert!(
+            sims.is_empty(),
+            "masters must not pair folders, got {sims:#?}"
+        );
+    }
+
+    /// A folder of processed outputs must not read as a copy of the folder it
+    /// was processed FROM.
+    ///
+    /// GraXpert/ABE outputs keep `IMAGETYP = 'Light'` and `is_master = 0`, and
+    /// carry their source's header verbatim (our XISF parser drops
+    /// PixInsight's `comment` history), so on the fingerprint alone every file
+    /// in `processed/` matches its counterpart in `raw/` and the pair scores
+    /// 100 % similar — with different bytes on every side. The filename half
+    /// of the key separates them; same rule as the Duplicates view.
+    #[test]
+    fn folder_similarity_ignores_processed_derivatives() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (id, path, header) in [
+            (1i64, "/vol/raw/Lum_001.xisf", "HDR-0"),
+            (2, "/vol/raw/Lum_002.xisf", "HDR-1"),
+            (3, "/vol/processed/Lum_001_GraXpert.xisf", "HDR-0"),
+            (4, "/vol/processed/Lum_002_GraXpert.xisf", "HDR-1"),
+        ] {
+            let filename = path.rsplit('/').next().unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
+                 VALUES (?1, ?2, ?3, 100, '2024-01-01T00:00:00+00:00', 'XISF', ?4)",
+                params![id, path, filename, format!("meta-{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'Light', 0)",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
+                params![
+                    id,
+                    header,
+                    crate::fingerprint::compute_header_fingerprint(header)
+                ],
+            )
+            .unwrap();
+        }
+
+        let sims = find_duplicate_folders(&conn, 50.0).unwrap();
+        assert!(
+            sims.is_empty(),
+            "a processed folder is not a copy of its source, got {sims:#?}"
+        );
     }
 }

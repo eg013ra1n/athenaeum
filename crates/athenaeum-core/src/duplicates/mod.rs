@@ -57,6 +57,32 @@ pub fn compute_xxhash(path: &Path) -> Result<String> {
     Ok(format!("{:016x}", hasher.digest()))
 }
 
+/// Hash a file's ENTIRE contents with XXH3_64.
+///
+/// The counterpart to [`compute_xxhash`], which samples three 512 KiB regions
+/// and is documented as lossy. Sampling is not merely lossy here, it is
+/// hopeless: measured over 20 000 trials, a sampling scheme's chance of
+/// noticing a changed pixel equals the fraction of the file it reads, and the
+/// real divergence between two PixInsight masters is ONE Float32 pixel — 4
+/// bytes in 77 MiB. Spending more of the budget on more, smaller samples makes
+/// it strictly worse. So masters are decided by reading everything.
+///
+/// Affordable only because the caller hashes a header-shortlisted subset (see
+/// [`backfill::fill_master_strong_hashes`]): 7.5 GiB, not 2.62 TiB.
+pub fn compute_full_xxhash(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Xxh3::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:016x}", hasher.digest()))
+}
+
 /// Compute metadata hash (quick, no file I/O required)
 /// Hashes: size + modified_time + filename
 /// Returns 16-character hex string
@@ -80,7 +106,8 @@ pub fn compute_metadata_hash(size: i64, modified_at: &DateTime<Utc>, filename: &
 /// This function is a wrapper - actual implementation is in db::find_duplicate_groups
 #[allow(dead_code)]
 pub fn find_duplicates(conn: &rusqlite::Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
-    crate::db::find_duplicate_groups(conn, use_content_hash).map_err(|e| anyhow::anyhow!(e.to_string()))
+    let key = crate::db::DuplicateKey::from_setting(use_content_hash);
+    crate::db::find_duplicate_groups(conn, key).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// Verify two files are byte-identical (optional safeguard).

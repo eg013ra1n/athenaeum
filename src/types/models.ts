@@ -491,6 +491,8 @@ export type ContentIndexFinished = { updated: number, skipped: number, cancelled
  */
 failed: boolean, };
 
+export type MasterHashProgress = { done: number, total: number, path: string, };
+
 export type ContentIndexStatus = { 
 /**
  * Catalogued files still missing a hash.

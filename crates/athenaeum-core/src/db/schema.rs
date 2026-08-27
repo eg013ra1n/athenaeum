@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OptionalExtension, Result};
 
 pub const UUID_TABLES: [&str; 7] = [
     "files", "frames", "frames_set", "sessions",
@@ -314,6 +314,85 @@ fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// The duplicate-groups cache, as `init_db` wants it. One definition shared by
+/// the creation path and the header-key migration below, so the two can never
+/// drift into disagreeing about the CHECK.
+///
+/// The indexes live here rather than in the index batch further down because
+/// the migration drops and recreates both tables AFTER that batch has already
+/// run — an index left behind there would only reappear on the *next* start.
+fn create_duplicate_cache_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS duplicate_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hash TEXT NOT NULL,
+            hash_type TEXT NOT NULL CHECK(hash_type IN ('content', 'metadata', 'header', 'master')),
+            size INTEGER NOT NULL,
+            file_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            -- `size` is part of the identity, not a payload: every key groups
+            -- on (hash, size), and a hash alone is NOT unique across sizes —
+            -- four header fingerprints on the owner's production catalog span
+            -- two sizes each. With `UNIQUE(hash, hash_type)` the second group
+            -- failed to insert and aborted the whole rebuild.
+            UNIQUE(hash, hash_type, size)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS duplicate_group_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            FOREIGN KEY (group_id) REFERENCES duplicate_groups(id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            UNIQUE(group_id, file_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dup_group_hash ON duplicate_groups(hash, hash_type)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dup_group_files_group ON duplicate_group_files(group_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dup_group_files_file ON duplicate_group_files(file_id)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// True when `duplicate_groups` already has the current shape: a `hash_type`
+/// CHECK that accepts every key AND the `(hash, hash_type, size)` uniqueness
+/// the keys actually have.
+///
+/// BOTH markers are probed, because the two arrived in different waves. A
+/// catalog carrying the intermediate shape — the four-value CHECK with the old
+/// `UNIQUE(hash, hash_type)` — passes a `'master'`-only probe while still
+/// rejecting the second group of any hash that spans two sizes, so it has to
+/// be re-migrated once.
+///
+/// Reads the stored DDL rather than probing with a rolled-back INSERT: a
+/// probe would open a savepoint in the middle of `init_db`, and the property
+/// is cheap to read directly. A reformatted constraint would make this return
+/// false and re-run the migration once, which drops and recreates a cache that
+/// the next scan rebuilds anyway — a harmless false negative, and the only way
+/// this check can be wrong.
+fn duplicate_cache_accepts_current_hash_types(conn: &Connection) -> rusqlite::Result<bool> {
+    let ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'duplicate_groups'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(ddl.is_some_and(|sql| sql.contains("'master'") && sql.contains("hash_type, size")))
 }
 
 /// Bridge a `sync::store` column-guard helper's `anyhow` error into the
@@ -685,33 +764,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Duplicate groups cache - stores pre-computed duplicate file groups
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS duplicate_groups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            hash TEXT NOT NULL,
-            hash_type TEXT NOT NULL CHECK(hash_type IN ('content', 'metadata')),
-            size INTEGER NOT NULL,
-            file_count INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(hash, hash_type)
-        )",
-        [],
-    )?;
-
-    // Duplicate group files - links files to duplicate groups
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS duplicate_group_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            file_id INTEGER NOT NULL,
-            FOREIGN KEY (group_id) REFERENCES duplicate_groups(id) ON DELETE CASCADE,
-            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
-            UNIQUE(group_id, file_id)
-        )",
-        [],
-    )?;
+    // Duplicate groups cache (+ its file links and indexes) - stores
+    // pre-computed duplicate file groups. Defined once in the helper, which
+    // the header-key migration further down reuses after dropping the tables.
+    create_duplicate_cache_tables(conn)?;
 
     // Folder similarity cache - stores pre-computed folder similarity results
     conn.execute(
@@ -976,19 +1032,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Indexes for duplicate cache tables
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_dup_group_hash ON duplicate_groups(hash, hash_type)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_dup_group_files_group ON duplicate_group_files(group_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_dup_group_files_file ON duplicate_group_files(file_id)",
-        [],
-    )?;
+    // Indexes for the duplicate cache tables are created by
+    // `create_duplicate_cache_tables` beside their tables, so the migration
+    // that recreates those tables (below, after this batch has run) restores
+    // them in the same start.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_archive_files_op ON archive_operation_files(operation_id)",
         [],
@@ -1207,6 +1254,29 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+
+    // Full-file hash, used ONLY to decide master/processed duplicates.
+    // Deliberately NOT `content_hash`: that column is the three-part sampling
+    // hash and the transfer dedup handshake depends on that meaning, so
+    // overloading it would silently change what a peer is told about a file.
+    // NULL means "not hashed yet" — a miss, never a false positive.
+    let has_strong_hash: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='strong_hash'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_strong_hash {
+        conn.execute("ALTER TABLE files ADD COLUMN strong_hash TEXT", [])?;
+    }
+    // The index lives HERE and not in the index batch above: that batch runs
+    // before the migrations, so on a catalog created before this column
+    // existed `CREATE INDEX ... ON files(strong_hash)` would fail to prepare
+    // with "no such column" and take init_db down with it. Column first,
+    // index immediately after, in the one place both are guaranteed.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_strong_hash ON files(strong_hash)",
+        [],
+    )?;
 
     // Add date_obs_start to frames_set table (migration for existing databases)
     let has_date_obs_start: Result<i64, _> = conn.query_row(
@@ -1935,6 +2005,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // sweep for the drift that pre-dates it (see helper docs).
     create_membership_count_sync_triggers(conn)?;
     resync_membership_counts(conn)?;
+
+    // The duplicate cache learned two new `hash_type`s ('header', 'master')
+    // when the cheap key stopped being `files.metadata_hash`, and its
+    // uniqueness widened to `(hash, hash_type, size)` to match what the keys
+    // actually group on. SQLite cannot widen a CHECK or a UNIQUE via ALTER,
+    // and the 12-step rebuild recipe is not worth running here: both tables
+    // are DERIVED DATA — every row is recomputed by
+    // `rebuild_duplicate_groups_cache` at the end of the next scan — so
+    // dropping and recreating them is the correct migration and costs one
+    // recompute. The probe covers both markers, so a catalog left on the
+    // intermediate shape is re-migrated once.
+    if !duplicate_cache_accepts_current_hash_types(conn)? {
+        conn.execute("DROP TABLE IF EXISTS duplicate_group_files", [])?;
+        conn.execute("DROP TABLE IF EXISTS duplicate_groups", [])?;
+        create_duplicate_cache_tables(conn)?;
+        tracing::info!("duplicate cache tables rebuilt for the header and master keys");
+    }
 
     // archive_operations: frames_set_id nullable + calibration_set_id.
     // SQLite can't drop NOT NULL via ALTER — rebuild once, detected by the
@@ -4216,5 +4303,239 @@ mod init_db_concurrency_tests {
             errs.is_empty(),
             "init_db raced under concurrent double-init: {errs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_cache_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The shipped CHECK was `IN ('content', 'metadata')`. A catalog created
+    /// before this change must accept 'header' after `init_db`, or every
+    /// post-scan cache rebuild dies on a constraint violation and the
+    /// Duplicates view silently recomputes on every open.
+    #[test]
+    fn init_db_widens_the_hash_type_check_on_an_old_catalog() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Reproduce the pre-fix shape exactly.
+        conn.execute("DROP TABLE duplicate_group_files", [])
+            .unwrap();
+        conn.execute("DROP TABLE duplicate_groups", []).unwrap();
+        conn.execute(
+            "CREATE TABLE duplicate_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT NOT NULL,
+                hash_type TEXT NOT NULL CHECK(hash_type IN ('content', 'metadata')),
+                size INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(hash, hash_type)
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE duplicate_group_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES duplicate_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                UNIQUE(group_id, file_id)
+             )",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+                 VALUES ('h', 'header', 1, 2)",
+                [],
+            )
+            .is_err(),
+            "old shape must reject 'header' — otherwise this test proves nothing"
+        );
+
+        // Next app start.
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 1, 2)",
+            [],
+        )
+        .expect("init_db must widen the CHECK to accept 'header'");
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('m', 'master', 1, 2)",
+            [],
+        )
+        .expect("the same migration must admit 'master' — Task 7 writes it");
+    }
+
+    /// A catalog left on the INTERMEDIATE shape — the four-value CHECK, but
+    /// still `UNIQUE(hash, hash_type)` — is re-migrated once.
+    ///
+    /// That shape shipped on this branch before the size joined the
+    /// uniqueness, and it is the dangerous one: it passes a `'master'`-only
+    /// probe, so a `'master'`-only probe would leave it in place forever, and
+    /// it rejects the second group of any hash that spans two sizes (four
+    /// header fingerprints do, on the owner's catalog) — failing every cache
+    /// rebuild from then on.
+    #[test]
+    fn init_db_rebuilds_a_cache_left_on_the_intermediate_unique() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Reproduce the intermediate shape exactly.
+        conn.execute("DROP TABLE duplicate_group_files", [])
+            .unwrap();
+        conn.execute("DROP TABLE duplicate_groups", []).unwrap();
+        conn.execute(
+            "CREATE TABLE duplicate_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT NOT NULL,
+                hash_type TEXT NOT NULL CHECK(hash_type IN ('content', 'metadata', 'header', 'master')),
+                size INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(hash, hash_type)
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE duplicate_group_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES duplicate_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                UNIQUE(group_id, file_id)
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 100, 2)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+                 VALUES ('h', 'header', 200, 2)",
+                [],
+            )
+            .is_err(),
+            "the intermediate shape must reject one hash across two sizes — otherwise this test proves nothing"
+        );
+
+        // Next app start.
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 100, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 200, 2)",
+            [],
+        )
+        .expect("init_db must widen the uniqueness to (hash, hash_type, size)");
+    }
+
+    /// A current catalog is left alone — a second `init_db` must not drop a
+    /// cache that was just rebuilt by a scan.
+    #[test]
+    fn a_current_catalog_keeps_its_cached_groups_across_init_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 1, 2)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM duplicate_groups", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "an up-to-date cache must survive a restart");
+    }
+
+    /// The cache is built with the same key it is read back with, and the
+    /// header key's cache never fans out on a duplicated child row (same
+    /// hazard as `find_duplicate_groups` — see Task 1).
+    #[test]
+    fn cache_round_trips_under_the_header_key() {
+        use crate::db::{
+            get_cached_duplicates, has_duplicate_cache, rebuild_duplicate_groups_cache,
+            DuplicateKey,
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/vol', 1)",
+            [],
+        )
+        .unwrap();
+        for (id, path, mtime) in [
+            (1i64, "/vol/a/f.fits", "2024-01-01T00:00:00+00:00"),
+            (2, "/vol/b/f.fits", "2024-01-01T00:00:01+00:00"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'f.fits', 100, ?3, 'FITS')",
+                rusqlite::params![id, path, mtime],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'Flat', 0)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint)
+                 VALUES (?1, 'HDR', ?2)",
+                rusqlite::params![id, crate::fingerprint::compute_header_fingerprint("HDR")],
+            )
+            .unwrap();
+        }
+        // A duplicated child row for file 1 — the schema permits it.
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint)
+             VALUES (1, 'HDR', ?1)",
+            rusqlite::params![crate::fingerprint::compute_header_fingerprint("HDR")],
+        )
+        .unwrap();
+
+        let created = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(created, 1);
+        assert!(has_duplicate_cache(&conn, DuplicateKey::Header).unwrap());
+        assert!(
+            !has_duplicate_cache(&conn, DuplicateKey::Content).unwrap(),
+            "the two keys must not share a cache"
+        );
+
+        let groups = get_cached_duplicates(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].file_count, 2,
+            "fan-out must not inflate the cache"
+        );
+        assert_eq!(groups[0].file_ids.len(), 2);
     }
 }

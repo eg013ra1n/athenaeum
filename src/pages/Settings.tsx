@@ -1167,13 +1167,19 @@ export default function Settings() {
                     Group duplicates by file content (XXHash)
                   </span>
                   <span className="block text-xs text-content-muted mt-1">
-                    Groups the Duplicates view by a content hash instead of by size, date and
-                    filename. More accurate, and it needs the content index below.
+                    Groups the Duplicates view by a hash of the file's bytes instead of by
+                    its FITS/XISF header. In the default mode, masters and processed files
+                    are matched by their full contents. With this on, everything — masters
+                    included — is grouped by the sampled content hash instead, which reads
+                    only 1.5 MB of each file; run a deep verify before deleting masters in
+                    this mode.
                   </span>
                   <span className="block text-xs text-content-muted mt-1">
-                    With this on, scans also hash new and changed files as they go — slower on
-                    NAS or other network storage. Left off, scans stay header-only — the content
-                    index below is what fills the hashes in.
+                    Left off, raw sub-frames are grouped by their stored header, which every
+                    scan already records — no extra reading, and copies still match after a
+                    move between drives changed their timestamps. With this on, scans also
+                    hash new and changed files as they go, which is slower on NAS or other
+                    network storage; the content index below fills in the rest.
                   </span>
                 </div>
               </label>
