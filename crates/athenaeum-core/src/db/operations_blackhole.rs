@@ -417,11 +417,32 @@ pub fn find_duplicate_folders(
     // Get all unique folder paths from files
     let mut folder_files: HashMap<String, Vec<(i64, String, i64)>> = HashMap::new();
 
+    // Same identity the Duplicates view uses (`DuplicateKey::Header`): folder
+    // similarity is the Duplicates question asked one directory at a time, so
+    // keying it differently would make the two screens disagree about the same
+    // pair of folders. Raw sub-frames only, for the reason in
+    // `DuplicateKey::eligibility`. `DISTINCT` because neither `fits_header`
+    // nor `frames` has a `UNIQUE(file_id)`, and a duplicated child row would
+    // otherwise put one file into a folder's list twice and inflate its
+    // similarity score.
+    //
+    // `fh.header <> ''` guards the source blob as well as the fingerprint, for
+    // the reason spelled out in `DuplicateKey::hash_is_usable`:
+    // `compute_header_fingerprint("")` is a well-formed 16-hex hash, so
+    // `header_fingerprint <> ''` never fires on an empty header — and
+    // sync-ingest really does insert empty `fits_header` rows. Without it
+    // every header-less file in a folder would match every header-less file in
+    // every other folder and manufacture similarity out of nothing.
     let mut stmt = conn.prepare(
-        "SELECT id, path, metadata_hash, size
-         FROM files
-         WHERE metadata_hash IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)"
+        "SELECT DISTINCT f.id, f.path, fh.header_fingerprint, f.size
+         FROM files f
+         JOIN fits_header fh ON fh.file_id = f.id
+         JOIN frames fr ON fr.file_id = f.id
+         WHERE fh.header_fingerprint IS NOT NULL AND fh.header_fingerprint <> ''
+         AND fh.header <> ''
+         AND COALESCE(fr.is_master, 0) = 0
+         AND fr.imagetyp IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat')
+         AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -1274,5 +1295,92 @@ mod tests {
         let tx = conn.unchecked_transaction().unwrap();
         rebuild_folder_similarity_cache(&conn, 50.0).unwrap();
         tx.commit().unwrap();
+    }
+
+    /// Folder similarity grouped on `metadata_hash` too, so it was blind in
+    /// exactly the same way the Duplicates view was: two folders holding the same
+    /// twenty flats scored 0 % similar because one side came off an exFAT volume.
+    #[test]
+    fn folder_similarity_sees_copies_whose_mtime_drifted() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (id, path, mtime) in [
+            (1i64, "/vol/a/f0.fits", "2024-10-05T04:21:46+00:00"),
+            (2, "/vol/a/f1.fits", "2024-10-05T04:21:50+00:00"),
+            (3, "/vol/b/f0.fits", "2024-10-05T04:21:44.307+00:00"),
+            (4, "/vol/b/f1.fits", "2024-10-05T04:21:49.223+00:00"),
+        ] {
+            // Per-file metadata_hash, so the OLD key finds nothing and this test
+            // is red before the change.
+            let header = if path.ends_with("f0.fits") {
+                "HDR-0"
+            } else {
+                "HDR-1"
+            };
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
+                 VALUES (?1, ?2, 'f.fits', 100, ?3, 'FITS', ?4)",
+                params![id, path, mtime, format!("meta-{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'Flat', 0)",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
+                params![
+                    id,
+                    header,
+                    crate::fingerprint::compute_header_fingerprint(header)
+                ],
+            )
+            .unwrap();
+        }
+
+        let sims = find_duplicate_folders(&conn, 50.0).unwrap();
+        assert_eq!(
+            sims.len(),
+            1,
+            "the two folders are full copies, got {sims:#?}"
+        );
+        assert_eq!(sims[0].shared_files, 2);
+        assert!((sims[0].similarity_percent - 100.0).abs() < 1e-6);
+    }
+
+    /// A master must not make two folders look alike — same exclusion as the
+    /// Duplicates view, for the same measured reason (spec §2.4).
+    #[test]
+    fn folder_similarity_ignores_masters() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (id, path) in [(1i64, "/vol/a/m.xisf"), (2, "/vol/b/m.xisf")] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
+                 VALUES (?1, ?2, 'm.xisf', 100, '2024-01-01T00:00:00+00:00', 'XISF', ?3)",
+                params![id, path, format!("meta-{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master)
+                 VALUES (?1, ?1, 'MasterLight', 1)",
+                params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'HDR', ?2)",
+                params![id, crate::fingerprint::compute_header_fingerprint("HDR")],
+            )
+            .unwrap();
+        }
+
+        let sims = find_duplicate_folders(&conn, 50.0).unwrap();
+        assert!(
+            sims.is_empty(),
+            "masters must not pair folders, got {sims:#?}"
+        );
     }
 }
