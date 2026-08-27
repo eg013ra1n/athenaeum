@@ -192,7 +192,12 @@ fn create_duplicate_cache_tables(conn: &Connection) -> rusqlite::Result<()> {
             file_count INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(hash, hash_type)
+            -- `size` is part of the identity, not a payload: every key groups
+            -- on (hash, size), and a hash alone is NOT unique across sizes —
+            -- four header fingerprints on the owner's production catalog span
+            -- two sizes each. With `UNIQUE(hash, hash_type)` the second group
+            -- failed to insert and aborted the whole rebuild.
+            UNIQUE(hash, hash_type, size)
         )",
         [],
     )?;
@@ -222,9 +227,15 @@ fn create_duplicate_cache_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// True when `duplicate_groups.hash_type` already accepts the current key
-/// set. Probing for `'master'` alone is sufficient: 'header' and 'master' are
-/// added by the same migration, so a DDL that knows 'master' knows both.
+/// True when `duplicate_groups` already has the current shape: a `hash_type`
+/// CHECK that accepts every key AND the `(hash, hash_type, size)` uniqueness
+/// the keys actually have.
+///
+/// BOTH markers are probed, because the two arrived in different waves. A
+/// catalog carrying the intermediate shape — the four-value CHECK with the old
+/// `UNIQUE(hash, hash_type)` — passes a `'master'`-only probe while still
+/// rejecting the second group of any hash that spans two sizes, so it has to
+/// be re-migrated once.
 ///
 /// Reads the stored DDL rather than probing with a rolled-back INSERT: a
 /// probe would open a savepoint in the middle of `init_db`, and the property
@@ -240,7 +251,7 @@ fn duplicate_cache_accepts_current_hash_types(conn: &Connection) -> rusqlite::Re
             |r| r.get(0),
         )
         .optional()?;
-    Ok(ddl.is_some_and(|sql| sql.contains("'master'")))
+    Ok(ddl.is_some_and(|sql| sql.contains("'master'") && sql.contains("hash_type, size")))
 }
 
 /// Bridge a `sync::store` column-guard helper's `anyhow` error into the
@@ -1848,13 +1859,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // the same exemptions the trigger applies (see helper doc).
     prune_orphaned_calibration_sets(conn)?;
 
-    // The duplicate cache learned a third `hash_type` ('header') when the
-    // cheap key stopped being `files.metadata_hash`. SQLite cannot widen a
-    // CHECK via ALTER, and the 12-step rebuild recipe is not worth running
-    // here: both tables are DERIVED DATA — every row is recomputed by
+    // The duplicate cache learned two new `hash_type`s ('header', 'master')
+    // when the cheap key stopped being `files.metadata_hash`, and its
+    // uniqueness widened to `(hash, hash_type, size)` to match what the keys
+    // actually group on. SQLite cannot widen a CHECK or a UNIQUE via ALTER,
+    // and the 12-step rebuild recipe is not worth running here: both tables
+    // are DERIVED DATA — every row is recomputed by
     // `rebuild_duplicate_groups_cache` at the end of the next scan — so
     // dropping and recreating them is the correct migration and costs one
-    // recompute.
+    // recompute. The probe covers both markers, so a catalog left on the
+    // intermediate shape is re-migrated once.
     if !duplicate_cache_accepts_current_hash_types(conn)? {
         conn.execute("DROP TABLE IF EXISTS duplicate_group_files", [])?;
         conn.execute("DROP TABLE IF EXISTS duplicate_groups", [])?;
@@ -3936,6 +3950,83 @@ mod duplicate_cache_tests {
             [],
         )
         .expect("the same migration must admit 'master' — Task 7 writes it");
+    }
+
+    /// A catalog left on the INTERMEDIATE shape — the four-value CHECK, but
+    /// still `UNIQUE(hash, hash_type)` — is re-migrated once.
+    ///
+    /// That shape shipped on this branch before the size joined the
+    /// uniqueness, and it is the dangerous one: it passes a `'master'`-only
+    /// probe, so a `'master'`-only probe would leave it in place forever, and
+    /// it rejects the second group of any hash that spans two sizes (four
+    /// header fingerprints do, on the owner's catalog) — failing every cache
+    /// rebuild from then on.
+    #[test]
+    fn init_db_rebuilds_a_cache_left_on_the_intermediate_unique() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Reproduce the intermediate shape exactly.
+        conn.execute("DROP TABLE duplicate_group_files", [])
+            .unwrap();
+        conn.execute("DROP TABLE duplicate_groups", []).unwrap();
+        conn.execute(
+            "CREATE TABLE duplicate_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT NOT NULL,
+                hash_type TEXT NOT NULL CHECK(hash_type IN ('content', 'metadata', 'header', 'master')),
+                size INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(hash, hash_type)
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE duplicate_group_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES duplicate_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                UNIQUE(group_id, file_id)
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 100, 2)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+                 VALUES ('h', 'header', 200, 2)",
+                [],
+            )
+            .is_err(),
+            "the intermediate shape must reject one hash across two sizes — otherwise this test proves nothing"
+        );
+
+        // Next app start.
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 100, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count)
+             VALUES ('h', 'header', 200, 2)",
+            [],
+        )
+        .expect("init_db must widen the uniqueness to (hash, hash_type, size)");
     }
 
     /// A current catalog is left alone — a second `init_db` must not drop a

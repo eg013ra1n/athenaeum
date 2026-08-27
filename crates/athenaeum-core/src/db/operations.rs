@@ -209,6 +209,35 @@ impl DuplicateKey {
         }
     }
 
+    /// A third grouping component beyond the hash and `files.size`, or `None`
+    /// when hash and size are the whole key.
+    ///
+    /// The header key adds `files.filename`, because the header fingerprint
+    /// does NOT separate a processed derivative from the frame it was made
+    /// from. A GraXpert- or ABE-processed XISF keeps `IMAGETYP = 'Light'` and
+    /// `is_master = 0`, so the eligibility allowlist admits it, and it carries
+    /// its source's header verbatim: PixInsight writes processing history into
+    /// the `comment` attribute, which our XISF parser drops (spec §2.4 cause
+    /// 2), so the stored blob of `Lum.xisf` and `Lum_GraXpert.xisf` is
+    /// identical and their sizes match. Measured on the owner's production
+    /// catalog, that pair was offered as a duplicate with DIFFERENT bytes on
+    /// each side — the one shape this feature must never produce.
+    ///
+    /// The filename is the signal the header lost. A byte-identical copy keeps
+    /// its name when it travels between drives — this feature's whole
+    /// candidate population is same-name/same-size — while a processing step
+    /// renames its output. A renamed true copy therefore becomes a MISS: the
+    /// fail-safe direction, and this cycle's standing rule.
+    ///
+    /// `Content` and `Master` are deliberately unchanged: both decide on the
+    /// bytes, so identical bytes must still group across a rename.
+    fn group_extra(self, files_alias: &str) -> Option<String> {
+        match self {
+            Self::Header => Some(format!("{files_alias}.filename")),
+            Self::Content | Self::Master => None,
+        }
+    }
+
     /// Extra joins the expression needs.
     ///
     /// Neither `fits_header` nor `frames` has a `UNIQUE(file_id)`, so these
@@ -2057,6 +2086,10 @@ pub fn get_distinct_instrumes(conn: &Connection) -> Result<Vec<String>> {
 
 /// Group files that are duplicates of each other under `key`.
 ///
+/// The grouping key is `(hash, files.size)` plus whatever
+/// [`DuplicateKey::group_extra`] adds — `files.filename` for the header key,
+/// nothing for the two byte-decided keys.
+///
 /// Both keys apply the same two gates the original query did: a file in the
 /// Black Hole is excluded, and a file must sit under a `scan_roots` row with
 /// `find_duplicates = 1`.
@@ -2090,7 +2123,7 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
          )
          {eligibility}
          AND ({roots})
-         GROUP BY {hash}, f.size
+         GROUP BY {hash}, f.size{group_extra}
          HAVING count > 1
          ORDER BY count DESC, f.size DESC",
         hash = key.hash_expr("f"),
@@ -2098,6 +2131,10 @@ pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec
         usable = key.hash_is_usable("f"),
         eligibility = key.eligibility(),
         roots = root_predicate,
+        group_extra = key
+            .group_extra("f")
+            .map(|col| format!(", {col}"))
+            .unwrap_or_default(),
     );
 
     let mut stmt = conn.prepare(&query)?;
@@ -2268,8 +2305,15 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
 /// other key's rows are left alone, so the two caches coexist.
 ///
 /// Both queries below mirror [`find_duplicate_groups`] exactly — same joins,
-/// same eligibility, same usability guard — because a cache that disagreed
-/// with the live computation would serve groups the recompute never finds.
+/// same eligibility, same usability guard, same grouping components — because
+/// a cache that disagreed with the live computation would serve groups the
+/// recompute never finds.
+///
+/// One thing the cache does differently: for a key with a third grouping
+/// component ([`DuplicateKey::group_extra`]) the stored `duplicate_groups.hash`
+/// is composite, `fingerprint || '|' || filename`. `UNIQUE(hash, hash_type,
+/// size)` cannot hold two same-(fingerprint, size) name-groups otherwise, and
+/// on the owner's catalog four fingerprints already span two sizes each.
 pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> Result<usize> {
     let hash_type = key.hash_type();
 
@@ -2300,8 +2344,12 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
     // not `COUNT(*)`: the header key's joins can fan out (neither fits_header
     // nor frames has a `UNIQUE(file_id)`), and a fanned-out row would make a
     // single file look like a group of two.
+    // Column 3 is the key's third grouping component (`files.filename` for the
+    // header key), selected as a literal NULL for the keys that have none so
+    // the row shape stays the same for every key.
+    let group_extra_col = key.group_extra("f");
     let query = format!(
-        "SELECT {hash}, f.size, COUNT(DISTINCT f.id) as count
+        "SELECT {hash}, f.size, COUNT(DISTINCT f.id) as count, {extra_select}
          FROM files f
          {joins}
          WHERE {usable}
@@ -2310,19 +2358,24 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
          )
          {eligibility}
          AND ({roots})
-         GROUP BY {hash}, f.size
+         GROUP BY {hash}, f.size{group_extra}
          HAVING count > 1",
         hash = key.hash_expr("f"),
         joins = key.joins("f"),
         usable = key.hash_is_usable("f"),
         eligibility = key.eligibility(),
         roots = root_predicate,
+        extra_select = group_extra_col.clone().unwrap_or_else(|| "NULL".to_string()),
+        group_extra = group_extra_col
+            .as_ref()
+            .map(|col| format!(", {col}"))
+            .unwrap_or_default(),
     );
 
     let mut stmt = conn.prepare(&query)?;
-    let rows: Vec<(String, i64, i64)> = stmt
+    let rows: Vec<(String, i64, i64, Option<String>)> = stmt
         .query_map(rusqlite::params_from_iter(root_values.iter()), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -2344,11 +2397,17 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
     // `UNIQUE(file_id)`, and a duplicated row would otherwise yield the same
     // file id twice and trip `duplicate_group_files`' `UNIQUE(group_id,
     // file_id)` — turning a benign schema quirk into a failed scan.
+    //
+    // The `{extra_predicate}` binds the key's third grouping component, so the
+    // member query selects exactly the group the aggregate above counted. Miss
+    // it and a header group would collect every file sharing the fingerprint
+    // and the size regardless of name — the very merge `group_extra` exists to
+    // prevent, re-introduced through the cache.
     let files_query = format!(
         "SELECT DISTINCT files.id
          FROM files
          {joins}
-         WHERE {hash} = ? AND files.size = ?
+         WHERE {hash} = ? AND files.size = ?{extra_predicate}
          AND NOT EXISTS (
              SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id
          )
@@ -2358,14 +2417,30 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
         joins = key.joins("files"),
         eligibility = key.eligibility(),
         roots = files_root_predicate,
+        extra_predicate = key
+            .group_extra("files")
+            .map(|col| format!(" AND {col} = ?"))
+            .unwrap_or_default(),
     );
 
-    for (hash, size, file_count) in rows {
+    for (hash, size, file_count, group_extra) in rows {
+        // What goes into `duplicate_groups.hash`. For a key with a third
+        // grouping component the stored value is composite — `fingerprint |
+        // filename` — because two name-groups can share a (fingerprint, size)
+        // and `UNIQUE(hash, hash_type, size)` would reject the second one.
+        // The column is opaque: nothing reads it back as a hash, and
+        // `get_cached_duplicates` only hands it to the frontend, which does
+        // not use it. The raw `hash` below still drives the member query.
+        let stored_hash = match group_extra.as_deref() {
+            Some(extra) => format!("{hash}|{extra}"),
+            None => hash.clone(),
+        };
+
         // Insert the group
         conn.execute(
             "INSERT INTO duplicate_groups (hash, hash_type, size, file_count, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![hash, hash_type, size, file_count, now],
+            params![stored_hash, hash_type, size, file_count, now],
         )?;
         let group_id = conn.last_insert_rowid();
 
@@ -2375,6 +2450,9 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
             rusqlite::types::Value::Text(hash.clone()),
             rusqlite::types::Value::Integer(size),
         ];
+        if let Some(extra) = group_extra {
+            bind_values.push(rusqlite::types::Value::Text(extra));
+        }
         bind_values.extend(files_root_values.iter().cloned());
         let file_ids: Vec<i64> = files_stmt
             .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
@@ -6874,8 +6952,17 @@ mod savepoint_migration_tests {
 
     // -- category 2: rollback-on-error leaves DB state unchanged ---------------
 
+    /// One hash across two sizes is TWO cached groups, not a constraint
+    /// violation.
+    ///
+    /// Every key groups on `(hash, size)`, so the size is part of the group's
+    /// identity — and on the owner's production catalog four header
+    /// fingerprints already span two sizes each. Under the shipped
+    /// `UNIQUE(hash, hash_type)` the second group's INSERT failed and took the
+    /// whole rebuild down with it, leaving the Duplicates view to recompute
+    /// from scratch on every open. Pins `UNIQUE(hash, hash_type, size)`.
     #[test]
-    fn rebuild_duplicate_groups_cache_rolls_back_partial_writes_on_constraint_violation() {
+    fn rebuild_duplicate_groups_cache_keeps_one_hash_across_two_sizes() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
@@ -6885,23 +6972,8 @@ mod savepoint_migration_tests {
         )
         .unwrap();
 
-        // Pre-existing cache row (same hash_type the call below will target)
-        // so we can prove the guard's rollback restores it after the
-        // function's own DELETE-then-INSERT sequence fails partway through.
-        conn.execute(
-            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count, created_at, updated_at)
-             VALUES ('PREEXISTING', 'content', 999, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-
         // Two duplicate pairs sharing the SAME content_hash but different
-        // sizes. The dedup query groups by (hash, size), so both pairs are
-        // found as separate duplicate groups — but duplicate_groups' unique
-        // index is on (hash, hash_type) only (no size), so inserting the
-        // second group's row deterministically violates it, failing the
-        // function mid-loop, after the savepoint has already performed a
-        // real DELETE plus one successful INSERT.
+        // sizes — two groups by the key's own definition.
         for (p, fname, size) in [
             ("/data/Root/a.fits", "a.fits", 100),
             ("/data/Root/b.fits", "b.fits", 100),
@@ -6916,10 +6988,84 @@ mod savepoint_migration_tests {
             .unwrap();
         }
 
-        let result = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content);
+        let created = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content)
+            .expect("one hash over two sizes must cache as two groups, not violate a constraint");
+        assert_eq!(created, 2);
+
+        let mut sizes: Vec<i64> = get_cached_duplicates(&conn, DuplicateKey::Content)
+            .unwrap()
+            .iter()
+            .map(|g| g.size)
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![100, 200]);
+    }
+
+    #[test]
+    fn rebuild_duplicate_groups_cache_rolls_back_partial_writes_on_constraint_violation() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/vol', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Pre-existing cache row (same hash_type the call below will target)
+        // so we can prove the guard's rollback restores it after the
+        // function's own DELETE-then-INSERT sequence fails partway through.
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count, created_at, updated_at)
+             VALUES ('PREEXISTING', 'header', 999, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Two header groups whose COMPOSITE cache hashes collide. The header
+        // key stores `fingerprint || '|' || filename`, so a fingerprint that
+        // itself contains the delimiter can be re-split at the wrong place:
+        // ('FP|x', 'y.fits') and ('FP', 'x|y.fits') both render as
+        // 'FP|x|y.fits' at the same size, and the second INSERT violates
+        // `UNIQUE(hash, hash_type, size)` — failing the function mid-loop,
+        // after the savepoint has already performed a real DELETE plus one
+        // successful INSERT.
+        //
+        // Unreachable in production (`compute_header_fingerprint` yields 16
+        // hex characters and nothing else), which is why the fingerprints
+        // below are hand-written rather than computed. What the test is
+        // actually here for is the rollback path: ANY failing INSERT mid-loop
+        // must leave the cache exactly as it was.
+        for (id, path, fingerprint) in [
+            (1i64, "/vol/a/y.fits", "FP|x"),
+            (2, "/vol/b/y.fits", "FP|x"),
+            (3, "/vol/a/x|y.fits", "FP"),
+            (4, "/vol/b/x|y.fits", "FP"),
+        ] {
+            let filename = path.rsplit('/').next().unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
+                 VALUES (?1, ?2, ?3, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+                rusqlite::params![id, path, filename],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, 'Light', 0)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint)
+                 VALUES (?1, 'HDR', ?2)",
+                rusqlite::params![id, fingerprint],
+            )
+            .unwrap();
+        }
+
+        let result = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Header);
         assert!(
             result.is_err(),
-            "the crafted (hash, hash_type) collision must surface as an Err, not silently succeed"
+            "the crafted composite-hash collision must surface as an Err, not silently succeed"
         );
 
         let groups: Vec<(String, i64)> = {
@@ -8135,5 +8281,128 @@ mod tests {
             "the header cache survived untouched"
         );
         assert!(cached_header[0].file_ids.contains(&1));
+    }
+
+    /// A processed derivative is NOT a copy of the frame it was made from.
+    ///
+    /// Verified on the owner's production catalog: a GraXpert/ABE output keeps
+    /// `IMAGETYP = 'Light'` and `is_master = 0`, so the eligibility allowlist
+    /// admits it, and it carries its source's header verbatim — PixInsight
+    /// writes processing history into the XISF `comment` attribute and our
+    /// parser drops it (spec §2.4 cause 2), so `Lum.xisf` and
+    /// `Lum_GraXpert.xisf` share a fingerprint AND a size while their bytes
+    /// differ. Before the filename joined the key, the view offered that pair
+    /// for deletion.
+    ///
+    /// The filename is the signal the header lost, and the cost is stated
+    /// plainly by the second half of this test: a renamed true copy is a MISS.
+    #[test]
+    fn header_key_does_not_group_a_processed_derivative_with_its_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        // Source and its GraXpert output: same header blob, same size,
+        // different bytes on disk. Only the name says so.
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/Lum.xisf",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-LUM",
+            "Light",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/a/Lum_GraXpert.xisf",
+            "2024-01-01T00:10:00+00:00",
+            "HDR-LUM",
+            "Light",
+            0,
+        );
+
+        assert!(
+            find_duplicate_groups(&conn, DuplicateKey::Header)
+                .unwrap()
+                .is_empty(),
+            "a processed derivative must never be offered as a copy of its source"
+        );
+
+        // A real copy of the SOURCE, under its own name, still groups — the
+        // derivative stays out of it.
+        seed_dup_file(
+            &conn,
+            3,
+            "/vol/b/Lum.xisf",
+            "2024-01-01T00:00:02+00:00",
+            "HDR-LUM",
+            "Light",
+            0,
+        );
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(groups.len(), 1, "the true copy still groups, got {groups:#?}");
+        let mut ids = groups[0].file_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "the derivative must not join the group");
+    }
+
+    /// Two name-groups sharing one (fingerprint, size) must round-trip through
+    /// the cache as two distinct groups.
+    ///
+    /// `duplicate_groups` is unique on `(hash, hash_type, size)`, so the
+    /// rebuild stores a composite `fingerprint || '|' || filename` for the
+    /// header key. Without it the second group's INSERT collides and the whole
+    /// rebuild fails; with a shared row, the two name-groups would be served
+    /// merged — the very pair `group_extra` exists to keep apart.
+    #[test]
+    fn header_cache_keeps_two_name_groups_of_one_fingerprint_apart() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        for (id, path) in [
+            (1i64, "/vol/a/Lum.xisf"),
+            (2, "/vol/b/Lum.xisf"),
+            (3, "/vol/a/Lum_GraXpert.xisf"),
+            (4, "/vol/b/Lum_GraXpert.xisf"),
+        ] {
+            seed_dup_file(
+                &conn,
+                id,
+                path,
+                "2024-01-01T00:00:00+00:00",
+                "HDR-LUM",
+                "Light",
+                0,
+            );
+        }
+
+        let created = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Header)
+            .expect("two name-groups of one fingerprint must both cache");
+        assert_eq!(created, 2);
+
+        let cached = get_cached_duplicates(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(cached.len(), 2, "got {cached:#?}");
+        let mut members: Vec<Vec<i64>> = cached
+            .iter()
+            .map(|g| {
+                let mut ids = g.file_ids.clone();
+                ids.sort_unstable();
+                ids
+            })
+            .collect();
+        members.sort();
+        assert_eq!(
+            members,
+            vec![vec![1, 2], vec![3, 4]],
+            "each cached group holds only its own name"
+        );
+        assert_eq!(
+            cached.iter().filter(|g| g.file_count == 2).count(),
+            2,
+            "neither group may collect the other's files"
+        );
     }
 }
