@@ -32,7 +32,7 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **The preview stretch is scale-adaptive.** | rustafits `stretch.rs` / `pipeline.rs` | The midtones parameter adapts to the normalized median, so `[0,1]` float FITS render almost identically to the same data in u16 ADU despite the hardcoded `max_input = 65536.0` — pinned by `unit_range_floats_stretch_like_u16`. A "missing float normalization" finding was raised and retracted. The real float bug was NaN poisoning the sample statistics, and it is fixed. |
 | **The Folders deep-link token is deliberately not monotonic** (raise → consume → lower → re-arm). | Folders workspace deep-linking | Monotonicity was the replay bug. Restoring it reintroduces it. |
 | **The calibration-set empty-prune trigger and `prune_orphaned_calibration_sets` are deliberately not identical.** | `db/schema.rs` | The per-row trigger exempts master-library sets because a master legitimately loses and regains its sole member during a re-import and the trigger fires inside that window. The whole-table prune runs only at quiescent points, where a member-less unreferenced master really is garbage. Both doc comments say so at length. |
-| **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | PixInsight writes history as `value="" comment="ImageIntegration.rejectedHigh_32: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
+| **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | PixInsight writes history as `value="" comment="ImageIntegration.rejectedHigh_32: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Processed **Light**-derivatives are a different case and the reason this is not free: a GraXpert/ABE output keeps `IMAGETYP = 'Light'` and `is_master = 0`, so the header key admits it and the erased history makes it identical to its source — they are shielded by the header key's `files.filename` component (spec D8), not by the master exclusion. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
 | **The three-part sampling hash is not a better default key than the header.** | Any "just use `compute_xxhash`" proposal | It IS `files.content_hash`, so the proposal is the existing `Content` branch. Measured: identical answer to the header key on raw frames (40/40 vs 80/80 against full SHA-256) for 61.4 GiB of reads and ~19 min; and on masters it is wrong in the DELETING direction — three of thirty groups are `..._DBE_WCS.xisf` / `_f.xisf` pairs differing by 3-4 bytes at 0.5-0.9 MiB, past the first sample and nowhere near the middle or end. Spec §2.5. |
 
 ---
@@ -46,7 +46,8 @@ review; what is missing is a human running the flow on real data.
 
 The cheap duplicate key stopped being `files.metadata_hash`
 (`size + mtime + filename`, where mtime is a property of the copy) and became
-`(fits_header.header_fingerprint, files.size)` restricted to raw sub-frames.
+`(fits_header.header_fingerprint, files.size, files.filename)` restricted to raw
+sub-frames.
 Spec: `specs/2026-08-27-duplicate-detection-design.md`. On the owner's
 production catalog the view returned 0 groups while holding 2 750
 (5 552 files, 170.5 GiB) across 33 calibration sets.
@@ -63,7 +64,14 @@ production catalog the view returned 0 groups while holding 2 750
   byte-DIFFERENT, so ZERO master groups is a legitimate — and expected —
   outcome; the smoke is that no wrong group appears, not that groups do.
 - After the scan, `SELECT COUNT(*) FROM files WHERE strong_hash IS NOT NULL`
-  is ~61 (the header-shortlisted masters), not 381 and not 41 893.
+  is ~61 (the header-shortlisted masters), not 381 and not 41 893. ~61 may read
+  high: the shortlist query does not gate on the Black Hole or on
+  `scan_roots.find_duplicates`, so it can hash a few masters the view would
+  never offer. Order of magnitude is the check, not the exact number.
+- A processed derivative is not offered as a copy of its source: `Lum.xisf` and
+  `Lum_GraXpert.xisf` (same header, same size, different bytes) must NOT be a
+  group, and `Find duplicate folders` must not score a folder of processed
+  outputs as similar to the folder it came from.
 - Run a scan: the post-scan rebuild fills `duplicate_groups` with
   `hash_type = 'header'` and the second open of the view is instant.
 - Turn on content grouping with an empty content index: the view goes empty

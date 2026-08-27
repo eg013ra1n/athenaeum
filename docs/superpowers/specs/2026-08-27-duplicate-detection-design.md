@@ -221,19 +221,48 @@ This is what D3 buys: masters shortlisted by header, decided by bytes.
 | D4 | The two keys become an enum, not a bool | `duplicate_groups.hash_type` needs a third value; a `DuplicateKey` enum makes the cache mapping explicit instead of leaving `use_content_hash: bool` to mean three things. |
 | D5 | The duplicate cache tables are dropped and recreated to widen their CHECK | They are derived data — `duplicate_groups`/`duplicate_group_files` hold nothing that cannot be recomputed, so a drop is correct and costs a single recompute, where the 12-step SQLite ALTER recipe costs a rebuild. |
 | D6 | `deep verify` stays advisory | Owner decision. The button, progress, cancel and mismatch filtering already exist and already remove mismatched files from a group before the card renders; it simply does not gate the Move button. Not changed here. |
+| D8 | The header key takes a third component, `files.filename` | The fingerprint does not separate a processed Light-derivative from its source: a GraXpert/ABE output keeps `IMAGETYP = 'Light'` and `is_master = 0`, and §2.4 cause 2 erases the processing history from the stored blob, so the two share header AND size while their bytes differ — verified as an offered duplicate pair on the owner's catalog. A byte-identical copy keeps its name across drives; a processing step renames its output. A renamed true copy becomes a deliberate miss. §4. |
 | D7 | Folder similarity moves to the same key | `find_duplicate_folders` groups by `metadata_hash` too, so it is blind in exactly the same way. Same substitution, same test shape. |
 
 ## 4. The key
 
 ```
-Header  →  (fits_header.header_fingerprint, files.size)
+Header  →  (fits_header.header_fingerprint, files.size, files.filename)
            restricted to  frames.is_master = 0
                       AND frames.imagetyp IN
                           ('Light','Flat','Dark','Bias','DarkFlat')
 
+Master  →  (files.strong_hash, files.size)
+           the complement of Header's allowlist — masters and processed
+           files, shortlisted by header, decided by a full-file hash (D3)
+
 Content →  (files.content_hash, files.size)
-           no restriction — this is the only key masters get
+           no restriction — the explicit override, and the only mode in
+           which a master is decided by the sampling hash
 ```
+
+In the default mode masters are decided by a full-file hash (`Master`, D3);
+`Content` is the user's explicit override and applies the sampling hash to
+everything, masters included — the one place where a master's identity is
+settled by 1.5 MiB of samples. §2.5 measures that as wrong in the deleting
+direction on 3 of 30 master groups, which is why it is not the default.
+
+### The filename component
+
+`Header` groups on the filename as well, because the fingerprint does not
+separate a processed derivative from the frame it was made from. A
+GraXpert/ABE-processed XISF keeps `IMAGETYP = 'Light'` and `is_master = 0`, so
+the allowlist admits it, and it carries its source's header verbatim — the
+parser defect of §2.4 cause 2 collapses the processing history to empty
+`HISTORY =` lines — so `Lum.xisf` and `Lum_GraXpert.xisf` share a fingerprint
+and a size while their bytes differ. Measured on the owner's production
+catalog, that pair was offered as a duplicate. The filename is the signal the
+header lost: a byte-identical copy keeps its name when it travels between
+drives (this feature's whole candidate population is same-name/same-size),
+while a processing step renames its output. The cost is a deliberate miss — a
+renamed true copy is not grouped — which is the fail-safe direction and this
+cycle's standing rule. Follow-up, not done here: decide name-divergent groups
+by their bytes, the way `Master` already does.
 
 Both keys keep the two predicates the current query already applies: the file
 must not be in the Black Hole, and its path must sit under a `scan_roots` row
@@ -259,7 +288,13 @@ header row and for sync-ingest's empty row.
 ## 6. Discovered, deliberately out of scope
 
 **The XISF parser drops `comment` (§2.4 cause 2).** It costs nothing for
-duplicate detection, because D3 removes masters from the header key regardless.
+duplicate detection *now*, but not for the reason first written here: masters
+are kept off the header key by D3, and processed **Light**-derivatives — which
+D3 does not touch, because they are `IMAGETYP = 'Light'`, `is_master = 0` — are
+kept out of each other's groups by D8's filename component instead. Without
+D8 the erased history is what makes `Lum.xisf` and `Lum_GraXpert.xisf`
+indistinguishable to the header key.
+
 It matters elsewhere: the stored blob is what the metadata pane's per-field
 revert and light calibration's Bayer copy-through read, and for a
 PixInsight-written XISF the entire processing history is currently erased.
