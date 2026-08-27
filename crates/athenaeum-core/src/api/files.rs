@@ -186,13 +186,11 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
     let db = db(ctx)?;
     let conn = db.conn();
 
-    let use_content_hash = ctx
-        .settings
-        .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false);
-    // Task 2 replaces this shim — the setting still selects the key, only the
-    // parameter type changed.
-    let key = crate::db::DuplicateKey::from_setting(use_content_hash);
+    let key = crate::db::DuplicateKey::from_setting(
+        ctx.settings
+            .get_duplicates_use_content_hash(&conn)
+            .unwrap_or(false),
+    );
 
     if crate::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
         return Ok(crate::db::get_cached_duplicates(&conn, key)?);
@@ -1087,5 +1085,78 @@ mod dir_rename_prefix_tests {
                 "a symlink aliasing the source is not a case variant of it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_key_tests {
+    use crate::services::ServiceContext;
+
+    /// With the setting off, the handler must use the header key and find the
+    /// pair whose mtimes drifted. With it on, it must use the content key and
+    /// find nothing (no content index has been built), rather than silently
+    /// falling back to the header key.
+    #[test]
+    fn get_duplicates_follows_the_use_content_hash_setting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+
+        {
+            let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/vol', 1)",
+                [],
+            )
+            .unwrap();
+            for (id, path, mtime) in [
+                (1i64, "/vol/a/f.fits", "2024-10-05T04:21:46+00:00"),
+                (2, "/vol/b/f.fits", "2024-10-05T04:21:44.307+00:00"),
+            ] {
+                conn.execute(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, 'f.fits', 100, ?3, 'FITS')",
+                    rusqlite::params![id, path, mtime],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO frames (id, file_id, imagetyp, is_master)
+                     VALUES (?1, ?1, 'Flat', 0)",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO fits_header (file_id, header, header_fingerprint)
+                     VALUES (?1, 'HDR', ?2)",
+                    rusqlite::params![id, crate::fingerprint::compute_header_fingerprint("HDR")],
+                )
+                .unwrap();
+            }
+        }
+
+        let groups = super::get_duplicates(&ctx).unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "header key is the default, got {groups:#?}"
+        );
+        assert_eq!(groups[0].file_count, 2);
+
+        {
+            let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::DUPLICATES_USE_CONTENT_HASH,
+                "true",
+            )
+            .unwrap();
+        }
+
+        let groups = super::get_duplicates(&ctx).unwrap();
+        assert!(
+            groups.is_empty(),
+            "content key with no content index must find nothing, got {groups:#?}"
+        );
     }
 }

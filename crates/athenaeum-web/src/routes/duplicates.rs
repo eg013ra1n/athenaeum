@@ -65,9 +65,10 @@ fn no_db() -> (StatusCode, String) {
 
 /// Return duplicate file groups.
 ///
-/// Checks the settings to determine whether content hashes or metadata hashes
-/// are used.  Serves from the warm cache when available; otherwise computes
-/// on-the-fly (slow path, used before the first scan populates the cache).
+/// The `duplicates.use_content_hash` setting selects the `DuplicateKey`:
+/// content hashes when on, header fingerprints when off. Serves from the warm
+/// cache of THAT key when available; otherwise computes on-the-fly (slow path,
+/// used before the first scan populates the cache).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_duplicates(
     State(state): State<WebAppState>,
@@ -76,14 +77,13 @@ pub async fn get_duplicates(
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    let use_content_hash = state
-        .ctx
-        .settings
-        .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false);
-    // Task 2 replaces this shim — the setting still selects the key, only the
-    // parameter type changed.
-    let key = athenaeum_core::db::DuplicateKey::from_setting(use_content_hash);
+    let key = athenaeum_core::db::DuplicateKey::from_setting(
+        state
+            .ctx
+            .settings
+            .get_duplicates_use_content_hash(&conn)
+            .unwrap_or(false),
+    );
 
     // Fast path: warm cache.
     if athenaeum_core::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
