@@ -190,11 +190,14 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
         .settings
         .get_duplicates_use_content_hash(&conn)
         .unwrap_or(false);
+    // Task 2 replaces this shim — the setting still selects the key, only the
+    // parameter type changed.
+    let key = crate::db::DuplicateKey::from_setting(use_content_hash);
 
-    if crate::db::has_duplicate_cache(&conn, use_content_hash).unwrap_or(false) {
-        return Ok(crate::db::get_cached_duplicates(&conn, use_content_hash)?);
+    if crate::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
+        return Ok(crate::db::get_cached_duplicates(&conn, key)?);
     }
-    Ok(crate::db::find_duplicate_groups(&conn, use_content_hash)?)
+    Ok(crate::db::find_duplicate_groups(&conn, key)?)
 }
 
 /// Get directory contents (subdirectories and files).

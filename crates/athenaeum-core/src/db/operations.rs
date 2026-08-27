@@ -137,6 +137,131 @@ pub fn scan_root_prefix_predicate(
     (clauses.join(" OR "), values)
 }
 
+/// Which identity two files must share before the Duplicates view calls them
+/// copies of each other.
+///
+/// This replaces a `use_content_hash: bool` that had come to mean three
+/// different things (which column to group on, which `duplicate_groups.hash_type`
+/// to write, which files are eligible at all), and it replaces
+/// `files.metadata_hash` as the cheap key.
+///
+/// `metadata_hash` is `xxh3(size + modified_at + filename)` — every term but
+/// one is a property of the FRAME, and `modified_at` is a property of the
+/// COPY. Copying is free to change it and routinely does: on the owner's
+/// catalog 2 189 of 2 763 duplicate candidates carry FAT/exFAT's two-second
+/// timestamp granularity on one side (a Windows capture PC to a Mac via a USB
+/// volume, the normal path for astro data), and another 548 were copied
+/// without `-p` so their mtime is the copy time. The measured result: the
+/// Duplicates view returned ZERO groups on a 41 893-file catalog holding
+/// 2 750 real ones. See `specs/2026-08-27-duplicate-detection-design.md` §2.1.
+///
+/// `Header` is `fits_header.header_fingerprint` — `xxh3` of the stored header
+/// blob, already written at scan time for relinking, already indexed, and
+/// independent of mtime by construction.
+///
+/// Every SQL accessor takes the caller's `files` alias, because the cache
+/// rebuild runs one query aliased `f` and a second aliased `files`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateKey {
+    /// Header identity. RAW SUB-FRAMES ONLY — see [`Self::eligibility`].
+    Header,
+    /// Byte content (`files.content_hash`). Needs the content index, and is
+    /// the only key masters and processed files are offered under.
+    Content,
+}
+
+impl DuplicateKey {
+    /// Map the `duplicates.use_content_hash` setting onto a key.
+    pub fn from_setting(use_content_hash: bool) -> Self {
+        if use_content_hash {
+            Self::Content
+        } else {
+            Self::Header
+        }
+    }
+
+    /// The value stored in `duplicate_groups.hash_type`. The two keys must
+    /// never share one, or a cached group built under one key would be served
+    /// for the other.
+    pub fn hash_type(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Content => "content",
+        }
+    }
+
+    /// SQL expression yielding the grouping hash.
+    fn hash_expr(self, files_alias: &str) -> String {
+        match self {
+            Self::Header => "fh.header_fingerprint".to_string(),
+            Self::Content => format!("{files_alias}.content_hash"),
+        }
+    }
+
+    /// Extra joins the expression needs.
+    ///
+    /// Neither `fits_header` nor `frames` has a `UNIQUE(file_id)`, so these
+    /// joins can fan out. Callers must aggregate with `COUNT(DISTINCT …)` and
+    /// de-duplicate any concatenated id/path list — see
+    /// `find_duplicate_groups`.
+    fn joins(self, files_alias: &str) -> String {
+        match self {
+            Self::Header => format!(
+                "JOIN fits_header fh ON fh.file_id = {files_alias}.id \
+                 JOIN frames fr ON fr.file_id = {files_alias}.id"
+            ),
+            Self::Content => String::new(),
+        }
+    }
+
+    /// Which files this key may consider at all.
+    ///
+    /// The header key takes raw sub-frames and nothing else. A PixInsight
+    /// master carries the FITS keywords of whichever image was the
+    /// integration REFERENCE, so `Pane_2_Sii.xisf` genuinely states
+    /// `FILTER = 'H'`; and `Pane_2_Sii.xisf` / `Pane_2_Sii_f.xisf` share all
+    /// 364 keywords, all 21 XISF properties, geometry and location, differing
+    /// only in pixels. Measured precision on that bucket: 0 of 30. No
+    /// header-level key of any completeness can separate them — do not widen
+    /// this. Spec §2.4.
+    ///
+    /// Both conditions are needed: `is_master` alone misses the 245
+    /// `MasterLight` rows that carry `is_master = 0`, and `imagetyp` alone
+    /// misses the production rows that are `Dark`/`Flat` WITH `is_master = 1`.
+    ///
+    /// An allowlist, not a denylist: an unclassified or newly-introduced
+    /// imagetyp is excluded by default, and exclusion is a miss rather than a
+    /// deletion. On the owner's catalog this costs nothing measurable — zero
+    /// duplicate groups involve a blank imagetyp.
+    fn eligibility(self) -> &'static str {
+        match self {
+            Self::Header => {
+                "AND COALESCE(fr.is_master, 0) = 0 \
+                 AND fr.imagetyp IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat')"
+            }
+            Self::Content => "",
+        }
+    }
+
+    /// Rejects a hash that is present but useless. An empty blob hashes to a
+    /// perfectly valid fingerprint that every other empty blob shares, so
+    /// `IS NOT NULL` alone would group every header-less file together.
+    ///
+    /// That is why the header key guards the SOURCE BLOB as well as the
+    /// fingerprint: `compute_header_fingerprint("")` is a well-formed
+    /// 16-hex-character hash, so `header_fingerprint <> ''` never fires on an
+    /// empty header — and sync-ingest really does insert an empty
+    /// `fits_header` row. Without `fh.header <> ''` every such row would land
+    /// in one large phantom group.
+    fn hash_is_usable(self, files_alias: &str) -> String {
+        let expr = self.hash_expr(files_alias);
+        match self {
+            Self::Header => format!("{expr} IS NOT NULL AND {expr} <> '' AND fh.header <> ''"),
+            Self::Content => format!("{expr} IS NOT NULL AND {expr} <> ''"),
+        }
+    }
+}
+
 /// Max bind parameters per statement for the `IN (…)` lists in this crate whose
 /// length comes from DATA rather than from a constant.
 ///
@@ -1877,27 +2002,23 @@ pub fn get_distinct_instrumes(conn: &Connection) -> Result<Vec<String>> {
     rows.collect()
 }
 
-/// Find duplicates by filename and metadata, or by content hash
-/// Only includes files from scan roots where find_duplicates = 1
+/// Group files that are duplicates of each other under `key`.
 ///
-/// If use_content_hash is true, groups by content_hash (xxhash).
-/// If use_content_hash is false, groups by metadata_hash (size + modified + filename).
-pub fn find_duplicate_groups(
-    conn: &Connection,
-    use_content_hash: bool,
-) -> Result<Vec<DuplicateGroup>> {
-    let hash_column = if use_content_hash {
-        "content_hash"
-    } else {
-        "metadata_hash"
-    };
-
+/// Both keys apply the same two gates the original query did: a file in the
+/// Black Hole is excluded, and a file must sit under a `scan_roots` row with
+/// `find_duplicates = 1`.
+///
+/// Fan-out safety: the header key joins `fits_header` and `frames`, neither of
+/// which has a `UNIQUE(file_id)` (see [`DuplicateKey::joins`]). The count is
+/// therefore `COUNT(DISTINCT f.id)` and the concatenated lists are
+/// de-duplicated below — SQLite's `GROUP_CONCAT` cannot take both `DISTINCT`
+/// and a separator, so the de-duplication happens in Rust. Without it a single
+/// file with two header rows would present itself as a group of two and be
+/// offered for deletion.
+pub fn find_duplicate_groups(conn: &Connection, key: DuplicateKey) -> Result<Vec<DuplicateGroup>> {
     // Scan roots eligible for duplicate detection, fetched once in Rust so
     // the path predicate can be bound as byte-range params per root instead
-    // of a per-row SQL-side `LIKE .. || '%'` concat. The original query also
-    // OR'd in `sr.path || '/%'` as a second alternative, but that's redundant
-    // — `X%` is already a superset of `X/%` — so only the plain-prefix
-    // alternative is preserved here.
+    // of a per-row SQL-side `LIKE .. || '%'` concat.
     let roots: Vec<String> = {
         let mut stmt = conn.prepare("SELECT path FROM scan_roots WHERE find_duplicates = 1")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1906,35 +2027,56 @@ pub fn find_duplicate_groups(
     let (root_predicate, root_values) = scan_root_prefix_predicate("f.path", &roots);
 
     let query = format!(
-        "SELECT f.{}, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
+        "SELECT {hash}, f.size, COUNT(DISTINCT f.id) as count,
+                GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
          FROM files f
-         WHERE f.{} IS NOT NULL
+         {joins}
+         WHERE {usable}
          AND NOT EXISTS (
              SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
          )
-         AND ({})
-         GROUP BY f.{}, f.size
+         {eligibility}
+         AND ({roots})
+         GROUP BY {hash}, f.size
          HAVING count > 1
          ORDER BY count DESC, f.size DESC",
-        hash_column, hash_column, root_predicate, hash_column
+        hash = key.hash_expr("f"),
+        joins = key.joins("f"),
+        usable = key.hash_is_usable("f"),
+        eligibility = key.eligibility(),
+        roots = root_predicate,
     );
 
     let mut stmt = conn.prepare(&query)?;
 
     let mut groups: Vec<DuplicateGroup> = stmt
         .query_map(rusqlite::params_from_iter(root_values.iter()), |row| {
-            let paths_str: String = row.get(3)?;
-            let file_paths: Vec<String> = paths_str.split('|').map(|s| s.to_string()).collect();
-
             let ids_str: String = row.get(4)?;
-            let file_ids: Vec<i64> = ids_str
-                .split('|')
-                .filter_map(|s| s.parse::<i64>().ok())
-                .collect();
+            let paths_str: String = row.get(3)?;
+
+            // Zip ids with paths and keep the first occurrence of each id, so
+            // a fanned-out join contributes each file exactly once and the
+            // two vectors stay index-aligned.
+            let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut file_ids: Vec<i64> = Vec::new();
+            let mut file_paths: Vec<String> = Vec::new();
+            for (id, path) in ids_str.split('|').zip(paths_str.split('|')) {
+                let Ok(id) = id.parse::<i64>() else { continue };
+                if seen.insert(id) {
+                    file_ids.push(id);
+                    file_paths.push(path.to_string());
+                }
+            }
 
             Ok(DuplicateGroup {
                 id: None,
                 size: row.get(1)?,
+                // Field name predates the enum: it carries whichever hash
+                // `key` selected, a header fingerprint or a content hash. Left
+                // as `content_hash` deliberately — it is a serde/ts-rs
+                // contract field (`src/types/models.ts::DuplicateGroup`) and
+                // no frontend code reads it, so renaming would churn the TS
+                // contract for no user-visible gain.
                 content_hash: row.get(0)?,
                 file_count: row.get(2)?,
                 file_paths,
@@ -1943,6 +2085,8 @@ pub fn find_duplicate_groups(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    tracing::debug!(key = ?key, groups = groups.len(), "duplicate groups computed");
 
     enrich_duplicate_groups(conn, &mut groups)?;
     Ok(groups)
@@ -2067,16 +2211,17 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
 
 /// Rebuild the duplicate groups cache tables
 /// This clears existing cache and recomputes all duplicate groups
-pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool) -> Result<usize> {
-    let hash_type = if use_content_hash {
-        "content"
-    } else {
-        "metadata"
+pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> Result<usize> {
+    // Task 2 replaces this shim — until then the cache keeps its pre-enum
+    // behaviour byte for byte (`Header` still means the legacy metadata_hash /
+    // "metadata" hash_type), so only the parameter TYPE changed here.
+    let hash_type = match key {
+        DuplicateKey::Content => "content",
+        DuplicateKey::Header => "metadata",
     };
-    let hash_column = if use_content_hash {
-        "content_hash"
-    } else {
-        "metadata_hash"
+    let hash_column = match key {
+        DuplicateKey::Content => "content_hash",
+        DuplicateKey::Header => "metadata_hash",
     };
 
     // Start transaction
@@ -2183,14 +2328,12 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
 
 /// Get duplicate groups from cache
 /// Returns cached duplicate groups with file paths and IDs
-pub fn get_cached_duplicates(
-    conn: &Connection,
-    use_content_hash: bool,
-) -> Result<Vec<DuplicateGroup>> {
-    let hash_type = if use_content_hash {
-        "content"
-    } else {
-        "metadata"
+pub fn get_cached_duplicates(conn: &Connection, key: DuplicateKey) -> Result<Vec<DuplicateGroup>> {
+    // Task 2 replaces this shim — `Header` still reads the legacy "metadata"
+    // rows so cache behaviour is unchanged until the rebuild is rewired.
+    let hash_type = match key {
+        DuplicateKey::Content => "content",
+        DuplicateKey::Header => "metadata",
     };
 
     let mut stmt = conn.prepare(
@@ -2249,11 +2392,12 @@ pub fn get_cached_duplicates(
 }
 
 /// Check if duplicate cache exists and has data
-pub fn has_duplicate_cache(conn: &Connection, use_content_hash: bool) -> Result<bool> {
-    let hash_type = if use_content_hash {
-        "content"
-    } else {
-        "metadata"
+pub fn has_duplicate_cache(conn: &Connection, key: DuplicateKey) -> Result<bool> {
+    // Task 2 replaces this shim — `Header` still probes the legacy "metadata"
+    // rows so cache behaviour is unchanged until the rebuild is rewired.
+    let hash_type = match key {
+        DuplicateKey::Content => "content",
+        DuplicateKey::Header => "metadata",
     };
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM duplicate_groups WHERE hash_type = ?1",
@@ -6031,7 +6175,7 @@ mod path_prefix_range_tests {
         }
 
         // Site 1427 (find_duplicate_groups).
-        let groups = find_duplicate_groups(&conn, true).unwrap();
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(
             groups.len(),
             1,
@@ -6049,12 +6193,12 @@ mod path_prefix_range_tests {
         );
 
         // Sites 1580 + 1614 (rebuild_duplicate_groups_cache, main query + per-group files query).
-        let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
+        let created = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(
             created, 1,
             "cache rebuild should also find exactly the RootA group"
         );
-        let cached = get_cached_duplicates(&conn, true).unwrap();
+        let cached = get_cached_duplicates(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(cached.len(), 1);
         let mut cached_paths = cached[0].file_paths.clone();
         cached_paths.sort();
@@ -6113,13 +6257,13 @@ mod path_prefix_range_tests {
             ).unwrap();
         }
 
-        let groups = find_duplicate_groups(&conn, true).unwrap();
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Content).unwrap();
         assert!(
             groups.is_empty(),
             "the M31_Ha file must not be pulled in through M31's range, so no pair forms"
         );
 
-        let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
+        let created = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(created, 0, "cache rebuild must likewise find no groups");
     }
 
@@ -6143,13 +6287,13 @@ mod path_prefix_range_tests {
             ).unwrap();
         }
 
-        let groups = find_duplicate_groups(&conn, true).unwrap();
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Content).unwrap();
         assert!(
             groups.is_empty(),
             "no scan root is eligible, so nothing should match"
         );
 
-        let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
+        let created = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(created, 0, "cache rebuild should likewise find no groups");
     }
 
@@ -6425,7 +6569,7 @@ mod path_prefix_range_tests {
         }
         tx.commit().unwrap();
 
-        let groups = find_duplicate_groups(&conn, true).unwrap();
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(groups.len(), PAIRS, "every hash must form its own group");
         assert!(
             groups.iter().all(|g| g.files.len() == 2),
@@ -6652,7 +6796,7 @@ mod savepoint_migration_tests {
         }
 
         let outer = conn.unchecked_transaction().unwrap();
-        let result = rebuild_duplicate_groups_cache(&conn, true);
+        let result = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content);
         result
             .as_ref()
             .expect("SAVEPOINT must nest inside an already-open outer transaction, not error with 'cannot start a transaction within a transaction'");
@@ -6663,7 +6807,7 @@ mod savepoint_migration_tests {
             1,
             "the one duplicate pair should have produced one cached group"
         );
-        let cached = get_cached_duplicates(&conn, true).unwrap();
+        let cached = get_cached_duplicates(&conn, DuplicateKey::Content).unwrap();
         assert_eq!(cached.len(), 1);
     }
 
@@ -6711,7 +6855,7 @@ mod savepoint_migration_tests {
             .unwrap();
         }
 
-        let result = rebuild_duplicate_groups_cache(&conn, true);
+        let result = rebuild_duplicate_groups_cache(&conn, DuplicateKey::Content);
         assert!(
             result.is_err(),
             "the crafted (hash, hash_type) collision must surface as an Err, not silently succeed"
@@ -7246,5 +7390,320 @@ mod stored_timestamp_tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0.modified_at, DateTime::<Utc>::UNIX_EPOCH);
         assert_eq!(listed[0].0.created_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
+}
+
+/// Duplicate-detection identity tests (`DuplicateKey`, `find_duplicate_groups`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// files + frames + fits_header rows for one duplicate-detection test file.
+    /// `header` becomes the stored blob AND drives the fingerprint, so two files
+    /// sharing a `header` string share a fingerprint — which is exactly the
+    /// production relation between two copies of one exposure.
+    fn seed_dup_file(
+        conn: &Connection,
+        id: i64,
+        path: &str,
+        modified_at: &str,
+        header: &str,
+        imagetyp: &str,
+        is_master: i64,
+    ) {
+        let filename = path.rsplit('/').next().unwrap();
+        let meta = crate::duplicates::compute_metadata_hash(
+            100,
+            &chrono::DateTime::parse_from_rfc3339(modified_at)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            filename,
+        );
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
+             VALUES (?1, ?2, ?3, 100, ?4, 'FITS', ?5)",
+            params![id, path, filename, modified_at, meta],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?1, ?2, ?3)",
+            params![id, imagetyp, is_master],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
+            params![
+                id,
+                header,
+                crate::fingerprint::compute_header_fingerprint(header)
+            ],
+        )
+        .unwrap();
+    }
+
+    /// A scan root that opts into duplicate detection. Every test below needs one:
+    /// the query gates on `find_duplicates = 1`.
+    fn seed_dup_root(conn: &Connection, path: &str, find_duplicates: i64) {
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES (?1, ?2)",
+            params![path, find_duplicates],
+        )
+        .unwrap();
+    }
+
+    /// Two byte-identical copies of one frame whose mtimes drifted — the shape of
+    /// production calibration set 628, where an exFAT hop rounded one copy's mtime
+    /// up to the next even whole second. The header key must see one group.
+    #[test]
+    fn header_key_groups_copies_whose_mtime_drifted() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/flat_0000.fits",
+            "2024-10-05T04:21:46+00:00",
+            "HDR-A",
+            "Flat",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/flat_0000.fits",
+            "2024-10-05T04:21:44.307+00:00",
+            "HDR-A",
+            "Flat",
+            0,
+        );
+
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected, got {groups:#?}");
+        assert_eq!(groups[0].file_count, 2);
+        let mut ids = groups[0].file_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// Masters never come back from the header key. Measured 0/30 precision:
+    /// `Pane_2_Sii.xisf` and `Pane_2_Ha.xisf` carry byte-identical FITS keywords
+    /// (spec §2.4), so grouping them would offer one filter as a copy of another.
+    #[test]
+    fn header_key_excludes_masters_and_processed_frames() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        // is_master = 1 with a raw imagetyp — the shape a bare imagetyp check
+        // would let through (production holds 2 such Darks and 1 Flat).
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/m.xisf",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-M",
+            "Dark",
+            1,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/m.xisf",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-M",
+            "Dark",
+            1,
+        );
+        // A processed imagetyp with is_master = 0 — the shape a bare is_master
+        // check would let through (production holds 245 MasterLight rows).
+        seed_dup_file(
+            &conn,
+            3,
+            "/vol/a/p.xisf",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-P",
+            "MasterLight",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            4,
+            "/vol/b/p.xisf",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-P",
+            "MasterLight",
+            0,
+        );
+
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert!(
+            groups.is_empty(),
+            "masters must not be offered, got {groups:#?}"
+        );
+    }
+
+    /// A file the scanner gave no header row, or gave an empty one, is simply not
+    /// grouped — a miss, never a false positive. Covers the three scanner branches
+    /// that insert no `fits_header` row and sync-ingest's empty row. Without the
+    /// `<> ''` guard every header-less file shares one fingerprint (the hash of
+    /// the empty string) and they would all group together.
+    #[test]
+    fn header_key_skips_files_without_a_usable_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/x.fits",
+            "2024-01-01T00:00:00+00:00",
+            "",
+            "Light",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/x.fits",
+            "2024-01-01T00:00:01+00:00",
+            "",
+            "Light",
+            0,
+        );
+        // id 3 gets files + frames rows but no fits_header row at all.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (3, '/vol/c/x.fits', 'x.fits', 100, '2024-01-01T00:00:02+00:00', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (3, 3, 'Light', 0)",
+            [],
+        )
+        .unwrap();
+
+        // The empty-blob rows must not group with each other, and the row with no
+        // header at all must not appear.
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert!(
+            groups.is_empty(),
+            "unusable headers must not group, got {groups:#?}"
+        );
+    }
+
+    /// `frames` and `fits_header` have no `UNIQUE(file_id)` — `scanner/mod.rs:1423`
+    /// says so and works around it, while three other call sites do a bare INSERT.
+    /// A duplicated child row must not fan the join out into a phantom group: ONE
+    /// file is never a duplicate of itself.
+    #[test]
+    fn header_key_survives_a_duplicated_child_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/only.fits",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-A",
+            "Light",
+            0,
+        );
+        // A second header row for the same file — permitted by the schema.
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (1, ?1, ?2)",
+            params![
+                "HDR-A",
+                crate::fingerprint::compute_header_fingerprint("HDR-A")
+            ],
+        )
+        .unwrap();
+
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert!(
+            groups.is_empty(),
+            "a single file must never be its own duplicate, got {groups:#?}"
+        );
+
+        // And with a genuine second file, the group is still exactly two files.
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/only.fits",
+            "2024-01-01T00:00:05+00:00",
+            "HDR-A",
+            "Light",
+            0,
+        );
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].file_count, 2,
+            "fan-out must not inflate the count"
+        );
+        assert_eq!(groups[0].file_ids.len(), 2);
+        assert_eq!(groups[0].file_paths.len(), 2);
+    }
+
+    /// The two gates the old key already applied still apply: a black-holed file
+    /// leaves its group, and a file outside every `find_duplicates = 1` root is
+    /// never considered.
+    #[test]
+    fn header_key_still_honours_black_hole_and_scan_root_gating() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+        seed_dup_root(&conn, "/other", 0);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/f.fits",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-A",
+            "Flat",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/f.fits",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-A",
+            "Flat",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            3,
+            "/other/f.fits",
+            "2024-01-01T00:00:02+00:00",
+            "HDR-A",
+            "Flat",
+            0,
+        );
+
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(groups.len(), 1, "the /other root has find_duplicates = 0");
+        assert_eq!(groups[0].file_count, 2);
+
+        conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+             VALUES (2, 'test', '2024-01-01T00:00:00+00:00', '/vol/b/f.fits')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            find_duplicate_groups(&conn, DuplicateKey::Header)
+                .unwrap()
+                .is_empty(),
+            "one survivor is not a duplicate group"
+        );
     }
 }

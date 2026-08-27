@@ -81,17 +81,18 @@ pub async fn get_duplicates(
         .settings
         .get_duplicates_use_content_hash(&conn)
         .unwrap_or(false);
+    // Task 2 replaces this shim — the setting still selects the key, only the
+    // parameter type changed.
+    let key = athenaeum_core::db::DuplicateKey::from_setting(use_content_hash);
 
     // Fast path: warm cache.
-    if athenaeum_core::db::has_duplicate_cache(&conn, use_content_hash).unwrap_or(false) {
-        let groups = athenaeum_core::db::get_cached_duplicates(&conn, use_content_hash)
-            .map_err(db_err)?;
+    if athenaeum_core::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
+        let groups = athenaeum_core::db::get_cached_duplicates(&conn, key).map_err(db_err)?;
         return Ok(Json(groups));
     }
 
     // Slow path: compute now.
-    let groups = athenaeum_core::db::find_duplicate_groups(&conn, use_content_hash)
-        .map_err(db_err)?;
+    let groups = athenaeum_core::db::find_duplicate_groups(&conn, key).map_err(db_err)?;
     Ok(Json(groups))
 }
 

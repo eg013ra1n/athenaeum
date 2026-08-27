@@ -3,7 +3,7 @@
 
 use crate::db::{
     file_exists, insert_file, insert_frame, insert_fits_header,
-    rebuild_duplicate_groups_cache, rebuild_folder_similarity_cache,
+    rebuild_duplicate_groups_cache, rebuild_folder_similarity_cache, DuplicateKey,
 };
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_parser::{
@@ -2396,7 +2396,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         );
 
         // Rebuild duplicate groups cache (using metadata hash by default)
-        if let Err(e) = rebuild_duplicate_groups_cache(conn, false) {
+        // Task 2 replaces this shim — `Header` is the enum spelling of the
+        // former `false`, and still rebuilds the legacy metadata-hash cache.
+        if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Header) {
             result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
         }
 
