@@ -2209,20 +2209,16 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
     Ok(())
 }
 
-/// Rebuild the duplicate groups cache tables
-/// This clears existing cache and recomputes all duplicate groups
+/// Rebuild the duplicate groups cache tables for one key.
+///
+/// Clears the cached groups of `key`'s `hash_type` and recomputes them; the
+/// other key's rows are left alone, so the two caches coexist.
+///
+/// Both queries below mirror [`find_duplicate_groups`] exactly — same joins,
+/// same eligibility, same usability guard — because a cache that disagreed
+/// with the live computation would serve groups the recompute never finds.
 pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> Result<usize> {
-    // Task 2 replaces this shim — until then the cache keeps its pre-enum
-    // behaviour byte for byte (`Header` still means the legacy metadata_hash /
-    // "metadata" hash_type), so only the parameter TYPE changed here.
-    let hash_type = match key {
-        DuplicateKey::Content => "content",
-        DuplicateKey::Header => "metadata",
-    };
-    let hash_column = match key {
-        DuplicateKey::Content => "content_hash",
-        DuplicateKey::Header => "metadata_hash",
-    };
+    let hash_type = key.hash_type();
 
     // Start transaction
     let sp = SavepointGuard::new(conn, "rebuild_dup_groups_cache")?;
@@ -2247,18 +2243,27 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
     };
     let (root_predicate, root_values) = scan_root_prefix_predicate("f.path", &roots);
 
-    // Find duplicate files (groups with count > 1)
+    // Find duplicate files (groups with count > 1). `COUNT(DISTINCT f.id)`,
+    // not `COUNT(*)`: the header key's joins can fan out (neither fits_header
+    // nor frames has a `UNIQUE(file_id)`), and a fanned-out row would make a
+    // single file look like a group of two.
     let query = format!(
-        "SELECT f.{}, f.size, COUNT(*) as count
+        "SELECT {hash}, f.size, COUNT(DISTINCT f.id) as count
          FROM files f
-         WHERE f.{} IS NOT NULL
+         {joins}
+         WHERE {usable}
          AND NOT EXISTS (
              SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
          )
-         AND ({})
-         GROUP BY f.{}, f.size
+         {eligibility}
+         AND ({roots})
+         GROUP BY {hash}, f.size
          HAVING count > 1",
-        hash_column, hash_column, root_predicate, hash_column
+        hash = key.hash_expr("f"),
+        joins = key.joins("f"),
+        usable = key.hash_is_usable("f"),
+        eligibility = key.eligibility(),
+        roots = root_predicate,
     );
 
     let mut stmt = conn.prepare(&query)?;
@@ -2282,11 +2287,24 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
     // keeps every bind position unambiguous by construction).
     let (files_root_predicate, files_root_values) =
         scan_root_prefix_predicate("files.path", &roots);
+    // `SELECT DISTINCT` is the fan-out guard: fits_header has no
+    // `UNIQUE(file_id)`, and a duplicated row would otherwise yield the same
+    // file id twice and trip `duplicate_group_files`' `UNIQUE(group_id,
+    // file_id)` — turning a benign schema quirk into a failed scan.
     let files_query = format!(
-        "SELECT id FROM files WHERE {} = ? AND size = ?
-         AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)
-         AND ({})",
-        hash_column, files_root_predicate
+        "SELECT DISTINCT files.id
+         FROM files
+         {joins}
+         WHERE {hash} = ? AND files.size = ?
+         AND NOT EXISTS (
+             SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id
+         )
+         {eligibility}
+         AND ({roots})",
+        hash = key.hash_expr("files"),
+        joins = key.joins("files"),
+        eligibility = key.eligibility(),
+        roots = files_root_predicate,
     );
 
     for (hash, size, file_count) in rows {
@@ -2329,12 +2347,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, key: DuplicateKey) -> R
 /// Get duplicate groups from cache
 /// Returns cached duplicate groups with file paths and IDs
 pub fn get_cached_duplicates(conn: &Connection, key: DuplicateKey) -> Result<Vec<DuplicateGroup>> {
-    // Task 2 replaces this shim — `Header` still reads the legacy "metadata"
-    // rows so cache behaviour is unchanged until the rebuild is rewired.
-    let hash_type = match key {
-        DuplicateKey::Content => "content",
-        DuplicateKey::Header => "metadata",
-    };
+    let hash_type = key.hash_type();
 
     let mut stmt = conn.prepare(
         "SELECT dg.id, dg.hash, dg.size, dg.file_count
@@ -2393,12 +2406,7 @@ pub fn get_cached_duplicates(conn: &Connection, key: DuplicateKey) -> Result<Vec
 
 /// Check if duplicate cache exists and has data
 pub fn has_duplicate_cache(conn: &Connection, key: DuplicateKey) -> Result<bool> {
-    // Task 2 replaces this shim — `Header` still probes the legacy "metadata"
-    // rows so cache behaviour is unchanged until the rebuild is rewired.
-    let hash_type = match key {
-        DuplicateKey::Content => "content",
-        DuplicateKey::Header => "metadata",
-    };
+    let hash_type = key.hash_type();
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM duplicate_groups WHERE hash_type = ?1",
         params![hash_type],

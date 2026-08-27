@@ -2395,9 +2395,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             "caching",
         );
 
-        // Rebuild duplicate groups cache (using metadata hash by default)
-        // Task 2 replaces this shim — `Header` is the enum spelling of the
-        // former `false`, and still rebuilds the legacy metadata-hash cache.
+        // Rebuild the duplicate groups cache under the default (header) key.
         if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Header) {
             result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
         }
