@@ -106,8 +106,6 @@ pub fn compute_metadata_hash(size: i64, modified_at: &DateTime<Utc>, filename: &
 /// This function is a wrapper - actual implementation is in db::find_duplicate_groups
 #[allow(dead_code)]
 pub fn find_duplicates(conn: &rusqlite::Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
-    // Task 2 replaces this shim — the bool still selects the key, only the
-    // callee's parameter type changed.
     let key = crate::db::DuplicateKey::from_setting(use_content_hash);
     crate::db::find_duplicate_groups(conn, key).map_err(|e| anyhow::anyhow!(e.to_string()))
 }

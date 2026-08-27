@@ -1168,9 +1168,11 @@ export default function Settings() {
                   </span>
                   <span className="block text-xs text-content-muted mt-1">
                     Groups the Duplicates view by a hash of the file's bytes instead of by
-                    its FITS/XISF header. Masters and processed files do not need this —
-                    they are always matched by their full contents, because processing
-                    tools copy a header verbatim onto a different image.
+                    its FITS/XISF header. In the default mode, masters and processed files
+                    are matched by their full contents. With this on, everything — masters
+                    included — is grouped by the sampled content hash instead, which reads
+                    only 1.5 MB of each file; run a deep verify before deleting masters in
+                    this mode.
                   </span>
                   <span className="block text-xs text-content-muted mt-1">
                     Left off, raw sub-frames are grouped by their stored header, which every

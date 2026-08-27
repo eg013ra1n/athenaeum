@@ -1321,14 +1321,17 @@ fn write_reparse_rows(
 ) -> anyhow::Result<()> {
     // UPDATE files in place. Mirrors insert_file's column list (path,
     // filename, created_at intentionally not touched).
+    //
+    // `strong_hash = NULL`: the bytes just changed, so any full-file hash is
+    // now a lie. NULL means "not hashed yet", which drops the row out of the
+    // Master key until the next pass re-reads it — a miss, never a stale group
+    // offered for deletion. (Kept out of the SQL string on purpose: a `--`
+    // comment inside a literal would silently swallow whatever a later reflow
+    // pushed onto its line, the `WHERE` clause included.)
     conn.execute(
         "UPDATE files
          SET size = ?1, modified_at = ?2, format = ?3,
              metadata_hash = ?4, content_hash = ?5,
-             -- The bytes just changed, so any full-file hash is now a lie.
-             -- NULL means \"not hashed yet\", which drops the row out of the
-             -- Master key until the next pass re-reads it: a miss, never a
-             -- stale group offered for deletion.
              strong_hash = NULL
          WHERE id = ?6",
         rusqlite::params![

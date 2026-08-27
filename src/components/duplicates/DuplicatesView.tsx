@@ -620,7 +620,7 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
               {hiddenGroupCount > 0
                 ? `; ${hiddenGroupCount} group${hiddenGroupCount === 1 ? '' : 's'} no longer have duplicates and were hidden.`
                 : '.'}
-              {' '}These files match the sampling hash but differ in content — they are <strong>not</strong> true duplicates.
+              {' '}These files matched the grouping key but differ in content — they are <strong>not</strong> true duplicates.
             </p>
           </div>
         )}
