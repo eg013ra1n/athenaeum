@@ -168,6 +168,15 @@ pub enum DuplicateKey {
     /// Byte content (`files.content_hash`). Needs the content index, and is
     /// the only key masters and processed files are offered under.
     Content,
+    /// Full-file hash (`files.strong_hash`) over masters and processed files.
+    ///
+    /// Their headers are shared by construction — PixInsight propagates the
+    /// integration reference's FITS keywords, so `Pane_2_Sii.xisf` states
+    /// `FILTER = 'H'` — which makes the header useless as a verdict and
+    /// excellent as a filter. [`crate::duplicates::backfill::fill_master_strong_hashes`]
+    /// hashes only the masters the header already shortlists into a group: 61
+    /// files / 7.5 GiB on the owner's catalog rather than 381 / 89.4 GiB.
+    Master,
 }
 
 impl DuplicateKey {
@@ -187,6 +196,7 @@ impl DuplicateKey {
         match self {
             Self::Header => "header",
             Self::Content => "content",
+            Self::Master => "master",
         }
     }
 
@@ -195,6 +205,7 @@ impl DuplicateKey {
         match self {
             Self::Header => "fh.header_fingerprint".to_string(),
             Self::Content => format!("{files_alias}.content_hash"),
+            Self::Master => format!("{files_alias}.strong_hash"),
         }
     }
 
@@ -211,6 +222,9 @@ impl DuplicateKey {
                  JOIN frames fr ON fr.file_id = {files_alias}.id"
             ),
             Self::Content => String::new(),
+            // `fr` only — the master key reads no header, but its
+            // `eligibility` clause is written entirely in terms of `fr`.
+            Self::Master => format!("JOIN frames fr ON fr.file_id = {files_alias}.id"),
         }
     }
 
@@ -240,6 +254,14 @@ impl DuplicateKey {
                  AND fr.imagetyp IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat')"
             }
             Self::Content => "",
+            // The exact complement of `Header`'s allowlist (¬A ∨ ¬B against
+            // its A ∧ B), so the two keys partition the catalog: nothing is
+            // decided twice and nothing falls between them. Pinned by
+            // `header_and_master_keys_partition_the_catalog`.
+            Self::Master => {
+                "AND (COALESCE(fr.is_master, 0) = 1 \
+                      OR fr.imagetyp NOT IN ('Light', 'Flat', 'Dark', 'Bias', 'DarkFlat'))"
+            }
         }
     }
 
@@ -257,7 +279,11 @@ impl DuplicateKey {
         let expr = self.hash_expr(files_alias);
         match self {
             Self::Header => format!("{expr} IS NOT NULL AND {expr} <> '' AND fh.header <> ''"),
-            Self::Content => format!("{expr} IS NOT NULL AND {expr} <> ''"),
+            // `strong_hash` is a plain nullable column written only after a
+            // successful full read, so there is no empty-blob analogue to
+            // guard against: NULL or '' means "not hashed yet", and both are
+            // rejected here as a miss rather than a group of unhashed files.
+            Self::Content | Self::Master => format!("{expr} IS NOT NULL AND {expr} <> ''"),
         }
     }
 }
@@ -7713,5 +7739,260 @@ mod tests {
                 .is_empty(),
             "one survivor is not a duplicate group"
         );
+    }
+
+    /// `strong_hash` for one file — what `fill_master_strong_hashes` would have
+    /// written after reading the bytes.
+    fn set_strong_hash(conn: &Connection, id: i64, hash: &str) {
+        conn.execute(
+            "UPDATE files SET strong_hash = ?2 WHERE id = ?1",
+            params![id, hash],
+        )
+        .unwrap();
+    }
+
+    /// Two masters with the same header (PixInsight copies the reference image's
+    /// keywords) but different bytes must NOT group; two with the same bytes must.
+    /// This is the whole point of the Master key: the header shortlists, the bytes
+    /// decide.
+    #[test]
+    fn master_key_decides_by_bytes_not_by_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        // Sii / Ha: identical header, different pixels — must stay apart.
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/Pane_2_Sii.xisf",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-SHARED",
+            "MasterLight",
+            1,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/a/Pane_2_Ha.xisf",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-SHARED",
+            "MasterLight",
+            1,
+        );
+        set_strong_hash(&conn, 1, "bytes-sii");
+        set_strong_hash(&conn, 2, "bytes-ha");
+
+        // A genuine copy of one master in two places — must group.
+        seed_dup_file(
+            &conn,
+            3,
+            "/vol/a/masterDark.xisf",
+            "2024-01-01T00:00:02+00:00",
+            "HDR-DARK",
+            "MasterDark",
+            1,
+        );
+        seed_dup_file(
+            &conn,
+            4,
+            "/vol/b/masterDark.xisf",
+            "2024-01-01T00:00:03+00:00",
+            "HDR-DARK",
+            "MasterDark",
+            1,
+        );
+        set_strong_hash(&conn, 3, "bytes-dark");
+        set_strong_hash(&conn, 4, "bytes-dark");
+
+        let groups = find_duplicate_groups(&conn, DuplicateKey::Master).unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the byte-identical pair groups, got {groups:#?}"
+        );
+        let mut ids = groups[0].file_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 4]);
+    }
+
+    /// A master whose bytes have not been hashed yet simply does not appear. A
+    /// missing hash is a miss, never a false positive — and never a NULL-groups-
+    /// with-NULL collapse.
+    #[test]
+    fn master_key_skips_files_with_no_strong_hash() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/m.xisf",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-M",
+            "MasterDark",
+            1,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/m.xisf",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-M",
+            "MasterDark",
+            1,
+        );
+        // Neither has a strong_hash; one gets an empty string, which must be
+        // rejected just like NULL.
+        set_strong_hash(&conn, 2, "");
+
+        assert!(find_duplicate_groups(&conn, DuplicateKey::Master)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The two keys partition the catalog: a raw sub-frame never reaches the
+    /// Master key, and a master never reaches the Header key. Nothing is decided
+    /// twice, and nothing falls between them.
+    #[test]
+    fn header_and_master_keys_partition_the_catalog() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/raw.fits",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-R",
+            "Light",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/raw.fits",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-R",
+            "Light",
+            0,
+        );
+        set_strong_hash(&conn, 1, "same");
+        set_strong_hash(&conn, 2, "same");
+
+        seed_dup_file(
+            &conn,
+            3,
+            "/vol/a/m.xisf",
+            "2024-01-01T00:00:02+00:00",
+            "HDR-M",
+            "MasterDark",
+            1,
+        );
+        seed_dup_file(
+            &conn,
+            4,
+            "/vol/b/m.xisf",
+            "2024-01-01T00:00:03+00:00",
+            "HDR-M",
+            "MasterDark",
+            1,
+        );
+        set_strong_hash(&conn, 3, "same-master");
+        set_strong_hash(&conn, 4, "same-master");
+
+        let header = find_duplicate_groups(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(header.len(), 1);
+        assert_eq!(header[0].file_ids.len(), 2);
+        assert!(
+            header[0].file_ids.contains(&1),
+            "header key owns the raw frames"
+        );
+
+        let master = find_duplicate_groups(&conn, DuplicateKey::Master).unwrap();
+        assert_eq!(master.len(), 1);
+        assert!(
+            master[0].file_ids.contains(&3),
+            "master key owns the masters"
+        );
+        assert!(
+            !master[0].file_ids.contains(&1),
+            "a raw frame must not be decided twice"
+        );
+    }
+
+    /// The scanner rebuilds the master cache on every scan, so `'master'` must
+    /// actually survive `duplicate_groups.hash_type`'s CHECK and read back as
+    /// the same group the live query finds. It must also leave the header
+    /// cache alone — both halves of the default view are cached side by side.
+    #[test]
+    fn master_cache_round_trips_and_leaves_the_header_cache_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_dup_root(&conn, "/vol", 1);
+
+        seed_dup_file(
+            &conn,
+            1,
+            "/vol/a/raw.fits",
+            "2024-01-01T00:00:00+00:00",
+            "HDR-R",
+            "Light",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            2,
+            "/vol/b/raw.fits",
+            "2024-01-01T00:00:01+00:00",
+            "HDR-R",
+            "Light",
+            0,
+        );
+        seed_dup_file(
+            &conn,
+            3,
+            "/vol/a/m.xisf",
+            "2024-01-01T00:00:02+00:00",
+            "HDR-M",
+            "MasterDark",
+            1,
+        );
+        seed_dup_file(
+            &conn,
+            4,
+            "/vol/b/m.xisf",
+            "2024-01-01T00:00:03+00:00",
+            "HDR-M",
+            "MasterDark",
+            1,
+        );
+        set_strong_hash(&conn, 3, "bytes-dark");
+        set_strong_hash(&conn, 4, "bytes-dark");
+
+        assert_eq!(
+            rebuild_duplicate_groups_cache(&conn, DuplicateKey::Header).unwrap(),
+            1
+        );
+        assert_eq!(
+            rebuild_duplicate_groups_cache(&conn, DuplicateKey::Master).unwrap(),
+            1,
+            "'master' must be an accepted hash_type"
+        );
+
+        assert!(has_duplicate_cache(&conn, DuplicateKey::Header).unwrap());
+        assert!(has_duplicate_cache(&conn, DuplicateKey::Master).unwrap());
+
+        let cached_master = get_cached_duplicates(&conn, DuplicateKey::Master).unwrap();
+        assert_eq!(cached_master.len(), 1);
+        let mut ids = cached_master[0].file_ids.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 4], "the cache serves what the live query finds");
+
+        let cached_header = get_cached_duplicates(&conn, DuplicateKey::Header).unwrap();
+        assert_eq!(cached_header.len(), 1, "the header cache survived untouched");
+        assert!(cached_header[0].file_ids.contains(&1));
     }
 }

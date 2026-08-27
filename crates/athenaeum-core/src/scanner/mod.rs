@@ -1324,7 +1324,12 @@ fn write_reparse_rows(
     conn.execute(
         "UPDATE files
          SET size = ?1, modified_at = ?2, format = ?3,
-             metadata_hash = ?4, content_hash = ?5
+             metadata_hash = ?4, content_hash = ?5,
+             -- The bytes just changed, so any full-file hash is now a lie.
+             -- NULL means \"not hashed yet\", which drops the row out of the
+             -- Master key until the next pass re-reads it: a miss, never a
+             -- stale group offered for deletion.
+             strong_hash = NULL
          WHERE id = ?6",
         rusqlite::params![
             size,
@@ -2395,9 +2400,21 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             "caching",
         );
 
+        // Masters are shortlisted by header and decided by bytes: hash the
+        // shortlist before the caches are rebuilt. Bounded by the shortlist,
+        // not by the master population (61 files / 7.5 GiB vs 381 / 89.4 GiB
+        // on the owner's catalog), and a scan has just read the whole library
+        // anyway.
+        crate::duplicates::backfill::fill_master_strong_hashes(conn, emitter, &cancel_flag);
+
         // Rebuild the duplicate groups cache under the default (header) key.
         if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Header) {
             result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
+        }
+        // …and under the master key, which the hashes above have just made
+        // computable. Both halves of the default view are cached together.
+        if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Master) {
+            result.errors.push(format!("Failed to rebuild master duplicate cache: {}", e));
         }
 
         // Rebuild folder similarity cache (threshold 70%)

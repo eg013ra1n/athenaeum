@@ -1103,6 +1103,29 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Full-file hash, used ONLY to decide master/processed duplicates.
+    // Deliberately NOT `content_hash`: that column is the three-part sampling
+    // hash and the transfer dedup handshake depends on that meaning, so
+    // overloading it would silently change what a peer is told about a file.
+    // NULL means "not hashed yet" — a miss, never a false positive.
+    let has_strong_hash: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='strong_hash'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_strong_hash {
+        conn.execute("ALTER TABLE files ADD COLUMN strong_hash TEXT", [])?;
+    }
+    // The index lives HERE and not in the index batch above: that batch runs
+    // before the migrations, so on a catalog created before this column
+    // existed `CREATE INDEX ... ON files(strong_hash)` would fail to prepare
+    // with "no such column" and take init_db down with it. Column first,
+    // index immediately after, in the one place both are guaranteed.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_strong_hash ON files(strong_hash)",
+        [],
+    )?;
+
     // Add date_obs_start to frames_set table (migration for existing databases)
     let has_date_obs_start: Result<i64, _> = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='date_obs_start'",

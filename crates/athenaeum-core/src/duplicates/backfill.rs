@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
@@ -62,6 +63,16 @@ pub struct ContentIndexProgress {
     pub total: usize,
     pub updated: usize,
     pub skipped: usize,
+}
+
+/// Per-file progress of the master strong-hash pass. UI data for the scan
+/// progress surface, not a log line — the pass logs its own lines separately.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterHashProgress {
+    pub done: usize,
+    pub total: usize,
+    pub path: String,
 }
 
 /// Terminal event. Emitted on EVERY exit path — normal completion, cancel,
@@ -254,6 +265,124 @@ pub fn run_content_index(
     );
     tracing::info!(pending = pending_count, updated, skipped, cancelled, "content index finished");
     BackfillSummary { pending: pending_count, updated, skipped, cancelled }
+}
+
+/// Fill `files.strong_hash` for every master or processed file the header key
+/// shortlists into a group and that has no hash yet.
+///
+/// The shortlist is the whole economy of this pass. A master with a unique
+/// header fingerprint is nobody's duplicate, so reading 300 MiB to prove it
+/// would be pure waste; on the owner's catalog the shortlist is 61 files /
+/// 7.5 GiB out of 381 / 89.4 GiB. Idempotent — only NULL-hash rows are
+/// visited, so a re-run converges.
+///
+/// A file whose size or mtime no longer matches its row is skipped, not
+/// hashed: the row is stale and the next scan will rewrite it (same stale-row
+/// stance as [`run_content_index`]). A read failure is logged and skipped —
+/// one unreadable master must not abandon the pass.
+///
+/// Takes `&Connection`, not `&Database`: the caller is the scanner's phase 4,
+/// which already holds the connection for the whole scan, so there is no
+/// pool slot to give back.
+pub fn fill_master_strong_hashes(
+    conn: &Connection,
+    emitter: &dyn ProgressEmitter,
+    cancel: &AtomicBool,
+) -> usize {
+    let pending: Vec<(i64, String, i64, String)> = {
+        let sql = "SELECT f.id, f.path, f.size, f.modified_at
+                   FROM files f
+                   JOIN fits_header fh ON fh.file_id = f.id
+                   JOIN frames fr ON fr.file_id = f.id
+                   WHERE (f.strong_hash IS NULL OR f.strong_hash = '')
+                     AND fh.header_fingerprint IS NOT NULL
+                     AND fh.header_fingerprint <> ''
+                     AND (COALESCE(fr.is_master, 0) = 1
+                          OR fr.imagetyp NOT IN ('Light','Flat','Dark','Bias','DarkFlat'))
+                     AND EXISTS (
+                        SELECT 1 FROM files f2
+                        JOIN fits_header fh2 ON fh2.file_id = f2.id
+                        JOIN frames fr2 ON fr2.file_id = f2.id
+                        WHERE f2.id <> f.id
+                          AND f2.size = f.size
+                          AND fh2.header_fingerprint = fh.header_fingerprint
+                          AND (COALESCE(fr2.is_master, 0) = 1
+                               OR fr2.imagetyp NOT IN ('Light','Flat','Dark','Bias','DarkFlat'))
+                     )";
+        match conn.prepare(sql).and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "master strong-hash: failed to list pending rows");
+                return 0;
+            }
+        }
+    };
+
+    if pending.is_empty() {
+        tracing::debug!(pending = 0, "master strong-hash: nothing to do");
+        return 0;
+    }
+    tracing::info!(pending = pending.len(), "master strong-hash: pass starting");
+
+    let total = pending.len();
+    let mut written = 0usize;
+    for (idx, (id, path, size, modified_at)) in pending.into_iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            tracing::info!(written, "master strong-hash: cancelled");
+            break;
+        }
+
+        let p = std::path::Path::new(&path);
+        // Stale-row check: hash only what the catalog still describes.
+        match std::fs::metadata(p) {
+            Ok(m) => {
+                let on_disk_mtime = chrono::DateTime::<Utc>::from(
+                    m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .to_rfc3339();
+                if m.len() as i64 != size || on_disk_mtime != modified_at {
+                    tracing::debug!(file_id = id, path = %path,
+                        "master strong-hash: row is stale, skipping");
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(file_id = id, path = %path, error = %e,
+                    "master strong-hash: stat failed, skipping");
+                continue;
+            }
+        }
+
+        let hash = match crate::duplicates::compute_full_xxhash(p) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(file_id = id, path = %path, error = %e,
+                    "master strong-hash: read failed, skipping");
+                continue;
+            }
+        };
+
+        if let Err(e) = conn.execute(
+            "UPDATE files SET strong_hash = ?2 WHERE id = ?1",
+            rusqlite::params![id, hash],
+        ) {
+            tracing::error!(file_id = id, error = %e, "master strong-hash: write failed");
+            continue;
+        }
+        written += 1;
+
+        emit_event(
+            emitter,
+            "master-hash-progress",
+            &MasterHashProgress { done: idx + 1, total, path: path.clone() },
+        );
+    }
+
+    tracing::info!(written, total, "master strong-hash: pass finished");
+    written
 }
 
 #[cfg(test)]
@@ -475,5 +604,81 @@ mod tests {
         assert_eq!(finished_events.len(), 1, "exactly one terminal event, no progress events");
         assert_eq!(finished_events[0].1["failed"], true);
         assert_eq!(finished_events[0].1["cancelled"], false);
+    }
+
+    use std::io::Write as _;
+
+    /// The shortlist is what keeps this affordable: only masters whose header
+    /// already puts them in a group get hashed. A master with a unique header
+    /// is nobody's duplicate, so reading 300 MiB to prove it would be waste.
+    #[test]
+    fn only_header_shortlisted_masters_are_hashed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        let write = |name: &str, body: &[u8]| -> String {
+            let p = tmp.path().join(name);
+            std::fs::File::create(&p).unwrap().write_all(body).unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let shared_a = write("a.xisf", b"AAAA");
+        let shared_b = write("b.xisf", b"AAAA");
+        let lonely = write("c.xisf", b"CCCC");
+
+        for (id, path, header) in [
+            (1i64, &shared_a, "HDR-SHARED"),
+            (2, &shared_b, "HDR-SHARED"),
+            (3, &lonely, "HDR-UNIQUE"),
+        ] {
+            let meta = std::fs::metadata(path).unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'x.xisf', ?3, ?4, 'XISF')",
+                rusqlite::params![
+                    id,
+                    path,
+                    meta.len() as i64,
+                    chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap())
+                        .to_rfc3339()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master)
+                 VALUES (?1, ?1, 'MasterLight', 1)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    id,
+                    header,
+                    crate::fingerprint::compute_header_fingerprint(header)
+                ],
+            )
+            .unwrap();
+        }
+
+        let emitter = CapturingEmitter(std::sync::Mutex::new(Vec::new()));
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let n = fill_master_strong_hashes(&conn, &emitter, &never);
+        assert_eq!(n, 2, "only the two shortlisted masters are read");
+
+        let hashed: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT id, strong_hash FROM files ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(hashed[0].1, hashed[1].1, "identical bytes, identical hash");
+        assert!(hashed[0].1.is_some());
+        assert!(hashed[2].1.is_none(), "the lonely master must not be read");
+
+        // Idempotent: a second pass hashes nothing.
+        assert_eq!(fill_master_strong_hashes(&conn, &emitter, &never), 0);
     }
 }

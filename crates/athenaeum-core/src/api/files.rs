@@ -186,16 +186,34 @@ pub fn get_duplicates(ctx: &ServiceContext) -> Result<Vec<DuplicateGroup>, ApiEr
     let db = db(ctx)?;
     let conn = db.conn();
 
-    let key = crate::db::DuplicateKey::from_setting(
-        ctx.settings
-            .get_duplicates_use_content_hash(&conn)
-            .unwrap_or(false),
-    );
+    // Content mode is a single explicit key over every file. Otherwise the
+    // view is Header (raw sub-frames, decided by their stored header) plus
+    // Master (everything else, decided by a full-file hash) — the two
+    // eligibility clauses are exact complements, so no file is decided twice.
+    let keys: &[crate::db::DuplicateKey] = if ctx
+        .settings
+        .get_duplicates_use_content_hash(&conn)
+        .unwrap_or(false)
+    {
+        &[crate::db::DuplicateKey::Content]
+    } else {
+        &[
+            crate::db::DuplicateKey::Header,
+            crate::db::DuplicateKey::Master,
+        ]
+    };
 
-    if crate::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
-        return Ok(crate::db::get_cached_duplicates(&conn, key)?);
+    let mut all = Vec::new();
+    for &key in keys {
+        let groups = if crate::db::has_duplicate_cache(&conn, key).unwrap_or(false) {
+            crate::db::get_cached_duplicates(&conn, key)?
+        } else {
+            crate::db::find_duplicate_groups(&conn, key)?
+        };
+        all.extend(groups);
     }
-    Ok(crate::db::find_duplicate_groups(&conn, key)?)
+    all.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(b.size.cmp(&a.size)));
+    Ok(all)
 }
 
 /// Get directory contents (subdirectories and files).
