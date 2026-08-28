@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, State};
 
+use athenaeum_core::api::lights::{FlatNormMode, LightCalParams};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
     DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
     TransferCleanup, TransferEventEntry, TransferStorage,
 };
 use athenaeum_core::events::ProgressEmitter;
+use athenaeum_core::export::models::ExportMode;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 
 use crate::tauri_events::TauriProgressEmitter;
@@ -127,6 +129,44 @@ pub async fn enqueue_sync_selection(
         frame_ids,
         batch_name,
         frame_set_id,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Frame-set send from the Export tab (spec 2026-08-28): one package per
+/// destination holding what the chosen export mode would put on disk.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+#[allow(clippy::too_many_arguments)]
+pub async fn enqueue_frame_set_send(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    frame_set_id: i64,
+    mode: ExportMode,
+    destination_device_id: String,
+    batch_name: Option<String>,
+    flat_norm: Option<bool>,
+    flat_norm_mode: Option<FlatNormMode>,
+    params: Option<LightCalParams>,
+) -> Result<EnqueueSelectionResult, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    let dest = api::resolve_dest_node(&state.ctx, &destination_device_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    api::enqueue_frame_set_send(
+        &state.ctx,
+        &state.sync_sender,
+        Arc::clone(&state.collab_sender),
+        &state.sync,
+        dest,
+        frame_set_id,
+        mode,
+        batch_name,
+        flat_norm.unwrap_or(true),
+        flat_norm_mode.unwrap_or(FlatNormMode::CentralThird),
+        params.unwrap_or_default(),
         Some(emitter),
     )
     .await

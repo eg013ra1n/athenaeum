@@ -23,8 +23,10 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::api::frame_set_send::PayloadEntry;
+use crate::api::lights::{FlatNormMode, LightCalParams};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
+use crate::export::models::ExportMode;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
@@ -3290,35 +3292,44 @@ async fn build_and_enqueue_selection(
             frame_set_id,
         )?
     };
-    if let Some(dir) = &built.pkg_dir {
-        // §D1/§D4: the batch name + per-file `pending` rows travel WITH the enqueue
-        // now — the engine's `store.enqueue` writes them in the same transaction as
-        // the row, so the first announce can never read a nameless / file-less row
-        // (the T3 enqueue→announce race is gone; no post-hoc write, no self-heal).
-        let files: Vec<crate::sharing::types::AnnounceFileEntry> = built
-            .files
-            .iter()
-            .map(
-                |(rel_path, byte_size, frame_uuid)| crate::sharing::types::AnnounceFileEntry {
-                    rel_path: rel_path.clone(),
-                    byte_size: *byte_size,
-                    frame_uuid: frame_uuid.clone(),
-                },
-            )
-            .collect();
-        // Desktop senders are out of the mirror-hierarchy v1 scope: a selection
-        // package is a curated batch, so it lands in the per-transfer batch folder.
-        engine
-            .enqueue_package(dir, built.display_name.clone(), files, PackageLayout::Batch)
-            .await
-            .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
-    }
+    enqueue_built(engine, &built).await?;
     Ok(EnqueueSelectionResult {
         enqueued_count: built.eligible.len() as u32,
         eligible_count: built.eligible.len() as u32,
         total_count: built.total as u32,
         ineligible: built.ineligible,
     })
+}
+
+/// Hand one built package to `engine`. A `pkg_dir` of `None` (nothing eligible)
+/// is a no-op — there is no package to announce. Shared by the frame-selection
+/// send and the frame-set send so both enqueue on exactly the same terms.
+async fn enqueue_built(engine: &SyncEngineHandle, built: &BuiltSelection) -> Result<(), ApiError> {
+    let Some(dir) = &built.pkg_dir else {
+        return Ok(());
+    };
+    // §D1/§D4: the batch name + per-file `pending` rows travel WITH the enqueue
+    // now — the engine's `store.enqueue` writes them in the same transaction as
+    // the row, so the first announce can never read a nameless / file-less row
+    // (the T3 enqueue→announce race is gone; no post-hoc write, no self-heal).
+    let files: Vec<crate::sharing::types::AnnounceFileEntry> = built
+        .files
+        .iter()
+        .map(
+            |(rel_path, byte_size, frame_uuid)| crate::sharing::types::AnnounceFileEntry {
+                rel_path: rel_path.clone(),
+                byte_size: *byte_size,
+                frame_uuid: frame_uuid.clone(),
+            },
+        )
+        .collect();
+    // Desktop senders are out of the mirror-hierarchy v1 scope: a selection
+    // package is a curated batch, so it lands in the per-transfer batch folder.
+    engine
+        .enqueue_package(dir, built.display_name.clone(), files, PackageLayout::Batch)
+        .await
+        .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
+    Ok(())
 }
 
 /// Explicit-target send (sync 2C): enqueue exactly the eligible frames in the
@@ -3377,6 +3388,92 @@ pub async fn enqueue_sync_selection(
         "sync selection enqueued"
     );
     Ok(result)
+}
+
+/// Frame-set send (spec 2026-08-28 §3): the export pipeline's file list for
+/// `frame_set_id` under `mode`, as ONE package to `dest`. The readiness gate
+/// runs BEFORE any engine is started — a not-ready mode must not spin up a
+/// sender for nothing.
+#[allow(clippy::too_many_arguments)]
+pub async fn enqueue_frame_set_send(
+    ctx: &Arc<ServiceContext>,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
+    dest: ResolvedDest,
+    frame_set_id: i64,
+    mode: ExportMode,
+    batch_name: Option<String>,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: LightCalParams,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<EnqueueSelectionResult, ApiError> {
+    let entries = crate::api::frame_set_send::frame_set_entries(
+        ctx,
+        frame_set_id,
+        mode,
+        flat_norm,
+        flat_norm_mode,
+        params,
+    )?;
+    // Nothing to send (a frame set with no lights passes every mode vacuously):
+    // a benign no-op that must not start an engine for `dest`, exactly as an
+    // empty frame selection does not.
+    if entries.is_empty() {
+        return Ok(EnqueueSelectionResult {
+            enqueued_count: 0,
+            eligible_count: 0,
+            total_count: 0,
+            ineligible: Vec::new(),
+        });
+    }
+    let total = entries.len();
+    let (engine, origin_device) = ensure_sender_engine(
+        ctx,
+        sender,
+        collab_sender,
+        sync,
+        dest.node,
+        dest.endpoint_addr.as_ref(),
+        emitter,
+    )
+    .await?;
+    let packages_dir = sender_packages_dir(ctx)?;
+    // The DB borrow is scoped so no connection guard is held across the enqueue's
+    // `.await` — the same discipline as `build_and_enqueue_selection`.
+    let built = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        build_selection_package(
+            &conn,
+            &origin_device,
+            &packages_dir,
+            SelectionInput {
+                entries,
+                ineligible: Vec::new(),
+                ancestor: None,
+                total,
+            },
+            batch_name.as_deref(),
+            Some(frame_set_id),
+        )?
+    };
+    enqueue_built(&engine, &built).await?;
+    tracing::info!(
+        frame_set_id,
+        ?mode,
+        enqueued = built.eligible.len(),
+        total,
+        ineligible = built.ineligible.len(),
+        "frame-set send enqueued"
+    );
+    Ok(EnqueueSelectionResult {
+        enqueued_count: built.eligible.len() as u32,
+        eligible_count: built.eligible.len() as u32,
+        total_count: built.total as u32,
+        ineligible: built.ineligible,
+    })
 }
 
 // ── Retry / send-now / cancel command surface (Task 8) ───────────────────────

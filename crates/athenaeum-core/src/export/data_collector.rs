@@ -285,6 +285,45 @@ fn collect_raw_sets(
     Ok(())
 }
 
+/// Ids of every linked set that IS a master set (`is_master_library = 1`),
+/// walking the same nodes [`raw_sets_without_master`] walks. The frame-set
+/// send's kind classifier (spec 2026-08-28 §3): a placement whose frame belongs
+/// to one of these sets travels as [`crate::package::PayloadKind::Master`].
+pub fn master_set_ids(conn: &Connection, data: &ExportData) -> Result<HashSet<i64>> {
+    fn walk(conn: &Connection, info: &CalibrationSetInfo, out: &mut HashSet<i64>) -> Result<()> {
+        if is_master_set(conn, info.set_id)? {
+            out.insert(info.set_id);
+        }
+        for node in [
+            info.dark_flat.as_deref(),
+            info.dark.as_deref(),
+            info.bias.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            walk(conn, node, out)?;
+        }
+        Ok(())
+    }
+    let mut out = HashSet::new();
+    for group in &data.groups {
+        for subgroup in &group.subgroups {
+            for node in [
+                subgroup.flat.as_ref(),
+                subgroup.dark.as_ref(),
+                subgroup.bias.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                walk(conn, node, &mut out)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Count-only walk for `ExportReadiness.file_counts` (spec 2026-08-28 §5): what
 /// each mode would place, never bailing. `raw_with_masters` counts a raw set as
 /// zero files (strict mode would refuse it) — the count is informational, the

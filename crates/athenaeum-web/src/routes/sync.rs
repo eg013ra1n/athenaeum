@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, Json};
 
+use athenaeum_core::api::lights::{FlatNormMode, LightCalParams};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
     DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
     TransferCleanup, TransferEventEntry, TransferStorage,
 };
 use athenaeum_core::events::ProgressEmitter;
+use athenaeum_core::export::models::ExportMode;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 use serde::Deserialize;
 
@@ -177,6 +179,60 @@ pub async fn enqueue_sync_selection(
         args.frame_ids,
         args.batch_name,
         args.frame_set_id,
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// Frame-set send from the Export tab (spec 2026-08-28): one package holding
+/// what the chosen export mode would put on disk. Mirrors the Tauri command.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueFrameSetSendArgs {
+    pub frame_set_id: i64,
+    pub mode: ExportMode,
+    /// The chosen destination — an account device id resolved to its node id.
+    pub destination_device_id: String,
+    /// User-edited batch name; `None`/blank → the backend auto-computes it (T3).
+    #[serde(default)]
+    pub batch_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub flat_norm: bool,
+    #[serde(default)]
+    pub flat_norm_mode: FlatNormMode,
+    #[serde(default)]
+    pub params: LightCalParams,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// POST /api/enqueue_frame_set_send
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn enqueue_frame_set_send(
+    State(state): State<WebAppState>,
+    Json(args): Json<EnqueueFrameSetSendArgs>,
+) -> Result<Json<EnqueueSelectionResult>, (StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    let dest = api::resolve_dest_node(&state.ctx, &args.destination_device_id)
+        .await
+        .map_err(api_err)?;
+    api::enqueue_frame_set_send(
+        &state.ctx,
+        &state.sync_sender,
+        Arc::clone(&state.collab_sender),
+        &state.sync,
+        dest,
+        args.frame_set_id,
+        args.mode,
+        args.batch_name,
+        args.flat_norm,
+        args.flat_norm_mode,
+        args.params,
         Some(emitter),
     )
     .await

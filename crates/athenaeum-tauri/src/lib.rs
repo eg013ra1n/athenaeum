@@ -459,6 +459,7 @@ pub fn run() {
             commands::list_transfer_files,
             commands::list_transfer_events,
             commands::enqueue_sync_selection,
+            commands::enqueue_frame_set_send,
             commands::retry_sync_package,
             commands::send_now_sync_package,
             commands::cancel_sync_package,

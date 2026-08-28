@@ -266,6 +266,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_transfer_files", post(sync::list_transfer_files))
         .route("/api/list_transfer_events", post(sync::list_transfer_events))
         .route("/api/enqueue_sync_selection", post(sync::enqueue_sync_selection))
+        .route("/api/enqueue_frame_set_send", post(sync::enqueue_frame_set_send))
         .route("/api/retry_sync_package", post(sync::retry_sync_package))
         .route("/api/send_now_sync_package", post(sync::send_now_sync_package))
         .route("/api/cancel_sync_package", post(sync::cancel_sync_package))
