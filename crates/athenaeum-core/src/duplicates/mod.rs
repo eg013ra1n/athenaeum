@@ -56,32 +56,6 @@ pub fn compute_xxhash(path: &Path) -> Result<String> {
     Ok(format!("{:016x}", hasher.digest()))
 }
 
-/// Hash a file's ENTIRE contents with XXH3_64.
-///
-/// The counterpart to [`compute_xxhash`], which samples three 512 KiB regions
-/// and is documented as lossy. Sampling is not merely lossy here, it is
-/// hopeless: measured over 20 000 trials, a sampling scheme's chance of
-/// noticing a changed pixel equals the fraction of the file it reads, and the
-/// real divergence between two PixInsight masters is ONE Float32 pixel — 4
-/// bytes in 77 MiB. Spending more of the budget on more, smaller samples makes
-/// it strictly worse. So masters are decided by reading everything.
-///
-/// Affordable only because the caller hashes a header-shortlisted subset (see
-/// [`backfill::fill_master_strong_hashes`]): 7.5 GiB, not 2.62 TiB.
-pub fn compute_full_xxhash(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Xxh3::new();
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:016x}", hasher.digest()))
-}
-
 /// Group files by size and hash to find duplicates
 /// This function is a wrapper - actual implementation is in db::find_duplicate_groups
 #[allow(dead_code)]
@@ -151,7 +125,7 @@ pub struct VerifyPairResult {
 /// [`verify_byte_identical`], but the read is not wasted: while comparing,
 /// the first file's bytes feed an incremental XXH3 — so an identical pair
 /// returns the full-content digest both files share, in exactly
-/// [`compute_full_xxhash`]'s format (streaming xxh3 is buffer-size
+/// [`crate::package::xxh3_full_file`]'s format (streaming xxh3 is buffer-size
 /// independent), ready to be banked into `files.strong_hash`.
 ///
 /// A mismatch still early-exits on the first differing chunk and returns
@@ -209,7 +183,7 @@ mod verify_hashing_tests {
 
     /// Identical files: the compare must return the full-content hash it
     /// already paid to read, and that hash must be byte-for-byte the one
-    /// `compute_full_xxhash` would produce — `files.strong_hash` stores the
+    /// `package::xxh3_full_file` would produce — `files.strong_hash` stores the
     /// latter, so a differing format would poison the master key's column.
     #[test]
     fn identical_files_yield_the_stored_hash_format() {
@@ -222,7 +196,10 @@ mod verify_hashing_tests {
 
         let (identical, digest) = verify_byte_identical_hashing(&a, &b).unwrap();
         assert!(identical);
-        assert_eq!(digest.as_deref(), Some(compute_full_xxhash(&a).unwrap().as_str()));
+        assert_eq!(
+            digest.as_deref(),
+            Some(crate::package::xxh3_full_file(&a).unwrap().as_str())
+        );
     }
 
     /// Different files: no digest — the compare early-exits on the first

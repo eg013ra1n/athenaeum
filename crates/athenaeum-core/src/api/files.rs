@@ -1273,7 +1273,8 @@ pub fn verify_duplicate_pair(
 
 #[cfg(test)]
 mod verify_pair_tests {
-    use crate::duplicates::{compute_full_xxhash, VerifyMethod};
+    use crate::duplicates::VerifyMethod;
+    use crate::package::xxh3_full_file;
     use crate::services::ServiceContext;
     use std::io::Write as _;
 
@@ -1318,7 +1319,7 @@ mod verify_pair_tests {
     }
 
     /// First verify of an identical pair pays the byte compare — and banks
-    /// the full-content hash into BOTH rows, in `compute_full_xxhash`'s
+    /// the full-content hash into BOTH rows, in `package::xxh3_full_file`'s
     /// format, so the read is never paid twice.
     #[test]
     fn identical_pair_stores_the_hash_for_both_files() {
@@ -1331,7 +1332,7 @@ mod verify_pair_tests {
 
         let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
         let conn = db.conn();
-        let expect = compute_full_xxhash(&paths[0]).unwrap();
+        let expect = xxh3_full_file(&paths[0]).unwrap();
         assert_eq!(stored_hash(&conn, 1).as_deref(), Some(expect.as_str()));
         assert_eq!(stored_hash(&conn, 2).as_deref(), Some(expect.as_str()));
     }

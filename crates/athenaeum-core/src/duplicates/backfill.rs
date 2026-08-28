@@ -359,7 +359,7 @@ pub fn fill_master_strong_hashes(
             continue;
         }
 
-        let hash = match crate::duplicates::compute_full_xxhash(p) {
+        let hash = match crate::package::xxh3_full_file(p) {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(file_id = id, path = %path, error = %e,
