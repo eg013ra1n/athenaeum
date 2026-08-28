@@ -16,7 +16,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import type { EnqueueSelectionResult, IneligibleFrame } from '../types/models';
+import type { ExportMode } from '../types/export';
+import type {
+  EnqueueSelectionResult,
+  FlatNormMode,
+  IneligibleFrame,
+  LightCalParams,
+} from '../types/models';
 
 /** Tauri and Axum both reject with a plain string, not an `Error`. */
 export function errMsg(err: unknown): string {
@@ -59,6 +65,15 @@ export interface SendOptions {
   frameSetId?: number | null;
 }
 
+/** Frame-set send (spec 2026-08-28): the export mode + the readiness prefs the
+ *  Export tab used, so the backend gate agrees with what the tab showed. */
+export interface FrameSetSendOptions {
+  batchName?: string | null;
+  flatNorm: boolean;
+  flatNormMode: FlatNormMode;
+  params: LightCalParams;
+}
+
 export interface UseSyncSend {
   /** An enqueue fan-out is in flight. */
   sending: boolean;
@@ -70,6 +85,19 @@ export interface UseSyncSend {
    * aggregates + notifies. `opts` carries the optional batch name + frame-set id.
    */
   sendSelection: (frameIds: number[], deviceIds: string[], opts?: SendOptions) => Promise<SendResult[]>;
+  /**
+   * Enqueue a whole frame set, resolved server-side by `mode`, to EACH `deviceId`.
+   * Same fan-out contract as `sendSelection` — one destination per backend call,
+   * each caught independently. `opts` carries the optional batch name plus the
+   * readiness prefs (flat normalization + light-cal params) so the backend's
+   * eligibility gate agrees with the counts the Export tab displayed.
+   */
+  sendFrameSet: (
+    frameSetId: number,
+    mode: ExportMode,
+    deviceIds: string[],
+    opts: FrameSetSendOptions,
+  ) => Promise<SendResult[]>;
 }
 
 export function useSyncSend(): UseSyncSend {
@@ -118,5 +146,43 @@ export function useSyncSend(): UseSyncSend {
     [],
   );
 
-  return { sending, sendSelection };
+  const sendFrameSet = useCallback(
+    async (
+      frameSetId: number,
+      mode: ExportMode,
+      deviceIds: string[],
+      opts: FrameSetSendOptions,
+    ): Promise<SendResult[]> => {
+      if (deviceIds.length === 0) return [];
+      const trimmed = opts.batchName?.trim();
+      const batchName = trimmed ? trimmed : null;
+      setSending(true);
+      try {
+        return await Promise.all(
+          deviceIds.map(async (deviceId): Promise<SendResult> => {
+            try {
+              const result = await api.invoke<EnqueueSelectionResult>('enqueue_frame_set_send', {
+                frameSetId,
+                mode,
+                destinationDeviceId: deviceId,
+                batchName,
+                flatNorm: opts.flatNorm,
+                flatNormMode: opts.flatNormMode,
+                params: opts.params,
+              });
+              return { deviceId, result };
+            } catch (err) {
+              console.error('[sync] enqueue_frame_set_send failed:', deviceId, err);
+              return { deviceId, error: errMsg(err) };
+            }
+          }),
+        );
+      } finally {
+        if (mounted.current) setSending(false);
+      }
+    },
+    [],
+  );
+
+  return { sending, sendSelection, sendFrameSet };
 }

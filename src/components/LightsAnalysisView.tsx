@@ -941,11 +941,10 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
 
       {/* Explicit app→app send dialog (Phase 3) — overlay portal, self-hides when closed. */}
       <SendToNodeDialog
-        frameIds={[...selectedFrameIds]}
+        target={{ kind: 'frames', frameIds: [...selectedFrameIds], frameSetId }}
         open={sendOpen}
         onClose={() => setSendOpen(false)}
         defaultBatchName={frameSetName}
-        frameSetId={frameSetId}
       />
     </div>
   );

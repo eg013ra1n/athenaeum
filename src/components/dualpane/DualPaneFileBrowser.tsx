@@ -1449,7 +1449,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           (see openSend) then fans the enqueue out to the chosen Athenaeum
           nodes. Self-contained overlay; closing just unmounts its body. */}
       <SendToNodeDialog
-        frameIds={sendFrameIds}
+        target={{ kind: 'frames', frameIds: sendFrameIds }}
         open={sendOpen}
         onClose={() => setSendOpen(false)}
         defaultBatchName={sendBatchName}

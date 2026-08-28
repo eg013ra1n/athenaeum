@@ -1,8 +1,10 @@
-// SendToNodeDialog — the reusable "send these frames to other nodes" modal (Phase
-// 3, explicit app→app send). Entry points (frame-selection toolbars, the analysis
-// view) render this with the selected `frameIds`; it resolves the account's other
-// Athenaeum peers, lets the user pick one or more, fans the enqueue out via
-// `useSyncSend.sendSelection`, and raises a single aggregated outcome notification.
+// SendToNodeDialog — the reusable "send these to other nodes" modal (Phase 3,
+// explicit app→app send). Entry points render it with a `target`: a frame
+// selection (frame-selection toolbars, the analysis view) or a whole frame set
+// resolved by an export mode (the Export tab, spec 2026-08-28). It resolves the
+// account's other Athenaeum peers, lets the user pick one or more, fans the
+// enqueue out via `useSyncSend` (`sendSelection` / `sendFrameSet`), and raises a
+// single aggregated outcome notification.
 //
 // A2 NOTE — destinations are read directly through `api.invoke('list_account_devices')`
 // + `api.invoke('account_status')`, NOT the account-state hook or the account settings
@@ -14,7 +16,13 @@ import { Send, Check, X, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useSyncSend, summarizeIneligible, errMsg } from '../../hooks/useSyncSend';
+import {
+  readFlatNormPref,
+  readFlatNormModePref,
+  readLightCalParamsPref,
+} from '../calibration/CalibrateLightsDialog';
 import { formatTimestamp } from '../../utils/dateFormatting';
+import type { ExportMode } from '../../types/export';
 import type { AccountDevice, AccountStatus, IneligibleFrame } from '../../types/models';
 
 /** Compact display for a hub-assigned device id (opaque, can be long). Mirrors the
@@ -24,9 +32,22 @@ function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…` : id;
 }
 
+/**
+ * What this send is about. `frames` is the original explicit selection send —
+ * the caller already knows the frame ids, and passes `frameSetId` when the
+ * selection came from inside an object so the backend uses the WBPP rel_path
+ * layout (`null`/absent for a browser selection → source-relative layout).
+ * `frameSet` is the Export-tab send (spec 2026-08-28): the backend resolves the
+ * set's files itself from `mode`, so the dialog only carries what it must show —
+ * the mode's label and the file count the tab displayed.
+ */
+export type SendToNodeTarget =
+  | { kind: 'frames'; frameIds: number[]; frameSetId?: number | null }
+  | { kind: 'frameSet'; frameSetId: number; mode: ExportMode; modeLabel: string; fileCount: number };
+
 interface SendToNodeDialogProps {
-  /** The frames to send. Button stays disabled while this is empty. */
-  frameIds: number[];
+  /** What to send. The Send button stays disabled while this resolves to nothing. */
+  target: SendToNodeTarget;
   /** Whether the modal is mounted/visible. */
   open: boolean;
   /** Close the modal (also called after a successful send). */
@@ -37,12 +58,6 @@ interface SendToNodeDialogProps {
    * → the field starts empty and the backend auto-names.
    */
   defaultBatchName?: string;
-  /**
-   * The originating frame set, when the caller has one (Object entry point). Sent
-   * to the backend to enable the WBPP rel_path layout server-side. `null`/absent
-   * for a browser selection (source-relative layout instead).
-   */
-  frameSetId?: number | null;
 }
 
 /** Explanatory empty state — signed out, or no eligible peers on the account. */
@@ -55,14 +70,19 @@ function EmptyState({ message }: { message: string }) {
 }
 
 export function SendToNodeDialog({
-  frameIds,
+  target,
   open,
   onClose,
   defaultBatchName,
-  frameSetId,
 }: SendToNodeDialogProps) {
   const { notify } = useNotifications();
-  const { sending, sendSelection } = useSyncSend();
+  const { sending, sendSelection, sendFrameSet } = useSyncSend();
+
+  // A selection send counts frames; a frame-set send counts the files the Export
+  // tab resolved for the chosen mode (the same number the backend reports back).
+  const itemCount = target.kind === 'frames' ? target.frameIds.length : target.fileCount;
+  const itemNoun = target.kind === 'frames' ? 'frame' : 'file';
+  const subtitle = target.kind === 'frameSet' ? ` — ${target.modeLabel}` : '';
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -132,15 +152,25 @@ export function SendToNodeDialog({
 
   const handleSend = async () => {
     const checkedIds = [...checked];
-    if (checkedIds.length === 0 || frameIds.length === 0 || sending) return;
+    if (checkedIds.length === 0 || itemCount === 0 || sending) return;
 
-    const results = await sendSelection(frameIds, checkedIds, {
-      batchName,
-      frameSetId: frameSetId ?? null,
-    });
+    // A frame-set send passes the same readiness prefs the Export tab read, so
+    // the backend's eligibility gate agrees with the counts the tab showed.
+    const results =
+      target.kind === 'frames'
+        ? await sendSelection(target.frameIds, checkedIds, {
+            batchName,
+            frameSetId: target.frameSetId ?? null,
+          })
+        : await sendFrameSet(target.frameSetId, target.mode, checkedIds, {
+            batchName,
+            flatNorm: readFlatNormPref(),
+            flatNormMode: readFlatNormModePref(),
+            params: readLightCalParamsPref(),
+          });
 
     // --- Aggregate the per-destination outcomes into one honest notification. ---
-    const total = frameIds.length;
+    const total = target.kind === 'frames' ? target.frameIds.length : target.fileCount;
     const nodeCount = checkedIds.length;
     const queued = results.reduce((sum, r) => sum + (r.result?.enqueuedCount ?? 0), 0);
     const failedNodes = results.filter((r) => r.error);
@@ -176,8 +206,8 @@ export function SendToNodeDialog({
       tone: allOk ? 'success' : 'warning',
       hasErrors: failedNodes.length > 0 || queued === 0,
       title: allOk
-        ? `Queued ${total} frame${total === 1 ? '' : 's'} to ${nodeCount} node${nodeCount === 1 ? '' : 's'}`
-        : `Queued ${eligible} of ${total} frame${total === 1 ? '' : 's'} to ${nodeCount} node${nodeCount === 1 ? '' : 's'}`,
+        ? `Queued ${total} ${itemNoun}${total === 1 ? '' : 's'} to ${nodeCount} node${nodeCount === 1 ? '' : 's'}`
+        : `Queued ${eligible} of ${total} ${itemNoun}${total === 1 ? '' : 's'} to ${nodeCount} node${nodeCount === 1 ? '' : 's'}`,
       detail:
         detailParts.length > 0
           ? detailParts.join(' · ')
@@ -205,7 +235,7 @@ export function SendToNodeDialog({
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-medium text-content flex items-center gap-2">
             <Send size={16} className="text-accent" />
-            Send {frameIds.length} frame{frameIds.length === 1 ? '' : 's'}
+            Send {itemCount} {itemNoun}{itemCount === 1 ? '' : 's'}{subtitle}
           </h3>
           <button
             onClick={onClose}
@@ -230,7 +260,8 @@ export function SendToNodeDialog({
         ) : (
           <>
             <p className="text-xs text-content-muted mb-2">
-              Choose which node{candidates.length === 1 ? '' : 's'} receive the selected frames.
+              Choose which node{candidates.length === 1 ? '' : 's'} receive the{' '}
+              {target.kind === 'frames' ? 'selected frames' : 'frame set'}.
             </p>
             <div className="space-y-0.5 mb-3">
               {candidates.map((d) => {
@@ -291,7 +322,7 @@ export function SendToNodeDialog({
             </button>
             <button
               onClick={handleSend}
-              disabled={sending || checkedCount === 0 || frameIds.length === 0}
+              disabled={sending || checkedCount === 0 || itemCount === 0}
               className="px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
             >
               {sending ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
