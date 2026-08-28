@@ -42,6 +42,37 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Frame-set send (2026-08-28) — two-instance smoke
+
+Real object with a raw dark set, a master flat, and a few calibrated lights; second
+instance on the same account as the receiver.
+
+- Export tab shows four modes with file counts; `Lights + masters` is disabled with
+  "Build masters first — 1 set without a master" and → Coverage lands on that set.
+- Build the master on Coverage, return: the radio enables without a reload.
+- Send each of the four modes; on the receiver the batch folder opens in WBPP as-is
+  (`camera_<x>/BIAS_/DARKS_/FLAT_/lights`), calibrated batch = `camera_<x>/lights/c_*.fits`
+  only.
+- Receiver Equipment shows the received master as imported (no Rebuild), the raw dark
+  set exists with all members.
+- Receiver: with the source light also received earlier, the light shows *calibrated*;
+  without it, only the file is on disk and the log says "deferred".
+- Re-send the calibrated batch: all files report duplicate, no `_2` copies.
+- Export to WBPP in `Lights + masters` with a raw set linked is refused with the same
+  sentence the tab shows.
+
+#### Follow-ups surfaced by review (not smokes)
+
+- Receiver dedup for calibrated artifacts is by `sync_receipts` content hash alone
+  (spec §4.1), so a deleted received `c_*.fits` is never re-receivable on that
+  receiver — a spec property to ratify or revisit.
+- A resend after a failed post-ingest calibration-set integration does not retry the
+  integration (the receipt-reuse short-circuit leaves the inserted-frames list empty;
+  only the `sync_events` journal records it).
+- Pre-existing, not this cycle: `cargo check -p athenaeum-core --no-default-features
+  --tests` fails (~40 errors in integration tests that use `render`/`solver`-gated
+  modules unconditionally); the lib target is green headless. Worth a separate ticket.
+
 ### Hash cleanup — 2026-08-28
 
 The catalog carried four hashes with three producers for one of them. First task
