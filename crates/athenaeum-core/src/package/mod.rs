@@ -24,7 +24,7 @@
 //! and compiles in the headless (`--no-default-features`) build.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Component, Path};
 
 use anyhow::{bail, Context, Result};
@@ -122,18 +122,31 @@ pub fn validate_package_id(package_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Full-content xxh3-64 of a file, lowercase 16-char hex.
+/// Full-content xxh3-64 of a file, lowercase 16-char hex — THE full-file hash
+/// of the codebase: the package manifest, the transfer dedup confirm, the
+/// master duplicate key (`files.strong_hash`) and deep verify all store or
+/// compare this exact format.
 ///
 /// Deliberately distinct from [`crate::duplicates::compute_xxhash`], which
-/// SAMPLES (first/middle/last 512 KB) for fast move-verify. A package manifest
-/// must catch corruption anywhere in the file, so this streams every byte.
+/// SAMPLES (first/middle/last 512 KB) for fast move-verify and the transfer
+/// dedup pre-check. Sampling cannot decide identity: two PixInsight masters
+/// differ by ONE Float32 pixel — 4 bytes in 77 MiB — and a sampling scheme's
+/// chance of noticing tracks the fraction of the file it reads (spec
+/// `2026-08-27-duplicate-detection-design.md` §2.5). A manifest must catch
+/// corruption anywhere in the file. So this streams every byte, in 4 MiB
+/// reads — large reads matter on the network storage these libraries live on.
+///
+/// Streaming xxh3 is read-size independent: the digest equals a one-shot
+/// `xxh3_64` over the whole file whatever the buffer (pinned by
+/// `tests::xxh3_full_file_is_read_size_independent`), which is what lets the
+/// 8 KiB compare loop of [`crate::duplicates::verify_byte_identical_hashing`]
+/// bank the same value.
 pub fn xxh3_full_file(path: &Path) -> Result<String> {
-    let file = File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let mut file = File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
     let mut hasher = Xxh3::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
     loop {
-        let n = reader
+        let n = file
             .read(&mut buf)
             .with_context(|| format!("read {} for hashing", path.display()))?;
         if n == 0 {

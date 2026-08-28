@@ -20,6 +20,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::db::SamplingHashMatch;
+use crate::duplicates::backfill::disk_matches_row;
 use crate::package::xxh3_full_file;
 use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sync::dedup::{confirm_candidates, partition_offer};
@@ -52,10 +54,10 @@ impl CatalogDedupResponder {
         Self { store }
     }
 
-    /// The set of offered/queried sampling hashes present in the local catalog.
-    /// A DB error is logged and treated as "nothing present" — the safe
-    /// direction (everything becomes a want / stays wanted).
-    fn present_sampling(&self, hashes: &[String]) -> Vec<(String, String)> {
+    /// The catalog rows whose sampling hash is one of `hashes`. A DB error is
+    /// logged and treated as "nothing present" — the safe direction
+    /// (everything becomes a want / stays wanted).
+    fn present_sampling(&self, hashes: &[String]) -> Vec<SamplingHashMatch> {
         match self.store.files_by_sampling_hashes(hashes) {
             Ok(rows) => rows,
             Err(e) => {
@@ -72,7 +74,7 @@ impl DedupResponder for CatalogDedupResponder {
         let present: HashSet<String> = self
             .present_sampling(&offered)
             .into_iter()
-            .map(|(hash, _path)| hash)
+            .map(|m| m.content_hash)
             .collect();
         let split = partition_offer(entries, &present);
         tracing::debug!(
@@ -91,21 +93,53 @@ impl DedupResponder for CatalogDedupResponder {
         // sampling_hash → set of FULL xxh3 of the local files carrying it. A
         // file missing on disk / unreadable is skipped (no local full hash), so
         // its candidate stays wanted — the safe direction.
+        //
+        // The full hash is the expensive part, so it is not thrown away: a row
+        // the disk still vouches for (`disk_matches_row`, the contract shared
+        // with the master-hash pass and deep verify) BANKS the digest it just
+        // read into `files.strong_hash`, and a row that already carries one is
+        // decided from it without reading at all — a re-offer of files
+        // confirmed once costs zero bytes of I/O. A stale row is still decided
+        // by reading (the question is what is on disk) but never written.
         let mut local_full_by_sampling: HashMap<String, HashSet<String>> = HashMap::new();
         let mut skipped = 0usize;
-        for (sampling_hash, path) in rows {
-            match xxh3_full_file(std::path::Path::new(&path)) {
-                Ok(full) => {
-                    local_full_by_sampling
-                        .entry(sampling_hash)
-                        .or_default()
-                        .insert(full);
+        let mut banked = 0usize;
+        let mut reused = 0usize;
+        for m in rows {
+            let path = std::path::Path::new(&m.path);
+            let current = disk_matches_row(path, m.size, &m.modified_at);
+            let full = match (&m.strong_hash, current) {
+                (Some(stored), true) => {
+                    reused += 1;
+                    stored.clone()
                 }
-                Err(e) => {
-                    skipped += 1;
-                    tracing::debug!(path = %path, error = %e, "skipping unhashable local file in dedup confirm");
-                }
-            }
+                _ => match xxh3_full_file(path) {
+                    Ok(full) => {
+                        if current {
+                            match self.store.bank_strong_hash(m.file_id, &full) {
+                                Ok(()) => banked += 1,
+                                // The verdict stands either way — losing the
+                                // banked hash costs a re-read later, never a
+                                // wrong answer now.
+                                Err(e) => tracing::error!(
+                                    file_id = m.file_id, error = %e,
+                                    "dedup confirm: strong_hash write failed"
+                                ),
+                            }
+                        }
+                        full
+                    }
+                    Err(e) => {
+                        skipped += 1;
+                        tracing::debug!(path = %m.path, error = %e, "skipping unhashable local file in dedup confirm");
+                        continue;
+                    }
+                },
+            };
+            local_full_by_sampling
+                .entry(m.content_hash)
+                .or_default()
+                .insert(full);
         }
 
         let still = confirm_candidates(entries, &local_full_by_sampling);
@@ -113,6 +147,8 @@ impl DedupResponder for CatalogDedupResponder {
             candidates = entries.len(),
             still_wanted = still.len(),
             skipped_files = skipped,
+            banked,
+            reused,
             "dedup responder confirmed candidate full hashes"
         );
         still
@@ -290,5 +326,137 @@ mod tests {
         assert!(want.is_empty());
         assert!(cands.is_empty());
         assert!(r.confirm_full_hashes(&[]).is_empty());
+    }
+
+    /// Insert a `files` row whose `(size, modified_at)` are the file's REAL
+    /// stat — a row the staleness contract (`disk_matches_row`) accepts, so a
+    /// full hash read for the dedup confirm may be banked into `strong_hash`.
+    /// `test_store_with_files` deliberately stores a fixed mtime (a stale row).
+    fn insert_current_row(catalog: &Path, path: &Path, sampling_hash: &str) -> i64 {
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime = chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339();
+        let db = crate::db::Database::new(catalog.to_path_buf()).unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+             VALUES (?1, ?2, ?3, ?4, 'FITS', '2026-07-11T00:00:00Z', ?5)",
+            rusqlite::params![
+                path.to_string_lossy().to_string(),
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                meta.len() as i64,
+                mtime,
+                sampling_hash,
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn stored_strong_hash(catalog: &Path, id: i64) -> Option<String> {
+        let db = crate::db::Database::new(catalog.to_path_buf()).unwrap();
+        let conn = db.conn();
+        conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The confirm step reads a candidate's whole file to compare full hashes;
+    /// that read is banked into `files.strong_hash` when the row still
+    /// describes the bytes on disk — the same contract as the master-hash
+    /// pass and deep verify, so the Master duplicate key and a later verify
+    /// get the digest for free.
+    #[tokio::test]
+    async fn confirm_banks_the_full_hash_into_a_current_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = tmp.path().join("have.fits");
+        std::fs::write(&payload, vec![0x5Cu8; 300_000]).unwrap();
+        let catalog = tmp.path().join("catalog.db");
+        let id = insert_current_row(&catalog, &payload, "samp-have");
+        assert_eq!(stored_strong_hash(&catalog, id), None, "precondition: nothing banked yet");
+
+        let full = xxh3_full_file(&payload).unwrap();
+        let r = CatalogDedupResponder::new(Arc::new(CatalogSyncStore::open(&catalog).unwrap()));
+        let still = r.confirm_full_hashes(&[FullHashEntry {
+            rel_path: "have.fits".into(),
+            sampling_hash: "samp-have".into(),
+            xxh3_full: full.clone(),
+        }]);
+        assert!(still.is_empty(), "true duplicate is dropped");
+        assert_eq!(
+            stored_strong_hash(&catalog, id).as_deref(),
+            Some(full.as_str()),
+            "the read the confirm already paid for is banked"
+        );
+    }
+
+    /// A row that lies about its bytes (`size` drifted) is still CONFIRMED by
+    /// reading the file — the decision is about what is on disk — but nothing
+    /// is banked into it: a fresh-content hash on a stale row would let a later
+    /// reader trust a digest the scanner never vouched for.
+    #[tokio::test]
+    async fn confirm_does_not_bank_into_a_stale_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = tmp.path().join("stale.fits");
+        std::fs::write(&payload, vec![0x5Cu8; 300_000]).unwrap();
+        let catalog = tmp.path().join("catalog.db");
+        let id = insert_current_row(&catalog, &payload, "samp-stale");
+        {
+            let db = crate::db::Database::new(catalog.clone()).unwrap();
+            db.conn()
+                .execute("UPDATE files SET size = size + 1 WHERE id = ?1", [id])
+                .unwrap();
+        }
+
+        let full = xxh3_full_file(&payload).unwrap();
+        let r = CatalogDedupResponder::new(Arc::new(CatalogSyncStore::open(&catalog).unwrap()));
+        let still = r.confirm_full_hashes(&[FullHashEntry {
+            rel_path: "stale.fits".into(),
+            sampling_hash: "samp-stale".into(),
+            xxh3_full: full,
+        }]);
+        assert!(still.is_empty(), "the bytes on disk match, so the candidate is still dropped");
+        assert_eq!(stored_strong_hash(&catalog, id), None, "a stale row is never written");
+    }
+
+    /// A current row that already carries `strong_hash` decides the confirm
+    /// WITHOUT reading the file: the payload is made unreadable (stat still
+    /// works, open does not), and the candidate is still dropped on the banked
+    /// digest. A re-offer of files already confirmed once costs zero reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirm_uses_a_banked_hash_without_reading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = tmp.path().join("banked.fits");
+        std::fs::write(&payload, vec![0x5Cu8; 300_000]).unwrap();
+        let full = xxh3_full_file(&payload).unwrap();
+        let catalog = tmp.path().join("catalog.db");
+        let id = insert_current_row(&catalog, &payload, "samp-banked");
+        {
+            let db = crate::db::Database::new(catalog.clone()).unwrap();
+            db.conn()
+                .execute("UPDATE files SET strong_hash = ?2 WHERE id = ?1", rusqlite::params![id, full])
+                .unwrap();
+        }
+        // Unreadable, but stat-able: a read attempt would fail and (by the
+        // existing rule) keep the candidate wanted — so a drop proves the
+        // banked digest decided it.
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&payload).is_ok() {
+            // Running as root: the permission bits do not bite, the probe is
+            // meaningless. Restore and bail rather than pass vacuously.
+            std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644)).unwrap();
+            eprintln!("skipping confirm_uses_a_banked_hash_without_reading: file readable despite 0o000 (root)");
+            return;
+        }
+
+        let r = CatalogDedupResponder::new(Arc::new(CatalogSyncStore::open(&catalog).unwrap()));
+        let still = r.confirm_full_hashes(&[FullHashEntry {
+            rel_path: "banked.fits".into(),
+            sampling_hash: "samp-banked".into(),
+            xxh3_full: full,
+        }]);
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(still.is_empty(), "the banked digest must decide the confirm without a read");
     }
 }

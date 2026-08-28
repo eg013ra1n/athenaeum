@@ -142,10 +142,11 @@ pub fn scan_root_prefix_predicate(
 ///
 /// This replaces a `use_content_hash: bool` that had come to mean three
 /// different things (which column to group on, which `duplicate_groups.hash_type`
-/// to write, which files are eligible at all), and it replaces
-/// `files.metadata_hash` as the cheap key.
+/// to write, which files are eligible at all), and it replaced
+/// `files.metadata_hash` as the cheap key — a column since dropped, because
+/// nothing read it once the view stopped grouping on it.
 ///
-/// `metadata_hash` is `xxh3(size + modified_at + filename)` — every term but
+/// `metadata_hash` was `xxh3(size + modified_at + filename)` — every term but
 /// one is a property of the FRAME, and `modified_at` is a property of the
 /// COPY. Copying is free to change it and routinely does: on the owner's
 /// catalog 2 189 of 2 763 duplicate candidates carry FAT/exFAT's two-second
@@ -502,8 +503,8 @@ pub(crate) fn parse_stored_ts(field: &'static str, raw: &str) -> DateTime<Utc> {
 /// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO files (path, filename, size, modified_at, format, created_at, metadata_hash, content_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     stmt.execute(params![
         file.path,
@@ -512,7 +513,6 @@ pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
         file.modified_at.to_rfc3339(),
         format!("{:?}", file.format),
         file.created_at.to_rfc3339(),
-        file.metadata_hash,
         file.content_hash,
     ])?;
     Ok(conn.last_insert_rowid())
@@ -1136,7 +1136,7 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
 /// Get a file by its path
 pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
     conn.query_row(
-        "SELECT id, path, filename, size, modified_at, format, created_at, metadata_hash, content_hash,
+        "SELECT id, path, filename, size, modified_at, format, created_at, content_hash,
                 archived_in_operation, archive_zip_path, archive_path_in_zip, uuid, updated_at
          FROM files WHERE path = ?1",
         params![path],
@@ -1153,13 +1153,12 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
                     _ => FileFormat::FITS,
                 },
                 created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-                metadata_hash: row.get(7)?,
-                content_hash: row.get(8)?,
-                archived_in_operation: row.get(9)?,
-                archive_zip_path: row.get(10)?,
-                archive_path_in_zip: row.get(11)?,
-                uuid: row.get(12)?,
-                updated_at: row.get(13)?,
+                content_hash: row.get(7)?,
+                archived_in_operation: row.get(8)?,
+                archive_zip_path: row.get(9)?,
+                archive_path_in_zip: row.get(10)?,
+                uuid: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         },
     )
@@ -1176,12 +1175,14 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
 /// columns at the end (and read them at the new index) — never reorder, never
 /// insert in the middle. Three of the CFA columns (`xbayroff`/`ybayroff`/
 /// `roworder`) sit at the end for exactly that reason: they were appended
-/// after `uuid`/`updated_at` had already claimed indices 45..48 (`bayerpat`
-/// was always mid-list at index 43).
+/// after `uuid`/`updated_at` had already claimed indices 44..47 (`bayerpat`
+/// was always mid-list at index 42). Every index from `content_hash` on moved
+/// down by one when the write-only `metadata_hash` column was dropped — the
+/// one permitted kind of reorder, a removal, taken in a single pass.
 ///
 /// Column list only, no `SELECT` keyword — callers prefix it themselves.
 pub(crate) const FILE_FRAME_SELECT: &str =
-    "f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+    "f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.content_hash,
      f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
      fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
      fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
@@ -1193,11 +1194,11 @@ pub(crate) const FILE_FRAME_SELECT: &str =
 /// Number of columns in [`FILE_FRAME_SELECT`], i.e. the index of the first
 /// column a caller appends after the shared block. Pinned against the real
 /// prepared statement by `shared_projection_column_count_matches_const`.
-const FILE_FRAME_COLUMNS: usize = 52;
+const FILE_FRAME_COLUMNS: usize = 51;
 
 /// Index of `fr.id` inside [`FILE_FRAME_SELECT`] — `NULL` there means the
 /// LEFT JOIN found no `frames` row for the file.
-const FRAME_ID_COLUMN: usize = 12;
+const FRAME_ID_COLUMN: usize = 11;
 
 /// Decode one row of [`FILE_FRAME_SELECT`] into its [`File`] and, when the
 /// join produced one, its [`Frame`].
@@ -1222,13 +1223,12 @@ pub(crate) fn map_file_frame_row(
             FileFormat::XISF
         },
         created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-        metadata_hash: row.get(7)?,
-        content_hash: row.get(8)?,
-        archived_in_operation: row.get(9)?,
-        archive_zip_path: row.get(10)?,
-        archive_path_in_zip: row.get(11)?,
-        uuid: row.get(45)?,
-        updated_at: row.get(46)?,
+        content_hash: row.get(7)?,
+        archived_in_operation: row.get(8)?,
+        archive_zip_path: row.get(9)?,
+        archive_path_in_zip: row.get(10)?,
+        uuid: row.get(44)?,
+        updated_at: row.get(45)?,
     };
 
     let frame = row
@@ -1236,9 +1236,9 @@ pub(crate) fn map_file_frame_row(
         .map(|frame_id| Frame {
             id: Some(frame_id),
             file_id,
-            object: row.get(13).ok(),
+            object: row.get(12).ok(),
             date_obs: row
-                .get::<_, Option<String>>(14)
+                .get::<_, Option<String>>(13)
                 .ok()
                 .flatten()
                 .and_then(|s| {
@@ -1246,45 +1246,45 @@ pub(crate) fn map_file_frame_row(
                         .ok()
                         .map(|dt| dt.with_timezone(&Utc))
                 }),
-            telescop: row.get(15).ok(),
-            instrume: row.get(16).ok(),
-            exptime: row.get(17).ok(),
-            filter: row.get(18).ok(),
+            telescop: row.get(14).ok(),
+            instrume: row.get(15).ok(),
+            exptime: row.get(16).ok(),
+            filter: row.get(17).ok(),
             imagetyp: row
-                .get::<_, Option<String>>(19)
+                .get::<_, Option<String>>(18)
                 .ok()
                 .flatten()
                 .and_then(|s| ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-            gain: row.get(21).ok(),
-            offset: row.get(22).ok(),
-            binning: row.get(23).ok(),
-            xbinning: row.get(24).ok(),
-            ybinning: row.get(25).ok(),
-            ccd_temp: row.get(26).ok(),
-            set_temp: row.get(27).ok(),
-            focallen: row.get(28).ok(),
-            xpixsz: row.get(29).ok(),
-            ypixsz: row.get(30).ok(),
-            naxis1: row.get(31).ok(),
-            naxis2: row.get(32).ok(),
-            ra: row.get(33).ok(),
-            dec: row.get(34).ok(),
-            sitelat: row.get(35).ok(),
-            lat_obs: row.get(36).ok(),
-            sitelong: row.get(37).ok(),
-            long_obs: row.get(38).ok(),
-            objctra: row.get(39).ok(),
-            objctdec: row.get(40).ok(),
-            override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-            swcreate: row.get(42).ok(),
-            bayerpat: row.get(43).ok(),
-            xbayroff: row.get(49).ok(),
-            ybayroff: row.get(50).ok(),
-            roworder: row.get(51).ok(),
-            rotation: row.get(44).ok(),
-            uuid: row.get(47).ok(),
-            updated_at: row.get(48).ok(),
+            is_master: row.get::<_, i32>(19).ok().map(|v| v == 1).unwrap_or(false),
+            gain: row.get(20).ok(),
+            offset: row.get(21).ok(),
+            binning: row.get(22).ok(),
+            xbinning: row.get(23).ok(),
+            ybinning: row.get(24).ok(),
+            ccd_temp: row.get(25).ok(),
+            set_temp: row.get(26).ok(),
+            focallen: row.get(27).ok(),
+            xpixsz: row.get(28).ok(),
+            ypixsz: row.get(29).ok(),
+            naxis1: row.get(30).ok(),
+            naxis2: row.get(31).ok(),
+            ra: row.get(32).ok(),
+            dec: row.get(33).ok(),
+            sitelat: row.get(34).ok(),
+            lat_obs: row.get(35).ok(),
+            sitelong: row.get(36).ok(),
+            long_obs: row.get(37).ok(),
+            objctra: row.get(38).ok(),
+            objctdec: row.get(39).ok(),
+            override_: row.get::<_, i32>(40).ok().map(|v| v == 1).unwrap_or(false),
+            swcreate: row.get(41).ok(),
+            bayerpat: row.get(42).ok(),
+            xbayroff: row.get(48).ok(),
+            ybayroff: row.get(49).ok(),
+            roworder: row.get(50).ok(),
+            rotation: row.get(43).ok(),
+            uuid: row.get(46).ok(),
+            updated_at: row.get(47).ok(),
         });
 
     Ok((file, frame))
@@ -1604,11 +1604,10 @@ mod file_frame_row_tests {
 /// Get frames with missing metadata
 /// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
 ///
-/// Each returned row includes a `has_duplicate` flag that is true when another
-/// file in the catalog shares either the same `content_hash` or the same
-/// `metadata_hash`. That covers both exact-byte duplicates (content hash) and
-/// "same header/size/filename" near-duplicates (metadata hash), matching how
-/// the rest of the app treats duplicates.
+/// Each returned row includes a `has_duplicate` flag that is true when the
+/// cached duplicate groups (`duplicate_group_files`, rebuilt after every scan)
+/// place the file in a group — under whichever key built the cache — so the
+/// flag agrees with what the Duplicates view shows.
 /// SELECT clause for `MissingMetadataRow` rows: the shared file+frame
 /// projection plus the duplicate flag. Both views that use it join `frames`
 /// with an INNER JOIN, so every row carries a frame.
@@ -7301,10 +7300,28 @@ mod savepoint_migration_tests {
     }
 }
 
+/// One catalog file matched by its SAMPLING hash — what the transfer dedup
+/// responder needs to decide a candidate: the path to (re-)hash, the row's
+/// `(size, modified_at)` so the staleness contract
+/// ([`crate::duplicates::backfill::disk_matches_row`]) can say whether the row
+/// still describes the bytes on disk, and any full hash already banked, so a
+/// current row that was confirmed once never has to be read again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplingHashMatch {
+    pub file_id: i64,
+    pub content_hash: String,
+    pub path: String,
+    pub size: i64,
+    /// The stored RFC 3339 text, uncompared — `disk_matches_row` takes it as is.
+    pub modified_at: String,
+    pub strong_hash: Option<String>,
+}
+
 /// Files whose `content_hash` (the SAMPLING xxh3 stored by the scanner) is one
-/// of `hashes`, returned as `(content_hash, path)` pairs. Backs the P2P dedup
-/// responder's membership probe: an offered sampling hash present here is a
-/// *candidate* duplicate that still needs full-hash confirmation.
+/// of `hashes`. Backs the P2P dedup responder's membership probe: an offered
+/// sampling hash present here is a *candidate* duplicate that still needs
+/// full-hash confirmation — and the row carries what that confirmation needs
+/// (see [`SamplingHashMatch`]).
 ///
 /// The `IN (…)` list is chunked at [`MAX_BIND_PARAMS`] and the per-chunk
 /// results are unioned. An empty `hashes` slice runs no
@@ -7313,7 +7330,7 @@ mod savepoint_migration_tests {
 pub fn find_files_by_content_hashes(
     conn: &Connection,
     hashes: &[String],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<SamplingHashMatch>> {
     let mut out = Vec::new();
     if hashes.is_empty() {
         return Ok(out);
@@ -7323,18 +7340,46 @@ pub fn find_files_by_content_hashes(
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql =
-            format!("SELECT content_hash, path FROM files WHERE content_hash IN ({placeholders})");
+        let sql = format!(
+            "SELECT id, content_hash, path, size, modified_at, strong_hash
+             FROM files WHERE content_hash IN ({placeholders})"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params_from_iter(chunk.iter().map(|s| s.as_str())),
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok(SamplingHashMatch {
+                    file_id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    path: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    strong_hash: row.get(5)?,
+                })
+            },
         )?;
         for r in rows {
             out.push(r?);
         }
     }
     Ok(out)
+}
+
+/// Record a file's full-content xxh3 (`package::xxh3_full_file` format) as
+/// `files.strong_hash`.
+///
+/// The one write every full-hash producer shares — the master-hash pass, deep
+/// verify, and the three places sync already reads a whole file (manifest
+/// build, dedup confirm, ingest). The caller owns the staleness check: bank
+/// only into a row `disk_matches_row` accepts (or a row written from the very
+/// bytes just hashed), because a fresh-content digest on a stale row would let
+/// a later reader trust a hash the scanner never vouched for. Returns the
+/// number of rows updated (0 = no such id).
+pub fn bank_strong_hash(conn: &Connection, file_id: i64, hash: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE files SET strong_hash = ?2 WHERE id = ?1",
+        params![file_id, hash],
+    )
 }
 
 /// Task 9 (calibration_library scan-root kind) — DB-level coverage for
@@ -7650,17 +7695,10 @@ mod tests {
         is_master: i64,
     ) {
         let filename = path.rsplit('/').next().unwrap();
-        let meta = crate::duplicates::compute_metadata_hash(
-            100,
-            &chrono::DateTime::parse_from_rfc3339(modified_at)
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-            filename,
-        );
         conn.execute(
-            "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
-             VALUES (?1, ?2, ?3, 100, ?4, 'FITS', ?5)",
-            params![id, path, filename, modified_at, meta],
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 100, ?4, 'FITS')",
+            params![id, path, filename, modified_at],
         )
         .unwrap();
         conn.execute(

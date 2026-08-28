@@ -1,4 +1,4 @@
-import { Plus, RefreshCw, Star } from 'lucide-react';
+import { Fingerprint, Plus, RefreshCw, Star } from 'lucide-react';
 import type { ScanRootWithAvailability, ArchiveRoot, ArchivedFrameSetSummary } from '../../types/helpers';
 import type { FolderOverview } from '../../types/models';
 import { ROLE_META, ROLE_ORDER, KIND_META, isRoleKind, type RailSelection, type RoleKind, type AddableKind, type LucideIcon } from './roleMeta';
@@ -23,6 +23,17 @@ interface FolderRailProps {
   onRescan: (rootId: number) => void;
   isScanning: (rootId: number) => boolean;
   scanPercent: (rootId: number) => number | null;
+  /**
+   * Content-index state for the rail's build button. `pending === null` means the
+   * status has not loaded yet — distinct from `0` ("nothing left to hash"), which
+   * is a real answer the button reports rather than an unknown one.
+   */
+  contentIndex: {
+    pending: number | null;
+    running: boolean;
+    starting: boolean;
+    onBuild: () => void;
+  };
 }
 
 const isSel = (sel: RailSelection | null, other: RailSelection) =>
@@ -74,7 +85,7 @@ function ScanRow({ root, sub, tint, Icon, selected, onClick, onRescan, scanning,
 
 export function FolderRail({
   scanRoots, archiveRoots, archivedSets, overview, missingCounts, coveredCalibrationDir,
-  selection, onSelect, onAdd, onRescan, isScanning, scanPercent,
+  selection, onSelect, onAdd, onRescan, isScanning, scanPercent, contentIndex,
 }: FolderRailProps) {
   // Anything that is not a known role lands in Monitored — including a kind this
   // build has never heard of (version downgrade). It must stay VISIBLE as a
@@ -91,6 +102,19 @@ export function FolderRail({
     archiveRow(root)?.set_count ?? archivedSets.filter((s) => (s.archive_root_path ?? '') === root.path).length;
   const archiveBytes = (root: ArchiveRoot) => archiveRow(root)?.total_zip_bytes ?? 0;
 
+  // Content-index button — four mutually exclusive states, resolved once so the
+  // JSX below stays a single button rather than four near-identical ones. A
+  // running pass is cancelled from the sidebar job card, not from here: this
+  // button only ever starts work.
+  const ciRunning = contentIndex.running;
+  const ciPending = contentIndex.pending;
+  const ciDisabled = ciRunning || ciPending === null || ciPending === 0 || contentIndex.starting;
+  const ciTitle = ciRunning
+    ? 'Cancel from the job card in the sidebar'
+    : ciPending != null && ciPending > 0
+      ? 'Hash the files the index is missing — runs in the background'
+      : undefined;
+
   return (
     <div className="w-[300px] shrink-0 bg-surface-elevated rounded-lg p-3 overflow-y-auto">
       <button
@@ -98,6 +122,26 @@ export function FolderRail({
         className="w-full flex items-center justify-center gap-2 px-3 py-2 mb-1 bg-accent hover:bg-accent-hover text-surface font-semibold rounded-lg transition"
       >
         <Plus size={16} /> Add Folder
+      </button>
+
+      <button
+        onClick={contentIndex.onBuild}
+        disabled={ciDisabled}
+        title={ciTitle}
+        className={`w-full flex items-center justify-center gap-2 px-3 py-2 bg-surface-hover rounded-lg text-sm transition ${
+          ciDisabled ? 'text-content-muted cursor-not-allowed' : 'text-content-secondary hover:text-accent'
+        }`}
+      >
+        {ciRunning
+          ? <RefreshCw size={16} className="animate-spin text-accent shrink-0" />
+          : <Fingerprint size={16} className="shrink-0" />}
+        {ciRunning
+          ? 'Indexing…'
+          : ciPending === null
+            ? 'Content index…'
+            : ciPending === 0
+              ? 'All files indexed'
+              : <span>Build content index <span className="text-content-muted">· {ciPending.toLocaleString()} pending</span></span>}
       </button>
 
       <GroupHeader label="Monitored" />

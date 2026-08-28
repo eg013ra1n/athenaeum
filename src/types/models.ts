@@ -5,7 +5,7 @@ export type FileFormat = "FITS" | "XISF";
 
 export type ImageType = "Light" | "Dark" | "Flat" | "Bias" | "DarkFlat" | "MasterLight" | "MasterDark" | "MasterFlat" | "MasterBias" | "MasterDarkFlat";
 
-export type File = { id: number | null, path: string, filename: string, size: number, modified_at: string, format: FileFormat, created_at: string, metadata_hash: string | null, content_hash: string | null, archived_in_operation: number | null, archive_zip_path: string | null, archive_path_in_zip: string | null, uuid: string | null, updated_at: string | null, };
+export type File = { id: number | null, path: string, filename: string, size: number, modified_at: string, format: FileFormat, created_at: string, content_hash: string | null, archived_in_operation: number | null, archive_zip_path: string | null, archive_path_in_zip: string | null, uuid: string | null, updated_at: string | null, };
 
 export type Frame = { id: number | null, file_id: number, object: string | null, date_obs: string | null, telescop: string | null, instrume: string | null, exptime: number | null, filter: string | null, imagetyp: ImageType | null, is_master: boolean, gain: number | null, offset: number | null, binning: string | null, xbinning: number | null, ybinning: number | null, ccd_temp: number | null, set_temp: number | null, focallen: number | null, xpixsz: number | null, ypixsz: number | null, naxis1: number | null, naxis2: number | null, ra: number | null, dec: number | null, sitelat: number | null, lat_obs: number | null, sitelong: number | null, long_obs: number | null, objctra: string | null, objctdec: string | null, override_: boolean, swcreate: string | null, 
 /**

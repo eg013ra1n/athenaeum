@@ -42,6 +42,53 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Hash cleanup — 2026-08-28
+
+The catalog carried four hashes with three producers for one of them. First task
+landed: `files.metadata_hash` (`size + mtime + filename`, the pre-2026-08-27
+duplicate key) was write-only since the header key replaced it — no SQL, no
+frontend consumer, an index maintained on every insert for nothing — so column,
+index, `File.metadata_hash`, `compute_metadata_hash` and the never-read setting
+key `duplicates.content_hash_rescanned` are gone. Existing catalogs lose the
+column on the next start (`DROP INDEX` then `DROP COLUMN`, guarded on
+`pragma_table_info`, rows untouched). Spec D2 of
+`2026-08-27-duplicate-detection-design.md` was corrected: its stated reader
+(`has_duplicate`) never read the column.
+
+- First launch on the production catalog: the log carries one
+  `dropped write-only column` line, `SELECT COUNT(*) FROM pragma_table_info('files')
+  WHERE name='metadata_hash'` is 0, and the second launch logs nothing.
+- Files page, Missing-metadata view and the Duplicates view open and list
+  frames — the shared file+frame projection lost a column and every index
+  after it moved down by one.
+- A scan of a root with changed files still re-parses them in place
+  (`files.id` preserved) — the in-place UPDATE lost a parameter.
+
+Then the rest of the cycle: one full-hash function (`package::xxh3_full_file`,
+4 MiB reads; `duplicates::compute_full_xxhash` gone), sync banks every full
+read into `strong_hash` (sender manifest, receiver confirm, ingest — via
+`db::bank_strong_hash`, under `disk_matches_row`), and the scan never hashes
+content any more: the content-index job is the one bulk producer, its autostart
+gate is `sync_configured || use_content_hash`, and a USER-started scan clears
+the cancel latch (the monitor cycle does not). Settings shows one "Content
+index" card; the Folders rail has a "Build content index" button.
+
+- Two-instance round trip: after a send lands, `SELECT COUNT(*) FROM files
+  WHERE strong_hash IS NOT NULL` grew on BOTH sides by the number of files
+  transferred; re-send the same selection — the receiver's log carries
+  `dedup responder confirmed candidate full hashes` with `reused = N` and
+  `banked = 0`, and no full reads happen.
+- Content grouping ON, sync signed out: run a Rescan — the job card appears
+  after the scan and the Duplicates view (content mode) shows the new files
+  once it finishes. Cancel the job, Rescan again — it comes back; cancel,
+  wait for a monitor cycle — it does not.
+- A large re-scan on the NAS with content grouping ON is as fast as with it
+  OFF (the scan reads headers only either way).
+- Settings → General: a single "Content index" card; nothing on the page still
+  claims scans hash files as they go. Folders → rail button shows the pending
+  count, spins while indexing, reads "All files indexed" at zero.
+- Web-backend parity: the web scan route re-arms the job the same way.
+
 ### Deep verify banks its reads, and survives a rules change — 2026-08-27
 
 Two fixes in one pass. (1) The verify loop now carries a run-generation token:
@@ -153,12 +200,14 @@ Duplicates view that put every group in the DOM at once.
 
 ### Content index — 2026-08-11
 
-Scan-time content hashing is opt-in again (×5.9 faster cold), and `content_hash` is
-built by one visible, cancellable background job gated on sync being configured.
+`content_hash` is built by one visible, cancellable background job gated on sync
+being configured. *(Since the 2026-08-28 hash cleanup: the scan never hashes at
+all — the opt-in scan-time path is gone — and the gate also opens when content
+grouping is on; see that section for the re-arm rules.)*
 
 - Scan the 18 946-file root signed **out** — seconds rather than ~40 s, `content_hash` stays NULL, no job card.
 - Sign in and relaunch — the card appears, progresses, finishes with one notification, `pending` reaches 0.
-- Press the card's X mid-pass, then run a scan — **it must not come back.** This is the check that exercises the cancel fix.
+- Press the card's X mid-pass, then let a **monitor cycle** scan — **it must not come back.** (A scan the user starts by hand DOES bring it back since 2026-08-28 — that is the hash-cleanup check, not this one.)
 - A catalog holding an archived frame set — a permanent non-zero remainder that the card explains without inviting a pointless retry.
 - Settings → "Build index now" while signed **out** — runs anyway (the manual path is ungated) and clears any suppression.
 - Start a master build and "Build index now" together — they queue rather than run concurrently (`compute.max_concurrent` defaults to 1).
@@ -254,6 +303,16 @@ cycle, so anything from them that matters later belongs here or in a plan.
 - **The archive banner wedge.** Banner buttons are disabled for as long as the resume/rollback widget lives, so a lost terminal event — a narrow listen-registration race, or a worker panic — wedges the banner until reload. No data is lost. Accept it, or add a bounded escape that re-enables the controls on a timeout.
 - **Auto-link deselect semantics**, and whether a "manual block" concept is wanted.
 - **`frames.is_master` without `is_master_library`** — what shape that takes in the archive.
+- **Header fingerprint as the transfer-dedup Offer key** (hash-cleanup follow-up,
+  2026-08-28, NOT started). The content index exists only to give the RECEIVER a
+  cheap "do I have this?" membership key — the sender computes its sampling hash
+  from the staged copy — and `fits_header.header_fingerprint` is already 100 %
+  populated there at zero I/O. Carrying the fingerprint in the Offer (a new
+  `Msg` variant; indices are frozen, append-only; Perseus already parses headers
+  through `athenaeum-core`) would retire `content_hash`, the index job and the
+  Settings card, with the full-hash confirm unchanged as the safety net. A
+  mismatch (WCS written into one copy, parser drift between versions) costs a
+  re-transfer, never a loss. A protocol cycle of its own; proposed: defer.
 
 ---
 
@@ -270,5 +329,16 @@ cycle, so anything from them that matters later belongs here or in a plan.
   in place from their original source frames (Equipment → expanded master row).
 - Calibration sets and sessions no longer keep counting frames that were deleted;
   existing catalogs are corrected once on startup.
+- The catalog drops a duplicate-detection column it no longer uses; existing
+  catalogs are migrated once on startup.
+- Transfers remember the files they hash: every full read a send, a receive
+  or a deep verify pays is kept, so masters that travelled between devices
+  show up in duplicate detection without another read, and re-sending files
+  a device already confirmed costs no disk I/O on the receiver.
+- Scans read headers only. The content index that powers transfer dedup and
+  content-based duplicate grouping is built by its own background job — after
+  every scan when sync is set up or content grouping is on, and from a new
+  "Build content index" button on the Folders page. Settings gained one
+  "Content index" card in place of two.
 
 (v0.5.1 lines were paid in full on 2026-08-24.)

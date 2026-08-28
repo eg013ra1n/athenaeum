@@ -2982,15 +2982,30 @@ impl CatalogSyncStore {
     }
 
     /// Catalog files whose SAMPLING hash (`files.content_hash`) is one of
-    /// `hashes`, as `(sampling_hash, path)` pairs — the membership probe the
-    /// P2P dedup responder ([`CatalogDedupResponder`](super::responder::CatalogDedupResponder))
+    /// `hashes` — the membership probe the P2P dedup responder
+    /// ([`CatalogDedupResponder`](super::responder::CatalogDedupResponder))
     /// uses to split an incoming offer into definite-wants vs. sampling-hash
-    /// candidates. Thin wrapper over
+    /// candidates, each row carrying what the full-hash confirm then needs.
+    /// Thin wrapper over
     /// [`find_files_by_content_hashes`](crate::db::find_files_by_content_hashes).
-    pub fn files_by_sampling_hashes(&self, hashes: &[String]) -> Result<Vec<(String, String)>> {
+    pub fn files_by_sampling_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<crate::db::SamplingHashMatch>> {
         let conn = self.lock_conn();
         crate::db::find_files_by_content_hashes(&conn, hashes)
             .map_err(|e| anyhow::anyhow!("look up files by sampling hash: {e}"))
+    }
+
+    /// Bank a full-content hash the dedup confirm just read into
+    /// `files.strong_hash`. The responder owns the staleness check; this is
+    /// the locked write. Thin wrapper over
+    /// [`bank_strong_hash`](crate::db::bank_strong_hash).
+    pub fn bank_strong_hash(&self, file_id: i64, hash: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        crate::db::bank_strong_hash(&conn, file_id, hash)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("bank strong_hash for file {file_id}: {e}"))
     }
 
     /// Every outbound row, newest-first, capped at `limit`. Twin of

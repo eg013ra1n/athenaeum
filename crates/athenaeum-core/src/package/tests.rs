@@ -239,3 +239,29 @@ fn manifest_forward_compat_unknown_field_ok() {
         "unknown fields ignored; known fields intact"
     );
 }
+
+/// `files.strong_hash`, the manifest and deep verify all bank the digest this
+/// function produces, and deep verify produces it from an 8 KiB compare loop
+/// while this reads 4 MiB at a time. That only works because streaming xxh3
+/// is read-size independent — so pin it against a one-shot digest over a file
+/// that spans several full read buffers plus a partial tail.
+#[test]
+fn xxh3_full_file_is_read_size_independent() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("big.bin");
+    // 9 MiB + 12345 bytes: two full 4 MiB reads, one partial, one short tail —
+    // and not a repeating byte, so a chunk-boundary slip would change the hash.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let bytes: Vec<u8> = (0..(9 * 1024 * 1024 + 12345))
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+
+    let expect = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+    assert_eq!(xxh3_full_file(&path).unwrap(), expect);
+}

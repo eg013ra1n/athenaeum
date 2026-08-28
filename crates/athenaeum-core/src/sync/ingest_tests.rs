@@ -655,6 +655,19 @@ fn ingest_lands_files_and_rows() {
         outcome.receipts[0].outcome,
         ReceiptOutcome::Ingested
     ));
+
+    // The manifest's full-content xxh3 was verified against the landed bytes
+    // in step 1, and the row was written from that same file — so it is
+    // banked as `files.strong_hash` in the same transaction, and the Master
+    // duplicate key / deep verify never have to read the file again for it.
+    let strong: Option<String> = conn
+        .query_row("SELECT strong_hash FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        strong.as_deref(),
+        Some(outcome.receipts[0].xxh3.as_str()),
+        "ingest banks the verified manifest hash as strong_hash"
+    );
 }
 
 #[test]

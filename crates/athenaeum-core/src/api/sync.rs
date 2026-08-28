@@ -2875,6 +2875,30 @@ pub(crate) fn unique_rel_path(filename: &str, frame_id: i64, used: &mut HashSet<
     candidate
 }
 
+/// Write the full hashes a manifest build already computed into
+/// `files.strong_hash`, one transaction for the batch. Best-effort by design:
+/// the package is the product, the banked hash is a by-product — an error is
+/// logged and the send goes on, and a row that vanished meanwhile (0 rows
+/// updated) is simply not counted.
+fn bank_manifest_hashes(conn: &rusqlite::Connection, bank: &[(i64, String)]) {
+    if bank.is_empty() {
+        return;
+    }
+    let write = || -> rusqlite::Result<usize> {
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0usize;
+        for (file_id, hash) in bank {
+            n += crate::db::bank_strong_hash(&tx, *file_id, hash)?;
+        }
+        tx.commit()?;
+        Ok(n)
+    };
+    match write() {
+        Ok(n) => tracing::debug!(count = n, "manifest build: strong_hash banked"),
+        Err(e) => tracing::error!(error = %e, count = bank.len(), "manifest build: strong_hash bank failed"),
+    }
+}
+
 /// Build ONE package from exactly the eligible frames in `frame_ids`. INELIGIBLE
 /// frames — not in the catalog, or whose file is missing/unreadable on disk — are
 /// collected and returned, never silently dropped (task M2). The manifest mirrors
@@ -2952,6 +2976,13 @@ fn build_selection_package(
     // retention (task M4) later joins on to resolve a confirmed package back to
     // the disk files it may reclaim, with the recorded stat as the TOCTOU guard.
     let mut source_links: Vec<(i64, String, u64, i64)> = Vec::new();
+    // The manifest hashes every source file in full; that read is banked as
+    // `files.strong_hash` after the loop for every row the disk still vouches
+    // for — `disk_matches_row`, the contract shared with the master-hash pass
+    // and deep verify — so the Master duplicate key and a later verify get the
+    // digest without reading the file again. Collected here, written in one
+    // transaction below; a bank failure never fails the send.
+    let mut bank: Vec<(i64, String)> = Vec::new();
 
     for (file_id, file, frame) in &rows {
         let Some(frame_id) = frame.id else { continue };
@@ -2987,6 +3018,13 @@ fn build_selection_package(
                 continue;
             }
         };
+        if crate::duplicates::backfill::disk_matches_row(
+            path,
+            file.size,
+            &file.modified_at.to_rfc3339(),
+        ) {
+            bank.push((*file_id, xxh3.clone()));
+        }
         let frame_meta = match serde_json::to_value(frame) {
             Ok(v) => v,
             Err(e) => {
@@ -3036,6 +3074,8 @@ fn build_selection_package(
         eligible.push(frame_id);
         source_links.push((*file_id, file.path.clone(), byte_size, mtime_ms));
     }
+
+    bank_manifest_hashes(conn, &bank);
 
     // Requested ids that never resolved to a catalog row at all.
     for id in &requested {
@@ -7274,7 +7314,6 @@ mod tests {
             modified_at: chrono::Utc::now(),
             format: FileFormat::FITS,
             created_at: chrono::Utc::now(),
-            metadata_hash: None,
             content_hash: None,
             archived_in_operation: None,
             archive_zip_path: None,
@@ -7374,6 +7413,59 @@ mod tests {
 
     /// Task M4: building a selection package records the retention linkage in
     /// `sync_sources` — one live row per eligible frame, keyed on the SAME
+    /// Building a package hashes every source file in full for the manifest.
+    /// That read is banked into `files.strong_hash` for every row the disk
+    /// still vouches for (`(size, modified_at)` match — the contract shared
+    /// with the master-hash pass and deep verify); a row that lies about its
+    /// bytes is left alone. The fixture stores `Utc::now()` as `modified_at`,
+    /// which never matches the file's mtime, so the current row here is
+    /// re-stamped with the real stat first.
+    #[test]
+    fn build_selection_banks_strong_hash_into_current_rows() {
+        let (tmp, ctx) = test_ctx();
+        let dir = tmp.path();
+        let current = insert_fixture_frame(&ctx, dir, "current.fits", "M42", false);
+        let stale = insert_fixture_frame(&ctx, dir, "stale.fits", "M42", false);
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let (current_file_id, current_path): (i64, String) = conn
+            .query_row(
+                "SELECT f.id, f.path FROM files f JOIN frames fr ON fr.file_id = f.id WHERE fr.id = ?1",
+                [current],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let meta = std::fs::metadata(&current_path).unwrap();
+        let mtime = chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339();
+        conn.execute(
+            "UPDATE files SET size = ?2, modified_at = ?3 WHERE id = ?1",
+            rusqlite::params![current_file_id, meta.len() as i64, mtime],
+        )
+        .unwrap();
+        // The stale row keeps the fixture's fictional mtime AND lies about its size.
+        let stale_file_id: i64 = conn
+            .query_row("SELECT file_id FROM frames WHERE id = ?1", [stale], |r| r.get(0))
+            .unwrap();
+        conn.execute("UPDATE files SET size = size + 7 WHERE id = ?1", [stale_file_id])
+            .unwrap();
+
+        let pkg_root = dir.join("packages");
+        let built =
+            build_selection_package(&conn, "origin-dev", &pkg_root, &[current, stale], None, None)
+                .unwrap();
+        assert_eq!(built.eligible.len(), 2, "both files exist on disk, both are packaged");
+        let expect = crate::package::xxh3_full_file(std::path::Path::new(&current_path)).unwrap();
+
+        let banked: Option<String> = conn
+            .query_row("SELECT strong_hash FROM files WHERE id = ?1", [current_file_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(banked.as_deref(), Some(expect.as_str()), "current row banks the manifest hash");
+        let untouched: Option<String> = conn
+            .query_row("SELECT strong_hash FROM files WHERE id = ?1", [stale_file_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(untouched, None, "a row the disk does not vouch for is never written");
+    }
+
     /// `package_ref` the engine stores in `sync_outbound`, carrying the catalog
     /// `file_id` + the file's `(size, mtime)`. This is exactly what
     /// `api::retention` later resolves to reclaim the source. Ineligible frames
@@ -8765,7 +8857,6 @@ mod tests {
             modified_at: chrono::Utc::now(),
             format: crate::models::FileFormat::FITS,
             created_at: chrono::Utc::now(),
-            metadata_hash: None,
             content_hash: None,
             archived_in_operation: None,
             archive_zip_path: None,
@@ -9102,7 +9193,6 @@ mod tests {
             modified_at: chrono::Utc::now(),
             format: FileFormat::FITS,
             created_at: chrono::Utc::now(),
-            metadata_hash: None,
             content_hash: None,
             archived_in_operation: None,
             archive_zip_path: None,

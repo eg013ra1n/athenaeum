@@ -468,7 +468,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // Files table - includes metadata hash for quick duplicate detection and content_hash for xxhash-based detection
+    // Files table. `content_hash` is the three-part sampling xxh3 (transfer
+    // dedup + the opt-in content grouping of the Duplicates view);
+    // `strong_hash` (added by migration below) is the full-file xxh3.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,7 +480,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             modified_at TEXT NOT NULL,
             format TEXT NOT NULL CHECK(format IN ('FITS', 'XISF')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            metadata_hash TEXT,
             content_hash TEXT
         )",
         [],
@@ -918,10 +919,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_files_metadata_hash ON files(metadata_hash)",
-        [],
-    )?;
-    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)",
         [],
     )?;
@@ -1277,6 +1274,25 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_files_strong_hash ON files(strong_hash)",
         [],
     )?;
+
+    // `files.metadata_hash` (size + mtime + filename) was the duplicate key
+    // until the header fingerprint replaced it (2026-08-27). Nothing read it
+    // after that — every insert still paid for it and its index — so it goes.
+    // The index must go FIRST: SQLite refuses to DROP a column an index still
+    // references. Guarded on the column, so a catalog already on the new shape
+    // pays one pragma read per start and nothing else.
+    let has_metadata_hash: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='metadata_hash'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(n) = has_metadata_hash {
+        if n > 0 {
+            conn.execute("DROP INDEX IF EXISTS idx_files_metadata_hash", [])?;
+            conn.execute("ALTER TABLE files DROP COLUMN metadata_hash", [])?;
+            tracing::info!(table = "files", column = "metadata_hash", "dropped write-only column");
+        }
+    }
 
     // Add date_obs_start to frames_set table (migration for existing databases)
     let has_date_obs_start: Result<i64, _> = conn.query_row(
@@ -4375,6 +4391,71 @@ mod duplicate_cache_tests {
             [],
         )
         .expect("the same migration must admit 'master' — Task 7 writes it");
+    }
+
+    /// `files.metadata_hash` (size + mtime + filename) was the duplicate key
+    /// until 2026-08-27, when the header fingerprint replaced it. Nothing has
+    /// read it since — it was written on every insert and served no query —
+    /// so `init_db` drops the column and its index. A fresh catalog never
+    /// creates them; an old one loses them on the next start with every row
+    /// intact; a second start is a no-op.
+    #[test]
+    fn init_db_drops_the_write_only_metadata_hash_column() {
+        fn has_column(conn: &Connection) -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'metadata_hash'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        }
+        fn has_index(conn: &Connection) -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_files_metadata_hash'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert!(!has_column(&conn), "a fresh catalog must not create metadata_hash");
+        assert!(!has_index(&conn), "a fresh catalog must not create idx_files_metadata_hash");
+
+        // Reproduce the pre-cleanup shape: the column, its index, and a row
+        // carrying a value — DROP COLUMN rewrites the table, so the row is
+        // what proves the rewrite kept the data.
+        conn.execute("ALTER TABLE files ADD COLUMN metadata_hash TEXT", [])
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_files_metadata_hash ON files(metadata_hash)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, metadata_hash)
+             VALUES ('/a/b.fits', 'b.fits', 10, '2025-01-01T00:00:00Z', 'FITS', 'deadbeef')",
+            [],
+        )
+        .unwrap();
+        assert!(has_column(&conn) && has_index(&conn), "old shape must be in place — otherwise this test proves nothing");
+
+        // Next app start.
+        init_db(&conn).unwrap();
+        assert!(!has_column(&conn), "init_db must drop metadata_hash from an old catalog");
+        assert!(!has_index(&conn), "init_db must drop idx_files_metadata_hash with it");
+        let (path, size): (String, i64) = conn
+            .query_row("SELECT path, size FROM files", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("the row must survive the column drop");
+        assert_eq!((path.as_str(), size), ("/a/b.fits", 10));
+
+        // And the start after that.
+        init_db(&conn).expect("a catalog already on the new shape must init cleanly");
+        assert!(!has_column(&conn));
     }
 
     /// A catalog left on the INTERMEDIATE shape — the four-value CHECK, but
