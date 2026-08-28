@@ -1157,7 +1157,7 @@ pub(crate) mod tests {
         let cancel2 = Arc::new(AtomicBool::new(false));
         let scan_result = scan_directory_parallel(
             scan.path(), 1, &conn, &NullEmitter,
-            false, cancel2, false,
+            cancel2, false,
         );
         assert!(
             scan_result.errors.is_empty(),

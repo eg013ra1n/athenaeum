@@ -2,14 +2,16 @@
 //!
 //! `files.content_hash` has two consumers — the device-to-device transfer dedup
 //! handshake, and content-based grouping in the Duplicates view when
-//! `duplicates.use_content_hash` is on. Neither is worth paying for on every
-//! scan, so the index is not part of scanning (which used to hash
-//! unconditionally, at 3 x 512 KB of disk reads per file), and the AUTOMATIC
-//! trigger does not fire at all on a node that has never configured sync — a
-//! node that wants the column only for duplicate grouping starts the job by
-//! hand from Settings, which is deliberately ungated. When it does run it is a
-//! first-class visible job: it takes a `ComputeQueue` ticket, so it shows up in
-//! the sidebar with a cancel button and can't fight a master build for the disk.
+//! `duplicates.use_content_hash` is on. Neither is worth paying for inside a
+//! scan (which used to hash as it went, 3 x 512 KB of disk reads per new or
+//! changed file, inside the scan's own write transaction), so this job is the
+//! ONE bulk producer of the column — a scan never writes it; sync ingest stamps
+//! only the file it just landed. The AUTOMATIC trigger fires when either
+//! consumer is live (sync configured, or content grouping on) and stays silent
+//! on a node with neither; the button in Settings and on the Folders page is
+//! deliberately ungated. When it runs it is a first-class visible job: it takes
+//! a `ComputeQueue` ticket, so it shows up in the sidebar with a cancel button
+//! and can't fight a master build for the disk.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -156,8 +158,9 @@ fn record_cancelled_by_user(path: &Path) {
 /// that is a real window: a cancelling worker records the marker after an
 /// in-flight autostart has already read it as absent, the autostart then claims
 /// the slot, and — clearing there — it would erase the suppression the user just
-/// earned and run the full pass anyway. Autostart never touches this function,
-/// so pressing the button is the only thing that clears.
+/// earned and run the full pass anyway. Autostart never touches this function;
+/// what clears is user intent at a seam — the button, or a scan the user
+/// started ([`autostart_after_user_scan`]); the monitor's cycle never does.
 pub fn clear_cancelled_by_user(path: &Path) {
     lock_cancelled().remove(path);
 }
@@ -304,9 +307,18 @@ pub fn start_content_index(
     true
 }
 
-/// The gated entry point. Both hosts call this at boot and after every scan.
-/// A node with no sync configured pays nothing.
+/// The gated entry point. Both hosts call this at boot, from the monitor's
+/// scan-completed hook, and — through [`autostart_after_user_scan`] — after
+/// every user-started scan. The gate opens for either consumer of the column:
+/// sync configured (the transfer dedup handshake) or
+/// `duplicates.use_content_hash` on (content grouping in the Duplicates view —
+/// since scans no longer hash as they go, this job is the only thing that
+/// gives a new file its hash). A node with neither pays nothing.
 pub fn autostart_content_index(ctx: &ServiceContext, emitter: Arc<dyn ProgressEmitter>) {
+    let Some(database) = ctx.db.get().cloned() else {
+        tracing::debug!("content index autostart skipped: database not initialised");
+        return;
+    };
     let configured = match crate::api::sync::sync_configured(ctx) {
         Ok(v) => v,
         Err(e) => {
@@ -314,14 +326,20 @@ pub fn autostart_content_index(ctx: &ServiceContext, emitter: Arc<dyn ProgressEm
             return;
         }
     };
-    if !configured {
-        tracing::debug!("content index autostart skipped: sync not configured");
+    // A read failure must not pass silently just because the fallback happens
+    // to equal the default: the visible symptom would be a user turning
+    // content grouping ON and the index quietly never building.
+    let grouping_by_content = ctx
+        .settings
+        .get_duplicates_use_content_hash(&database.conn())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "duplicates.use_content_hash read failed; treating as off");
+            false
+        });
+    if !configured && !grouping_by_content {
+        tracing::debug!("content index autostart skipped: neither sync nor content grouping is on");
         return;
     }
-    let Some(database) = ctx.db.get().cloned() else {
-        tracing::debug!("content index autostart skipped: database not initialised");
-        return;
-    };
     // Checked BEFORE `count_pending`, so a cancelled catalog costs nothing per
     // trigger — and this fires on every scan and every monitor cycle.
     if was_cancelled_by_user(database.path()) {
@@ -361,6 +379,21 @@ pub fn autostart_content_index(ctx: &ServiceContext, emitter: Arc<dyn ProgressEm
     if start_content_index(database, ctx.compute_queue.clone(), emitter) {
         tracing::info!(pending, "content index autostart");
     }
+}
+
+/// The autostart a USER-initiated scan fires — Rescan, "Find new images",
+/// the web mirror of either. Same gate and single-flight as
+/// [`autostart_content_index`]; the boot trigger and the monitor cycle keep
+/// calling that one directly.
+pub fn autostart_after_user_scan(ctx: &ServiceContext, emitter: Arc<dyn ProgressEmitter>) {
+    // A cancel means "not now"; a scan the user starts afterwards is "now" —
+    // they asked for new files, and the index that serves those files re-arms.
+    // The same clear the manual button performs (see `clear_cancelled_by_user`
+    // for why it lives at the seam and not inside `start_content_index`).
+    if let Some(database) = ctx.db.get() {
+        clear_cancelled_by_user(database.path());
+    }
+    autostart_content_index(ctx, emitter);
 }
 
 #[cfg(test)]
@@ -566,6 +599,77 @@ mod tests {
         // worker may legitimately finish before the test thread looks again.
         // A closed gate makes this wait time out loudly instead.
         wait_until("every hashable row carries a hash", || {
+            get_content_index_status(&ctx).unwrap().pending == 0
+        });
+        wait_until("the pass releases the single-flight slot", || {
+            !get_content_index_status(&ctx).unwrap().running
+        });
+    }
+
+    /// The other consumer of the column. A node that never configured sync
+    /// but groups its Duplicates view by content has turned
+    /// `duplicates.use_content_hash` on — and that is now the ONLY way new
+    /// files get a `content_hash`, because scans no longer hash as they go.
+    /// So the setting opens the gate exactly like a sign-in does.
+    #[test]
+    fn autostart_runs_a_pass_when_content_grouping_is_on_without_sync() {
+        let (ctx, _tmp) = test_ctx_with_files(2);
+        {
+            let database = ctx.db.get().unwrap();
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::DUPLICATES_USE_CONTENT_HASH,
+                "true",
+            )
+            .unwrap();
+        }
+        assert!(!crate::api::sync::sync_configured(&ctx).unwrap(), "precondition: no sync");
+        assert_eq!(get_content_index_status(&ctx).unwrap().pending, 2);
+
+        autostart_content_index(&ctx, Arc::new(NullEmitter));
+
+        wait_until("every hashable row carries a hash", || {
+            get_content_index_status(&ctx).unwrap().pending == 0
+        });
+        wait_until("the pass releases the single-flight slot", || {
+            !get_content_index_status(&ctx).unwrap().running
+        });
+    }
+
+    /// A cancel means "not now". A scan the user starts afterwards is "now":
+    /// they went and asked for new files, so the index that serves those
+    /// files re-arms — the user-scan seam clears the marker the way the
+    /// manual button does. The monitor's own cycle does NOT (it keeps calling
+    /// the plain autostart), or a cancel would be undone by the clock.
+    #[test]
+    fn a_user_scan_clears_the_cancel_latch() {
+        let (ctx, _tmp) = test_ctx_with_files(70);
+        sign_in(&ctx);
+        let database = ctx.db.get().unwrap().clone();
+
+        assert!(start_content_index(
+            database.clone(),
+            ctx.compute_queue.clone(),
+            Arc::new(CancelOnFirstProgress {
+                queue: ctx.compute_queue.clone(),
+                fired: AtomicBool::new(false),
+            }),
+        ));
+        wait_until("the cancelled pass releases the single-flight slot", || {
+            !get_content_index_status(&ctx).unwrap().running
+        });
+        let left_behind = get_content_index_status(&ctx).unwrap().pending;
+        assert!(left_behind > 0, "the cancel must have left work (pending = {left_behind})");
+        assert!(was_cancelled_by_user(database.path()), "precondition: the latch is set");
+
+        autostart_after_user_scan(&ctx, Arc::new(NullEmitter));
+
+        assert!(
+            !was_cancelled_by_user(database.path()),
+            "a user scan must clear the suppression, not merely bypass it"
+        );
+        wait_until("the post-scan pass indexes what the cancel left", || {
             get_content_index_status(&ctx).unwrap().pending == 0
         });
         wait_until("the pass releases the single-flight slot", || {

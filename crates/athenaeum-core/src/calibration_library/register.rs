@@ -34,10 +34,10 @@ pub struct MasterRegistration {
 /// `calibration_library::headers::build_master_cards`) and stored in
 /// `master_provenance.member_hash`.
 ///
-/// Content hashes (`files.content_hash`) are only computed when duplicate
-/// detection opts into hashing during a scan, so they may be `NULL` for any
-/// given member frame — an identity hash built on top of them would be
-/// unreliable. `frames.uuid` is a Phase-1 invariant: every frame row gets one
+/// Content hashes (`files.content_hash`) are filled by the content-index job,
+/// not by the scan, so they may be `NULL` for any given member frame — an
+/// identity hash built on top of them would be unreliable. `frames.uuid` is a
+/// Phase-1 invariant: every frame row gets one
 /// via an `AFTER INSERT` trigger the moment it's inserted, so it's always
 /// present and is the right foundation for "did this exact set of frames
 /// build this master" identity.
@@ -446,7 +446,7 @@ mod tests {
         conn_b.execute("INSERT INTO scan_roots (path) VALUES (?1)",
             [scan_dir.path().to_string_lossy()]).unwrap();
         let scan_result = crate::scanner::scan_directory(
-            scan_dir.path(), &conn_b, None, false, false, 1,
+            scan_dir.path(), &conn_b, None, false, 1,
         );
         assert!(scan_result.errors.is_empty(), "scan errors: {:?}", scan_result.errors);
 

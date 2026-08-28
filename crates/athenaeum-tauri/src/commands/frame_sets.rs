@@ -820,7 +820,7 @@ pub async fn find_new_frames_for_set(
                 let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
                     Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle.clone()));
                 std::thread::spawn(move || {
-                    athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+                    athenaeum_core::api::content_index::autostart_after_user_scan(&ctx, emitter);
                 });
             }
         }

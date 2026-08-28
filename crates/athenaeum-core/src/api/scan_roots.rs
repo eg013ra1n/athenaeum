@@ -921,14 +921,12 @@ pub fn start_scan(ctx: &ServiceContext, root_id: i64) -> Result<ScanResultDto, A
         .find(|r| r.id == Some(root_id))
         .ok_or_else(|| ApiError::NotFound("Scan root not found".to_string()))?;
 
-    // Scan-time hashing is opt-in (see `scanner::scan_hashing_enabled`); the
-    // dedup index is filled by `api::content_index`, not by the scan.
-    let use_content_hash = crate::scanner::scan_hashing_enabled(&ctx.settings, &conn);
+    // Header-only scan; `files.content_hash` is filled by `api::content_index`
+    // (autostarted after the scan by the host seam), never by the scan itself.
     let mut result = crate::scanner::scan_directory(
         Path::new(&root.path),
         &conn,
         None,
-        use_content_hash,
         root.unique_camera,
         root_id,
     );

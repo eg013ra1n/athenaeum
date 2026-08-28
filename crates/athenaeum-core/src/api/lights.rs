@@ -3652,7 +3652,7 @@ mod orchestration_tests {
                 params![src.to_string_lossy()],
             )
             .unwrap();
-            let sr = scan_directory(&src, &conn, None, false, false, 1);
+            let sr = scan_directory(&src, &conn, None, false, 1);
             assert!(sr.errors.is_empty(), "scan errors: {:?}", sr.errors);
             eprintln!(
                 "[b5-e2e] scan: lights={} darks={} flats={} calib_sets_created={}",
@@ -3907,7 +3907,7 @@ mod orchestration_tests {
             let conn = db_ref.conn();
             let frames_before = count(&conn, "SELECT COUNT(*) FROM frames");
             let cal_before = count(&conn, "SELECT COUNT(*) FROM light_calibrations");
-            let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
+            let sr = scan_directory(&library_dir, &conn, None, false, lib_root_id);
             assert!(sr.errors.is_empty(), "rescan errors: {:?}", sr.errors);
             let frames_after = count(&conn, "SELECT COUNT(*) FROM frames");
             let cal_after = count(&conn, "SELECT COUNT(*) FROM light_calibrations");
@@ -3943,7 +3943,7 @@ mod orchestration_tests {
                 (old, moved)
             };
             let conn = db_ref.conn();
-            let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
+            let sr = scan_directory(&library_dir, &conn, None, false, lib_root_id);
             assert!(sr.errors.is_empty(), "move-rescan errors: {:?}", sr.errors);
             let repaired = get_light_calibration_for_frame(&conn, moved_fid)
                 .unwrap()
@@ -3974,7 +3974,7 @@ mod orchestration_tests {
                 (kept, dup)
             };
             let conn = db_ref.conn();
-            let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
+            let sr = scan_directory(&library_dir, &conn, None, false, lib_root_id);
             assert!(sr.errors.is_empty(), "copy-rescan errors: {:?}", sr.errors);
             eprintln!("[b5-e2e] copy(c): dups={:?}", sr.calibrated_duplicates);
             assert!(

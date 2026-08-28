@@ -166,7 +166,7 @@ pub async fn start_scan(
         let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
             Arc::new(TauriProgressEmitter(app_handle));
         std::thread::spawn(move || {
-            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+            athenaeum_core::api::content_index::autostart_after_user_scan(&ctx, emitter);
         });
     }
     Ok(dto)
@@ -249,7 +249,7 @@ pub async fn start_scan_with_progress(
         let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
             Arc::new(TauriProgressEmitter(app_handle.clone()));
         std::thread::spawn(move || {
-            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+            athenaeum_core::api::content_index::autostart_after_user_scan(&ctx, emitter);
         });
     }
     Ok(dto)

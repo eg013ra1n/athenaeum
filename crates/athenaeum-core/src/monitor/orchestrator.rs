@@ -372,16 +372,15 @@ mod tests {
     }
 
     /// Task E briefly made the production scan path (`run_registered_scan`,
-    /// driven here by the monitor cycle) ALWAYS populate `files.content_hash`,
-    /// even with `duplicates.use_content_hash` unset (default false) — a 3 x
-    /// 512 KB sampling read on every new/changed file, measured x5.9 slower
-    /// cold on a real library (see `scanner::scan_hashing_enabled`). The
-    /// content-index-job plan's Task 1 reverted that: scan-time hashing is
-    /// opt-in again, so the transfer dedup index is filled by an explicit
-    /// backfill pass instead of riding every scan. This test now pins BOTH
-    /// halves of that contract: the scan itself leaves the column NULL, and
+    /// driven here by the monitor cycle) ALWAYS populate `files.content_hash`
+    /// — a 3 x 512 KB sampling read on every new/changed file, measured x5.9
+    /// slower cold on a real library. The content-index-job plan reverted
+    /// that to opt-in, and the hash cleanup (2026-08-28) removed scan-time
+    /// hashing altogether: the transfer dedup index is filled by the explicit
+    /// content-index pass, never by a scan. This test pins BOTH halves of
+    /// that contract: the scan itself leaves the column NULL, and
     /// `duplicates::backfill` (driven explicitly, as the content-index job
-    /// will) is what populates it.
+    /// does) is what populates it.
     #[test]
     fn registered_scan_leaves_content_hash_null_backfill_populates_it() {
         let (_tmp, ctx) = test_ctx_with_scan_root(1);
@@ -418,6 +417,42 @@ mod tests {
         assert!(
             hash_after_backfill.is_some(),
             "an explicit backfill pass must populate content_hash for a scanned-but-unhashed file"
+        );
+    }
+
+    /// The scan hot path is header-only, full stop. `duplicates.use_content_hash`
+    /// used to double as "hash during the scan" — 3 x 512 KB of reads per new or
+    /// changed file inside the scan's own write transaction. Now it only picks
+    /// the Duplicates view's key and opens the content-index autostart gate; the
+    /// job (visible, cancellable, queued behind master builds) is the one bulk
+    /// producer of `content_hash`, and a scan never writes it whatever the
+    /// setting says.
+    #[test]
+    fn registered_scan_never_hashes_even_with_content_grouping_on() {
+        let (_tmp, ctx) = test_ctx_with_scan_root(1);
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::DUPLICATES_USE_CONTENT_HASH,
+                "true",
+            )
+            .unwrap();
+            assert!(ctx.settings.get_duplicates_use_content_hash(&conn).unwrap());
+        }
+        let offline_roots = Arc::new(Mutex::new(HashSet::new()));
+
+        run_cycle(&ctx, &NullEmitter, &offline_roots, None);
+
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        let hash_after_scan: Option<String> = conn
+            .query_row("SELECT content_hash FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            hash_after_scan.is_none(),
+            "a scan must not compute content_hash — the content-index job is the only producer"
         );
     }
 }

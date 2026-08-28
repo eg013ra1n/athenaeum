@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::events::{ProgressEmitter, emit_event};
-use anyhow::Context;
 use walkdir::WalkDir;
 
 /// Convert a path to UTF-8 string for DB persistence.
@@ -92,9 +91,6 @@ pub struct FileProcessResult {
     pub frame: Frame,
     pub header: Option<String>,
     pub imagetyp: Option<ImageType>,
-    /// Non-fatal hash failure encountered during processing. The file was
-    /// still parsed and is in the result; only its content_hash is None.
-    pub hash_error: Option<String>,
     /// Set when the parsed header identifies a calibrated-LIGHT artifact
     /// (design §4). The Phase-2 write loop diverts these onto the DB-touching
     /// reconcile-adopt path instead of inserting a `files`/`frames` row —
@@ -150,7 +146,6 @@ pub fn scan_directory(
     root_path: &Path,
     conn: &Connection,
     progress_callback: Option<Box<dyn Fn(ScanProgress) + Send + Sync>>,
-    use_content_hash: bool,
     unique_camera: bool,
     root_id: i64,
 ) -> ScanResult {
@@ -279,7 +274,7 @@ pub fn scan_directory(
             // bookkeeping (junction tables, calibration links) stays
             // valid; just record the error and move on.
             match reparse_and_update_in_place(
-                file_path, file_id, conn, use_content_hash, unique_camera, root_id, false,
+                file_path, file_id, conn, unique_camera, root_id, false,
             ) {
                 Ok(()) => {
                     *processed.lock().unwrap() += 1;
@@ -295,14 +290,11 @@ pub fn scan_directory(
             continue;
         }
 
-        let mut hash_errors_local: Vec<String> = Vec::new();
         match process_file(
             file_path,
             conn,
-            use_content_hash,
             unique_camera,
             root_id,
-            &mut hash_errors_local,
             &mut calibrated_duplicates,
         ) {
             Ok(frame_info) => {
@@ -331,9 +323,6 @@ pub fn scan_directory(
                     .unwrap()
                     .push(format!("{}: {}", file_path.display(), e));
             }
-        }
-        if !hash_errors_local.is_empty() {
-            errors.lock().unwrap().extend(hash_errors_local);
         }
     }
 
@@ -405,16 +394,14 @@ pub fn scan_directory(
     result
 }
 
-/// Process a single file: hash, parse metadata, insert into database
+/// Process a single file: parse metadata, insert into database. Header-only —
+/// `files.content_hash` is the content-index job's to fill, never the scan's.
 /// Returns Some((frame_id, imagetyp)) for successfully processed frames with known imagetyp
-/// Any non-fatal hash failures are pushed to `hash_errors_out` (prefixed `hash_error:`).
 fn process_file(
     path: &PathBuf,
     conn: &Connection,
-    use_content_hash: bool,
     unique_camera: bool,
     root_id: i64,
-    hash_errors_out: &mut Vec<String>,
     calibrated_duplicates_out: &mut Vec<CalibratedDuplicate>,
 ) -> anyhow::Result<Option<(i64, ImageType)>> {
     // Get file metadata
@@ -577,24 +564,6 @@ fn process_file(
     }
 
     // If we get here, it's a truly new file - insert it
-    let content_hash = if use_content_hash {
-        match crate::duplicates::compute_xxhash(path) {
-            Ok(hash) => {
-                tracing::debug!(root_id, path = %current_path, hash = %hash, "computed content hash");
-                Some(hash)
-            }
-            Err(e) => {
-                // Surface the failure so the user knows duplicate detection
-                // skipped this file. Previously silently dropped to None.
-                let msg = format!("hash_error: {}: failed to compute content hash: {}", current_path, e);
-                tracing::warn!(path = %current_path, error = %e, "failed to compute content hash");
-                hash_errors_out.push(msg);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let file = File {
         id: None,
@@ -604,7 +573,7 @@ fn process_file(
         modified_at: modified_dt,
         format: format.clone(),
         created_at: Utc::now(),
-        content_hash,
+        content_hash: None,
         archived_in_operation: None,
         archive_zip_path: None,
         archive_path_in_zip: None,
@@ -1071,7 +1040,6 @@ fn reparse_and_update_in_place(
     path: &Path,
     file_id: i64,
     conn: &Connection,
-    use_content_hash: bool,
     unique_camera: bool,
     root_id: i64,
     warn_override_skip: bool,
@@ -1115,22 +1083,6 @@ fn reparse_and_update_in_place(
             };
             (f, h)
         }
-    };
-
-    // KNOWN TRADE-OFF (smoke №8 review, deferred): this ~1.5MB sampling read runs
-    // inside the caller's phase-2 batch WRITE transaction, so a re-scan with many
-    // changed files extends the exclusive-lock hold and can SQLITE_BUSY concurrent
-    // writers (the content index skips-and-retries next launch; UI writes
-    // ride the 5s busy_timeout). Hoisting the hash out of the tx needs a scanner
-    // phase restructure — deliberately deferred; changed-file batches are small in
-    // normal use (mtime/size drift only).
-    let content_hash = if use_content_hash {
-        Some(
-            crate::duplicates::compute_xxhash(path)
-                .with_context(|| format!("compute content hash for {}", path.display()))?,
-        )
-    } else {
-        None
     };
 
     let new_instrume = if unique_camera {
@@ -1224,7 +1176,6 @@ fn reparse_and_update_in_place(
         size,
         &modified_dt,
         &format,
-        content_hash.as_deref(),
         &frame,
         new_instrume.as_deref(),
         header_text.as_deref(),
@@ -1262,10 +1213,10 @@ fn reparse_and_update_in_place(
 ///
 /// Fixed argument choices, matching what `register_master` writes for a
 /// freshly built master:
-/// - `use_content_hash = false` — registration never stores one, and the
-///   rewrite invalidates any value a hashing scan had filled in. The re-parse
-///   writes NULL, which is honest and recoverable (the content index fills
-///   NULLs); a retained stale hash would not be.
+/// - both hashes go to NULL — the rewrite invalidates any value a previous
+///   pass had filled in. NULL is honest and recoverable (the content index
+///   fills `content_hash`, the master-hash pass `strong_hash`); a retained
+///   stale hash would not be.
 /// - `unique_camera = false` / `root_id = 0` — `register_master` stores
 ///   INSTRUME exactly as parsed, with no " N<root_id>" suffix, and later
 ///   library scans classify the file as unchanged so they never add one.
@@ -1287,7 +1238,7 @@ pub fn resync_catalog_rows_from_disk(
     file_id: i64,
     path: &Path,
 ) -> anyhow::Result<()> {
-    reparse_and_update_in_place(path, file_id, conn, false, false, 0, true)
+    reparse_and_update_in_place(path, file_id, conn, false, 0, true)
 }
 
 /// The write half of `reparse_and_update_in_place`. Runs inside the
@@ -1300,7 +1251,6 @@ fn write_reparse_rows(
     size: i64,
     modified_dt: &chrono::DateTime<Utc>,
     format: &FileFormat,
-    content_hash: Option<&str>,
     frame: &Frame,
     new_instrume: Option<&str>,
     header_text: Option<&str>,
@@ -1310,23 +1260,23 @@ fn write_reparse_rows(
     // UPDATE files in place. Mirrors insert_file's column list (path,
     // filename, created_at intentionally not touched).
     //
-    // `strong_hash = NULL`: the bytes just changed, so any full-file hash is
-    // now a lie. NULL means "not hashed yet", which drops the row out of the
-    // Master key until the next pass re-reads it — a miss, never a stale group
-    // offered for deletion. (Kept out of the SQL string on purpose: a `--`
-    // comment inside a literal would silently swallow whatever a later reflow
-    // pushed onto its line, the `WHERE` clause included.)
+    // Both hashes to NULL: the bytes just changed, so any hash of them is now
+    // a lie. NULL means "not hashed yet" — the content-index job re-hashes
+    // `content_hash` on its next pass, and the row drops out of the Master
+    // duplicate key until the master-hash pass re-reads it: a miss, never a
+    // stale group offered for deletion. (Kept out of the SQL string on
+    // purpose: a `--` comment inside a literal would silently swallow whatever
+    // a later reflow pushed onto its line, the `WHERE` clause included.)
     conn.execute(
         "UPDATE files
          SET size = ?1, modified_at = ?2, format = ?3,
-             content_hash = ?4,
+             content_hash = NULL,
              strong_hash = NULL
-         WHERE id = ?5",
+         WHERE id = ?4",
         rusqlite::params![
             size,
             modified_dt.to_rfc3339(),
             format!("{:?}", format),
-            content_hash,
             file_id,
         ],
     )?;
@@ -1520,7 +1470,6 @@ fn emit_scan_complete<E: ProgressEmitter>(emitter: &E, root_id: i64, result: &Sc
 /// Returns file data ready for batch insertion
 fn process_file_parallel(
     path: &PathBuf,
-    use_content_hash: bool,
     root_id: i64,
 ) -> Result<FileProcessResult, String> {
     tracing::debug!(root_id, path = %path.display(), "processing file");
@@ -1552,25 +1501,8 @@ fn process_file_parallel(
 
     let current_path = path_to_utf8(path).map_err(|e| e.to_string())?;
 
-    // Compute content hash if enabled. Surface failures to the caller as
-    // hash_error so duplicate detection coverage gaps are visible to the user.
-    let (content_hash, hash_error) = if use_content_hash {
-        match crate::duplicates::compute_xxhash(path) {
-            Ok(hash) => (Some(hash), None),
-            Err(e) => {
-                let msg = format!(
-                    "hash_error: {}: failed to compute content hash: {}",
-                    path.display(),
-                    e
-                );
-                (None, Some(msg))
-            }
-        }
-    } else {
-        (None, None)
-    };
-
-    // Create file record (id will be assigned during insert)
+    // Create file record (id will be assigned during insert). Header-only:
+    // `content_hash` is the content-index job's to fill, never the scan's.
     let file = File {
         id: None,
         path: current_path,
@@ -1579,7 +1511,7 @@ fn process_file_parallel(
         modified_at: modified_dt,
         format: format.clone(),
         created_at: Utc::now(),
-        content_hash,
+        content_hash: None,
         archived_in_operation: None,
         archive_zip_path: None,
         archive_path_in_zip: None,
@@ -1615,7 +1547,6 @@ fn process_file_parallel(
         frame,
         header,
         imagetyp,
-        hash_error,
         calibrated_identity,
     })
 }
@@ -1630,7 +1561,6 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     root_id: i64,
     conn: &Connection,
     emitter: &E,
-    use_content_hash: bool,
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
 ) -> ScanResult {
@@ -1863,7 +1793,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             // headers). Without this, rayon swallows the panic and the file
             // silently disappears from the result with no error trail.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process_file_parallel(path, use_content_hash, root_id)
+                process_file_parallel(path, root_id)
             }));
 
             match outcome {
@@ -1910,14 +1840,6 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     // Phase 2: Sequential database inserts in a transaction
     emit_progress(emitter, root_id, 0, processed_results.len(), None, "inserting");
-
-    // Collect non-fatal hash errors from Phase 1 so users see which files
-    // had no content_hash computed (duplicate detection coverage gaps).
-    for r in processed_results.iter() {
-        if let Some(ref msg) = r.hash_error {
-            errors.lock().unwrap().push(msg.clone());
-        }
-    }
 
     // Track calibration frame IDs
     let mut flat_frame_ids: Vec<i64> = Vec::new();
@@ -2153,7 +2075,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         if let Some(&file_id) = modified_files_by_path.get(&file_result.file.path) {
             let path_buf = PathBuf::from(&file_result.file.path);
             match reparse_and_update_in_place(
-                &path_buf, file_id, conn, use_content_hash, unique_camera, root_id, false,
+                &path_buf, file_id, conn, unique_camera, root_id, false,
             ) {
                 Ok(()) => {
                     result.files_processed += 1;
@@ -2423,30 +2345,6 @@ pub struct RegisteredScanOutcome {
     pub reconcile: crate::db::ReconcileResult,
 }
 
-/// Scan-time content hashing is opt-in via `duplicates.use_content_hash`
-/// (default false).
-///
-/// `5aa58fed` briefly hard-coded this on so the transfer dedup handshake would
-/// see the whole scanned library. That put a 3 x 512 KB sampling read on every
-/// new/changed file — 27.86 GiB instead of 0.30 GiB on an 18 946-file library,
-/// measured x5.9 cold. The dedup index is now filled by the explicit,
-/// cancellable content-index job (`api::content_index`) instead, so the scan
-/// hot path stays header-only.
-pub(crate) fn scan_hashing_enabled(
-    settings: &crate::settings::SettingsManager,
-    conn: &rusqlite::Connection,
-) -> bool {
-    // A read failure must not pass silently just because the fallback happens
-    // to equal the default: the visible symptom would be a user turning the
-    // setting ON and scans quietly continuing not to hash.
-    settings
-        .get_duplicates_use_content_hash(conn)
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "duplicates.use_content_hash read failed; scan hashing disabled");
-            false
-        })
-}
-
 /// Run a scan against a scan root with full lifecycle management:
 /// - Fails fast if a scan is already active for this root.
 /// - Registers a `ScanHandle` in `ctx.active_scans` (with cancel flag).
@@ -2512,13 +2410,11 @@ pub fn run_registered_scan<E: ProgressEmitter>(
         .find(|r| r.id == Some(root_id))
         .ok_or("Scan root not found")?;
 
-    let use_content_hash = scan_hashing_enabled(&ctx.settings, &conn);
     let result = scan_directory_parallel(
         Path::new(&root.path),
         root_id,
         &conn,
         emitter,
-        use_content_hash,
         cancel_flag,
         root.unique_camera,
     );
@@ -2587,7 +2483,6 @@ mod inplace_tests {
             1,
             &conn,
             &NullEmitter,
-            false,
             cancel.clone(),
             false,
         );
@@ -2615,7 +2510,7 @@ mod inplace_tests {
         std::fs::write(&f, bytes).unwrap();
 
         // Rescan via the serial path (the path Task 4 fixes).
-        let scan2 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        let scan2 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
         assert!(!scan2.cancelled);
 
@@ -2681,7 +2576,7 @@ mod inplace_tests {
         std::fs::write(&f, bytes).unwrap();
 
         // Rescan via the serial path that Task 4 fixed.
-        let result = scan_directory(scan.path(), &conn, None, false, false, 1);
+        let result = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(result.errors.is_empty(), "rescan must succeed: {:?}", result.errors);
         assert!(!result.cancelled);
 
@@ -2748,7 +2643,7 @@ mod inplace_tests {
         )
         .unwrap();
 
-        let scan1 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        let scan1 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
 
         let (frame_id, xbayroff, ybayroff, roworder): (i64, Option<i64>, Option<i64>, Option<String>) =
@@ -2776,7 +2671,7 @@ mod inplace_tests {
             ],
         );
 
-        let scan2 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        let scan2 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
         assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
 
@@ -2820,7 +2715,7 @@ mod inplace_tests {
         )
         .unwrap();
 
-        let scan1 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        let scan1 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
 
         let stored_header = |conn: &Connection| -> String {
@@ -2839,7 +2734,7 @@ mod inplace_tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         write_fits_with_extra_cards(&f, &["BAYERPAT= 'GRBG    '"]);
 
-        let scan2 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        let scan2 = scan_directory(scan.path(), &conn, None, false, 1);
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
         assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
 
@@ -2899,7 +2794,7 @@ mod inplace_tests {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let scan1 = scan_directory_parallel(
-            scan.path(), 1, &conn, &NullEmitter, false, cancel.clone(), false,
+            scan.path(), 1, &conn, &NullEmitter, cancel.clone(), false,
         );
         assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
 
@@ -2918,7 +2813,7 @@ mod inplace_tests {
         // Rescan via the parallel path.
         let cancel2 = Arc::new(AtomicBool::new(false));
         let scan2 = scan_directory_parallel(
-            scan.path(), 1, &conn, &NullEmitter, false, cancel2, false,
+            scan.path(), 1, &conn, &NullEmitter, cancel2, false,
         );
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
         assert!(!scan2.cancelled);
@@ -2969,7 +2864,7 @@ mod inplace_tests {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let scan1 = scan_directory_parallel(
-            scan.path(), 1, &conn, &NullEmitter, false, cancel.clone(), false,
+            scan.path(), 1, &conn, &NullEmitter, cancel.clone(), false,
         );
         assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
 
@@ -2987,7 +2882,7 @@ mod inplace_tests {
 
         let cancel2 = Arc::new(AtomicBool::new(false));
         let scan2 = scan_directory_parallel(
-            scan.path(), 1, &conn, &NullEmitter, false, cancel2, false,
+            scan.path(), 1, &conn, &NullEmitter, cancel2, false,
         );
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
         assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
@@ -3043,7 +2938,6 @@ mod inplace_tests {
             1,
             &conn,
             &NullEmitter,
-            false,
             cancel.clone(),
             false,
         );
@@ -3063,7 +2957,7 @@ mod inplace_tests {
         // Size and mtime are unchanged — the old classification skipped this
         // file forever. It must now be re-parsed and the frames row recreated,
         // with files.id preserved.
-        let r2 = scan_directory_parallel(dir.path(), 1, &conn, &NullEmitter, false, cancel, false);
+        let r2 = scan_directory_parallel(dir.path(), 1, &conn, &NullEmitter, cancel, false);
         assert!(r2.errors.is_empty(), "healing scan clean: {:?}", r2.errors);
         let frames: i64 = conn
             .query_row(
@@ -3092,7 +2986,7 @@ mod inplace_tests {
         )
         .unwrap();
 
-        let r1 = scan_directory(dir.path(), &conn, None, false, false, 1);
+        let r1 = scan_directory(dir.path(), &conn, None, false, 1);
         assert!(r1.errors.is_empty(), "first scan clean: {:?}", r1.errors);
         let file_id: i64 = conn
             .query_row(
@@ -3107,7 +3001,7 @@ mod inplace_tests {
         conn.execute("DELETE FROM frames WHERE file_id = ?1", [file_id])
             .unwrap();
 
-        let r2 = scan_directory(dir.path(), &conn, None, false, false, 1);
+        let r2 = scan_directory(dir.path(), &conn, None, false, 1);
         assert!(r2.errors.is_empty(), "healing scan clean: {:?}", r2.errors);
         assert_eq!(r2.files_skipped, 0, "the frameless row must not be skipped");
         let frames: i64 = conn
@@ -3120,35 +3014,7 @@ mod inplace_tests {
         assert_eq!(frames, 1, "frameless files row must be re-parsed");
     }
 
-    /// Scan-time content hashing is OPT-IN. `5aa58fed` hard-coded it on at both
-    /// entry points, which added a 3 x 512 KB read per file — measured x5.9 on a
-    /// cold 2010-file real library. The hash column is now populated by the
-    /// content-index job instead (see `api::content_index`).
-    #[test]
-    fn scan_hashing_defaults_off_and_follows_the_setting() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        let settings = crate::settings::SettingsManager::new();
-
-        assert!(
-            !scan_hashing_enabled(&settings, &conn),
-            "no setting row: scan must not hash"
-        );
-
-        crate::db::set_setting(&conn, "duplicates.use_content_hash", "true").unwrap();
-        assert!(
-            scan_hashing_enabled(&settings, &conn),
-            "setting on: scan hashes"
-        );
-
-        crate::db::set_setting(&conn, "duplicates.use_content_hash", "false").unwrap();
-        assert!(
-            !scan_hashing_enabled(&settings, &conn),
-            "setting off: scan must not hash"
-        );
-    }
-
-    /// The behavioural half: with hashing off the scanner writes NULL, so the
+    /// The scanner writes NULL for `content_hash` — always, whatever the setting — so the
     /// content-index job has rows to find.
     #[test]
     fn scan_leaves_content_hash_null_when_hashing_is_off() {
@@ -3171,7 +3037,6 @@ mod inplace_tests {
             1,
             &conn,
             &NullEmitter,
-            false, // hashing off
             cancel,
             false,
         );
@@ -3257,10 +3122,9 @@ mod moved_file_guard_tests {
         let new_path = online_root.join("L_001.fits");
         std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
 
-        let mut hash_errors = Vec::new();
         let mut cal_dups = Vec::new();
         let result =
-            process_file(&new_path, &conn, false, false, 2, &mut hash_errors, &mut cal_dups).unwrap();
+            process_file(&new_path, &conn, false, 2, &mut cal_dups).unwrap();
         assert!(
             result.is_some(),
             "guard must let the new file insert instead of silently treating it as a move"
@@ -3320,10 +3184,9 @@ mod moved_file_guard_tests {
         let new_path = new_root.join("L_001.fits");
         std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
 
-        let mut hash_errors = Vec::new();
         let mut cal_dups = Vec::new();
         let result =
-            process_file(&new_path, &conn, false, false, 2, &mut hash_errors, &mut cal_dups).unwrap();
+            process_file(&new_path, &conn, false, 2, &mut cal_dups).unwrap();
         assert!(
             result.is_none(),
             "a genuine move must short-circuit with Ok(None), not insert a new row"
@@ -3649,12 +3512,11 @@ mod calibrated_light_scan_tests {
                 root_id,
                 conn,
                 &NullEmitter,
-                false,
                 Arc::new(AtomicBool::new(false)),
                 false,
             )
         } else {
-            scan_directory(root, conn, None, false, false, root_id)
+            scan_directory(root, conn, None, false, root_id)
         }
     }
 
