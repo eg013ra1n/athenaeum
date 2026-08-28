@@ -604,6 +604,13 @@ fn insert_ingested_rows(
         updated_at: None,
     };
     let file_id = crate::db::insert_file(tx, &file).context("insert files row")?;
+    // The manifest's full-content xxh3 was verified against these exact bytes
+    // in step 1 and the row was written from that same landed file, so it is
+    // current by construction — bank it, and the Master duplicate key / deep
+    // verify never re-read this file for it. (Kept out of `insert_file`: that
+    // primitive stays byte-identical to the scanner's, pinned by
+    // `direct_registration_matches_scanner_ingestion`.)
+    crate::db::bank_strong_hash(tx, file_id, &record.xxh3).context("bank strong_hash")?;
 
     // Re-extract the raw header from the landed file for the metadata-pane revert
     // blob. The manifest carries only the parsed Frame snapshot, not header text.

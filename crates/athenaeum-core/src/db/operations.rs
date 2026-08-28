@@ -7300,10 +7300,28 @@ mod savepoint_migration_tests {
     }
 }
 
+/// One catalog file matched by its SAMPLING hash — what the transfer dedup
+/// responder needs to decide a candidate: the path to (re-)hash, the row's
+/// `(size, modified_at)` so the staleness contract
+/// ([`crate::duplicates::backfill::disk_matches_row`]) can say whether the row
+/// still describes the bytes on disk, and any full hash already banked, so a
+/// current row that was confirmed once never has to be read again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplingHashMatch {
+    pub file_id: i64,
+    pub content_hash: String,
+    pub path: String,
+    pub size: i64,
+    /// The stored RFC 3339 text, uncompared — `disk_matches_row` takes it as is.
+    pub modified_at: String,
+    pub strong_hash: Option<String>,
+}
+
 /// Files whose `content_hash` (the SAMPLING xxh3 stored by the scanner) is one
-/// of `hashes`, returned as `(content_hash, path)` pairs. Backs the P2P dedup
-/// responder's membership probe: an offered sampling hash present here is a
-/// *candidate* duplicate that still needs full-hash confirmation.
+/// of `hashes`. Backs the P2P dedup responder's membership probe: an offered
+/// sampling hash present here is a *candidate* duplicate that still needs
+/// full-hash confirmation — and the row carries what that confirmation needs
+/// (see [`SamplingHashMatch`]).
 ///
 /// The `IN (…)` list is chunked at [`MAX_BIND_PARAMS`] and the per-chunk
 /// results are unioned. An empty `hashes` slice runs no
@@ -7312,7 +7330,7 @@ mod savepoint_migration_tests {
 pub fn find_files_by_content_hashes(
     conn: &Connection,
     hashes: &[String],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<SamplingHashMatch>> {
     let mut out = Vec::new();
     if hashes.is_empty() {
         return Ok(out);
@@ -7322,18 +7340,46 @@ pub fn find_files_by_content_hashes(
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql =
-            format!("SELECT content_hash, path FROM files WHERE content_hash IN ({placeholders})");
+        let sql = format!(
+            "SELECT id, content_hash, path, size, modified_at, strong_hash
+             FROM files WHERE content_hash IN ({placeholders})"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params_from_iter(chunk.iter().map(|s| s.as_str())),
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok(SamplingHashMatch {
+                    file_id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    path: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    strong_hash: row.get(5)?,
+                })
+            },
         )?;
         for r in rows {
             out.push(r?);
         }
     }
     Ok(out)
+}
+
+/// Record a file's full-content xxh3 (`package::xxh3_full_file` format) as
+/// `files.strong_hash`.
+///
+/// The one write every full-hash producer shares — the master-hash pass, deep
+/// verify, and the three places sync already reads a whole file (manifest
+/// build, dedup confirm, ingest). The caller owns the staleness check: bank
+/// only into a row `disk_matches_row` accepts (or a row written from the very
+/// bytes just hashed), because a fresh-content digest on a stale row would let
+/// a later reader trust a hash the scanner never vouched for. Returns the
+/// number of rows updated (0 = no such id).
+pub fn bank_strong_hash(conn: &Connection, file_id: i64, hash: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE files SET strong_hash = ?2 WHERE id = ?1",
+        params![file_id, hash],
+    )
 }
 
 /// Task 9 (calibration_library scan-root kind) — DB-level coverage for

@@ -1256,10 +1256,7 @@ pub fn verify_duplicate_pair(
             if !current {
                 continue;
             }
-            if let Err(e) = conn.execute(
-                "UPDATE files SET strong_hash = ?2 WHERE id = ?1",
-                rusqlite::params![id, d],
-            ) {
+            if let Err(e) = crate::db::bank_strong_hash(&conn, id, &d) {
                 // The verdict stands either way — losing the banked hash
                 // costs a re-read later, never a wrong answer now.
                 tracing::error!(file_id = id, error = %e, "verify pair: strong_hash write failed");
