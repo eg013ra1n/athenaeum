@@ -51,7 +51,7 @@ use crate::db::light_calibrations::{
     LightCalStatus, LIGHT_CAL_ENGINE_VERSION,
 };
 use crate::events::{emit_event, ProgressEmitter};
-use crate::export::models::ExportMode;
+use crate::export::models::{ExportFileCounts, ExportMode};
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{Card, CardValue};
@@ -115,19 +115,24 @@ pub struct LightCalReadiness {
     pub cfa_warnings: Vec<String>,
 }
 
-/// Export-readiness tallies for the WBPP export dialog's mode selector
-/// (spec §12.2). Reported per frame set: `total` = in-scope LIGHT members,
+/// Export/send readiness for one frame set, every mode at once (spec
+/// 2026-08-28 §5). Reported per frame set: `total` = in-scope LIGHT members,
 /// `calibrated` = fresh calibrated outputs, `stale` = has an output but its
-/// derived status is Stale/Partial, `missing` = no calibrated output at all.
-/// The dialog blocks the `calibratedLights` mode (and the export command
-/// re-checks) while `stale + missing > 0`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ts_rs::TS)]
+/// derived status is Stale/Partial, `missing` = no calibrated output at all —
+/// together the `calibratedLights` rule. `raw_sets_without_master` (with the
+/// ids behind it, for the Coverage link) is the `rawWithMasters` rule;
+/// `file_counts` is what each mode would place. The gate itself is
+/// [`check_mode_ready`].
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportReadiness {
     pub total: i64,
     pub calibrated: i64,
     pub stale: i64,
     pub missing: i64,
+    pub raw_sets_without_master: i64,
+    pub raw_set_ids_without_master: Vec<i64>,
+    pub file_counts: ExportFileCounts,
 }
 
 /// Per-frame calibration recipe for the Calibration Coverage lights table
@@ -720,32 +725,45 @@ pub fn get_light_calibration_readiness(
     compute_readiness(&conn, set_id, flat_norm, flat_norm_mode, params)
 }
 
-// ── Export readiness gate (spec §12.2) ───────────────────────────────────────
+// ── Export readiness + the shared mode gate (spec 2026-08-28 §5) ─────────────
 
-/// Tally per-frame calibration status for a frame set's LIGHT members, in the
-/// four buckets the export dialog's `calibratedLights` gate needs. Pure DB work
-/// (no pixel I/O). For the two raw modes there is nothing to gate — the raw
-/// lights are always on hand — so everything counts as `calibrated` and the
-/// caller never blocks.
+/// The ONE gate shared by `export_to_wbpp` and `enqueue_frame_set_send`. The
+/// returned sentence is what the Export tab shows under a disabled mode.
+pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), String> {
+    match mode {
+        ExportMode::LightsOnly | ExportMode::RawWithCalibrationSets => Ok(()),
+        ExportMode::RawWithMasters if r.raw_sets_without_master == 0 => Ok(()),
+        ExportMode::RawWithMasters => {
+            let n = r.raw_sets_without_master;
+            Err(format!(
+                "{n} calibration set{} {} no master — build masters first",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "has" } else { "have" }
+            ))
+        }
+        ExportMode::CalibratedLights if r.stale + r.missing == 0 => Ok(()),
+        ExportMode::CalibratedLights => Err(format!(
+            "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
+            r.stale + r.missing,
+            r.total
+        )),
+    }
+}
+
+/// Tally everything the mode gate needs for a frame set, for every mode at
+/// once: the per-frame calibration status buckets, the raw calibration sets
+/// that still have no master, and what each mode would place. Pure DB work (no
+/// pixel I/O) — the export tree is collected once and feeds both raw-set
+/// readiness and the file counts.
 fn compute_export_readiness(
     conn: &Connection,
     set_id: i64,
-    mode: ExportMode,
     flat_norm: bool,
     flat_norm_mode: FlatNormMode,
     params: LightCalParams,
 ) -> Result<ExportReadiness, ApiError> {
     let members = load_light_members(conn, set_id)?;
     let total = members.len() as i64;
-
-    if mode != ExportMode::CalibratedLights {
-        return Ok(ExportReadiness {
-            total,
-            calibrated: total,
-            stale: 0,
-            missing: 0,
-        });
-    }
 
     let mut calibrated = 0i64;
     let mut stale = 0i64;
@@ -761,12 +779,21 @@ fn compute_export_readiness(
         }
     }
 
+    let data = crate::export::collect_export_data(conn, set_id)
+        .map_err(|e| ApiError::Internal(format!("collect export data for readiness: {e:#}")))?;
+    let raw_set_ids_without_master =
+        crate::export::data_collector::raw_sets_without_master(conn, &data)
+            .map_err(|e| ApiError::Internal(format!("raw-set readiness: {e:#}")))?;
+    let file_counts = crate::export::data_collector::export_file_counts(conn, &data)
+        .map_err(|e| ApiError::Internal(format!("export file counts: {e:#}")))?;
+
     tracing::debug!(
         set_id,
         total,
         calibrated,
         stale,
         missing,
+        raw_sets = raw_set_ids_without_master.len(),
         "export readiness computed"
     );
     Ok(ExportReadiness {
@@ -774,25 +801,27 @@ fn compute_export_readiness(
         calibrated,
         stale,
         missing,
+        raw_sets_without_master: raw_set_ids_without_master.len() as i64,
+        raw_set_ids_without_master,
+        file_counts,
     })
 }
 
-/// Export-readiness tallies for the WBPP export dialog + the `calibratedLights`
-/// strict gate (spec §12.2). `flat_norm` / `flat_norm_mode` / `params` are the
-/// caller's calibration preferences; staleness is derived against them exactly
-/// like [`get_light_calibration_readiness`], so a frame calibrated with settings
-/// the user has since changed reads as stale and blocks the export.
+/// Export/send readiness for every mode in one call (spec 2026-08-28 §5).
+/// `flat_norm` / `flat_norm_mode` / `params` are the caller's calibration
+/// preferences; staleness is derived against them exactly like
+/// [`get_light_calibration_readiness`], so a frame calibrated with settings the
+/// user has since changed reads as stale and blocks `calibratedLights`.
 pub fn get_export_readiness(
     ctx: &ServiceContext,
     set_id: i64,
-    mode: ExportMode,
     flat_norm: bool,
     flat_norm_mode: FlatNormMode,
     params: LightCalParams,
 ) -> Result<ExportReadiness, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    compute_export_readiness(&conn, set_id, mode, flat_norm, flat_norm_mode, params)
+    compute_export_readiness(&conn, set_id, flat_norm, flat_norm_mode, params)
 }
 
 // ── Per-frame recipe details (spec §12.1) ────────────────────────────────────
@@ -4933,5 +4962,51 @@ mod tests {
         }
         // A non-blank blob card in the same header still wins its keyword.
         assert_eq!(card_str(&cards, "INSTRUME").as_deref(), Some("TestCam"));
+    }
+
+    #[test]
+    fn check_mode_ready_truth_table() {
+        let ready = ExportReadiness {
+            total: 4,
+            calibrated: 4,
+            stale: 0,
+            missing: 0,
+            raw_sets_without_master: 0,
+            raw_set_ids_without_master: vec![],
+            file_counts: Default::default(),
+        };
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithCalibrationSets,
+            ExportMode::RawWithMasters,
+            ExportMode::CalibratedLights,
+        ] {
+            assert!(check_mode_ready(&ready, mode).is_ok(), "{mode:?}");
+        }
+        let uncal = ExportReadiness {
+            calibrated: 1,
+            stale: 2,
+            missing: 1,
+            ..ready.clone()
+        };
+        assert!(check_mode_ready(&uncal, ExportMode::LightsOnly).is_ok());
+        assert!(check_mode_ready(&uncal, ExportMode::RawWithCalibrationSets).is_ok());
+        assert!(check_mode_ready(&uncal, ExportMode::RawWithMasters).is_ok());
+        let msg = check_mode_ready(&uncal, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(
+            msg,
+            "3 of 4 lights lack a fresh calibrated output — run Calibrate Lights first"
+        );
+        let raw = ExportReadiness {
+            raw_sets_without_master: 2,
+            raw_set_ids_without_master: vec![7, 9],
+            ..ready.clone()
+        };
+        assert!(check_mode_ready(&raw, ExportMode::CalibratedLights).is_ok());
+        let msg = check_mode_ready(&raw, ExportMode::RawWithMasters).unwrap_err();
+        assert_eq!(
+            msg,
+            "2 calibration sets have no master — build masters first"
+        );
     }
 }

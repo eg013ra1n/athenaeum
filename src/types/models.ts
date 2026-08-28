@@ -645,7 +645,9 @@ rawSetIdsToBuild: Array<number>,
  */
 cfaWarnings: Array<string>, };
 
-export type ExportReadiness = { total: number, calibrated: number, stale: number, missing: number, };
+export type ExportFileCounts = { lightsOnly: number, rawWithCalibrationSets: number, rawWithMasters: number, calibratedLights: number, };
+
+export type ExportReadiness = { total: number, calibrated: number, stale: number, missing: number, rawSetsWithoutMaster: number, rawSetIdsWithoutMaster: Array<number>, fileCounts: ExportFileCounts, };
 
 export type LightCalDetails = { frameId: number, 
 /**

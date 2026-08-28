@@ -6,8 +6,8 @@
 use crate::db::light_calibrations::get_light_calibration_for_frame;
 use crate::export::models::{
     CalibrationDetail, CalibrationSetInfo, CalibrationSubgroup, CalibrationSummary, CameraType,
-    DetailedWarning, ExportCalibrationSet, ExportData, ExportFrame, ExportGroup, ExportMode,
-    ExportSummary, ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode,
+    DetailedWarning, ExportCalibrationSet, ExportData, ExportFileCounts, ExportFrame, ExportGroup,
+    ExportMode, ExportSummary, ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode,
     FolderNodeType, FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity,
     WarningType, WbppExportConfig,
 };
@@ -281,6 +281,62 @@ fn collect_raw_sets(
     .flatten()
     {
         collect_raw_sets(conn, node, seen, out)?;
+    }
+    Ok(())
+}
+
+/// Count-only walk for `ExportReadiness.file_counts` (spec 2026-08-28 §5): what
+/// each mode would place, never bailing. `raw_with_masters` counts a raw set as
+/// zero files (strict mode would refuse it) — the count is informational, the
+/// gate is `check_mode_ready`.
+pub fn export_file_counts(conn: &Connection, data: &ExportData) -> Result<ExportFileCounts> {
+    use crate::export::file_organizer::compute_wbpp_placements;
+    let lights: i64 = data
+        .groups
+        .iter()
+        .flat_map(|g| g.subgroups.iter())
+        .map(|sg| sg.frames.len() as i64)
+        .sum();
+    let raw_with_calibration_sets = compute_wbpp_placements(data).len() as i64;
+    let mut masters_only = data.clone();
+    for group in &mut masters_only.groups {
+        for subgroup in &mut group.subgroups {
+            for node in [
+                subgroup.flat.as_mut(),
+                subgroup.dark.as_mut(),
+                subgroup.bias.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                clear_raw_frames_recursive(conn, node)?;
+            }
+        }
+    }
+    let raw_with_masters = compute_wbpp_placements(&masters_only).len() as i64;
+    Ok(ExportFileCounts {
+        lights_only: lights,
+        raw_with_calibration_sets,
+        raw_with_masters,
+        calibrated_lights: lights,
+    })
+}
+
+/// Count helper: empty the frames of every non-master set in one subtree.
+fn clear_raw_frames_recursive(conn: &Connection, info: &mut CalibrationSetInfo) -> Result<()> {
+    if !is_master_set(conn, info.set_id)? {
+        info.frames.clear();
+        info.frame_count = 0;
+    }
+    for node in [
+        info.dark_flat.as_mut(),
+        info.dark.as_mut(),
+        info.bias.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        clear_raw_frames_recursive(conn, node)?;
     }
     Ok(())
 }
@@ -2232,7 +2288,8 @@ mod tests {
 #[cfg(test)]
 mod export_mode_tests {
     use super::{
-        apply_export_mode, collect_export_data, raw_sets_without_master, resolve_export_mode,
+        apply_export_mode, collect_export_data, export_file_counts, raw_sets_without_master,
+        resolve_export_mode,
     };
     use crate::db::light_calibrations::{
         upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
@@ -2560,5 +2617,30 @@ mod export_mode_tests {
         let warnings = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(serde_json::to_value(&data).unwrap(), before);
+    }
+
+    /// Per-mode file counts equal the placements each mode would produce.
+    #[test]
+    fn export_file_counts_match_placements() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        seed_light(&conn, 11, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 3);
+        let flat = seed_master_set(&conn, 200, "Flat");
+        for f in [10, 11] {
+            add_link(&conn, f, dark, "Dark");
+            add_link(&conn, f, flat, "Flat");
+        }
+        let data = collect_export_data(&conn, 1).unwrap();
+        let counts = export_file_counts(&conn, &data).unwrap();
+        assert_eq!(counts.lights_only, 2);
+        assert_eq!(counts.raw_with_calibration_sets, 2 + 3 + 1);
+        assert_eq!(
+            counts.raw_with_masters,
+            2 + 1,
+            "raw dark set contributes nothing"
+        );
+        assert_eq!(counts.calibrated_lights, 2);
     }
 }
