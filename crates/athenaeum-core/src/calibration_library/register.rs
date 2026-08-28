@@ -134,9 +134,6 @@ pub fn register_master(
         Some(ext) if ext == "xisf" => FileFormat::XISF,
         _ => FileFormat::FITS,
     };
-    let metadata_hash =
-        crate::duplicates::compute_metadata_hash(meta.len() as i64, &modified_at, &filename);
-
     // member_hash reads calibration_set_frames/frames for the RAW set — read
     // before the transaction opens (no mutation involved), and before the
     // raw set's frames get relinked/superseded below.
@@ -153,7 +150,6 @@ pub fn register_master(
         modified_at,
         format,
         created_at: chrono::Utc::now(),
-        metadata_hash: Some(metadata_hash),
         content_hash: None,
         archived_in_operation: None,
         archive_zip_path: None,

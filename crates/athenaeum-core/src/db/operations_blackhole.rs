@@ -1310,7 +1310,7 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// Folder similarity grouped on `metadata_hash` too, so it was blind in
+    /// Folder similarity grouped on the size+mtime+name key too, so it was blind in
     /// exactly the same way the Duplicates view was: two folders holding the same
     /// twenty flats scored 0 % similar because one side came off an exFAT volume.
     #[test]
@@ -1324,8 +1324,8 @@ mod tests {
             (3, "/vol/b/f0.fits", "2024-10-05T04:21:44.307+00:00"),
             (4, "/vol/b/f1.fits", "2024-10-05T04:21:49.223+00:00"),
         ] {
-            // Per-file metadata_hash, so the OLD key finds nothing and this test
-            // is red before the change.
+            // Distinct mtimes per copy, so the pre-2026-08-27 size+mtime+name
+            // key found nothing and this test was red before the change.
             let header = if path.ends_with("f0.fits") {
                 "HDR-0"
             } else {
@@ -1336,9 +1336,9 @@ mod tests {
             // `f0.fits`, `f1.fits` with `f1.fits`.
             let filename = path.rsplit('/').next().unwrap();
             conn.execute(
-                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
-                 VALUES (?1, ?2, ?3, 100, ?4, 'FITS', ?5)",
-                params![id, path, filename, mtime, format!("meta-{id}")],
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 100, ?4, 'FITS')",
+                params![id, path, filename, mtime],
             )
             .unwrap();
             conn.execute(
@@ -1376,9 +1376,9 @@ mod tests {
 
         for (id, path) in [(1i64, "/vol/a/m.xisf"), (2, "/vol/b/m.xisf")] {
             conn.execute(
-                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
-                 VALUES (?1, ?2, 'm.xisf', 100, '2024-01-01T00:00:00+00:00', 'XISF', ?3)",
-                params![id, path, format!("meta-{id}")],
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'm.xisf', 100, '2024-01-01T00:00:00+00:00', 'XISF')",
+                params![id, path],
             )
             .unwrap();
             conn.execute(
@@ -1423,9 +1423,9 @@ mod tests {
         ] {
             let filename = path.rsplit('/').next().unwrap();
             conn.execute(
-                "INSERT INTO files (id, path, filename, size, modified_at, format, metadata_hash)
-                 VALUES (?1, ?2, ?3, 100, '2024-01-01T00:00:00+00:00', 'XISF', ?4)",
-                params![id, path, filename, format!("meta-{id}")],
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 100, '2024-01-01T00:00:00+00:00', 'XISF')",
+                params![id, path, filename],
             )
             .unwrap();
             conn.execute(

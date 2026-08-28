@@ -11,7 +11,6 @@ pub struct File {
     pub modified_at: DateTime<Utc>,
     pub format: FileFormat,
     pub created_at: DateTime<Utc>,
-    pub metadata_hash: Option<String>,
     pub content_hash: Option<String>,
     // ZIP archive feature — populated when this file's data has been moved
     // into a zip in the archive root. Original `path` is preserved for restore.

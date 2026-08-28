@@ -596,7 +596,6 @@ fn insert_ingested_rows(
         modified_at,
         format: format.clone(),
         created_at: now,
-        metadata_hash: None,
         content_hash: Some(content_hash.to_string()),
         archived_in_operation: None,
         archive_zip_path: None,

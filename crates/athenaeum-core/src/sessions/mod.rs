@@ -190,7 +190,6 @@ mod tests {
             created_at: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            metadata_hash: None,
             content_hash: None,
             archived_in_operation: None,
             archive_zip_path: None,

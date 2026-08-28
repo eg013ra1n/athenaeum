@@ -42,6 +42,28 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Hash cleanup — 2026-08-28
+
+The catalog carried four hashes with three producers for one of them. First task
+landed: `files.metadata_hash` (`size + mtime + filename`, the pre-2026-08-27
+duplicate key) was write-only since the header key replaced it — no SQL, no
+frontend consumer, an index maintained on every insert for nothing — so column,
+index, `File.metadata_hash`, `compute_metadata_hash` and the never-read setting
+key `duplicates.content_hash_rescanned` are gone. Existing catalogs lose the
+column on the next start (`DROP INDEX` then `DROP COLUMN`, guarded on
+`pragma_table_info`, rows untouched). Spec D2 of
+`2026-08-27-duplicate-detection-design.md` was corrected: its stated reader
+(`has_duplicate`) never read the column.
+
+- First launch on the production catalog: the log carries one
+  `dropped write-only column` line, `SELECT COUNT(*) FROM pragma_table_info('files')
+  WHERE name='metadata_hash'` is 0, and the second launch logs nothing.
+- Files page, Missing-metadata view and the Duplicates view open and list
+  frames — the shared file+frame projection lost a column and every index
+  after it moved down by one.
+- A scan of a root with changed files still re-parses them in place
+  (`files.id` preserved) — the in-place UPDATE lost a parameter.
+
 ### Deep verify banks its reads, and survives a rules change — 2026-08-27
 
 Two fixes in one pass. (1) The verify loop now carries a run-generation token:
@@ -270,5 +292,7 @@ cycle, so anything from them that matters later belongs here or in a plan.
   in place from their original source frames (Equipment → expanded master row).
 - Calibration sets and sessions no longer keep counting frames that were deleted;
   existing catalogs are corrected once on startup.
+- The catalog drops a duplicate-detection column it no longer uses; existing
+  catalogs are migrated once on startup.
 
 (v0.5.1 lines were paid in full on 2026-08-24.)

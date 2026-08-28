@@ -98,9 +98,6 @@ pub mod keys {
 
     // Duplicate detection
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "duplicates.use_content_hash";
-    // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
-    #[allow(dead_code)]
-    pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "duplicates.content_hash_rescanned";
 
     // Blink viewer
     pub const BLINK_THREADS: &str = "blink.threads";

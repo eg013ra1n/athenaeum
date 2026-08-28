@@ -10,7 +10,6 @@ use crate::fits_parser::{
     calibrated_light_identity, extract_xisf_header, parse_fits_with_header, parse_xisf,
     CalibratedIdentity,
 };
-use crate::duplicates::compute_metadata_hash;
 use crate::models::{File, Frame, FileFormat, ImageType};
 use chrono::Utc;
 use rayon::prelude::*;
@@ -578,8 +577,6 @@ fn process_file(
     }
 
     // If we get here, it's a truly new file - insert it
-    let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
-
     let content_hash = if use_content_hash {
         match crate::duplicates::compute_xxhash(path) {
             Ok(hash) => {
@@ -607,7 +604,6 @@ fn process_file(
         modified_at: modified_dt,
         format: format.clone(),
         created_at: Utc::now(),
-        metadata_hash: Some(metadata_hash),
         content_hash,
         archived_in_operation: None,
         archive_zip_path: None,
@@ -1090,11 +1086,6 @@ fn reparse_and_update_in_place(
         .map(|e| e.to_lowercase())
         .map(|e| if e == "xisf" { FileFormat::XISF } else { FileFormat::FITS })
         .unwrap_or(FileFormat::FITS);
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
 
     // Parse FIRST. If parse fails, we leave the DB alone — better stale
     // than missing.
@@ -1126,7 +1117,6 @@ fn reparse_and_update_in_place(
         }
     };
 
-    let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
     // KNOWN TRADE-OFF (smoke №8 review, deferred): this ~1.5MB sampling read runs
     // inside the caller's phase-2 batch WRITE transaction, so a re-scan with many
     // changed files extends the exclusive-lock hold and can SQLITE_BUSY concurrent
@@ -1234,7 +1224,6 @@ fn reparse_and_update_in_place(
         size,
         &modified_dt,
         &format,
-        &metadata_hash,
         content_hash.as_deref(),
         &frame,
         new_instrume.as_deref(),
@@ -1311,7 +1300,6 @@ fn write_reparse_rows(
     size: i64,
     modified_dt: &chrono::DateTime<Utc>,
     format: &FileFormat,
-    metadata_hash: &str,
     content_hash: Option<&str>,
     frame: &Frame,
     new_instrume: Option<&str>,
@@ -1331,14 +1319,13 @@ fn write_reparse_rows(
     conn.execute(
         "UPDATE files
          SET size = ?1, modified_at = ?2, format = ?3,
-             metadata_hash = ?4, content_hash = ?5,
+             content_hash = ?4,
              strong_hash = NULL
-         WHERE id = ?6",
+         WHERE id = ?5",
         rusqlite::params![
             size,
             modified_dt.to_rfc3339(),
             format!("{:?}", format),
-            Some(metadata_hash),
             content_hash,
             file_id,
         ],
@@ -1565,9 +1552,6 @@ fn process_file_parallel(
 
     let current_path = path_to_utf8(path).map_err(|e| e.to_string())?;
 
-    // Compute metadata hash
-    let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
-
     // Compute content hash if enabled. Surface failures to the caller as
     // hash_error so duplicate detection coverage gaps are visible to the user.
     let (content_hash, hash_error) = if use_content_hash {
@@ -1595,7 +1579,6 @@ fn process_file_parallel(
         modified_at: modified_dt,
         format: format.clone(),
         created_at: Utc::now(),
-        metadata_hash: Some(metadata_hash),
         content_hash,
         archived_in_operation: None,
         archive_zip_path: None,
