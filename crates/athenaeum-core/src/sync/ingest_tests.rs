@@ -678,7 +678,22 @@ fn build_calibrated_package(
     filename: &str,
     with_identity: bool,
 ) -> (PathBuf, PackageAnnounce) {
-    let src_dir = root.join("csrc");
+    build_calibrated_package_v(root, source_uuid, filename, with_identity, 1)
+}
+
+/// [`build_calibrated_package`] with the engine version as a knob: two packages
+/// that differ only in `ATH_CVER` carry the SAME identity (CALSTAT + ATH_CSRC +
+/// ATH_CSRN) but different bytes — the shape a re-calibrated light is re-sent
+/// with, and the only way to reach the receiver's already-tracked branch (the
+/// content-hash receipt dedup swallows a byte-identical re-send first).
+fn build_calibrated_package_v(
+    root: &Path,
+    source_uuid: &str,
+    filename: &str,
+    with_identity: bool,
+    engine_version: i64,
+) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join(format!("csrc-v{engine_version}"));
     std::fs::create_dir_all(&src_dir).unwrap();
     let src = src_dir.join(filename);
     let mut cards = vec![
@@ -689,9 +704,24 @@ fn build_calibrated_package(
         cards.push(Card::new("CALSTAT", CardValue::Str("BDF".into())).unwrap());
         cards.push(Card::new("ATH_CSRC", CardValue::Str(source_uuid.into())).unwrap());
         cards.push(Card::new("ATH_CSRN", CardValue::Str("L_0001.fits".into())).unwrap());
-        cards.push(Card::new("ATH_CVER", CardValue::Integer(1)).unwrap());
+        cards.push(Card::new("ATH_CVER", CardValue::Integer(engine_version)).unwrap());
     }
     write_fits_with_cards(&src, &cards);
+    let pkg_dir = root.join(format!(
+        "cpkg-{source_uuid}-{with_identity}-v{engine_version}"
+    ));
+    calibrated_package_from_payload(&pkg_dir, src, source_uuid, filename)
+}
+
+/// Wrap one already-written payload file as a single-record `CalibratedLight`
+/// package. Split out of [`build_calibrated_package_v`] so a test can hand in a
+/// payload that is not a FITS file at all.
+fn calibrated_package_from_payload(
+    pkg_dir: &Path,
+    src: PathBuf,
+    source_uuid: &str,
+    filename: &str,
+) -> (PathBuf, PackageAnnounce) {
     let byte_size = std::fs::metadata(&src).unwrap().len();
     let xxh3 = package::xxh3_full_file(&src).unwrap();
     let record = ManifestRecord {
@@ -713,9 +743,8 @@ fn build_calibrated_package(
         app_version: "test".to_string(),
         project: None,
     };
-    let pkg_dir = root.join(format!("cpkg-{source_uuid}-{with_identity}"));
-    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
-    (pkg_dir, announce)
+    let announce = package::write_package(pkg_dir, vec![(src, record)]).unwrap();
+    (pkg_dir.to_path_buf(), announce)
 }
 
 #[test]
@@ -844,6 +873,85 @@ fn calibrated_light_without_source_lands_deferred() {
     );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 0);
     assert_eq!(walkdir_files(&incoming).len(), 1, "file kept on disk");
+}
+
+/// An unreadable payload is a DIFFERENT verdict from a readable one that is not
+/// a calibrated light: reporting the I/O failure as "payload is not a calibrated
+/// light" would point the operator at the sender's export mode instead of at the
+/// read that failed. Both remove the landed file.
+#[test]
+fn calibrated_light_with_unreadable_header_is_rejected_with_the_cause() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    // A payload that is not FITS at all — no END card, so the header read fails
+    // rather than returning a card-less header.
+    let src_dir = tmp.path().join("csrc-garbage");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join("c_L_0004.fits");
+    std::fs::write(&src, b"this is not a FITS file\n").unwrap();
+    let (pkg, ann) = calibrated_package_from_payload(
+        &tmp.path().join("cpkg-garbage"),
+        src,
+        "src-4",
+        "c_L_0004.fits",
+    );
+
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.rejected, 1, "{outcome:?}");
+    assert!(
+        matches!(&outcome.receipts[0].outcome, ReceiptOutcome::Rejected(r)
+            if r.starts_with("cannot read calibrated light header:")),
+        "{:?}",
+        outcome.receipts[0].outcome
+    );
+    assert!(walkdir_files(&incoming).is_empty(), "nothing left behind");
+}
+
+/// An adopt failure (spec §8) is a Rejected receipt AND the landed copy goes
+/// with it — leaving it would strand an untracked artifact that a later scan
+/// re-adopts or `_2`-duplicates. Provoked by dropping `light_calibrations` so
+/// the very first query inside `reconcile_calibrated_light` errors.
+#[test]
+fn calibrated_light_adopt_failure_removes_the_landed_copy() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    let (pkg, ann) = build_calibrated_package(tmp.path(), "src-5", "c_L_0005.fits", true);
+    conn.execute("DROP TABLE light_calibrations", []).unwrap();
+
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.rejected, 1, "{outcome:?}");
+    assert!(
+        matches!(&outcome.receipts[0].outcome, ReceiptOutcome::Rejected(r)
+            if r.contains("adopt calibrated light")),
+        "{:?}",
+        outcome.receipts[0].outcome
+    );
+    assert!(
+        walkdir_files(&incoming).is_empty(),
+        "the landed artifact is removed when adopt fails"
+    );
 }
 
 #[test]

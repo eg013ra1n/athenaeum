@@ -613,18 +613,39 @@ fn process_calibrated_light(
         .with_context(|| format!("land calibrated light {}", record.rel_path))?;
     let landed_str = landed.to_string_lossy().into_owned();
 
-    let identity = crate::fits_parser::extract_fits_header(&landed)
-        .ok()
-        .map(|text| parse_stored_header_keys(FileFormat::FITS, &text))
-        .and_then(|keys| calibrated_light_identity(&keys));
-    let Some(identity) = identity else {
-        tracing::error!(frame_uuid = %record.frame_uuid, path = %landed_str, "sync ingest: CalibratedLight payload lacks identity cards; rejecting");
+    // Reject-and-remove: a landed artifact we refuse must never stay on disk
+    // untracked (a later scan would adopt or `_2`-duplicate it).
+    let reject = |reason: String| -> Result<FrameVerdict> {
         if let Err(e) = std::fs::remove_file(&landed) {
             tracing::warn!(path = %landed_str, error = %e, "sync ingest: failed to remove rejected artifact");
         }
-        let receipt = rejected_receipt(record, "payload is not a calibrated light".to_string());
+        let receipt = rejected_receipt(record, reason);
         record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
-        return Ok(FrameVerdict { receipt, history_outcome: "rejected", inserted: None });
+        Ok(FrameVerdict { receipt, history_outcome: "rejected", inserted: None })
+    };
+
+    // A light-cal output is always FITS (`light_cal.rs` writes `.fits` even for
+    // an XISF source), so the header is parsed as FITS unconditionally.
+    // The read error and the missing-cards case are DIFFERENT verdicts: an
+    // unreadable payload must not be reported as "not a calibrated light",
+    // which would send the operator looking at the sender's export mode
+    // instead of at the I/O that actually failed.
+    let text = match crate::fits_parser::extract_fits_header(&landed) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!(
+                frame_uuid = %record.frame_uuid,
+                path = %landed_str,
+                error = %format!("{e:#}"),
+                "sync ingest: cannot read calibrated light header; rejecting"
+            );
+            return reject(format!("cannot read calibrated light header: {e}"));
+        }
+    };
+    let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+    let Some(identity) = calibrated_light_identity(&keys) else {
+        tracing::error!(frame_uuid = %record.frame_uuid, path = %landed_str, "sync ingest: CalibratedLight payload lacks identity cards; rejecting");
+        return reject("payload is not a calibrated light".to_string());
     };
 
     // Log field only (the scanner's `root_id`): the designated incoming root's
@@ -638,8 +659,23 @@ fn process_calibrated_light(
         }
     };
     let mut dups = Vec::new();
-    crate::scanner::reconcile_calibrated_light(conn, &landed, &landed_str, &identity, root_id, &mut dups)
-        .with_context(|| format!("adopt calibrated light {}", record.rel_path))?;
+    if let Err(e) = crate::scanner::reconcile_calibrated_light(conn, &landed, &landed_str, &identity, root_id, &mut dups) {
+        // Spec §8: an adopt failure is a Rejected receipt (the caller turns this
+        // Err into one) — and the landed copy goes with it, exactly as the
+        // RawFrame path removes its landing on a transaction failure. Leaving it
+        // would strand an untracked artifact that a later scan re-adopts or
+        // `_2`-duplicates.
+        tracing::error!(
+            frame_uuid = %record.frame_uuid,
+            path = %landed_str,
+            error = %format!("{e:#}"),
+            "sync ingest: calibrated light adopt failed; removing landed copy"
+        );
+        if let Err(rm) = std::fs::remove_file(&landed) {
+            tracing::warn!(path = %landed_str, error = %rm, "sync ingest: failed to remove landed artifact after adopt failure");
+        }
+        return Err(e).with_context(|| format!("adopt calibrated light {}", record.rel_path));
+    }
     if !dups.is_empty() {
         // The receiver already tracks this artifact at another path: keep that
         // copy, drop the one we just landed, report Duplicate.
