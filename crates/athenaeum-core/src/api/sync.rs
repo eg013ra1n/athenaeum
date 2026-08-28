@@ -2978,8 +2978,13 @@ fn selection_entries(
         let Some(frame_id) = frame.id else { continue };
         resolved.insert(frame_id);
         // A hand-picked master is labeled honestly, which is also what keeps it
-        // out of the retention linkage in the builder below (§D5).
-        let kind = if frame.imagetyp.as_ref().is_some_and(|t| t.is_master()) {
+        // out of the retention linkage in the builder below (§D5). The test is
+        // the CATALOG's own master signal, not the header alone: the scanner
+        // sets `frames.is_master` from `imagetyp.is_master() || filename_is_master`
+        // (`fits_parser/mod.rs`), so a `master_dark_*.fits` whose IMAGETYP still
+        // reads `Dark` must not fall through to `RawFrame` and become
+        // retention-reclaimable.
+        let kind = if frame.is_master || frame.imagetyp.as_ref().is_some_and(|t| t.is_master()) {
             PayloadKind::Master
         } else {
             PayloadKind::RawFrame
@@ -9285,6 +9290,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(banked, 2);
+    }
+
+    /// `selection_entries`' kind classification — the one behavior change on the
+    /// otherwise behavior-preserving selection path, and the gate on spec §D5
+    /// ("masters are never reclaimable by retention through a send"). The signal
+    /// is the CATALOG's `frames.is_master`, which the scanner sets from
+    /// `imagetyp.is_master() || filename_is_master` (`fits_parser/mod.rs`) — a
+    /// header-only test would miss a `master_dark_*.fits` still carrying
+    /// `IMAGETYP = Dark` and ship it as a reclaimable `RawFrame`.
+    #[test]
+    fn selection_entries_labels_masters_by_the_catalog_signal() {
+        use crate::db::schema::init_db;
+        use crate::fits_writer::write_fits_f32;
+        use crate::package::PayloadKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let light = tmp.path().join("L_10.fits");
+        let header_master = tmp.path().join("master_bias.fits");
+        // The leaky shape: named like a master, header still says a plain Dark,
+        // so only `frames.is_master` gives it away.
+        let filename_master = tmp.path().join("master_dark_300s.fits");
+        for p in [&light, &header_master, &filename_master] {
+            write_fits_f32(p, 4, 4, 1, &[1.0f32; 16], &[]).unwrap();
+        }
+        let insert = |file_id: i64,
+                      frame_id: i64,
+                      path: &std::path::Path,
+                      imagetyp: &str,
+                      is_master: i64| {
+            let meta = std::fs::metadata(path).unwrap();
+            let mtime: chrono::DateTime<chrono::Utc> = meta.modified().unwrap().into();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, ?4, ?5, 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy(), meta.len() as i64, mtime.to_rfc3339()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master, uuid) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![frame_id, file_id, imagetyp, is_master, format!("uuid-{frame_id}")],
+            ).unwrap();
+        };
+        insert(1, 10, &light, "Light", 0);
+        insert(2, 20, &header_master, "MasterBias", 1);
+        insert(3, 30, &filename_master, "Dark", 1);
+
+        let input = selection_entries(&conn, &[10, 20, 30], None).unwrap();
+        assert_eq!(input.total, 3);
+        assert!(input.ineligible.is_empty());
+        let kinds: HashMap<i64, PayloadKind> = input
+            .entries
+            .iter()
+            .map(|e| (e.frame_id, e.kind.clone()))
+            .collect();
+        assert_eq!(kinds[&10], PayloadKind::RawFrame);
+        assert_eq!(kinds[&20], PayloadKind::Master, "IMAGETYP says master");
+        assert_eq!(
+            kinds[&30],
+            PayloadKind::Master,
+            "filename-detected master: frames.is_master is the catalog's own signal"
+        );
+
+        // The consequence that matters: neither master may leave behind a
+        // retention linkage the desktop could later reclaim (§D5).
+        let built = build_selection_package(
+            &conn,
+            "ab".repeat(32).as_str(),
+            &tmp.path().join("packages"),
+            input,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(built.eligible.len(), 3);
+        let linked: Vec<i64> = conn
+            .prepare("SELECT file_id FROM sync_sources ORDER BY file_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(linked, vec![1], "only the raw light is reclaimable");
     }
 
     /// `resolve_batch_name` — each of the three auto-name rules plus the verbatim
