@@ -60,7 +60,7 @@
 - Regenerate: `src/types/export.ts`
 
 **Interfaces:**
-- Produces: `ExportMode::LightsOnly` (serde `"lightsOnly"`); `apply_export_mode(conn, &mut ExportData, ExportMode::LightsOnly) -> Result<Vec<String>>` clears every subgroup's `flat`/`dark`/`bias` and leaves light `file_path`/`filename` untouched; `apply_export_mode(.., RawWithMasters)` returns `Err` when any linked set with frames is not a master (message contains `"have no master"`); `pub fn raw_sets_without_master(conn: &Connection, data: &ExportData) -> Result<Vec<i64>>` (distinct set ids, first-seen order, only sets with `frames` non-empty and `is_master_library = 0`).
+- Produces: `ExportMode::LightsOnly` (serde `"lightsOnly"`); `apply_export_mode(conn, &mut ExportData, ExportMode::LightsOnly) -> Result<Vec<String>>` clears every subgroup's `flat`/`dark`/`bias` and leaves light `file_path`/`filename` untouched; `apply_export_mode(.., RawWithMasters)` returns `Err` when any linked set with frames is not a master (message contains `"no master"`); `pub fn raw_sets_without_master(conn: &Connection, data: &ExportData) -> Result<Vec<i64>>` (distinct set ids, first-seen order, only sets with `frames` non-empty and `is_master_library = 0`).
 
 - [ ] **Step 1: Write the failing tests** — append to `mod tests` in `data_collector.rs` (the fixtures `mem`, `seed_frame_set`, `seed_light`, `seed_raw_set`, `seed_master_set`, `add_link` already exist there):
 
@@ -86,7 +86,7 @@
         assert_eq!(sg.frames[0].file_path, "/test/light_10.fits", "raw light path untouched");
         let placements = crate::export::file_organizer::compute_wbpp_placements(&data);
         assert_eq!(placements.len(), 1);
-        assert_eq!(placements[0].rel_dir, "camera_TestCam/lights");
+        assert_eq!(placements[0].rel_dir, "camera_testcam/lights");
     }
 
     /// raw_sets_without_master lists only raw sets that have frames, once each.
@@ -118,7 +118,7 @@
         add_link(&conn, 10, dark, "Dark");
         let mut data = collect_export_data(&conn, 1).unwrap();
         let err = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap_err();
-        assert!(err.to_string().contains("have no master"), "got: {err}");
+        assert!(err.to_string().contains("no master"), "got: {err}");
     }
 
     /// Strict raw+masters passes untouched when every linked set is a master.
@@ -240,7 +240,7 @@ fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Ve
     let raw = raw_sets_without_master(conn, data)?;
     if !raw.is_empty() {
         anyhow::bail!(
-            "{} calibration sets have no master — build masters first (sets {:?})",
+            "{} calibration set(s) have no master — build masters first (sets {:?})",
             raw.len(),
             raw
         );
@@ -429,10 +429,14 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
     match mode {
         ExportMode::LightsOnly | ExportMode::RawWithCalibrationSets => Ok(()),
         ExportMode::RawWithMasters if r.raw_sets_without_master == 0 => Ok(()),
-        ExportMode::RawWithMasters => Err(format!(
-            "{} calibration sets have no master — build masters first",
-            r.raw_sets_without_master
-        )),
+        ExportMode::RawWithMasters => {
+            let n = r.raw_sets_without_master;
+            Err(format!(
+                "{n} calibration set{} {} no master — build masters first",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "has" } else { "have" }
+            ))
+        }
         ExportMode::CalibratedLights if r.stale + r.missing == 0 => Ok(()),
         ExportMode::CalibratedLights => Err(format!(
             "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
@@ -621,7 +625,7 @@ already refused calibratedLights with stale outputs."
             ).unwrap();
         };
         insert(1, 10, &light, "Light", 0);
-        insert(2, 20, &master, "Master Dark", 1);
+        insert(2, 20, &master, "MasterDark", 1);
 
         let input = SelectionInput {
             entries: vec![
@@ -895,7 +899,7 @@ sync_sources (spec 2026-08-28 D5)."
   ```
   Frontend command: `enqueue_frame_set_send { frameSetId, mode, destinationDeviceId, batchName?, flatNorm, flatNormMode, params }` → `EnqueueSelectionResult`.
 
-- [ ] **Step 1: Write the failing tests** — `#[cfg(test)] mod tests` in `api/frame_set_send.rs`. The fixture writes real FITS files because the builder (not exercised here) and `collect_export_data` need rows; `frame_set_entries` itself only reads the catalog.
+- [ ] **Step 1: Write the failing tests** — `#[cfg(test)] mod tests` in `api/frame_set_send.rs`. The fixture is catalog-only (paths like `/test/L_10.fits` never exist on disk): `frame_set_entries` reads the catalog and composes entries, it never touches the files — the builder that does is Task 4's, tested there.
 
 ```rust
 #[cfg(test)]
@@ -936,7 +940,7 @@ mod tests {
         }
         conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (200, 'Flat', '2026-07-05', 1)", []).unwrap();
         conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (600, '/lib/master_flat.fits', 'master_flat.fits', 0, '2026-07-05T00:00:00Z', 'FITS')", []).unwrap();
-        conn.execute("INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (600, 600, 'Master Flat', 1)", []).unwrap();
+        conn.execute("INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (600, 600, 'MasterFlat', 1)", []).unwrap();
         conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (200, 600)", []).unwrap();
         for f in [10i64, 11] {
             conn.execute("INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) VALUES (?1, 'frame', 100, 'Dark', '2026-07-05T00:00:00Z')", params![f]).unwrap();
@@ -957,13 +961,13 @@ mod tests {
 
         let lights = frame_set_entries(&ctx, 1, ExportMode::LightsOnly, fn_, fm, p.clone()).unwrap();
         assert_eq!(lights.len(), 2);
-        assert!(lights.iter().all(|e| e.kind == PayloadKind::RawFrame && e.rel_path.starts_with("camera_TestCam/lights/")));
+        assert!(lights.iter().all(|e| e.kind == PayloadKind::RawFrame && e.rel_path.starts_with("camera_testcam/lights/")));
 
         let raw = frame_set_entries(&ctx, 1, ExportMode::RawWithCalibrationSets, fn_, fm, p).unwrap();
         assert_eq!(raw.len(), 2 + 2 + 1);
         assert_eq!(raw.iter().filter(|e| e.kind == PayloadKind::Master).count(), 1);
-        assert!(raw.iter().any(|e| e.rel_path == "camera_TestCam/DARKS_100/FLAT_200/master_flat.fits"), "{raw:?}");
-        assert!(raw.iter().any(|e| e.rel_path == "camera_TestCam/DARKS_100/D_0.fits"), "{raw:?}");
+        assert!(raw.iter().any(|e| e.rel_path == "camera_testcam/DARKS_100/FLAT_200/master_flat.fits"), "{raw:?}");
+        assert!(raw.iter().any(|e| e.rel_path == "camera_testcam/DARKS_100/D_0.fits"), "{raw:?}");
     }
 
     #[test]
@@ -973,7 +977,7 @@ mod tests {
         { let db = ctx.db.get().unwrap(); seed(&db.conn()); }
         let (fn_, fm, p) = prefs();
         let err = frame_set_entries(&ctx, 1, ExportMode::RawWithMasters, fn_, fm, p).unwrap_err();
-        assert!(err.to_string().contains("1 calibration sets have no master"), "{err}");
+        assert!(err.to_string().contains("1 calibration set has no master"), "{err}");
     }
 
     #[test]
@@ -1002,13 +1006,13 @@ mod tests {
         let cal = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, fn_, fm, p).unwrap();
         assert_eq!(cal.len(), 2);
         assert!(cal.iter().all(|e| e.kind == PayloadKind::CalibratedLight));
-        assert!(cal.iter().any(|e| e.rel_path == "camera_TestCam/lights/c_L_10.fits" && e.source_path == std::path::Path::new("/lib/M31/TestCam/2026-07-05/c_L_10.fits")), "{cal:?}");
+        assert!(cal.iter().any(|e| e.rel_path == "camera_testcam/lights/c_L_10.fits" && e.source_path == std::path::Path::new("/lib/M31/TestCam/2026-07-05/c_L_10.fits")), "{cal:?}");
         assert!(cal.iter().all(|e| e.frame_id == 10 || e.frame_id == 11), "frame_id is the SOURCE light");
     }
 }
 ```
 
-If the readiness row for `derive_status` needs `cal_params` to match `LightCalParams::default()` serialized, use `serde_json::to_string(&LightCalParams::default()).unwrap()` instead of `"{}"` — run the test and follow the derived status.
+(`cal_params: "{}"` is what the scanner's adopt path stores too; `derive_status` parses it as `LightCalParams::default()`, and the mono fixture frames declare no CFA, so the rows derive *calibrated*.)
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1046,7 +1050,9 @@ pub fn frame_set_entries(
         .map_err(|e| ApiError::Internal(format!("collect export data: {e:#}")))?;
     crate::export::apply_export_mode(&conn, &mut data, mode)
         .map_err(|e| ApiError::Invalid(format!("{e:#}")))?;
-    let masters: std::collections::HashSet<i64> = master_frame_ids(&data);
+    let master_sets = crate::export::data_collector::master_set_ids(&conn, &data)
+        .map_err(|e| ApiError::Internal(format!("master set ids: {e:#}")))?;
+    let masters = master_frame_ids(&data, &master_sets);
     let entries = crate::export::file_organizer::compute_wbpp_placements(&data)
         .into_iter()
         .map(|p| PayloadEntry {
@@ -1094,15 +1100,7 @@ fn master_frame_ids(
 }
 ```
 
-In `frame_set_entries` the two lines around the placements read:
-
-```rust
-    let master_sets = crate::export::data_collector::master_set_ids(&conn, &data)
-        .map_err(|e| ApiError::Internal(format!("master set ids: {e:#}")))?;
-    let masters = master_frame_ids(&data, &master_sets);
-```
-
-and `data_collector.rs` gains, next to `raw_sets_without_master`:
+`data_collector.rs` gains, next to `raw_sets_without_master`:
 
 ```rust
 /// Ids of every linked set that IS a master set (`is_master_library = 1`),
@@ -1315,7 +1313,7 @@ fn build_calibrated_package(root: &Path, source_uuid: &str, filename: &str, with
         origin_catalog_uuid: "catalog-uuid".to_string(),
         origin_device: ORIGIN_DEVICE.to_string(),
         payload_kind: PayloadKind::CalibratedLight,
-        rel_path: format!("camera_TestCam/lights/{filename}"),
+        rel_path: format!("camera_testcam/lights/{filename}"),
         byte_size,
         xxh3,
         frame_meta: serde_json::to_value(fixture_frame(source_uuid, "M31", "2026-01-16T10:00:00.000Z")).unwrap(),
@@ -1328,9 +1326,7 @@ fn build_calibrated_package(root: &Path, source_uuid: &str, filename: &str, with
     (pkg_dir, announce)
 }
 
-fn count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |r| r.get(0)).unwrap()
-}
+// `count(conn, sql) -> i64` already exists in this file (line ~552) — reuse it.
 
 #[test]
 fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
@@ -1348,7 +1344,7 @@ fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "artifact never becomes a frame");
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
     let landed: String = conn.query_row("SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'", [], |r| r.get(0)).unwrap();
-    assert!(landed.ends_with("camera_TestCam/lights/c_L_0001.fits"), "{landed}");
+    assert!(landed.ends_with("camera_testcam/lights/c_L_0001.fits"), "{landed}");
     assert!(Path::new(&landed).exists());
     let frame_id: Option<i64> = conn.query_row("SELECT frame_id FROM light_calibrations WHERE source_uuid = 'src-1'", [], |r| r.get(0)).unwrap();
     assert!(frame_id.is_some(), "adopted against the cataloged source light");
@@ -1418,7 +1414,7 @@ pub fn scan_root_id_of_kind(conn: &Connection, kind: &str) -> Result<Option<i64>
 }
 ```
 
-(export it wherever `scan_root_path_of_kind` is re-exported from `db/mod.rs`.)
+(`db/mod.rs` has `pub use operations::*;`, so `crate::db::scan_root_id_of_kind` resolves with no further edit.)
 
 `scanner/mod.rs:645`: `pub(crate) fn reconcile_calibrated_light(`.
 
@@ -1529,7 +1525,7 @@ Expected: the three new tests PASS; every existing ingest test unchanged and gre
 
 ```bash
 rustfmt crates/athenaeum-core/src/sync/ingest.rs crates/athenaeum-core/src/sync/ingest_tests.rs crates/athenaeum-core/src/scanner/mod.rs crates/athenaeum-core/src/db/operations.rs
-git add crates/athenaeum-core/src/sync/ingest.rs crates/athenaeum-core/src/sync/ingest_tests.rs crates/athenaeum-core/src/scanner/mod.rs crates/athenaeum-core/src/db/operations.rs crates/athenaeum-core/src/db/mod.rs
+git add crates/athenaeum-core/src/sync/ingest.rs crates/athenaeum-core/src/sync/ingest_tests.rs crates/athenaeum-core/src/scanner/mod.rs crates/athenaeum-core/src/db/operations.rs
 git commit -m "feat(sync): receiver lands CalibratedLight payloads outside the catalog
 
 A CalibratedLight record is landed and handed to the scanner's
@@ -1564,9 +1560,13 @@ fn build_typed_package(root: &Path, tag: &str, specs: &[(&str, FrameKind)]) -> (
     let mut items = Vec::new();
     for (i, (name, kind)) in specs.iter().enumerate() {
         let path = src_dir.join(name);
+        // DATE-OBS matters: the raw-set clusterer groups by time and skips a
+        // frame without one.
+        let date_obs: DateTime<Utc> = "2026-01-15T22:30:00Z".parse().unwrap();
         let cards = HeaderBuilder::new(*kind)
             .instrume("TestCam").exptime(if matches!(kind, FrameKind::Flat | FrameKind::MasterFlat) { 3.0 } else { 300.0 })
             .gain(100).offset(50).binning(1, 1).ccd_temp(-10.0).filter("Ha")
+            .date_obs(date_obs + chrono::Duration::seconds(i as i64 * 60))
             .build().unwrap();
         write_fits_f32(&path, 4, 4, 1, &[(i as f32) + 1.0; 16], &cards).unwrap();
         let mut frame = crate::fits_parser::parse_fits(&path, 0).unwrap();
@@ -1579,7 +1579,7 @@ fn build_typed_package(root: &Path, tag: &str, specs: &[(&str, FrameKind)]) -> (
             origin_catalog_uuid: "catalog-uuid".to_string(),
             origin_device: ORIGIN_DEVICE.to_string(),
             payload_kind: if kind.imagetyp().to_uppercase().starts_with("MASTER") { PayloadKind::Master } else { PayloadKind::RawFrame },
-            rel_path: format!("camera_TestCam/DARKS_1/{name}"),
+            rel_path: format!("camera_testcam/DARKS_1/{name}"),
             byte_size,
             xxh3: package::xxh3_full_file(&path).unwrap(),
             frame_meta: serde_json::to_value(&frame).unwrap(),
@@ -1615,7 +1615,8 @@ fn received_calibration_frames_and_masters_become_sets() {
     assert_eq!(flat_members, 2);
     let master_sets: i64 = count(&conn, "SELECT COUNT(*) FROM calibration_set WHERE is_master_library = 1");
     assert_eq!(master_sets, 1);
-    let is_master: i64 = count(&conn, "SELECT is_master FROM frames WHERE imagetyp = 'Master Dark'");
+    // `insert_frame` stores `imagetyp` as the enum's Debug name (`MasterDark`).
+    let is_master: i64 = count(&conn, "SELECT is_master FROM frames WHERE imagetyp = 'MasterDark'");
     assert_eq!(is_master, 1);
     // Lights never enter a calibration set.
     let light_sets: i64 = count(&conn, "SELECT COUNT(*) FROM calibration_set_frames csf JOIN frames f ON f.id = csf.frame_id WHERE f.imagetyp = 'Light'");
@@ -1635,7 +1636,7 @@ fn received_master_set_matches_scanner_ingestion() {
 
     let scan_dir = tmp.path().join("scan");
     std::fs::create_dir_all(&scan_dir).unwrap();
-    std::fs::copy(pkg.join("camera_TestCam/DARKS_1/master_dark.fits"), scan_dir.join("master_dark.fits")).unwrap();
+    std::fs::copy(pkg.join("camera_testcam/DARKS_1/master_dark.fits"), scan_dir.join("master_dark.fits")).unwrap();
     let conn_b = catalog_conn();
     conn_b.execute("INSERT INTO scan_roots (path) VALUES (?1)", [scan_dir.to_string_lossy()]).unwrap();
     let scan = crate::scanner::scan_directory(&scan_dir, &conn_b, None, false, 1);
@@ -1644,14 +1645,25 @@ fn received_master_set_matches_scanner_ingestion() {
     const SET_COLS: &str = "imagetyp, is_master_library, frame_count, exptime, gain, offset, binning, instrume";
     let set_row = |conn: &Connection| -> Vec<Option<String>> {
         conn.query_row(&format!("SELECT {SET_COLS} FROM calibration_set WHERE is_master_library = 1"), [], |r| {
-            Ok((0..8).map(|i| r.get_ref(i).unwrap().as_str().ok().map(|s| s.to_string()).or_else(|| r.get::<_, Option<f64>>(i).ok().flatten().map(|v| v.to_string()))).collect())
+            Ok((0..8).map(|i| col_to_string(r.get_ref(i).unwrap())).collect())
         }).unwrap()
     };
     assert_eq!(set_row(&conn_a), set_row(&conn_b), "received master set must equal a scanned one");
 }
-```
 
-(If `r.get_ref(i)` column-to-string juggling fights the types, reuse `col_to_string` from `calibration_library/register.rs` tests by making it `pub(crate)` in a `#[cfg(test)]` helper module — the plan accepts either.)
+/// SQLite value → comparable string (same helper the direct-registration pin
+/// in `calibration_library/register.rs` uses; copied, tests are per-module).
+fn col_to_string(v: rusqlite::types::ValueRef) -> Option<String> {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t).to_string()),
+        ValueRef::Blob(_) => None,
+    }
+}
+```
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1664,7 +1676,7 @@ Expected: compile error on `integration_error`; after adding the field alone, `f
 - `IngestOutcome` gains `pub integration_error: Option<String>,` (Default keeps `None`).
 - `insert_ingested_rows(...) -> Result<i64>` returns `frame_id` (last line `Ok(frame_id)`).
 - In `process_frame`'s success path capture it: `let mut inserted_frame: Option<i64> = None;` before the closure; inside `let frame_id = insert_ingested_rows(&tx, …)?; inserted_frame = Some(frame_id);` and return `FrameVerdict { receipt, history_outcome: "ingested", inserted: inserted_frame.map(|id| (id, snapshot.imagetyp.clone())) }`.
-- In `ingest_package`, before the loop: `let mut inserted: Vec<(i64, Option<ImageType>)> = Vec::new();`; after each verdict: `if let Some(i) = verdict.inserted.clone() { inserted.push(i); }` (and `verdict.receipt` pushed as today — destructure the struct rather than moving twice). After the loop, before the final `info!`:
+- In `ingest_package`, before the loop: `let mut inserted: Vec<(i64, Option<ImageType>)> = Vec::new();`; after each verdict replace the two `verdict.*` uses with one destructure — `let FrameVerdict { receipt, history_outcome, inserted: this_inserted } = verdict; if let Some(i) = this_inserted { inserted.push(i); }` — then the existing `match history_outcome { … }` and `outcome.receipts.push(receipt)`. After the loop, before the final `info!`:
 
 ```rust
     if !inserted.is_empty() {
@@ -1917,15 +1929,39 @@ function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
 Readiness effect: fetch once per `frameSetId` regardless of mode (drop the `exportMode !== 'calibratedLights'` early return and the `mode` invoke arg), and re-fetch on the two window events:
 
 ```ts
-  const loadReadiness = useCallback(() => { /* the existing invoke, without `mode` */ }, [frameSetId]);
-  useEffect(() => { /* cancelled-flag fetch via loadReadiness */ }, [loadReadiness]);
+  // A tick re-runs the cancelled-flag effect below; bumped on mount-independent
+  // triggers (Coverage-tab work finishing) without duplicating the fetch.
+  const [readinessTick, setReadinessTick] = useState(0);
+  const loadReadiness = useCallback(() => setReadinessTick(t => t + 1), []);
+
   useEffect(() => {
-    const rerun = () => loadReadiness();
-    window.addEventListener('light-cal-updated', rerun);
-    window.addEventListener('library-updated', rerun);
+    let cancelled = false;
+    setReadinessLoading(true);
+    setReadinessError(null);
+    api
+      .invoke<ExportReadiness>('get_export_readiness', {
+        setId: frameSetId,
+        flatNorm: readFlatNormPref(),
+        flatNormMode: readFlatNormModePref(),
+        params: readLightCalParamsPref(),
+      })
+      .then(r => { if (!cancelled) setReadiness(r); })
+      .catch(err => {
+        if (cancelled) return;
+        console.error('[ExportTab] get_export_readiness failed:', err);
+        setReadinessError(typeof err === 'string' ? err : (err as Error)?.message ?? String(err));
+        setReadiness(null);
+      })
+      .finally(() => { if (!cancelled) setReadinessLoading(false); });
+    return () => { cancelled = true; };
+  }, [frameSetId, readinessTick]);
+
+  useEffect(() => {
+    window.addEventListener('light-cal-updated', loadReadiness);
+    window.addEventListener('library-updated', loadReadiness);
     return () => {
-      window.removeEventListener('light-cal-updated', rerun);
-      window.removeEventListener('library-updated', rerun);
+      window.removeEventListener('light-cal-updated', loadReadiness);
+      window.removeEventListener('library-updated', loadReadiness);
     };
   }, [loadReadiness]);
 ```
