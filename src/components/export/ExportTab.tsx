@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Folder, Loader2, Play } from 'lucide-react';
+import { AlertTriangle, Folder, Loader2, Play, Send } from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
@@ -9,13 +9,14 @@ import { useExportProgressContext } from '../../contexts/ExportProgressContext';
 import { ExportSummary } from './ExportSummary';
 import { WarningsPanel } from './WarningsPanel';
 import { FolderBrowserModal } from '../FolderBrowserModal';
+import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
 import {
   readFlatNormPref,
   readFlatNormModePref,
   readLightCalParamsPref,
 } from '../calibration/CalibrateLightsDialog';
 import type { CalibrationDetail, ExportMode } from '../../types/export';
-import type { ExportReadiness } from '../../types/models';
+import type { ExportFileCounts, ExportReadiness } from '../../types/models';
 
 interface ExportTabProps {
   frameSetId: number;
@@ -25,28 +26,27 @@ interface ExportTabProps {
 /** localStorage key for the last-used WBPP export mode (spec §12.2). */
 const EXPORT_MODE_KEY = 'athenaeum.export.mode';
 
-/** Message shown when the calibrated-lights gate blocks the export. */
-const CALIBRATE_FIRST_MSG = 'Run Calibrate Lights first';
-
 /** Radio options for the export-mode selector, in spec §12.2 order. The default
- *  (first-run, unset/corrupt storage) is `rawWithCalibrationSets`. */
-const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string }[] = [
-  {
-    value: 'rawWithCalibrationSets',
-    label: 'Raw lights + calibration sets (current)',
-    hint: 'Exports raw light frames with their matched raw calibration frames — WBPP performs all calibration.',
-  },
-  {
-    value: 'rawWithMasters',
-    label: 'Raw lights + master calibration files',
-    hint: 'Uses built master calibration files. Raw sets without a built master are omitted with a warning.',
-  },
-  {
-    value: 'calibratedLights',
-    label: 'Calibrated lights (skip WBPP calibration)',
-    hint: 'Exports c_*.fits calibrated artifacts, no calibration frames. Run Calibrate Lights first.',
-  },
+ *  (first-run, unset/corrupt storage) is `rawWithCalibrationSets`. Each row
+ *  selects its own file count out of the readiness payload, so a single fetch
+ *  feeds all four. */
+const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; count: (c: ExportFileCounts) => number }[] = [
+  { value: 'lightsOnly', label: 'Lights only', hint: 'Raw light frames, no calibration frames.', count: c => c.lightsOnly },
+  { value: 'rawWithCalibrationSets', label: 'Lights + calibration sets', hint: 'Raw light frames with their matched raw calibration frames — WBPP performs all calibration.', count: c => c.rawWithCalibrationSets },
+  { value: 'rawWithMasters', label: 'Lights + masters', hint: 'Raw lights with the built master calibration files. Every linked set needs a master.', count: c => c.rawWithMasters },
+  { value: 'calibratedLights', label: 'Calibrated lights', hint: 'c_*.fits calibrated artifacts, no calibration frames — WBPP runs with calibration disabled.', count: c => c.calibratedLights },
 ];
+
+/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready`. */
+function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
+  if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
+    return `Build masters first — ${r.rawSetsWithoutMaster} set${r.rawSetsWithoutMaster === 1 ? '' : 's'} without a master`;
+  }
+  if (mode === 'calibratedLights' && r.stale + r.missing > 0) {
+    return `Calibrate lights first — ${r.stale} stale, ${r.missing} missing`;
+  }
+  return null;
+}
 
 /** Read the persisted export mode, defaulting to `rawWithCalibrationSets` when
  *  unset or corrupt. */
@@ -76,12 +76,13 @@ function readExportModePref(): ExportMode {
  *   - Symlinks toggle hidden states explained inline.
  *   - "Export to WBPP" button has a tooltip explaining the acronym.
  */
-export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTabProps) {
+export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   const navigate = useNavigate();
   const [outputDir, setOutputDir] = useState<string>('');
   const [useSymlinks, setUseSymlinks] = useState(false);
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [sendOpen, setSendOpen] = useState(false);
 
   const { summary, loading: loadingSummary, error: summaryError } = useExportSummary(frameSetId);
   const { config: wbppConfig, save: saveWbppConfig } = useWbppConfig();
@@ -93,9 +94,10 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
   // backend reads `export_mode` from that config, not from the invoke args).
   const [exportMode, setExportMode] = useState<ExportMode>(readExportModePref);
 
-  // Calibrated-lights readiness — fetched only when that mode is selected. The
-  // gate here is UX; the backend re-checks and hard-errors on a stale/missing
-  // calibrated output, so the guarantee never depends on this fetch.
+  // Readiness for the whole set — one fetch, mode-independent: it carries every
+  // mode's file count plus the two blocker tallies. The gate here is UX; the
+  // backend re-checks the same rule and hard-errors, so the guarantee never
+  // depends on this fetch.
   const [readiness, setReadiness] = useState<ExportReadiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
   const [readinessError, setReadinessError] = useState<string | null>(null);
@@ -109,21 +111,20 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
     }
   }, []);
 
+  // A tick re-runs the cancelled-flag effect below; bumped on mount-independent
+  // triggers (Coverage-tab work finishing) without duplicating the fetch.
+  const [readinessTick, setReadinessTick] = useState(0);
+  const loadReadiness = useCallback(() => setReadinessTick(t => t + 1), []);
+
   useEffect(() => {
-    if (exportMode !== 'calibratedLights') {
-      setReadiness(null);
-      setReadinessError(null);
-      return;
-    }
     let cancelled = false;
     setReadinessLoading(true);
     setReadinessError(null);
     // Resolve staleness against the exact prefs Calibrate Lights would submit,
-    // so the dialog's tally agrees with what the backend gate will compute.
+    // so the tally agrees with what the backend gate will compute.
     api
       .invoke<ExportReadiness>('get_export_readiness', {
         setId: frameSetId,
-        mode: 'calibratedLights',
         flatNorm: readFlatNormPref(),
         flatNormMode: readFlatNormModePref(),
         params: readLightCalParamsPref(),
@@ -137,16 +138,25 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
       })
       .finally(() => { if (!cancelled) setReadinessLoading(false); });
     return () => { cancelled = true; };
-  }, [exportMode, frameSetId]);
+  }, [frameSetId, readinessTick]);
 
-  // Number of lights lacking a fresh calibrated output (stale + missing).
-  const notReady = readiness ? readiness.stale + readiness.missing : 0;
-  // Calibrated-lights export is gated until every light has a fresh output.
-  // The other two modes are always allowed. `readiness === null` (loading /
-  // errored) keeps the gate closed so we never fire an export that will
-  // hard-error at the backend.
-  const calibratedGateOk =
-    exportMode !== 'calibratedLights' || (readiness !== null && notReady === 0);
+  // A master build or a light calibration finishing elsewhere (Coverage tab)
+  // changes what this tab may export — re-read rather than making the user
+  // leave and come back.
+  useEffect(() => {
+    window.addEventListener('light-cal-updated', loadReadiness);
+    window.addEventListener('library-updated', loadReadiness);
+    return () => {
+      window.removeEventListener('light-cal-updated', loadReadiness);
+      window.removeEventListener('library-updated', loadReadiness);
+    };
+  }, [loadReadiness]);
+
+  // Why the selected mode can't run, or null. `readiness === null` (loading /
+  // errored) keeps both gates closed so we never fire an operation the backend
+  // will hard-error on.
+  const blocker = readiness ? modeBlocker(readiness, exportMode) : null;
+  const modeReady = readiness !== null && blocker === null;
 
   // In web mode, pull the server-configured export directory once.
   useEffect(() => {
@@ -291,7 +301,9 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
     }
   }, [frameSetId, outputDir, useSymlinks, exportMode, wbppConfig, saveWbppConfig, startExport]);
 
-  const canExport = outputDir !== '' && !exporting && calibratedGateOk;
+  const canExport = outputDir !== '' && !exporting && modeReady;
+  // Sending needs no output folder — the payload is staged by the backend.
+  const canSend = modeReady;
 
   // Symlink toggle eligibility — Tauri on macOS / Linux only. On web mode
   // (Docker always copies) and on Windows we hide the toggle but explain
@@ -330,64 +342,68 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
             <p className="text-sm text-content-muted mb-3">
               Choose what lands on disk for PixInsight WBPP.
             </p>
+            {readinessLoading && (
+              <p className="flex items-center gap-2 text-sm text-content-muted mb-3">
+                <Loader2 size={14} className="animate-spin" /> Checking readiness…
+              </p>
+            )}
+            {readinessError && (
+              <p className="text-sm text-error mb-3">Failed to check readiness: {readinessError}</p>
+            )}
             <div role="radiogroup" aria-label="Export mode" className="space-y-2">
               {EXPORT_MODE_OPTIONS.map(opt => {
                 const active = exportMode === opt.value;
+                // Display only — the backend re-checks the same rule.
+                const reason = readiness ? modeBlocker(readiness, opt.value) : null;
+                const disabled = readiness !== null && reason !== null;
                 return (
                   <label
                     key={opt.value}
-                    className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                    className={`flex items-start gap-3 p-3 rounded-lg border transition-colors ${
                       active
                         ? 'border-accent bg-accent/10'
                         : 'border-border bg-surface-hover/50 hover:bg-surface-hover'
-                    }`}
+                    } ${disabled ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
                   >
                     <input
                       type="radio"
                       name="export-mode"
                       value={opt.value}
                       checked={active}
+                      disabled={disabled}
                       onChange={() => handleModeChange(opt.value)}
                       className="mt-0.5 w-4 h-4 text-accent border-border focus:ring-accent"
                     />
-                    <span className="flex-1">
-                      <span className="block text-sm font-medium text-content">{opt.label}</span>
+                    <span className="flex-1 min-w-0 flex flex-col">
+                      <span className="flex items-baseline gap-2">
+                        <span className="flex-1 text-sm font-medium text-content">{opt.label}</span>
+                        <span className="text-xs text-content-muted tabular-nums">
+                          {readiness ? `${opt.count(readiness.fileCounts)} files` : ''}
+                        </span>
+                      </span>
                       <span className="block text-xs text-content-muted mt-0.5">{opt.hint}</span>
+                      {reason && (
+                        <span className="mt-1 flex items-center gap-2 text-xs text-error">
+                          <AlertTriangle size={12} /> {reason}
+                          <button
+                            type="button"
+                            className="underline hover:no-underline text-content-secondary"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              const first = opt.value === 'rawWithMasters' ? readiness?.rawSetIdsWithoutMaster[0] : undefined;
+                              navigate(first !== undefined ? `?tab=calibration&highlightSet=${first}&kind=dark` : '?tab=calibration');
+                            }}
+                          >
+                            → Coverage
+                          </button>
+                        </span>
+                      )}
                     </span>
                   </label>
                 );
               })}
             </div>
-
-            {/* Calibrated-lights readiness tally + gate message. */}
-            {exportMode === 'calibratedLights' && (
-              <div className="mt-3 text-sm">
-                {readinessLoading ? (
-                  <span className="flex items-center gap-2 text-content-muted">
-                    <Loader2 size={14} className="animate-spin" /> Checking calibrated-lights readiness…
-                  </span>
-                ) : readinessError ? (
-                  <span className="text-error">Failed to check readiness: {readinessError}</span>
-                ) : readiness ? (
-                  <div
-                    className={`rounded-lg p-3 ${
-                      notReady > 0
-                        ? 'bg-error/10 border border-error/30'
-                        : 'bg-success/10 border border-success/30'
-                    }`}
-                  >
-                    <span className="text-content">
-                      <span className="font-medium">{readiness.calibrated}</span> of {readiness.total} calibrated,{' '}
-                      <span className="font-medium">{readiness.stale}</span> stale,{' '}
-                      <span className="font-medium">{readiness.missing}</span> missing.
-                    </span>
-                    {notReady > 0 && (
-                      <span className="block mt-1 text-error font-medium">{CALIBRATE_FIRST_MSG}</span>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-            )}
           </section>
 
           {/* Top-level warnings — was previously dead code (WarningsPanel
@@ -508,33 +524,20 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
             </div>
           )}
 
-          {/* Export trigger */}
-          <button
-            onClick={() => { void handleExport(); }}
-            disabled={!canExport}
-            title={
-              exportMode === 'calibratedLights' && !calibratedGateOk
-                ? CALIBRATE_FIRST_MSG
-                : 'Export to PixInsight WBPP folder structure'
-            }
-            className={`w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${
-              canExport
-                ? 'bg-accent hover:bg-accent-hover text-white'
-                : 'bg-surface-hover cursor-not-allowed text-content-muted'
-            }`}
-          >
-            {exporting ? (
-              <>
-                <Loader2 className="animate-spin" size={20} />
-                Exporting…
-              </>
-            ) : (
-              <>
-                <Play size={20} />
-                Export to WBPP
-              </>
-            )}
-          </button>
+          {/* Actions — both run the selected mode: one writes it to a folder,
+              the other ships it to another node. Same readiness gate. */}
+          <div className="flex gap-3">
+            <button onClick={() => { void handleExport(); }} disabled={!canExport}
+              title={blocker ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
+              className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${canExport ? 'bg-accent hover:bg-accent-hover text-white' : 'bg-surface-hover cursor-not-allowed text-content-muted'}`}>
+              {exporting ? (<><Loader2 className="animate-spin" size={20} /> Exporting…</>) : (<><Play size={20} /> Export to WBPP</>)}
+            </button>
+            <button onClick={() => setSendOpen(true)} disabled={!canSend}
+              title={blocker ?? 'Send this frame set to another Athenaeum node'}
+              className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 border ${canSend ? 'border-accent text-accent hover:bg-accent/10' : 'border-border cursor-not-allowed text-content-muted'}`}>
+              <Send size={20} /> Send to node…
+            </button>
+          </div>
         </div>
       )}
 
@@ -548,6 +551,23 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
         }}
         onClose={() => setShowFolderBrowser(false)}
       />
+
+      {/* Send the selected mode's files to another node. Mounted only once
+          readiness resolved — the dialog's header shows that file count. */}
+      {readiness && (
+        <SendToNodeDialog
+          target={{
+            kind: 'frameSet',
+            frameSetId,
+            mode: exportMode,
+            modeLabel: EXPORT_MODE_OPTIONS.find(o => o.value === exportMode)?.label ?? exportMode,
+            fileCount: EXPORT_MODE_OPTIONS.find(o => o.value === exportMode)?.count(readiness.fileCounts) ?? 0,
+          }}
+          open={sendOpen}
+          onClose={() => setSendOpen(false)}
+          defaultBatchName={frameSetName}
+        />
+      )}
     </div>
   );
 }
