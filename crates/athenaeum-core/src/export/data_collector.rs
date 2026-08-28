@@ -168,14 +168,15 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
 // ============================================================================
 
 /// Rewrite an already-collected [`ExportData`] for the chosen [`ExportMode`],
-/// returning per-set omission warnings to fold into the export summary.
+/// returning warnings to fold into the export summary.
 ///
 /// - [`ExportMode::RawWithCalibrationSets`] (default): no change — the caller
 ///   gets today's behavior bit-for-bit (zero-regression path).
-/// - [`ExportMode::RawWithMasters`]: lights stay raw; every linked calibration
-///   set that is NOT a built master-library set (`is_master_library = 1`) has
-///   its frames dropped so only master files are placed, and each dropped set
-///   contributes one warning.
+/// - [`ExportMode::LightsOnly`]: every calibration node is dropped; the raw
+///   light paths are left exactly as collected.
+/// - [`ExportMode::RawWithMasters`]: lights stay raw and only master files are
+///   placed on the calibration side. Strict (spec 2026-08-28 D2): a linked set
+///   that still has raw frames is an error, not an omission.
 /// - [`ExportMode::CalibratedLights`]: each light's raw file is swapped for its
 ///   `light_calibrations.output_path` artifact (`c_*.fits`) and ALL calibration
 ///   nodes are dropped (WBPP runs with calibration disabled). Errors if any
@@ -190,8 +191,24 @@ pub fn apply_export_mode(
     tracing::debug!(frame_set_id = data.frame_set_id, ?mode, "applying export mode");
     match mode {
         ExportMode::RawWithCalibrationSets => Ok(Vec::new()),
+        ExportMode::LightsOnly => {
+            drop_calibration_nodes(data);
+            Ok(Vec::new())
+        }
         ExportMode::RawWithMasters => apply_raw_with_masters(conn, data),
         ExportMode::CalibratedLights => apply_calibrated_lights(conn, data),
+    }
+}
+
+/// Clear every subgroup's calibration nodes (LightsOnly, and the first half of
+/// CalibratedLights). Light frames are not touched.
+fn drop_calibration_nodes(data: &mut ExportData) {
+    for group in &mut data.groups {
+        for subgroup in &mut group.subgroups {
+            subgroup.flat = None;
+            subgroup.dark = None;
+            subgroup.bias = None;
+        }
     }
 }
 
@@ -222,72 +239,76 @@ fn is_master_set(conn: &Connection, set_id: i64) -> Result<bool> {
     Ok(flag == Some(1))
 }
 
-fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Vec<String>> {
-    let mut warnings: Vec<String> = Vec::new();
-    let mut omitted: HashSet<i64> = HashSet::new();
-    for group in &mut data.groups {
-        for subgroup in &mut group.subgroups {
+/// Distinct ids of linked calibration sets that have frames but are not master
+/// sets (`is_master_library = 0`), first-seen order. The `rawWithMasters`
+/// readiness number (spec 2026-08-28 §5): an empty list = mode ready.
+pub fn raw_sets_without_master(conn: &Connection, data: &ExportData) -> Result<Vec<i64>> {
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut out: Vec<i64> = Vec::new();
+    for group in &data.groups {
+        for subgroup in &group.subgroups {
             for node in [
-                subgroup.flat.as_mut(),
-                subgroup.dark.as_mut(),
-                subgroup.bias.as_mut(),
+                subgroup.flat.as_ref(),
+                subgroup.dark.as_ref(),
+                subgroup.bias.as_ref(),
             ]
             .into_iter()
             .flatten()
             {
-                filter_masters_recursive(conn, node, &mut warnings, &mut omitted)?;
+                collect_raw_sets(conn, node, &mut seen, &mut out)?;
             }
         }
     }
-    tracing::debug!(
-        frame_set_id = data.frame_set_id,
-        omitted = omitted.len(),
-        "raw+masters mode: raw calibration sets dropped"
-    );
-    Ok(warnings)
+    Ok(out)
 }
 
-/// Drop the frames of every non-master set in one calibration subtree, recording
-/// a one-per-set warning. Master nodes keep their (single) master file.
-fn filter_masters_recursive(
+/// Walk one calibration subtree, appending each raw-with-frames set id once.
+fn collect_raw_sets(
     conn: &Connection,
-    info: &mut CalibrationSetInfo,
-    warnings: &mut Vec<String>,
-    omitted: &mut HashSet<i64>,
+    info: &CalibrationSetInfo,
+    seen: &mut HashSet<i64>,
+    out: &mut Vec<i64>,
 ) -> Result<()> {
-    if !is_master_set(conn, info.set_id)? {
-        if !info.frames.is_empty() && omitted.insert(info.set_id) {
-            warnings.push(format!(
-                "Raw {} set #{} omitted — no master built (Raw + Masters mode exports master files only)",
-                info.imagetyp, info.set_id
-            ));
-        }
-        info.frames.clear();
-        info.frame_count = 0;
+    if !info.frames.is_empty() && !is_master_set(conn, info.set_id)? && seen.insert(info.set_id) {
+        out.push(info.set_id);
     }
-    if let Some(node) = info.dark_flat.as_mut() {
-        filter_masters_recursive(conn, node, warnings, omitted)?;
-    }
-    if let Some(node) = info.dark.as_mut() {
-        filter_masters_recursive(conn, node, warnings, omitted)?;
-    }
-    if let Some(node) = info.bias.as_mut() {
-        filter_masters_recursive(conn, node, warnings, omitted)?;
+    for node in [
+        info.dark_flat.as_deref(),
+        info.dark.as_deref(),
+        info.bias.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        collect_raw_sets(conn, node, seen, out)?;
     }
     Ok(())
 }
 
+/// Strict (spec 2026-08-28 D2): every linked set with frames must be a master.
+/// The API-layer gate runs first; this is the backstop that guarantees a
+/// partial export/send can never be written.
+fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Vec<String>> {
+    let raw = raw_sets_without_master(conn, data)?;
+    if !raw.is_empty() {
+        anyhow::bail!(
+            "{} calibration set(s) have no master — build masters first (sets {:?})",
+            raw.len(),
+            raw
+        );
+    }
+    Ok(Vec::new())
+}
+
 fn apply_calibrated_lights(conn: &Connection, data: &mut ExportData) -> Result<Vec<String>> {
+    // No calibration frames are exported — WBPP runs with calibration disabled,
+    // so the BIAS/DARKS/FLAT nesting is dropped entirely and the lights land
+    // directly under the camera folder.
+    drop_calibration_nodes(data);
     let mut missing: Vec<i64> = Vec::new();
     let mut total = 0usize;
     for group in &mut data.groups {
         for subgroup in &mut group.subgroups {
-            // No calibration frames are exported — WBPP runs with calibration
-            // disabled, so the BIAS/DARKS/FLAT nesting is dropped entirely and
-            // the lights land directly under the camera folder.
-            subgroup.flat = None;
-            subgroup.dark = None;
-            subgroup.bias = None;
             for frame in &mut subgroup.frames {
                 total += 1;
                 match get_light_calibration_for_frame(conn, frame.frame_id)? {
@@ -2210,7 +2231,9 @@ mod tests {
 /// Export-mode transform (spec §12.2) against a seeded in-memory catalog.
 #[cfg(test)]
 mod export_mode_tests {
-    use super::{apply_export_mode, collect_export_data, resolve_export_mode};
+    use super::{
+        apply_export_mode, collect_export_data, raw_sets_without_master, resolve_export_mode,
+    };
     use crate::db::light_calibrations::{
         upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
     };
@@ -2419,37 +2442,6 @@ mod export_mode_tests {
         );
     }
 
-    /// Raw+Masters keeps master files, drops raw-set frames, and reports the omission.
-    #[test]
-    fn raw_with_masters_drops_raw_and_reports() {
-        let conn = mem();
-        let session = seed_frame_set(&conn, 1);
-        seed_light(&conn, 10, session, Some("Ha"));
-        let dark = seed_raw_set(&conn, 100, "Dark", 2); // raw → dropped
-        let flat = seed_master_set(&conn, 200, "Flat"); // master → kept
-        add_link(&conn, 10, dark, "Dark");
-        add_link(&conn, 10, flat, "Flat");
-
-        let mut data = collect_export_data(&conn, 1).unwrap();
-        // Sanity: collection captured the raw dark (2) and master flat (1).
-        {
-            let sg = &data.groups[0].subgroups[0];
-            assert_eq!(sg.dark.as_ref().unwrap().frames.len(), 2);
-            assert_eq!(sg.flat.as_ref().unwrap().frames.len(), 1);
-        }
-
-        let warnings = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap();
-
-        let sg = &data.groups[0].subgroups[0];
-        assert_eq!(sg.dark.as_ref().unwrap().frames.len(), 0, "raw dark frames dropped");
-        assert_eq!(sg.dark.as_ref().unwrap().frame_count, 0);
-        assert_eq!(sg.flat.as_ref().unwrap().frames.len(), 1, "master flat retained");
-        assert!(
-            warnings.iter().any(|w| w.contains("#100")),
-            "omitted raw set reported, got {warnings:?}"
-        );
-    }
-
     /// CalibratedLights swaps the raw light for its artifact and drops calibration.
     #[test]
     fn calibrated_lights_substitutes_artifact_paths() {
@@ -2494,5 +2486,79 @@ mod export_mode_tests {
             err.to_string().contains("lack a fresh calibrated output"),
             "gate message, got: {err}"
         );
+    }
+
+    /// LightsOnly drops every calibration node and never touches light paths.
+    #[test]
+    fn lights_only_drops_calibration_and_keeps_light_paths() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        let flat = seed_master_set(&conn, 200, "Flat");
+        add_link(&conn, 10, dark, "Dark");
+        add_link(&conn, 10, flat, "Flat");
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let warnings = apply_export_mode(&conn, &mut data, ExportMode::LightsOnly).unwrap();
+        assert!(warnings.is_empty());
+
+        let sg = &data.groups[0].subgroups[0];
+        assert!(sg.flat.is_none() && sg.dark.is_none() && sg.bias.is_none());
+        assert_eq!(sg.frames.len(), 1);
+        assert_eq!(
+            sg.frames[0].file_path, "/test/light_10.fits",
+            "raw light path untouched"
+        );
+        let placements = crate::export::file_organizer::compute_wbpp_placements(&data);
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].rel_dir, "camera_testcam/lights");
+    }
+
+    /// raw_sets_without_master lists only raw sets that have frames, once each.
+    #[test]
+    fn raw_sets_without_master_counts_raw_sets_with_frames_once() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        seed_light(&conn, 11, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        let empty = seed_raw_set(&conn, 101, "Bias", 0);
+        let flat = seed_master_set(&conn, 200, "Flat");
+        for f in [10, 11] {
+            add_link(&conn, f, dark, "Dark");
+            add_link(&conn, f, empty, "Bias");
+            add_link(&conn, f, flat, "Flat");
+        }
+        let data = collect_export_data(&conn, 1).unwrap();
+        assert_eq!(raw_sets_without_master(&conn, &data).unwrap(), vec![100]);
+    }
+
+    /// Strict raw+masters: a raw set with frames is an error, never an omission.
+    #[test]
+    fn raw_with_masters_errors_on_raw_set_with_frames() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        add_link(&conn, 10, dark, "Dark");
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let err = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap_err();
+        assert!(err.to_string().contains("no master"), "got: {err}");
+    }
+
+    /// Strict raw+masters passes untouched when every linked set is a master.
+    #[test]
+    fn raw_with_masters_is_noop_when_all_masters() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let flat = seed_master_set(&conn, 200, "Flat");
+        add_link(&conn, 10, flat, "Flat");
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let before = serde_json::to_value(&data).unwrap();
+        let warnings = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(serde_json::to_value(&data).unwrap(), before);
     }
 }

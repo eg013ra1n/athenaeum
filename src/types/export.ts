@@ -764,7 +764,7 @@ phase: string, };
 
 export type ExportCompleteEvent = { frameSetId: number, success: boolean, filesOrganized: number, warnings: Array<string>, error: string | null, outputDir: string, };
 
-export type ExportMode = "calibratedLights" | "rawWithMasters" | "rawWithCalibrationSets";
+export type ExportMode = "lightsOnly" | "calibratedLights" | "rawWithMasters" | "rawWithCalibrationSets";
 
 export type WbppExportConfig = { 
 /**

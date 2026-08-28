@@ -696,14 +696,19 @@ pub enum WarningSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ExportMode {
+    /// Raw light frames only — every calibration node dropped, light paths
+    /// untouched. The frame-set send's "just the lights"; for a folder export
+    /// the lights land under `camera_<x>/lights/`.
+    LightsOnly,
     /// Export the `c_*.fits` calibrated-light artifacts in place of the raw
     /// lights, with NO calibration frames at all (WBPP runs with its own
     /// calibration disabled). Strictly gated: every in-scope light must have a
     /// fresh calibrated output first.
     CalibratedLights,
-    /// Raw lights as today, but the calibration side exports ONLY built master
-    /// files (`calibration_set.is_master_library = 1`); raw non-master sets are
-    /// omitted, each reported as an export warning.
+    /// Raw lights as today, with the calibration side exporting ONLY built
+    /// master files (`calibration_set.is_master_library = 1`). Strict (spec
+    /// 2026-08-28 D2): a linked set that still has raw frames is an error, not
+    /// a silent omission — what the summary shows is what lands.
     RawWithMasters,
     /// Current behavior (default): raw lights plus whatever raw calibration sets
     /// are linked.
@@ -746,6 +751,18 @@ impl Default for WbppExportConfig {
             export_mode: ExportMode::default(),
         }
     }
+}
+
+/// How many files each export mode would place for one frame set — the
+/// informational half of `ExportReadiness` (spec 2026-08-28 §5). Computed by a
+/// count-only walk that never bails, so a not-ready mode still shows a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFileCounts {
+    pub lights_only: i64,
+    pub raw_with_calibration_sets: i64,
+    pub raw_with_masters: i64,
+    pub calibrated_lights: i64,
 }
 
 /// Setup instructions for configuring WBPP grouping keywords

@@ -53,7 +53,7 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string }[] 
 function readExportModePref(): ExportMode {
   try {
     const raw = localStorage.getItem(EXPORT_MODE_KEY);
-    if (raw === 'calibratedLights' || raw === 'rawWithMasters' || raw === 'rawWithCalibrationSets') {
+    if (raw === 'lightsOnly' || raw === 'calibratedLights' || raw === 'rawWithMasters' || raw === 'rawWithCalibrationSets') {
       return raw;
     }
   } catch {
