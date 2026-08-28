@@ -271,7 +271,14 @@ pub async fn export_to_wbpp(
         make_fail("Export cancelled".to_string())
     } else {
         match prepare(&mut export_data) {
-            Err(e) => make_fail(e),
+            Err(e) => {
+                // Mirrors the web route: the refusal returns Ok(ExportResult{
+                // success: false }), so without this the only log record of a
+                // readiness/DB failure would be the gate's own warn! — and a DB
+                // failure emits none at all.
+                tracing::error!(frame_set_id, error = %e, "export blocked before organizing");
+                make_fail(e)
+            }
             Ok(mode_warnings) => {
                 let export_emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
                 match organize_files_wbpp(
