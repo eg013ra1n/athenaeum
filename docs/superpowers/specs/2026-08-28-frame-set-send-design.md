@@ -120,6 +120,7 @@ Steps, in order — nothing is written before step 3 passes:
        source_path: PathBuf,   // file to copy into the package
        rel_path: String,       // WBPP dir + filename, forward slashes
        kind: PayloadKind,      // RawFrame | Master | CalibratedLight
+       reclaimable: bool,      // may retention reclaim it after confirm? (D5)
    }
    ```
 
@@ -132,7 +133,10 @@ Steps, in order — nothing is written before step 3 passes:
    filename dedup — with these kind-specific rules:
    - **`RawFrame`** (lights, raw calibration frames): unchanged. `frame_meta` =
      the frame's snapshot; `frame_uuid` = `frames.uuid`; `sync_sources` row
-     written.
+     written **iff the composer marked the entry `reclaimable`** (D5). The
+     builder does not decide which raw frames those are: `selection_entries`
+     marks every raw frame (the user picked them file by file),
+     `frame_set_entries` marks only the set's own LIGHT frames.
    - **`Master`**: same as `RawFrame` for the receiver's purposes (a master is a
      catalog frame); the kind is an honest label. **No `sync_sources` row** —
      retention must never reclaim a master from the calibration library
@@ -318,8 +322,12 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
   The Offer's sampling hash of a `c_*.fits` never matches a receiver `files`
   row, so calibrated lights are always wanted; re-sends dedup at ingest by
   receipt (§4.1).
-- **Retention**: only `RawFrame` entries get `sync_sources` rows. Masters and
-  calibrated outputs are never reclaimable through a send.
+- **Retention**: a `sync_sources` row is written only for a `RawFrame` entry
+  the composer marked `reclaimable` (D5). On a frame-SET send that is the set's
+  own LIGHT frames alone — its raw calibration frames belong to sets shared
+  across objects, so reclaiming them would eat a shared calibration library. A
+  frame-SELECTION send still links every picked raw frame. Masters and
+  calibrated outputs are never reclaimable through a send at all.
 - **TS types**: `ExportMode` (new variant), `ExportReadiness` (new fields),
   `ExportFileCounts` (new) regenerate from the `ts_export.rs` registry;
   `src/types/models.ts` / `src/types/export.ts` updated in the same change.
@@ -422,8 +430,16 @@ source is cataloged).
 - **D4** — calibrated lights are never cataloged on the receiver; adoption
   into `light_calibrations` is best-effort and deferred when the source light
   is absent (same contract as the scanner).
-- **D5** — masters and calibrated outputs are excluded from `sync_sources`
-  so desktop retention can never reclaim library artifacts because of a send.
+- **D5** — retention reclaim after a send is opt-in per payload entry
+  (`PayloadEntry.reclaimable`), decided by the composer and honoured by the one
+  package builder. Masters and calibrated outputs are always excluded, so
+  desktop retention can never reclaim library artifacts because of a send. On a
+  **frame-set** send only the set's OWN light frames are reclaimable: the linked
+  calibration sets are shared across objects by construction
+  (`archive/shared_calibration.rs`), so enrolling their raw dark/flat/bias
+  frames would let one confirmed send delete a shared calibration library. A
+  **frame-selection** send is unchanged — those files were picked explicitly
+  (revised after the whole-branch review, owner, 2026-08-28).
 - **Limitation** — the export summary's folder preview is not mode-aware.
 - **Limitation** — a receiver older than this change ingests `CalibratedLight` records as
   raw frames; documented "upgrade the receiver" stance, no wire guard.

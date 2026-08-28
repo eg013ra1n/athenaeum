@@ -32,6 +32,17 @@ pub struct PayloadEntry {
     pub source_path: PathBuf,
     pub rel_path: String,
     pub kind: PayloadKind,
+    /// May this file be reclaimed by desktop retention once the package is
+    /// confirmed? Decided by the composer, honoured by the builder — which
+    /// writes the `sync_sources` linkage only for a [`PayloadKind::RawFrame`]
+    /// entry that is also `reclaimable` (spec 2026-08-28 §D5).
+    ///
+    /// A frame SELECTION was explicitly picked file by file, so every raw frame
+    /// in it is reclaimable. A frame-SET send is composed from links the user
+    /// never enumerated: its raw calibration frames belong to sets that are
+    /// shared across objects by construction, so only the set's own LIGHT
+    /// frames carry this flag.
+    pub reclaimable: bool,
 }
 
 /// The export pipeline's file list for one frame set under `mode`, as payload
@@ -59,6 +70,18 @@ pub fn frame_set_entries(
     let conn = db.conn();
     let mut data = crate::export::collect_export_data(&conn, frame_set_id)
         .map_err(|e| ApiError::Internal(format!("collect export data: {e:#}")))?;
+    // The set's OWN light frames, read BEFORE the mode transform rewrites their
+    // paths (`calibratedLights` swaps `file_path`/`filename` in place). These
+    // are the only entries a frame-set send may make retention-reclaimable
+    // (§D5): the linked calibration sets are shared across objects, so
+    // reclaiming their raw frames would eat a shared library.
+    let light_ids: HashSet<i64> = data
+        .groups
+        .iter()
+        .flat_map(|g| &g.subgroups)
+        .flat_map(|s| &s.frames)
+        .map(|f| f.frame_id)
+        .collect();
     crate::export::apply_export_mode(&conn, &mut data, mode)
         .map_err(|e| ApiError::Invalid(format!("{e:#}")))?;
     let master_sets = crate::export::data_collector::master_set_ids(&conn, &data)
@@ -66,19 +89,26 @@ pub fn frame_set_entries(
     let masters = master_frame_ids(&data, &master_sets);
     let entries = crate::export::file_organizer::compute_wbpp_placements(&data)
         .into_iter()
-        .map(|p| PayloadEntry {
-            frame_id: p.frame_id,
-            source_path: PathBuf::from(&p.file_path),
-            rel_path: if p.rel_dir.is_empty() {
-                p.filename.clone()
-            } else {
-                format!("{}/{}", p.rel_dir, p.filename)
-            },
-            kind: match mode {
+        .map(|p| {
+            let kind = match mode {
                 ExportMode::CalibratedLights => PayloadKind::CalibratedLight,
                 _ if masters.contains(&p.frame_id) => PayloadKind::Master,
                 _ => PayloadKind::RawFrame,
-            },
+            };
+            PayloadEntry {
+                frame_id: p.frame_id,
+                source_path: PathBuf::from(&p.file_path),
+                rel_path: if p.rel_dir.is_empty() {
+                    p.filename.clone()
+                } else {
+                    format!("{}/{}", p.rel_dir, p.filename)
+                },
+                // Raw calibration frames and masters are never reclaimable
+                // here; in `calibratedLights` every entry is an artifact, so
+                // nothing is (§D5).
+                reclaimable: kind == PayloadKind::RawFrame && light_ids.contains(&p.frame_id),
+                kind,
+            }
         })
         .collect::<Vec<_>>();
     tracing::info!(
@@ -221,6 +251,10 @@ mod tests {
             .iter()
             .all(|e| e.kind == PayloadKind::RawFrame
                 && e.rel_path.starts_with("camera_testcam/lights/")));
+        assert!(
+            lights.iter().all(|e| e.reclaimable),
+            "the set's own lights are the reclaimable ones"
+        );
 
         let raw =
             frame_set_entries(&ctx, 1, ExportMode::RawWithCalibrationSets, fn_, fm, p).unwrap();
@@ -238,6 +272,26 @@ mod tests {
             raw.iter()
                 .any(|e| e.rel_path == "camera_testcam/DARKS_100/D_0.fits"),
             "{raw:?}"
+        );
+        // §D5: a frame-set send may only make the set's OWN lights
+        // retention-reclaimable. The linked dark set and the master flat are
+        // shared across objects by construction — a confirmed send must never
+        // let retention sweep a shared calibration library.
+        let reclaimable: std::collections::HashSet<i64> = raw
+            .iter()
+            .filter(|e| e.reclaimable)
+            .map(|e| e.frame_id)
+            .collect();
+        assert_eq!(
+            reclaimable,
+            std::collections::HashSet::from([10, 11]),
+            "{raw:?}"
+        );
+        assert!(
+            raw.iter()
+                .filter(|e| e.frame_id == 500 || e.frame_id == 501 || e.frame_id == 600)
+                .all(|e| !e.reclaimable),
+            "raw darks and the master flat are never reclaimable: {raw:?}"
         );
     }
 
@@ -316,6 +370,10 @@ mod tests {
         assert!(
             cal.iter().all(|e| e.frame_id == 10 || e.frame_id == 11),
             "frame_id is the SOURCE light"
+        );
+        assert!(
+            cal.iter().all(|e| !e.reclaimable),
+            "an artifact is a rebuildable by-product, never reclaimable"
         );
     }
 }

@@ -3001,6 +3001,10 @@ fn selection_entries(
             frame_id,
             source_path: PathBuf::from(&file.path),
             rel_path: assign_rel_path(&layout, frame_id, file, &mut used_by_dir),
+            // The user picked these files one by one, so every raw frame among
+            // them is retention-reclaimable (§D5) — the frame-SET composer is
+            // the one that has to be narrower.
+            reclaimable: kind == PayloadKind::RawFrame,
             kind,
         });
     }
@@ -3032,7 +3036,11 @@ fn selection_entries(
 ///
 /// Per-kind rules (spec 2026-08-28 §3 step 5 / §D5):
 /// - [`PayloadKind::RawFrame`] — the frame's own snapshot and uuid, `strong_hash`
-///   banked, and the ONLY kind that gets a `sync_sources` retention linkage row.
+///   banked, and the ONLY kind that can get a `sync_sources` retention linkage
+///   row — and then only when the composer marked the entry
+///   [`reclaimable`](PayloadEntry::reclaimable). WHICH raw frames those are is
+///   not the builder's call: a frame selection marks all of them, a frame-set
+///   send only the set's own lights.
 /// - [`PayloadKind::Master`] — the same manifest as a raw frame, but no linkage:
 ///   a master is shared by construction, so retention must never reclaim it out
 ///   from under its other consumers.
@@ -3208,10 +3216,12 @@ fn build_selection_package(
             },
         ));
         eligible.push(entry.frame_id);
-        // Retention linkage for raw frames ONLY (§D5): a master is shared by
-        // construction and a calibrated artifact is a rebuildable by-product, so
-        // neither may be swept as "the source this package delivered".
-        if entry.kind == PayloadKind::RawFrame {
+        // Retention linkage for raw frames the COMPOSER marked reclaimable
+        // (§D5). A master is shared by construction and a calibrated artifact is
+        // a rebuildable by-product, so neither may ever be swept as "the source
+        // this package delivered"; on a frame-set send the linked calibration
+        // sets are shared too, so only the set's own lights carry the flag.
+        if entry.kind == PayloadKind::RawFrame && entry.reclaimable {
             source_links.push((file_id, file.path.clone(), byte_size, mtime_ms));
         }
     }
@@ -9293,7 +9303,8 @@ mod tests {
         let light = tmp.path().join("L_10.fits");
         let master = tmp.path().join("master_dark.fits");
         let artifact = tmp.path().join("c_L_10.fits");
-        for p in [&light, &master, &artifact] {
+        let shared_dark = tmp.path().join("D_0.fits");
+        for p in [&light, &master, &artifact, &shared_dark] {
             write_fits_f32(p, 4, 4, 1, &[1.0f32; 16], &[]).unwrap();
         }
         let insert = |file_id: i64,
@@ -9314,6 +9325,7 @@ mod tests {
         };
         insert(1, 10, &light, "Light", 0);
         insert(2, 20, &master, "MasterDark", 1);
+        insert(3, 30, &shared_dark, "Dark", 0);
 
         let input = SelectionInput {
             entries: vec![
@@ -9322,23 +9334,35 @@ mod tests {
                     source_path: light.clone(),
                     rel_path: "camera_X/lights/L_10.fits".into(),
                     kind: PayloadKind::RawFrame,
+                    reclaimable: true,
                 },
                 PayloadEntry {
                     frame_id: 20,
                     source_path: master.clone(),
                     rel_path: "camera_X/DARKS_5/master_dark.fits".into(),
                     kind: PayloadKind::Master,
+                    reclaimable: false,
                 },
                 PayloadEntry {
                     frame_id: 10,
                     source_path: artifact.clone(),
                     rel_path: "camera_X/lights/c_L_10.fits".into(),
                     kind: PayloadKind::CalibratedLight,
+                    reclaimable: false,
+                },
+                // A raw frame the COMPOSER declined to mark: the shape a
+                // frame-set send produces for a shared calibration frame (§D5).
+                PayloadEntry {
+                    frame_id: 30,
+                    source_path: shared_dark.clone(),
+                    rel_path: "camera_X/DARKS_5/D_0.fits".into(),
+                    kind: PayloadKind::RawFrame,
+                    reclaimable: false,
                 },
             ],
             ineligible: Vec::new(),
             ancestor: None,
-            total: 3,
+            total: 4,
         };
         let packages = tmp.path().join("packages");
         let built = build_selection_package(
@@ -9350,7 +9374,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(built.eligible.len(), 3);
+        assert_eq!(built.eligible.len(), 4);
         assert!(built.ineligible.is_empty());
         let dir = built.pkg_dir.unwrap();
         let records = crate::package::read_manifest(&dir).unwrap();
@@ -9387,9 +9411,10 @@ mod tests {
         assert_eq!(
             linked,
             vec![1],
-            "masters and artifacts never enter sync_sources"
+            "masters, artifacts and a raw frame the composer left unmarked never \
+             enter sync_sources"
         );
-        // strong_hash banked for catalog files only.
+        // strong_hash banked for catalog files only (the artifact is not one).
         let banked: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM files WHERE strong_hash IS NOT NULL",
@@ -9397,7 +9422,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(banked, 2);
+        assert_eq!(banked, 3);
     }
 
     /// `selection_entries`' kind classification — the one behavior change on the
@@ -9459,6 +9484,16 @@ mod tests {
             PayloadKind::Master,
             "filename-detected master: frames.is_master is the catalog's own signal"
         );
+        // The composer's retention decision on the SELECTION path: every raw
+        // frame the user picked is reclaimable, neither master is (§D5).
+        let reclaimable: HashMap<i64, bool> = input
+            .entries
+            .iter()
+            .map(|e| (e.frame_id, e.reclaimable))
+            .collect();
+        assert!(reclaimable[&10], "a picked raw light is reclaimable");
+        assert!(!reclaimable[&20], "IMAGETYP master");
+        assert!(!reclaimable[&30], "filename-detected master");
 
         // The consequence that matters: neither master may leave behind a
         // retention linkage the desktop could later reclaim (§D5).
