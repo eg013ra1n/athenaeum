@@ -151,7 +151,6 @@ pub async fn get_calibration_route(
 pub async fn get_export_readiness(
     state: State<'_, AppState>,
     set_id: i64,
-    mode: ExportMode,
     flat_norm: bool,
     flat_norm_mode: FlatNormMode,
     params: Option<LightCalParams>,
@@ -159,7 +158,7 @@ pub async fn get_export_readiness(
     let params = params.unwrap_or_default();
     let ctx = state.ctx.clone();
     tokio::task::spawn_blocking(move || {
-        api_get_export_readiness(&ctx, set_id, mode, flat_norm, flat_norm_mode, params)
+        api_get_export_readiness(&ctx, set_id, flat_norm, flat_norm_mode, params)
     })
     .await
     .map_err(|e| format!("Export readiness task panicked: {}", e))?
@@ -185,9 +184,9 @@ pub async fn get_export_readiness(
 /// [`WbppExportConfig`]'s mode — the frontend loads that config asynchronously
 /// and could present it as `null`, so the mode is now passed explicitly rather
 /// than relying on a best-effort config sync. `flat_norm` / `flat_norm_mode` /
-/// `params` are the caller's calibration preferences, used only by the
-/// `calibratedLights` strict gate; they are optional so the pre-mode-UI frontend
-/// keeps working (defaults: normalize ON, central-third, default advanced params).
+/// `params` are the caller's calibration preferences, used by the strict mode
+/// gate; they are optional so the pre-mode-UI frontend keeps working
+/// (defaults: normalize ON, central-third, default advanced params).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
@@ -249,23 +248,17 @@ pub async fn export_to_wbpp(
     // per-set omission warnings to fold into the final result, or an Err
     // message that aborts the export before any file is written.
     let prepare = |export_data: &mut ExportData| -> Result<Vec<String>, String> {
-        if mode == ExportMode::CalibratedLights {
-            let readiness = api_get_export_readiness(
-                &state.ctx,
-                frame_set_id,
-                mode,
-                flat_norm.unwrap_or(true),
-                flat_norm_mode.unwrap_or(FlatNormMode::CentralThird),
-                params.clone().unwrap_or_default(),
-            )
-            .map_err(|e| e.to_string())?;
-            let not_ready = readiness.missing + readiness.stale;
-            if not_ready > 0 {
-                return Err(format!(
-                    "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
-                    not_ready, readiness.total
-                ));
-            }
+        let readiness = api_get_export_readiness(
+            &state.ctx,
+            frame_set_id,
+            flat_norm.unwrap_or(true),
+            flat_norm_mode.unwrap_or(FlatNormMode::CentralThird),
+            params.clone().unwrap_or_default(),
+        )
+        .map_err(|e| e.to_string())?;
+        if let Err(msg) = athenaeum_core::api::lights::check_mode_ready(&readiness, mode) {
+            tracing::warn!(frame_set_id, ?mode, error = %msg, "export refused: mode not ready");
+            return Err(msg);
         }
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();

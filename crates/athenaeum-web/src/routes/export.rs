@@ -106,7 +106,6 @@ fn default_flat_norm() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct GetExportReadinessArgs {
     pub set_id: i64,
-    pub mode: ExportMode,
     #[serde(default = "default_flat_norm")]
     pub flat_norm: bool,
     #[serde(default)]
@@ -261,7 +260,7 @@ fn get_export_readiness_core(
     ctx: &athenaeum_core::services::ServiceContext,
     args: GetExportReadinessArgs,
 ) -> Result<ExportReadiness, athenaeum_core::api::ApiError> {
-    api_get_export_readiness(ctx, args.set_id, args.mode, args.flat_norm, args.flat_norm_mode, args.params)
+    api_get_export_readiness(ctx, args.set_id, args.flat_norm, args.flat_norm_mode, args.params)
 }
 
 /// Export a frame set to PixInsight WBPP folder structure.
@@ -339,23 +338,17 @@ pub async fn export_to_wbpp(
     // Strict gate (spec §12.2) + mode transform. Returns per-set omission
     // warnings to fold in, or an Err message that aborts before any file write.
     let prepare = |export_data: &mut ExportData| -> Result<Vec<String>, String> {
-        if mode == ExportMode::CalibratedLights {
-            let readiness = api_get_export_readiness(
-                &state.ctx,
-                frame_set_id,
-                mode,
-                args.flat_norm,
-                args.flat_norm_mode,
-                args.params.clone(),
-            )
-            .map_err(|e| e.to_string())?;
-            let not_ready = readiness.missing + readiness.stale;
-            if not_ready > 0 {
-                return Err(format!(
-                    "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
-                    not_ready, readiness.total
-                ));
-            }
+        let readiness = api_get_export_readiness(
+            &state.ctx,
+            frame_set_id,
+            args.flat_norm,
+            args.flat_norm_mode,
+            args.params.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        if let Err(msg) = athenaeum_core::api::lights::check_mode_ready(&readiness, mode) {
+            tracing::warn!(frame_set_id, ?mode, error = %msg, "export refused: mode not ready");
+            return Err(msg);
         }
         let db = state.ctx.db.get().ok_or_else(|| "Database not initialized".to_string())?;
         let conn = db.conn();
