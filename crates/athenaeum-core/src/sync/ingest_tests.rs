@@ -2870,3 +2870,197 @@ fn landed_rel_paths(conn: &Connection, incoming: &Path) -> Vec<String> {
     out.sort();
     out
 }
+
+/// A package of N frames written from `HeaderBuilder` cards, each record's
+/// snapshot taken from the file the way a sender would (parse → Frame).
+fn build_typed_package(
+    root: &Path,
+    tag: &str,
+    specs: &[(&str, crate::fits_writer::keywords::FrameKind)],
+) -> (PathBuf, PackageAnnounce) {
+    use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
+    let src_dir = root.join(format!("tsrc-{tag}"));
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let mut items = Vec::new();
+    for (i, (name, kind)) in specs.iter().enumerate() {
+        let path = src_dir.join(name);
+        // DATE-OBS matters: the raw-set clusterer groups by time and skips a
+        // frame without one.
+        let date_obs: DateTime<Utc> = "2026-01-15T22:30:00Z".parse().unwrap();
+        let cards = HeaderBuilder::new(*kind)
+            .instrume("TestCam")
+            .exptime(if matches!(kind, FrameKind::Flat | FrameKind::MasterFlat) {
+                3.0
+            } else {
+                300.0
+            })
+            .gain(100)
+            .offset(50)
+            .binning(1, 1)
+            .ccd_temp(-10.0)
+            .filter("Ha")
+            .date_obs(date_obs + chrono::Duration::seconds(i as i64 * 60))
+            .build()
+            .unwrap();
+        write_fits_f32(&path, 4, 4, 1, &[(i as f32) + 1.0; 16], &cards).unwrap();
+        let mut frame = crate::fits_parser::parse_fits(&path, 0).unwrap();
+        frame.uuid = Some(format!("{tag}-{i}"));
+        frame.updated_at = Some("2026-01-16T10:00:00.000Z".to_string());
+        let byte_size = std::fs::metadata(&path).unwrap().len();
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: format!("{tag}-{i}"),
+            origin_catalog_uuid: "catalog-uuid".to_string(),
+            origin_device: ORIGIN_DEVICE.to_string(),
+            payload_kind: if kind.imagetyp().to_uppercase().starts_with("MASTER") {
+                PayloadKind::Master
+            } else {
+                PayloadKind::RawFrame
+            },
+            rel_path: format!("camera_testcam/DARKS_1/{name}"),
+            byte_size,
+            xxh3: package::xxh3_full_file(&path).unwrap(),
+            frame_meta: serde_json::to_value(&frame).unwrap(),
+            analysis: None,
+            app_version: "test".to_string(),
+            project: None,
+        };
+        items.push((path, record));
+    }
+    let pkg_dir = root.join(format!("tpkg-{tag}"));
+    let announce = package::write_package(&pkg_dir, items).unwrap();
+    (pkg_dir, announce)
+}
+
+#[test]
+fn received_calibration_frames_and_masters_become_sets() {
+    use crate::fits_writer::keywords::FrameKind;
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    let (pkg, ann) = build_typed_package(
+        tmp.path(),
+        "cal",
+        &[
+            ("F_0.fits", FrameKind::Flat),
+            ("F_1.fits", FrameKind::Flat),
+            ("master_dark.fits", FrameKind::MasterDark),
+            ("L_0.fits", FrameKind::Light),
+        ],
+    );
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.ingested, 4, "{outcome:?}");
+    assert!(
+        outcome.integration_error.is_none(),
+        "{:?}",
+        outcome.integration_error
+    );
+
+    let flat_sets: i64 = count(
+        &conn,
+        "SELECT COUNT(*) FROM calibration_set WHERE imagetyp = 'Flat' AND is_master_library = 0",
+    );
+    assert_eq!(flat_sets, 1);
+    let flat_members: i64 = count(&conn, "SELECT COUNT(*) FROM calibration_set_frames csf JOIN calibration_set cs ON cs.id = csf.set_id WHERE cs.imagetyp = 'Flat'");
+    assert_eq!(flat_members, 2);
+    let master_sets: i64 = count(
+        &conn,
+        "SELECT COUNT(*) FROM calibration_set WHERE is_master_library = 1",
+    );
+    assert_eq!(master_sets, 1);
+    // `insert_frame` stores `imagetyp` as the enum's Debug name (`MasterDark`).
+    let is_master: i64 = count(
+        &conn,
+        "SELECT is_master FROM frames WHERE imagetyp = 'MasterDark'",
+    );
+    assert_eq!(is_master, 1);
+    // Lights never enter a calibration set.
+    let light_sets: i64 = count(&conn, "SELECT COUNT(*) FROM calibration_set_frames csf JOIN frames f ON f.id = csf.frame_id WHERE f.imagetyp = 'Light'");
+    assert_eq!(light_sets, 0);
+}
+
+/// The master the receiver builds from a package equals what the scanner
+/// would build from the same file (the direct-registration pin's technique).
+#[test]
+fn received_master_set_matches_scanner_ingestion() {
+    use crate::fits_writer::keywords::FrameKind;
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn_a = catalog_conn();
+    let (pkg, ann) = build_typed_package(
+        tmp.path(),
+        "m",
+        &[("master_dark.fits", FrameKind::MasterDark)],
+    );
+    ingest_package(
+        IngestConn::Borrowed(&conn_a),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let scan_dir = tmp.path().join("scan");
+    std::fs::create_dir_all(&scan_dir).unwrap();
+    std::fs::copy(
+        pkg.join("camera_testcam/DARKS_1/master_dark.fits"),
+        scan_dir.join("master_dark.fits"),
+    )
+    .unwrap();
+    let conn_b = catalog_conn();
+    conn_b
+        .execute(
+            "INSERT INTO scan_roots (path) VALUES (?1)",
+            [scan_dir.to_string_lossy()],
+        )
+        .unwrap();
+    let scan = crate::scanner::scan_directory(&scan_dir, &conn_b, None, false, 1);
+    assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+
+    const SET_COLS: &str =
+        "imagetyp, is_master_library, frame_count, exptime, gain, offset, binning, instrume";
+    let set_row = |conn: &Connection| -> Vec<Option<String>> {
+        conn.query_row(
+            &format!("SELECT {SET_COLS} FROM calibration_set WHERE is_master_library = 1"),
+            [],
+            |r| {
+                Ok((0..8)
+                    .map(|i| col_to_string(r.get_ref(i).unwrap()))
+                    .collect())
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        set_row(&conn_a),
+        set_row(&conn_b),
+        "received master set must equal a scanned one"
+    );
+}
+
+/// SQLite value → comparable string (same helper the direct-registration pin
+/// in `calibration_library/register.rs` uses; copied, tests are per-module).
+fn col_to_string(v: rusqlite::types::ValueRef) -> Option<String> {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Text(t) => Some(String::from_utf8_lossy(t).to_string()),
+        ValueRef::Blob(_) => None,
+    }
+}

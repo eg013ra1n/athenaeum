@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{File, FileFormat, Frame};
+use crate::models::{File, FileFormat, Frame, ImageType};
 use crate::package::{self, ManifestRecord, PayloadKind};
 use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome};
 
@@ -155,6 +155,11 @@ pub struct IngestOutcome {
     pub duplicate: u32,
     pub skipped_older: u32,
     pub rejected: u32,
+    /// Why the post-package calibration-set integration failed, when it did
+    /// (spec 2026-08-28 §4.2 / D3). Never fails the package — the frames are
+    /// landed and catalogued either way; the receiver journals this on the
+    /// batch so the failure is visible instead of silent.
+    pub integration_error: Option<String>,
 }
 
 impl IngestOutcome {
@@ -177,10 +182,9 @@ struct FrameVerdict {
     history_outcome: &'static str,
     /// The catalog row this frame inserted — `(frames.id, imagetyp)` — or `None`
     /// when nothing was cataloged (duplicate, rejected, or a `CalibratedLight`
-    /// artifact, which never gets a `frames` row at all). Carried so the caller
-    /// can act on what an ingest actually created; not read yet.
-    #[allow(dead_code)]
-    inserted: Option<(i64, Option<crate::models::ImageType>)>,
+    /// artifact, which never gets a `frames` row at all). The package epilogue
+    /// runs the calibration-set integration over exactly these rows.
+    inserted: Option<(i64, Option<ImageType>)>,
 }
 
 /// Ingest one fetched package into the catalog on `conn`, landing accepted
@@ -255,6 +259,10 @@ pub fn ingest_package(
             Ok((landing_base, existing_receipts))
         })?;
 
+    // The `frames` rows this package inserted, fed to the calibration-set
+    // integration once the loop is done (spec 2026-08-28 §4.2 / D3).
+    let mut inserted: Vec<(i64, Option<ImageType>)> = Vec::new();
+
     for record in &records {
         // The redelivery-skip branch needs no connection at all.
         if let Some(prior) = existing_receipts.get(&record.frame_uuid) {
@@ -314,13 +322,53 @@ pub fn ingest_package(
             }
         });
 
-        match verdict.history_outcome {
+        let FrameVerdict {
+            receipt,
+            history_outcome,
+            inserted: this_inserted,
+        } = verdict;
+        if let Some(i) = this_inserted {
+            inserted.push(i);
+        }
+        match history_outcome {
             "ingested" => outcome.ingested += 1,
             "skipped_older" => outcome.skipped_older += 1,
             "rejected" => outcome.rejected += 1,
             _ => outcome.duplicate += 1,
         }
-        outcome.receipts.push(verdict.receipt);
+        outcome.receipts.push(receipt);
+    }
+
+    // Package epilogue (spec 2026-08-28 §4.2 / D3): the frames this ingest
+    // inserted have no calibration sets yet — the scanner's tail only ever runs
+    // over a scan pass's own inserts, and a later scan skips an already-cataloged
+    // path. Run that same tail here so received calibration frames and masters
+    // look exactly like scanned ones. A failure is logged + recorded on the
+    // outcome (the receiver journals it on the batch) and never fails the
+    // package: the frames are landed and catalogued regardless.
+    if !inserted.is_empty() {
+        let result = conn.with(|c| integrate_calibration_sets(c, &inserted));
+        match result {
+            Ok(Some(r)) => tracing::info!(
+                package_id = %announce.package_id.0,
+                count = r.sets_created,
+                master_count = r.master_dark_sets_created
+                    + r.master_flat_sets_created
+                    + r.master_bias_sets_created
+                    + r.master_darkflat_sets_created,
+                "sync ingest: calibration sets created"
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(
+                    package_id = %announce.package_id.0,
+                    error = %msg,
+                    "sync ingest: calibration-set integration failed"
+                );
+                outcome.integration_error = Some(msg);
+            }
+        }
     }
 
     tracing::info!(
@@ -332,6 +380,47 @@ pub fn ingest_package(
         "sync ingest done"
     );
     Ok(outcome)
+}
+
+/// The scanner's tail, run over the frames this ingest inserted (spec
+/// 2026-08-28 §4.2 / D3): raw calibration frames cluster into sets, each
+/// master becomes one `is_master_library = 1` set. `Ok(None)` = nothing to do.
+fn integrate_calibration_sets(
+    conn: &Connection,
+    inserted: &[(i64, Option<ImageType>)],
+) -> Result<Option<crate::calibration::scan_integration::CalibrationScanResult>> {
+    use crate::calibration::scan_integration::{
+        create_calibration_sets_from_scan_with_masters, MasterFrameIds,
+    };
+    let (mut flats, mut darks, mut bias, mut darkflats) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut masters = MasterFrameIds::default();
+    for (id, kind) in inserted {
+        match kind {
+            Some(ImageType::Flat) => flats.push(*id),
+            Some(ImageType::Dark) => darks.push(*id),
+            Some(ImageType::Bias) => bias.push(*id),
+            Some(ImageType::DarkFlat) => darkflats.push(*id),
+            Some(ImageType::MasterDark) => masters.master_dark_ids.push(*id),
+            Some(ImageType::MasterFlat) => masters.master_flat_ids.push(*id),
+            Some(ImageType::MasterBias) => masters.master_bias_ids.push(*id),
+            Some(ImageType::MasterDarkFlat) => masters.master_darkflat_ids.push(*id),
+            Some(ImageType::Light) | Some(ImageType::MasterLight) | None => {}
+        }
+    }
+    if flats.is_empty()
+        && darks.is_empty()
+        && bias.is_empty()
+        && darkflats.is_empty()
+        && masters.is_empty()
+    {
+        return Ok(None);
+    }
+    let r = create_calibration_sets_from_scan_with_masters(
+        conn, flats, darks, bias, darkflats, masters,
+    )
+    .context("create calibration sets from ingested frames")?;
+    Ok(Some(r))
 }
 
 /// Process one manifest record end to end and return its verdict. All DB writes
@@ -453,9 +542,11 @@ fn process_frame(
     // heaviest store write, where SQLite write contention with the sender's
     // separate connection would surface. Instrumentation only — no behavior change.
     let write_started = std::time::Instant::now();
+    let mut inserted_frame: Option<i64> = None;
     let write_result: Result<()> = (|| {
         let tx = conn.unchecked_transaction().context("begin ingest tx")?;
-        insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
+        let frame_id = insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
+        inserted_frame = Some(frame_id);
         insert_receipt(&tx, package_id, &receipt, started_at)?;
         insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", history_key, batch_name))?;
         tx.commit().context("commit ingest tx")
@@ -484,7 +575,11 @@ fn process_frame(
     }
 
     tracing::info!(frame_uuid = %record.frame_uuid, path = %landed.display(), "sync ingest frame landed");
-    Ok(FrameVerdict { receipt, history_outcome: "ingested", inserted: None })
+    Ok(FrameVerdict {
+        receipt,
+        history_outcome: "ingested",
+        inserted: inserted_frame.map(|id| (id, snapshot.imagetyp.clone())),
+    })
 }
 
 /// A calibrated-light artifact (spec 2026-08-28 §4.1): land it, never catalog it,
@@ -681,14 +776,16 @@ fn land_payload(
 }
 
 /// Insert the `files` + `fits_header` + `frames` rows for an ingested frame,
-/// carrying the manifest `frame_uuid` onto `frames.uuid`. Runs on `tx`.
+/// carrying the manifest `frame_uuid` onto `frames.uuid`. Runs on `tx`. Returns
+/// the new `frames.id` — the package epilogue's calibration-set integration
+/// works from exactly the rows this inserted.
 fn insert_ingested_rows(
     tx: &Connection,
     landed: &Path,
     record: &ManifestRecord,
     snapshot: &Frame,
     content_hash: &str,
-) -> Result<()> {
+) -> Result<i64> {
     let format = format_of(&record.rel_path);
     let now = chrono::Utc::now();
     let modified_at = snapshot.date_obs.unwrap_or(now);
@@ -780,7 +877,7 @@ fn insert_ingested_rows(
         }
     }
 
-    Ok(())
+    Ok(frame_id)
 }
 
 /// Write the receipt + history rows for one frame in a single transaction.

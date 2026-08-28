@@ -2525,6 +2525,19 @@ async fn handle_announce(
         }
     };
 
+    // The package itself succeeded even when the calibration-set integration
+    // (spec 2026-08-28 §4.2 / D3) did not: every frame is landed and catalogued,
+    // only the sets are missing. Journal it on the batch so the failure is
+    // visible in the transfer's event list instead of only in the log.
+    if let Some(err) = &outcome.integration_error {
+        journal(
+            store,
+            inbound_id,
+            "calibration_integration_failed",
+            Some(err),
+        );
+    }
+
     // Settle the per-file rows from the per-frame receipts (Transfers Status Model v2
     // §D4) — OUTSIDE the ingest transaction (it committed inside `ingest_package`),
     // keyed rel_path ← frame_uuid via the announced file rows. `done` + the receiver's
