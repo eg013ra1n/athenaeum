@@ -20,6 +20,9 @@ pub mod calendar;
 pub mod frame_sets;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
+// Frame-set send (spec 2026-08-28): the `PayloadEntry` currency `api::sync`'s
+// package builder consumes. Ungated: models/package types only.
+pub mod frame_set_send;
 // Trigger policy for the whole-library content-hash index. Ungated: db +
 // duplicates::backfill + the compute queue, plus `api::sync`'s own gate.
 pub mod content_index;

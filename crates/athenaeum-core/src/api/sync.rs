@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::frame_set_send::PayloadEntry;
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
@@ -2672,6 +2673,18 @@ struct BuiltSelection {
     files: Vec<(String, u64, String)>,
 }
 
+/// What a package build starts from: the entries to write plus the caller's
+/// already-known ineligible frames and reporting context.
+pub(crate) struct SelectionInput {
+    pub(crate) entries: Vec<PayloadEntry>,
+    pub(crate) ineligible: Vec<IneligibleFrame>,
+    /// Common ancestor of the selection's files (browser sends) — feeds the
+    /// auto batch name. `None` for frame-set sends.
+    pub(crate) ancestor: Option<PathBuf>,
+    /// Frames the caller was asked for (the `M` in `N of M`).
+    pub(crate) total: usize,
+}
+
 /// The package `rel_path` layout chosen for one send (T3, spec §D2).
 enum RelPathLayout {
     /// Object send: `frame_id → WBPP rel_dir` (forward-slash, frame-set name NOT
@@ -2899,20 +2912,16 @@ fn bank_manifest_hashes(conn: &rusqlite::Connection, bank: &[(i64, String)]) {
     }
 }
 
-/// Build ONE package from exactly the eligible frames in `frame_ids`. INELIGIBLE
-/// frames — not in the catalog, or whose file is missing/unreadable on disk — are
-/// collected and returned, never silently dropped (task M2). The manifest mirrors
-/// what Perseus builds (serialized `models::Frame` as `frame_meta` + the analysis
-/// summary when present) so the primary ingests app- and Perseus-sourced frames
-/// identically.
-fn build_selection_package(
+/// Resolve a frame-id selection into payload entries — the catalog-lookup half
+/// of a send: which requested ids are real frames, where each one's file sits,
+/// and the package `rel_path` it gets under the chosen layout (§D2). Ids with no
+/// catalog row come back as ineligible here; the missing/unreadable-file half of
+/// eligibility belongs to [`build_selection_package`], which is what touches disk.
+fn selection_entries(
     conn: &rusqlite::Connection,
-    origin_device: &str,
-    packages_dir: &Path,
     frame_ids: &[i64],
-    batch_name: Option<&str>,
     frame_set_id: Option<i64>,
-) -> Result<BuiltSelection, ApiError> {
+) -> Result<SelectionInput, ApiError> {
     // Dedup requested ids, preserving first-seen order for stable reporting.
     let mut seen_req = HashSet::new();
     let requested: Vec<i64> = frame_ids
@@ -2924,10 +2933,6 @@ fn build_selection_package(
 
     let rows = crate::db::get_frames_with_files_by_ids(conn, &requested)
         .map_err(|e| ApiError::Internal(format!("resolve frames for selection: {e:#}")))?;
-    let analyses = crate::db::analysis::get_frame_analyses_by_ids(conn, &requested)
-        .map_err(|e| ApiError::Internal(format!("load analysis summaries: {e:#}")))?;
-    let analysis_by_frame: HashMap<i64, &crate::models::FrameAnalysis> =
-        analyses.iter().map(|a| (a.frame_id, a)).collect();
 
     // Common ancestor of the selection's files — drives both the source-relative
     // rel_path layout and the common-ancestor auto-name. Computed over every row
@@ -2965,11 +2970,100 @@ fn build_selection_package(
         None => RelPathLayout::SourceRelative(ancestor.clone()),
     };
 
+    // Per-directory used-filename sets for collision suffixing (§D2).
+    let mut used_by_dir: HashMap<String, HashSet<String>> = HashMap::new();
     let mut resolved: HashSet<i64> = HashSet::new();
-    let mut ineligible: Vec<IneligibleFrame> = Vec::new();
+    let mut entries = Vec::with_capacity(rows.len());
+    for (_file_id, file, frame) in &rows {
+        let Some(frame_id) = frame.id else { continue };
+        resolved.insert(frame_id);
+        // A hand-picked master is labeled honestly, which is also what keeps it
+        // out of the retention linkage in the builder below (§D5).
+        let kind = if frame.imagetyp.as_ref().is_some_and(|t| t.is_master()) {
+            PayloadKind::Master
+        } else {
+            PayloadKind::RawFrame
+        };
+        entries.push(PayloadEntry {
+            frame_id,
+            source_path: PathBuf::from(&file.path),
+            rel_path: assign_rel_path(&layout, frame_id, file, &mut used_by_dir),
+            kind,
+        });
+    }
+
+    // Requested ids that never resolved to a catalog row at all.
+    let ineligible = requested
+        .iter()
+        .filter(|id| !resolved.contains(id))
+        .map(|id| IneligibleFrame {
+            frame_id: *id,
+            reason: "frame not found in catalog".to_string(),
+        })
+        .collect();
+
+    Ok(SelectionInput {
+        entries,
+        ineligible,
+        ancestor,
+        total,
+    })
+}
+
+/// Build ONE package from exactly the payload entries in `input`. INELIGIBLE
+/// entries — whose frame is not (or no longer) in the catalog, or whose file is
+/// missing/unreadable on disk — are collected and returned, never silently
+/// dropped (task M2). The manifest mirrors what Perseus builds (serialized
+/// `models::Frame` as `frame_meta` + the analysis summary when present) so the
+/// primary ingests app- and Perseus-sourced frames identically.
+///
+/// Per-kind rules (spec 2026-08-28 §3 step 5 / §D5):
+/// - [`PayloadKind::RawFrame`] — the frame's own snapshot and uuid, `strong_hash`
+///   banked, and the ONLY kind that gets a `sync_sources` retention linkage row.
+/// - [`PayloadKind::Master`] — the same manifest as a raw frame, but no linkage:
+///   a master is shared by construction, so retention must never reclaim it out
+///   from under its other consumers.
+/// - [`PayloadKind::CalibratedLight`] — an artifact that is not in the catalog at
+///   all: it carries the SOURCE light's `frame_meta` under its own fresh uuid,
+///   with no analysis, no hash banking (the catalog row describes the source
+///   file, not this one) and no linkage.
+fn build_selection_package(
+    conn: &rusqlite::Connection,
+    origin_device: &str,
+    packages_dir: &Path,
+    input: SelectionInput,
+    batch_name: Option<&str>,
+    frame_set_id: Option<i64>,
+) -> Result<BuiltSelection, ApiError> {
+    // Load each referenced frame's snapshot once, indexed by frame id rather than
+    // walked row-by-row: two entries may share one frame (a calibrated artifact
+    // and its source light both point at the light's catalog row).
+    let mut seen_frame = HashSet::new();
+    let frame_ids: Vec<i64> = input
+        .entries
+        .iter()
+        .map(|e| e.frame_id)
+        .filter(|id| seen_frame.insert(*id))
+        .collect();
+    let rows = crate::db::get_frames_with_files_by_ids(conn, &frame_ids)
+        .map_err(|e| ApiError::Internal(format!("resolve frames for selection: {e:#}")))?;
+    let by_frame: HashMap<i64, (i64, &crate::models::File, &crate::models::Frame)> = rows
+        .iter()
+        .filter_map(|(file_id, file, frame)| Some((frame.id?, (*file_id, file, frame))))
+        .collect();
+    let analyses = crate::db::analysis::get_frame_analyses_by_ids(conn, &frame_ids)
+        .map_err(|e| ApiError::Internal(format!("load analysis summaries: {e:#}")))?;
+    let analysis_by_frame: HashMap<i64, &crate::models::FrameAnalysis> =
+        analyses.iter().map(|a| (a.frame_id, a)).collect();
+
+    // The caller's own ineligible frames (ids that never resolved) come first;
+    // the per-file failures below append to the same list.
+    let mut ineligible: Vec<IneligibleFrame> = input.ineligible;
     let mut eligible: Vec<i64> = Vec::new();
     let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::new();
-    // Per-directory used-filename sets for collision suffixing (§D2).
+    // Per-directory used-filename sets for collision suffixing (§D2). The caller
+    // owns the directory; the filename is deduped within it here so no two
+    // entries can overwrite each other inside the package.
     let mut used_by_dir: HashMap<String, HashSet<String>> = HashMap::new();
     // Per-eligible source linkage recorded into `sync_sources` after the package
     // is written: (catalog file_id, absolute path, size, mtime_ms). This is what
@@ -2984,14 +3078,19 @@ fn build_selection_package(
     // transaction below; a bank failure never fails the send.
     let mut bank: Vec<(i64, String)> = Vec::new();
 
-    for (file_id, file, frame) in &rows {
-        let Some(frame_id) = frame.id else { continue };
-        resolved.insert(frame_id);
+    for entry in &input.entries {
+        let Some((file_id, file, frame)) = by_frame.get(&entry.frame_id).copied() else {
+            ineligible.push(IneligibleFrame {
+                frame_id: entry.frame_id,
+                reason: "frame not found in catalog".to_string(),
+            });
+            continue;
+        };
 
-        let path = Path::new(&file.path);
+        let path = entry.source_path.as_path();
         if !path.exists() {
             ineligible.push(IneligibleFrame {
-                frame_id,
+                frame_id: entry.frame_id,
                 reason: "file missing on disk".to_string(),
             });
             continue;
@@ -3000,7 +3099,7 @@ fn build_selection_package(
             Ok(m) => m,
             Err(e) => {
                 ineligible.push(IneligibleFrame {
-                    frame_id,
+                    frame_id: entry.frame_id,
                     reason: format!("cannot stat file: {e}"),
                 });
                 continue;
@@ -3012,47 +3111,71 @@ fn build_selection_package(
             Ok(h) => h,
             Err(e) => {
                 ineligible.push(IneligibleFrame {
-                    frame_id,
+                    frame_id: entry.frame_id,
                     reason: format!("cannot read file: {e:#}"),
                 });
                 continue;
             }
         };
-        if crate::duplicates::backfill::disk_matches_row(
-            path,
-            file.size,
-            &file.modified_at.to_rfc3339(),
-        ) {
-            bank.push((*file_id, xxh3.clone()));
+        // A calibrated artifact is NOT the file the catalog row describes, so
+        // neither its hash nor its analysis may be attributed to that row.
+        let is_catalog_file = entry.kind != PayloadKind::CalibratedLight;
+        if is_catalog_file
+            && crate::duplicates::backfill::disk_matches_row(
+                path,
+                file.size,
+                &file.modified_at.to_rfc3339(),
+            )
+        {
+            bank.push((file_id, xxh3.clone()));
         }
         let frame_meta = match serde_json::to_value(frame) {
             Ok(v) => v,
             Err(e) => {
                 ineligible.push(IneligibleFrame {
-                    frame_id,
+                    frame_id: entry.frame_id,
                     reason: format!("serialize frame_meta: {e}"),
                 });
                 continue;
             }
         };
-        let analysis = match analysis_by_frame.get(&frame_id) {
-            Some(a) => match serde_json::to_value(a) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(frame_id, error = %e, "sync selection: analysis serialize failed; omitting");
-                    None
-                }
-            },
-            None => None,
+        let analysis = if is_catalog_file {
+            analysis_by_frame
+                .get(&entry.frame_id)
+                .and_then(|a| match serde_json::to_value(a) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(frame_id = entry.frame_id, error = %e, "sync selection: analysis serialize failed; omitting");
+                        None
+                    }
+                })
+        } else {
+            None
         };
 
         // Identity anchor: the catalog frame uuid (the receiver dedups on it).
-        let frame_uuid = frame
-            .uuid
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let rel_path = assign_rel_path(&layout, frame_id, file, &mut used_by_dir);
+        // A calibrated artifact is a distinct file from its source light, so it
+        // gets its own identity — reusing the light's uuid would make the
+        // receiver treat the two as the same frame.
+        let frame_uuid = match entry.kind {
+            PayloadKind::CalibratedLight => uuid::Uuid::new_v4().to_string(),
+            _ => frame
+                .uuid
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        };
+        // The caller assigned the directory; only the filename is deduped here.
+        let (dir, base) = match entry.rel_path.rsplit_once('/') {
+            Some((d, b)) => (d.to_string(), b.to_string()),
+            None => (String::new(), entry.rel_path.clone()),
+        };
+        let name = dedup_in_dir(&dir, &base, &mut used_by_dir);
+        let rel_path = if dir.is_empty() {
+            name
+        } else {
+            format!("{dir}/{name}")
+        };
 
         records.push((
             path.to_path_buf(),
@@ -3061,7 +3184,7 @@ fn build_selection_package(
                 frame_uuid: frame_uuid.clone(),
                 origin_catalog_uuid: frame_uuid,
                 origin_device: origin_device.to_string(),
-                payload_kind: PayloadKind::RawFrame,
+                payload_kind: entry.kind.clone(),
                 rel_path,
                 byte_size,
                 xxh3,
@@ -3071,28 +3194,23 @@ fn build_selection_package(
                 project: None,
             },
         ));
-        eligible.push(frame_id);
-        source_links.push((*file_id, file.path.clone(), byte_size, mtime_ms));
+        eligible.push(entry.frame_id);
+        // Retention linkage for raw frames ONLY (§D5): a master is shared by
+        // construction and a calibrated artifact is a rebuildable by-product, so
+        // neither may be swept as "the source this package delivered".
+        if entry.kind == PayloadKind::RawFrame {
+            source_links.push((file_id, file.path.clone(), byte_size, mtime_ms));
+        }
     }
 
     bank_manifest_hashes(conn, &bank);
-
-    // Requested ids that never resolved to a catalog row at all.
-    for id in &requested {
-        if !resolved.contains(id) {
-            ineligible.push(IneligibleFrame {
-                frame_id: *id,
-                reason: "frame not found in catalog".to_string(),
-            });
-        }
-    }
 
     if records.is_empty() {
         return Ok(BuiltSelection {
             pkg_dir: None,
             eligible,
             ineligible,
-            total,
+            total: input.total,
             display_name: None,
             files: Vec::new(),
         });
@@ -3104,7 +3222,7 @@ fn build_selection_package(
         batch_name,
         conn,
         frame_set_id,
-        ancestor.as_deref(),
+        input.ancestor.as_deref(),
         records.len(),
     );
     let files: Vec<(String, u64, String)> = records
@@ -3135,7 +3253,7 @@ fn build_selection_package(
         pkg_dir: Some(pkg_dir),
         eligible,
         ineligible,
-        total,
+        total: input.total,
         display_name: Some(display_name),
         files,
     })
@@ -3157,11 +3275,12 @@ async fn build_and_enqueue_selection(
     let built = {
         let db = db(ctx)?;
         let conn = db.conn();
+        let input = selection_entries(&conn, frame_ids, frame_set_id)?;
         build_selection_package(
             &conn,
             origin_device,
             packages_dir,
-            frame_ids,
+            input,
             batch_name,
             frame_set_id,
         )?
@@ -7374,7 +7493,15 @@ mod tests {
         let built = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None).unwrap()
+            build_selection_package(
+                &conn,
+                "origin-dev",
+                &pkg_root,
+                selection_entries(&conn, &[f1, f2], None).unwrap(),
+                None,
+                None,
+            )
+            .unwrap()
         };
         assert_eq!(built.eligible.len(), 2);
         assert!(built.ineligible.is_empty());
@@ -7450,9 +7577,15 @@ mod tests {
             .unwrap();
 
         let pkg_root = dir.join("packages");
-        let built =
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[current, stale], None, None)
-                .unwrap();
+        let built = build_selection_package(
+            &conn,
+            "origin-dev",
+            &pkg_root,
+            selection_entries(&conn, &[current, stale], None).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(built.eligible.len(), 2, "both files exist on disk, both are packaged");
         let expect = crate::package::xxh3_full_file(std::path::Path::new(&current_path)).unwrap();
 
@@ -7481,8 +7614,15 @@ mod tests {
         let pkg_root = tmp.path().join("packages");
         let db = db(&ctx).unwrap();
         let conn = db.conn();
-        let built =
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None).unwrap();
+        let built = build_selection_package(
+            &conn,
+            "origin-dev",
+            &pkg_root,
+            selection_entries(&conn, &[f1, f2], None).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
         let pkg_ref = built
             .pkg_dir
             .clone()
@@ -7535,7 +7675,7 @@ mod tests {
                 &conn,
                 "origin-dev",
                 &pkg_root,
-                &[f1, f2, unknown],
+                selection_entries(&conn, &[f1, f2, unknown], None).unwrap(),
                 None,
                 None,
             )
@@ -7622,10 +7762,17 @@ mod tests {
         let pkg_root = tmp.join("packages");
         let db = db(ctx).unwrap();
         let conn = db.conn();
-        build_selection_package(&conn, "origin-dev", &pkg_root, &[f1], None, None)
-            .unwrap()
-            .pkg_dir
-            .expect("a package was written")
+        build_selection_package(
+            &conn,
+            "origin-dev",
+            &pkg_root,
+            selection_entries(&conn, &[f1], None).unwrap(),
+            None,
+            None,
+        )
+        .unwrap()
+        .pkg_dir
+        .expect("a package was written")
     }
 
     /// A loopback sender engine bound to the SAME catalog store the api fns read,
@@ -8162,10 +8309,17 @@ mod tests {
         let pkg_dir = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None)
-                .unwrap()
-                .pkg_dir
-                .expect("a package was written")
+            build_selection_package(
+                &conn,
+                "origin-dev",
+                &pkg_root,
+                selection_entries(&conn, &[f1, f2], None).unwrap(),
+                None,
+                None,
+            )
+            .unwrap()
+            .pkg_dir
+            .expect("a package was written")
         };
 
         // Reactive loopback receiver: fetch every announce and ack each frame
@@ -8278,18 +8432,32 @@ mod tests {
         let intact_dir = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root2, &[f1, f2], None, None)
-                .unwrap()
-                .pkg_dir
-                .expect("a package was written")
+            build_selection_package(
+                &conn,
+                "origin-dev",
+                &pkg_root2,
+                selection_entries(&conn, &[f1, f2], None).unwrap(),
+                None,
+                None,
+            )
+            .unwrap()
+            .pkg_dir
+            .expect("a package was written")
         };
         let swept_dir = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root2, &[f1, f2], None, None)
-                .unwrap()
-                .pkg_dir
-                .expect("a package was written")
+            build_selection_package(
+                &conn,
+                "origin-dev",
+                &pkg_root2,
+                selection_entries(&conn, &[f1, f2], None).unwrap(),
+                None,
+                None,
+            )
+            .unwrap()
+            .pkg_dir
+            .expect("a package was written")
         };
         std::fs::remove_dir_all(&swept_dir).unwrap();
 
@@ -8357,11 +8525,17 @@ mod tests {
         let (pkg_dir, id) = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let pkg_dir =
-                build_selection_package(&conn, "origin-dev", &pkg_root, &[f1], None, None)
-                    .unwrap()
-                    .pkg_dir
-                    .expect("a package was written");
+            let pkg_dir = build_selection_package(
+                &conn,
+                "origin-dev",
+                &pkg_root,
+                selection_entries(&conn, &[f1], None).unwrap(),
+                None,
+                None,
+            )
+            .unwrap()
+            .pkg_dir
+            .expect("a package was written");
             drop(conn);
             let store = CatalogSyncStore::open(&db_path).unwrap();
             let id = store
@@ -8988,6 +9162,129 @@ mod tests {
             assign_rel_path(&layout, 2, &file_at("/b/x.fits", "x.fits"), &mut used),
             "camera_asi/lights/x_2.fits"
         );
+    }
+
+    /// Builder over payload entries: kinds, rel_paths and the retention linkage
+    /// rule (spec 2026-08-28 §3 step 5 / D5).
+    #[test]
+    fn build_selection_package_honours_payload_kinds() {
+        use crate::db::schema::init_db;
+        use crate::fits_writer::write_fits_f32;
+        use crate::package::PayloadKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // One raw light (frame 10), one master (frame 20), one calibrated
+        // artifact of frame 10 that is NOT in the catalog.
+        let light = tmp.path().join("L_10.fits");
+        let master = tmp.path().join("master_dark.fits");
+        let artifact = tmp.path().join("c_L_10.fits");
+        for p in [&light, &master, &artifact] {
+            write_fits_f32(p, 4, 4, 1, &[1.0f32; 16], &[]).unwrap();
+        }
+        let insert = |file_id: i64,
+                      frame_id: i64,
+                      path: &std::path::Path,
+                      imagetyp: &str,
+                      is_master: i64| {
+            let meta = std::fs::metadata(path).unwrap();
+            let mtime: chrono::DateTime<chrono::Utc> = meta.modified().unwrap().into();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, ?4, ?5, 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy(), meta.len() as i64, mtime.to_rfc3339()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, is_master, uuid) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![frame_id, file_id, imagetyp, is_master, format!("uuid-{frame_id}")],
+            ).unwrap();
+        };
+        insert(1, 10, &light, "Light", 0);
+        insert(2, 20, &master, "MasterDark", 1);
+
+        let input = SelectionInput {
+            entries: vec![
+                PayloadEntry {
+                    frame_id: 10,
+                    source_path: light.clone(),
+                    rel_path: "camera_X/lights/L_10.fits".into(),
+                    kind: PayloadKind::RawFrame,
+                },
+                PayloadEntry {
+                    frame_id: 20,
+                    source_path: master.clone(),
+                    rel_path: "camera_X/DARKS_5/master_dark.fits".into(),
+                    kind: PayloadKind::Master,
+                },
+                PayloadEntry {
+                    frame_id: 10,
+                    source_path: artifact.clone(),
+                    rel_path: "camera_X/lights/c_L_10.fits".into(),
+                    kind: PayloadKind::CalibratedLight,
+                },
+            ],
+            ineligible: Vec::new(),
+            ancestor: None,
+            total: 3,
+        };
+        let packages = tmp.path().join("packages");
+        let built = build_selection_package(
+            &conn,
+            "ab".repeat(32).as_str(),
+            &packages,
+            input,
+            Some("Test batch"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(built.eligible.len(), 3);
+        assert!(built.ineligible.is_empty());
+        let dir = built.pkg_dir.unwrap();
+        let records = crate::package::read_manifest(&dir).unwrap();
+        let by_rel: std::collections::HashMap<_, _> =
+            records.iter().map(|r| (r.rel_path.clone(), r)).collect();
+        assert_eq!(
+            by_rel["camera_X/lights/L_10.fits"].payload_kind,
+            PayloadKind::RawFrame
+        );
+        assert_eq!(by_rel["camera_X/lights/L_10.fits"].frame_uuid, "uuid-10");
+        assert_eq!(
+            by_rel["camera_X/DARKS_5/master_dark.fits"].payload_kind,
+            PayloadKind::Master
+        );
+        let cal = by_rel["camera_X/lights/c_L_10.fits"];
+        assert_eq!(cal.payload_kind, PayloadKind::CalibratedLight);
+        assert_ne!(
+            cal.frame_uuid, "uuid-10",
+            "artifact carries its own identity"
+        );
+        assert_eq!(
+            cal.frame_meta["uuid"], "uuid-10",
+            "frame_meta is the SOURCE light's snapshot"
+        );
+        assert!(cal.analysis.is_none());
+        // Retention linkage: only the raw light.
+        let linked: Vec<i64> = conn
+            .prepare("SELECT file_id FROM sync_sources ORDER BY file_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            linked,
+            vec![1],
+            "masters and artifacts never enter sync_sources"
+        );
+        // strong_hash banked for catalog files only.
+        let banked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE strong_hash IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(banked, 2);
     }
 
     /// `resolve_batch_name` — each of the three auto-name rules plus the verbatim
