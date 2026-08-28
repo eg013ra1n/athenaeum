@@ -5,6 +5,7 @@ import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { useScanRootsWithAvailability } from '../../hooks/useTauri';
 import { useScanProgressContext } from '../../contexts/ScanProgressContext';
+import { useContentIndex } from '../../hooks/useContentIndex';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { listArchiveRoots, listArchivedFrameSets, deleteArchiveRoot, setDefaultArchiveRoot } from '../../api/archive';
 import { ConfirmDialog } from '../ConfirmDialog';
@@ -50,6 +51,8 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
   } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning, activeScans } = useScanProgressContext();
   const { notify } = useNotifications();
+  // Content index — status + manual start for the rail's build button.
+  const contentIndex = useContentIndex();
 
   const [archiveRoots, setArchiveRoots] = useState<ArchiveRoot[]>([]);
   const [archivedSets, setArchivedSets] = useState<ArchivedFrameSetSummary[]>([]);
@@ -254,6 +257,11 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
       setScanResultMap((prev) => ({ ...prev, [rootId]: result }));
       setScanSummary({ rootId, rootPath: root.path, missingFilesCount: result.missingFilesCount });
       refreshAll();
+      // The scan just added rows the index has not hashed. The job only re-arms
+      // itself when sync is set up or content grouping is on, so without this
+      // the rail's pending count would stay stale on exactly the setup where
+      // the button is the only way to build it.
+      contentIndex.refresh();
     } catch (e) {
       console.error('[FoldersTab] scan failed:', e);
       showAlert('Scan failed', typeof e === 'string' ? e : String(e));
@@ -566,6 +574,12 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onRescan={handleScan}
             isScanning={isScanning}
             scanPercent={scanPercent}
+            contentIndex={{
+              pending: contentIndex.status?.pending ?? null,
+              running: contentIndex.running,
+              starting: contentIndex.starting,
+              onBuild: contentIndex.start,
+            }}
           />
           <Fragment key={selectionKey}>
             {inspector ?? (

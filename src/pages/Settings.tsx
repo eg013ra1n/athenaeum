@@ -1150,51 +1150,16 @@ export default function Settings() {
         </div>
 
         <div>
-          <h3 className="text-lg font-semibold mb-4">Duplicate Detection</h3>
-
-          <div className="space-y-4">
-            {/* Content Hash Toggle */}
-            <div>
-              <label className="flex items-center gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={useContentHash}
-                  onChange={(e) => setUseContentHash(e.target.checked)}
-                  className="w-5 h-5 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0"
-                />
-                <div>
-                  <span className="block text-sm font-medium text-content-secondary">
-                    Group duplicates by file content (XXHash)
-                  </span>
-                  <span className="block text-xs text-content-muted mt-1">
-                    Groups the Duplicates view by a hash of the file's bytes instead of by
-                    its FITS/XISF header. In the default mode, masters and processed files
-                    are matched by their full contents. With this on, everything — masters
-                    included — is grouped by the sampled content hash instead, which reads
-                    only 1.5 MB of each file; run a deep verify before deleting masters in
-                    this mode.
-                  </span>
-                  <span className="block text-xs text-content-muted mt-1">
-                    Left off, raw sub-frames are grouped by their stored header, which every
-                    scan already records — no extra reading, and copies still match after a
-                    move between drives changed their timestamps. With this on, scans also
-                    hash new and changed files as they go, which is slower on NAS or other
-                    network storage; the content index below fills in the rest.
-                  </span>
-                </div>
-              </label>
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <h3 className="text-lg font-semibold mb-4">Content Index</h3>
+          <h3 className="text-lg font-semibold mb-4">Content index</h3>
           <div className="p-4 bg-surface rounded-lg border border-border space-y-3">
             <p className="text-xs text-content-muted">
-              A content hash of every catalogued file, used to skip files a device already has
-              when transferring, and to group duplicates by content. Building it reads about
-              1.5 MB per file, so it runs in the background as a job of its own — not as part of
-              a scan — and you can stop it any time from the job card in the sidebar.
+              A sampled content hash of every catalogued file — the first, middle and last
+              512 KB, about 1.5 MB of reading per file. It has two uses: skipping files the
+              other device already has when transferring, and grouping the Duplicates view by
+              content when the option below is on. It is built in the background as a job of
+              its own, never during a scan: automatically after each scan when sync is set up
+              or content grouping is on, and by hand from the button here or on the Folders
+              page. A running job can be stopped from the job card in the sidebar.
             </p>
 
             {contentIndex.status && (
@@ -1231,12 +1196,42 @@ export default function Settings() {
               </p>
             )}
 
+            <label className="flex items-start gap-3 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={useContentHash}
+                onChange={(e) => setUseContentHash(e.target.checked)}
+                className="mt-0.5 w-5 h-5 shrink-0 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0"
+              />
+              <div>
+                <span className="block text-sm font-medium text-content-secondary">
+                  Group the Duplicates view by content
+                </span>
+                <span className="block text-xs text-content-muted mt-1">
+                  <span className="font-semibold text-content-secondary">Off</span> — raw
+                  sub-frames are grouped by their stored FITS/XISF header, which every scan
+                  already records: no extra reading, and copies still match after a move
+                  between drives changed their timestamps. Masters and processed files are
+                  compared by their full contents.
+                </span>
+                <span className="block text-xs text-content-muted mt-1">
+                  <span className="font-semibold text-content-secondary">On</span> —
+                  everything, masters included, is grouped by the sampled hash: 1.5 MB of each
+                  file, so two masters that differ only outside the sampled regions look
+                  identical. Run a deep verify before deleting masters in this mode.
+                </span>
+                <span className="block text-xs text-content-muted mt-1">
+                  New files get their hash from the index job after each scan, not during it.
+                </span>
+              </div>
+            </label>
+
             {/* Also gated on pending: with nothing to index the button is
                 disabled, and inviting a build it refuses would read as broken. */}
-            {contentIndex.status && !contentIndex.status.syncConfigured && contentIndex.status.pending > 0 && (
+            {contentIndex.status && !contentIndex.status.syncConfigured && !useContentHash && contentIndex.status.pending > 0 && (
               <p className="text-xs text-content-muted">
-                Sync is not set up on this device, so the index is not built automatically.
-                You can still build it now if you want content-based duplicate grouping.
+                Sync is not set up on this device and content grouping is off, so the index is
+                not built automatically. You can still build it now.
               </p>
             )}
 
