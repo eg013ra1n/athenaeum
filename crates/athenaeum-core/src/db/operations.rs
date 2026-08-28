@@ -695,6 +695,19 @@ pub fn scan_root_path_of_kind(conn: &Connection, kind: &str) -> Result<Option<St
     .optional()
 }
 
+/// The id of the (unique) scan root of a given special `kind`, if one is
+/// designated. Sibling of [`scan_root_path_of_kind`]: the sync receiver's
+/// calibrated-light path passes it to the scanner's reconcile primitive as that
+/// function's `root_id` log field.
+pub fn scan_root_id_of_kind(conn: &Connection, kind: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM scan_roots WHERE kind = ?1 LIMIT 1",
+        params![kind],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// Update scan root find_duplicates flag
 pub fn update_scan_root_duplicates_flag(conn: &Connection, id: i64, enabled: bool) -> Result<()> {
     conn.execute(

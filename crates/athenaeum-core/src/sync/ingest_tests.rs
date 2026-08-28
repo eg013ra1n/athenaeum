@@ -670,6 +670,226 @@ fn ingest_lands_files_and_rows() {
     );
 }
 
+/// A calibrated-light fixture: a FITS whose header carries the identity cards
+/// the scanner's adopt path reads (CALSTAT + ATH_CSRC + ATH_CSRN).
+fn build_calibrated_package(
+    root: &Path,
+    source_uuid: &str,
+    filename: &str,
+    with_identity: bool,
+) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join("csrc");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join(filename);
+    let mut cards = vec![
+        Card::new("OBJECT", CardValue::Str("M31".into())).unwrap(),
+        Card::new("DATE-OBS", CardValue::Str("2026-01-15T22:30:00".into())).unwrap(),
+    ];
+    if with_identity {
+        cards.push(Card::new("CALSTAT", CardValue::Str("BDF".into())).unwrap());
+        cards.push(Card::new("ATH_CSRC", CardValue::Str(source_uuid.into())).unwrap());
+        cards.push(Card::new("ATH_CSRN", CardValue::Str("L_0001.fits".into())).unwrap());
+        cards.push(Card::new("ATH_CVER", CardValue::Integer(1)).unwrap());
+    }
+    write_fits_with_cards(&src, &cards);
+    let byte_size = std::fs::metadata(&src).unwrap().len();
+    let xxh3 = package::xxh3_full_file(&src).unwrap();
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: format!("cal-{source_uuid}"),
+        origin_catalog_uuid: "catalog-uuid".to_string(),
+        origin_device: ORIGIN_DEVICE.to_string(),
+        payload_kind: PayloadKind::CalibratedLight,
+        rel_path: format!("camera_testcam/lights/{filename}"),
+        byte_size,
+        xxh3,
+        frame_meta: serde_json::to_value(fixture_frame(
+            source_uuid,
+            "M31",
+            "2026-01-16T10:00:00.000Z",
+        ))
+        .unwrap(),
+        analysis: None,
+        app_version: "test".to_string(),
+        project: None,
+    };
+    let pkg_dir = root.join(format!("cpkg-{source_uuid}-{with_identity}"));
+    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+    (pkg_dir, announce)
+}
+
+#[test]
+fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    // The receiver already holds the source light (uuid src-1).
+    let (src_pkg, src_ann) = build_fixture_package(
+        tmp.path(),
+        "src-1",
+        "L_0001.fits",
+        "M31",
+        "2026-01-16T10:00:00.000Z",
+    );
+    ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &src_pkg,
+        &src_ann,
+        PEER_HEX,
+        &src_ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1);
+
+    let (pkg, ann) = build_calibrated_package(tmp.path(), "src-1", "c_L_0001.fits", true);
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        Some("M31 calibrated"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.ingested, 1, "{outcome:?}");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        1,
+        "artifact never becomes a frame"
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
+    let landed: String = conn
+        .query_row(
+            "SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        landed.ends_with("camera_testcam/lights/c_L_0001.fits"),
+        "{landed}"
+    );
+    assert!(Path::new(&landed).exists());
+    let frame_id: Option<i64> = conn
+        .query_row(
+            "SELECT frame_id FROM light_calibrations WHERE source_uuid = 'src-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        frame_id.is_some(),
+        "adopted against the cataloged source light"
+    );
+
+    // Re-send: duplicate by content hash, one file on disk. A fresh announce
+    // (a real resend mints a new per-attempt wire package id), so this exercises
+    // the artifact content-hash dedup rather than `ingest_package`'s
+    // package-level receipt replay, which keys on the wire package_id.
+    let ann2 = PackageAnnounce {
+        package_id: crate::sharing::types::PackageId("second-attempt".to_string()),
+        ..ann.clone()
+    };
+    let again = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann2,
+        PEER_HEX,
+        "second-attempt",
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(again.duplicate, 1, "{again:?}");
+    let files: Vec<_> = walkdir_files(&incoming)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("c_L_0001")
+        })
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+}
+
+#[test]
+fn calibrated_light_without_source_lands_deferred() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    let (pkg, ann) = build_calibrated_package(tmp.path(), "src-unknown", "c_L_0002.fits", true);
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.ingested, 1, "{outcome:?}");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
+        0,
+        "no source → no row (deferred)"
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 0);
+    assert_eq!(walkdir_files(&incoming).len(), 1, "file kept on disk");
+}
+
+#[test]
+fn calibrated_light_payload_without_identity_is_rejected_and_removed() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    let (pkg, ann) = build_calibrated_package(tmp.path(), "src-3", "c_L_0003.fits", false);
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.rejected, 1, "{outcome:?}");
+    assert!(
+        matches!(&outcome.receipts[0].outcome, ReceiptOutcome::Rejected(r) if r.contains("not a calibrated light"))
+    );
+    assert!(walkdir_files(&incoming).is_empty(), "nothing left behind");
+}
+
+/// Every regular file under `root`, recursively.
+fn walkdir_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn duplicate_delivery_single_row_but_acked() {
     let tmp = TempDir::new().unwrap();

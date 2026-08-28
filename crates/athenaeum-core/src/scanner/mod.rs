@@ -642,7 +642,7 @@ fn process_file(
 ///    filenames collide across nights); resolved to exactly one → INSERT a
 ///    tracking row (`info!`); zero or ambiguous → `warn!` and skip so a later
 ///    scan (once the source is cataloged / disambiguated) succeeds.
-fn reconcile_calibrated_light(
+pub(crate) fn reconcile_calibrated_light(
     conn: &Connection,
     path: &Path,
     current_path: &str,

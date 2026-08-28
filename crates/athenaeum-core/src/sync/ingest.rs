@@ -80,7 +80,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{File, FileFormat, Frame};
-use crate::package::{self, ManifestRecord};
+use crate::package::{self, ManifestRecord, PayloadKind};
 use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome};
 
 use super::now_iso;
@@ -175,6 +175,12 @@ impl IngestOutcome {
 struct FrameVerdict {
     receipt: FrameReceipt,
     history_outcome: &'static str,
+    /// The catalog row this frame inserted — `(frames.id, imagetyp)` — or `None`
+    /// when nothing was cataloged (duplicate, rejected, or a `CalibratedLight`
+    /// artifact, which never gets a `frames` row at all). Carried so the caller
+    /// can act on what an ingest actually created; not read yet.
+    #[allow(dead_code)]
+    inserted: Option<(i64, Option<crate::models::ImageType>)>,
 }
 
 /// Ingest one fetched package into the catalog on `conn`, landing accepted
@@ -303,7 +309,7 @@ pub fn ingest_package(
                     let _ = record_receipt_and_history(
                         c, package_id, history_key, &receipt, record, peer_device, &started_at, "rejected", batch_name,
                     );
-                    FrameVerdict { receipt, history_outcome: "rejected" }
+                    FrameVerdict { receipt, history_outcome: "rejected", inserted: None }
                 }
             }
         });
@@ -353,14 +359,24 @@ fn process_frame(
         Err(e) => {
             let receipt = rejected_receipt(record, format!("payload unreadable: {e}"));
             record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
-            return Ok(FrameVerdict { receipt, history_outcome: "rejected" });
+            return Ok(FrameVerdict { receipt, history_outcome: "rejected", inserted: None });
         }
     };
     if actual != record.xxh3 {
         tracing::warn!(frame_uuid = %record.frame_uuid, "sync ingest xxh3 mismatch; rejecting");
         let receipt = rejected_receipt(record, format!("xxh3 mismatch: manifest {}, disk {actual}", record.xxh3));
         record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
-        return Ok(FrameVerdict { receipt, history_outcome: "rejected" });
+        return Ok(FrameVerdict { receipt, history_outcome: "rejected", inserted: None });
+    }
+
+    // 1b. A calibrated-light artifact is NOT catalog material (frame-set-send
+    // design 2026-08-28 §4.1 / D4): it lands on disk and is reconciled against
+    // `light_calibrations`, never inserted into `files`/`frames`. Branch before
+    // the snapshot deserialization below — for this kind `frame_meta` describes
+    // the SOURCE light, not the payload, so none of the frame-shaped steps
+    // (uuid dedup, catalog insert) apply.
+    if record.payload_kind == PayloadKind::CalibratedLight {
+        return process_calibrated_light(conn, landing_base, &payload, record, package_id, history_key, peer_device, started_at, batch_name);
     }
 
     // Deserialize the Frame snapshot early — needed for the landing date, dedup
@@ -401,7 +417,7 @@ fn process_frame(
         let receipt = duplicate_receipt(record);
         record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, history_outcome, batch_name)?;
         tracing::debug!(frame_uuid = %record.frame_uuid, outcome = history_outcome, "sync ingest duplicate by uuid");
-        return Ok(FrameVerdict { receipt, history_outcome });
+        return Ok(FrameVerdict { receipt, history_outcome, inserted: None });
     }
 
     // 3. Dedup by FULL content hash (same bytes, different/absent uuid), gated
@@ -421,7 +437,7 @@ fn process_frame(
         tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest duplicate by full content hash");
         let receipt = duplicate_receipt(record);
         record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
-        return Ok(FrameVerdict { receipt, history_outcome: "duplicate" });
+        return Ok(FrameVerdict { receipt, history_outcome: "duplicate", inserted: None });
     }
 
     // 4. Ingest: land the payload, then insert catalog rows in one transaction.
@@ -468,7 +484,96 @@ fn process_frame(
     }
 
     tracing::info!(frame_uuid = %record.frame_uuid, path = %landed.display(), "sync ingest frame landed");
-    Ok(FrameVerdict { receipt, history_outcome: "ingested" })
+    Ok(FrameVerdict { receipt, history_outcome: "ingested", inserted: None })
+}
+
+/// A calibrated-light artifact (spec 2026-08-28 §4.1): land it, never catalog it,
+/// and run the scanner's own adopt path so the receiver's `light_calibrations`
+/// learns about it when the source light is cataloged.
+#[allow(clippy::too_many_arguments)]
+fn process_calibrated_light(
+    conn: &Connection,
+    landing_base: &Path,
+    payload: &Path,
+    record: &ManifestRecord,
+    package_id: &str,
+    history_key: &str,
+    peer_device: &str,
+    started_at: &str,
+    batch_name: Option<&str>,
+) -> Result<FrameVerdict> {
+    use crate::fits_parser::calibrated_light::calibrated_light_identity;
+    use crate::fits_parser::stored_header::parse_stored_header_keys;
+
+    // Dedup by full content hash against receipts alone — there is no frames
+    // row to join for an artifact.
+    if full_hash_receipt_ingested(conn, &record.xxh3)? {
+        tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest: calibrated light duplicate by content hash");
+        let receipt = duplicate_receipt(record);
+        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
+        return Ok(FrameVerdict { receipt, history_outcome: "duplicate", inserted: None });
+    }
+
+    let landed = land_payload(landing_base, payload, record)
+        .with_context(|| format!("land calibrated light {}", record.rel_path))?;
+    let landed_str = landed.to_string_lossy().into_owned();
+
+    let identity = crate::fits_parser::extract_fits_header(&landed)
+        .ok()
+        .map(|text| parse_stored_header_keys(FileFormat::FITS, &text))
+        .and_then(|keys| calibrated_light_identity(&keys));
+    let Some(identity) = identity else {
+        tracing::error!(frame_uuid = %record.frame_uuid, path = %landed_str, "sync ingest: CalibratedLight payload lacks identity cards; rejecting");
+        if let Err(e) = std::fs::remove_file(&landed) {
+            tracing::warn!(path = %landed_str, error = %e, "sync ingest: failed to remove rejected artifact");
+        }
+        let receipt = rejected_receipt(record, "payload is not a calibrated light".to_string());
+        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
+        return Ok(FrameVerdict { receipt, history_outcome: "rejected", inserted: None });
+    };
+
+    // Log field only (the scanner's `root_id`): the designated incoming root's
+    // id when there is one, 0 otherwise.
+    let root_id = match crate::db::scan_root_id_of_kind(conn, "sync_incoming") {
+        Ok(Some(id)) => id,
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "sync ingest: sync_incoming root lookup failed; root_id = 0");
+            0
+        }
+    };
+    let mut dups = Vec::new();
+    crate::scanner::reconcile_calibrated_light(conn, &landed, &landed_str, &identity, root_id, &mut dups)
+        .with_context(|| format!("adopt calibrated light {}", record.rel_path))?;
+    if !dups.is_empty() {
+        // The receiver already tracks this artifact at another path: keep that
+        // copy, drop the one we just landed, report Duplicate.
+        tracing::info!(frame_uuid = %record.frame_uuid, kept = %dups[0].kept_path, "sync ingest: calibrated light already tracked; dropping landed copy");
+        if let Err(e) = std::fs::remove_file(&landed) {
+            tracing::warn!(path = %landed_str, error = %e, "sync ingest: failed to remove duplicate artifact");
+        }
+        let receipt = duplicate_receipt(record);
+        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
+        return Ok(FrameVerdict { receipt, history_outcome: "duplicate", inserted: None });
+    }
+
+    let receipt = ingested_receipt(record);
+    record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "ingested", batch_name)?;
+    tracing::info!(frame_uuid = %record.frame_uuid, path = %landed_str, "sync ingest calibrated light landed");
+    Ok(FrameVerdict { receipt, history_outcome: "ingested", inserted: None })
+}
+
+/// True if `xxh3` was already recorded as [`Ingested`](ReceiptOutcome::Ingested)
+/// in `sync_receipts`. The artifact twin of [`full_hash_already_ingested`],
+/// deliberately WITHOUT that function's join to `frames`: a calibrated light
+/// never gets a `frames` row, so the join would find nothing and every re-send
+/// would land a second copy.
+fn full_hash_receipt_ingested(conn: &Connection, xxh3: &str) -> Result<bool> {
+    let ingested = receipt_outcome_to_db(&ReceiptOutcome::Ingested);
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_receipts WHERE xxh3 = ?1 AND outcome = ?2", params![xxh3, ingested], |r| r.get(0))
+        .context("dedup lookup by receipt content hash")?;
+    Ok(n > 0)
 }
 
 /// The minimal existing-frame projection dedup needs.
