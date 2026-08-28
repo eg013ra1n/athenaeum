@@ -846,6 +846,110 @@ fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
         })
         .collect();
     assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
+        1,
+        "a duplicate never mints a second tracking row"
+    );
+}
+
+/// The already-tracked branch (spec §4.1): a SECOND artifact for a source the
+/// receiver already tracks, with different bytes and a different filename, so
+/// neither the content-hash receipt dedup nor the package replay guard fires.
+/// The receiver's existing artifact wins — the landed copy is dropped and the
+/// record reports Duplicate, mirroring the scanner's own duplicate branch
+/// (non-destructive; nothing on the receiver is overwritten).
+///
+/// This is also the v1 LIMITATION it pins: re-sending a RE-calibrated light does
+/// not replace the receiver's tracked artifact.
+#[test]
+fn calibrated_light_already_tracked_is_dropped_as_duplicate() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+    // The receiver holds the source light and already tracks an artifact for it.
+    let (src_pkg, src_ann) = build_fixture_package(
+        tmp.path(),
+        "src-1",
+        "L_0001.fits",
+        "M31",
+        "2026-01-16T10:00:00.000Z",
+    );
+    ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &src_pkg,
+        &src_ann,
+        PEER_HEX,
+        &src_ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    let (pkg, ann) = build_calibrated_package(tmp.path(), "src-1", "c_L_0001.fits", true);
+    ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg,
+        &ann,
+        PEER_HEX,
+        &ann.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    let tracked: String = conn
+        .query_row(
+            "SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Same identity, different bytes (ATH_CVER = 2) and a different filename.
+    let (pkg2, ann2) = build_calibrated_package_v(tmp.path(), "src-1", "c_L_0001_v2.fits", true, 2);
+    // Guard the route: identical bytes would be swallowed by the content-hash
+    // receipt dedup above, and this test would prove nothing about adoption.
+    assert_ne!(
+        package::read_manifest(&pkg).unwrap()[0].xxh3,
+        package::read_manifest(&pkg2).unwrap()[0].xxh3,
+        "the second artifact must differ in bytes"
+    );
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg2,
+        &ann2,
+        PEER_HEX,
+        &ann2.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.duplicate, 1, "{outcome:?}");
+    let files: Vec<_> = walkdir_files(&incoming)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("c_L_0001")
+        })
+        .collect();
+    assert_eq!(files.len(), 1, "the landed copy is dropped: {files:?}");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
+        1,
+        "the existing artifact wins; no second row"
+    );
+    let still: String = conn
+        .query_row(
+            "SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(still, tracked, "the tracking row is left untouched");
 }
 
 #[test]

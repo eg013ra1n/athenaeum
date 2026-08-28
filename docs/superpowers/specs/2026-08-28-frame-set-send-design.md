@@ -186,6 +186,10 @@ Landing location is unchanged: `<incoming>/<sender_slug>/<batch_slug>/<rel_path>
      landed file removed — a sender bug must not leave an untracked file;
   5. `Ingested` receipt + `sync_history` row, so the Transfers UI counts it.
 
+  A re-sent artifact whose identity is already tracked at another path is
+  dropped as a duplicate — the receiver's existing artifact wins; re-sending a
+  re-calibrated light does not replace it.
+
 ### 4.2 Per package — calibration-set integration
 
 After the record loop, once per package, under one connection acquisition:

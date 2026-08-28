@@ -60,6 +60,8 @@ instance on the same account as the receiver.
 - Re-send the calibrated batch: all files report duplicate, no `_2` copies.
 - Export to WBPP in `Lights + masters` with a raw set linked is refused with the same
   sentence the tab shows.
+- The → Coverage link from a *flat* (or bias) set without a master lands on the matching
+  library with that set highlighted, not the Dark library.
 
 #### Follow-ups surfaced by review (not smokes)
 
@@ -72,6 +74,10 @@ instance on the same account as the receiver.
 - Pre-existing, not this cycle: `cargo check -p athenaeum-core --no-default-features
   --tests` fails (~40 errors in integration tests that use `render`/`solver`-gated
   modules unconditionally); the lib target is green headless. Worth a separate ticket.
+- A re-sent artifact whose identity is already tracked at another path is dropped as a
+  duplicate — the receiver's existing artifact wins, so re-sending a RE-calibrated light
+  does not replace it (spec §4.1; pinned by
+  `calibrated_light_already_tracked_is_dropped_as_duplicate`).
 
 ### Hash cleanup — 2026-08-28
 
