@@ -240,8 +240,13 @@ fn is_master_set(conn: &Connection, set_id: i64) -> Result<bool> {
 }
 
 /// Distinct ids of linked calibration sets that have frames but are not master
-/// sets (`is_master_library = 0`), first-seen order. The `rawWithMasters`
+/// sets (`is_master_library = 0`), in ASCENDING id order. The `rawWithMasters`
 /// readiness number (spec 2026-08-28 §5): an empty list = mode ready.
+///
+/// Sorted rather than tree-walk order because the Export tab's `→ Coverage`
+/// link deep-links to `[0]`: accumulation order depends on which subgroup the
+/// walk reaches first, so the same not-ready set could send two consecutive
+/// clicks to two different rows.
 pub fn raw_sets_without_master(conn: &Connection, data: &ExportData) -> Result<Vec<i64>> {
     let mut seen: HashSet<i64> = HashSet::new();
     let mut out: Vec<i64> = Vec::new();
@@ -259,6 +264,7 @@ pub fn raw_sets_without_master(conn: &Connection, data: &ExportData) -> Result<V
             }
         }
     }
+    out.sort_unstable();
     Ok(out)
 }
 
@@ -2628,6 +2634,27 @@ mod export_mode_tests {
         }
         let data = collect_export_data(&conn, 1).unwrap();
         assert_eq!(raw_sets_without_master(&conn, &data).unwrap(), vec![100]);
+    }
+
+    /// The ids come back ASCENDING, not in tree-walk order. The Export tab's
+    /// `→ Coverage` link deep-links to `[0]`, and the walk visits flat before
+    /// dark — so a higher-id flat set would otherwise become the "first" one
+    /// and two refetches could send the same click to two different rows.
+    #[test]
+    fn raw_sets_without_master_returns_ascending_ids() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        // Walked first, but numbered last.
+        let flat = seed_raw_set(&conn, 300, "Flat", 2);
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        add_link(&conn, 10, flat, "Flat");
+        add_link(&conn, 10, dark, "Dark");
+        let data = collect_export_data(&conn, 1).unwrap();
+        assert_eq!(
+            raw_sets_without_master(&conn, &data).unwrap(),
+            vec![100, 300]
+        );
     }
 
     /// Strict raw+masters: a raw set with frames is an error, never an omission.

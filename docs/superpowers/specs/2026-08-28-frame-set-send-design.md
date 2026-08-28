@@ -245,6 +245,9 @@ pub struct ExportReadiness {
 `raw_sets_without_master` walks the collected tree the same way
 `filter_masters_recursive` does (subgroup flat/dark/bias and their sub-cals),
 counting distinct set ids with `frames` non-empty and `is_master_library = 0`.
+The ids come back in **ascending** order, not tree-walk order: the tab's
+`→ Coverage` link deep-links to `[0]`, and accumulation order depends on which
+subgroup the walk reaches first.
 `file_counts` come from a count-only walk of the collected tree that never
 bails, so a not-ready mode still shows a number: `lights_only` = lights;
 `raw_with_calibration_sets` = lights + every calibration frame, each set

@@ -131,6 +131,8 @@ pub struct ExportReadiness {
     pub stale: i64,
     pub missing: i64,
     pub raw_sets_without_master: i64,
+    /// Ascending, so the tab's `→ Coverage` deep link (`[0]`) is stable across
+    /// refetches.
     pub raw_set_ids_without_master: Vec<i64>,
     pub file_counts: ExportFileCounts,
 }

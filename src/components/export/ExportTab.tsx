@@ -391,8 +391,12 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                             onClick={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
+                              // handleSetClick resolves the set's REAL kind from
+                              // setKindMap — a flat or bias set without a master
+                              // must not land on the Dark library.
                               const first = opt.value === 'rawWithMasters' ? readiness?.rawSetIdsWithoutMaster[0] : undefined;
-                              navigate(first !== undefined ? `?tab=calibration&highlightSet=${first}&kind=dark` : '?tab=calibration');
+                              if (first !== undefined) handleSetClick(first);
+                              else navigate('?tab=calibration');
                             }}
                           >
                             → Coverage
