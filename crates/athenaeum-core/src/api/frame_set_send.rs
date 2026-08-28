@@ -2,13 +2,25 @@
 //! payload entries. `PayloadEntry` is the currency between whoever decides
 //! WHAT to send (a frame selection, or a frame set under an export mode) and
 //! the one package builder in `api::sync` that writes it.
+//!
+//! [`PayloadEntry`] is UNGATED — the frame-selection send path
+//! (`api::sync::selection_entries` / `build_selection_package`) is built by
+//! headless consumers (Perseus links core with `default-features = false`).
+//! Composing entries FROM A FRAME SET needs the export readiness gate in
+//! `api::lights`, which is `render`-only, so [`frame_set_entries`] and its
+//! helper carry that feature gate.
+#[cfg(feature = "render")]
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+#[cfg(feature = "render")]
 use crate::api::lights::{check_mode_ready, get_export_readiness, FlatNormMode, LightCalParams};
+#[cfg(feature = "render")]
 use crate::api::{db, ApiError};
+#[cfg(feature = "render")]
 use crate::export::models::{CalibrationSetInfo, ExportData, ExportMode};
 use crate::package::PayloadKind;
+#[cfg(feature = "render")]
 use crate::services::ServiceContext;
 
 /// One file to put in a package: the catalog frame it is (or derives from —
@@ -29,6 +41,7 @@ pub struct PayloadEntry {
 ///
 /// Catalog-only — the entries name the files to copy; the copying is the package
 /// builder's job (`api::sync::build_selection_package`).
+#[cfg(feature = "render")]
 pub fn frame_set_entries(
     ctx: &ServiceContext,
     frame_set_id: i64,
@@ -79,6 +92,7 @@ pub fn frame_set_entries(
 
 /// Frame ids of every master file in the tree — a master set's frames are its
 /// single master file.
+#[cfg(feature = "render")]
 fn master_frame_ids(data: &ExportData, master_sets: &HashSet<i64>) -> HashSet<i64> {
     fn walk(info: &CalibrationSetInfo, master_sets: &HashSet<i64>, out: &mut HashSet<i64>) {
         if master_sets.contains(&info.set_id) {
@@ -113,7 +127,9 @@ fn master_frame_ids(data: &ExportData, master_sets: &HashSet<i64>) -> HashSet<i6
     out
 }
 
-#[cfg(test)]
+// The fixture exercises `frame_set_entries`, so it rides the same gate as the
+// function under test (mirrors `api/mod.rs`'s own `cfg(all(test, feature = …))`).
+#[cfg(all(test, feature = "render"))]
 mod tests {
     use super::*;
     use crate::api::lights::{FlatNormMode, LightCalParams};

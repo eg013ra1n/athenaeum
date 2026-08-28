@@ -23,9 +23,15 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::api::frame_set_send::PayloadEntry;
+// The frame-set send is desktop/web only: it gates on export readiness from the
+// `render`-only `api::lights`. The frame-SELECTION send below stays ungated so
+// headless consumers (Perseus links core with `default-features = false`) keep
+// compiling.
+#[cfg(feature = "render")]
 use crate::api::lights::{FlatNormMode, LightCalParams};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
+#[cfg(feature = "render")]
 use crate::export::models::ExportMode;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
@@ -3394,6 +3400,11 @@ pub async fn enqueue_sync_selection(
 /// `frame_set_id` under `mode`, as ONE package to `dest`. The readiness gate
 /// runs BEFORE any engine is started — a not-ready mode must not spin up a
 /// sender for nothing.
+///
+/// `render`-gated: the readiness gate lives in `api::lights`, which is itself
+/// `render`-only. `enqueue_built` / `SelectionInput` / `build_selection_package`
+/// stay ungated — the frame-selection send needs them headless.
+#[cfg(feature = "render")]
 #[allow(clippy::too_many_arguments)]
 pub async fn enqueue_frame_set_send(
     ctx: &Arc<ServiceContext>,
