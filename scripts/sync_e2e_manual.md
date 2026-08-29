@@ -208,24 +208,24 @@ Watch the primary's **Transfers** panel drain, exactly as in Variant A.
       (`… direction='sent' AND outcome='duplicate'` = 50 on the sender;
       `… direction='received' AND outcome='duplicate'` = 50 on the primary).
 
-- [ ] **Policy deletion with two history events** (the one place M-Sync1 exercises
-      *live* retention, on the full-app capture node, gated behind the explicit
-      opt-in). In **Settings → Sync** on the capture app, set the retention policy
-      to **On confirm** and enable live deletion (this sets
-      `sync.retention.dry_run = false` **and** the `sync.retention.live_confirmed`
-      opt-in — both are required; either alone stays dry-run). Trigger a retention
-      pass. Then on the capture app's DB confirm **both** events are searchable
-      for the deleted frames, and only confirmed sources went:
+- [ ] **A send deletes nothing.** Owner ruling 2026-08-29: retention is a
+      Perseus-only concern — the full-app retention loop and its
+      `sync.retention.*` settings were removed, so there is no policy to set and
+      nothing to enable (Settings → Sync never had that UI). After the two
+      confirmed deliveries above, on the capture app's own catalog DB confirm the
+      catalog is intact and no deletion was ever audited:
 
       ```sql
-      SELECT COUNT(*) FROM sync_history WHERE outcome='retention_deleted';  -- the deletes
+      SELECT COUNT(*) FROM sync_history WHERE outcome='retention_deleted';  -- 0
+      SELECT COUNT(*) FROM files;    -- unchanged: the 50 sent + any never-synced file
+      SELECT COUNT(*) FROM frames;   -- likewise unchanged
       SELECT COUNT(*) FROM sync_history WHERE direction='sent' AND outcome='ingested';
-      -- the transfer events survive → BOTH events present per frame
+      -- 50: transfer events are the ONLY history a send writes
       ```
 
-      Confirm on disk that the confirmed source files are gone **and any
-      never-synced file in the same catalog is untouched** (retention only ever
-      deletes `confirmed` synced sources — the hard invariant).
+      Confirm on disk that all 50 source files are **still there**, alongside any
+      never-synced file in the same catalog. The app never deletes a sent source;
+      reclaiming disk on a capture node is Perseus's job (Variant A).
 
 ---
 
@@ -267,8 +267,8 @@ transport across two networks, with the hub showing both devices. Record the run
 - [ ] 50 frames on primary with uuid + metadata          frames=…
 - [ ] receiver / sender history complete                 …
 - [ ] re-run dedupe-safe                                 …
-- [ ] live retention: retention_deleted + transfer both searchable
-- [ ] only confirmed sources deleted; keeper untouched   …
+- [ ] a send deletes nothing: retention_deleted=0, files/frames unchanged
+- [ ] all 50 sources + the keeper still on disk          …
 
 ## Verdict
 PASS / FAIL — notes:
@@ -281,8 +281,8 @@ PASS / FAIL — notes:
 `crates/athenaeum-core/tests/sync_e2e.rs` runs the identical scenario shape over
 the in-process loopback transport on every `cargo test -p athenaeum-core`: two
 `ServiceContext`s, 50 fixture frames, full-metadata ingest, dedupe-safe re-run
-(all-`Duplicate` acks), **live**-mode retention deleting only confirmed sources
-(a never-synced keeper survives) with both the transfer and `retention_deleted`
-history events, and history complete on both ends — all asserted via SQL. The
+(all-`Duplicate` acks), the proof that **a send deletes nothing** (every source
+and the never-synced keeper survive, `retention_deleted` = 0), and history
+complete on both ends — all asserted via SQL. The
 manual run above adds only what loopback cannot: real iroh, the relay, NAT
 traversal, and the hub device registry.

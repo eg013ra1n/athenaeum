@@ -21,7 +21,7 @@
 - `api.listen` uses the cancelled-flag form (see CLAUDE.md "Tauri/SSE listener pattern").
 - Commit as the repository user (author is already configured); no Co-Authored-By trailer. Use `rustfmt <files>` on touched Rust files, not `cargo fmt -p`.
 - Gates before claiming a task done: `cargo build --workspace`, the task's `cargo test -p athenaeum-core <filter>`, and `npx tsc --noEmit` for frontend tasks.
-- Decisions that are NOT up for re-litigation (spec §11): D1 no offer-to-build from the tab; D2 `rawWithMasters` is strict for export too; D3 receiver integrates via the scanner tail at ingest; D4 calibrated lights never cataloged on the receiver; D5 masters and calibrated outputs never in `sync_sources`.
+- Decisions that are NOT up for re-litigation (spec §11): D1 no offer-to-build from the tab; D2 `rawWithMasters` is strict for export too; D3 receiver integrates via the scanner tail at ingest; D4 calibrated lights never cataloged on the receiver; D5 masters and calibrated outputs never in `sync_sources`. **SUPERSEDED 2026-08-29** — owner ruling: no `sync_sources` linkage at all, app-shell retention removed; see spec §11 D5.
 
 ---
 

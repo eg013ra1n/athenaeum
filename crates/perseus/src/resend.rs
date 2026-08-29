@@ -25,11 +25,11 @@
 //!
 //! Mirrors the desktop's `api::sync::resend_transfer` /
 //! `resend_declined_as_new_transfer` semantics, rebuilt on Perseus's own
-//! bookkeeping (`perseus_seen` / `perseus_batch_files` instead of
-//! `sync_sources` — the desktop implementation is welded to `ServiceContext`
-//! and not extractable; the shared core primitives ARE reused:
-//! `reset_outbound_for_resend`, `CANCELLED_BY_RECEIVER_DETAIL`,
-//! `read_manifest` / `xxh3_full_file`).
+//! bookkeeping (`perseus_seen` / `perseus_batch_files`; the desktop had its own
+//! `sync_sources` linkage, welded to `ServiceContext` and not extractable — and
+//! removed outright on 2026-08-29, since the app never deletes a sent source.
+//! The shared core primitives ARE reused: `reset_outbound_for_resend`,
+//! `CANCELLED_BY_RECEIVER_DETAIL`, `read_manifest` / `xxh3_full_file`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
