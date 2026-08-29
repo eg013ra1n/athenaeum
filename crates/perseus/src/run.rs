@@ -1942,7 +1942,7 @@ fn spawn_retention_task(
                 // pressure on any one watched directory should trigger the gate.
                 let disk_probe = move || {
                     dirs.iter()
-                        .map(|d| athenaeum_core::api::retention::disk_usage_pct(d))
+                        .map(|d| athenaeum_core::sync::retention::disk_usage_pct(d))
                         .max()
                         .unwrap_or(0)
                 };

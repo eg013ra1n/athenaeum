@@ -26,8 +26,6 @@ pub mod frame_set_send;
 // Trigger policy for the whole-library content-hash index. Ungated: db +
 // duplicates::backfill + the compute queue, plus `api::sync`'s own gate.
 pub mod content_index;
-// Full-app capture-node retention (task M4). Ungated: db/settings/sync only.
-pub mod retention;
 // Account commands (Stage II, task B4). Ungated: db/settings/account only.
 pub mod account;
 // Stage-II collaboration package exchange — holder-side request-to-serve (slice 4,

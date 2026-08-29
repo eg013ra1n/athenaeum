@@ -78,6 +78,8 @@ instance on the same account as the receiver.
   duplicate — the receiver's existing artifact wins, so re-sending a RE-calibrated light
   does not replace it (spec §4.1; pinned by
   `calibrated_light_already_tracked_is_dropped_as_duplicate`).
+- App-shell retention removed 2026-08-29 (owner ruling) — `sync_sources` table is
+  vestigial; drop it in a future schema pass.
 
 ### Hash cleanup — 2026-08-28
 

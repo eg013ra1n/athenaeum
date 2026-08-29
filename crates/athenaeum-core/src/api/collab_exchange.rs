@@ -2618,8 +2618,7 @@ async fn auto_sync_pass(
 /// The auto-replication loop (spec §3.3): a pass every `interval` OR as soon as a
 /// hub poll changes a project's package set, after a short startup grace. Each
 /// pass runs on its own task so a panic anywhere below is logged and the loop
-/// survives it — the retention loop's shape, for the same reason (a background
-/// loop that dies is a feature that silently stops).
+/// survives it (a background loop that dies is a feature that silently stops).
 pub async fn run_collab_auto_sync_loop(
     ctx: Arc<ServiceContext>,
     sync: Arc<crate::sync::SyncRuntime>,

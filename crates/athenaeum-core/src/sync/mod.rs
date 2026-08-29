@@ -93,7 +93,9 @@ pub use models::{
 };
 pub use project_ingest::{ingest_project_package, ProjectIngestOutcome};
 pub use refusal::RefusalRefresher;
-pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
+pub use retention::{
+    disk_usage_pct, evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy,
+};
 pub use receiver::{
     allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
     ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ProjectRequestHandler,
@@ -107,10 +109,7 @@ pub use status::{
     InboundSummary, OutboundSummary, QueuedInboundSummary, SyncReceiverStatus, SyncSenderStatus,
     SyncStatus, TransferFileCounts, TransferFileEntry, TransportHealth,
 };
-pub use store::{
-    ensure_history_columns, insert_sync_source, live_sources_for_package, mark_sync_source_deleted,
-    rekey_sync_sources, CatalogSyncStore, StandaloneSyncStore, SyncSourceRow, SyncStore,
-};
+pub use store::{ensure_history_columns, CatalogSyncStore, StandaloneSyncStore, SyncStore};
 
 /// Canonical timestamp rendering for the sync tables: RFC3339 UTC, millisecond
 /// precision, `Z` suffix. Sortable as text, unambiguous across time zones.

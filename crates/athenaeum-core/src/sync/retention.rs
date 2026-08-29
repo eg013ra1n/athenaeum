@@ -53,8 +53,9 @@
 //! Result<DeleteOutcome>`. Perseus supplies a closure that maps the confirmed
 //! package back to its original capture file (via its own `perseus_seen` table —
 //! see the crate-external plumbing), removes it, and writes a `sync_history`
-//! audit row (`outcome = "retention_deleted"`). The app shell (task M4) will
-//! instead route deletion through the `file_op` pipeline. Core stays agnostic:
+//! audit row (`outcome = "retention_deleted"`). Perseus is the ONLY caller: the
+//! desktop/web app shell never deletes a sent source (owner ruling 2026-08-29 —
+//! its own retention loop was removed). Core stays agnostic:
 //! it decides *which* confirmed subjects are eligible and logs the decision; the
 //! deleter performs the side effect and owns any audit write, because only it
 //! has the frame metadata.
@@ -186,6 +187,45 @@ fn confirmed_age_reached(row: &OutboundRow, days: u32, now: DateTime<Utc>) -> bo
             false
         }
     }
+}
+
+/// Current disk usage of the volume holding `path`, as a whole percent
+/// (`0..=100`) — the probe a [`RetentionPolicy::DiskPct`] caller feeds to
+/// [`evaluate_and_apply`]. Perseus is the only caller (it takes the MAX across
+/// its capture volumes); nothing else consults it.
+///
+/// Fails **safe**: any error, or a platform without `statvfs`, returns `0`
+/// ("empty disk") so a bad reading can never *trigger* a deletion — it can only
+/// decline to.
+#[cfg(unix)]
+pub fn disk_usage_pct(path: &Path) -> u8 {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+    // SAFETY: `stat` is zero-initialised and only read after a successful call;
+    // `cpath` is a valid NUL-terminated C string living for the call's duration.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
+    if rc != 0 {
+        tracing::warn!(path = %path.display(), "statvfs failed; retention disk probe returns 0%");
+        return 0;
+    }
+    let total = stat.f_blocks as u128;
+    let avail = stat.f_bavail as u128;
+    if total == 0 {
+        return 0;
+    }
+    let used = total.saturating_sub(avail);
+    ((used * 100) / total).min(100) as u8
+}
+
+#[cfg(not(unix))]
+pub fn disk_usage_pct(_path: &Path) -> u8 {
+    // No statvfs; treat as empty so retention never deletes on disk pressure.
+    0
 }
 
 /// Evaluate `policy` over the store's confirmed packages and (unless `dry_run`)

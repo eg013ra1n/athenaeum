@@ -63,18 +63,6 @@ pub mod defaults {
     // `SettingsManager::get_sync_max_concurrent_receives`).
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "2";
 
-    // Full-app capture-node retention (task M4). Reclaims local disk once frames
-    // are confirmed on the paired primary. Every default is the SAFE one: keep
-    // everything, dry-run on, and no live opt-in — a fresh install never deletes
-    // anything. Live deletion needs BOTH `dry_run = false` AND `live_confirmed =
-    // true` (the app equivalent of Perseus's soak opt-in). Only *confirmed*
-    // frames are ever eligible, under any policy.
-    pub const SYNC_RETENTION_POLICY: &str = "keep_everything"; // keep_everything|on_confirm|keep_days|disk_pct
-    pub const SYNC_RETENTION_KEEP_DAYS: &str = "30";
-    pub const SYNC_RETENTION_DISK_MAX_PCT: &str = "90";
-    pub const SYNC_RETENTION_DRY_RUN: &str = "true";
-    pub const SYNC_RETENTION_LIVE_CONFIRMED: &str = "false";
-
     // Account layer (task B4). Base URL of the athenaeum-hub. The device token
     // lives in the OS keychain (never here), keyed per hub host — so the prod
     // and test sign-ins coexist and switching is safe.
@@ -149,26 +137,6 @@ pub mod keys {
     /// every `api::sync::set_sync_max_concurrent_receives` — a change never
     /// interrupts a transfer already in flight.
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "sync.max_concurrent_receives";
-
-    // Full-app capture-node retention (task M4). Read by the hourly retention
-    // tick (`api::retention`). All get/set through the generic `get_setting` /
-    // `set_setting` commands — no dedicated command surface. Live deletion is
-    // impossible unless BOTH `SYNC_RETENTION_DRY_RUN = "false"` AND
-    // `SYNC_RETENTION_LIVE_CONFIRMED = "true"`; either missing forces dry-run.
-    /// Retention policy: `keep_everything` (default) | `on_confirm` | `keep_days`
-    /// | `disk_pct`.
-    pub const SYNC_RETENTION_POLICY: &str = "sync.retention.policy";
-    /// `keep_days` threshold in days (only the `keep_days` policy consults it).
-    pub const SYNC_RETENTION_KEEP_DAYS: &str = "sync.retention.keep_days";
-    /// Disk-usage cap in percent (only the `disk_pct` policy consults it).
-    pub const SYNC_RETENTION_DISK_MAX_PCT: &str = "sync.retention.disk_max_pct";
-    /// Dry-run flag (default `"true"`). When true, retention logs would-deletes
-    /// and removes nothing. The hard invariant's default until the owner opts in.
-    pub const SYNC_RETENTION_DRY_RUN: &str = "sync.retention.dry_run";
-    /// Explicit live-deletion opt-in (default `"false"`). The app equivalent of
-    /// Perseus's `i_have_verified_the_soak`: `dry_run = false` is honored ONLY
-    /// when this is also `"true"`; otherwise retention forces dry-run and warns.
-    pub const SYNC_RETENTION_LIVE_CONFIRMED: &str = "sync.retention.live_confirmed";
 
     // Account layer (task B4). Non-secret account state persisted so
     // `account_status` works offline. The device TOKEN is never here — it lives

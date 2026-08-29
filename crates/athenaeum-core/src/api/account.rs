@@ -378,7 +378,7 @@ pub fn hub_credentials(ctx: &ServiceContext) -> Result<Option<(String, String)>,
 
 /// Test-only: write a device token through the SAME [`resolve_config`] +
 /// [`AccountConfig::token_store`] path the account commands use, so
-/// [`hub_credentials`] (and thus `retention_ready`) see this node as signed in.
+/// [`hub_credentials`] sees this node as signed in.
 /// Lives here rather than in a sibling test module so it reuses the private
 /// path-resolution logic instead of duplicating the sanitize/file-name derivation.
 #[cfg(test)]

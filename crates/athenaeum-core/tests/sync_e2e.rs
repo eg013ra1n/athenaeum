@@ -9,7 +9,7 @@
 //! ([`SyncReceiver`]) over the in-process
 //! [`LoopbackNetwork`](athenaeum_core::sharing::loopback::LoopbackNetwork). No
 //! iroh, no hub, no keychain — the loopback transport is the observable oracle
-//! for the exact engine/ingest/retention code that ships.
+//! for the exact engine/ingest code that ships.
 //!
 //! It asserts, entirely via SQL against both catalog DBs, the four invariants
 //! Stage I must hold before M-Sync1 sign-off:
@@ -20,25 +20,24 @@
 //! 2. **Dedupe safety.** Re-running the identical selection creates NO new
 //!    primary rows; every second-delivery ack is `Duplicate` (proven from the
 //!    sender's own confirm history), so a lost ack / resend never double-ingests.
-//! 3. **Retention safety.** Live mode (`on_confirm`, `dry_run=false` + the
-//!    explicit opt-in) deletes ONLY confirmed synced sources — a never-synced
-//!    "keeper" file in the same catalog is untouched — and records both the
-//!    transfer event and the `retention_deleted` audit for each deleted frame.
+//! 3. **A send deletes nothing.** After two confirmed deliveries every source
+//!    file is still on disk and still in the catalog, and no `retention_deleted`
+//!    audit exists — the app never reclaims a sent source (owner ruling
+//!    2026-08-29: retention is a Perseus-only concern).
 //! 4. **History completeness on both ends** — 50 sender confirms, 50 receiver
 //!    ingests, all searchable.
 //!
 //! The harness reaches production code through one intentionally minimal
 //! test-support surface: [`ServiceContext::new_for_tests`] (a `#[doc(hidden)]`
 //! constructor; see its doc comment). Everything else — `enqueue_sync_selection`,
-//! `SyncReceiver`, the retention `evaluate` seam, the loopback transport, the
-//! catalog store — is the same public API the desktop/web hosts use.
+//! `SyncReceiver`, the loopback transport, the catalog store — is the same
+//! public API the desktop/web hosts use.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
 use athenaeum_core::api::sync::{
     cancel_incoming_package, cancel_sync_package, delete_transfer_history, enqueue_sync_selection,
     get_status, get_transfer_storage, list_terminal_transfers, list_transfer_files,
@@ -57,8 +56,8 @@ use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::{
     allow_all_peers, node_id_hex, CatalogDedupResponder, CatalogSyncStore, DedupResponder,
-    Direction, InboundControl, RetentionPolicy, StartedSender, SyncConfig, SyncEngine,
-    SyncEngineHandle, SyncReceiver, SyncRuntime, SyncSenderRuntime, SyncStore,
+    Direction, InboundControl, StartedSender, SyncConfig, SyncEngine, SyncEngineHandle,
+    SyncReceiver, SyncRuntime, SyncSenderRuntime, SyncStore,
 };
 use chrono::Utc;
 
@@ -515,19 +514,6 @@ fn landed_count(dir: &Path) -> usize {
         .count()
 }
 
-/// Count *live* (`deleted_at IS NULL`) `sync_sources` retention rows keyed on
-/// `package_ref` — the oracle for "retention follows the payload" across a
-/// declined-resend re-key. Parameterised so a tempdir path with odd chars is safe.
-fn sync_sources_live_count(db: &Database, package_ref: &str) -> i64 {
-    db.conn()
-        .query_row(
-            "SELECT COUNT(*) FROM sync_sources WHERE package_ref = ?1 AND deleted_at IS NULL",
-            [package_ref],
-            |r| r.get(0),
-        )
-        .expect("count sync_sources")
-}
-
 #[tokio::test]
 async fn two_instance_sync_e2e() {
     let tmp = tempfile::tempdir().unwrap();
@@ -641,7 +627,7 @@ async fn two_instance_sync_e2e() {
     }
 
     // ── Seed 50 fixture frames into the capture catalog + one never-synced
-    // "keeper" file that retention must never touch. ──
+    // "keeper" file, the control for "a send touches nothing on disk". ──
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
     let mut expected: Vec<(String, String, f64)> = Vec::with_capacity(N); // (uuid, object, exptime)
     for idx in 0..N {
@@ -822,76 +808,48 @@ async fn two_instance_sync_e2e() {
         "every second-delivery ack receipt is Duplicate"
     );
 
-    // ── (3) Retention: live mode, on_confirm, opt-in set — deletes confirmed
-    // sources ONLY. ──
+    // ── (3) The app never deletes a sent source (owner ruling 2026-08-29:
+    // retention is a Perseus-only concern; the app-shell retention loop was
+    // removed). After two confirmed deliveries every source is still on disk and
+    // still in the catalog. ──
     for idx in 0..N {
         assert!(
             capture_files.join(format!("light_{idx:04}.fits")).exists(),
-            "source {idx} present before retention"
+            "confirmed source {idx} survives the send"
         );
     }
-    let ret_store = CatalogSyncStore::open(&capture_db).unwrap();
-    let cfg = AppRetentionConfig {
-        policy: RetentionPolicy::OnConfirm,
-        raw_dry_run: false,
-        live_confirmed: true,
-    };
-    let outcome = evaluate(&ret_store, &cfg, Utc::now(), &|| 0u8).expect("retention evaluate");
-    assert!(!outcome.dry_run, "dry_run=false + opt-in goes live");
-    assert_eq!(
-        outcome.eligible.len(),
-        2,
-        "both confirmed packages are retention candidates"
-    );
-    // The two packages link the SAME 50 files; whichever is processed first
-    // deletes them, the second finds them gone and is a no-op → exactly one
-    // package reports a real removal.
-    assert_eq!(
-        outcome.deleted.len(),
-        1,
-        "one package did the real deletion; its twin was a no-op"
-    );
-
-    // Every confirmed source is gone from disk AND its catalog rows are removed…
-    for idx in 0..N {
-        assert!(
-            !capture_files.join(format!("light_{idx:04}.fits")).exists(),
-            "confirmed source {idx} deleted at source"
-        );
-    }
-    // …while the never-synced keeper survives, on disk and in the catalog.
     assert!(
         keeper_path.exists(),
-        "the never-synced keeper file is untouched by retention"
+        "the never-synced keeper file is untouched"
     );
     assert_eq!(
         count(cdb, "SELECT COUNT(*) FROM files"),
-        1,
-        "only the never-synced keeper survives"
+        N as i64 + 1,
+        "a send removes no catalog rows (the 50 sent frames + the keeper)"
     );
     assert_eq!(
         count(cdb, "SELECT COUNT(*) FROM frames"),
-        1,
-        "keeper's frame survives (CASCADE removed the rest)"
+        N as i64 + 1,
+        "…and no frames"
     );
-
-    // Both history events are searchable for the deleted frames: the transfer
-    // ('ingested') AND the retention audit ('retention_deleted').
     assert_eq!(
         count(
             cdb,
             "SELECT COUNT(*) FROM sync_history WHERE outcome = 'retention_deleted'"
         ),
-        N as i64,
-        "one retention_deleted audit per confirmed source"
+        0,
+        "the app writes no retention audit — it deletes nothing"
     );
+
+    // ── (4) History completeness on the sender: one confirm per frame, each
+    // searchable by frame uuid. ──
     assert_eq!(
         count(
             cdb,
             "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"
         ),
         N as i64,
-        "the transfer events survive retention (both events searchable)"
+        "one sender confirm per frame"
     );
     for (uuid, _, _) in expected.iter().step_by(11) {
         assert!(
@@ -902,15 +860,6 @@ async fn two_instance_sync_e2e() {
                 ),
             ) >= 1,
             "transfer event present for {uuid}"
-        );
-        assert!(
-            count(
-                cdb,
-                &format!(
-                    "SELECT COUNT(*) FROM sync_history WHERE frame_uuid = '{uuid}' AND outcome = 'retention_deleted'"
-                ),
-            ) >= 1,
-            "retention_deleted event present for the same frame {uuid}"
         );
     }
 
@@ -1373,8 +1322,7 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
 /// row does NOT bounce — it renames the payload dir to a fresh basename (⇒ new wire
 /// `batch_uuid`) and enqueues a brand-NEW `sync_outbound` row that confirms; the
 /// receiver keys a SECOND inbound row on the new batch and ingests, while the old
-/// declined row stays declined and untouched. Retention (`sync_sources`) follows
-/// the renamed dir.
+/// declined row stays declined and untouched.
 ///
 /// Deterministic mid-transfer cancel: the receiver endpoint's `abort_after_bytes`
 /// fault is held armed so no payload fetch can ever COMPLETE (hence no ingest can
@@ -1463,13 +1411,8 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     .await
     .expect("enqueue selection");
     let old_id = latest_outbound_id(cdb);
-    // The declined transfer's payload dir + its N retention rows — the re-key oracle.
+    // The declined transfer's payload dir — the rename oracle below.
     let old_pkg_ref = outbound_package_ref(cdb, old_id);
-    assert_eq!(
-        sync_sources_live_count(cdb, &old_pkg_ref),
-        N as i64,
-        "the send records one sync_sources retention row per frame"
-    );
 
     // Learn the wire package_id from the inbound row the announce created, re-arming
     // the one-shot abort fault each poll so every retry's payload fetch keeps
@@ -1616,22 +1559,10 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
         "the declined row keeps its receiver-decline reason"
     );
 
-    // Retention followed the payload: the N `sync_sources` rows now key on the NEW
-    // transfer's package_ref, none on the old one.
     let new_pkg_ref = outbound_package_ref(cdb, new_id);
     assert_ne!(
         new_pkg_ref, old_pkg_ref,
         "the new transfer owns a fresh payload dir"
-    );
-    assert_eq!(
-        sync_sources_live_count(cdb, &new_pkg_ref),
-        N as i64,
-        "sync_sources re-keyed onto the new transfer"
-    );
-    assert_eq!(
-        sync_sources_live_count(cdb, &old_pkg_ref),
-        0,
-        "no sync_sources remain under the old package_ref"
     );
 
     // The old payload dir was renamed away (gone from disk); the new dir is present

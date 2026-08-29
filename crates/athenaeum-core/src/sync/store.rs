@@ -490,28 +490,16 @@ pub const DDL_SYNC_EVENTS: &str = "CREATE TABLE IF NOT EXISTS sync_events (
     detail TEXT
 )";
 
-/// `sync_sources` — the app sender's package → source-file linkage (task M4).
+/// `sync_sources` — **VESTIGIAL** since 2026-08-29.
 ///
-/// The app-side equivalent of Perseus's `perseus_seen`: it maps a
-/// `sync_outbound.package_ref` back to the ORIGINAL catalog source file(s) the
-/// package was built from, so retention can resolve a *confirmed package* to the
-/// disk files it may reclaim. Unlike Perseus (one file per package), an app
-/// selection/scan-batch package carries MANY files, so this is a one-package →
-/// many-rows table keyed on `(package_ref, path)`.
-///
-/// Columns mirror `perseus_seen`'s retention semantics:
-/// - `file_id` — the catalog `files.id`, so retention can do a *catalog-consistent*
-///   delete (remove the `files` row → CASCADE to `frames`) alongside the disk file.
-///   Nullable only defensively (every app package is built from catalog frames).
-/// - `size` / `mtime` — the stat recorded at package-build time; retention's
-///   last-line TOCTOU guard re-stats the file and requires an exact match before
-///   deleting, so a since-rewritten path is never destroyed.
-/// - `deleted_at` — stamped once retention has handled the linkage, so it never
-///   surfaces again (the row is kept as a durable audit trail).
-///
-/// Receiver-agnostic and app-only: Perseus keeps its own `perseus_seen`. The DDL
-/// lives here beside the other sync tables so `db/schema.rs` materialises it in
-/// the app catalog through the one shared definition.
+/// It used to hold the app sender's `sync_outbound.package_ref` → source-file
+/// linkage, written at package-build time so the app-shell retention loop could
+/// resolve a confirmed package back to the disk files it might reclaim. That
+/// loop is gone (owner ruling: retention is a Perseus-only concern — the app
+/// never deletes a sent source), so NOTHING writes or reads this table any
+/// more. The DDL and its entry in `TRANSFER_TABLES` stay so existing catalogs
+/// keep a table they already have and the upgrade wipe still finds it; dropping
+/// it is a future schema pass.
 pub const DDL_SYNC_SOURCES: &str = "CREATE TABLE IF NOT EXISTS sync_sources (
     package_ref TEXT NOT NULL,
     file_id INTEGER,
@@ -1091,110 +1079,6 @@ pub fn set_outbound_project_id(conn: &Connection, id: i64, project_id: Option<&s
     )
     .with_context(|| format!("set project_id for outbound {id}"))?;
     Ok(())
-}
-
-/// One `sync_sources` row: a live (or historic) linkage from an app package back
-/// to one catalog source file it was built from. See [`DDL_SYNC_SOURCES`].
-///
-/// `size`/`mtime_ms` are the stat recorded when the package was built — the
-/// retention deleter's last-line TOCTOU guard re-stats the file and requires an
-/// exact match before removal, so a since-rewritten path is never destroyed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncSourceRow {
-    pub package_ref: String,
-    pub file_id: Option<i64>,
-    pub path: String,
-    pub size: u64,
-    pub mtime_ms: i64,
-}
-
-/// Record (insert or overwrite) one source-file linkage for `package_ref` at
-/// build time. Idempotent by `(package_ref, path)`: a rebuild of the same
-/// selection overwrites the recorded stat and clears any prior `deleted_at` (the
-/// file is a live source again). See [`SyncSourceRow`].
-pub fn insert_sync_source(
-    conn: &Connection,
-    package_ref: &str,
-    file_id: Option<i64>,
-    path: &str,
-    size: u64,
-    mtime_ms: i64,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO sync_sources (package_ref, file_id, path, size, mtime, enqueued_at, deleted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-         ON CONFLICT(package_ref, path) DO UPDATE SET
-             file_id = excluded.file_id,
-             size = excluded.size,
-             mtime = excluded.mtime,
-             enqueued_at = excluded.enqueued_at,
-             deleted_at = NULL",
-        params![package_ref, file_id, path, size as i64, mtime_ms, now_iso()],
-    )
-    .context("insert sync_sources")?;
-    Ok(())
-}
-
-/// Every *live* (`deleted_at IS NULL`) source linkage for `package_ref`, ordered
-/// by path for a deterministic pass. Retention resolves a confirmed package to
-/// exactly the source files it may reclaim through this call.
-pub fn live_sources_for_package(
-    conn: &Connection,
-    package_ref: &str,
-) -> Result<Vec<SyncSourceRow>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT package_ref, file_id, path, size, mtime FROM sync_sources
-             WHERE package_ref = ?1 AND deleted_at IS NULL
-             ORDER BY path ASC",
-        )
-        .context("prepare live_sources_for_package")?;
-    let rows = stmt
-        .query_map(params![package_ref], |r| {
-            Ok(SyncSourceRow {
-                package_ref: r.get(0)?,
-                file_id: r.get(1)?,
-                path: r.get(2)?,
-                size: {
-                    let s: i64 = r.get(3)?;
-                    s.max(0) as u64
-                },
-                mtime_ms: r.get(4)?,
-            })
-        })
-        .context("query live_sources_for_package")?
-        .collect::<rusqlite::Result<Vec<SyncSourceRow>>>()
-        .context("collect live_sources_for_package")?;
-    Ok(rows)
-}
-
-/// Stamp a source linkage `deleted_at = now` after retention has handled it, so
-/// it never surfaces via [`live_sources_for_package`] again (the row survives as
-/// a durable audit trail).
-pub fn mark_sync_source_deleted(conn: &Connection, package_ref: &str, path: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE sync_sources SET deleted_at = ?3 WHERE package_ref = ?1 AND path = ?2",
-        params![package_ref, path, now_iso()],
-    )
-    .context("mark sync_sources row deleted")?;
-    Ok(())
-}
-
-/// Re-key every `sync_sources` row from `old_ref` to `new_ref` and return the
-/// number of rows moved. Used by the declined-resend path (Transfers Batch Model,
-/// Task D): a receiver-declined transfer's Resend renames its package dir to a
-/// fresh uuid basename (a new wire `batch_uuid`), so the retention linkage must
-/// follow the renamed dir or the new transfer's confirmed sources would never be
-/// reclaimed. The `(package_ref, path)` primary key stays unique by construction —
-/// `new_ref` is a freshly-minted uuid dir that has never held any of these paths.
-pub fn rekey_sync_sources(conn: &Connection, old_ref: &str, new_ref: &str) -> Result<usize> {
-    let n = conn
-        .execute(
-            "UPDATE sync_sources SET package_ref = ?2 WHERE package_ref = ?1",
-            params![old_ref, new_ref],
-        )
-        .context("re-key sync_sources")?;
-    Ok(n)
 }
 
 /// Stable text encoding of a [`ReceiptOutcome`] for the `sync_receipts.outcome`

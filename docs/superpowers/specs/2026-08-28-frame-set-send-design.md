@@ -51,8 +51,8 @@ Coverage tab (Create All Masters / Calibrate Lights), and the tab links there.
   batch_name, frame_set_id)` → `build_selection_package`, which resolves
   catalog files, hashes them (`package::xxh3_full_file`, banks
   `files.strong_hash`), assigns `rel_path` from the WBPP placement map when a
-  `frame_set_id` is given, writes the package, records `sync_sources` for
-  retention, and enqueues on the per-peer sender engine. Every record today is
+  `frame_set_id` is given, writes the package, and enqueues on the per-peer
+  sender engine. Every record today is
   `PayloadKind::RawFrame` with `frame_meta` = the `models::Frame` snapshot.
 - **Readiness** — `api::lights::get_export_readiness(set_id, mode, flat_norm,
   flat_norm_mode, params)` tallies `total/calibrated/stale/missing` for the
@@ -73,10 +73,8 @@ Coverage tab (Create All Masters / Calibrate Lights), and the tab links there.
   routes it to `scanner::reconcile_calibrated_light` (known / moved /
   duplicate / adopt; adoption deferred with a `warn!` when the source light is
   not cataloged). Never registered as a frame.
-- **Desktop retention** (`api::retention`) — opt-in (dry-run + explicit
-  `live_confirmed`), deletes the *sources* of a confirmed package via the
-  `sync_sources` linkage written at package-build time, catalog-consistently
-  (`db::send_to_void`).
+- **Desktop retention** — removed 2026-08-29 (owner ruling: retention is
+  Perseus-only; the app never deletes a sent source).
 
 ## 3. Sender: composing the package
 
@@ -120,7 +118,6 @@ Steps, in order — nothing is written before step 3 passes:
        source_path: PathBuf,   // file to copy into the package
        rel_path: String,       // WBPP dir + filename, forward slashes
        kind: PayloadKind,      // RawFrame | Master | CalibratedLight
-       reclaimable: bool,      // may retention reclaim it after confirm? (D5)
    }
    ```
 
@@ -132,19 +129,13 @@ Steps, in order — nothing is written before step 3 passes:
    `disk_matches_row` (catalog file only), manifest record, per-directory
    filename dedup — with these kind-specific rules:
    - **`RawFrame`** (lights, raw calibration frames): unchanged. `frame_meta` =
-     the frame's snapshot; `frame_uuid` = `frames.uuid`; `sync_sources` row
-     written **iff the composer marked the entry `reclaimable`** (D5). The
-     builder does not decide which raw frames those are: `selection_entries`
-     marks every raw frame (the user picked them file by file),
-     `frame_set_entries` marks only the set's own LIGHT frames.
+     the frame's snapshot; `frame_uuid` = `frames.uuid`.
    - **`Master`**: same as `RawFrame` for the receiver's purposes (a master is a
-     catalog frame); the kind is an honest label. **No `sync_sources` row** —
-     retention must never reclaim a master from the calibration library
-     because it was sent.
+     catalog frame); the kind is an honest label.
    - **`CalibratedLight`**: `frame_meta` = the **source light's** snapshot
      (`frames` row of `frame_id`), `frame_uuid` = a fresh v4 uuid (identity on
      the receiver comes from the file's own header, §4), `analysis` = `None`,
-     **no `sync_sources` row**, no `strong_hash` banking (not a catalog file).
+     no `strong_hash` banking (not a catalog file).
 6. **Enqueue** — `engine.enqueue_package(dir, display_name, files,
    PackageLayout::Batch)` exactly as `enqueue_sync_selection` does; the batch
    auto-name falls back to the frame-set name. The frontend fans the command
@@ -329,12 +320,8 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
   The Offer's sampling hash of a `c_*.fits` never matches a receiver `files`
   row, so calibrated lights are always wanted; re-sends dedup at ingest by
   receipt (§4.1).
-- **Retention**: a `sync_sources` row is written only for a `RawFrame` entry
-  the composer marked `reclaimable` (D5). On a frame-SET send that is the set's
-  own LIGHT frames alone — its raw calibration frames belong to sets shared
-  across objects, so reclaiming them would eat a shared calibration library. A
-  frame-SELECTION send still links every picked raw frame. Masters and
-  calibrated outputs are never reclaimable through a send at all.
+- **Retention**: the app writes no source linkage and never deletes a sent
+  source; retention is a Perseus-only concern.
 - **TS types**: `ExportMode` (new variant), `ExportReadiness` (new fields),
   `ExportFileCounts` (new) regenerate from the `ts_export.rs` registry;
   `src/types/models.ts` / `src/types/export.ts` updated in the same change.
@@ -370,9 +357,8 @@ Sender:
 - `check_mode_ready` truth table (four modes × ready / not ready).
 - Package build from payload entries, per mode: `rel_path`s are the WBPP
   directories; `payload_kind` per file is `RawFrame` for lights and raw
-  calibration, `Master` for master files, `CalibratedLight` for `c_*.fits`;
-  `sync_sources` holds exactly the `RawFrame` file ids; a `CalibratedLight`
-  record's `frame_meta` is the source light's snapshot.
+  calibration, `Master` for master files, `CalibratedLight` for `c_*.fits`; a
+  `CalibratedLight` record's `frame_meta` is the source light's snapshot.
 - `enqueue_sync_selection` regression: the existing selection tests pass
   unchanged through the generalized builder.
 
@@ -437,16 +423,9 @@ source is cataloged).
 - **D4** — calibrated lights are never cataloged on the receiver; adoption
   into `light_calibrations` is best-effort and deferred when the source light
   is absent (same contract as the scanner).
-- **D5** — retention reclaim after a send is opt-in per payload entry
-  (`PayloadEntry.reclaimable`), decided by the composer and honoured by the one
-  package builder. Masters and calibrated outputs are always excluded, so
-  desktop retention can never reclaim library artifacts because of a send. On a
-  **frame-set** send only the set's OWN light frames are reclaimable: the linked
-  calibration sets are shared across objects by construction
-  (`archive/shared_calibration.rs`), so enrolling their raw dark/flat/bias
-  frames would let one confirmed send delete a shared calibration library. A
-  **frame-selection** send is unchanged — those files were picked explicitly
-  (revised after the whole-branch review, owner, 2026-08-28).
+- **D5** — the app writes no source linkage and never deletes a sent source;
+  retention is a Perseus-only concern (owner ruling, 2026-08-29 — supersedes
+  the per-entry `reclaimable` opt-in this section originally specified).
 - **Limitation** — the export summary's folder preview is not mode-aware.
 - **Limitation** — a receiver older than this change ingests `CalibratedLight` records as
   raw frames; documented "upgrade the receiver" stance, no wire guard.

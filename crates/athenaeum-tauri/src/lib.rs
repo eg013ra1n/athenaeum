@@ -228,25 +228,6 @@ pub fn run() {
                 });
             }
 
-            // Full-app capture-node retention loop (task M4). Hourly; every tick
-            // is gated inside `run_app_retention_once` (a no-op unless this is a
-            // signed-in `capture` node with a policy other than keep_everything),
-            // and dry-run is the enforced default — live deletion needs the
-            // explicit `sync.retention.live_confirmed` opt-in. Safe to arm
-            // unconditionally: on any other device it never touches disk.
-            {
-                let ctx_for_retention = Arc::clone(&state.ctx);
-                tauri::async_runtime::spawn(async move {
-                    athenaeum_core::api::retention::run_app_retention_loop(
-                        ctx_for_retention,
-                        Duration::from_secs(
-                            athenaeum_core::api::retention::DEFAULT_RETENTION_INTERVAL_SECS,
-                        ),
-                    )
-                    .await;
-                });
-            }
-
             tracing::info!("Athenaeum started, Tauri setup complete");
             Ok(())
         })

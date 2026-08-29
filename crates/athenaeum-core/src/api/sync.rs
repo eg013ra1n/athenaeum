@@ -2985,13 +2985,11 @@ fn selection_entries(
     for (_file_id, file, frame) in &rows {
         let Some(frame_id) = frame.id else { continue };
         resolved.insert(frame_id);
-        // A hand-picked master is labeled honestly, which is also what keeps it
-        // out of the retention linkage in the builder below (§D5). The test is
-        // the CATALOG's own master signal, not the header alone: the scanner
-        // sets `frames.is_master` from `imagetyp.is_master() || filename_is_master`
-        // (`fits_parser/mod.rs`), so a `master_dark_*.fits` whose IMAGETYP still
-        // reads `Dark` must not fall through to `RawFrame` and become
-        // retention-reclaimable.
+        // A hand-picked master is labeled honestly. The test is the CATALOG's own
+        // master signal, not the header alone: the scanner sets `frames.is_master`
+        // from `imagetyp.is_master() || filename_is_master` (`fits_parser/mod.rs`),
+        // so a `master_dark_*.fits` whose IMAGETYP still reads `Dark` must not
+        // fall through to `RawFrame` and be shipped as an ordinary sub-frame.
         let kind = if frame.is_master || frame.imagetyp.as_ref().is_some_and(|t| t.is_master()) {
             PayloadKind::Master
         } else {
@@ -3001,10 +2999,6 @@ fn selection_entries(
             frame_id,
             source_path: PathBuf::from(&file.path),
             rel_path: assign_rel_path(&layout, frame_id, file, &mut used_by_dir),
-            // The user picked these files one by one, so every raw frame among
-            // them is retention-reclaimable (§D5) — the frame-SET composer is
-            // the one that has to be narrower.
-            reclaimable: kind == PayloadKind::RawFrame,
             kind,
         });
     }
@@ -3034,20 +3028,18 @@ fn selection_entries(
 /// `models::Frame` as `frame_meta` + the analysis summary when present) so the
 /// primary ingests app- and Perseus-sourced frames identically.
 ///
-/// Per-kind rules (spec 2026-08-28 §3 step 5 / §D5):
+/// No retention linkage: the app never deletes a sent source (owner ruling
+/// 2026-08-29 — retention is a Perseus-only concern), so a send records nothing
+/// that points a sweeper back at the user's files.
+///
+/// Per-kind rules (spec 2026-08-28 §3 step 5):
 /// - [`PayloadKind::RawFrame`] — the frame's own snapshot and uuid, `strong_hash`
-///   banked, and the ONLY kind that can get a `sync_sources` retention linkage
-///   row — and then only when the composer marked the entry
-///   [`reclaimable`](PayloadEntry::reclaimable). WHICH raw frames those are is
-///   not the builder's call: a frame selection marks all of them, a frame-set
-///   send only the set's own lights.
-/// - [`PayloadKind::Master`] — the same manifest as a raw frame, but no linkage:
-///   a master is shared by construction, so retention must never reclaim it out
-///   from under its other consumers.
+///   banked.
+/// - [`PayloadKind::Master`] — the same manifest as a raw frame.
 /// - [`PayloadKind::CalibratedLight`] — an artifact that is not in the catalog at
 ///   all: it carries the SOURCE light's `frame_meta` under its own fresh uuid,
-///   with no analysis, no hash banking (the catalog row describes the source
-///   file, not this one) and no linkage.
+///   with no analysis and no hash banking (the catalog row describes the source
+///   file, not this one).
 fn build_selection_package(
     conn: &rusqlite::Connection,
     origin_device: &str,
@@ -3086,11 +3078,6 @@ fn build_selection_package(
     // owns the directory; the filename is deduped within it here so no two
     // entries can overwrite each other inside the package.
     let mut used_by_dir: HashMap<String, HashSet<String>> = HashMap::new();
-    // Per-eligible source linkage recorded into `sync_sources` after the package
-    // is written: (catalog file_id, absolute path, size, mtime_ms). This is what
-    // retention (task M4) later joins on to resolve a confirmed package back to
-    // the disk files it may reclaim, with the recorded stat as the TOCTOU guard.
-    let mut source_links: Vec<(i64, String, u64, i64)> = Vec::new();
     // The manifest hashes every source file in full; that read is banked as
     // `files.strong_hash` after the loop for every row the disk still vouches
     // for — `disk_matches_row`, the contract shared with the master-hash pass
@@ -3127,7 +3114,6 @@ fn build_selection_package(
             }
         };
         let byte_size = meta.len();
-        let mtime_ms = crate::api::retention::mtime_millis(meta.modified().ok());
         let xxh3 = match package::xxh3_full_file(path) {
             Ok(h) => h,
             Err(e) => {
@@ -3216,14 +3202,6 @@ fn build_selection_package(
             },
         ));
         eligible.push(entry.frame_id);
-        // Retention linkage for raw frames the COMPOSER marked reclaimable
-        // (§D5). A master is shared by construction and a calibrated artifact is
-        // a rebuildable by-product, so neither may ever be swept as "the source
-        // this package delivered"; on a frame-set send the linked calibration
-        // sets are shared too, so only the set's own lights carry the flag.
-        if entry.kind == PayloadKind::RawFrame && entry.reclaimable {
-            source_links.push((file_id, file.path.clone(), byte_size, mtime_ms));
-        }
     }
 
     bank_manifest_hashes(conn, &bank);
@@ -3256,21 +3234,6 @@ fn build_selection_package(
     let pkg_dir = packages_dir.join(uuid::Uuid::new_v4().to_string());
     package::write_package(&pkg_dir, records)
         .map_err(|e| ApiError::Internal(format!("write selection package: {e:#}")))?;
-
-    // Record the package → source-file linkage for retention (task M4). Written
-    // AFTER the package exists (so a failed write never leaves a dangling
-    // linkage) and keyed on the same `package_ref` the engine stores in
-    // `sync_outbound`. Best-effort: a failure here only means retention can't
-    // reclaim these files later (they stay on disk — the safe direction), so it
-    // is logged, never fatal to the send.
-    let pkg_ref = pkg_dir.to_string_lossy();
-    for (file_id, path, size, mtime_ms) in &source_links {
-        if let Err(e) =
-            crate::sync::insert_sync_source(conn, &pkg_ref, Some(*file_id), path, *size, *mtime_ms)
-        {
-            tracing::warn!(error = %e, path = %path, "failed to record sync_sources retention linkage");
-        }
-    }
 
     Ok(BuiltSelection {
         pkg_dir: Some(pkg_dir),
@@ -3678,13 +3641,10 @@ pub async fn resend_transfer(
 ///    whereas the only failure after the rename is the enqueue itself, which has a
 ///    rename-back. The old row keeps its `package_ref` string (history/delete
 ///    joins intact) and its Resend affordance recomputes false (payload dir gone).
-/// 3. **Re-key** the `sync_sources` retention linkage onto the new dir (warn-and-
-///    continue — a failure only means the new transfer's sources aren't reclaimed,
-///    the safe direction).
-/// 4. **Clone** the manifest (`list_outbound_files`) + `display_name`.
-/// 5. **Enqueue** on `row.peer`'s engine — the WORKER inserts the new row (no API
-///    pre-insert). On enqueue error, best-effort rename the dir back (and re-key the
-///    sources back) so the old row's Resend stays live, then surface `Internal`.
+/// 3. **Clone** the manifest (`list_outbound_files`) + `display_name`.
+/// 4. **Enqueue** on `row.peer`'s engine — the WORKER inserts the new row (no API
+///    pre-insert). On enqueue error, best-effort rename the dir back so the old
+///    row's Resend stays live, then surface `Internal`.
 ///
 ///    Crash window (verified vs `dir_age` — recursive max mtime; payload mtimes stay
 ///    OLD through a rename): a hard crash between the rename and the worker's row
@@ -3692,9 +3652,9 @@ pub async fn resend_transfer(
 ///    reclaims — acceptable degradation (payload dirs are copies; the sources are the
 ///    user's catalog files; the old row's Resend affordance goes dead and the user
 ///    re-sends from the library). Documented, not engineered around.
-/// 6. **Journal** cross-links on both ids (old: `resend as_new_transfer=<new>`; new:
+/// 5. **Journal** cross-links on both ids (old: `resend as_new_transfer=<new>`; new:
 ///    `resend of_declined=<old>`), best-effort.
-/// 7. The old declined row is **kept as history**; return the NEW id.
+/// 6. The old declined row is **kept as history**; return the NEW id.
 async fn resend_declined_as_new_transfer(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
@@ -3704,7 +3664,7 @@ async fn resend_declined_as_new_transfer(
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<i64, ApiError> {
     use crate::sharing::types::AnnounceFileEntry;
-    use crate::sync::store::{append_sync_event, outbound_ref_states, rekey_sync_sources};
+    use crate::sync::store::{append_sync_event, outbound_ref_states};
 
     let old_id = row.id;
     let old_ref = row.package_ref.clone();
@@ -3718,8 +3678,8 @@ async fn resend_declined_as_new_transfer(
     let new_dir = parent.join(uuid::Uuid::new_v4().to_string());
     let new_ref = new_dir.to_string_lossy().to_string();
 
-    // Steps 1–4 under ONE pooled connection, dropped before the async enqueue (no DB
-    // handle is ever held across an `.await`).
+    // Steps 1 and 3 under ONE pooled connection, dropped before the async enqueue
+    // (no DB handle is ever held across an `.await`).
     let (files, display_name, layout) = {
         let database = db(ctx)?;
         let conn = database.conn();
@@ -3735,7 +3695,7 @@ async fn resend_declined_as_new_transfer(
             )));
         }
 
-        // (4, read before the rename) Clone the manifest for the new row's announce.
+        // (3, read before the rename) Clone the manifest for the new row's announce.
         let file_rows = list_outbound_files(&conn, old_id)
             .map_err(|e| ApiError::Internal(format!("list outbound files {old_id}: {e:#}")))?;
         let files: Vec<AnnounceFileEntry> = file_rows
@@ -3757,11 +3717,11 @@ async fn resend_declined_as_new_transfer(
         (files, display_name, layout)
     };
 
-    // (5a) Resolve row.peer's engine BEFORE any side effect (review fix): engine
+    // (4a) Resolve row.peer's engine BEFORE any side effect (review fix): engine
     // construction is network/hub-dependent and can fail transiently (relay
     // resolution, node startup, dial address) — if it fails HERE, nothing has been
-    // renamed or re-keyed and the old row's Resend stays fully live. Renaming
-    // first would leave every engine-resolution failure with no rename-back.
+    // renamed and the old row's Resend stays fully live. Renaming first would
+    // leave every engine-resolution failure with no rename-back.
     let engine = match sender.current_for(&row.peer).await {
         Some((engine, _)) => engine,
         None => {
@@ -3788,27 +3748,6 @@ async fn resend_declined_as_new_transfer(
         });
     }
 
-    // (3) Re-key retention linkage onto the new dir. Best-effort: a failure only
-    // means retention can't reclaim the new transfer's sources later (they stay
-    // on disk — the safe direction).
-    {
-        let database = db(ctx)?;
-        let conn = database.conn();
-        match rekey_sync_sources(&conn, &old_ref, &new_ref) {
-            Ok(moved) => {
-                tracing::debug!(
-                    old_id,
-                    moved,
-                    "re-keyed sync_sources onto the resent transfer"
-                )
-            }
-            Err(e) => tracing::warn!(
-                old_id,
-                error = %format!("{e:#}"),
-                "re-key sync_sources for resend failed; retention may not reclaim the new transfer"
-            ),
-        }
-    }
     // The worker inserts the new `sync_outbound` row (+ per-file `pending` rows) in
     // one transaction and replies with its id — do NOT pre-insert here.
     let new_id = match engine
@@ -3818,18 +3757,10 @@ async fn resend_declined_as_new_transfer(
         Ok(id) => id,
         Err(e) => {
             // Best-effort undo so the old row's Resend affordance stays live: rename
-            // the dir back and re-key the sources back to `old_ref`. (See the crash-
-            // window note above — a hard crash inside this window is handled by the
-            // startup orphan sweep, so this undo is a courtesy, never a correctness
-            // dependency.)
-            if std::fs::rename(&new_dir, &old_dir).is_ok() {
-                if let Ok(database) = db(ctx) {
-                    let conn = database.conn();
-                    if let Err(re) = rekey_sync_sources(&conn, &new_ref, &old_ref) {
-                        tracing::warn!(old_id, error = %format!("{re:#}"), "re-key sync_sources back after failed resend enqueue");
-                    }
-                }
-            } else {
+            // the dir back. (See the crash-window note above — a hard crash inside
+            // this window is handled by the startup orphan sweep, so this undo is a
+            // courtesy, never a correctness dependency.)
+            if std::fs::rename(&new_dir, &old_dir).is_err() {
                 tracing::warn!(
                     old_id,
                     "could not rename package dir back after failed resend enqueue"
@@ -3841,7 +3772,7 @@ async fn resend_declined_as_new_transfer(
         }
     };
 
-    // (6) Journal cross-links on both ids (best-effort — a log write must never fail
+    // (5) Journal cross-links on both ids (best-effort — a log write must never fail
     // the resend). The old row's own terminal `cancelled` is already journaled; the
     // new row's `enqueued`/`announce_sent`/`confirmed` follow from the worker.
     {
@@ -3868,7 +3799,7 @@ async fn resend_declined_as_new_transfer(
         }
     }
 
-    // (7) Old declined row kept as history; the new transfer is now driving.
+    // (6) Old declined row kept as history; the new transfer is now driving.
     tracing::info!(old_id, new_id, peer = %node_id_hex(&row.peer), "declined transfer resent as new");
     Ok(new_id)
 }
@@ -7661,8 +7592,6 @@ mod tests {
         );
     }
 
-    /// Task M4: building a selection package records the retention linkage in
-    /// `sync_sources` — one live row per eligible frame, keyed on the SAME
     /// Building a package hashes every source file in full for the manifest.
     /// That read is banked into `files.strong_hash` for every row the disk
     /// still vouches for (`(size, modified_at)` match — the contract shared
@@ -7720,62 +7649,6 @@ mod tests {
             .query_row("SELECT strong_hash FROM files WHERE id = ?1", [stale_file_id], |r| r.get(0))
             .unwrap();
         assert_eq!(untouched, None, "a row the disk does not vouch for is never written");
-    }
-
-    /// `package_ref` the engine stores in `sync_outbound`, carrying the catalog
-    /// `file_id` + the file's `(size, mtime)`. This is exactly what
-    /// `api::retention` later resolves to reclaim the source. Ineligible frames
-    /// (missing on disk) never get a linkage row.
-    #[test]
-    fn build_selection_writes_sync_sources_linkage() {
-        let (tmp, ctx) = test_ctx();
-        let dir = tmp.path();
-        let f1 = insert_fixture_frame(&ctx, dir, "light-0001.fits", "M42", false);
-        let f2 = insert_fixture_frame(&ctx, dir, "light-0002.fits", "M42", false);
-        std::fs::remove_file(dir.join("light-0002.fits")).unwrap(); // f2 → missing on disk
-
-        let pkg_root = tmp.path().join("packages");
-        let db = db(&ctx).unwrap();
-        let conn = db.conn();
-        let built = build_selection_package(
-            &conn,
-            "origin-dev",
-            &pkg_root,
-            selection_entries(&conn, &[f1, f2], None).unwrap(),
-            None,
-            None,
-        )
-        .unwrap();
-        let pkg_ref = built
-            .pkg_dir
-            .clone()
-            .expect("a package was written")
-            .to_string_lossy()
-            .to_string();
-
-        let sources = crate::sync::live_sources_for_package(&conn, &pkg_ref).unwrap();
-        assert_eq!(
-            sources.len(),
-            1,
-            "one linkage row for the single eligible frame (f2 was missing)"
-        );
-        let row = &sources[0];
-        assert_eq!(
-            row.path,
-            dir.join("light-0001.fits").to_string_lossy(),
-            "linkage points at the source path"
-        );
-        assert!(
-            row.file_id.is_some(),
-            "the catalog file_id is recorded for a catalog-consistent delete"
-        );
-        assert_eq!(
-            row.size,
-            std::fs::metadata(dir.join("light-0001.fits"))
-                .unwrap()
-                .len(),
-            "recorded size matches disk"
-        );
     }
 
     /// Step 1: ineligible files (missing on disk, or an unknown id) are reported
@@ -8129,7 +8002,6 @@ mod tests {
     /// - the payload dir is renamed to a fresh uuid sibling (old path gone, new dir
     ///   present WITH its payload); the declined row keeps its now-stale `package_ref`;
     /// - the manifest (`sync_outbound_files`) is cloned onto the new row;
-    /// - `sync_sources` retention is re-keyed onto the new dir (old ref → 0, new → N);
     /// - both journals carry the cross-link (`as_new_transfer=` / `of_declined=`);
     /// - a SECOND Resend of the OLD id now errors honestly (its payload dir is gone).
     ///
@@ -8140,7 +8012,7 @@ mod tests {
     #[tokio::test]
     async fn resend_of_declined_mints_new_transfer() {
         use crate::sharing::types::AnnounceFileEntry;
-        use crate::sync::store::{insert_outbound_with_files, live_sources_for_package};
+        use crate::sync::store::insert_outbound_with_files;
 
         let (tmp, ctx) = test_ctx();
         let pkg_dir = build_one_frame_package(&ctx, tmp.path());
@@ -8191,17 +8063,6 @@ mod tests {
             .unwrap();
             id
         };
-        // The fixture package wrote one retention row per frame, keyed on old_ref.
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            assert_eq!(
-                live_sources_for_package(&conn, &old_ref).unwrap().len(),
-                n,
-                "fixture seeded sync_sources on the old ref"
-            );
-        }
-
         // Resend → a NEW transfer.
         let new_id = resend_transfer(
             &ctx,
@@ -8294,22 +8155,6 @@ mod tests {
             assert_eq!(
                 got, want,
                 "cloned file rel_paths match the declined manifest"
-            );
-        }
-
-        // Retention followed the payload: N on the new ref, 0 on the old.
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            assert_eq!(
-                live_sources_for_package(&conn, &new_ref).unwrap().len(),
-                n,
-                "sync_sources re-keyed onto the new ref"
-            );
-            assert_eq!(
-                live_sources_for_package(&conn, &old_ref).unwrap().len(),
-                0,
-                "no sync_sources remain on the old ref"
             );
         }
 
@@ -9287,8 +9132,8 @@ mod tests {
         );
     }
 
-    /// Builder over payload entries: kinds, rel_paths and the retention linkage
-    /// rule (spec 2026-08-28 §3 step 5 / D5).
+    /// Builder over payload entries: kinds and rel_paths, per the per-kind rules
+    /// (spec 2026-08-28 §3 step 5).
     #[test]
     fn build_selection_package_honours_payload_kinds() {
         use crate::db::schema::init_db;
@@ -9334,30 +9179,26 @@ mod tests {
                     source_path: light.clone(),
                     rel_path: "camera_X/lights/L_10.fits".into(),
                     kind: PayloadKind::RawFrame,
-                    reclaimable: true,
                 },
                 PayloadEntry {
                     frame_id: 20,
                     source_path: master.clone(),
                     rel_path: "camera_X/DARKS_5/master_dark.fits".into(),
                     kind: PayloadKind::Master,
-                    reclaimable: false,
                 },
                 PayloadEntry {
                     frame_id: 10,
                     source_path: artifact.clone(),
                     rel_path: "camera_X/lights/c_L_10.fits".into(),
                     kind: PayloadKind::CalibratedLight,
-                    reclaimable: false,
                 },
-                // A raw frame the COMPOSER declined to mark: the shape a
-                // frame-set send produces for a shared calibration frame (§D5).
+                // A second raw frame: the shape a frame-set send produces for a
+                // shared calibration frame.
                 PayloadEntry {
                     frame_id: 30,
                     source_path: shared_dark.clone(),
                     rel_path: "camera_X/DARKS_5/D_0.fits".into(),
                     kind: PayloadKind::RawFrame,
-                    reclaimable: false,
                 },
             ],
             ineligible: Vec::new(),
@@ -9400,20 +9241,6 @@ mod tests {
             "frame_meta is the SOURCE light's snapshot"
         );
         assert!(cal.analysis.is_none());
-        // Retention linkage: only the raw light.
-        let linked: Vec<i64> = conn
-            .prepare("SELECT file_id FROM sync_sources ORDER BY file_id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(
-            linked,
-            vec![1],
-            "masters, artifacts and a raw frame the composer left unmarked never \
-             enter sync_sources"
-        );
         // strong_hash banked for catalog files only (the artifact is not one).
         let banked: i64 = conn
             .query_row(
@@ -9426,12 +9253,11 @@ mod tests {
     }
 
     /// `selection_entries`' kind classification — the one behavior change on the
-    /// otherwise behavior-preserving selection path, and the gate on spec §D5
-    /// ("masters are never reclaimable by retention through a send"). The signal
-    /// is the CATALOG's `frames.is_master`, which the scanner sets from
+    /// otherwise behavior-preserving selection path. The signal is the CATALOG's
+    /// `frames.is_master`, which the scanner sets from
     /// `imagetyp.is_master() || filename_is_master` (`fits_parser/mod.rs`) — a
     /// header-only test would miss a `master_dark_*.fits` still carrying
-    /// `IMAGETYP = Dark` and ship it as a reclaimable `RawFrame`.
+    /// `IMAGETYP = Dark` and ship it as an ordinary `RawFrame`.
     #[test]
     fn selection_entries_labels_masters_by_the_catalog_signal() {
         use crate::db::schema::init_db;
@@ -9484,19 +9310,9 @@ mod tests {
             PayloadKind::Master,
             "filename-detected master: frames.is_master is the catalog's own signal"
         );
-        // The composer's retention decision on the SELECTION path: every raw
-        // frame the user picked is reclaimable, neither master is (§D5).
-        let reclaimable: HashMap<i64, bool> = input
-            .entries
-            .iter()
-            .map(|e| (e.frame_id, e.reclaimable))
-            .collect();
-        assert!(reclaimable[&10], "a picked raw light is reclaimable");
-        assert!(!reclaimable[&20], "IMAGETYP master");
-        assert!(!reclaimable[&30], "filename-detected master");
 
-        // The consequence that matters: neither master may leave behind a
-        // retention linkage the desktop could later reclaim (§D5).
+        // The labels survive into the written package: all three frames are
+        // eligible and the manifest carries the kind each entry was given.
         let built = build_selection_package(
             &conn,
             "ab".repeat(32).as_str(),
@@ -9507,14 +9323,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(built.eligible.len(), 3);
-        let linked: Vec<i64> = conn
-            .prepare("SELECT file_id FROM sync_sources ORDER BY file_id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
+        let records = crate::package::read_manifest(&built.pkg_dir.unwrap()).unwrap();
+        let by_uuid: HashMap<String, PayloadKind> = records
+            .iter()
+            .map(|r| (r.frame_uuid.clone(), r.payload_kind.clone()))
             .collect();
-        assert_eq!(linked, vec![1], "only the raw light is reclaimable");
+        assert_eq!(by_uuid["uuid-10"], PayloadKind::RawFrame);
+        assert_eq!(by_uuid["uuid-20"], PayloadKind::Master);
+        assert_eq!(by_uuid["uuid-30"], PayloadKind::Master);
     }
 
     /// `resolve_batch_name` — each of the three auto-name rules plus the verbatim
