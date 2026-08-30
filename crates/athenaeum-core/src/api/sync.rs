@@ -103,9 +103,10 @@ pub struct EnqueueSelectionResult {
     /// The `sync_outbound` row this send created (transfer-prepare spec §3), so
     /// the caller can address the transfer — cancel it, watch it — while it is
     /// still being staged. `None` when nothing was eligible and no row was
-    /// written. Additive: absent from the JSON when there is no row, so the
-    /// generated TS types it optional (`default` is what tells ts-rs to, the
-    /// same pairing every other omitted field here uses).
+    /// written. Additive: absent from the JSON when there is no row. `default`
+    /// rides along with `skip_serializing_if` so ts-rs generates the field as
+    /// optional (`outboundId?`) rather than merely nullable — the same pairing
+    /// every other omitted field in this module uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_id: Option<i64>,
 }
@@ -10333,6 +10334,19 @@ mod tests {
         Arc<SyncEngineHandle>,
         NodeId,
     ) {
+        loopback_ctx_with_engine_emitting(None).await
+    }
+
+    /// [`loopback_ctx_with_engine`] with a host emitter on the ENGINE, so a test
+    /// can count the events both owners of a transfer produce on one stream.
+    async fn loopback_ctx_with_engine_emitting(
+        engine_emitter: Option<Arc<dyn crate::events::ProgressEmitter>>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServiceContext>,
+        Arc<SyncEngineHandle>,
+        NodeId,
+    ) {
         use crate::sharing::loopback::LoopbackNetwork;
         use crate::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
         use crate::sharing::{noop_fetch_sink, SharingTransport};
@@ -10375,10 +10389,11 @@ mod tests {
         });
 
         let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
-        let engine = Arc::new(SyncEngine::spawn(
+        let engine = Arc::new(SyncEngine::spawn_with_emitter(
             store as Arc<dyn SyncStore>,
             Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
             peer,
+            engine_emitter,
         ));
         (tmp, ctx, engine, peer)
     }
@@ -10627,6 +10642,94 @@ mod tests {
         assert!(
             !sender.prepare().is_preparing(id),
             "the flag is dropped once the worker is done"
+        );
+    }
+
+    /// A verdict another owner already wrote is FINAL, whatever the copy went on
+    /// to do.
+    ///
+    /// Until the cancel command routes to the preparation runtime,
+    /// `cancel_sync_package` reaches the ENGINE, which stamps the row
+    /// `cancelled`, settles its per-file rows and emits its own `sync-finished`.
+    /// If the copy then fails — a source that vanished, a full disk — the worker
+    /// must NOT re-stamp `failed` on top: that would rewrite `last_error` with a
+    /// reason for an outcome the user never chose, raise a second
+    /// `sync-finished` (a second notification for one transfer), and leave file
+    /// rows settled `cancelled` beneath a batch labelled `failed`. Both owners
+    /// emit onto the same recorder here, so "exactly one finish" is countable.
+    #[tokio::test]
+    async fn a_row_cancelled_by_the_engine_is_not_re_terminalized_by_the_worker() {
+        let emitter = Arc::new(RecordingEmitter::default());
+        let (tmp, ctx, engine, peer) = loopback_ctx_with_engine_emitting(Some(
+            Arc::clone(&emitter) as Arc<dyn crate::events::ProgressEmitter>,
+        ))
+        .await;
+        let frame_ids = seed_frames_on_disk(&ctx, &tmp.path().join("M31_data"), 2, 1_000_000);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let permit = sender.prepare().slot().acquire_owned().await.unwrap();
+
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &sync_dirs(&ctx).unwrap().packages_dir,
+            &frame_ids,
+            Some("Batch"),
+            None,
+            peer,
+            Some(Arc::clone(&emitter) as Arc<dyn crate::events::ProgressEmitter>),
+            Arc::clone(&sender),
+        )
+        .await
+        .unwrap();
+        let id = result.outbound_id.unwrap();
+
+        // The other owner writes the verdict while the worker is parked.
+        engine.cancel(id).await.unwrap();
+        let row = wait_outbound(&ctx, id, OutboundState::Cancelled).await;
+        let pkg_dir = PathBuf::from(&row.package_ref);
+        let last_error_after_cancel = row.last_error.clone();
+        let settled = file_counts(&ctx, id);
+        assert_eq!(settled.done, settled.total, "the engine settled the files");
+
+        // …and now the copy the worker resumes is doomed.
+        std::fs::remove_file(source_path_of(&ctx, frame_ids[1])).unwrap();
+        drop(permit);
+        for _ in 0..500 {
+            if !sender.prepare().is_preparing(id) && !pkg_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !pkg_dir.exists(),
+            "the staged dir is discarded, not kept: {}",
+            pkg_dir.display()
+        );
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
+        let row = CatalogSyncStore::open(&db_path)
+            .unwrap()
+            .get_outbound(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            OutboundState::Cancelled,
+            "the verdict the engine wrote still stands"
+        );
+        assert_eq!(
+            row.last_error, last_error_after_cancel,
+            "the worker never rewrote the reason"
+        );
+        let after = file_counts(&ctx, id);
+        assert_eq!(after.failed, 0, "no file row was re-settled as failed");
+        assert_eq!(after.done, after.total);
+        assert_eq!(
+            emitter.named("sync-finished").len(),
+            1,
+            "one transfer, one finish — the worker adds none: {:?}",
+            emitter.named("sync-finished")
         );
     }
 

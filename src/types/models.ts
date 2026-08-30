@@ -1304,9 +1304,10 @@ ineligible: Array<IneligibleFrame>,
  * The `sync_outbound` row this send created (transfer-prepare spec §3), so
  * the caller can address the transfer — cancel it, watch it — while it is
  * still being staged. `None` when nothing was eligible and no row was
- * written. Additive: absent from the JSON when there is no row, so the
- * generated TS types it optional (`default` is what tells ts-rs to, the
- * same pairing every other omitted field here uses).
+ * written. Additive: absent from the JSON when there is no row. `default`
+ * rides along with `skip_serializing_if` so ts-rs generates the field as
+ * optional (`outboundId?`) rather than merely nullable — the same pairing
+ * every other omitted field in this module uses.
  */
 outboundId?: number | null, };
 

@@ -100,20 +100,46 @@ impl PrepareError {
 pub fn spawn_prepare(ctx: Arc<ServiceContext>, sender: Arc<SyncSenderRuntime>, job: PrepareJob) {
     let flag = sender.prepare().register(job.id);
     let slot = sender.prepare().slot();
+    // Copied out before `job` is moved into the staging closure, so every exit
+    // path below — including the one that never gets to stage — can address the
+    // row and the dir it was going to fill.
+    let id = job.id;
+    let peer = job.peer;
+    let pkg_dir = job.pkg_dir.clone();
+    let engine = Arc::clone(&job.engine);
+    let emitter = job.emitter.clone();
     tokio::spawn(async move {
         let _permit = match slot.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
-                tracing::error!(package_id = job.id, error = %e, "prepare slot closed");
-                sender.prepare().finish(job.id);
+                // The runtime is going away, so this transfer will never be
+                // staged. Say so on the row instead of leaving it `preparing`
+                // forever — the same treatment the panic arm gives.
+                tracing::error!(package_id = id, error = %e, "prepare slot closed");
+                sender.prepare().finish(id);
+                match sync_store(&ctx) {
+                    Ok(store) => {
+                        if claim_row(&store, id, &pkg_dir) {
+                            terminalize(
+                                &store,
+                                id,
+                                peer,
+                                &pkg_dir,
+                                OutboundState::Failed,
+                                Some("preparation failed: preparation slot closed"),
+                                "failed",
+                                None,
+                                emitter.as_deref(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(package_id = id, error = %format!("{e:#}"), "prepare: open store failed")
+                    }
+                }
                 return;
             }
         };
-        let id = job.id;
-        let peer = job.peer;
-        let pkg_dir = job.pkg_dir.clone();
-        let engine = Arc::clone(&job.engine);
-        let emitter = job.emitter.clone();
         let ctx2 = Arc::clone(&ctx);
         let flag2 = Arc::clone(&flag);
         let started = Instant::now();
@@ -129,21 +155,17 @@ pub fn spawn_prepare(ctx: Arc<ServiceContext>, sender: Arc<SyncSenderRuntime>, j
                 return;
             }
         };
+        // ONE ownership check covering EVERY outcome, hoisted above the match on
+        // purpose. Promote, cancel and fail all write a verdict, so a worker that
+        // only checked before promoting would still overwrite someone else's
+        // terminal with its own: a rewritten `last_error`, a second
+        // `sync-finished` (a second notification), and file rows settled
+        // `cancelled` under a batch now labelled `failed`.
+        if !claim_row(&store, id, &pkg_dir) {
+            return;
+        }
         match outcome {
             Ok(Ok(stats)) => {
-                // The worker only promotes a row that is STILL its own. Anything
-                // that moved the row while the copy ran (a cancel routed straight
-                // to the engine, a heal) has already decided this transfer's fate,
-                // and flipping it back to `queued` here would resurrect it and
-                // announce a package the user stopped.
-                if !still_preparing(&store, id) {
-                    if let Err(e) = std::fs::remove_dir_all(&pkg_dir) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(package_id = id, path = %pkg_dir.display(), error = %e, "remove staged package dir failed");
-                        }
-                    }
-                    return;
-                }
                 if let Err(e) = store.set_state(id, OutboundState::Queued) {
                     tracing::error!(package_id = id, error = %format!("{e:#}"), "prepare: set queued failed");
                     return;
@@ -397,6 +419,48 @@ pub(crate) fn bank_prepared_hashes(
     crate::api::sync::bank_manifest_hashes(conn, &bank);
 }
 
+/// Claim row `id` for a terminal (or promoting) write by the worker.
+///
+/// `true` — the row is still [`Preparing`](OutboundState::Preparing), so it is
+/// still the worker's to speak for. `false` — someone else already wrote this
+/// transfer's verdict (a cancel routed straight to the engine, a restart heal)
+/// AND settled its per-file rows, so the worker throws away the dir it staged
+/// and says nothing at all. A second terminal write here would be strictly
+/// destructive: it overwrites `last_error` with a reason for an outcome the user
+/// never saw, raises a second `sync-finished` (a second notification for one
+/// transfer), and leaves file rows settled under one verdict beneath a batch
+/// labelled with another.
+///
+/// The single gate for every arm of the worker's outcome match — promote,
+/// cancel, fail, panic and slot-closed — so the asymmetry that made only the
+/// promote path safe cannot come back.
+fn claim_row(store: &CatalogSyncStore, id: i64, pkg_dir: &Path) -> bool {
+    if still_preparing(store, id) {
+        return true;
+    }
+    remove_staged_dir(id, pkg_dir);
+    tracing::info!(
+        package_id = id,
+        "row already settled elsewhere; discarding staged dir"
+    );
+    false
+}
+
+/// Best-effort removal of a package dir the worker staged. An absent dir is the
+/// normal case on several paths (nothing staged yet, an earlier owner already
+/// swept it), so it is `debug!`, not `warn!`.
+fn remove_staged_dir(id: i64, pkg_dir: &Path) {
+    match std::fs::remove_dir_all(pkg_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(package_id = id, path = %pkg_dir.display(), "staged package dir already gone")
+        }
+        Err(e) => {
+            tracing::warn!(package_id = id, path = %pkg_dir.display(), error = %e, "remove staged package dir failed")
+        }
+    }
+}
+
 /// Whether row `id` is still in [`Preparing`](OutboundState::Preparing) — the
 /// worker's handover precondition.
 ///
@@ -449,11 +513,7 @@ fn terminalize(
     culprit: Option<(&str, &str)>,
     emitter: Option<&dyn ProgressEmitter>,
 ) {
-    if let Err(e) = std::fs::remove_dir_all(pkg_dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(package_id = id, path = %pkg_dir.display(), error = %e, "remove partial package dir failed");
-        }
-    }
+    remove_staged_dir(id, pkg_dir);
     if let Err(e) = store.set_state(id, state) {
         tracing::error!(package_id = id, error = %format!("{e:#}"), "prepare: set terminal state failed");
     }
