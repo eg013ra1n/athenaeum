@@ -176,10 +176,10 @@ impl std::error::Error for StageCancelled {}
 /// The staged file is verified against `expected_size` and `dest` is removed on
 /// *every* failure path — a size drift, an I/O error, a cancellation — so a
 /// package directory never keeps a partial payload that its manifest claims is
-/// whole. `cancelled` is consulted before the first byte and every 64 MiB;
-/// a stop returns [`StageCancelled`]. `on_progress` receives the running byte
-/// count, its last call equal to the file's size (a zero-byte payload reports
-/// nothing — there is no byte to report).
+/// whole. `cancelled` is consulted before the first byte and at every 4 MiB
+/// chunk boundary; a stop returns [`StageCancelled`]. `on_progress` receives the
+/// running byte count, its last call equal to the file's size (a zero-byte
+/// payload reports nothing — there is no byte to report).
 pub fn stage_payload(
     src: &Path,
     dest: &Path,
@@ -187,11 +187,42 @@ pub fn stage_payload(
     cancelled: &dyn Fn() -> bool,
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<StagedPayload> {
+    stage_payload_with_reflink(src, dest, expected_size, true, cancelled, on_progress)
+}
+
+/// [`stage_payload`] with the reflink attempt made switchable.
+///
+/// Test seam — the stream branch is the ext4/NTFS/Docker path and must be
+/// exercisable on a reflink-capable dev machine. `allow_reflink = false` skips
+/// the clone attempt so the copy+hash loop runs unconditionally; production
+/// callers use [`stage_payload`], which passes `true`.
+pub(crate) fn stage_payload_with_reflink(
+    src: &Path,
+    dest: &Path,
+    expected_size: u64,
+    allow_reflink: bool,
+    cancelled: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(u64),
+) -> Result<StagedPayload> {
+    // Checked here, ABOVE the remove-on-failure wrapper below: staging a file
+    // onto itself must not reach that cleanup, which would delete the user's
+    // original. No caller does it (`dest` always lives under the package dir),
+    // so this is a loud refusal, not a supported mode.
+    if src == dest {
+        anyhow::bail!("refusing to stage {} onto itself", src.display());
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create payload dir {}", parent.display()))?;
     }
-    let result = stage_payload_inner(src, dest, expected_size, cancelled, on_progress);
+    let result = stage_payload_inner(
+        src,
+        dest,
+        expected_size,
+        allow_reflink,
+        cancelled,
+        on_progress,
+    );
     if let Err(e) = &result {
         tracing::debug!(
             src = %src.display(),
@@ -208,24 +239,19 @@ fn stage_payload_inner(
     src: &Path,
     dest: &Path,
     expected_size: u64,
+    allow_reflink: bool,
     cancelled: &dyn Fn() -> bool,
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<StagedPayload> {
     // 4 MiB reads: the size `xxh3_full_file` uses, and what the network storage
     // these libraries live on wants. Streaming xxh3 is read-size independent, so
-    // the digest matches whatever the buffer.
+    // the digest matches whatever the buffer. The cancel check rides the same
+    // boundary — one closure call per 4 MiB is free next to the I/O, and it
+    // bounds a stop request at one chunk of work instead of a coarser window.
     const CHUNK: usize = 4 * 1024 * 1024;
-    const CANCEL_EVERY: u64 = 64 * 1024 * 1024;
 
     if cancelled() {
         return Err(StageCancelled.into());
-    }
-
-    // Staging a file onto itself would delete the user's original on the next
-    // line. No caller does it (`dest` always lives under the package dir), so
-    // this is a loud refusal, not a supported mode.
-    if src == dest {
-        anyhow::bail!("refusing to stage {} onto itself", src.display());
     }
 
     // `reflink` refuses an existing `to`, and a leftover from an earlier attempt
@@ -235,22 +261,22 @@ fn stage_payload_inner(
     let mut hasher = Xxh3::new();
     let mut buf = vec![0u8; CHUNK];
     let mut done: u64 = 0;
-    let mut next_cancel_check = CANCEL_EVERY;
 
-    let reflinked = match reflink_copy::reflink(src, dest) {
-        Ok(()) => true,
-        Err(e) => {
-            // Not an error: the filesystem simply cannot clone. Recorded at
-            // trace so a debugging session can see which branch a machine took
-            // without flooding a per-file loop at info/debug.
-            tracing::trace!(
-                src = %src.display(),
-                error = %e,
-                "reflink unavailable; streaming copy instead"
-            );
-            false
-        }
-    };
+    let reflinked = allow_reflink
+        && match reflink_copy::reflink(src, dest) {
+            Ok(()) => true,
+            Err(e) => {
+                // Not an error: the filesystem simply cannot clone. Recorded at
+                // trace so a debugging session can see which branch a machine
+                // took without flooding a per-file loop at info/debug.
+                tracing::trace!(
+                    src = %src.display(),
+                    error = %e,
+                    "reflink unavailable; streaming copy instead"
+                );
+                false
+            }
+        };
 
     // Reflinked: read the clone (the source's bytes, already on disk) and write
     // nothing. Otherwise: read the source and write the copy.
@@ -277,11 +303,8 @@ fn stage_payload_inner(
         }
         done += n as u64;
         on_progress(done);
-        if done >= next_cancel_check {
-            next_cancel_check += CANCEL_EVERY;
-            if cancelled() {
-                return Err(StageCancelled.into());
-            }
+        if cancelled() {
+            return Err(StageCancelled.into());
         }
     }
 
