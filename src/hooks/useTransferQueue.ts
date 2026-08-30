@@ -505,6 +505,16 @@ export function useTransferQueue(): UseTransferQueue {
       activeOutboundIds.add(s.id);
       const live = liveOutboundBytes.get(s.id);
       const liveStage = liveOutboundStage.get(s.id) ?? null;
+      // Transfer-prepare spec §7.1: the serve import has no state of its own — the
+      // row stays `queued` until the announce goes out — so "indexing now" is the
+      // PAIR "`queued` + the last live tick was the import", never the bare stage.
+      // The bare stage goes stale: indexing emits its final tick before the
+      // announce and nothing ticks again until the peer pulls, so `liveStage`
+      // still reads `'indexing'` through the whole `announced` window (and through
+      // any `waiting`/`waiting_peer` after a failed announce). Gating throughput on
+      // it alone painted the last indexing EMA — "320 MB/s" — under a chip that
+      // says the transfer is waiting on the peer.
+      const indexingNow = s.displayState === 'queued' && liveStage === 'indexing';
       out.push({
         key: `out:${s.id}`,
         kind: 'outbound',
@@ -515,12 +525,9 @@ export function useTransferQueue(): UseTransferQueue {
         displayName: s.displayName,
         deviceName: s.deviceName,
         peerKind: null,
-        // Transfer-prepare spec §7.1: the serve import has no state of its own —
-        // the row stays `queued` until the announce goes out — so a `queued` row
-        // whose last live tick was the import renders as `indexing` (same chip as
-        // `preparing`, its own subline). Every other state passes through.
-        displayState:
-          s.displayState === 'queued' && liveStage === 'indexing' ? 'indexing' : s.displayState,
+        // An indexing row wears the `indexing` label (same chip as `preparing`,
+        // its own subline); every other state passes through untouched.
+        displayState: indexingNow ? 'indexing' : s.displayState,
         stalledUntil: s.stalledUntil,
         retrying: s.retrying,
         fileCounts: s.fileCounts,
@@ -540,11 +547,10 @@ export function useTransferQueue(): UseTransferQueue {
         // Preparing and indexing move real bytes (locally), so they get a live
         // speed + a moving bar exactly like the wire stage does.
         speedBps:
-          s.state === 'transferring' || s.state === 'preparing' || liveStage === 'indexing'
+          s.state === 'transferring' || s.state === 'preparing' || indexingNow
             ? (live?.speedBps ?? null)
             : null,
-        isTransferring:
-          s.state === 'transferring' || s.state === 'preparing' || liveStage === 'indexing',
+        isTransferring: s.state === 'transferring' || s.state === 'preparing' || indexingNow,
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
     }

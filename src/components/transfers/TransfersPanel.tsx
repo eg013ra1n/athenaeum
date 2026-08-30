@@ -26,7 +26,8 @@ type DirFilter = 'all' | Direction;
  *  `OutboundSummary` carries no `bytesDone` — only the event stream does — and
  *  without it a staging row's mini-line would sit frozen at "0 of 340" for the
  *  whole preparation, which is the exact "is it doing anything?" gap this cycle
- *  closes. Entries exist ONLY while a package ticks `preparing`/`indexing`. */
+ *  closes. An entry appears on a `preparing`/`indexing` tick and is dropped on
+ *  the first tick of any other sender stage, or on `sync-finished`. */
 interface PreparingBytes {
   bytesDone: number;
   /** The tick's own view of the package total. Kept for parity with
@@ -459,10 +460,21 @@ function ActiveTab({
         // Denominator is the row's own §D4-adjusted manifest total (NOT the
         // tick's `bytesTotal`), so the mini-row and the full /transfers row
         // always quote the same "/ Y".
-        const preparingLike = row.displayState === 'preparing' || row.displayState === 'indexing';
+        //
+        // The predicate keys off the LIVE tick, because `displayState` here comes
+        // from the polled `OutboundSummary` and never says `indexing`: the serve
+        // import has no state of its own, so the row reads `queued` for all of it
+        // (the derived `indexing` label lives only in `useTransferQueue`). Both
+        // halves earn their place — `queued` keeps the leftover entry (it lingers
+        // until the first `transferring` tick or `sync-finished`) off an
+        // `announced`/`waiting` row, and the entry's presence keeps a row that is
+        // genuinely just queued, having never ticked, on the honest "N of M".
+        const prepared = preparingBytes.get(row.id);
+        const preparingLike =
+          row.displayState === 'preparing' ||
+          (row.displayState === 'queued' && prepared !== undefined);
         const travelFiles = Math.max(0, total - dup);
         const travelBytes = Math.max(0, row.byteSize - row.fileCounts.duplicateBytes);
-        const prepared = preparingBytes.get(row.id);
         return (
           <li key={`out-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
             <div className="min-w-0">
