@@ -5929,6 +5929,95 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
     engine.shutdown().await;
 }
 
+/// Transfer-prepare §3.3: `drive` picks up a row the API layer inserted itself.
+///
+/// A finished preparation flips its `Preparing` row to `Queued` OUTSIDE the
+/// worker — the row never passed through `Command::Process`, so it owns no slot
+/// in the worker's `pending` map and a `Kick` cannot reach it. `drive` is the
+/// command that reads such a row off disk and starts it exactly like a
+/// crash-resume; here it must carry a store-inserted `Queued` row all the way to
+/// `Confirmed` over loopback.
+///
+/// The barrier enqueue is load-bearing: `enqueue_package` awaits the worker's own
+/// id reply, which the worker can only send AFTER its startup crash-resume
+/// enumeration has run. Inserting the target row after that reply proves the row
+/// confirms because of `drive`, not because the resume swept it up.
+#[tokio::test]
+async fn drive_picks_up_a_pre_inserted_queued_row_and_confirms_it() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    // Barrier: the worker is past its crash-resume enumeration once it has
+    // replied to a command.
+    let barrier = build_package(
+        &tmp.path().join("src-barrier"),
+        "uuid-barrier",
+        "barrier.fits",
+        "M42",
+        1024,
+    );
+    let barrier_id = engine
+        .enqueue_package(&barrier, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, barrier_id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    // The API layer inserted the row itself (as the preparation worker will).
+    let pkg = build_package(
+        &tmp.path().join("src-drive"),
+        "uuid-drive",
+        "a.fits",
+        "M31",
+        4096,
+    );
+    let files = announce_files_of(&pkg);
+    let id = store
+        .enqueue(
+            &pkg.to_string_lossy(),
+            receiver_id,
+            Some("Prepared batch"),
+            &files,
+            PackageLayout::Batch,
+        )
+        .unwrap();
+    assert_eq!(
+        state_of(&store, id),
+        Some(OutboundState::Queued),
+        "the API layer's row starts out queued, unknown to the worker"
+    );
+
+    engine.drive(id).await.unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    let rows = files_of(&store, id);
+    assert!(!rows.is_empty(), "the driven batch kept its per-file rows");
+    assert!(
+        rows.iter().all(|r| r.state == OutboundFileState::Done),
+        "every file of the driven row settled, got {rows:?}"
+    );
+
+    engine.shutdown().await;
+}
+
 /// Attempt-isolation (§D1, item 5): a resend mints a fresh wire id, so an ack
 /// carrying the OLD attempt's wire id can NEVER short-circuit the new attempt.
 /// Seeds a stale `Ingested` ack keyed by the cancelled attempt's wire id and

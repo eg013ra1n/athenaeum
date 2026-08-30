@@ -264,6 +264,11 @@ enum Command {
     /// cannot reach it. This tells the worker to read the fresh row and re-drive it
     /// exactly like a crash-resume.
     Resend(i64),
+    /// Drive a row the API layer already inserted as `Queued` (a finished
+    /// preparation, transfer-prepare spec §3.3): read it and start it like a
+    /// crash-resume. The row is NOT in the in-memory `pending` map (it never
+    /// passed through `Process`), so a `Kick` could not reach it.
+    Drive(i64),
     /// Kick one in-flight package: collapse its retry deadline to now and reset
     /// its backoff rung so the next worker pass re-announces immediately (spec §2
     /// wake event / send-now). A no-op for an id with no pending slot.
@@ -728,6 +733,22 @@ impl SyncEngineHandle {
         Ok(())
     }
 
+    /// Drive a row the API layer already inserted as `Queued` — a finished
+    /// preparation (transfer-prepare spec §3.3): the package dir exists on disk
+    /// and its row is in the DB, so the worker reads it and starts it like a
+    /// crash-resume. Same shape as [`resend`](Self::resend) (both pick a row up
+    /// from the store rather than minting one), and distinct from
+    /// [`kick`](Self::kick) for the same reason: the row never passed through
+    /// `Command::Process`, so it owns no slot in the worker's `pending` map and a
+    /// kick would be a no-op.
+    pub async fn drive(&self, id: i64) -> Result<()> {
+        self.cmd_tx
+            .send(Command::Drive(id))
+            .await
+            .map_err(|_| anyhow!("sync engine worker stopped"))?;
+        Ok(())
+    }
+
     /// Kick one in-flight package (send-now / spec §2 wake event): wake it out of
     /// its backoff so the worker re-announces on the next pass. A no-op on the
     /// worker side if the id has no pending slot (already terminal / unknown).
@@ -1018,7 +1039,8 @@ impl Worker {
                             tracing::error!(package_id = id, error = %e, "sync cancel failed");
                         }
                     }
-                    Some(Command::Resend(id)) => self.resend_package(id).await,
+                    Some(Command::Resend(id)) => self.drive_package(id, "resend").await,
+                    Some(Command::Drive(id)) => self.drive_package(id, "drive").await,
                     Some(Command::PeerPresent) => {
                         self.peer_reachable("presence", ReachabilityProof::Beacon)
                     }
@@ -2244,14 +2266,22 @@ impl Worker {
         });
     }
 
-    /// (Re)drive a resent transfer ([`Command::Resend`]). `resend_transfer` (API
-    /// layer) has already reset the SAME durable row back to `Queued` — attempts++,
-    /// a fresh per-attempt wire id, per-file rows → `pending` — while the row was
-    /// terminal, so its slot is NOT in `pending` and a fresh
-    /// [`start_package`](Self::start_package) is what picks the new attempt up
-    /// (reading `wire_package_id` fresh; nothing is cached across the reset). This
-    /// mirrors the crash-resume drive, scoped to this engine's own peer.
-    async fn resend_package(&mut self, id: i64) {
+    /// Drive a durable row the API layer put in front of the worker — the shared
+    /// body of [`Command::Resend`] and [`Command::Drive`], told apart only by the
+    /// `why` log field.
+    ///
+    /// `resend` (Transfers Batch Model §D1/§D3): `resend_transfer` has already
+    /// reset the SAME row back to `Queued` — attempts++, a fresh per-attempt wire
+    /// id, per-file rows → `pending` — while the row was terminal.
+    /// `drive` (transfer-prepare §3.3): the preparation worker inserted/flipped
+    /// the row to `Queued` after staging its payloads.
+    ///
+    /// Either way the row's slot is NOT in `pending` (it never passed through
+    /// [`Command::Process`], or its slot was dropped on the earlier terminal
+    /// transition), so a fresh [`start_package`](Self::start_package) is what picks
+    /// it up — reading `wire_package_id` fresh, nothing cached across the reset.
+    /// This mirrors the crash-resume drive, scoped to this engine's own peer.
+    async fn drive_package(&mut self, id: i64, why: &'static str) {
         // Already live (a fresh-built engine's crash-resume beat this command to the
         // row): just collapse its backoff so it re-announces now.
         if self.pending.contains_key(&id) {
@@ -2261,35 +2291,33 @@ impl Worker {
         let row = match self.store.get_outbound(id) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                tracing::warn!(package_id = id, "resend: outbound row vanished; ignoring");
+                tracing::warn!(package_id = id, why, "outbound row vanished; ignoring");
                 return;
             }
             Err(e) => {
-                tracing::error!(package_id = id, error = %format!("{e:#}"), "resend: read outbound row failed");
+                tracing::error!(package_id = id, why, error = %format!("{e:#}"), "read outbound row failed");
                 return;
             }
         };
         // Scope to this engine's peer (the shared store returns every peer's rows).
         if row.peer != self.peer {
-            tracing::warn!(
-                package_id = id,
-                "resend: row targets another peer; ignoring"
-            );
+            tracing::warn!(package_id = id, why, "row targets another peer; ignoring");
             return;
         }
-        // The API layer guards terminal-state eligibility + does the reset; if the
-        // row is still terminal here the reset never ran — do not re-drive.
+        // The API layer guards state eligibility + does the reset/insert; if the row
+        // is terminal here that never ran — do not drive it.
         if row.state.is_terminal() {
             tracing::warn!(
                 package_id = id,
+                why,
                 state = row.state.as_str(),
-                "resend: row still terminal; not re-driving"
+                "row is terminal; not driving"
             );
             return;
         }
         let dir = PathBuf::from(&row.package_ref);
         if let Err(e) = self.start_package(id, dir, row.state).await {
-            tracing::error!(package_id = id, error = %format!("{e:#}"), "resend: start_package failed");
+            tracing::error!(package_id = id, why, error = %format!("{e:#}"), "start_package failed");
         }
     }
 
