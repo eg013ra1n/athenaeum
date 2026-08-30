@@ -163,6 +163,12 @@ export function displayStateChip(displayState: string): StateChip {
       return { label: 'queued', className: CHIP_MUTED };
     case 'preparing':
       return { label: 'preparing', className: CHIP_MUTED };
+    // Transfer-prepare spec §7.1: `indexing` (the iroh serve import hashing the
+    // staged payload) is the SECOND half of the same pre-transfer wait, so it
+    // wears the `preparing` label — the user sees one continuous "getting it
+    // ready" phase. Only the subline (below) distinguishes the two.
+    case 'indexing':
+      return { label: 'preparing', className: CHIP_MUTED };
     case 'announced':
       return { label: 'announced', className: CHIP_MUTED };
     case 'transferring':
@@ -219,6 +225,13 @@ export function displayStateSubline(
   kind?: 'outbound' | 'inbound',
 ): string | null {
   if (displayState === 'uploaded') return 'awaiting confirmation';
+  // Transfer-prepare spec §7.1: the two pre-transfer waits, which share one
+  // `preparing` chip. `indexing` says what the second one is doing (nothing has
+  // left this device yet); an outbound `announced` says the ball is in the
+  // peer's court — the bytes are staged and offered, we are waiting on them.
+  if (displayState === 'indexing') return 'indexing — hashing the package for transfer';
+  if (displayState === 'announced' && kind === 'outbound')
+    return 'waiting for the peer to start pulling';
   // D1: says WHY there is no countdown. The transfer resumes the moment the peer
   // announces itself — which is a signal, not an instant we could name.
   if (displayState === 'waiting_peer') return 'device unreachable — resumes when it is back';

@@ -231,6 +231,11 @@ export function useTransferQueue(): UseTransferQueue {
   >(new Map());
   const outSpeedRef = useRef<Map<string, SpeedTrackerEntry>>(new Map());
   const inSpeedRef = useRef<Map<string, SpeedTrackerEntry>>(new Map());
+  // Mirror of `liveOutboundStage` in a ref: the `sync-progress` listener below is
+  // mounted once (`[]` deps), so its closure can never read the live state Map —
+  // and it must know the PREVIOUS stage synchronously (see the reset there).
+  // Outbound only; the receive side has one stage and needs no such bookkeeping.
+  const outStageRef = useRef<Map<number, string>>(new Map());
 
   // Bumped per row `key` (`out:<id>` / `in:<packageId>`) on every `sync-finished`
   // for that package — lets an already-expanded row (same component instance,
@@ -346,6 +351,16 @@ export function useTransferQueue(): UseTransferQueue {
         if (p.direction === 'sent') {
           const id = Number(p.packageId);
           if (!Number.isFinite(id)) return;
+          // Transfer-prepare spec: `preparing` (staging copy+hash), `indexing`
+          // (the serve import) and `transferring` (the wire) are three different
+          // pipes with three different speeds, and each restarts its byte counter
+          // from zero. Drop the tracker on a stage change — BEFORE the sample
+          // below — so the EMA restarts from this stage's first sample instead of
+          // carrying the previous stage's rate forward.
+          if (outStageRef.current.get(id) !== p.stage) {
+            outStageRef.current.set(id, p.stage);
+            outSpeedRef.current.delete(`out:${id}`);
+          }
           const live = trackBytes(outSpeedRef.current, `out:${id}`, p.bytesDone, p.bytesTotal);
           setLiveOutboundBytes((prev) => new Map(prev).set(id, live));
           // Record the stage for the row's post-upload/pre-ack label; a later
@@ -387,6 +402,7 @@ export function useTransferQueue(): UseTransferQueue {
           if (!Number.isFinite(id)) return;
           bumpFinishNonce(`out:${id}`);
           outSpeedRef.current.delete(`out:${id}`);
+          outStageRef.current.delete(id);
           setLiveOutboundBytes((prev) => {
             if (!prev.has(id)) return prev;
             const next = new Map(prev);
@@ -488,6 +504,7 @@ export function useTransferQueue(): UseTransferQueue {
     for (const s of status?.sender.active ?? []) {
       activeOutboundIds.add(s.id);
       const live = liveOutboundBytes.get(s.id);
+      const liveStage = liveOutboundStage.get(s.id) ?? null;
       out.push({
         key: `out:${s.id}`,
         kind: 'outbound',
@@ -498,7 +515,12 @@ export function useTransferQueue(): UseTransferQueue {
         displayName: s.displayName,
         deviceName: s.deviceName,
         peerKind: null,
-        displayState: s.displayState,
+        // Transfer-prepare spec §7.1: the serve import has no state of its own —
+        // the row stays `queued` until the announce goes out — so a `queued` row
+        // whose last live tick was the import renders as `indexing` (same chip as
+        // `preparing`, its own subline). Every other state passes through.
+        displayState:
+          s.displayState === 'queued' && liveStage === 'indexing' ? 'indexing' : s.displayState,
         stalledUntil: s.stalledUntil,
         retrying: s.retrying,
         fileCounts: s.fileCounts,
@@ -514,9 +536,15 @@ export function useTransferQueue(): UseTransferQueue {
         nextRetryAt: s.nextRetryAt,
         terminal: false,
         resendable: false,
-        liveStage: liveOutboundStage.get(s.id) ?? null,
-        speedBps: s.state === 'transferring' ? (live?.speedBps ?? null) : null,
-        isTransferring: s.state === 'transferring',
+        liveStage,
+        // Preparing and indexing move real bytes (locally), so they get a live
+        // speed + a moving bar exactly like the wire stage does.
+        speedBps:
+          s.state === 'transferring' || s.state === 'preparing' || liveStage === 'indexing'
+            ? (live?.speedBps ?? null)
+            : null,
+        isTransferring:
+          s.state === 'transferring' || s.state === 'preparing' || liveStage === 'indexing',
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
     }

@@ -148,6 +148,9 @@ function stageProgress(
     case 'queued':
       return 0.02;
     case 'preparing':
+    // Transfer-prepare spec §7.1: the serve import is the second half of the same
+    // pre-transfer wait, so it shares `preparing`'s rung.
+    case 'indexing':
       return 0.05;
     case 'announced':
     case 'waiting':
@@ -242,6 +245,10 @@ function LiveRowBody({
   // no "0 B /".
   const compactCounts = row.terminal || row.fileCounts.total === 0;
   const displayCount = travelFiles;
+  // Preparing/indexing: no file has moved yet — every per-file row is still
+  // `pending`, so "0 of 340 files" would read as a stuck transfer. Show the file
+  // TOTAL plus the byte figure, which is the one thing genuinely advancing.
+  const preparingLike = row.displayState === 'preparing' || row.displayState === 'indexing';
 
   // Reason text is honest, not sticky: it shows only while a retry is genuinely
   // pending (`retrying`) or on a terminal failure/cancel — NEVER gated on the
@@ -365,6 +372,16 @@ function LiveRowBody({
               <span className="tabular-nums">
                 {displayCount} file{displayCount === 1 ? '' : 's'} · {formatBytes(travelBytes)}
               </span>
+            ) : preparingLike ? (
+              <>
+                <span className="tabular-nums">
+                  {travelFiles} file{travelFiles === 1 ? '' : 's'}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="tabular-nums">
+                  {formatBytes(row.bytesDone)} / {formatBytes(travelBytes)}
+                </span>
+              </>
             ) : (
               <>
                 <span className="tabular-nums">

@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
-import { plainTransferError, displayStateChip, displayStateSubline } from './presentation';
+import { plainTransferError, displayStateChip, displayStateSubline, formatBytes } from './presentation';
 import { transportHealthView } from './transportHealth';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
@@ -358,6 +358,14 @@ function ActiveTab({
         // and would otherwise read as progress. Tooltip carries the remainder;
         // the 10px line has no room for the suffix.
         const dup = row.fileCounts.duplicate;
+        // Transfer-prepare spec §7.1: before the announce goes out no file has
+        // moved, so "0 of 340" reads as a stuck transfer. Say the size of what is
+        // being made ready instead. (No live byte counter here on purpose — the
+        // mini-row renders the polled `OutboundSummary`, which carries no
+        // `bytesDone`; the moving "X / Y" bar lives on the full /transfers row.)
+        const preparingLike = row.displayState === 'preparing' || row.displayState === 'indexing';
+        const travelFiles = Math.max(0, total - dup);
+        const travelBytes = Math.max(0, row.byteSize - row.fileCounts.duplicateBytes);
         return (
           <li key={`out-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
             <div className="min-w-0">
@@ -372,7 +380,9 @@ function ActiveTab({
                   className="shrink-0 tabular-nums"
                   title={dup > 0 ? `${dup} already on peer` : undefined}
                 >
-                  {Math.max(0, row.fileCounts.done - dup)} of {Math.max(0, total - dup)}
+                  {preparingLike
+                    ? `${travelFiles} file${travelFiles === 1 ? '' : 's'} · ${formatBytes(travelBytes)}`
+                    : `${Math.max(0, row.fileCounts.done - dup)} of ${travelFiles}`}
                 </span>
               </p>
               {row.displayState === 'waiting' && (
