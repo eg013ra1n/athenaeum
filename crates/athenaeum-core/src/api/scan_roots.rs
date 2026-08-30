@@ -324,6 +324,12 @@ pub fn add_scan_root(
 /// inside, or contains any existing scan root — the shared guard behind
 /// `add_scan_root` and the transfer-folder settings (a folder the scanner
 /// watches would ingest transfer copies as duplicates).
+///
+/// An existing root that cannot be resolved is compared by its STORED path
+/// instead of aborting the whole check: a root on an unplugged external drive
+/// stays registered (missing ≠ orphan), and one offline drive must not block
+/// every other root/transfer-folder decision. `add_scan_root` persists the
+/// canonicalized path, so the stored spelling is the right thing to compare.
 pub fn check_scan_root_overlap(
     conn: &rusqlite::Connection,
     new_path: &Path,
@@ -331,9 +337,13 @@ pub fn check_scan_root_overlap(
     let existing_roots = crate::db::get_scan_roots(conn)?;
 
     for root in existing_roots.iter() {
-        let existing_path = normalize_path(&Path::new(&root.path).canonicalize().map_err(|e| {
-            ApiError::Internal(format!("Failed to resolve existing root path: {}", e))
-        })?);
+        let existing_path = match Path::new(&root.path).canonicalize() {
+            Ok(p) => normalize_path(&p),
+            Err(e) => {
+                tracing::warn!(path = %root.path, error = %e, "scan root not resolvable; comparing by its stored path");
+                normalize_path(Path::new(&root.path))
+            }
+        };
 
         // Check exact match
         if new_path == existing_path {

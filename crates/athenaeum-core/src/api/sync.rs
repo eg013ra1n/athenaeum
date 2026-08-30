@@ -9973,4 +9973,58 @@ mod tests {
             "{err:?}"
         );
     }
+
+    /// An unplugged external drive leaves its scan root registered but
+    /// unresolvable (missing ≠ orphan). The overlap check must fall back to the
+    /// root's stored path instead of aborting — one offline drive can't be
+    /// allowed to block every transfer-folder decision.
+    #[test]
+    fn validate_transfer_dir_tolerates_an_offline_scan_root() {
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        // Seed the root in canonical form (what `add_scan_root` persists) and
+        // never create it on disk — that is an unplugged drive.
+        let base = tmp.path().canonicalize().unwrap();
+        let offline = base.join("unplugged").join("lights");
+        assert!(!offline.exists());
+        crate::db::upsert_scan_root(&conn, offline.to_str().unwrap(), "normal").unwrap();
+
+        // (a) An unrelated folder still validates: the unresolvable root is
+        //     warned about and compared by its stored path, not fatal.
+        let got = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            base.join("staging").to_str().unwrap(),
+            "Outgoing staging folder",
+        )
+        .unwrap();
+        assert!(
+            got.is_dir(),
+            "offline root does not block an unrelated folder"
+        );
+
+        // (b) A folder CONTAINING the offline root is still rejected. Only the
+        //     "contains" shape stays offline end-to-end: for the equal/inside
+        //     shapes `validate_transfer_dir`'s own create step would materialize
+        //     the root and make it resolvable again.
+        let err = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            base.to_str().unwrap(),
+            "X",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "contains: {err:?}");
+
+        // The equal/inside shapes hold under the same fallback — asserted on the
+        // helper, where nothing creates the root first.
+        for candidate in [offline.clone(), offline.join("night1")] {
+            assert!(
+                crate::api::scan_roots::check_scan_root_overlap(&conn, &candidate).is_err(),
+                "{}",
+                candidate.display()
+            );
+        }
+    }
 }
