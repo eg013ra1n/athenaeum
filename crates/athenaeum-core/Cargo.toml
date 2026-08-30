@@ -102,6 +102,14 @@ base64 = "0.23"
 # dependency-light; the name is cosmetic (renamable via the hub) so this only
 # needs a best-effort read, with a synthetic `<prefix>-<short6>` fallback.
 hostname = "0.4"
+# Copy-on-write file clone for package staging (`package::stage_payload`): APFS /
+# Btrfs / XFS / ReFS clone a payload in constant time and zero extra disk, so
+# preparing a transfer costs one read (the hash of the clone) instead of a full
+# copy. Already in the build graph transitively under iroh-blobs — single 0.1.30
+# version, no new dependency tree. Falls back to the stream copy+hash whenever
+# the filesystem cannot clone (ext4, exFAT, cross-device), which is a plain
+# `Err` from `reflink`, never a panic.
+reflink-copy = "0.1"
 # Unix statvfs for the retention disk-usage probe (task M4). Already in the build
 # graph transitively (rusqlite/tokio); named directly, single 0.2 version, so the
 # `disk_pct` retention policy can measure free space without a new dependency tree.

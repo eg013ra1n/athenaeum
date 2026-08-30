@@ -13,8 +13,9 @@ use crate::models::Frame;
 
 use super::manifest::MANIFEST_VERSION;
 use super::{
-    read_manifest, validate_package, validate_package_id, validate_rel_path, write_package,
-    write_package_with_root_hash, xxh3_full_file, ManifestRecord, PayloadKind, MANIFEST_FILENAME,
+    read_manifest, stage_payload, validate_package, validate_package_id, validate_rel_path,
+    write_manifest, write_package, write_package_with_root_hash, xxh3_full_file, ManifestRecord,
+    PayloadKind, StageCancelled, MANIFEST_FILENAME,
 };
 
 /// Fabricate a tiny valid FITS (4x4 float image) at `path`.
@@ -122,7 +123,10 @@ fn root_hash_provider_overrides_placeholder() {
     // supplies the opaque root_hash — this is the seam A5's iroh transport uses
     // to inject the collection hash.
     let provider = |dir: &std::path::Path| {
-        assert!(dir.join(MANIFEST_FILENAME).exists(), "manifest written before provider runs");
+        assert!(
+            dir.join(MANIFEST_FILENAME).exists(),
+            "manifest written before provider runs"
+        );
         Ok("collection-hash-stub".to_string())
     };
     let announce =
@@ -264,4 +268,72 @@ fn xxh3_full_file_is_read_size_independent() {
 
     let expect = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
     assert_eq!(xxh3_full_file(&path).unwrap(), expect);
+}
+
+// --- stage_payload / write_manifest (transfer-prepare spec §3.3) ------------
+//
+// These assert on RESULTS (bytes, digest, staged content, terminal progress
+// tick), never on which branch ran: `stage_payload` reflinks when the
+// filesystem can clone (APFS, Btrfs, XFS, ReFS) and stream-copies when it
+// cannot (ext4, exFAT, cross-device). Both paths must produce the same staged
+// file, the same digest and the same terminal tick, so the same assertions hold
+// on every developer machine and CI runner.
+
+#[test]
+fn stage_payload_copies_hashes_and_reports_progress() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let dest = tmp.path().join("pkg").join("sub").join("dst.bin");
+    let mut ticks = Vec::new();
+    let staged = stage_payload(&src, &dest, bytes.len() as u64, &|| false, &mut |done| {
+        ticks.push(done)
+    })
+    .unwrap();
+    assert_eq!(staged.bytes, bytes.len() as u64);
+    assert_eq!(staged.xxh3, xxh3_full_file(&src).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert_eq!(
+        *ticks.last().unwrap(),
+        bytes.len() as u64,
+        "terminal tick == size"
+    );
+}
+
+#[test]
+fn stage_payload_rejects_a_size_drift_and_removes_the_partial_file() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, vec![1u8; 100]).unwrap();
+    let dest = tmp.path().join("dst.bin");
+    let err = stage_payload(&src, &dest, 200, &|| false, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("size mismatch"), "{err:#}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn stage_payload_honors_cancellation() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, vec![9u8; 5_000_000]).unwrap();
+    let dest = tmp.path().join("dst.bin");
+    let err = stage_payload(&src, &dest, 5_000_000, &|| true, &mut |_| {}).unwrap_err();
+    assert!(err.downcast_ref::<StageCancelled>().is_some(), "{err:#}");
+    assert!(!dest.exists());
+}
+
+/// `write_manifest` alone writes the NDJSON `write_package` has always written —
+/// the split must not change a byte of the on-disk format.
+#[test]
+fn write_package_still_writes_the_same_manifest() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("a.fits");
+    write_fixture_fits(&src);
+    let rec = sample_record(&src, "a.fits");
+    write_manifest(tmp.path(), std::slice::from_ref(&rec)).unwrap();
+    let back = read_manifest(tmp.path()).unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].rel_path, "a.fits");
+    assert_eq!(back[0], rec);
 }
