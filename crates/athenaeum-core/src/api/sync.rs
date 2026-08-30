@@ -1270,6 +1270,17 @@ pub async fn autostart_if_enabled(
     // closure) and borrow it for the rest of the body unchanged.
     let ctx_arc = ctx;
     let ctx: &ServiceContext = &ctx_arc;
+    // Above the gate on purpose (transfer-prepare spec §3.6): a `preparing` row
+    // left by a crash is dead work whichever way the autostart decides, and a
+    // non-terminal row is one the user cannot clear. Never fatal — a heal that
+    // fails must not keep the transport down.
+    match crate::api::sync_prepare::heal_interrupted_preparations(ctx) {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "healed interrupted preparations"),
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "heal interrupted preparations failed")
+        }
+    }
     let dev = dev_pairing_enabled(ctx)?;
     let signed_in = account_signed_in(ctx)?;
     if !autostart_gate(dev, signed_in) {
@@ -4131,11 +4142,35 @@ pub async fn send_now_sync_package(
     Ok(())
 }
 
-/// Cancel a live outbound package: drive it to the terminal `Cancelled` state on
-/// its owning engine (Task 3). Only an in-flight package can be cancelled —
-/// [`active_engine_for_row`] returns `Invalid("package is not active")` for a
-/// terminal / unknown id (an already-terminal package needs no cancel).
+/// Cancel a live outbound package. A transfer has two possible owners, so the
+/// cancel is routed to whichever one actually holds it:
+///
+/// - **Preparing** (transfer-prepare spec §3.4) — the row has never reached an
+///   engine, and its cancel flag is the only thing that can STOP the copy: the
+///   staging loop reads it at every chunk, and the preparation worker then
+///   writes the terminal `Cancelled` row, removes the partial dir and settles
+///   the per-file rows. Raising the flag is the whole command, and it is tried
+///   FIRST. [`active_engine_for_row`] can reach a preparing row too (its
+///   snapshot is every non-terminal row), but stamping one terminal from there
+///   stops nothing: the copy runs to the end of the batch before the worker
+///   throws the bytes away — and on a device with no engine started yet, it
+///   refuses the cancel outright.
+/// - **In flight** (Task 3) — drive it to the terminal `Cancelled` state on its
+///   owning engine. [`active_engine_for_row`] returns
+///   `Invalid("package is not active")` for a terminal / unknown id (an
+///   already-terminal package needs no cancel).
+///
+/// The two routes cannot fight over one row: the worker drops the flag
+/// (`PrepareRuntime::finish`) before it promotes, so a cancel racing the
+/// handover either raises a flag the worker still reads or falls through to the
+/// engine — and one that lands on the engine in the gap between the two still
+/// wins, because the worker promotes with a compare-and-set on `preparing`,
+/// which a terminal row turns into a no-op.
 pub async fn cancel_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Result<(), ApiError> {
+    if sender.prepare().cancel(id) {
+        tracing::info!(package_id = id, "sync package cancel requested (preparing)");
+        return Ok(());
+    }
     let engine = active_engine_for_row(sender, id).await?;
     engine
         .cancel(id)
@@ -10648,9 +10683,9 @@ mod tests {
     /// A verdict another owner already wrote is FINAL, whatever the copy went on
     /// to do.
     ///
-    /// Until the cancel command routes to the preparation runtime,
-    /// `cancel_sync_package` reaches the ENGINE, which stamps the row
-    /// `cancelled`, settles its per-file rows and emits its own `sync-finished`.
+    /// A cancel that arrives after the handover — or a receiver-driven terminal —
+    /// reaches the ENGINE, which stamps the row `cancelled`, settles its per-file
+    /// rows and emits its own `sync-finished`.
     /// If the copy then fails — a source that vanished, a full disk — the worker
     /// must NOT re-stamp `failed` on top: that would rewrite `last_error` with a
     /// reason for an outcome the user never chose, raise a second
@@ -10734,11 +10769,10 @@ mod tests {
     }
 
     /// A row that goes terminal while the worker is still copying is no longer
-    /// the worker's to hand over. Until the cancel command learns to route to the
-    /// preparation runtime, a cancel of a `preparing` row lands on the ENGINE and
-    /// stamps it `cancelled` mid-copy — and the worker must not flip that back to
-    /// `queued` and announce a package the user stopped. It finishes the copy it
-    /// was in the middle of, then throws the staged dir away.
+    /// the worker's to hand over. The engine stamping it `cancelled` mid-copy is
+    /// the case driven here — and the worker must not flip that back to `queued`
+    /// and announce a package the user stopped. It finishes the copy it was in
+    /// the middle of, then throws the staged dir away.
     #[tokio::test]
     async fn a_row_cancelled_out_from_under_the_worker_is_not_resurrected() {
         let (tmp, ctx, engine, peer) = loopback_ctx_with_engine().await;
@@ -10839,6 +10873,121 @@ mod tests {
         let c = file_counts(&ctx, id);
         assert_eq!(c.failed, 1, "exactly the culprit file is marked failed");
         assert_eq!(c.done + c.failed, c.total, "every file row is settled");
+    }
+
+    /// Transfer-prepare §3.6: a `preparing` row found at startup is not
+    /// resumable work — its staging thread and its cancel flag died with the
+    /// process, and the dir it left behind is a half-copy no announce could ever
+    /// satisfy. The heal says exactly that: `failed`, a reason that names the
+    /// interruption, and the partial dir gone.
+    #[tokio::test]
+    async fn heal_marks_a_preparing_row_failed_and_removes_its_dir() {
+        let (tmp, ctx) = test_ctx();
+        let dirs = sync_dirs(&ctx).unwrap();
+        let pkg = dirs.packages_dir.join("half-done");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("a.fits"), b"partial").unwrap();
+        let store = CatalogSyncStore::open(&dirs.db_path).unwrap();
+        let files = vec![crate::sharing::types::AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 7,
+            frame_uuid: "u".into(),
+        }];
+        let peer: NodeId = [0x7a; 32];
+        let id = store
+            .enqueue_preparing(
+                &pkg.to_string_lossy(),
+                peer,
+                Some("B"),
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
+
+        assert_eq!(
+            crate::api::sync_prepare::heal_interrupted_preparations(&ctx).unwrap(),
+            1
+        );
+
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.state, OutboundState::Failed);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("interrupted"),
+            "the reason names the interruption: {:?}",
+            row.last_error
+        );
+        assert!(!pkg.exists(), "the half-copy is removed: {}", pkg.display());
+        drop(tmp);
+    }
+
+    /// The heal runs on EVERY boot, not only on the boots that start the
+    /// transport: an install with neither the dev flag nor an account still has
+    /// `preparing` rows left by a crash, and leaving them non-terminal makes
+    /// them permanently unclearable. So it sits ABOVE the autostart gate — this
+    /// ctx starts nothing, and the row is healed anyway.
+    #[tokio::test]
+    async fn autostart_heals_interrupted_preparations_even_when_it_does_not_start() {
+        let (_tmp, ctx) = test_ctx();
+        let dirs = sync_dirs(&ctx).unwrap();
+        let pkg = dirs.packages_dir.join("half-done");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let store = CatalogSyncStore::open(&dirs.db_path).unwrap();
+        let files = vec![crate::sharing::types::AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 7,
+            frame_uuid: "u".into(),
+        }];
+        let peer: NodeId = [0x7a; 32];
+        let id = store
+            .enqueue_preparing(
+                &pkg.to_string_lossy(),
+                peer,
+                Some("B"),
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
+
+        let started = autostart_if_enabled(
+            Arc::new(ctx),
+            Arc::new(SyncRuntime::default()),
+            Arc::new(SyncSenderRuntime::new()),
+            Arc::new(SyncSenderRuntime::new()),
+            Arc::new(RecordingEmitter::default()) as Arc<dyn crate::events::ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !started,
+            "neither the dev flag nor an account: the transport must not start"
+        );
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().state,
+            OutboundState::Failed,
+            "the interrupted preparation is closed on a boot that starts nothing"
+        );
+        assert!(!pkg.exists(), "the half-copy is removed: {}", pkg.display());
+    }
+
+    /// Transfer-prepare §3.4: the prepare flag is checked FIRST, so the cancel
+    /// reaches the copy itself. Routed to [`active_engine_for_row`] instead —
+    /// which is where this command went before — a preparing row on a device
+    /// with no started engine (this test's shape, and a fresh install's) is
+    /// refused outright with "package is not active", and the copy runs to
+    /// completion with nothing to stop it.
+    #[tokio::test]
+    async fn cancel_routes_to_the_prepare_flag_while_preparing() {
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let flag = sender.prepare().register(42);
+        cancel_sync_package(&sender, 42).await.unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the cancel reached the preparation, not the engine"
+        );
     }
 
     /// W1 §T1.3: the upload-limit bounds check, pinned through the REAL guard

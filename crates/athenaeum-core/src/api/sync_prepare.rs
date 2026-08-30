@@ -166,9 +166,24 @@ pub fn spawn_prepare(ctx: Arc<ServiceContext>, sender: Arc<SyncSenderRuntime>, j
         }
         match outcome {
             Ok(Ok(stats)) => {
-                if let Err(e) = store.set_state(id, OutboundState::Queued) {
-                    tracing::error!(package_id = id, error = %format!("{e:#}"), "prepare: set queued failed");
-                    return;
+                // The claim above and this promotion are two statements, so the
+                // CAS carries the state the claim read into the WHERE clause: a
+                // verdict that landed in between (a cancel routed to the engine)
+                // makes it a no-op instead of a resurrection.
+                match store.set_state_if(id, OutboundState::Preparing, OutboundState::Queued) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        remove_staged_dir(id, &pkg_dir);
+                        tracing::info!(
+                            package_id = id,
+                            "row moved on before promotion; discarding staged dir"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(package_id = id, error = %format!("{e:#}"), "prepare: set queued failed");
+                        return;
+                    }
                 }
                 let duration_ms = started.elapsed().as_millis() as u64;
                 if let Err(e) = store.append_sync_event(
@@ -434,6 +449,14 @@ pub(crate) fn bank_prepared_hashes(
 /// The single gate for every arm of the worker's outcome match — promote,
 /// cancel, fail, panic and slot-closed — so the asymmetry that made only the
 /// promote path safe cannot come back.
+///
+/// It is a read, not a lock: a verdict landing between this check and the write
+/// it guards would still slip through. The promote path therefore also carries
+/// the state it read into its UPDATE
+/// ([`set_state_if`](crate::sync::store::SyncStore::set_state_if)), so the one
+/// write that could resurrect a stopped transfer is settled in a single
+/// statement. The terminal arms need no such guard: their own write is what a
+/// second owner would be overwriting, and the claim is what stops them.
 fn claim_row(store: &CatalogSyncStore, id: i64, pkg_dir: &Path) -> bool {
     if still_preparing(store, id) {
         return true;

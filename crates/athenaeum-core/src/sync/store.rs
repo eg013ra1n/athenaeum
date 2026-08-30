@@ -592,6 +592,21 @@ pub trait SyncStore: Send + Sync {
     /// Force one outbound row to a new state.
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()>;
 
+    /// Compare-and-set: move row `id` to `new` only while its state is still
+    /// `expect`. `Ok(true)` when the row moved; `Ok(false)` when it did not —
+    /// someone else wrote this transfer's verdict first (a cancel, a restart
+    /// heal), so the caller's own read of the state is stale and it must not
+    /// write.
+    ///
+    /// The preparation worker promotes `preparing` → `queued` with this rather
+    /// than [`set_state`](Self::set_state): its ownership check and its
+    /// promotion are two statements, and a verdict landing between them would
+    /// otherwise be silently overwritten — the package the user stopped
+    /// announced anyway. It deliberately does NOT carry `set_state`'s
+    /// terminal-transition housekeeping (clearing `next_retry_at`), so a
+    /// terminal write still belongs on `set_state`.
+    fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool>;
+
     /// Record the most recent failed-attempt reason for a package (Task 9), or
     /// clear it with `None` on success. Best-effort diagnostic surfaced beside
     /// `attempts` on the Perseus status page; [`confirm`](Self::confirm) also clears
@@ -1730,6 +1745,30 @@ pub fn replace_inbound_files(
     Ok(())
 }
 
+/// The one CAS both stores' [`SyncStore::set_state_if`] delegate to: the state
+/// the caller read is part of the WHERE clause, so the move happens in the same
+/// statement that checks for it. Returns whether a row changed.
+fn set_outbound_state_if(
+    conn: &Connection,
+    id: i64,
+    expect: OutboundState,
+    new: OutboundState,
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE sync_outbound SET state = ?1 WHERE id = ?2 AND state = ?3",
+            params![new.as_str(), id, expect.as_str()],
+        )
+        .with_context(|| {
+            format!(
+                "set state {} for outbound {id} while {}",
+                new.as_str(),
+                expect.as_str()
+            )
+        })?;
+    Ok(changed > 0)
+}
+
 /// Update one outbound file's mutable fields — `state`, `bytes_done`, `outcome`,
 /// `error` — stamping a fresh `updated_at` (Transfers Status Model v2 §D4). Keyed
 /// on `(outbound_id, rel_path)`; the row is created up front by
@@ -2746,6 +2785,11 @@ impl SyncStore for StandaloneSyncStore {
         Ok(())
     }
 
+    fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        set_outbound_state_if(&conn, id, expect, new)
+    }
+
     fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         conn.execute(
@@ -3130,6 +3174,11 @@ impl SyncStore for CatalogSyncStore {
         }
         .with_context(|| format!("set state {} for outbound {id}", s.as_str()))?;
         Ok(())
+    }
+
+    fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool> {
+        let conn = self.lock_conn();
+        set_outbound_state_if(&conn, id, expect, new)
     }
 
     fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
@@ -4256,6 +4305,48 @@ mod tests {
         assert_eq!(
             counts[&id].total_bytes, 40,
             "the manifest-free byte total the summary falls back to"
+        );
+    }
+
+    /// The compare-and-set the preparation worker promotes with: it moves the
+    /// row only while the state it read is still the state on disk. Without it,
+    /// a verdict written between the worker's ownership check and its promotion
+    /// (a cancel, a restart heal) would be flipped back to `queued` and the
+    /// package the user stopped would be announced anyway.
+    #[test]
+    fn set_state_if_moves_the_row_only_while_the_expected_state_still_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let files = vec![AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "ua".into(),
+        }];
+        let id = store
+            .enqueue_preparing("/pkg/x", PEER, None, &files, PackageLayout::Batch)
+            .unwrap();
+
+        assert!(
+            store
+                .set_state_if(id, OutboundState::Preparing, OutboundState::Queued)
+                .unwrap(),
+            "the expected state held, so the row moved"
+        );
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().state,
+            OutboundState::Queued
+        );
+
+        assert!(
+            !store
+                .set_state_if(id, OutboundState::Preparing, OutboundState::Cancelled)
+                .unwrap(),
+            "the expected state no longer holds, so nothing moved"
+        );
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().state,
+            OutboundState::Queued,
+            "a failed CAS leaves the row exactly as it found it"
         );
     }
 

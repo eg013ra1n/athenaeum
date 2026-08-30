@@ -2301,6 +2301,9 @@ mod retention_tests {
         fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
             self.0.set_state(id, s)
         }
+        fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool> {
+            self.0.set_state_if(id, expect, new)
+        }
         fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
             self.0.set_last_error(id, err)
         }
