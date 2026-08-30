@@ -307,6 +307,10 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
   `enqueue_frame_set_send` per device with the same readiness prefs the tab
   used (`readFlatNormPref` etc.), so the backend gate agrees with the UI.
 - The frame-table "Send to…" (selected frames) is untouched.
+  *Amended 2026-08-30 (owner call):* the Analyze tab's "Send to…" button was
+  removed — on an object page the Export tab's **Send to node…** is the one
+  send affordance. `enqueue_sync_selection` and the file browser's selection
+  send remain as described.
 
 ## 7. Data and compatibility
 

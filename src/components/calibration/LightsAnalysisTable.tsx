@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useRef } from 'react';
 import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis, LightFrameReadiness, LightCalDetails } from '../../types/models';
@@ -142,15 +142,10 @@ export function LightsAnalysisTable({
     });
   }, [navigate]);
 
-  const toggleFrame = useCallback((frameId: number) => {
-    const next = new Set(selectedFrameIds);
-    if (next.has(frameId)) {
-      next.delete(frameId);
-    } else {
-      next.add(frameId);
-    }
-    onSelectionChange(next);
-  }, [selectedFrameIds, onSelectionChange]);
+  // Range-select anchor: the frame last clicked without Shift. Kept as an id and
+  // resolved against the current sort order at click time, so a re-sort between
+  // two clicks cannot shift the range onto different rows.
+  const anchorFrameIdRef = useRef<number | null>(null);
 
   const toggleAll = useCallback(() => {
     if (selectedFrameIds.size === frames.length && frames.length > 0) {
@@ -158,6 +153,7 @@ export function LightsAnalysisTable({
     } else {
       onSelectionChange(new Set(frames.map(f => f.frame_id)));
     }
+    anchorFrameIdRef.current = null;
   }, [selectedFrameIds, frames, onSelectionChange]);
 
   const allSelected = frames.length > 0 && selectedFrameIds.size === frames.length;
@@ -270,6 +266,32 @@ export function LightsAnalysisTable({
     });
   }, [frames, sortField, sortDirection, getAnalysis]);
 
+  // Plain click toggles one row; Shift+click selects (or clears) every row
+  // between the anchor and the clicked row in the displayed order, the way the
+  // file browser and the blink viewer do.
+  const handleRowSelect = useCallback((frameId: number, e: React.MouseEvent) => {
+    const next = new Set(selectedFrameIds);
+    const anchorIdx = anchorFrameIdRef.current != null
+      ? sortedFrames.findIndex(f => f.frame_id === anchorFrameIdRef.current)
+      : -1;
+    const clickedIdx = sortedFrames.findIndex(f => f.frame_id === frameId);
+    if (e.shiftKey && anchorIdx >= 0 && clickedIdx >= 0) {
+      const lo = Math.min(anchorIdx, clickedIdx);
+      const hi = Math.max(anchorIdx, clickedIdx);
+      // The clicked row decides the direction: selecting if it was unselected.
+      const selecting = !next.has(frameId);
+      for (let i = lo; i <= hi; i++) {
+        if (selecting) next.add(sortedFrames[i].frame_id);
+        else next.delete(sortedFrames[i].frame_id);
+      }
+    } else {
+      if (next.has(frameId)) next.delete(frameId);
+      else next.add(frameId);
+      anchorFrameIdRef.current = frameId;
+    }
+    onSelectionChange(next);
+  }, [selectedFrameIds, sortedFrames, onSelectionChange]);
+
   return (
     <div>
       <table className="w-full" role="table">
@@ -363,17 +385,19 @@ export function LightsAnalysisTable({
             return (
               <tr
                 key={frame.frame_id}
+                onClick={e => handleRowSelect(frame.frame_id, e)}
                 className={`
                   ${isRejected ? 'bg-error/10' : idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'}
-                  hover:bg-surface-hover transition-colors
+                  hover:bg-surface-hover transition-colors cursor-pointer select-none
                 `}
               >
                 {/* Identity group — no tint */}
-                <td className="w-10 px-1.5 py-1 text-center">
+                <td className="w-10 px-1.5 py-1 text-center" onClick={e => e.stopPropagation()}>
                   <input
                     type="checkbox"
                     checked={isSelected}
-                    onChange={() => toggleFrame(frame.frame_id)}
+                    readOnly
+                    onClick={e => handleRowSelect(frame.frame_id, e)}
                     className="rounded border-border text-accent focus:ring-accent cursor-pointer"
                   />
                 </td>
