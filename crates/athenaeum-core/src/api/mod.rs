@@ -20,6 +20,9 @@ pub mod calendar;
 pub mod frame_sets;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
+// Background package preparation (transfer-prepare spec §3): the worker that
+// stages + hashes a planned send after its row is already in the list.
+pub mod sync_prepare;
 // Frame-set send (spec 2026-08-28): the `PayloadEntry` currency `api::sync`'s
 // package builder consumes. Ungated: models/package types only.
 pub mod frame_set_send;

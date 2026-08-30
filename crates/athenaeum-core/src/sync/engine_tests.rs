@@ -6549,3 +6549,94 @@ async fn confirm_protects_shared_blobs_before_cleaning_payloads() {
 
     engine.shutdown().await;
 }
+
+/// Transfer-prepare §3.3: a `preparing` row belongs to the preparation worker,
+/// not to the engine. Its package dir is half-staged and carries no manifest, so
+/// neither the fresh-engine crash-resume sweep nor an explicit
+/// [`SyncEngineHandle::drive`] may pick it up — an announce of that dir would
+/// offer the peer a package that does not exist yet.
+///
+/// The barrier is a REAL package enqueued after the drive: the worker processes
+/// its commands in order, so once that one confirms both the startup sweep and
+/// the `Drive` have run — and the receiver saw exactly one announce.
+#[tokio::test]
+async fn a_preparing_row_is_neither_resumed_nor_driven() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let db_path = tmp.path().join("sync.db");
+    let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+
+    // The worker's dir at its most dangerous instant: the manifest is already
+    // written (so the package IS announceable) but the row has not been flipped
+    // to `queued` and handed over yet — the real window between `write_manifest`
+    // and `set_state(Queued)`. A dir that is merely half-copied would fail to
+    // announce all by itself and prove nothing.
+    let worker_dir = build_package(
+        &tmp.path().join("src-preparing"),
+        "uuid-preparing",
+        "preparing.fits",
+        "M42",
+        4096,
+    );
+    let preparing_id = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        crate::sync::store::insert_outbound_with_files_in_state(
+            &conn,
+            &worker_dir.to_string_lossy(),
+            &crate::sync::node_id_hex(&receiver_id),
+            Some("Preparing batch"),
+            &[AnnounceFileEntry {
+                rel_path: "preparing.fits".to_string(),
+                byte_size: 4096,
+                frame_uuid: "uuid-preparing".to_string(),
+            }],
+            PackageLayout::Batch,
+            OutboundState::Preparing,
+        )
+        .unwrap()
+    };
+
+    // Built AFTER the row exists, so the startup `non_terminal()` sweep sees it.
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+    engine.drive(preparing_id).await.unwrap();
+
+    let pkg = build_package(
+        &tmp.path().join("src1"),
+        "uuid-1",
+        "frame1.fits",
+        "M42",
+        4096,
+    );
+    let ok_id = engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, ok_id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&store, preparing_id),
+        Some(OutboundState::Preparing),
+        "the preparing row is still the worker's, untouched by resume or drive"
+    );
+    assert_eq!(
+        stats.attempts.load(SeqCst),
+        1,
+        "only the real package was ever announced"
+    );
+
+    engine.shutdown().await;
+}

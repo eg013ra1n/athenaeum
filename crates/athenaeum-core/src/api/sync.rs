@@ -100,6 +100,14 @@ pub struct EnqueueSelectionResult {
     pub total_count: u32,
     /// Frames that could not be sent, each with a reason. Never silently dropped.
     pub ineligible: Vec<IneligibleFrame>,
+    /// The `sync_outbound` row this send created (transfer-prepare spec §3), so
+    /// the caller can address the transfer — cancel it, watch it — while it is
+    /// still being staged. `None` when nothing was eligible and no row was
+    /// written. Additive: absent from the JSON when there is no row, so the
+    /// generated TS types it optional (`default` is what tells ts-rs to, the
+    /// same pairing every other omitted field here uses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_id: Option<i64>,
 }
 
 /// Whether the dev ticket-pairing flag is enabled.
@@ -2879,17 +2887,27 @@ pub async fn ensure_sender_engine(
 }
 
 /// A built (or empty) selection package plus the eligibility split.
-struct BuiltSelection {
-    /// The written package directory, or `None` when nothing was eligible.
-    pkg_dir: Option<PathBuf>,
-    eligible: Vec<i64>,
-    ineligible: Vec<IneligibleFrame>,
-    total: usize,
+/// A send resolved down to "what would travel", with nothing copied yet
+/// (transfer-prepare spec §3.2). Everything here comes from the catalog and a
+/// `stat` per source — cheap enough to run inside the command, so the durable
+/// row and its file manifest exist before the first byte moves. The
+/// preparation worker turns it into a package.
+pub(crate) struct PlannedSelection {
+    /// Where the package WILL be staged, or `None` when nothing was eligible.
+    pub(crate) pkg_dir: Option<PathBuf>,
+    /// `(source, record)` per payload, each record's `xxh3` still empty — the
+    /// worker fills it from the read its copy already pays for.
+    pub(crate) records: Vec<(PathBuf, ManifestRecord)>,
+    /// Catalog rows whose `strong_hash` the worker may bank from that same read.
+    pub(crate) bank: Vec<crate::api::sync_prepare::BankCandidate>,
+    pub(crate) eligible: Vec<i64>,
+    pub(crate) ineligible: Vec<IneligibleFrame>,
+    pub(crate) total: usize,
     /// The resolved human batch name (T3). `None` when nothing was eligible.
-    display_name: Option<String>,
-    /// Per-payload `(rel_path, byte_size, frame_uuid)` for the `sync_outbound_files`
-    /// rows written after the row id is minted. One entry per manifest record.
-    files: Vec<(String, u64, String)>,
+    pub(crate) display_name: Option<String>,
+    /// Per-payload announce entries for the `sync_outbound_files` rows written in
+    /// the same transaction as the row. One entry per manifest record.
+    pub(crate) files: Vec<crate::sharing::types::AnnounceFileEntry>,
 }
 
 /// What a package build starts from: the entries to write plus the caller's
@@ -3107,12 +3125,12 @@ pub(crate) fn unique_rel_path(filename: &str, frame_id: i64, used: &mut HashSet<
     candidate
 }
 
-/// Write the full hashes a manifest build already computed into
-/// `files.strong_hash`, one transaction for the batch. Best-effort by design:
+/// Write the full hashes the preparation worker's staging pass already computed
+/// into `files.strong_hash`, one transaction for the batch. Best-effort by design:
 /// the package is the product, the banked hash is a by-product — an error is
 /// logged and the send goes on, and a row that vanished meanwhile (0 rows
 /// updated) is simply not counted.
-fn bank_manifest_hashes(conn: &rusqlite::Connection, bank: &[(i64, String)]) {
+pub(crate) fn bank_manifest_hashes(conn: &rusqlite::Connection, bank: &[(i64, String)]) {
     if bank.is_empty() {
         return;
     }
@@ -3234,12 +3252,18 @@ fn selection_entries(
     })
 }
 
-/// Build ONE package from exactly the payload entries in `input`. INELIGIBLE
-/// entries — whose frame is not (or no longer) in the catalog, or whose file is
-/// missing/unreadable on disk — are collected and returned, never silently
-/// dropped (task M2). The manifest mirrors what Perseus builds (serialized
-/// `models::Frame` as `frame_meta` + the analysis summary when present) so the
-/// primary ingests app- and Perseus-sourced frames identically.
+/// Plan ONE package from exactly the payload entries in `input` — resolve every
+/// manifest record and the package dir it will be staged into, WITHOUT touching
+/// a payload byte (transfer-prepare spec §3.2). INELIGIBLE entries — whose frame
+/// is not (or no longer) in the catalog, or whose file is missing/unstattable on
+/// disk — are collected and returned, never silently dropped (task M2). The
+/// manifest mirrors what Perseus builds (serialized `models::Frame` as
+/// `frame_meta` + the analysis summary when present) so the primary ingests app-
+/// and Perseus-sourced frames identically.
+///
+/// The hash a record needs is deliberately NOT computed here: it is the same
+/// read the worker's copy makes anyway, so hashing in the command would read
+/// every selected file twice AND keep the user waiting for it.
 ///
 /// No retention linkage: the app never deletes a sent source (owner ruling
 /// 2026-08-29 — retention is a Perseus-only concern), so a send records nothing
@@ -3253,14 +3277,14 @@ fn selection_entries(
 ///   all: it carries the SOURCE light's `frame_meta` under its own fresh uuid,
 ///   with no analysis and no hash banking (the catalog row describes the source
 ///   file, not this one).
-fn build_selection_package(
+pub(crate) fn plan_selection_package(
     conn: &rusqlite::Connection,
     origin_device: &str,
     packages_dir: &Path,
     input: SelectionInput,
     batch_name: Option<&str>,
     frame_set_id: Option<i64>,
-) -> Result<BuiltSelection, ApiError> {
+) -> Result<PlannedSelection, ApiError> {
     // Load each referenced frame's snapshot once, indexed by frame id rather than
     // walked row-by-row: two entries may share one frame (a calibrated artifact
     // and its source light both point at the light's catalog row).
@@ -3291,13 +3315,14 @@ fn build_selection_package(
     // owns the directory; the filename is deduped within it here so no two
     // entries can overwrite each other inside the package.
     let mut used_by_dir: HashMap<String, HashSet<String>> = HashMap::new();
-    // The manifest hashes every source file in full; that read is banked as
-    // `files.strong_hash` after the loop for every row the disk still vouches
-    // for — `disk_matches_row`, the contract shared with the master-hash pass
-    // and deep verify — so the Master duplicate key and a later verify get the
-    // digest without reading the file again. Collected here, written in one
-    // transaction below; a bank failure never fails the send.
-    let mut bank: Vec<(i64, String)> = Vec::new();
+    // The worker hashes every source file in full while it stages it; that read
+    // is banked as `files.strong_hash` for every row the disk still vouches for
+    // — `disk_matches_row`, the contract shared with the master-hash pass and
+    // deep verify — so the Master duplicate key and a later verify get the digest
+    // without reading the file again. The staleness check belongs to the worker
+    // (the disk may drift between planning and copying), so the plan only names
+    // the candidates.
+    let mut bank: Vec<crate::api::sync_prepare::BankCandidate> = Vec::new();
 
     for entry in &input.entries {
         let Some((file_id, file, frame)) = by_frame.get(&entry.frame_id).copied() else {
@@ -3327,28 +3352,9 @@ fn build_selection_package(
             }
         };
         let byte_size = meta.len();
-        let xxh3 = match package::xxh3_full_file(path) {
-            Ok(h) => h,
-            Err(e) => {
-                ineligible.push(IneligibleFrame {
-                    frame_id: entry.frame_id,
-                    reason: format!("cannot read file: {e:#}"),
-                });
-                continue;
-            }
-        };
         // A calibrated artifact is NOT the file the catalog row describes, so
         // neither its hash nor its analysis may be attributed to that row.
         let is_catalog_file = entry.kind != PayloadKind::CalibratedLight;
-        if is_catalog_file
-            && crate::duplicates::backfill::disk_matches_row(
-                path,
-                file.size,
-                &file.modified_at.to_rfc3339(),
-            )
-        {
-            bank.push((file_id, xxh3.clone()));
-        }
         let frame_meta = match serde_json::to_value(frame) {
             Ok(v) => v,
             Err(e) => {
@@ -3397,6 +3403,15 @@ fn build_selection_package(
             format!("{dir}/{name}")
         };
 
+        if is_catalog_file {
+            bank.push(crate::api::sync_prepare::BankCandidate {
+                file_id,
+                path: path.to_path_buf(),
+                size: file.size,
+                modified_at: file.modified_at.to_rfc3339(),
+                rel_path: rel_path.clone(),
+            });
+        }
         records.push((
             path.to_path_buf(),
             ManifestRecord {
@@ -3407,7 +3422,8 @@ fn build_selection_package(
                 payload_kind: entry.kind.clone(),
                 rel_path,
                 byte_size,
-                xxh3,
+                // Filled by the preparation worker from the copy's own read.
+                xxh3: String::new(),
                 frame_meta,
                 analysis,
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3417,11 +3433,11 @@ fn build_selection_package(
         eligible.push(entry.frame_id);
     }
 
-    bank_manifest_hashes(conn, &bank);
-
     if records.is_empty() {
-        return Ok(BuiltSelection {
+        return Ok(PlannedSelection {
             pkg_dir: None,
+            records: Vec::new(),
+            bank: Vec::new(),
             eligible,
             ineligible,
             total: input.total,
@@ -3439,17 +3455,19 @@ fn build_selection_package(
         input.ancestor.as_deref(),
         records.len(),
     );
-    let files: Vec<(String, u64, String)> = records
+    let files: Vec<crate::sharing::types::AnnounceFileEntry> = records
         .iter()
-        .map(|(_, r)| (r.rel_path.clone(), r.byte_size, r.frame_uuid.clone()))
+        .map(|(_, r)| crate::sharing::types::AnnounceFileEntry {
+            rel_path: r.rel_path.clone(),
+            byte_size: r.byte_size,
+            frame_uuid: r.frame_uuid.clone(),
+        })
         .collect();
 
-    let pkg_dir = packages_dir.join(uuid::Uuid::new_v4().to_string());
-    package::write_package(&pkg_dir, records)
-        .map_err(|e| ApiError::Internal(format!("write selection package: {e:#}")))?;
-
-    Ok(BuiltSelection {
-        pkg_dir: Some(pkg_dir),
+    Ok(PlannedSelection {
+        pkg_dir: Some(packages_dir.join(uuid::Uuid::new_v4().to_string())),
+        records,
+        bank,
         eligible,
         ineligible,
         total: input.total,
@@ -3458,24 +3476,31 @@ fn build_selection_package(
     })
 }
 
-/// Build the selection package and enqueue it into `engine`. The transport-
+/// Plan the selection and hand it to the preparation worker. The transport-
 /// agnostic core shared by the manual command and the auto-mode hook — exercised
 /// in tests against a loopback-backed engine. The DB borrow is dropped before the
 /// (async) enqueue so no connection guard is ever held across an `.await`.
+///
+/// Returns as soon as the row is durable (transfer-prepare spec §3.1): the copy
+/// runs in the background, so a send of a night's subs is a click, not a wait.
+#[allow(clippy::too_many_arguments)]
 async fn build_and_enqueue_selection(
-    ctx: &ServiceContext,
-    engine: &SyncEngineHandle,
+    ctx: &Arc<ServiceContext>,
+    engine: &Arc<SyncEngineHandle>,
     origin_device: &str,
     packages_dir: &Path,
     frame_ids: &[i64],
     batch_name: Option<&str>,
     frame_set_id: Option<i64>,
+    peer: NodeId,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+    sender: Arc<SyncSenderRuntime>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
-    let built = {
+    let planned = {
         let db = db(ctx)?;
         let conn = db.conn();
         let input = selection_entries(&conn, frame_ids, frame_set_id)?;
-        build_selection_package(
+        plan_selection_package(
             &conn,
             origin_device,
             packages_dir,
@@ -3484,44 +3509,87 @@ async fn build_and_enqueue_selection(
             frame_set_id,
         )?
     };
-    enqueue_built(engine, &built).await?;
+    let enqueued_count = planned.eligible.len() as u32;
+    let total_count = planned.total as u32;
+    let ineligible = planned.ineligible.clone();
+    let outbound_id = enqueue_planned(ctx, &sender, engine, peer, planned, emitter).await?;
     Ok(EnqueueSelectionResult {
-        enqueued_count: built.eligible.len() as u32,
-        eligible_count: built.eligible.len() as u32,
-        total_count: built.total as u32,
-        ineligible: built.ineligible,
+        enqueued_count,
+        eligible_count: enqueued_count,
+        total_count,
+        ineligible,
+        outbound_id,
     })
 }
 
-/// Hand one built package to `engine`. A `pkg_dir` of `None` (nothing eligible)
-/// is a no-op — there is no package to announce. Shared by the frame-selection
-/// send and the frame-set send so both enqueue on exactly the same terms.
-async fn enqueue_built(engine: &SyncEngineHandle, built: &BuiltSelection) -> Result<(), ApiError> {
-    let Some(dir) = &built.pkg_dir else {
-        return Ok(());
+/// Insert the `preparing` row (name + per-file rows in one tx) and hand the
+/// staging to the worker. Returns the row id, or `None` when nothing was
+/// eligible — there is no package to prepare, so no row is written.
+///
+/// This is the whole point of the split: the row is the send's FIRST durable
+/// act, so the transfer appears in the list (with its file manifest, its byte
+/// total and a working Cancel) before a single payload is read.
+async fn enqueue_planned(
+    ctx: &Arc<ServiceContext>,
+    sender: &Arc<SyncSenderRuntime>,
+    engine: &Arc<SyncEngineHandle>,
+    peer: NodeId,
+    planned: PlannedSelection,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<Option<i64>, ApiError> {
+    let Some(pkg_dir) = planned.pkg_dir.clone() else {
+        return Ok(None);
     };
-    // §D1/§D4: the batch name + per-file `pending` rows travel WITH the enqueue
-    // now — the engine's `store.enqueue` writes them in the same transaction as
-    // the row, so the first announce can never read a nameless / file-less row
-    // (the T3 enqueue→announce race is gone; no post-hoc write, no self-heal).
-    let files: Vec<crate::sharing::types::AnnounceFileEntry> = built
-        .files
-        .iter()
-        .map(
-            |(rel_path, byte_size, frame_uuid)| crate::sharing::types::AnnounceFileEntry {
-                rel_path: rel_path.clone(),
-                byte_size: *byte_size,
-                frame_uuid: frame_uuid.clone(),
-            },
-        )
-        .collect();
+    let store = {
+        let dirs = sync_dirs(ctx)?;
+        CatalogSyncStore::open(&dirs.db_path)
+            .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?
+    };
+    // §D1/§D4: the batch name + per-file `pending` rows travel WITH the row —
+    // written in the same transaction — so the list can never show a nameless /
+    // file-less transfer, and neither can the first announce.
+    //
     // Desktop senders are out of the mirror-hierarchy v1 scope: a selection
     // package is a curated batch, so it lands in the per-transfer batch folder.
-    engine
-        .enqueue_package(dir, built.display_name.clone(), files, PackageLayout::Batch)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
-    Ok(())
+    let id = store
+        .enqueue_preparing(
+            &pkg_dir.to_string_lossy(),
+            peer,
+            planned.display_name.as_deref(),
+            &planned.files,
+            PackageLayout::Batch,
+        )
+        .map_err(|e| ApiError::Internal(format!("insert preparing row: {e:#}")))?;
+    let byte_size: u64 = planned.files.iter().map(|f| f.byte_size).sum();
+    if let Err(e) = store.append_sync_event(
+        Direction::Sent,
+        &id.to_string(),
+        "enqueued",
+        Some(&format!("frames={} bytes={byte_size}", planned.files.len())),
+    ) {
+        tracing::warn!(package_id = id, error = %format!("{e:#}"), "enqueue: journal failed");
+    }
+    tracing::info!(
+        package_id = id,
+        state = "preparing",
+        count = planned.files.len(),
+        bytes = byte_size,
+        "sync state"
+    );
+    crate::api::sync_prepare::spawn_prepare(
+        Arc::clone(ctx),
+        Arc::clone(sender),
+        crate::api::sync_prepare::PrepareJob {
+            id,
+            peer,
+            pkg_dir,
+            records: planned.records,
+            bank: planned.bank,
+            engine: Arc::clone(engine),
+            emitter,
+        },
+    );
+    Ok(Some(id))
 }
 
 /// Explicit-target send (sync 2C): enqueue exactly the eligible frames in the
@@ -3550,8 +3618,12 @@ pub async fn enqueue_sync_selection(
             eligible_count: 0,
             total_count: 0,
             ineligible: Vec::new(),
+            outbound_id: None,
         });
     }
+    // The engine is started BEFORE the row is written: a row in the list must
+    // always have an engine behind it, or the Transfers view would show a
+    // transfer nothing is driving.
     let (engine, origin_device) = ensure_sender_engine(
         ctx,
         sender,
@@ -3559,7 +3631,7 @@ pub async fn enqueue_sync_selection(
         sync,
         dest.node,
         dest.endpoint_addr.as_ref(),
-        emitter,
+        emitter.clone(),
     )
     .await?;
     let packages_dir = sender_packages_dir(ctx)?;
@@ -3571,6 +3643,9 @@ pub async fn enqueue_sync_selection(
         &frame_ids,
         batch_name.as_deref(),
         frame_set_id,
+        dest.node,
+        emitter,
+        Arc::clone(sender),
     )
     .await?;
     tracing::info!(
@@ -3623,6 +3698,7 @@ pub async fn enqueue_frame_set_send(
             eligible_count: 0,
             total_count: 0,
             ineligible: Vec::new(),
+            outbound_id: None,
         });
     }
     let total = entries.len();
@@ -3633,16 +3709,16 @@ pub async fn enqueue_frame_set_send(
         sync,
         dest.node,
         dest.endpoint_addr.as_ref(),
-        emitter,
+        emitter.clone(),
     )
     .await?;
     let packages_dir = sender_packages_dir(ctx)?;
     // The DB borrow is scoped so no connection guard is held across the enqueue's
     // `.await` — the same discipline as `build_and_enqueue_selection`.
-    let built = {
+    let planned = {
         let db = db(ctx)?;
         let conn = db.conn();
-        build_selection_package(
+        plan_selection_package(
             &conn,
             &origin_device,
             &packages_dir,
@@ -3656,20 +3732,24 @@ pub async fn enqueue_frame_set_send(
             Some(frame_set_id),
         )?
     };
-    enqueue_built(&engine, &built).await?;
+    let enqueued_count = planned.eligible.len() as u32;
+    let total_count = planned.total as u32;
+    let ineligible = planned.ineligible.clone();
+    let outbound_id = enqueue_planned(ctx, sender, &engine, dest.node, planned, emitter).await?;
     tracing::info!(
         frame_set_id,
         ?mode,
-        enqueued = built.eligible.len(),
+        enqueued = enqueued_count,
         total,
-        ineligible = built.ineligible.len(),
+        ineligible = ineligible.len(),
         "frame-set send enqueued"
     );
     Ok(EnqueueSelectionResult {
-        enqueued_count: built.eligible.len() as u32,
-        eligible_count: built.eligible.len() as u32,
-        total_count: built.total as u32,
-        ineligible: built.ineligible,
+        enqueued_count,
+        eligible_count: enqueued_count,
+        total_count,
+        ineligible,
+        outbound_id,
     })
 }
 
@@ -5652,6 +5732,48 @@ mod tests {
             presence_debounce_admits(b),
             "the window is per peer — another device is unaffected"
         );
+    }
+
+    /// Plan a selection AND stage it, synchronously — what `build_selection_package`
+    /// was before the preparation split (transfer-prepare spec §3.2).
+    ///
+    /// The package-shape tests in this module are about what a send *produces*,
+    /// not about when it produces it, so they keep asserting against a real
+    /// written package dir. They get one by running the plan and then the very
+    /// staging pass the worker runs (`stage_records` + the same hash banking),
+    /// rather than a test-local re-implementation of either.
+    fn build_selection_package(
+        conn: &rusqlite::Connection,
+        origin_device: &str,
+        packages_dir: &Path,
+        input: SelectionInput,
+        batch_name: Option<&str>,
+        frame_set_id: Option<i64>,
+    ) -> Result<PlannedSelection, ApiError> {
+        let mut planned = plan_selection_package(
+            conn,
+            origin_device,
+            packages_dir,
+            input,
+            batch_name,
+            frame_set_id,
+        )?;
+        if let Some(dir) = planned.pkg_dir.clone() {
+            let flag = std::sync::atomic::AtomicBool::new(false);
+            crate::api::sync_prepare::stage_records(
+                0,
+                [0u8; 32],
+                &dir,
+                &mut planned.records,
+                None,
+                &flag,
+            )
+            .map_err(|e| {
+                ApiError::Internal(format!("stage planned selection: {}", e.describe()))
+            })?;
+            crate::api::sync_prepare::bank_prepared_hashes(conn, &planned.records, &planned.bank);
+        }
+        Ok(planned)
     }
 
     fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
@@ -10022,13 +10144,19 @@ mod tests {
         let db_path = db(&ctx).unwrap().path().to_path_buf();
         let net = LoopbackNetwork::new();
         let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
-        let engine = SyncEngine::spawn(
+        let peer: NodeId = [9u8; 32];
+        let engine = Arc::new(SyncEngine::spawn(
             store as Arc<dyn SyncStore>,
             Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
-            [9u8; 32],
-        );
+            peer,
+        ));
 
         let pkg_root = tmp.path().join("packages");
+        let sender = Arc::new(SyncSenderRuntime::new());
+        // Hold the single staging permit so the row stays exactly as the command
+        // wrote it: the assertions below are about the enqueue's own write, and a
+        // worker that raced ahead would have handed the row to the engine.
+        let _permit = sender.prepare().slot().acquire_owned().await.unwrap();
         let result = build_and_enqueue_selection(
             &ctx,
             &engine,
@@ -10037,12 +10165,15 @@ mod tests {
             &[f1, f2],
             None, // auto-name → common-ancestor basename "M31_data"
             None, // browser send (no frame set)
+            peer,
+            None,
+            Arc::clone(&sender),
         )
         .await
         .unwrap();
         assert_eq!(result.enqueued_count, 2);
 
-        // Inspect the row the engine minted.
+        // Inspect the row the enqueue minted.
         let db = db(&ctx).unwrap();
         let conn = db.conn();
         let rows = crate::sync::store::all_outbound_rows(&conn, 10).unwrap();
@@ -10084,14 +10215,17 @@ mod tests {
         let db_path = db(&ctx).unwrap().path().to_path_buf();
         let net = LoopbackNetwork::new();
         let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
-        let engine = SyncEngine::spawn(
+        let peer: NodeId = [3u8; 32];
+        let engine = Arc::new(SyncEngine::spawn(
             store as Arc<dyn SyncStore>,
             Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
-            [3u8; 32],
-        );
+            peer,
+        ));
 
         let pkg_root = tmp.path().join("packages");
         let name = Some("Trip to M42".to_string());
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let _permit = sender.prepare().slot().acquire_owned().await.unwrap();
         build_and_enqueue_selection(
             &ctx,
             &engine,
@@ -10100,6 +10234,9 @@ mod tests {
             &[f1],
             name.as_deref(),
             None,
+            peer,
+            None,
+            Arc::clone(&sender),
         )
         .await
         .unwrap();
@@ -10153,6 +10290,452 @@ mod tests {
             ..Default::default()
         };
         crate::db::insert_frame(&conn, &frame).unwrap()
+    }
+
+    // ── Background preparation (transfer-prepare spec §3) ────────────────────
+
+    /// Records every event a preparation emits, so a test can assert on the
+    /// progress contract instead of on log lines.
+    #[derive(Default)]
+    struct RecordingEmitter {
+        events: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl crate::events::ProgressEmitter for RecordingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.events
+                .lock()
+                .expect("emitter mutex poisoned")
+                .push((event_name.to_string(), payload));
+        }
+    }
+
+    impl RecordingEmitter {
+        fn named(&self, name: &str) -> Vec<serde_json::Value> {
+            self.events
+                .lock()
+                .expect("emitter mutex poisoned")
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+    }
+
+    /// A ctx plus a loopback sender engine whose peer is a reactive receiver: it
+    /// fetches every announce and acks each frame `Ingested`, so a package the
+    /// preparation worker hands over walks the whole sender path to `Confirmed`.
+    /// Returns the tempdir (the ctx's own — payload roots and `sync/packages`
+    /// are siblings under it), the ctx, the engine and the destination peer.
+    async fn loopback_ctx_with_engine() -> (
+        tempfile::TempDir,
+        Arc<ServiceContext>,
+        Arc<SyncEngineHandle>,
+        NodeId,
+    ) {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
+        use crate::sharing::{noop_fetch_sink, SharingTransport};
+
+        let (tmp, ctx) = test_ctx();
+        let ctx = Arc::new(ctx);
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
+
+        let net = LoopbackNetwork::new();
+        let receiver = Arc::new(net.endpoint());
+        let peer = receiver.start().await.unwrap().node_id;
+        let recv_root = tmp.path().join("recv");
+        tokio::spawn(async move {
+            let mut events = receiver.events().await;
+            let mut n = 0usize;
+            while let Some(event) = events.recv().await {
+                let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
+                    continue;
+                };
+                n += 1;
+                let dest = recv_root.join(format!("fetch-{n}"));
+                if receiver
+                    .fetch(from, &announce, &dest, noop_fetch_sink())
+                    .await
+                    .is_ok()
+                {
+                    if let Ok(records) = crate::package::read_manifest(&dest) {
+                        let receipts: Vec<FrameReceipt> = records
+                            .iter()
+                            .map(|r| FrameReceipt {
+                                frame_uuid: r.frame_uuid.clone(),
+                                xxh3: r.xxh3.clone(),
+                                outcome: ReceiptOutcome::Ingested,
+                            })
+                            .collect();
+                        let _ = receiver.ack(from, &announce.package_id, receipts).await;
+                    }
+                }
+            }
+        });
+
+        let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
+        let engine = Arc::new(SyncEngine::spawn(
+            store as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+            peer,
+        ));
+        (tmp, ctx, engine, peer)
+    }
+
+    /// Seed `count` catalog frames of `size` bytes each under `root` and return
+    /// their frame ids. Real files with the row's `(size, modified_at)` matching
+    /// the disk, so the staging pass's `strong_hash` banking is genuinely
+    /// exercised rather than skipped by the staleness contract.
+    fn seed_frames_on_disk(
+        ctx: &ServiceContext,
+        root: &Path,
+        count: usize,
+        size: usize,
+    ) -> Vec<i64> {
+        use crate::models::{File, FileFormat, Frame};
+        std::fs::create_dir_all(root).unwrap();
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        (0..count)
+            .map(|i| {
+                let path = root.join(format!("frame-{i}.fits"));
+                let bytes: Vec<u8> = (0..size).map(|b| ((b + i) % 251) as u8).collect();
+                std::fs::write(&path, &bytes).unwrap();
+                let meta = std::fs::metadata(&path).unwrap();
+                let file = File {
+                    id: None,
+                    path: path.to_string_lossy().into_owned(),
+                    filename: format!("frame-{i}.fits"),
+                    size: meta.len() as i64,
+                    modified_at: chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()),
+                    format: FileFormat::FITS,
+                    created_at: chrono::Utc::now(),
+                    content_hash: None,
+                    archived_in_operation: None,
+                    archive_zip_path: None,
+                    archive_path_in_zip: None,
+                    uuid: None,
+                    updated_at: None,
+                };
+                let file_id = crate::db::insert_file(&conn, &file).unwrap();
+                let frame = Frame {
+                    file_id,
+                    object: Some("M31".to_string()),
+                    ..Default::default()
+                };
+                crate::db::insert_frame(&conn, &frame).unwrap()
+            })
+            .collect()
+    }
+
+    /// The on-disk path behind a catalog frame.
+    fn source_path_of(ctx: &ServiceContext, frame_id: i64) -> PathBuf {
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        let path: String = conn
+            .query_row(
+                "SELECT f.path FROM files f JOIN frames fr ON fr.file_id = f.id WHERE fr.id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        PathBuf::from(path)
+    }
+
+    /// Poll the catalog sync store until outbound row `id` reaches `want`.
+    async fn wait_outbound(
+        ctx: &ServiceContext,
+        id: i64,
+        want: OutboundState,
+    ) -> crate::sync::OutboundRow {
+        let db_path = sync_dirs(ctx).unwrap().db_path;
+        for _ in 0..500 {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let row = store.get_outbound(id).unwrap().expect("row exists");
+            if row.state == want {
+                return row;
+            }
+            drop(store);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let store = CatalogSyncStore::open(&db_path).unwrap();
+        let row = store.get_outbound(id).unwrap().unwrap();
+        panic!(
+            "outbound {id} never reached {want:?} (state {:?}, last_error {:?})",
+            row.state, row.last_error
+        );
+    }
+
+    /// The per-file rollup for one outbound row.
+    fn file_counts(ctx: &ServiceContext, id: i64) -> crate::sync::status::TransferFileCounts {
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        crate::sync::store::outbound_file_counts(&conn, &[id])
+            .unwrap()
+            .remove(&id)
+            .expect("per-file rows exist")
+    }
+
+    /// Transfer-prepare §3: a `Send` writes its row FIRST and returns — the copy
+    /// runs in a background worker. The single staging permit is held by the test
+    /// while the command runs, so "the row is durable before a byte is copied" is
+    /// asserted structurally rather than by racing a stopwatch: the worker cannot
+    /// have started. Releasing the permit lets it stage, hash, write the manifest
+    /// and hand the row to the engine, which delivers it.
+    #[tokio::test]
+    async fn enqueue_returns_a_preparing_row_then_prepares_and_confirms() {
+        let (tmp, ctx, engine, peer) = loopback_ctx_with_engine().await;
+        let frame_ids = seed_frames_on_disk(&ctx, &tmp.path().join("M31_data"), 2, 1_500_000);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let emitter = Arc::new(RecordingEmitter::default());
+        let permit = sender.prepare().slot().acquire_owned().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &sync_dirs(&ctx).unwrap().packages_dir,
+            &frame_ids,
+            Some("Batch"),
+            None,
+            peer,
+            Some(Arc::clone(&emitter) as Arc<dyn crate::events::ProgressEmitter>),
+            Arc::clone(&sender),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.enqueued_count, 2);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "returns before copying"
+        );
+
+        let id = result.outbound_id.expect("row id");
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
+        let row = CatalogSyncStore::open(&db_path)
+            .unwrap()
+            .get_outbound(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            OutboundState::Preparing,
+            "durable the moment the command returns"
+        );
+        assert_eq!(row.display_name.as_deref(), Some("Batch"));
+        let counts = file_counts(&ctx, id);
+        assert_eq!(counts.total, 2, "the file manifest lands with the row");
+        assert!(
+            counts.total_bytes >= 3_000_000,
+            "bytes known before the copy"
+        );
+        assert!(sender.prepare().is_preparing(id));
+
+        drop(permit);
+        let row = wait_outbound(&ctx, id, OutboundState::Confirmed).await;
+        assert!(
+            !sender.prepare().is_preparing(id),
+            "the cancel flag is dropped when the preparation ends"
+        );
+
+        let dir = PathBuf::from(&row.package_ref);
+        assert!(dir.join("manifest.ndjson").is_file());
+        let manifest = crate::package::read_manifest(&dir).unwrap();
+        assert_eq!(manifest.len(), 2);
+        for r in &manifest {
+            assert_eq!(r.xxh3.len(), 16, "hash filled by the worker");
+        }
+
+        // The full read the staging pass paid for is banked as `files.strong_hash`.
+        {
+            let dbh = db(&ctx).unwrap();
+            let conn = dbh.conn();
+            let banked: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE strong_hash IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(banked, 2, "both source reads banked their digest");
+        }
+
+        // Progress: batch ticks under the `preparing` stage, and every file
+        // reports its own terminal byte count.
+        let batch = emitter.named("sync-progress");
+        assert!(
+            batch.iter().any(|e| e["stage"] == "preparing"),
+            "the preparation reports its own stage: {batch:?}"
+        );
+        let per_file = emitter.named("sync-file-progress");
+        for r in &manifest {
+            assert!(
+                per_file.iter().any(|e| {
+                    e["file"] == serde_json::json!(r.rel_path)
+                        && e["bytesDone"] == serde_json::json!(r.byte_size)
+                }),
+                "{} reported its terminal byte count: {per_file:?}",
+                r.rel_path
+            );
+        }
+    }
+
+    /// Cancelling while the package is still staging is a real stop: the row goes
+    /// terminal as `cancelled`, the partial package dir is removed, and every
+    /// per-file row is settled — nothing else will ever close them, because the
+    /// engine never saw this transfer.
+    #[tokio::test]
+    async fn cancelling_a_preparing_row_removes_the_dir_and_settles_files() {
+        let (tmp, ctx, engine, peer) = loopback_ctx_with_engine().await;
+        let frame_ids = seed_frames_on_disk(&ctx, &tmp.path().join("big"), 2, 4_000_000);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let permit = sender.prepare().slot().acquire_owned().await.unwrap();
+
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &sync_dirs(&ctx).unwrap().packages_dir,
+            &frame_ids,
+            Some("Batch"),
+            None,
+            peer,
+            None,
+            Arc::clone(&sender),
+        )
+        .await
+        .unwrap();
+        let id = result.outbound_id.unwrap();
+        assert!(
+            sender.prepare().cancel(id),
+            "cancel flag set while preparing"
+        );
+        drop(permit);
+
+        let row = wait_outbound(&ctx, id, OutboundState::Cancelled).await;
+        assert!(
+            !Path::new(&row.package_ref).exists(),
+            "partial dir removed: {}",
+            row.package_ref
+        );
+        let c = file_counts(&ctx, id);
+        assert_eq!(c.total, 2);
+        assert_eq!(c.done, c.total, "files settled cancelled");
+        assert_eq!(c.failed, 0, "a cancel is not a failure");
+        assert!(
+            !sender.prepare().is_preparing(id),
+            "the flag is dropped once the worker is done"
+        );
+    }
+
+    /// A row that goes terminal while the worker is still copying is no longer
+    /// the worker's to hand over. Until the cancel command learns to route to the
+    /// preparation runtime, a cancel of a `preparing` row lands on the ENGINE and
+    /// stamps it `cancelled` mid-copy — and the worker must not flip that back to
+    /// `queued` and announce a package the user stopped. It finishes the copy it
+    /// was in the middle of, then throws the staged dir away.
+    #[tokio::test]
+    async fn a_row_cancelled_out_from_under_the_worker_is_not_resurrected() {
+        let (tmp, ctx, engine, peer) = loopback_ctx_with_engine().await;
+        let frame_ids = seed_frames_on_disk(&ctx, &tmp.path().join("M31_data"), 2, 1_000_000);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let permit = sender.prepare().slot().acquire_owned().await.unwrap();
+
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &sync_dirs(&ctx).unwrap().packages_dir,
+            &frame_ids,
+            Some("Batch"),
+            None,
+            peer,
+            None,
+            Arc::clone(&sender),
+        )
+        .await
+        .unwrap();
+        let id = result.outbound_id.unwrap();
+
+        // The engine-side cancel path, exactly as `cancel_sync_package` drives it.
+        engine.cancel(id).await.unwrap();
+        let row = wait_outbound(&ctx, id, OutboundState::Cancelled).await;
+        let pkg_dir = PathBuf::from(&row.package_ref);
+
+        // Let the worker run to completion; its refusal removes the dir it staged.
+        drop(permit);
+        for _ in 0..500 {
+            if !sender.prepare().is_preparing(id) && !pkg_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !pkg_dir.exists(),
+            "the staged dir is thrown away, not handed over: {}",
+            pkg_dir.display()
+        );
+
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
+        let final_state = CatalogSyncStore::open(&db_path)
+            .unwrap()
+            .get_outbound(id)
+            .unwrap()
+            .unwrap()
+            .state;
+        assert_eq!(
+            final_state,
+            OutboundState::Cancelled,
+            "the worker never resurrects a row someone else made terminal"
+        );
+    }
+
+    /// A source that disappears between the plan's `stat` and the worker reaching
+    /// it fails the transfer honestly: a `failed` row whose reason names the
+    /// preparation, the partial dir removed, and the one file that broke the run
+    /// marked as the culprit rather than the whole batch reported as "failed".
+    #[tokio::test]
+    async fn a_source_that_vanishes_mid_preparation_fails_the_row_honestly() {
+        let (tmp, ctx, engine, peer) = loopback_ctx_with_engine().await;
+        let frame_ids = seed_frames_on_disk(&ctx, &tmp.path().join("M31_data"), 2, 1_000_000);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let permit = sender.prepare().slot().acquire_owned().await.unwrap();
+        let second_path = source_path_of(&ctx, frame_ids[1]);
+
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &sync_dirs(&ctx).unwrap().packages_dir,
+            &frame_ids,
+            Some("Batch"),
+            None,
+            peer,
+            None,
+            Arc::clone(&sender),
+        )
+        .await
+        .unwrap();
+        let id = result.outbound_id.unwrap();
+        // Gone after the plan's stat, before the worker's first byte.
+        std::fs::remove_file(&second_path).unwrap();
+        drop(permit);
+
+        let row = wait_outbound(&ctx, id, OutboundState::Failed).await;
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("preparation failed:"),
+            "{:?}",
+            row.last_error
+        );
+        assert!(!Path::new(&row.package_ref).exists());
+        let c = file_counts(&ctx, id);
+        assert_eq!(c.failed, 1, "exactly the culprit file is marked failed");
+        assert_eq!(c.done + c.failed, c.total, "every file row is settled");
     }
 
     /// W1 §T1.3: the upload-limit bounds check, pinned through the REAL guard

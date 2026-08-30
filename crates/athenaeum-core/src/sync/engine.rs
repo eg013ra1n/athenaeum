@@ -917,6 +917,20 @@ impl Worker {
                     if row.peer != self.peer {
                         continue;
                     }
+                    // A `preparing` row is the preparation worker's (transfer-prepare
+                    // spec §3.3): its package dir is half-staged and its manifest is
+                    // not written yet, so announcing it would ship a package that does
+                    // not exist. The worker hands the row over itself, via
+                    // `Command::Drive`, once the dir is whole; a preparation the
+                    // process did not survive is healed to `failed` at startup by
+                    // `api::sync_prepare::heal_interrupted_preparations`, never here.
+                    if row.state == OutboundState::Preparing {
+                        tracing::debug!(
+                            package_id = row.id,
+                            "preparing row belongs to the preparation worker; not resumed"
+                        );
+                        continue;
+                    }
                     let dir = PathBuf::from(&row.package_ref);
                     if let Err(e) = self.start_package(row.id, dir, row.state).await {
                         tracing::error!(package_id = row.id, error = %e, "resume re-announce failed");
@@ -2316,6 +2330,18 @@ impl Worker {
                 reason,
                 state = row.state.as_str(),
                 "row is terminal; not driving"
+            );
+            return;
+        }
+        // Still staging: the preparation worker flips the row to `Queued` itself
+        // and only then drives it, so a `Preparing` row here means someone drove
+        // a package whose dir is not written yet. Refusing is the same rule the
+        // startup sweep applies — an engine must never announce a half-staged dir.
+        if row.state == OutboundState::Preparing {
+            tracing::warn!(
+                package_id = id,
+                reason,
+                "row is still preparing; not driving"
             );
             return;
         }
