@@ -620,6 +620,64 @@ pub(crate) fn export_source_vanished(err: &iroh_blobs::api::RequestError) -> boo
     }
 }
 
+/// What one child export did: `Ok(())` landed, `Err` is iroh's own failure for
+/// the caller to classify (§5.3) with the collection tag in hand.
+type ExportOutcome = std::result::Result<(), iroh_blobs::api::RequestError>;
+
+/// One child of [`fetch_collection_to_dir`]'s export loop: clear a stale target
+/// left by an earlier attempt, then export the blob BY REFERENCE.
+///
+/// **Why the remove.** The receiver derives staging from the wire id
+/// (`<root>/staging/<wire_id>`) and does NOT clean it when a transfer parks
+/// `Waiting`, so a retry re-runs this loop over children an earlier attempt
+/// already exported. Such a child's entry is `External([that exact target])`, and
+/// upstream's non-empty-external arm (`store/fs.rs:1284-1290`) then calls
+/// `reflink_or_copy(source_path, target)` with `source_path == target`:
+/// `File::create(to)` truncates the inode to ZERO before the read, so the export
+/// fails `UnexpectedEof` — a non-`NotFound` io error, hence `LocalFault`, hence a
+/// row wrongly terminalized `Failed` when the truth is recoverable — AND leaves
+/// the entry pointing at a 0-byte file, wedging every sibling package that shares
+/// the hash. Removing the target first makes that impossible: if it was the
+/// entry's only external path the export now fails as a *vanished source*, which
+/// is already the correct, self-healing classification (§5.3); otherwise this is
+/// simply stale-file cleanup from the earlier attempt.
+///
+/// `Err` is returned ONLY for that local pre-step: a target we cannot remove is a
+/// [`LocalFault`], because exporting over a file we failed to clear is exactly
+/// the truncation this guards against.
+pub(crate) async fn export_child(
+    store: &Store,
+    hash: Hash,
+    target: &Path,
+) -> Result<ExportOutcome> {
+    match tokio::fs::remove_file(target).await {
+        Ok(()) => {}
+        // Nothing there is the normal case (a first attempt).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(LocalFault(
+                anyhow::Error::new(e)
+                    .context(format!("remove stale export target {}", target.display())),
+            )
+            .into())
+        }
+    }
+    // Transfer-prepare spec §5.1: MOVE the store-owned data file into staging
+    // (rename; EXDEV → copy, and iroh drops its own copy either way). The store
+    // then REFERENCES the staged file, so the receiver holds one copy of the
+    // payload instead of two while the package awaits confirmation.
+    Ok(store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash,
+            mode: ExportMode::TryReference,
+            target: target.to_path_buf(),
+        })
+        .finish()
+        .await
+        .map(|_| ()))
+}
+
 /// Handle the ONE export failure that is transfer-class (§5.3): the file the
 /// store references is gone. Drops the receiver's collection tag, logs, and
 /// returns the (deliberately un-[`LocalFault`]ed) error the fetch propagates.
@@ -656,7 +714,7 @@ pub(crate) async fn on_export_source_vanished(
 ) -> anyhow::Error {
     if let Err(te) = store.tags().delete(tag.as_bytes()).await {
         tracing::warn!(
-            tag,
+            collection_tag = tag,
             root_hash = %root_hash,
             error = %format!("{te:#}"),
             "delete collection tag after vanished export failed"
@@ -899,20 +957,7 @@ pub async fn fetch_collection_to_dir(
                 )
             })?;
         }
-        // Transfer-prepare spec §5.1: MOVE the store-owned data file into staging
-        // (rename; EXDEV → copy, and iroh drops its own copy either way). The
-        // store then REFERENCES the staged file, so the receiver holds one copy
-        // of the payload instead of two while the package awaits confirmation.
-        let res = store
-            .blobs()
-            .export_with_opts(ExportOptions {
-                hash: *blob_hash,
-                mode: ExportMode::TryReference,
-                target: target.clone(),
-            })
-            .finish()
-            .await;
-        if let Err(e) = res {
+        if let Err(e) = export_child(store, *blob_hash, &target).await? {
             // §5.3: a same-hash sibling package's staged file was cleaned before
             // this export ran and GC has not yet dropped the dead entry. NOT a
             // local fault — the row parks `Waiting` and the sender retries; the

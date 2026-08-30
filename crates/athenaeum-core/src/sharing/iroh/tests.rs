@@ -3218,3 +3218,92 @@ async fn vanished_export_drops_the_collection_tag() {
     let msg = format!("{out:#}");
     assert!(msg.contains("source vanished"), "{msg}");
 }
+
+/// A retry re-runs the export loop over a staging dir nobody cleaned (a `Waiting`
+/// park leaves `<root>/staging/<wire_id>` in place), so a child an earlier attempt
+/// already exported is re-exported into the SAME target — and that target is now
+/// the entry's own external path. Upstream would take its non-empty-external arm
+/// and `reflink_or_copy(source_path, target)` with `source_path == target`:
+/// `File::create(to)` truncates the inode to zero before the read, which both
+/// fails the export with a NON-`NotFound` io error (⇒ `LocalFault` ⇒ the row is
+/// terminalized `Failed`, when the truth is recoverable) and leaves the entry
+/// pointing at a 0-byte file, wedging every sibling package sharing that hash.
+///
+/// `export_child` — the exact code the loop runs — removes a stale target first,
+/// so the pathological self-copy cannot happen: the re-export degrades to the
+/// vanished-source class, which self-heals (§5.3). Exporting to a DIFFERENT target
+/// still works, so the guard costs the legitimate copy path nothing.
+#[tokio::test]
+async fn re_export_into_the_same_staging_target_does_not_truncate_it() {
+    let tmp = tempdir().unwrap();
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    // Above the inline threshold, so the store keeps a real data file that
+    // `TryReference` moves out and then references.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let tt = store
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let target = staging.join("a.fits");
+
+    // First attempt: the payload moves out of the store into staging.
+    super::blobs::export_child(&store, tt.hash(), &target)
+        .await
+        .expect("no local pre-step failure")
+        .expect("the first export lands");
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+
+    // The retry: same child, same target, which is now the entry's only external
+    // path. Pre-fix this truncated `target` to 0 bytes and reported a LocalFault.
+    let err = super::blobs::export_child(&store, tt.hash(), &target)
+        .await
+        .expect("no local pre-step failure")
+        .expect_err("re-exporting onto the entry's own external path cannot succeed");
+    assert!(
+        super::blobs::export_source_vanished(&err),
+        "the re-export degrades to the self-healing vanished class, never a \
+         LocalFault that terminalizes the row: {err:?}"
+    );
+    match std::fs::metadata(&target) {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::NotFound,
+            "target is either gone or intact — nothing else"
+        ),
+        Ok(m) => assert_eq!(
+            m.len(),
+            bytes.len() as u64,
+            "the target must never be left truncated"
+        ),
+    }
+
+    // And the legitimate multi-target path is untouched: a fresh entry exported
+    // to two DIFFERENT targets copies from the external path and lands intact.
+    let store2 = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s2"))
+        .await
+        .unwrap();
+    let tt2 = store2
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    let t1 = staging.join("t1.fits");
+    let t2 = staging.join("t2.fits");
+    super::blobs::export_child(&store2, tt2.hash(), &t1)
+        .await
+        .unwrap()
+        .unwrap();
+    super::blobs::export_child(&store2, tt2.hash(), &t2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(&t1).unwrap(), bytes);
+    assert_eq!(std::fs::read(&t2).unwrap(), bytes);
+}
