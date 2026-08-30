@@ -299,6 +299,24 @@ pub enum TransportEvent {
         bytes_done: u64,
         bytes_total: u64,
     },
+    /// SENDER-SIDE ONLY: the serve import is hashing the package we are about to
+    /// announce (transfer-prepare spec §4.4). Importing a package dir into the
+    /// blob store computes a BLAKE3 outboard over every payload — a multi-GB read
+    /// that happens BEFORE the peer hears about the transfer at all, which used to
+    /// leave the row frozen with nothing to show. `bytes_total` is the package's
+    /// payload bytes (everything the import reads off disk); `bytes_done` is the
+    /// cumulative, monotonically non-decreasing figure across all children.
+    ///
+    /// Like [`ServeProgress`](Self::ServeProgress) this originates LOCALLY — on
+    /// OUR endpoint, from the import itself, never from a peer control message —
+    /// so it carries no `from`. Routed to the sender engine, which turns it into a
+    /// `sync-progress` tick with `stage = "indexing"`. Best-effort UI data
+    /// (throttled, droppable), never delivery truth.
+    ImportProgress {
+        package_id: PackageId,
+        bytes_done: u64,
+        bytes_total: u64,
+    },
 }
 
 /// Live progress of a fetch, delivered on the [`FetchSink`] callback threaded

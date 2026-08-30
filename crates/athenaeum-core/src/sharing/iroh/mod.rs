@@ -1406,10 +1406,11 @@ impl SharingTransport for IrohTransport {
         let tag = package_tag(&pkg.package_id);
         // `None` → full package (pre-dedup). `Some(w)` → the negotiated subset:
         // only those payloads plus a manifest filtered to exactly them.
-        // The legacy transport surfaces no per-file progress, so the ordered
-        // entries are discarded here (only the shared node records them); it has
-        // no `NodeOptions` either, so both paths keep the historic `Copy` import
-        // (the shared node is the one that references payloads in place).
+        // The legacy transport surfaces no per-file or import progress, so the
+        // ordered entries are discarded here and no progress sink is passed (only
+        // the shared node records them); it has no `NodeOptions` either, so both
+        // paths keep the historic `Copy` import (the shared node is the one that
+        // references payloads in place).
         let (hash, _entries) = match want {
             None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
             Some(w) => {
@@ -1419,6 +1420,7 @@ impl SharingTransport for IrohTransport {
                     w,
                     &tag,
                     iroh_blobs::api::blobs::ImportMode::Copy,
+                    None,
                 )
                 .await?
             }

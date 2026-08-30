@@ -1092,6 +1092,10 @@ fn event_peer(ev: &TransportEvent) -> Option<NodeId> {
         TransportEvent::ServeProgress { .. } => None,
         TransportEvent::ServeComplete { .. } => None,
         TransportEvent::ServeFileProgress { .. } => None,
+        // Locally-originated serve-IMPORT progress (our own package being hashed
+        // before we announce it): the sender engine's `indexing` stage, never the
+        // receiver's business.
+        TransportEvent::ImportProgress { .. } => None,
     }
 }
 
@@ -1402,7 +1406,8 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
         TransportEvent::AckReceived { .. }
         | TransportEvent::ServeProgress { .. }
         | TransportEvent::ServeComplete { .. }
-        | TransportEvent::ServeFileProgress { .. } => {}
+        | TransportEvent::ServeFileProgress { .. }
+        | TransportEvent::ImportProgress { .. } => {}
     }
 }
 

@@ -2326,6 +2326,17 @@ impl Worker {
                 self.on_serve_file_progress(package_id, file, bytes_done, bytes_total);
                 Ok(())
             }
+            // The serve import is hashing the package we are about to announce
+            // (transfer-prepare spec §4.4): surface it as the `indexing` stage so a
+            // multi-GB send is not a frozen row.
+            TransportEvent::ImportProgress {
+                package_id,
+                bytes_done,
+                bytes_total,
+            } => {
+                self.on_import_progress(package_id, bytes_done, bytes_total);
+                Ok(())
+            }
         }
     }
 
@@ -2497,6 +2508,29 @@ impl Worker {
             cumulative.min(byte_size),
             byte_size,
         );
+    }
+
+    /// Serve-import (outboard hashing) progress for a package we are preparing to
+    /// announce (transfer-prepare spec §4.4) — surfaced as the `indexing` stage.
+    ///
+    /// The slot is resolved exactly as [`on_serve_progress`](Self::on_serve_progress)
+    /// resolves it: the pending entry whose minted announce carries this
+    /// `package_id`. A tick for no live slot is dropped at debug. Unlike a serve
+    /// tick this is NOT peer contact — no bytes have left this device — so it
+    /// deliberately does not touch the ack-timeout ladder, the reachability
+    /// tracker, or `last_error`. It is a display stage and nothing more; the
+    /// figures come straight from the import, so no session-base arithmetic
+    /// applies either.
+    fn on_import_progress(&mut self, package_id: PackageId, bytes_done: u64, bytes_total: u64) {
+        let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
+            Some(a) if a.package_id == package_id => Some((*k, a.frame_count)),
+            _ => None,
+        });
+        let Some((id, frame_count)) = slot else {
+            tracing::debug!(package_id = %package_id.0, "import-progress for no pending slot; dropped");
+            return;
+        };
+        self.emit_progress_bytes(id, "indexing", frame_count, bytes_done, bytes_total);
     }
 
     /// Bytes of this package the peer has ALREADY taken, read from the durable

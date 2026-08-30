@@ -2541,11 +2541,12 @@ async fn try_reference_import_yields_same_hash_and_no_store_copy() {
     let ref_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("reference"))
         .await
         .unwrap();
-    let (h_copy, _) = import_package_collection_with_mode(&copy_store, &pkg, "t", ImportMode::Copy)
-        .await
-        .unwrap();
+    let (h_copy, _) =
+        import_package_collection_with_mode(&copy_store, &pkg, "t", ImportMode::Copy, None)
+            .await
+            .unwrap();
     let (h_ref, _) =
-        import_package_collection_with_mode(&ref_store, &pkg, "t", ImportMode::TryReference)
+        import_package_collection_with_mode(&ref_store, &pkg, "t", ImportMode::TryReference, None)
             .await
             .unwrap();
     assert_eq!(h_copy, h_ref, "mode never changes the collection hash");
@@ -2560,7 +2561,7 @@ async fn try_reference_import_yields_same_hash_and_no_store_copy() {
         .await
         .unwrap();
     let want: std::collections::HashSet<String> = ["a.fits".to_string()].into_iter().collect();
-    import_subset_collection(&sub_store, &pkg, &want, "t", ImportMode::TryReference)
+    import_subset_collection(&sub_store, &pkg, &want, "t", ImportMode::TryReference, None)
         .await
         .unwrap();
     assert!(!store_holds_payload_copy(
@@ -2703,7 +2704,7 @@ async fn dead_first_external_path_is_repaired_by_a_copy_reimport() {
         "precondition: the entry reads the now-deleted first path"
     );
 
-    import_package_collection_with_mode(&store, &pkg, "t", ImportMode::TryReference)
+    import_package_collection_with_mode(&store, &pkg, "t", ImportMode::TryReference, None)
         .await
         .unwrap();
     assert!(
@@ -2726,7 +2727,7 @@ async fn dead_first_external_path_is_repaired_by_a_copy_reimport() {
     let hash2 = add_by_reference(&store2, &stale2).await.hash();
     std::fs::remove_file(&stale2).unwrap();
 
-    import_package_collection_with_mode(&store2, &pkg2, "t", ImportMode::TryReference)
+    import_package_collection_with_mode(&store2, &pkg2, "t", ImportMode::TryReference, None)
         .await
         .unwrap();
     assert!(
@@ -2737,6 +2738,42 @@ async fn dead_first_external_path_is_repaired_by_a_copy_reimport() {
         readable(&store2, hash2).await,
         "still served from the live package path"
     );
+}
+
+/// Transfer-prepare spec §4.4: the serve import reports byte progress so a
+/// multi-GB package's outboard-hashing pass is visible as the `indexing` stage
+/// instead of a frozen row. Ticks are throttled, so the only figure a consumer
+/// can rely on is the terminal one — which must pin `done == total`, and `total`
+/// must be everything the import actually read off disk (payloads AND the
+/// package's own `manifest.ndjson`, which `collect_files` walks like any other
+/// file).
+#[tokio::test]
+async fn import_reports_byte_progress_reaching_the_total() {
+    use crate::sharing::iroh::blobs::import_package_collection_with_mode;
+    use iroh_blobs::api::blobs::ImportMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = write_test_package(tmp.path(), &[("a.fits", 2_000_000), ("b.fits", 2_000_000)]);
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = {
+        let seen = seen.clone();
+        std::sync::Arc::new(move |done: u64, total: u64| seen.lock().unwrap().push((done, total)))
+    };
+    import_package_collection_with_mode(&store, &pkg, "t", ImportMode::TryReference, Some(sink))
+        .await
+        .unwrap();
+    let ticks = seen.lock().unwrap().clone();
+    let last = ticks.last().copied().expect("at least the terminal tick");
+    assert_eq!(
+        last.1,
+        4_000_000
+            + std::fs::metadata(pkg.join("manifest.ndjson"))
+                .unwrap()
+                .len()
+    );
+    assert_eq!(last.0, last.1, "terminal tick pins done == total");
 }
 
 /// A node that imports serves BY REFERENCE, the way the app's

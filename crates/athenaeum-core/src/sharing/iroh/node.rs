@@ -493,15 +493,17 @@ impl EventDemux {
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
                 }
-                // ServeProgress / ServeComplete / ServeFileProgress originate on OUR
-                // endpoint (the provider-events consumer), never arrive as a decoded
-                // inbound control message, and are routed via `route_serve_progress`
-                // / `route_serve_complete` / `route_serve_file_progress` — not this
-                // path. Treat a stray one defensively as an orphan (no consumer, no
-                // delivery ack).
+                // ServeProgress / ServeComplete / ServeFileProgress / ImportProgress
+                // originate on OUR endpoint (the provider-events consumer, or the
+                // serve import itself), never arrive as a decoded inbound control
+                // message, and are routed via `route_serve_progress` /
+                // `route_serve_complete` / `route_serve_file_progress` /
+                // `route_import_progress` — not this path. Treat a stray one
+                // defensively as an orphan (no consumer, no delivery ack).
                 TransportEvent::ServeProgress { .. }
                 | TransportEvent::ServeComplete { .. }
-                | TransportEvent::ServeFileProgress { .. } => None,
+                | TransportEvent::ServeFileProgress { .. }
+                | TransportEvent::ImportProgress { .. } => None,
             }
         };
         match target {
@@ -633,6 +635,37 @@ impl EventDemux {
             }
         }
     }
+
+    /// Route a locally-generated
+    /// [`ImportProgress`](TransportEvent::ImportProgress) (transfer-prepare spec
+    /// §4.4) to the sender handle(s) that announced this package — the
+    /// serve-import sibling of
+    /// [`route_serve_progress`](Self::route_serve_progress), matched by
+    /// `package_id` across the live ack claims. Non-blocking (`try_send`): a full
+    /// channel drops the tick and a package with no live claim is silently
+    /// ignored — import progress is best-effort UI data.
+    ///
+    /// Same keyed-on-`package_id`-only cross-destination caveat as
+    /// [`route_serve_progress`](Self::route_serve_progress): a package fanned out
+    /// to N peers delivers this same tick to every one of them — a benign
+    /// over-report of one shared local import, never a misroute.
+    pub(crate) fn route_import_progress(
+        &self,
+        package_id: &PackageId,
+        bytes_done: u64,
+        bytes_total: u64,
+    ) {
+        let inner = self.inner.lock().expect("demux mutex poisoned");
+        for ((_, pid), (_, tx)) in inner.claims.iter() {
+            if pid == package_id {
+                let _ = tx.try_send(TransportEvent::ImportProgress {
+                    package_id: package_id.clone(),
+                    bytes_done,
+                    bytes_total,
+                });
+            }
+        }
+    }
 }
 
 /// The inbound-event variant an orphan warn names, plus the peer it came from.
@@ -647,6 +680,7 @@ fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
         TransportEvent::ServeProgress { .. } => ("serve_progress", [0u8; 32]),
         TransportEvent::ServeComplete { .. } => ("serve_complete", [0u8; 32]),
         TransportEvent::ServeFileProgress { .. } => ("serve_file_progress", [0u8; 32]),
+        TransportEvent::ImportProgress { .. } => ("import_progress", [0u8; 32]),
     }
 }
 
@@ -2514,11 +2548,33 @@ impl SharedIrohNode {
         // dir). Both import paths honor it — a dedup-narrowed subset send must not
         // fall back to a copy.
         let mode = self.serve_import_mode;
+        // Transfer-prepare spec §4.4: the import hashes every payload before the
+        // peer is even told the package exists, so a multi-GB send would otherwise
+        // sit frozen. Feed those bytes to the announcing sender engine as
+        // `ImportProgress` (its `indexing` stage). Best-effort UI data: the sink
+        // never blocks and a tick with no live claim is dropped.
+        let progress: blobs::ImportProgressSink = {
+            let demux = Arc::clone(&self.demux);
+            let package_id = pkg.package_id.clone();
+            Arc::new(move |bytes_done, bytes_total| {
+                demux.route_import_progress(&package_id, bytes_done, bytes_total)
+            })
+        };
         let (hash, entries) = match want {
             None => {
-                blobs::import_package_collection_with_mode(&self.store, src_dir, &tag, mode).await?
+                blobs::import_package_collection_with_mode(
+                    &self.store,
+                    src_dir,
+                    &tag,
+                    mode,
+                    Some(progress),
+                )
+                .await?
             }
-            Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag, mode).await?,
+            Some(w) => {
+                blobs::import_subset_collection(&self.store, src_dir, w, &tag, mode, Some(progress))
+                    .await?
+            }
         };
         self.served.lock().expect("served mutex poisoned").insert(
             tag.clone(),
@@ -2630,11 +2686,14 @@ impl SharedIrohNode {
                 return Ok(entry.hash);
             }
         }
+        // No progress sink: project seeding (D3) is not an announced transfer, so
+        // there is no sender row waiting on an `indexing` stage.
         let (hash, entries) = blobs::import_package_collection_with_mode(
             &self.store,
             pkg_dir,
             &tag,
             ImportMode::TryReference,
+            None,
         )
         .await
         .with_context(|| format!("seed project package {package_id}"))?;

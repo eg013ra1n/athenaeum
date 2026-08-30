@@ -11,11 +11,12 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
+use iroh_blobs::api::blobs::{AddPathOptions, AddProgressItem, ImportMode};
 use iroh_blobs::api::downloader::{DownloadProgressItem, DownloadRequest, Shuffled, SplitStrategy};
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
@@ -33,6 +34,26 @@ use crate::sharing::{FetchSink, ProviderEvent, ProviderTelemetrySink};
 /// throttle or not, so the sink never misses a terminal value. Progress is UI
 /// event data, never a log.
 const FETCH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Minimum wall-clock gap between two [`ImportProgressSink`] ticks. Same figure
+/// and same reasoning as [`FETCH_PROGRESS_MIN_INTERVAL`]: iroh-blobs emits
+/// copy/outboard offsets far faster than any UI can consume them. The terminal
+/// `(total, total)` tick is emitted unconditionally, throttle or not, so a
+/// consumer never misses the completion figure.
+const IMPORT_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Byte progress of a package import, reported as `(bytes_done, bytes_total)`
+/// over the WHOLE import (every child, cumulative), not per child.
+///
+/// Importing a package hashes every payload (BLAKE3 outboard) and, in
+/// [`ImportMode::Copy`], copies it into the store first — a multi-GB read that
+/// happens BEFORE the peer is even told the package exists (transfer-prepare
+/// spec §4.4). Without this the sender's row sits frozen for minutes; with it,
+/// the same pass surfaces as the `indexing` stage.
+///
+/// Progress is UI event data, never a log: the sink is called on the import's
+/// own task and must not block. `bytes_done` is monotonically non-decreasing.
+pub type ImportProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Aborts every spawned per-file observer task on drop — the ONE place that
 /// covers all exit paths from [`fetch_collection_to_dir`]: an early `?`
@@ -115,6 +136,121 @@ pub(crate) async fn probe_first_byte(store: &Store, hash: Hash) -> Result<()> {
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("read first byte of {hash}: {e}"))
+}
+
+/// Throttled cumulative-byte accounting for ONE package import, shared by the
+/// full-package and want-subset paths.
+///
+/// `bytes_done` is monotonically non-decreasing by construction: iroh-blobs
+/// reports the copy phase and the outboard phase as two separate `0..len` ramps
+/// over the SAME child (`Size → CopyProgress* → CopyDone → OutboardProgress* →
+/// Done`), so a naive `before + offset` would rewind once per child under
+/// [`ImportMode::Copy`]. `reported` is the floor that keeps a bar from walking
+/// backwards.
+struct ImportProgressMeter {
+    sink: Option<ImportProgressSink>,
+    /// Every byte this import will read off disk (all children summed).
+    total: u64,
+    /// Bytes of the children already fully imported.
+    before: u64,
+    /// Highest figure handed to the sink so far.
+    reported: u64,
+    last_tick: Instant,
+}
+
+impl ImportProgressMeter {
+    fn new(sink: Option<ImportProgressSink>, total: u64) -> Self {
+        Self {
+            sink,
+            total,
+            before: 0,
+            reported: 0,
+            last_tick: Instant::now(),
+        }
+    }
+
+    /// One in-child offset off the import stream. Dropped when it adds nothing
+    /// (the second ramp over the same child) or when the throttle window has not
+    /// elapsed — progress is best-effort UI data.
+    fn tick(&mut self, offset: u64, child_len: u64) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let done = self.before.saturating_add(offset.min(child_len));
+        if done <= self.reported || self.last_tick.elapsed() < IMPORT_PROGRESS_MIN_INTERVAL {
+            return;
+        }
+        self.reported = done;
+        self.last_tick = Instant::now();
+        sink(done, self.total);
+    }
+
+    /// A child finished importing: its full length is now behind us.
+    fn child_done(&mut self, child_len: u64) {
+        self.before = self.before.saturating_add(child_len);
+    }
+
+    /// The terminal tick, emitted unconditionally (throttle or not) so a consumer
+    /// always sees `done == total` at the end of a successful import.
+    fn finish(&mut self) {
+        if let Some(sink) = &self.sink {
+            self.reported = self.total;
+            sink(self.total, self.total);
+        }
+    }
+}
+
+/// Import ONE payload file as a blob, streaming the import so its copy/outboard
+/// offsets reach `meter`, and return the child's temp tag.
+///
+/// The non-streaming `.temp_tag()` shorthand this replaces drains this very same
+/// stream and returns its `Done` tag; the only difference here is that the
+/// intermediate items are observed instead of discarded. A stream that ends with
+/// neither `Done` nor `Error` violates the iroh-blobs contract — it fails loudly
+/// rather than silently importing nothing.
+async fn add_path_child(
+    store: &Store,
+    abs: &Path,
+    child_len: u64,
+    mode: ImportMode,
+    meter: &mut ImportProgressMeter,
+) -> Result<TempTag> {
+    let mut stream = store
+        .blobs()
+        .add_path_with_opts(AddPathOptions {
+            path: abs.to_path_buf(),
+            format: BlobFormat::Raw,
+            mode,
+        })
+        .stream()
+        .await;
+    let mut done: Option<TempTag> = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            AddProgressItem::CopyProgress(offset) | AddProgressItem::OutboardProgress(offset) => {
+                meter.tick(offset, child_len)
+            }
+            AddProgressItem::Done(tt) => done = Some(tt),
+            AddProgressItem::Error(e) => {
+                tracing::error!(
+                    path = %abs.display(),
+                    error = %e,
+                    "import blob failed"
+                );
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("import blob {}", abs.display()));
+            }
+            AddProgressItem::Size(_) | AddProgressItem::CopyDone => {}
+        }
+    }
+    let tt = done.with_context(|| {
+        format!(
+            "import blob {}: progress stream ended without Done",
+            abs.display()
+        )
+    })?;
+    meter.child_done(child_len);
+    Ok(tt)
 }
 
 /// Guarantee the just-imported child is actually readable, repairing it if not.
@@ -210,7 +346,7 @@ pub async fn import_package_collection(
     pkg_dir: &Path,
     tag: &str,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
-    import_package_collection_with_mode(store, pkg_dir, tag, ImportMode::Copy).await
+    import_package_collection_with_mode(store, pkg_dir, tag, ImportMode::Copy, None).await
 }
 
 /// [`import_package_collection`] under an explicit [`ImportMode`].
@@ -224,14 +360,22 @@ pub async fn import_package_collection(
 /// (it inlines small files regardless of mode), which is why this is a hint, and
 /// the mode never affects the resulting hashes — an identical package always
 /// yields the identical collection hash either way.
+///
+/// `progress`, when set, receives throttled cumulative `(bytes_done,
+/// bytes_total)` ticks across the whole import plus one terminal
+/// `(total, total)` — the `indexing` stage a sender surfaces while this pass
+/// hashes the package (transfer-prepare spec §4.4). `bytes_total` counts every
+/// file the import reads off disk, `manifest.ndjson` included.
 pub async fn import_package_collection_with_mode(
     store: &Store,
     pkg_dir: &Path,
     tag: &str,
     mode: ImportMode,
+    progress: Option<ImportProgressSink>,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
     let files = collect_files(pkg_dir)?;
     let count = files.len();
+    let mut meter = ImportProgressMeter::new(progress, files.iter().map(|f| f.len).sum());
 
     // Hold each child's temp tag alive until the collection is stored + tagged,
     // so nothing it references can be collected mid-assembly.
@@ -242,16 +386,7 @@ pub async fn import_package_collection_with_mode(
     // attribution map for Task 2.2.
     let mut entries: Vec<(String, u64)> = Vec::with_capacity(count);
     for f in &files {
-        let tt = store
-            .blobs()
-            .add_path_with_opts(AddPathOptions {
-                path: f.abs.clone(),
-                format: BlobFormat::Raw,
-                mode,
-            })
-            .temp_tag()
-            .await
-            .with_context(|| format!("import blob {}", f.abs.display()))?;
+        let tt = add_path_child(store, &f.abs, f.len, mode, &mut meter).await?;
         let hash = tt.hash();
         // A referenced child must be readable before we hand its hash to a peer.
         let tt = ensure_child_readable(store, &f.abs, hash, f.len, mode, tt).await?;
@@ -259,6 +394,7 @@ pub async fn import_package_collection_with_mode(
         entries.push((f.name.clone(), f.len));
         child_tags.push(tt);
     }
+    meter.finish();
 
     let hash = store_and_tag_collection(store, items, child_tags, tag).await?;
     tracing::debug!(
@@ -322,12 +458,18 @@ async fn store_and_tag_collection(
 /// transfer-prepare spec §4.1 this path hardcoded `add_path` (= `Copy`), so an
 /// app send that dedup narrowed to a subset silently paid a second copy of every
 /// wanted frame while the full-package path was already mode-aware.
+///
+/// `progress` behaves exactly as in [`import_package_collection_with_mode`],
+/// except that `bytes_total` is the wanted PAYLOAD bytes only: the filtered
+/// manifest never touches the disk here (it is added from memory), so it
+/// contributes no work to report.
 pub async fn import_subset_collection(
     store: &Store,
     pkg_dir: &Path,
     want: &HashSet<String>,
     tag: &str,
     mode: ImportMode,
+    progress: Option<ImportProgressSink>,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
     if want.is_empty() {
         anyhow::bail!(
@@ -361,18 +503,28 @@ pub async fn import_subset_collection(
     enum Src {
         /// Filtered `manifest.ndjson`, added straight from memory.
         ManifestBytes(Vec<u8>),
-        /// A wanted payload file at its absolute on-disk path.
-        Payload(PathBuf),
+        /// A wanted payload file at its absolute on-disk path, with the size the
+        /// import will read (stat'd once here, so the progress meter knows the
+        /// total before the first byte is hashed).
+        Payload { abs: PathBuf, size: u64 },
     }
     let mut entries: Vec<(String, Src)> = Vec::with_capacity(kept.len() + 1);
     entries.push((
         MANIFEST_FILENAME.to_string(),
         Src::ManifestBytes(manifest_ndjson.into_bytes()),
     ));
+    let mut payload_bytes: u64 = 0;
     for r in &kept {
-        entries.push((r.rel_path.clone(), Src::Payload(pkg_dir.join(&r.rel_path))));
+        let abs = pkg_dir.join(&r.rel_path);
+        let size = tokio::fs::metadata(&abs)
+            .await
+            .with_context(|| format!("stat {}", abs.display()))?
+            .len();
+        payload_bytes = payload_bytes.saturating_add(size);
+        entries.push((r.rel_path.clone(), Src::Payload { abs, size }));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut meter = ImportProgressMeter::new(progress, payload_bytes);
 
     let mut child_tags: Vec<TempTag> = Vec::with_capacity(entries.len());
     let mut items: Vec<(String, Hash)> = Vec::with_capacity(entries.len());
@@ -393,21 +545,8 @@ pub async fn import_subset_collection(
                     .context("import filtered manifest blob")?;
                 (tt, size)
             }
-            Src::Payload(abs) => {
-                let size = tokio::fs::metadata(&abs)
-                    .await
-                    .with_context(|| format!("stat {}", abs.display()))?
-                    .len();
-                let tt = store
-                    .blobs()
-                    .add_path_with_opts(AddPathOptions {
-                        path: abs.clone(),
-                        format: BlobFormat::Raw,
-                        mode,
-                    })
-                    .temp_tag()
-                    .await
-                    .with_context(|| format!("import blob {}", abs.display()))?;
+            Src::Payload { abs, size } => {
+                let tt = add_path_child(store, &abs, size, mode, &mut meter).await?;
                 // Same guard as the full-package path: a referenced child must be
                 // readable before its hash goes into the served collection.
                 let hash = tt.hash();
@@ -419,6 +558,7 @@ pub async fn import_subset_collection(
         ordered.push((name, size));
         child_tags.push(tt);
     }
+    meter.finish();
 
     let count = items.len();
     let hash = store_and_tag_collection(store, items, child_tags, tag).await?;
