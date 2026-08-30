@@ -1979,19 +1979,29 @@ pub fn list_outbound_files(conn: &Connection, outbound_id: i64) -> Result<Vec<Ou
 /// name the one file that broke the run. Rows already `done` keep their own
 /// verdict — the same "an already-settled row wins" rule the receive-side
 /// [`settle_unsettled_inbound_files`] follows.
+///
+/// ONE TRANSACTION, like that receive-side twin (which settles in a single
+/// UPDATE): the read and every write run on `tx`, so a crash mid-settle rolls
+/// the whole thing back rather than leaving a terminal batch with half its file
+/// rows still `pending` — a shape no heal revisits, since the batch row itself
+/// is already terminal. The per-row loop (rather than one UPDATE) is what the
+/// culprit split needs: exactly one row takes a different state + its own error.
 pub fn settle_outbound_files_terminal(
     conn: &Connection,
     outbound_id: i64,
     outcome: &str,
     culprit: Option<(&str, &str)>,
 ) -> Result<()> {
-    for row in list_outbound_files(conn, outbound_id)? {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin settle_outbound_files_terminal")?;
+    for row in list_outbound_files(&tx, outbound_id)? {
         if row.state == OutboundFileState::Done {
             continue;
         }
         match culprit {
             Some((rel, err)) if rel == row.rel_path => set_outbound_file_state(
-                conn,
+                &tx,
                 outbound_id,
                 &row.rel_path,
                 OutboundFileState::Failed,
@@ -2000,7 +2010,7 @@ pub fn settle_outbound_files_terminal(
                 Some(err),
             )?,
             _ => set_outbound_file_state(
-                conn,
+                &tx,
                 outbound_id,
                 &row.rel_path,
                 OutboundFileState::Done,
@@ -2010,6 +2020,8 @@ pub fn settle_outbound_files_terminal(
             )?,
         }
     }
+    tx.commit()
+        .context("commit settle_outbound_files_terminal")?;
     Ok(())
 }
 
@@ -4250,9 +4262,10 @@ mod tests {
     /// Transfer-prepare §3: a preparation that failed or was cancelled never
     /// reached the engine, so the API layer closes the per-file rows itself —
     /// every unfinished row lands `done`/<outcome>, and the one file that broke
-    /// the run lands `failed` with its own error.
+    /// the run lands `failed` with its own error. All in ONE transaction, so the
+    /// batch can never end terminal with half its rows still `pending`.
     #[test]
-    fn settle_outbound_files_terminal_marks_culprit_failed_and_rest_cancelled() {
+    fn settle_outbound_files_terminal_marks_culprit_failed_and_rest_settled_with_the_outcome() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(DDL_OUTBOUND_FILES, []).unwrap();
         let row = |rel: &str| OutboundFileRow {
@@ -4280,6 +4293,16 @@ mod tests {
         assert_eq!(
             (b.state, b.error.as_deref()),
             (OutboundFileState::Failed, Some("read error"))
+        );
+        // The settle is one transaction: it either lands whole or not at all, so
+        // no row is left behind in flight.
+        assert!(
+            rows.iter()
+                .all(|r| matches!(r.state, OutboundFileState::Done | OutboundFileState::Failed)),
+            "every row settled: {:?}",
+            rows.iter()
+                .map(|r| (r.rel_path.clone(), r.state))
+                .collect::<Vec<_>>()
         );
         let c = outbound_file_counts(&conn, &[1]).unwrap();
         assert_eq!((c[&1].done, c[&1].failed), (1, 1));

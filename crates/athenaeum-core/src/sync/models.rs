@@ -469,7 +469,9 @@ pub struct HistoryQuery {
 /// §D4). Mirrors [`OutboundState`]'s `as_str`/`from_db` shape: a file walks
 /// `Pending → Sending → Uploaded → Done`. `Uploaded` means "the sender finished
 /// serving this file's bytes"; `Done` means the batch ack recorded the receiver's
-/// per-frame verdict for it.
+/// per-frame verdict for it. [`Failed`](Self::Failed) is the one rung off that
+/// walk — terminal, and the only ERROR state: the file whose staging broke a
+/// preparation that never reached the engine (transfer-prepare spec §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboundFileState {

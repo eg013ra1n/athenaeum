@@ -2090,7 +2090,21 @@ async fn build_sender_status(
     for row in &active {
         match row.state {
             OutboundState::Transferring | OutboundState::Delivered => transferring += 1,
-            _ => queued += 1, // Queued / Announced
+            // Everything else in the Active list is pending work waiting to move.
+            // `Preparing` is counted here on purpose (transfer-prepare spec §3):
+            // its payload is still being staged, so nothing is transferring yet,
+            // but the user has a transfer waiting and the badge must say so.
+            // Enumerated rather than a wildcard so a future state has to choose
+            // its bucket instead of silently landing in this one.
+            OutboundState::Preparing | OutboundState::Queued | OutboundState::Announced => {
+                queued += 1
+            }
+            // Terminal rows never reach this list (the rollup reads non-terminal
+            // rows only); count them as pending rather than dropping them if one
+            // ever does.
+            OutboundState::Confirmed | OutboundState::Failed | OutboundState::Cancelled => {
+                queued += 1
+            }
         }
     }
 
