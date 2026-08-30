@@ -2025,6 +2025,12 @@ pub fn inbound_file_counts(
 /// `done` CASE via three-valued logic), so an `uploaded`/`fetched` file with no
 /// outcome still counts as done — that pair is the same rung on the two sides
 /// (D2 §3.4), which is why one CASE serves both directions.
+///
+/// The two trailing `duplicate` columns (count + `byte_size` sum over
+/// `outcome = 'duplicate'` rows) ride the same statement: they are a subset of
+/// `done` that the send-side progress line subtracts (see
+/// [`TransferFileCounts`]), so they must come from the same snapshot as `done`
+/// or the subtraction could go negative mid-settle.
 fn grouped_file_counts(
     conn: &Connection,
     table: &str,
@@ -2045,7 +2051,9 @@ fn grouped_file_counts(
                          THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN (state = 'done' OR state = 'uploaded' OR state = 'fetched') \
                           AND NOT (state = 'failed' OR COALESCE(outcome,'') LIKE 'rejected%') \
-                         THEN 1 ELSE 0 END) \
+                         THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN COALESCE(outcome,'') = 'duplicate' THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN COALESCE(outcome,'') = 'duplicate' THEN byte_size ELSE 0 END) \
          FROM {table} WHERE {id_col} IN ({placeholders}) GROUP BY {id_col}"
     );
     let mut stmt = conn.prepare(&sql).context("prepare grouped_file_counts")?;
@@ -2055,18 +2063,23 @@ fn grouped_file_counts(
             let total: i64 = r.get(1)?;
             let failed: i64 = r.get(2)?;
             let done: i64 = r.get(3)?;
-            Ok((id, total, done, failed))
+            let duplicate: i64 = r.get(4)?;
+            let duplicate_bytes: i64 = r.get(5)?;
+            Ok((id, total, done, failed, duplicate, duplicate_bytes))
         })
         .context("query grouped_file_counts")?;
     let mut map = HashMap::new();
     for row in rows {
-        let (id, total, done, failed) = row.context("row grouped_file_counts")?;
+        let (id, total, done, failed, duplicate, duplicate_bytes) =
+            row.context("row grouped_file_counts")?;
         map.insert(
             id,
             TransferFileCounts {
                 total: total.max(0) as u32,
                 done: done.max(0) as u32,
                 failed: failed.max(0) as u32,
+                duplicate: duplicate.max(0) as u32,
+                duplicate_bytes: duplicate_bytes.max(0) as u64,
             },
         );
     }
@@ -4175,6 +4188,15 @@ mod tests {
                     OutboundFileState::Done,
                     Some("cancelled"),
                 ),
+                // §D4 negotiate-time exclusion: the peer already had it, settled
+                // done/duplicate before a byte moved → done AND duplicate (a
+                // subset of done, not a sibling).
+                row(
+                    1,
+                    "duplicate.fits",
+                    OutboundFileState::Done,
+                    Some("duplicate"),
+                ),
             ],
         )
         .unwrap();
@@ -4188,15 +4210,20 @@ mod tests {
 
         let counts = outbound_file_counts(&conn, &[1, 2, 999]).unwrap();
         let p1 = counts.get(&1).expect("parent 1 present");
-        assert_eq!(p1.total, 6);
-        // done = uploaded + ingested + cancelled = 3.
-        assert_eq!(p1.done, 3, "uploaded/ingested/cancelled are done");
+        assert_eq!(p1.total, 7);
+        // done = uploaded + ingested + cancelled + duplicate = 4.
+        assert_eq!(p1.done, 4, "uploaded/ingested/cancelled/duplicate are done");
         // failed = rejected = 1.
         assert_eq!(p1.failed, 1, "rejected is failed, not done");
-        // in-flight remainder = pending + sending = 6 - 3 - 1 = 2.
+        // in-flight remainder = pending + sending = 7 - 4 - 1 = 2.
         assert_eq!(p1.total - p1.done - p1.failed, 2);
+        // The split the sender's progress line subtracts: 1 file, its 10 bytes.
+        assert_eq!(p1.duplicate, 1, "the duplicate row is counted inside done");
+        assert_eq!(p1.duplicate_bytes, 10, "and its byte_size is summed");
 
-        assert_eq!(counts.get(&2).unwrap().total, 1);
+        let p2 = counts.get(&2).unwrap();
+        assert_eq!(p2.total, 1);
+        assert_eq!((p2.duplicate, p2.duplicate_bytes), (0, 0));
         assert!(!counts.contains_key(&999), "an id with no rows is absent");
 
         // Empty id set → no query, empty map.
@@ -4229,13 +4256,16 @@ mod tests {
         ins("ingested.fits", "done", Some("ingested"));
         ins("failed.fits", "failed", None);
         ins("rejected.fits", "done", Some("rejected:bad hash"));
+        // An ingest-time duplicate (the file travelled, the catalog already had
+        // it): done, and reported in the shared `duplicate` columns.
+        ins("duplicate.fits", "done", Some("duplicate"));
 
         let counts = inbound_file_counts(&conn, &[1]).unwrap();
         let c = counts.get(&1).expect("parent present");
-        assert_eq!(c.total, 6);
+        assert_eq!(c.total, 7);
         assert_eq!(
-            c.done, 2,
-            "fetched + ingested — a rejected done is not done"
+            c.done, 3,
+            "fetched + ingested + duplicate — a rejected done is not done"
         );
         assert_eq!(c.failed, 2, "the failed row and the rejected-outcome row");
         assert_eq!(
@@ -4243,6 +4273,7 @@ mod tests {
             2,
             "announced + fetching remain in flight"
         );
+        assert_eq!((c.duplicate, c.duplicate_bytes), (1, 10));
     }
 
     /// D2 §3.4: `settle_unsettled_inbound_files` keys on `state <> 'done'`, so a

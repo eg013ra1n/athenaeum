@@ -217,11 +217,22 @@ function LiveRowBody({
 
   const totalFiles = row.fileCounts.total || row.fileCount;
   const doneFiles = row.fileCounts.done;
+  // Send-side dedup split (§D4): the peer's duplicates are settled `done` at
+  // negotiate and never travel, so a raw "done of total" over the full manifest
+  // reads 346 of 562 while the receiver — whose announce carries only the
+  // want-subset — reads 84 of 300. Subtract them (files AND bytes, so the bar
+  // and "X / Y" stop topping out at 53%) and say where the rest went. Outbound
+  // only: an inbound `duplicate` is an ingest verdict on a file that DID travel.
+  const alreadyOnPeer = row.kind === 'outbound' ? row.fileCounts.duplicate : 0;
+  const alreadyOnPeerBytes = row.kind === 'outbound' ? row.fileCounts.duplicateBytes : 0;
+  const travelFiles = Math.max(0, totalFiles - alreadyOnPeer);
+  const travelDone = Math.max(0, doneFiles - alreadyOnPeer);
+  const travelBytes = Math.max(0, row.byteSize - alreadyOnPeerBytes);
 
   const cap = row.kind === 'outbound' && !row.terminal;
-  const progress = stageProgress(row.displayState, row.bytesDone, row.byteSize, cap);
+  const progress = stageProgress(row.displayState, row.bytesDone, travelBytes, cap);
   const speedLabel = row.isTransferring ? formatSpeed(row.speedBps) : null;
-  const remaining = Math.max(0, row.byteSize - row.bytesDone);
+  const remaining = Math.max(0, travelBytes - row.bytesDone);
   const eta = row.isTransferring && remaining > 0 ? formatEta(remaining, row.speedBps) : null;
 
   // Progress-line shape (§problem 3): the detailed "N of M · X / Y" form is for
@@ -230,7 +241,7 @@ function LiveRowBody({
   // "0 B / …") shows the honest compact "M files · total" instead — no "0 of",
   // no "0 B /".
   const compactCounts = row.terminal || row.fileCounts.total === 0;
-  const displayCount = row.fileCounts.total || row.fileCount;
+  const displayCount = travelFiles;
 
   // Reason text is honest, not sticky: it shows only while a retry is genuinely
   // pending (`retrying`) or on a terminal failure/cancel — NEVER gated on the
@@ -352,16 +363,27 @@ function LiveRowBody({
             <span aria-hidden="true">·</span>
             {compactCounts ? (
               <span className="tabular-nums">
-                {displayCount} file{displayCount === 1 ? '' : 's'} · {formatBytes(row.byteSize)}
+                {displayCount} file{displayCount === 1 ? '' : 's'} · {formatBytes(travelBytes)}
               </span>
             ) : (
               <>
                 <span className="tabular-nums">
-                  {doneFiles} of {totalFiles} file{totalFiles === 1 ? '' : 's'}
+                  {travelDone} of {travelFiles} file{travelFiles === 1 ? '' : 's'}
                 </span>
                 <span aria-hidden="true">·</span>
                 <span className="tabular-nums">
-                  {formatBytes(row.bytesDone)} / {formatBytes(row.byteSize)}
+                  {formatBytes(row.bytesDone)} / {formatBytes(travelBytes)}
+                </span>
+              </>
+            )}
+            {alreadyOnPeer > 0 && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className="tabular-nums"
+                  title={`${formatBytes(alreadyOnPeerBytes)} the peer already had — never re-transferred`}
+                >
+                  {alreadyOnPeer} already on peer
                 </span>
               </>
             )}

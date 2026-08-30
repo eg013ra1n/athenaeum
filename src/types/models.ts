@@ -793,7 +793,17 @@ done: number,
 /**
  * Files that failed or were rejected by the peer.
  */
-failed: number, };
+failed: number, 
+/**
+ * Files the peer already held (`outcome = 'duplicate'`) — counted INSIDE
+ * `total` and `done`; see the struct doc for the send-side split.
+ */
+duplicate: number, 
+/**
+ * `byte_size` sum of the `duplicate` rows — subtract from the summary's
+ * manifest-total `byte_size` to get the bytes that actually travel.
+ */
+duplicateBytes: number, };
 
 export type OutboundSummary = { 
 /**

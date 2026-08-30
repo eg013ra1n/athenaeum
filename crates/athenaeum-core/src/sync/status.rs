@@ -22,6 +22,16 @@ use super::models::{InboundState, OutboundState};
 ///   starts with `rejected` (the receiver refused it).
 /// - **done** — a file that reached `done`/`uploaded` AND was not rejected
 ///   (a user-cancelled file counts as `done`: terminal, not an error).
+/// - **duplicate** — a file the peer already held (`outcome = 'duplicate'`), a
+///   SUBSET of `done` (and of `total`), never a sibling. On the send side these
+///   are the §D4 want-subset exclusions: settled `done` at negotiate, never
+///   transferred — so a raw "done of total" over the full manifest reads
+///   346 of 562 while the receiver, whose announce carries only the want
+///   subset, reads 84 of 300. The sender's progress line subtracts them (files
+///   AND bytes) and says where the rest went ("84 of 300 · 262 already on
+///   peer"). A receiver-ingest duplicate (travelled, then found in the catalog)
+///   lands here too once the ack settles it; inbound rows carry only that kind,
+///   and the receive-side UI ignores the field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferFileCounts {
@@ -32,6 +42,12 @@ pub struct TransferFileCounts {
     pub done: u32,
     /// Files that failed or were rejected by the peer.
     pub failed: u32,
+    /// Files the peer already held (`outcome = 'duplicate'`) — counted INSIDE
+    /// `total` and `done`; see the struct doc for the send-side split.
+    pub duplicate: u32,
+    /// `byte_size` sum of the `duplicate` rows — subtract from the summary's
+    /// manifest-total `byte_size` to get the bytes that actually travel.
+    pub duplicate_bytes: u64,
 }
 
 /// One in-flight outbound package for the Active tab (never a terminal row —

@@ -42,6 +42,28 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Sender counter subtracts the peer's duplicates (2026-08-30)
+
+`TransferFileCounts` grew `duplicate` / `duplicateBytes` (files settled
+`done`/`duplicate` at negotiate — the §D4 want-subset exclusion — plus ack-time
+ingest duplicates). The send-side row subtracts them from files AND bytes, so it
+counts what the receiver counts. Verified against the live sender DB for the
+LDN 1272 transfer (562 files, 262 already on the peer): the new `GROUP BY`
+returns `duplicate=262`, `duplicate_bytes=13.65 GB`; the confirmed sibling
+transfer reports its 8 ingest-time duplicates the same way. Not yet seen on a
+running build:
+
+- Re-send an object the peer partly holds: the Transfers row reads
+  `N of M files · X / Y · K already on peer` where `M` and `Y` match the
+  receiver's own `of M` and total; the progress bar reaches 95% at upload end,
+  not ~53%.
+- The sidebar Transfers panel shows the same `N of M`, with `K already on peer`
+  in the tooltip.
+- After confirm, the history row reads `M files · Y · K already on peer`; a fully
+  duplicate send reads `0 files · 0 B · K already on peer` next to the existing
+  "Peer already had every file" banner in the detail pane.
+- Received rows are unchanged (`80 of 300` stays `80 of 300`).
+
 ### Frame-set send (2026-08-28) — two-instance smoke
 
 Real object with a raw dark set, a master flat, and a few calibrated lights; second
@@ -361,5 +383,10 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 ## Release notes owed at the next tag
 
-(Paid in full by v0.5.4 on 2026-08-30; the v0.5.1–v0.5.3 lines before it were paid
-at their own tags.)
+(The v0.5.1–v0.5.4 lines were paid at their own tags.)
+
+- Transfers: the sender's progress line now counts only the files that actually
+  travel and says how many the receiver already had — "84 of 300 files · 262
+  already on peer" instead of "346 of 562" — so both sides of a transfer show the
+  same total and the progress bar no longer stalls at half when most of a set is
+  already there.

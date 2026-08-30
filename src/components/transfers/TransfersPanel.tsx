@@ -353,6 +353,11 @@ function ActiveTab({
         const chip = displayStateChip(row.displayState);
         const subline = displayStateSubline(row.displayState, 'outbound');
         const total = row.fileCounts.total || row.fileCount;
+        // Same §D4 split as the page row (`TransferRow`): count what travels,
+        // not the manifest — the peer's duplicates are settled `done` up front
+        // and would otherwise read as progress. Tooltip carries the remainder;
+        // the 10px line has no room for the suffix.
+        const dup = row.fileCounts.duplicate;
         return (
           <li key={`out-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
             <div className="min-w-0">
@@ -363,8 +368,11 @@ function ActiveTab({
                 <ArrowUp size={9} className="shrink-0 text-accent" />
                 <span className="truncate">{row.deviceName ?? row.peerShort}</span>
                 <span aria-hidden="true">·</span>
-                <span className="shrink-0 tabular-nums">
-                  {row.fileCounts.done} of {total}
+                <span
+                  className="shrink-0 tabular-nums"
+                  title={dup > 0 ? `${dup} already on peer` : undefined}
+                >
+                  {Math.max(0, row.fileCounts.done - dup)} of {Math.max(0, total - dup)}
                 </span>
               </p>
               {row.displayState === 'waiting' && (

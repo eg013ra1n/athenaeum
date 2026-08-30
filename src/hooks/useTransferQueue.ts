@@ -47,6 +47,7 @@ import type {
   SyncFinishedEvent,
   SyncProgressEvent,
   TerminalTransfers,
+  TransferFileCounts,
 } from '../types/models';
 
 /** Leading chars of a node-id hex, enough to disambiguate (mirrors useSyncStatus/TransfersPanel). */
@@ -133,8 +134,9 @@ export interface TransferRow {
   stalledUntil: string | null;
   /** Whether a retry is armed (`next_retry_at` set) — gates the error-reason line. NOT `attempts`. */
   retrying: boolean;
-  /** Per-file rollup for the "N of M files" progress line. */
-  fileCounts: { total: number; done: number; failed: number };
+  /** Per-file rollup for the "N of M files" progress line (the generated
+   *  shape — `duplicate`/`duplicateBytes` drive the send-side §D4 split). */
+  fileCounts: TransferFileCounts;
   fileCount: number;
   byteSize: number;
   bytesDone: number;
@@ -430,10 +432,16 @@ export function useTransferQueue(): UseTransferQueue {
                   deviceName: null,
                   displayState: outcome,
                   stalledUntil: null,
+                  // `okCount` is the receipt count — already the want-subset
+                  // (the §D4 duplicates were never announced, so the peer never
+                  // acks them), hence no split to record here. The durable row's
+                  // counts, which DO carry it, supersede on the next poll.
                   fileCounts: {
                     total: p.okCount + p.failed.length,
                     done: p.okCount,
                     failed: p.failed.length,
+                    duplicate: 0,
+                    duplicateBytes: 0,
                   },
                   retrying: false,
                   resendable: true,
@@ -722,7 +730,7 @@ export function useTransferQueue(): UseTransferQueue {
         retrying: false,
         // Manifest counts from the announce: N files, none done yet. Same shape a
         // real announced row reports, so the progress line doesn't change on handoff.
-        fileCounts: { total: q.frameCount, done: 0, failed: 0 },
+        fileCounts: { total: q.frameCount, done: 0, failed: 0, duplicate: 0, duplicateBytes: 0 },
         fileCount: q.frameCount,
         byteSize: q.byteSize,
         bytesDone: 0,
