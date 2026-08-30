@@ -42,6 +42,44 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Transfer preparation + single-copy footprint (2026-08-30)
+
+Spec `docs/superpowers/specs/2026-08-30-transfer-prepare-and-footprint-design.md`.
+
+- Send a ≥ 20 GB object from this Mac: the dialog closes in < 1 s, the row reads
+  `preparing · 300 files · X / Y · speed`, Cancel mid-way removes the row's dir,
+  a fresh send prepares while a second one waits in `preparing` at 0 B.
+- After confirm, `<packages>/<uuid>` is manifest-only and `blobs/` on the Mac
+  stays in the tens of MB (outboards only).
+- Receive on the pod (ext4): `du blobs/` drops to KB right after export, landed
+  files share inodes with `staging/` until confirm, storage card matches `du`.
+- Kill the app mid-preparation: on relaunch the row is `failed — preparation
+  interrupted`, its dir is gone.
+- Settings → Transfers: move both folders, restart, send + receive again;
+  Storage shows the leftovers in the old folder and Clean up frees them.
+- Perseus resend against the same receiver still lands (Copy path untouched).
+
+#### Follow-ups surfaced by review (not smokes)
+
+- The sidebar Transfers mini-row keeps the `queued` chip beside a moving byte
+  fraction for the whole serve-import (`indexing`) phase, while `/transfers`
+  shows the `preparing` chip and the "indexing" subline — the panel's
+  `displayState` comes from the polled `OutboundSummary`, which has no
+  `indexing` label. Spec §7.1 asks for the same chip in both places; one-line
+  fix, held for final-review triage.
+- `set_transfer_paths` has no "keep this one" value on the wire (`Option<String>`
+  means set-or-reset), so the UI resends the other folder's configured value and
+  the backend re-validates it (`create_dir_all` + write probe). An unreachable
+  working folder therefore blocks an outgoing-only change — with an honest
+  message, on the right card.
+- `fetch_collection_multi`'s Copy-export loop has no stale-target guard (Task 7
+  deferred it): a swarm retry into the same staging path could hit the self-copy
+  truncation if a collab package ever shares a hash with a push-path package now
+  referenced in place. The guard is `export_child`'s — delete the complete staged
+  children on every retry.
+- An `announced` row's bar sits at the 0.95 cap it inherited from the final
+  indexing byte count; speed and ETA are correctly suppressed there.
+
 ### Sender counter subtracts the peer's duplicates (2026-08-30)
 
 `TransferFileCounts` grew `duplicate` / `duplicateBytes` (files settled
@@ -390,3 +428,15 @@ cycle, so anything from them that matters later belongs here or in a plan.
   already on peer" instead of "346 of 562" — so both sides of a transfer show the
   same total and the progress bar no longer stalls at half when most of a set is
   already there.
+- Transfers: sending returns instantly — the transfer appears right away as a
+  *preparing* row with a live byte count, speed and a Cancel button while the
+  files are staged in the background, instead of the dialog hanging until every
+  file has been copied.
+- Transfers: a transfer now costs one copy of its files on each machine instead
+  of two — the sender serves the prepared package where it lies and the receiver
+  links the downloaded files into place — so a 20 GB send no longer needs 40 GB
+  of free space at either end.
+- Settings has a new Transfers tab: the outgoing staging folder and the incoming
+  working folder can each be pointed at any disk (with the upload limit,
+  receiving limit and storage figures moved there too), and whatever the previous
+  folders still hold can be cleaned up from the same page.
