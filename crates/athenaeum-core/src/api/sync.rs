@@ -193,6 +193,54 @@ pub(crate) fn sync_dirs(ctx: &ServiceContext) -> Result<SyncDirs, ApiError> {
     })
 }
 
+/// Validate (and create) a transfer folder the operator typed or picked
+/// (transfer-prepare spec §6.3). Order: absolute → create → canonicalize →
+/// `PathPolicy` → no scan-root overlap → write probe. Returns the normalized
+/// path to persist. `label` names the setting in messages.
+pub(crate) fn validate_transfer_dir(
+    conn: &rusqlite::Connection,
+    policy: &crate::api::PathPolicy,
+    raw: &str,
+    label: &str,
+) -> Result<PathBuf, ApiError> {
+    let raw = raw.trim();
+    let candidate = Path::new(raw);
+    if raw.is_empty() || !candidate.is_absolute() {
+        return Err(ApiError::Invalid(format!(
+            "{label}: enter an absolute path"
+        )));
+    }
+    std::fs::create_dir_all(candidate).map_err(|e| {
+        tracing::warn!(path = %candidate.display(), error = %e, "transfer folder create failed");
+        ApiError::Invalid(format!("{label}: cannot create folder: {e}"))
+    })?;
+    let path = crate::api::scan_roots::normalize_path(&candidate.canonicalize().map_err(|e| {
+        tracing::warn!(path = %candidate.display(), error = %e, "transfer folder resolve failed");
+        ApiError::Invalid(format!("{label}: cannot resolve folder: {e}"))
+    })?);
+    policy.check(&path)?;
+    crate::api::scan_roots::check_scan_root_overlap(conn, &path).map_err(|e| match e {
+        ApiError::Conflict(_) => {
+            tracing::warn!(path = %path.display(), error = %e, "transfer folder overlaps a scan root");
+            ApiError::Invalid(format!(
+                "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
+            ))
+        }
+        other => other,
+    })?;
+    let probe = path.join(".athenaeum-write-test");
+    if let Err(e) = std::fs::write(&probe, b"probe") {
+        tracing::warn!(path = %path.display(), error = %e, "transfer folder write probe failed");
+        return Err(ApiError::Invalid(format!(
+            "{label}: folder is not writable: {e}"
+        )));
+    }
+    if let Err(e) = std::fs::remove_file(&probe) {
+        tracing::warn!(path = %probe.display(), error = %e, "transfer folder probe cleanup failed");
+    }
+    Ok(path)
+}
+
 /// Build the receiver's live per-package landing resolver. It re-reads the
 /// designated `sync_incoming` scan root from the catalog on **every** package —
 /// so designating or clearing that root (task 4) takes effect on the next
@@ -9849,6 +9897,80 @@ mod tests {
             dirs.packages_dir,
             dirs.identity_dir.join("packages"),
             "blank = default"
+        );
+    }
+
+    #[test]
+    fn validate_transfer_dir_creates_and_returns_a_writable_dir() {
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let target = tmp.path().join("staging-new");
+        let got = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            target.to_str().unwrap(),
+            "Outgoing staging folder",
+        )
+        .unwrap();
+        assert!(got.is_dir(), "created on validation");
+        assert!(
+            !got.join(".athenaeum-write-test").exists(),
+            "probe file removed"
+        );
+    }
+
+    #[test]
+    fn validate_transfer_dir_rejects_relative_and_scan_root_overlap() {
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let err =
+            validate_transfer_dir(&conn, &crate::api::PathPolicy::AllowAll, "relative/x", "X")
+                .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "relative: {err:?}");
+
+        // A monitored root: inside it, equal to it, and containing it are all rejected.
+        let root = tmp.path().join("lights");
+        std::fs::create_dir_all(root.join("night1")).unwrap();
+        crate::db::upsert_scan_root(&conn, root.to_str().unwrap(), "normal").unwrap();
+        for candidate in [root.join("night1"), root.clone(), tmp.path().to_path_buf()] {
+            let err = validate_transfer_dir(
+                &conn,
+                &crate::api::PathPolicy::AllowAll,
+                candidate.to_str().unwrap(),
+                "X",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ApiError::Invalid(_) | ApiError::Conflict(_)),
+                "{}: {err:?}",
+                candidate.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_transfer_dir_rejects_a_dir_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let ro = tmp.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            ro.to_str().unwrap(),
+            "X",
+        )
+        .unwrap_err();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m.contains("not writable")),
+            "{err:?}"
         );
     }
 }
