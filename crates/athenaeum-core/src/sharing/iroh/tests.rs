@@ -2464,3 +2464,189 @@ async fn bind_with_keeps_identity_in_identity_dir_and_blobs_in_working_dir() {
     );
     node.shutdown().await;
 }
+
+/// Build a package under `root/pkg` from synthetic payloads written to
+/// `root/src`. Each payload is above the fs store's inline threshold (16 KiB),
+/// so the store must genuinely either copy the bytes in or reference them where
+/// they lie — which is what the import-mode tests below measure.
+fn write_test_package(root: &std::path::Path, files: &[(&str, usize)]) -> std::path::PathBuf {
+    use crate::package::{write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut records = Vec::new();
+    for (name, size) in files {
+        let p = src.join(name);
+        let bytes: Vec<u8> = (0..*size).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&p, &bytes).unwrap();
+        records.push((
+            p.clone(),
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("u-{name}"),
+                origin_catalog_uuid: format!("u-{name}"),
+                origin_device: "dev".into(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: name.to_string(),
+                byte_size: *size as u64,
+                xxh3: crate::package::xxh3_full_file(&p).unwrap(),
+                frame_meta: serde_json::json!({}),
+                analysis: None,
+                app_version: "test".into(),
+                project: None,
+            },
+        ));
+    }
+    let pkg = root.join("pkg");
+    write_package(&pkg, records).unwrap();
+    pkg
+}
+
+/// Does the blob store hold a file of exactly `size` bytes — i.e. a second copy
+/// of a payload? `TryReference` stores only the outboard (64 B per 16 KiB), so a
+/// referenced payload never shows up here.
+fn store_holds_payload_copy(blob_dir: &std::path::Path, size: u64) -> bool {
+    walkdir::WalkDir::new(blob_dir)
+        .into_iter()
+        .flatten()
+        .any(|e| e.file_type().is_file() && e.metadata().map(|m| m.len() == size).unwrap_or(false))
+}
+
+/// Transfer-prepare spec §4.1: an app-host serve imports the prepared package
+/// dir by REFERENCE — the store gains metadata (collection, hash-seq, outboards),
+/// not a second copy of every frame — and the mode never moves the hash, so the
+/// announced `root_hash` is identical either way. The want-subset import (the
+/// dedup-negotiated send) honors the same mode; it used to call `add_path`,
+/// i.e. an unconditional Copy on every subset send.
+#[tokio::test]
+async fn try_reference_import_yields_same_hash_and_no_store_copy() {
+    use crate::sharing::iroh::blobs::{
+        import_package_collection_with_mode, import_subset_collection,
+    };
+    use iroh_blobs::api::blobs::ImportMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = write_test_package(tmp.path(), &[("a.fits", 300_000), ("b.fits", 300_000)]);
+
+    let copy_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("copy"))
+        .await
+        .unwrap();
+    let ref_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("reference"))
+        .await
+        .unwrap();
+    let (h_copy, _) = import_package_collection_with_mode(&copy_store, &pkg, "t", ImportMode::Copy)
+        .await
+        .unwrap();
+    let (h_ref, _) =
+        import_package_collection_with_mode(&ref_store, &pkg, "t", ImportMode::TryReference)
+            .await
+            .unwrap();
+    assert_eq!(h_copy, h_ref, "mode never changes the collection hash");
+    assert!(store_holds_payload_copy(&tmp.path().join("copy"), 300_000));
+    assert!(
+        !store_holds_payload_copy(&tmp.path().join("reference"), 300_000),
+        "reference: no 300 000-byte file in the store"
+    );
+
+    // The want-subset import honors the mode too (it used to call add_path = Copy).
+    let sub_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("subset"))
+        .await
+        .unwrap();
+    let want: std::collections::HashSet<String> = ["a.fits".to_string()].into_iter().collect();
+    import_subset_collection(&sub_store, &pkg, &want, "t", ImportMode::TryReference)
+        .await
+        .unwrap();
+    assert!(!store_holds_payload_copy(
+        &tmp.path().join("subset"),
+        300_000
+    ));
+}
+
+/// Import a file by reference and return its temp tag — the one-liner the
+/// re-import test repeats.
+async fn add_by_reference(
+    store: &iroh_blobs::store::fs::FsStore,
+    path: &std::path::Path,
+) -> iroh_blobs::api::TempTag {
+    use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
+    store
+        .blobs()
+        .add_path_with_opts(AddPathOptions {
+            path: path.to_path_buf(),
+            format: iroh_blobs::BlobFormat::Raw,
+            mode: ImportMode::TryReference,
+        })
+        .temp_tag()
+        .await
+        .unwrap()
+}
+
+/// What re-importing a KNOWN hash from a new path actually does in iroh-blobs
+/// 0.103 — the lifecycle question `TryReference` hangs on (spec §4.2).
+///
+/// It does NOT re-point the entry. `finish_import_impl` builds
+/// `DataLocation::External(vec![new_path], size)`, but the meta actor
+/// (`handle_update` → `EntryState::union` → `DataLocation::union`) UNIONS it
+/// with what was there, then **sorts and dedups** the path list; every reader
+/// (`export_path_impl`, and `BaoFileStorage::open` when the in-memory handle has
+/// to be reloaded) takes `paths.first()`. So:
+///
+/// - re-importing the SAME path is idempotent (dedup) — the cancel/resend case;
+/// - re-importing a live path that sorts BEFORE a vanished one heals the entry;
+/// - a vanished path that sorts FIRST keeps losing, and the entry stays
+///   unreadable from disk until GC drops it.
+///
+/// The last bullet is a real exposure for repeat sends of the same bytes from
+/// two different `packages/<uuid>` dirs (and for the declined-divert rename);
+/// pinned here because the spec's §4.2 prose assumes a re-point. In-process it
+/// is masked — an import always leaves the handle holding the live file's
+/// descriptor — which is exactly why only a from-disk read exposes it.
+#[tokio::test]
+async fn reimport_of_a_known_hash_unions_external_paths_and_reads_the_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+    // The live path sorts FIRST: the entry heals, the blob reads back.
+    let healed = iroh_blobs::store::fs::FsStore::load(tmp.path().join("healed"))
+        .await
+        .unwrap();
+    let stale = tmp.path().join("z_stale.bin");
+    let live = tmp.path().join("a_live.bin");
+    std::fs::write(&stale, &bytes).unwrap();
+    let tag1 = add_by_reference(&healed, &stale).await;
+    std::fs::remove_file(&stale).unwrap();
+    std::fs::write(&live, &bytes).unwrap();
+    let tag2 = add_by_reference(&healed, &live).await;
+    assert_eq!(tag1.hash(), tag2.hash(), "path never moves the hash");
+    let out = tmp.path().join("out.bin");
+    healed.blobs().export(tag2.hash(), &out).await.unwrap();
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        bytes,
+        "read from the live path once it sorts first"
+    );
+
+    // Same bytes, same sequence, only the names swapped so the VANISHED path
+    // sorts first — the re-import does not displace it and the read fails.
+    let stuck = iroh_blobs::store::fs::FsStore::load(tmp.path().join("stuck"))
+        .await
+        .unwrap();
+    let stale2 = tmp.path().join("a_stale.bin");
+    let live2 = tmp.path().join("z_live.bin");
+    std::fs::write(&stale2, &bytes).unwrap();
+    let tag3 = add_by_reference(&stuck, &stale2).await;
+    std::fs::remove_file(&stale2).unwrap();
+    std::fs::write(&live2, &bytes).unwrap();
+    let tag4 = add_by_reference(&stuck, &live2).await;
+    assert_eq!(tag3.hash(), tag4.hash());
+    let out2 = tmp.path().join("out2.bin");
+    assert!(
+        stuck.blobs().export(tag4.hash(), &out2).await.is_err(),
+        "union, not re-point: the stale first path still wins the read"
+    );
+
+    // Re-importing the SAME path is idempotent — the resend-the-same-dir case.
+    let again = add_by_reference(&healed, &live).await;
+    assert_eq!(again.hash(), tag2.hash());
+    let out3 = tmp.path().join("out3.bin");
+    healed.blobs().export(tag2.hash(), &out3).await.unwrap();
+    assert_eq!(std::fs::read(&out3).unwrap(), bytes);
+}

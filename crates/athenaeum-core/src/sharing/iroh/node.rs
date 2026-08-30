@@ -2217,9 +2217,16 @@ impl SharedIrohNode {
                 }
             }
         }
+        // The host's import mode (spec §4.1): the app references its immutable
+        // `packages/<uuid>` in place, Perseus copies (its resend rewrites the same
+        // dir). Both import paths honor it — a dedup-narrowed subset send must not
+        // fall back to a copy.
+        let mode = self.serve_import_mode;
         let (hash, entries) = match want {
-            None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
-            Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
+            None => {
+                blobs::import_package_collection_with_mode(&self.store, src_dir, &tag, mode).await?
+            }
+            Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag, mode).await?,
         };
         self.served.lock().expect("served mutex poisoned").insert(
             tag.clone(),

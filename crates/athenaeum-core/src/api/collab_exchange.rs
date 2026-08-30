@@ -534,7 +534,7 @@ pub async fn ensure_collab_sender_engine(
     let db_path = crate::api::sync::sync_dirs(ctx)?.db_path;
 
     // The ONE shared iroh node (C1 fix): the collab sender is its `Collab` role
-    // handle, sharing the single endpoint + `<sync>/blobs` store with the
+    // handle, sharing the single endpoint + `<working>/blobs` store with the
     // receiver and the personal sender. Role-prefixed blob tags (Д3) keep the
     // three roles from clobbering each other's tags on the shared store — this
     // replaces the old dedicated `blobs_collab` `FsStore` (audit m7), which only

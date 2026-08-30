@@ -1134,10 +1134,26 @@ pub(crate) async fn ensure_iroh_node(
         &dirs.identity_dir,
         &dirs.working_dir,
         relay_mode,
-        // Task 5 flips this to `TryReference` (single-copy serve); until then the
-        // node keeps today's copy-into-the-store behavior.
+        // Single-copy serve (spec §4.2): the store references each payload where
+        // preparation wrote it instead of copying it in, so a send costs metadata
+        // (collection + outboards, ≈0.4 %) rather than a second copy of every
+        // frame. The invariant `TryReference` demands — the file never changes
+        // after import — is already the app's: `packages/<uuid>` is written once
+        // by preparation and touched again only by the post-confirm payload
+        // cleanup, which runs AFTER the tag release. Perseus keeps `Copy` (§4.3)
+        // — its resend rewrites payloads in place.
+        //
+        // Known limitation (pinned by
+        // `reimport_of_a_known_hash_unions_external_paths_and_reads_the_first`):
+        // re-importing a hash the store already knows from a DIFFERENT path does
+        // not re-point the entry — iroh-blobs unions the external paths, sorts
+        // them and reads `paths.first()`. Re-serving the same dir is idempotent
+        // (dedup), but the same bytes prepared under a second `packages/<uuid>`
+        // leave a stale sibling path that may sort first; from-disk reads of that
+        // entry then fail until GC drops it (an in-process import always leaves
+        // the live descriptor on the handle, which is what masks it today).
         NodeOptions {
-            serve_import_mode: ImportMode::Copy,
+            serve_import_mode: ImportMode::TryReference,
         },
     )
     .await
@@ -1162,7 +1178,9 @@ pub(crate) async fn ensure_iroh_node(
     // Unified store: the node binds at `<working>/blobs`. After the first
     // successful bind, the old per-role stores are dead weight — remove them so a
     // migrated install doesn't carry three parallel blob DBs (tolerate absence).
-    cleanup_orphan_blob_stores(&dirs.working_dir);
+    // They only ever existed under `<db dir>/sync`, i.e. the identity dir — a
+    // configurable working folder is newer than they are.
+    cleanup_orphan_blob_stores(&dirs.identity_dir);
     // Report THIS device's dialable endpoint address to the hub (finding H1, T7):
     // a fire-and-forget task that polls the node's address and PUTs it on change.
     // Only when signed in (a pure dev-ticket node has no hub to report to); never
@@ -1176,13 +1194,15 @@ pub(crate) async fn ensure_iroh_node(
 
 /// Delete the now-orphaned per-role blob-store directories left by the
 /// pre-Task-3 split transports (`blobs_out` for the personal sender,
-/// `blobs_collab` for the collab sender). The shared node's single store lives
-/// at `<working_dir>/blobs`, so these two siblings hold nothing live once every
-/// role rides the node. Best-effort: a missing dir is the common (fresh-install)
-/// case and is silent; any other error is logged, never fatal.
-fn cleanup_orphan_blob_stores(working_dir: &Path) {
+/// `blobs_collab` for the collab sender). They only ever lived beside the device
+/// key under `<db dir>/sync` — the identity dir — since both predate the
+/// configurable working folder; the shared node's single store lives at
+/// `<working_dir>/blobs`, so these two siblings hold nothing live once every role
+/// rides the node. Best-effort: a missing dir is the common (fresh-install) case
+/// and is silent; any other error is logged, never fatal.
+fn cleanup_orphan_blob_stores(identity_dir: &Path) {
     for name in ["blobs_out", "blobs_collab"] {
-        let dir = working_dir.join(name);
+        let dir = identity_dir.join(name);
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => tracing::info!(path = %dir.display(), "removed orphaned per-role blob store"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2759,7 +2779,7 @@ pub async fn ensure_sender_engine(
     let db_path = sync_dirs(ctx)?.db_path;
 
     // The ONE shared iroh node (C1 fix): the personal sender is its `Out` role
-    // handle, sharing the single endpoint + `<sync>/blobs` store with the
+    // handle, sharing the single endpoint + `<working>/blobs` store with the
     // receiver and the collab sender. Before this, each of these three bound its
     // OWN endpoint from the SAME device key over a separate store (`blobs` /
     // `blobs_out` / `blobs_collab`); a relay admits one connection per node id,

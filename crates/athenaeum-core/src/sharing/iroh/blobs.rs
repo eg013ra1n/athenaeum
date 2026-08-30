@@ -97,17 +97,21 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
 
 /// Import every file under `pkg_dir` into `store` and assemble them into a
 /// collection, COPYING each payload into the store ([`ImportMode::Copy`]) — the
-/// safe default for a dir the app may rebuild or mutate (a Perseus resend
-/// rewrites its payloads in place). Returns the collection [`Hash`] (the package
-/// `root_hash`) plus the ORDERED collection entries `(rel_path, byte_size)` — in
-/// the exact order [`Collection::from_iter`] stores them (the sorted-name walk
-/// order) — so the provider-upload-events consumer (Task 2.2) can attribute a
-/// served child to its entry by hash-seq index. Pins the collection under the
-/// deterministic `tag` name so it survives garbage collection and is serveable to
-/// peers — and so `release` can later delete it by that exact name.
+/// safe default for a dir whose payloads may be rewritten in place, which is
+/// exactly why Perseus keeps this mode (its resend rebuilds the same dir). The
+/// app passes `TryReference` at bind instead (transfer-prepare spec §4.1): its
+/// `packages/<uuid>` is an immutable snapshot. Returns the collection [`Hash`]
+/// (the package `root_hash`) plus the ORDERED collection entries
+/// `(rel_path, byte_size)` — in the exact order [`Collection::from_iter`] stores
+/// them (the sorted-name walk order) — so the provider-upload-events consumer
+/// (Task 2.2) can attribute a served child to its entry by hash-seq index. Pins
+/// the collection under the deterministic `tag` name so it survives garbage
+/// collection and is serveable to peers — and so `release` can later delete it by
+/// that exact name.
 ///
 /// [`import_package_collection_with_mode`] is the same import under a caller-
-/// chosen [`ImportMode`]; project seeding (D3) uses `TryReference` there.
+/// chosen [`ImportMode`]; project seeding (D3) and the app's serve use
+/// `TryReference` there.
 pub async fn import_package_collection(
     store: &Store,
     pkg_dir: &Path,
@@ -215,11 +219,19 @@ async fn store_and_tag_collection(
 /// `want` must be non-empty — an all-duplicate package is dropped before serve,
 /// never served empty; an empty (or manifest-matching-nothing) want is a caller
 /// error and returns `Err`.
+///
+/// `mode` applies to the payloads exactly as in
+/// [`import_package_collection_with_mode`] — the filtered manifest is always an
+/// in-memory blob, so only the payload imports can reference. Before
+/// transfer-prepare spec §4.1 this path hardcoded `add_path` (= `Copy`), so an
+/// app send that dedup narrowed to a subset silently paid a second copy of every
+/// wanted frame while the full-package path was already mode-aware.
 pub async fn import_subset_collection(
     store: &Store,
     pkg_dir: &Path,
     want: &HashSet<String>,
     tag: &str,
+    mode: ImportMode,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
     if want.is_empty() {
         anyhow::bail!(
@@ -292,7 +304,11 @@ pub async fn import_subset_collection(
                     .len();
                 let tt = store
                     .blobs()
-                    .add_path(&abs)
+                    .add_path_with_opts(AddPathOptions {
+                        path: abs.clone(),
+                        format: BlobFormat::Raw,
+                        mode,
+                    })
                     .temp_tag()
                     .await
                     .with_context(|| format!("import blob {}", abs.display()))?;
@@ -311,6 +327,7 @@ pub async fn import_subset_collection(
         count,
         want = kept.len(),
         root_hash = %hash,
+        reference = matches!(mode, ImportMode::TryReference),
         "package subset imported as collection"
     );
     Ok((hash, ordered))
