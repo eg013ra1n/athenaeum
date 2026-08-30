@@ -32,8 +32,11 @@ export function formatCountdown(deadlineIso: string, now: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-/** ETA from remaining bytes + smoothed speed. `∞` when nothing is moving
- *  (speed ≈ 0) — an honest "unestimable", never a fake number. */
+/** ETA from remaining bytes + the caller's MEDIAN rate over the recent window
+ *  (not the EMA that drives the speed label — one QUIC stream swings too far
+ *  minute to minute for a 3-sample ETA). `∞` when nothing is moving (rate
+ *  ≈ 0) — an honest "unestimable", never a fake number; callers with no
+ *  median yet pass nothing at all and hide the ETA instead. */
 export function formatEta(remainingBytes: number, speedBps: number | null): string {
   if (speedBps == null || !isFinite(speedBps) || speedBps <= 0) return '∞';
   const secs = remainingBytes / speedBps;

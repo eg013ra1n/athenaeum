@@ -63,22 +63,42 @@ function shortId(s: string): string {
 
 /** EMA smoothing factor tuned for "~3 samples" per the approved design. */
 const SPEED_EMA_ALPHA = 2 / (3 + 1);
+/** How many instantaneous-rate samples feed the ETA median. At the backend's
+ *  ~300 ms tick cadence this is roughly the last 15–40 s of transfer. */
+const SPEED_MEDIAN_WINDOW = 48;
+/** Below this many samples the median is meaningless; the ETA stays hidden. */
+const SPEED_MEDIAN_MIN_SAMPLES = 6;
 
 interface LiveBytes {
   bytesDone: number;
   bytesTotal: number;
-  /** Smoothed bytes/sec, `null` until at least two increasing samples arrive. */
+  /** Smoothed bytes/sec for the speed label (EMA, ~3 samples). */
   speedBps: number | null;
+  /** Median bytes/sec over the recent window — the ETA's basis. `null` until
+   *  `SPEED_MEDIAN_MIN_SAMPLES` increasing samples have arrived. */
+  etaBps: number | null;
 }
 
 interface SpeedTrackerEntry {
   lastTs: number;
   lastBytes: number;
   ema: number | null;
+  /** Ring of the last `SPEED_MEDIAN_WINDOW` instantaneous rates (bytes/sec). */
+  samples: number[];
+}
+
+/** Median of a non-empty array (copy + sort; the window is tiny). */
+function medianOf(samples: number[]): number {
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 /** Push one (time, bytes) sample into `store[key]`'s tracker and return the
- * live-bytes reading (merging the raw bytes with the freshly computed EMA). */
+ * live-bytes reading: the raw bytes, the freshly computed EMA (the speed label)
+ * and the median of the recent window (the ETA). The two differ on purpose — a
+ * single-stream QUIC transfer swings minute to minute, which the speed label
+ * SHOULD show and the ETA should not. */
 function trackBytes(
   store: Map<string, SpeedTrackerEntry>,
   key: string,
@@ -88,12 +108,16 @@ function trackBytes(
   const now = Date.now();
   const prev = store.get(key);
   let ema = prev?.ema ?? null;
+  const samples = prev?.samples ?? [];
   if (prev && bytesDone > prev.lastBytes && now > prev.lastTs) {
     const rate = ((bytesDone - prev.lastBytes) / (now - prev.lastTs)) * 1000;
     ema = ema == null ? rate : SPEED_EMA_ALPHA * rate + (1 - SPEED_EMA_ALPHA) * ema;
+    samples.push(rate);
+    if (samples.length > SPEED_MEDIAN_WINDOW) samples.splice(0, samples.length - SPEED_MEDIAN_WINDOW);
   }
-  store.set(key, { lastTs: now, lastBytes: bytesDone, ema });
-  return { bytesDone, bytesTotal, speedBps: ema };
+  store.set(key, { lastTs: now, lastBytes: bytesDone, ema, samples });
+  const etaBps = samples.length >= SPEED_MEDIAN_MIN_SAMPLES ? medianOf(samples) : null;
+  return { bytesDone, bytesTotal, speedBps: ema, etaBps };
 }
 
 export type TransferRowKind = 'outbound' | 'inbound';
@@ -170,6 +194,10 @@ export interface TransferRow {
    * cleared on `sync-finished`. Outbound-only; `null` for inbound/terminal rows. */
   liveStage: string | null;
   speedBps: number | null;
+  /** Median bytes/sec over the recent window — what the ETA divides by, kept
+   *  apart from the EMA `speedBps` that drives the speed label. `null` until
+   *  the window has enough samples, which HIDES the ETA (never an "∞"). */
+  etaBps: number | null;
   isTransferring: boolean;
   /** Bumped on every `sync-finished` for this package — a selected/expanded row
    * watches this to know its cached `list_transfer_files` detail needs a re-fetch. */
@@ -550,6 +578,10 @@ export function useTransferQueue(): UseTransferQueue {
           s.state === 'transferring' || s.state === 'preparing' || indexingNow
             ? (live?.speedBps ?? null)
             : null,
+        etaBps:
+          s.state === 'transferring' || s.state === 'preparing' || indexingNow
+            ? (live?.etaBps ?? null)
+            : null,
         isTransferring: s.state === 'transferring' || s.state === 'preparing' || indexingNow,
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
@@ -602,6 +634,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: summary.resendable,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`out:${summary.id}`) ?? 0,
       });
@@ -646,6 +679,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: s.resendable,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
@@ -684,6 +718,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: false,
         liveStage: null,
         speedBps: s.state === 'fetching' ? (live?.speedBps ?? null) : null,
+        etaBps: s.state === 'fetching' ? (live?.etaBps ?? null) : null,
         isTransferring: s.state === 'fetching',
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
@@ -724,6 +759,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: false,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
@@ -791,6 +827,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: false,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: 0,
       });

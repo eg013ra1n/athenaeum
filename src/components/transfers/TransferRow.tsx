@@ -236,7 +236,12 @@ function LiveRowBody({
   const progress = stageProgress(row.displayState, row.bytesDone, travelBytes, cap);
   const speedLabel = row.isTransferring ? formatSpeed(row.speedBps) : null;
   const remaining = Math.max(0, travelBytes - row.bytesDone);
-  const eta = row.isTransferring && remaining > 0 ? formatEta(remaining, row.speedBps) : null;
+  // ETA from the median (robust to the minute-scale swings of one QUIC stream);
+  // hidden until the window has enough samples — never an "∞" or a wild first guess.
+  const eta =
+    row.isTransferring && remaining > 0 && row.etaBps != null
+      ? formatEta(remaining, row.etaBps)
+      : null;
 
   // Progress-line shape (§problem 3): the detailed "N of M · X / Y" form is for
   // an ACTIVE row with real per-file counts. A legacy batch (no per-file rows) OR
