@@ -95,6 +95,91 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
     Ok(out)
 }
 
+/// Read one byte of `hash` back out of the store — the ONLY call that notices a
+/// dead external path. `has`/`status` answer from the metadata row and happily
+/// report `Complete` for an entry whose file is gone; a range read is what opens
+/// the file. One byte, no temp file, no full read.
+async fn probe_first_byte(store: &Store, hash: Hash) -> Result<()> {
+    store
+        .blobs()
+        .export_ranges(hash, 0..1u64)
+        .concatenate()
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("read first byte of {hash}: {e}"))
+}
+
+/// Guarantee the just-imported child is actually readable, repairing it if not.
+///
+/// A `TryReference` import of a hash the store ALREADY holds does not re-point
+/// the entry: iroh-blobs 0.103 UNIONS the external path list, sorts it and reads
+/// `paths.first()` (`store/fs/entry_state.rs:44`, via `meta.rs::handle_update`).
+/// So a path that has since been deleted — the previous send's
+/// `packages/<uuid>` — keeps winning the read while a live tag pins the entry
+/// against GC. Probing one byte detects it (in-process too: the failure is
+/// immediate, not restart-only); re-importing the same file with `Copy` repairs
+/// it for good, because `Owned` beats `External` in that union from BOTH sides
+/// (`entry_state.rs:58`/`:63`) — the store then owns the bytes and no path list
+/// survives.
+///
+/// Costs one byte per child on the happy path. `Copy` mode needs no probe (it
+/// never produces an external entry), and a zero-byte payload has no byte to
+/// read — both return the original tag untouched.
+async fn ensure_child_readable(
+    store: &Store,
+    abs: &Path,
+    hash: Hash,
+    size: u64,
+    mode: ImportMode,
+    tt: TempTag,
+) -> Result<TempTag> {
+    if !matches!(mode, ImportMode::TryReference) || size == 0 {
+        return Ok(tt);
+    }
+    if probe_first_byte(store, hash).await.is_ok() {
+        return Ok(tt);
+    }
+    tracing::warn!(
+        hash = %hash,
+        path = %abs.display(),
+        "reference import reads a dead path; copying instead"
+    );
+    let copied = store
+        .blobs()
+        .add_path_with_opts(AddPathOptions {
+            path: abs.to_path_buf(),
+            format: BlobFormat::Raw,
+            mode: ImportMode::Copy,
+        })
+        .temp_tag()
+        .await
+        .with_context(|| format!("copy-import blob {}", abs.display()))?;
+    if copied.hash() != hash {
+        tracing::error!(
+            hash = %hash,
+            copied_hash = %copied.hash(),
+            path = %abs.display(),
+            "file changed between the reference and copy imports"
+        );
+        anyhow::bail!(
+            "{} changed between the reference and copy imports ({} → {})",
+            abs.display(),
+            hash,
+            copied.hash()
+        );
+    }
+    if let Err(e) = probe_first_byte(store, hash).await {
+        tracing::error!(
+            hash = %hash,
+            path = %abs.display(),
+            error = %e,
+            "copy re-import did not make the blob readable"
+        );
+        return Err(e.context(format!("repair blob {}", abs.display())));
+    }
+    Ok(copied)
+}
+
 /// Import every file under `pkg_dir` into `store` and assemble them into a
 /// collection, COPYING each payload into the store ([`ImportMode::Copy`]) — the
 /// safe default for a dir whose payloads may be rewritten in place, which is
@@ -159,7 +244,10 @@ pub async fn import_package_collection_with_mode(
             .temp_tag()
             .await
             .with_context(|| format!("import blob {}", f.abs.display()))?;
-        items.push((f.name.clone(), tt.hash()));
+        let hash = tt.hash();
+        // A referenced child must be readable before we hand its hash to a peer.
+        let tt = ensure_child_readable(store, &f.abs, hash, f.len, mode, tt).await?;
+        items.push((f.name.clone(), hash));
         entries.push((f.name.clone(), f.len));
         child_tags.push(tt);
     }
@@ -312,6 +400,10 @@ pub async fn import_subset_collection(
                     .temp_tag()
                     .await
                     .with_context(|| format!("import blob {}", abs.display()))?;
+                // Same guard as the full-package path: a referenced child must be
+                // readable before its hash goes into the served collection.
+                let hash = tt.hash();
+                let tt = ensure_child_readable(store, &abs, hash, size, mode, tt).await?;
                 (tt, size)
             }
         };

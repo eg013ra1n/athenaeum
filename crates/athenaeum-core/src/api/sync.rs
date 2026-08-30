@@ -1143,15 +1143,17 @@ pub(crate) async fn ensure_iroh_node(
         // cleanup, which runs AFTER the tag release. Perseus keeps `Copy` (§4.3)
         // — its resend rewrites payloads in place.
         //
-        // Known limitation (pinned by
-        // `reimport_of_a_known_hash_unions_external_paths_and_reads_the_first`):
-        // re-importing a hash the store already knows from a DIFFERENT path does
+        // Re-importing a hash the store already knows from a DIFFERENT path does
         // not re-point the entry — iroh-blobs unions the external paths, sorts
-        // them and reads `paths.first()`. Re-serving the same dir is idempotent
-        // (dedup), but the same bytes prepared under a second `packages/<uuid>`
-        // leave a stale sibling path that may sort first; from-disk reads of that
-        // entry then fail until GC drops it (an in-process import always leaves
-        // the live descriptor on the handle, which is what masks it today).
+        // them and reads `paths.first()`, so the same bytes prepared under a
+        // second `packages/<uuid>` can leave a stale sibling path winning the
+        // read (re-serving the SAME dir is idempotent — the union dedups).
+        // `blobs::ensure_child_readable` closes that: every referenced child is
+        // probed for one byte after import and re-imported with `Copy` if the
+        // read fails, which repairs the entry for good (`Owned` beats `External`
+        // in the union). Pinned by
+        // `reimport_of_a_known_hash_unions_external_paths_and_reads_the_first`
+        // and `dead_first_external_path_is_repaired_by_a_copy_reimport`.
         NodeOptions {
             serve_import_mode: ImportMode::TryReference,
         },

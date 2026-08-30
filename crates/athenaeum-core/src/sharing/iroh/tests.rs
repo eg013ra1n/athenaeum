@@ -2650,3 +2650,82 @@ async fn reimport_of_a_known_hash_unions_external_paths_and_reads_the_first() {
     healed.blobs().export(tag2.hash(), &out3).await.unwrap();
     assert_eq!(std::fs::read(&out3).unwrap(), bytes);
 }
+
+/// The mitigation for the union semantics pinned above: after a `TryReference`
+/// import the app probes one byte per child, and a child that reads a DEAD path
+/// is re-imported with `Copy` — `Owned` wins the union, so the entry is repaired
+/// permanently instead of staying unreadable until GC.
+///
+/// Both directions are asserted, because the probe (not an unconditional copy)
+/// is what gates the repair: with the stale path sorting FIRST the store ends up
+/// holding an owned copy and reads survive deleting every source file; with the
+/// stale path sorting LAST nothing is copied and reads work as they always did.
+#[tokio::test]
+async fn dead_first_external_path_is_repaired_by_a_copy_reimport() {
+    use crate::sharing::iroh::blobs::import_package_collection_with_mode;
+    use iroh_blobs::api::blobs::ImportMode;
+    use iroh_blobs::store::fs::FsStore;
+
+    const SIZE: usize = 300_000;
+    // Byte-for-byte what `write_test_package` writes, so the stale file and the
+    // package payload are the same blob.
+    let payload: Vec<u8> = (0..SIZE).map(|i| (i % 253) as u8).collect();
+
+    async fn readable(store: &FsStore, hash: Hash) -> bool {
+        store
+            .blobs()
+            .export_ranges(hash, 0..1u64)
+            .concatenate()
+            .await
+            .is_ok()
+    }
+
+    // --- stale path sorts FIRST ("aaa_stale.bin" < "pkg/a.fits") → repair runs.
+    let tmp = tempdir().unwrap();
+    let pkg = write_test_package(tmp.path(), &[("a.fits", SIZE)]);
+    let store_dir = tmp.path().join("store");
+    let store = FsStore::load(&store_dir).await.unwrap();
+    let stale = tmp.path().join("aaa_stale.bin");
+    std::fs::write(&stale, &payload).unwrap();
+    let hash = add_by_reference(&store, &stale).await.hash();
+    std::fs::remove_file(&stale).unwrap();
+    assert!(
+        !readable(&store, hash).await,
+        "precondition: the entry reads the now-deleted first path"
+    );
+
+    import_package_collection_with_mode(&store, &pkg, "t", ImportMode::TryReference)
+        .await
+        .unwrap();
+    assert!(
+        store_holds_payload_copy(&store_dir, SIZE as u64),
+        "a dead first path is repaired by copying the payload into the store"
+    );
+    std::fs::remove_file(pkg.join("a.fits")).unwrap();
+    assert!(
+        readable(&store, hash).await,
+        "owned after the repair: readable with no source file left on disk"
+    );
+
+    // --- stale path sorts LAST ("pkg/a.fits" < "zzz_stale.bin") → no repair.
+    let tmp2 = tempdir().unwrap();
+    let pkg2 = write_test_package(tmp2.path(), &[("a.fits", SIZE)]);
+    let store_dir2 = tmp2.path().join("store");
+    let store2 = FsStore::load(&store_dir2).await.unwrap();
+    let stale2 = tmp2.path().join("zzz_stale.bin");
+    std::fs::write(&stale2, &payload).unwrap();
+    let hash2 = add_by_reference(&store2, &stale2).await.hash();
+    std::fs::remove_file(&stale2).unwrap();
+
+    import_package_collection_with_mode(&store2, &pkg2, "t", ImportMode::TryReference)
+        .await
+        .unwrap();
+    assert!(
+        !store_holds_payload_copy(&store_dir2, SIZE as u64),
+        "a healthy probe takes no copy — the probe is the gate, not the mode"
+    );
+    assert!(
+        readable(&store2, hash2).await,
+        "still served from the live package path"
+    );
+}

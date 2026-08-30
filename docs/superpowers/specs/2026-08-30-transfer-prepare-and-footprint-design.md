@@ -74,9 +74,17 @@ Facts verified in code on 2026-08-30 (iroh-blobs 0.103.0, iroh 1.0.3):
   the inline threshold is opened only to compute the outboard; the entry's
   `data_location` becomes `External(vec![path])`. No same-filesystem
   requirement (it is a path reference, not a hardlink). `finish_import_impl`
-  builds the location from THIS import only and `update_await`s it — so a
-  re-import of an already-known hash from a new path **re-points** the entry
-  to the new path.
+  builds the location from THIS import only, but `update_await` goes through
+  `meta.rs::handle_update` → `EntryState::union`, which **unions** the external
+  path list, sorts it and dedups it (`store/fs/entry_state.rs:44`); every reader
+  takes `paths.first()`. So a re-import of an already-known hash from a new path
+  does **not** re-point the entry: re-importing the SAME path is idempotent, but
+  a stale path that sorts first keeps winning the read while a live tag pins the
+  entry against GC. `Owned` beats `External` from both sides of that union
+  (`entry_state.rs:58`/`:63`), so a `Copy` re-import repairs such an entry
+  permanently — which is what §4.2's probe does. `has`/`status` answer from the
+  metadata row and do not notice; only a read (one byte via `export_ranges`)
+  does.
 - **iroh `ExportMode::TryReference`** (`store/fs.rs:1284`): if the entry is
   store-owned, `rename` to the target (EXDEV → `reflink_or_copy` fallback) and
   the entry becomes `External([target])`; "setting the new entry state will
@@ -254,13 +262,20 @@ touched again only by `cleanup_package_payloads` (delete) after confirm. Order
 on confirm is unchanged: `transport.release` (tag delete) → payload cleanup.
 Between cleanup and the next GC pass the store may hold entries whose external
 path is gone; nothing reads them (a manifest-only dir fails
-`package_has_payload`, so it can never be re-served), and a later import of
-the same hash from a live path re-points the entry (§2). Cancel keeps the
-payload (as today) — resend re-serves the same dir, same bytes.
+`package_has_payload`, so it can never be re-served). A later import of the
+same hash from a live path does NOT re-point such an entry — iroh unions the
+external paths and reads the first one (§2) — so the import instead **probes
+each referenced child for one byte and, on a failed read, re-imports that one
+file with `Copy`** (`blobs::ensure_child_readable`): `Owned` wins the union, so
+the entry is repaired permanently and the cost is one copy of the affected
+file, not of the package. `warn!` on repair, `error!` if it still fails. Cancel
+keeps the payload (as today) — resend re-serves the same dir, same bytes, and
+the union dedups the identical path.
 
 Declined-divert (`resend_declined_as_new_transfer`) renames the payload dir to
 a new uuid: the old row is terminal (tag released on decline), the new row
-imports from the new path. No change.
+imports from the new path — the stale sibling path is exactly the case the
+probe repairs.
 
 ### 4.3 Perseus
 
