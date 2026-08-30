@@ -1235,15 +1235,17 @@ pub async fn publish_collab_frames(
     }
 
     // ── 2. Mint the HUB package uuid FIRST; stamp each artifact into staging ──
-    let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx)?;
-    let own_node = DeviceKey::load_or_create(&device_key_path(&sync_dir))
+    let dirs = crate::api::sync::sync_dirs(ctx)?;
+    // The key is IDENTITY (identity dir); `collab_pub` is DATA (working dir).
+    let own_node = DeviceKey::load_or_create(&device_key_path(&dirs.identity_dir))
         .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
         .node_id();
     let own_device = crate::sync::node_id_hex(&own_node);
 
     let hub_package_id = uuid::Uuid::new_v4().to_string();
-    let pub_dir = sync_dir.join("collab_pub").join(&hub_package_id);
-    let staging = sync_dir
+    let pub_dir = dirs.working_dir.join("collab_pub").join(&hub_package_id);
+    let staging = dirs
+        .working_dir
         .join("collab_pub")
         .join(format!("{hub_package_id}.staging"));
     std::fs::create_dir_all(&staging).map_err(|e| {

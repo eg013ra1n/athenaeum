@@ -78,8 +78,10 @@ fn resolve_config(ctx: &ServiceContext) -> Result<AccountConfig, ApiError> {
     Ok(AccountConfig {
         hub_host: hub_host(&hub_url),
         hub_url,
-        // The device key MUST be the transport's key — same `<db_parent>/sync`
-        // dir the receiver uses (`api::sync::sync_paths`), one identity.
+        // The device key MUST be the transport's key — the same `<db_parent>/sync`
+        // identity dir the node binds under (`api::sync::sync_dirs`'s
+        // `identity_dir`, which never follows the configurable transfer folders),
+        // one identity.
         sync_dir: parent.join("sync"),
         account_dir: parent.join("account"),
     })

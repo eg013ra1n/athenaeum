@@ -892,26 +892,76 @@ pub struct SharedIrohNode {
     /// every role handle, every peer, every concurrent GET — and a limit change
     /// lands on the next chunk without a rebind.
     upload_pacer: Arc<UploadPacer>,
+    /// The data dir this node was bound at — blob store, and the root every
+    /// host-side data path hangs off (transfer-prepare spec §4.1). Equal to the
+    /// identity dir for the single-dir [`bind`](Self::bind).
+    working_dir: PathBuf,
+    /// How [`serve`](SharingTransport::serve) imports a package dir into the blob
+    /// store; chosen by the host at bind, see [`NodeOptions`].
+    serve_import_mode: ImportMode,
+}
+
+/// Host-chosen node behavior (transfer-prepare spec §4.1).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeOptions {
+    /// How `serve` imports a package dir into the blob store. `TryReference`
+    /// (the app: `packages/<uuid>` is an immutable snapshot) references the
+    /// payload in place and stores only the outboard; `Copy` (Perseus: a resend
+    /// rewrites its payloads in place) copies it into the store.
+    pub serve_import_mode: ImportMode,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self {
+            serve_import_mode: ImportMode::Copy,
+        }
+    }
 }
 
 impl SharedIrohNode {
-    /// Bind the ONE endpoint for this process from the install's device key.
+    /// Single-dir bind: identity and data under the same `sync_dir`, `Copy`
+    /// imports — Perseus and every existing test keep this shape.
+    pub async fn bind(sync_dir: &Path, relay_mode: RelayMode) -> Result<Arc<Self>> {
+        Self::bind_with(sync_dir, sync_dir, relay_mode, NodeOptions::default()).await
+    }
+
+    /// The data dir this node bound at (its blob store's parent).
+    pub fn working_dir(&self) -> &Path {
+        &self.working_dir
+    }
+
+    /// The import mode [`serve`](SharingTransport::serve) uses for package dirs.
+    pub fn serve_import_mode(&self) -> ImportMode {
+        self.serve_import_mode
+    }
+
+    /// Bind the ONE endpoint for this process from the install's device key,
+    /// with the IDENTITY and the DATA dirs split (transfer-prepare spec §4.1):
+    /// the device key + its advisory-lock sidecar live under `identity_dir` and
+    /// never move, while the blob store follows `working_dir` — so relocating
+    /// the transfer working folder relocates bytes, never the identity.
     ///
     /// Takes the device-key advisory lock (fail ⇒ actionable, key-material-free
     /// error, I4/S2); builds the endpoint (`presets::Minimal` + secret +
     /// `relay_mode` + [`MemoryLookup`](iroh::address_lookup::memory::MemoryLookup));
-    /// opens the single [`FsStore`] at `<sync_dir>/blobs` (GC enabled once);
+    /// opens the single [`FsStore`] at `<working_dir>/blobs` (GC enabled once);
     /// mounts the [`Router`] with both ALPNs once; spawns the home-relay-status
     /// watcher. `relay_mode` is [`RelayMode::Default`] for production or
     /// [`RelayMode::Disabled`] for direct-only / in-process tests.
-    pub async fn bind(sync_dir: &Path, relay_mode: RelayMode) -> Result<Arc<Self>> {
+    pub async fn bind_with(
+        identity_dir: &Path,
+        working_dir: &Path,
+        relay_mode: RelayMode,
+        opts: NodeOptions,
+    ) -> Result<Arc<Self>> {
         // The one device identity (task B4): the endpoint binds this secret and
         // the advisory lock is on the `device_key.lock` sidecar (NOT the key
         // file — a mandatory Windows lock there blocks account sign-in, os
         // error 33), so a second install started from a copied key fails here
         // instead of dueling on the relay (I4).
-        let key = DeviceKey::load_or_create_in(sync_dir).context("load device key")?;
-        let key_lock = DeviceKeyLock::acquire(&device_key_lock_path(sync_dir))?;
+        let key = DeviceKey::load_or_create_in(identity_dir).context("load device key")?;
+        let key_lock = DeviceKeyLock::acquire(&device_key_lock_path(identity_dir))?;
 
         let demux = EventDemux::new();
         let secret_key = SecretKey::from_bytes(&key.secret_bytes());
@@ -947,11 +997,11 @@ impl SharedIrohNode {
             "shared iroh node relay configuration"
         );
 
-        // One `FsStore` at `<sync_dir>/blobs` for all roles (spec §2). Mirror
+        // One `FsStore` at `<working_dir>/blobs` for all roles (spec §2). Mirror
         // `FsStore::load`'s internals but with GC on (load() hardcodes gc: None,
         // so released blobs would leak forever). Interval is slack (see
         // `GC_INTERVAL`) so an in-flight transfer never races collection.
-        let blob_dir = sync_dir.join("blobs");
+        let blob_dir = working_dir.join("blobs");
         std::fs::create_dir_all(&blob_dir)
             .with_context(|| format!("create blob dir {}", blob_dir.display()))?;
         let db_path = blob_dir.join("blobs.db");
@@ -1076,6 +1126,8 @@ impl SharedIrohNode {
             counters_at_bind,
             presence,
             upload_pacer,
+            working_dir: working_dir.to_path_buf(),
+            serve_import_mode: opts.serve_import_mode,
         }))
     }
 

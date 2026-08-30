@@ -52,7 +52,7 @@ use crate::sharing::{
 };
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
-use super::node::{Role, SharedIrohNode};
+use super::node::{NodeOptions, Role, SharedIrohNode};
 use super::{random_secret, BlobStore, IrohTransport};
 
 /// A [`FetchSink`] that appends every event into a shared vec, plus the vec so a
@@ -2426,4 +2426,41 @@ async fn multi_fetch_with_all_dead_providers_fails_cleanly() {
     );
 
     c.shutdown().await;
+}
+
+/// Transfer-prepare spec §4.1: the two-dir bind keeps the device IDENTITY under
+/// `identity_dir` (the key and its advisory-lock sidecar never move, so a
+/// relocated working folder can never mint a second identity) while every byte
+/// of data — the blob store here — follows `working_dir`.
+#[tokio::test]
+async fn bind_with_keeps_identity_in_identity_dir_and_blobs_in_working_dir() {
+    let tmp = tempdir().unwrap();
+    let identity = tmp.path().join("identity");
+    let working = tmp.path().join("working");
+    let node = SharedIrohNode::bind_with(
+        &identity,
+        &working,
+        RelayMode::Disabled,
+        NodeOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        identity.join("device_key").is_file(),
+        "key under identity dir"
+    );
+    assert!(
+        !working.join("device_key").exists(),
+        "no key under working dir"
+    );
+    assert!(
+        working.join("blobs").join("blobs.db").is_file(),
+        "store under working dir"
+    );
+    assert_eq!(node.working_dir(), working.as_path());
+    assert_eq!(
+        node.serve_import_mode(),
+        iroh_blobs::api::blobs::ImportMode::Copy
+    );
+    node.shutdown().await;
 }

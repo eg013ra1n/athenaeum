@@ -3689,21 +3689,22 @@ impl SyncRuntime {
         });
     }
 
-    /// Lazily build the iroh transport under `sync_dir`, spawn one receiver that
-    /// ingests into the catalog at `db_path`, and return the pairing ticket.
-    /// Idempotent — a second call returns the existing ticket without starting a
-    /// second transport.
+    /// Lazily build the iroh transport under `working_dir` — the data dir: blob
+    /// store, staging, collab (the device identity lives elsewhere, see
+    /// [`crate::api::sync::SyncDirs`]) — spawn one receiver that ingests into the
+    /// catalog at `db_path`, and return the pairing ticket. Idempotent — a second
+    /// call returns the existing ticket without starting a second transport.
     ///
     /// The `node` is the process-wide [`SharedIrohNode`] (bound by
     /// [`crate::api::sync::ensure_iroh_node`], which resolves the relay mode once):
     /// the receiver rides it as its `Recv` role handle, sharing the single
-    /// endpoint + `<sync>/blobs` store with the personal + collab senders (C1
+    /// endpoint + `<working>/blobs` store with the personal + collab senders (C1
     /// fix). This method installs the dedup responder + connect gate on that
     /// shared node and spawns one receiver over its `Recv` handle.
     pub async fn ensure_started(
         &self,
         node: Arc<SharedIrohNode>,
-        sync_dir: PathBuf,
+        working_dir: PathBuf,
         db_path: PathBuf,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
@@ -3715,11 +3716,11 @@ impl SyncRuntime {
             return Ok(started.ticket.clone());
         }
 
-        std::fs::create_dir_all(&sync_dir)
-            .with_context(|| format!("create sync dir {}", sync_dir.display()))?;
+        std::fs::create_dir_all(&working_dir)
+            .with_context(|| format!("create sync working dir {}", working_dir.display()))?;
         // Remember what this run actually bound under: a later settings change
         // only takes effect on the next start, and the UI says so (spec §6.4).
-        self.set_bound_working_dir(sync_dir.clone()).await;
+        self.set_bound_working_dir(working_dir.clone()).await;
         let store = Arc::new(
             CatalogSyncStore::open(&db_path)
                 .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
@@ -3754,11 +3755,11 @@ impl SyncRuntime {
         // operator's number, not at the default until someone re-saves the setting.
         apply_receive_limit(&control, hooks.max_concurrent_receives);
 
-        // Staging lives under the sync dir; the landing root is resolved live per
-        // package by the caller-supplied resolver (task 5).
+        // Staging lives under the working dir; the landing root is resolved live
+        // per package by the caller-supplied resolver (task 5).
         let (info, receiver) = SyncReceiver::spawn(
             store,
-            sync_dir.clone(),
+            working_dir.clone(),
             incoming,
             authorized,
             ProjectReceiveHooks {

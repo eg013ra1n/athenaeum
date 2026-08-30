@@ -130,8 +130,8 @@ fn wire_hub(ctx: &ServiceContext, uri: &str, token: &str) {
 /// This device's node id for `ctx`'s sync dir (the identity the download role
 /// guard / publish own-name resolve against the cached snapshot).
 fn own_node_for(ctx: &ServiceContext) -> NodeId {
-    let (sync_dir, _) = crate::api::sync::sync_paths(ctx).unwrap();
-    DeviceKey::load_or_create(&device_key_path(&sync_dir))
+    let identity_dir = crate::api::sync::sync_dirs(ctx).unwrap().identity_dir;
+    DeviceKey::load_or_create(&device_key_path(&identity_dir))
         .unwrap()
         .node_id()
 }
@@ -461,9 +461,17 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     let coord_ctx = Arc::new(coord_ctx);
     let (proc_tmp, proc_ctx) = test_ctx();
 
-    let (contrib_sync_dir, _) = crate::api::sync::sync_paths(&contrib_ctx).unwrap();
-    let (coord_sync_dir, coord_db_path) = crate::api::sync::sync_paths(&coord_ctx).unwrap();
-    let (proc_sync_dir, proc_db_path) = crate::api::sync::sync_paths(&proc_ctx).unwrap();
+    let contrib_sync_dir = crate::api::sync::sync_dirs(&contrib_ctx)
+        .unwrap()
+        .working_dir;
+    let (coord_sync_dir, coord_db_path) = {
+        let d = crate::api::sync::sync_dirs(&coord_ctx).unwrap();
+        (d.working_dir, d.db_path)
+    };
+    let (proc_sync_dir, proc_db_path) = {
+        let d = crate::api::sync::sync_dirs(&proc_ctx).unwrap();
+        (d.working_dir, d.db_path)
+    };
 
     let contrib_device = own_node_for(&contrib_ctx);
     let proc_device = own_node_for(&proc_ctx);

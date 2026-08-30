@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use iroh_blobs::api::blobs::ImportMode;
 use serde::{Deserialize, Serialize};
 
 use crate::api::frame_set_send::PayloadEntry;
@@ -36,7 +37,7 @@ use crate::export::models::ExportMode;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
-use crate::sharing::iroh::node::{RelayResolver, Role, SharedIrohNode};
+use crate::sharing::iroh::node::{NodeOptions, RelayResolver, Role, SharedIrohNode};
 use crate::sharing::types::{NodeId, PackageLayout};
 use crate::sharing::SharingTransport;
 use crate::sync::engine::SERVE_ACTIVITY_FRESHNESS;
@@ -111,23 +112,6 @@ fn dev_pairing_enabled(ctx: &ServiceContext) -> Result<bool, ApiError> {
         defaults::SYNC_DEV_TICKET_PAIRING,
     )?;
     Ok(v.eq_ignore_ascii_case("true"))
-}
-
-/// Resolve the sync data dir (`<db_parent>/sync`) and the catalog DB path.
-/// Everything sync needs — device key, blob store, landed files — lives beside
-/// the catalog so it follows the same OS-appdata / Docker `/data` location.
-///
-/// `pub(crate)` so the collab request-to-serve path
-/// ([`crate::api::collab_exchange`]) resolves the same sync dir + catalog path
-/// its dedicated `blobs_collab` sender engine binds under.
-pub(crate) fn sync_paths(ctx: &ServiceContext) -> Result<(PathBuf, PathBuf), ApiError> {
-    let db = db(ctx)?;
-    let db_path = db.path().to_path_buf();
-    let sync_dir = db_path
-        .parent()
-        .map(|p| p.join("sync"))
-        .unwrap_or_else(|| PathBuf::from("sync"));
-    Ok((sync_dir, db_path))
 }
 
 /// Every directory the transfer machinery writes, resolved once per call
@@ -890,10 +874,10 @@ fn presence_debounce_admits(peer: NodeId) -> bool {
 /// Whether we hold at least one non-terminal outbound row for `peer` — i.e.
 /// whether a presence beacon from it has anything to resume.
 fn has_pending_rows_for(ctx: &ServiceContext, peer: NodeId) -> bool {
-    let Ok((_sync_dir, db_path)) = sync_paths(ctx) else {
+    let Ok(dirs) = sync_dirs(ctx) else {
         return false;
     };
-    let Ok(store) = CatalogSyncStore::open(&db_path) else {
+    let Ok(store) = CatalogSyncStore::open(&dirs.db_path) else {
         return false;
     };
     match store.non_terminal() {
@@ -1129,12 +1113,35 @@ pub(crate) async fn ensure_iroh_node(
         return Ok(Arc::clone(node));
     }
     let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
-    let (sync_dir, _db_path) = sync_paths(ctx)?;
-    std::fs::create_dir_all(&sync_dir)
-        .map_err(|e| ApiError::Internal(format!("create sync dir {}: {e}", sync_dir.display())))?;
-    let node = SharedIrohNode::bind(&sync_dir, relay_mode)
-        .await
-        .map_err(|e| ApiError::Internal(format!("bind shared iroh node: {e:#}")))?;
+    let dirs = sync_dirs(ctx)?;
+    // Identity and data are separate dirs now (transfer-prepare spec §4.1): the
+    // device key stays under `<db dir>/sync` forever, the blob store follows the
+    // configurable working folder. Both are created here — the working folder may
+    // be a freshly configured, still-empty path.
+    std::fs::create_dir_all(&dirs.identity_dir).map_err(|e| {
+        ApiError::Internal(format!(
+            "create sync identity dir {}: {e}",
+            dirs.identity_dir.display()
+        ))
+    })?;
+    std::fs::create_dir_all(&dirs.working_dir).map_err(|e| {
+        ApiError::Internal(format!(
+            "create sync working dir {}: {e}",
+            dirs.working_dir.display()
+        ))
+    })?;
+    let node = SharedIrohNode::bind_with(
+        &dirs.identity_dir,
+        &dirs.working_dir,
+        relay_mode,
+        // Task 5 flips this to `TryReference` (single-copy serve); until then the
+        // node keeps today's copy-into-the-store behavior.
+        NodeOptions {
+            serve_import_mode: ImportMode::Copy,
+        },
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("bind shared iroh node: {e:#}")))?;
     // W1: the node always binds unlimited, so the persisted device-wide upload
     // cap is applied right here. This ONE site covers desktop AND web — the node
     // binds lazily in core, so neither host needs startup code of its own. A
@@ -1152,10 +1159,10 @@ pub(crate) async fn ensure_iroh_node(
             "read upload limit at bind failed; running unlimited"
         ),
     }
-    // Unified store: the node binds at `<sync>/blobs`. After the first successful
-    // bind, the old per-role stores are dead weight — remove them so a migrated
-    // install doesn't carry three parallel blob DBs (tolerate absence).
-    cleanup_orphan_blob_stores(&sync_dir);
+    // Unified store: the node binds at `<working>/blobs`. After the first
+    // successful bind, the old per-role stores are dead weight — remove them so a
+    // migrated install doesn't carry three parallel blob DBs (tolerate absence).
+    cleanup_orphan_blob_stores(&dirs.working_dir);
     // Report THIS device's dialable endpoint address to the hub (finding H1, T7):
     // a fire-and-forget task that polls the node's address and PUTs it on change.
     // Only when signed in (a pure dev-ticket node has no hub to report to); never
@@ -1170,12 +1177,12 @@ pub(crate) async fn ensure_iroh_node(
 /// Delete the now-orphaned per-role blob-store directories left by the
 /// pre-Task-3 split transports (`blobs_out` for the personal sender,
 /// `blobs_collab` for the collab sender). The shared node's single store lives
-/// at `<sync>/blobs`, so these two siblings hold nothing live once every role
-/// rides the node. Best-effort: a missing dir is the common (fresh-install)
+/// at `<working_dir>/blobs`, so these two siblings hold nothing live once every
+/// role rides the node. Best-effort: a missing dir is the common (fresh-install)
 /// case and is silent; any other error is logged, never fatal.
-fn cleanup_orphan_blob_stores(sync_dir: &Path) {
+fn cleanup_orphan_blob_stores(working_dir: &Path) {
     for name in ["blobs_out", "blobs_collab"] {
-        let dir = sync_dir.join(name);
+        let dir = working_dir.join(name);
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => tracing::info!(path = %dir.display(), "removed orphaned per-role blob store"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1238,8 +1245,8 @@ pub async fn autostart_if_enabled(
         return Ok(false);
     }
     tracing::debug!(dev, signed_in, "sync autostart condition met");
-    let (sync_dir, db_path) = sync_paths(ctx)?;
-    let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
+    let dirs = sync_dirs(ctx)?;
+    let incoming = incoming_resolver(ctx, dirs.incoming_fallback())?;
     // Lazily bind the ONE shared node (resolves the relay mode + binds the single
     // endpoint/store on first need; the receiver rides it as its Recv role
     // handle). The receiver only listens, so no dial-hint relay URLs are needed.
@@ -1287,7 +1294,13 @@ pub async fn autostart_if_enabled(
     let emitter_for_resurrect = Arc::clone(&emitter);
     let emitter_for_auto_sync = Arc::clone(&emitter);
     sync.ensure_started(
-        node, sync_dir, db_path, incoming, authorized, hooks, emitter,
+        node,
+        dirs.working_dir.clone(),
+        dirs.db_path.clone(),
+        incoming,
+        authorized,
+        hooks,
+        emitter,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -1529,8 +1542,8 @@ pub async fn resurrect_pending_senders(
     sync: Arc<SyncRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) {
-    let db_path = match sync_paths(&ctx) {
-        Ok((_sync_dir, db_path)) => db_path,
+    let db_path = match sync_dirs(&ctx) {
+        Ok(dirs) => dirs.db_path,
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
@@ -1592,8 +1605,8 @@ pub async fn get_pairing_ticket(
             "personal sync is dev-gated; enable sync.dev_ticket_pairing first".into(),
         ));
     }
-    let (sync_dir, db_path) = sync_paths(ctx)?;
-    let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
+    let dirs = sync_dirs(ctx)?;
+    let incoming = incoming_resolver(ctx, dirs.incoming_fallback())?;
     // Same reasoning as `autostart_if_enabled`: bind the ONE shared node (relay
     // mode resolved inside), which the receiver rides as its Recv role handle.
     let node = ensure_iroh_node(ctx).await?;
@@ -1642,7 +1655,13 @@ pub async fn get_pairing_ticket(
     let emitter_for_auto_sync = Arc::clone(&emitter);
     let ticket = sync
         .ensure_started(
-            node, sync_dir, db_path, incoming, authorized, hooks, emitter,
+            node,
+            dirs.working_dir.clone(),
+            dirs.db_path.clone(),
+            incoming,
+            authorized,
+            hooks,
+            emitter,
         )
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -2462,7 +2481,7 @@ fn received_transfer_files(
     ctx: &ServiceContext,
     id: i64,
 ) -> Result<Vec<TransferFileEntry>, ApiError> {
-    let (sync_dir, _db_path) = sync_paths(ctx)?;
+    let dirs = sync_dirs(ctx)?;
     let db = db(ctx)?;
     let conn = db.conn();
     let row = get_inbound_by_row_id(&conn, id)
@@ -2522,9 +2541,9 @@ fn received_transfer_files(
     }
 
     // Still active: backfill names/sizes from the staged manifest if the fetch has
-    // landed it (the receiver stages under `<sync_dir>/staging/<package_id>`), else
+    // landed it (the receiver stages under `<working>/staging/<package_id>`), else
     // an honest empty list — the live per-file bars come from `sync-file-progress`.
-    let staging = sync_dir.join("staging").join(&row.package_id);
+    let staging = dirs.staging_root().join(&row.package_id);
     match package::read_manifest(&staging) {
         Ok(records) => Ok(records
             .iter()
@@ -2692,10 +2711,12 @@ pub async fn resolve_dest_node(
     })
 }
 
-/// The directory the app writes outgoing packages into (`<sync_dir>/packages`).
+/// The directory the app writes outgoing packages into — the configured
+/// outgoing-staging folder, `<identity>/packages` by default
+/// ([`SyncDirs::packages_dir`]). The ONE write target: the leftovers pass keys
+/// off the same field, so what the writer fills is never a leftovers root.
 fn sender_packages_dir(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
-    let (sync_dir, _db_path) = sync_paths(ctx)?;
-    Ok(sync_dir.join("packages"))
+    Ok(sync_dirs(ctx)?.packages_dir)
 }
 
 /// Ensure the sender engine for `dest` is running and return its handle + this
@@ -2735,7 +2756,7 @@ pub async fn ensure_sender_engine(
     // account-resolved dest is undialable without one); the shared node resolves
     // the relay MODE once, inside `ensure_iroh_node`.
     let (_relay_mode, relay_urls) = resolve_relay_mode(ctx).await?;
-    let (_sync_dir, db_path) = sync_paths(ctx)?;
+    let db_path = sync_dirs(ctx)?.db_path;
 
     // The ONE shared iroh node (C1 fix): the personal sender is its `Out` role
     // handle, sharing the single endpoint + `<sync>/blobs` store with the
@@ -3691,7 +3712,7 @@ pub async fn resend_transfer(
     id: i64,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<i64, ApiError> {
-    let (_sync_dir, db_path) = sync_paths(ctx)?;
+    let db_path = sync_dirs(ctx)?.db_path;
     // Read the row from the shared catalog store (an engine may not be started for
     // its peer yet — e.g. after a restart).
     let row = {
@@ -4042,7 +4063,7 @@ pub async fn cancel_incoming_package(
     use crate::sync::store::{get_inbound, set_inbound_state};
     use crate::sync::InboundState;
 
-    let (_sync_dir, db_path) = sync_paths(ctx)?;
+    let db_path = sync_dirs(ctx)?.db_path;
     let store = CatalogSyncStore::open(&db_path)
         .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?;
     let control = sync.inbound_control().await;
@@ -4630,8 +4651,7 @@ fn remove_terminal_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiE
 /// Returns `(dirs_removed, bytes_reclaimed)` — freed-now bytes, unlike released
 /// tags. Best-effort: one un-removable dir `warn!`s and the pass continues.
 fn remove_terminal_staging_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiError> {
-    let (sync_dir, _db_path) = sync_paths(ctx)?;
-    let staging_root = sync_dir.join("staging");
+    let staging_root = sync_dirs(ctx)?.staging_root();
     let entries = match std::fs::read_dir(&staging_root) {
         Ok(e) => e,
         // Never materialized (nothing ever received) → nothing to reclaim.
@@ -4995,6 +5015,15 @@ fn referenced_package_paths(ctx: &ServiceContext) -> Result<HashSet<PathBuf>, Ap
 /// So a leftover packages root contributes only its ROW-LESS top-level dirs (see
 /// [`referenced_package_paths`]), listed individually; `blobs/` and `staging/`
 /// contribute whole.
+///
+/// The packages leg carries [`sweep_orphan_payload_dirs`]'s age gate for the same
+/// reason it does (review carry-forward): the enqueue path is dir-before-row, so
+/// a row-less `<uuid>` dir can be an in-progress build whose `sync_outbound` row
+/// has not landed yet. A dir younger than [`ORPHAN_SWEEP_MIN_AGE`] — or one whose
+/// mtime cannot be read — is left out of the report and therefore out of the
+/// cleanup. It is a pure safety gate here: the effective packages dir is never a
+/// leftovers root ([`sender_packages_dir`] is `dirs.packages_dir`), so this only
+/// covers the window where the operator moved the folder mid-build.
 fn leftover_dirs(ctx: &ServiceContext, dirs: &SyncDirs) -> Result<Vec<PathBuf>, ApiError> {
     let prev = {
         let db = db(ctx)?;
@@ -5046,6 +5075,26 @@ fn leftover_dirs(ctx: &ServiceContext, dirs: &SyncDirs) -> Result<Vec<PathBuf>, 
                 }
                 if referenced.contains(&crate::api::scan_roots::normalize_path(&p)) {
                     continue;
+                }
+                // Same age gate as `sweep_orphan_payload_dirs`: row-less is not
+                // enough — dir-before-row means a young dir may be a live build.
+                match dir_age(&p) {
+                    Some(age) if age < ORPHAN_SWEEP_MIN_AGE => {
+                        tracing::debug!(
+                            path = %p.display(),
+                            age_secs = age.as_secs(),
+                            "transfer leftovers: dir too young, skipped (in-progress enqueue guard)"
+                        );
+                        continue;
+                    }
+                    Some(_) => {}
+                    None => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            "transfer leftovers: mtime unreadable, skipped"
+                        );
+                        continue;
+                    }
                 }
                 out.push(p);
             }
@@ -5399,7 +5448,7 @@ mod tests {
         reason: Option<&str>,
     ) -> i64 {
         use crate::sync::store::{set_inbound_state, upsert_inbound_attempt, CatalogSyncStore};
-        let (_sync_dir, db_path) = sync_paths(ctx).unwrap();
+        let db_path = sync_dirs(ctx).unwrap().db_path;
         let store = CatalogSyncStore::open(&db_path).unwrap();
         let conn = store.lock_conn();
         let (id, _) = upsert_inbound_attempt(&conn, &"ee".repeat(32), batch, wire, 2, 100).unwrap();
@@ -5409,7 +5458,7 @@ mod tests {
 
     fn read_inbound(ctx: &ServiceContext, wire: &str) -> crate::sync::models::InboundRow {
         use crate::sync::store::{get_inbound, CatalogSyncStore};
-        let (_sync_dir, db_path) = sync_paths(ctx).unwrap();
+        let db_path = sync_dirs(ctx).unwrap().db_path;
         let store = CatalogSyncStore::open(&db_path).unwrap();
         let conn = store.lock_conn();
         get_inbound(&conn, wire).unwrap().unwrap()
@@ -6102,7 +6151,7 @@ mod tests {
         use crate::sync::InboundState;
 
         let (_tmp, ctx) = test_ctx();
-        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
         let peer = "cc".repeat(32);
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
@@ -6233,7 +6282,7 @@ mod tests {
         let peer = node_id_hex(&peer_bytes);
 
         // The transfer this device is fetching right now: a live, non-terminal row.
-        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
             let conn = store.lock_conn();
@@ -6317,7 +6366,7 @@ mod tests {
         let sender = SyncSenderRuntime::new();
 
         let peer = "cc".repeat(32);
-        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
             let conn = store.lock_conn();
@@ -7034,8 +7083,9 @@ mod tests {
 
         let (_tmp, ctx) = test_ctx();
         let sync = SyncRuntime::default();
-        let (sync_dir, db_path) = sync_paths(&ctx).unwrap();
-        let staging = sync_dir.join("staging");
+        let dirs = sync_dirs(&ctx).unwrap();
+        let db_path = dirs.db_path.clone();
+        let staging = dirs.staging_root();
         let mk = |wire: &str| {
             let d = staging.join(wire);
             std::fs::create_dir_all(&d).unwrap();
@@ -7109,7 +7159,7 @@ mod tests {
 
         let (tmp, ctx) = test_ctx();
         {
-            let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+            let db_path = sync_dirs(&ctx).unwrap().db_path;
             let store = CatalogSyncStore::open(&db_path).unwrap();
             let conn = store.lock_conn();
             let peer = "ff".repeat(32);
@@ -8777,7 +8827,7 @@ mod tests {
 
         // The sender engine writes to the catalog sync store (== ctx's DB), so
         // `list_transfer_files` reads the same rows it wrote.
-        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
         let pkg_root = tmp.path().join("packages");
         let pkg_dir = {
             let db = db(&ctx).unwrap();
@@ -8993,7 +9043,7 @@ mod tests {
         let dir = tmp.path();
         let f1 = insert_fixture_frame(&ctx, dir, "light-0001.fits", "M42", false);
 
-        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
         let pkg_root = tmp.path().join("packages");
         let (pkg_dir, id) = {
             let db = db(&ctx).unwrap();
@@ -10587,6 +10637,10 @@ mod tests {
         std::fs::create_dir_all(&pkg_b).unwrap();
         std::fs::write(pkg_a.join("a.fits"), vec![1u8; 4096]).unwrap();
         std::fs::write(pkg_b.join("b.fits"), vec![2u8; 2048]).unwrap();
+        // Past the leftovers age gate — these are stranded from a prior session,
+        // not a build in progress (see `leftover_dirs`).
+        backdate_mtime(&pkg_a, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
+        backdate_mtime(&pkg_b, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
@@ -10631,6 +10685,50 @@ mod tests {
             "a payload dir a sync_outbound row still names is never removed"
         );
         assert_eq!(get_transfer_storage(&ctx).unwrap().leftover_bytes, 0);
+    }
+
+    /// The leftovers packages leg carries the orphan sweep's age gate: enqueue is
+    /// dir-before-row, so a row-less `<uuid>` dir that is still YOUNG may be a
+    /// live build whose `sync_outbound` row has not landed yet. It must be
+    /// neither counted nor deleted until it ages past
+    /// [`ORPHAN_SWEEP_MIN_AGE`] — the same contract
+    /// [`sweep_orphan_payload_dirs`] already honours.
+    #[tokio::test]
+    async fn leftovers_spare_a_young_rowless_payload_dir() {
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let dirs = sync_dirs(&ctx).unwrap();
+
+        // One row-less payload dir in the DEFAULT packages dir, created NOW.
+        let pkg = dirs.default_packages_dir().join("uuid-young");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("in-progress.fits"), vec![7u8; 4096]).unwrap();
+
+        // Move ONLY the outgoing folder, stranding `<identity>/packages`.
+        let out = tmp.path().join("moved-out");
+        set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            Some(out.to_str().unwrap().to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_transfer_storage(&ctx).unwrap().leftover_bytes,
+            0,
+            "a young row-less payload dir is presumed an in-progress enqueue"
+        );
+        assert_eq!(cleanup_transfer_leftovers(&ctx, &sync).await.unwrap(), 0);
+        assert!(pkg.is_dir(), "and is never deleted while it is young");
+
+        // Aged past the gate it is a genuine leftover and both legs see it.
+        backdate_mtime(&pkg, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
+        assert_eq!(get_transfer_storage(&ctx).unwrap().leftover_bytes, 4096);
+        assert_eq!(cleanup_transfer_leftovers(&ctx, &sync).await.unwrap(), 4096);
+        assert!(!pkg.exists());
     }
 
     #[tokio::test]
