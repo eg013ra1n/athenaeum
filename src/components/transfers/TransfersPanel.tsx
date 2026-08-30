@@ -446,7 +446,6 @@ function ActiveTab({
           name, device name, `displayState` chip incl. neutral waiting). The full
           unified view with actions + per-file detail lives on /transfers. */}
       {active.map((row) => {
-        const chip = displayStateChip(row.displayState);
         const subline = displayStateSubline(row.displayState, 'outbound');
         const total = row.fileCounts.total || row.fileCount;
         // Same §D4 split as the page row (`TransferRow`): count what travels,
@@ -473,6 +472,14 @@ function ActiveTab({
         const preparingLike =
           row.displayState === 'preparing' ||
           (row.displayState === 'queued' && prepared !== undefined);
+        // Same predicate drives the CHIP (spec §7.1: one label on both surfaces).
+        // A row still `queued` while its serve import hashes reads `indexing`,
+        // which `displayStateChip` renders as the same muted "preparing" the
+        // /transfers row shows — the sidebar must not say "queued" for that whole
+        // phase.
+        const chip = displayStateChip(
+          preparingLike && row.displayState === 'queued' ? 'indexing' : row.displayState,
+        );
         const travelFiles = Math.max(0, total - dup);
         const travelBytes = Math.max(0, row.byteSize - row.fileCounts.duplicateBytes);
         return (

@@ -245,7 +245,7 @@ export default function TransfersSection() {
       if (!mounted.current) return;
       setPaths(next);
       notify({
-        kind: 'generic',
+        kind: 'sync',
         tone: 'success',
         title: 'Transfer folders saved',
         // `NotifyInput.detail` is required, so the non-restart case says what
