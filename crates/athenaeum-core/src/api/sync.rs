@@ -194,9 +194,23 @@ pub(crate) fn sync_dirs(ctx: &ServiceContext) -> Result<SyncDirs, ApiError> {
 }
 
 /// Validate (and create) a transfer folder the operator typed or picked
-/// (transfer-prepare spec §6.3). Order: absolute → create → canonicalize →
-/// `PathPolicy` → no scan-root overlap → write probe. Returns the normalized
-/// path to persist. `label` names the setting in messages.
+/// (transfer-prepare spec §6.3). Order: absolute → `PathPolicy` (lexical) →
+/// create → canonicalize → `PathPolicy` (resolved) → no scan-root overlap →
+/// write probe. Returns the normalized path to persist. `label` names the
+/// setting in messages.
+///
+/// The policy is checked TWICE on purpose. The lexical pre-check runs before
+/// `create_dir_all` so a sandboxed host (athenaeum-web's `AllowedRoots`, from
+/// `ATHENAEUM_ALLOWED_PATHS`) never gets a `mkdir -p` outside its allowed roots
+/// from an unvetted request path; it is not sufficient on its own, because
+/// `PathPolicy::check` resolves neither `..` nor symlinks, so the authoritative
+/// check is the one on the canonicalized path.
+///
+/// If a later step rejects, a directory THIS call created is removed again so a
+/// typo'd path doesn't litter the filesystem. Cleanup is best-effort and
+/// leaf-only: `remove_dir` (never `remove_dir_all`) so a non-empty directory is
+/// always left alone, and any parents `create_dir_all` had to create along the
+/// way stay behind — they are empty and harmless.
 pub(crate) fn validate_transfer_dir(
     conn: &rusqlite::Connection,
     policy: &crate::api::PathPolicy,
@@ -210,35 +224,52 @@ pub(crate) fn validate_transfer_dir(
             "{label}: enter an absolute path"
         )));
     }
+    // Lexical pre-check — nothing is created outside the sandbox even when the
+    // path is later rejected. Re-checked below once the path is resolved.
+    policy.check(&crate::api::scan_roots::normalize_path(candidate))?;
+
+    let created = !candidate.exists();
     std::fs::create_dir_all(candidate).map_err(|e| {
         tracing::warn!(path = %candidate.display(), error = %e, "transfer folder create failed");
         ApiError::Invalid(format!("{label}: cannot create folder: {e}"))
     })?;
-    let path = crate::api::scan_roots::normalize_path(&candidate.canonicalize().map_err(|e| {
-        tracing::warn!(path = %candidate.display(), error = %e, "transfer folder resolve failed");
-        ApiError::Invalid(format!("{label}: cannot resolve folder: {e}"))
-    })?);
-    policy.check(&path)?;
-    crate::api::scan_roots::check_scan_root_overlap(conn, &path).map_err(|e| match e {
-        ApiError::Conflict(_) => {
-            tracing::warn!(path = %path.display(), error = %e, "transfer folder overlaps a scan root");
-            ApiError::Invalid(format!(
-                "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
-            ))
+
+    let outcome = (|| -> Result<PathBuf, ApiError> {
+        let path = crate::api::scan_roots::normalize_path(&candidate.canonicalize().map_err(
+            |e| {
+                tracing::warn!(path = %candidate.display(), error = %e, "transfer folder resolve failed");
+                ApiError::Invalid(format!("{label}: cannot resolve folder: {e}"))
+            },
+        )?);
+        policy.check(&path)?;
+        crate::api::scan_roots::check_scan_root_overlap(conn, &path).map_err(|e| match e {
+            ApiError::Conflict(_) => {
+                tracing::warn!(path = %path.display(), error = %e, "transfer folder overlaps a scan root");
+                ApiError::Invalid(format!(
+                    "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
+                ))
+            }
+            other => other,
+        })?;
+        let probe = path.join(".athenaeum-write-test");
+        if let Err(e) = std::fs::write(&probe, b"probe") {
+            tracing::warn!(path = %path.display(), error = %e, "transfer folder write probe failed");
+            return Err(ApiError::Invalid(format!(
+                "{label}: folder is not writable: {e}"
+            )));
         }
-        other => other,
-    })?;
-    let probe = path.join(".athenaeum-write-test");
-    if let Err(e) = std::fs::write(&probe, b"probe") {
-        tracing::warn!(path = %path.display(), error = %e, "transfer folder write probe failed");
-        return Err(ApiError::Invalid(format!(
-            "{label}: folder is not writable: {e}"
-        )));
+        if let Err(e) = std::fs::remove_file(&probe) {
+            tracing::warn!(path = %probe.display(), error = %e, "transfer folder probe cleanup failed");
+        }
+        Ok(path)
+    })();
+
+    if outcome.is_err() && created {
+        if let Err(e) = std::fs::remove_dir(candidate) {
+            tracing::debug!(path = %candidate.display(), error = %e, "rejected transfer folder left in place");
+        }
     }
-    if let Err(e) = std::fs::remove_file(&probe) {
-        tracing::warn!(path = %probe.display(), error = %e, "transfer folder probe cleanup failed");
-    }
-    Ok(path)
+    outcome
 }
 
 /// Build the receiver's live per-package landing resolver. It re-reads the
@@ -10026,5 +10057,71 @@ mod tests {
                 candidate.display()
             );
         }
+    }
+
+    /// The web sandbox (`ATHENAEUM_ALLOWED_PATHS` → `AllowedRoots`) must be
+    /// consulted BEFORE anything is created — otherwise a request naming any
+    /// absolute path would `mkdir -p` wherever the server can write and only
+    /// then get its 403.
+    #[test]
+    fn validate_transfer_dir_checks_the_policy_before_creating_anything() {
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let base = tmp.path().canonicalize().unwrap();
+        let allowed = base.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let outside = base.join("outside").join("new");
+
+        let err = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowedRoots(vec![allowed]),
+            outside.to_str().unwrap(),
+            "X",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        assert!(!outside.exists(), "no mkdir for a path outside the sandbox");
+        assert!(
+            !base.join("outside").exists(),
+            "not even the parent create_dir_all would have made"
+        );
+    }
+
+    /// A rejection AFTER the folder was created takes the folder back out again,
+    /// so a typo'd path leaves nothing behind — but a folder that already
+    /// existed is never touched.
+    #[test]
+    fn validate_transfer_dir_removes_a_folder_it_created_when_a_later_step_rejects() {
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("lights");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::db::upsert_scan_root(&conn, root.to_str().unwrap(), "normal").unwrap();
+
+        // Rejected by the scan-root overlap check, i.e. after create_dir_all.
+        let inside = root.join("staging");
+        let err = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            inside.to_str().unwrap(),
+            "X",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        assert!(!inside.exists(), "the folder this call created is removed");
+
+        // Same rejection, but the folder pre-existed: leave it alone.
+        let err = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            root.to_str().unwrap(),
+            "X",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        assert!(root.is_dir(), "a pre-existing folder survives a rejection");
     }
 }
