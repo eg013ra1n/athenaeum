@@ -3118,3 +3118,103 @@ async fn export_try_reference_leaves_no_owned_copy_in_the_store() {
         "{err:?}"
     );
 }
+
+/// Transfer-prepare spec §5.3: a vanished-source export must leave the receiver
+/// able to HEAL. An unmarked (transfer-class) error parks the inbound row
+/// `Waiting`, and a park never calls `release` — so if the fetch kept its own
+/// collection tag, the dead child entry would stay pinned against GC and every
+/// sender retry would re-run the same failing export (the downloader skips a blob
+/// whose entry reads `Complete`, dead file or not). `on_export_source_vanished`
+/// therefore drops that tag, leaving the entry untagged for the next GC pass.
+///
+/// The error handed to it here is a REAL one: a `TryReference` export of a blob
+/// whose only external path has been deleted, exactly as the export loop
+/// produces it. Driving the whole of `fetch_collection_to_dir` into this branch
+/// is not possible — a re-fetch over such an entry trips an iroh-blobs 0.103
+/// panic (`bitfield()` on `BaoFileStorage::Poisoned`, reached through our own
+/// per-file `observe`) during phase 2, before the export loop runs.
+#[tokio::test]
+async fn vanished_export_drops_the_collection_tag() {
+    use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
+    use iroh_blobs::HashAndFormat;
+
+    let tmp = tempdir().unwrap();
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    // Above the inline threshold, so the store keeps a real data file that
+    // `TryReference` can move out and then reference.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let tt = store
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    let target = tmp.path().join("staging").join("a.fits");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tt.hash(),
+            mode: ExportMode::TryReference,
+            target: target.clone(),
+        })
+        .finish()
+        .await
+        .unwrap();
+
+    // The tag the fetch sets on the collection just before the export loop.
+    let tag = "pkg/vanished-probe";
+    store
+        .tags()
+        .set(tag, HashAndFormat::hash_seq(tt.hash()))
+        .await
+        .unwrap();
+    assert!(
+        store.tags().get(tag.as_bytes()).await.unwrap().is_some(),
+        "precondition: the fetch has pinned the collection"
+    );
+
+    // Now the staged file the store references is cleaned by a sibling package —
+    // §5.3 — and the next export of that hash finds nothing to read.
+    std::fs::remove_file(&target).unwrap();
+    let err = store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tt.hash(),
+            mode: ExportMode::TryReference,
+            target: tmp.path().join("staging").join("b.fits"),
+        })
+        .finish()
+        .await
+        .unwrap_err();
+    assert!(
+        super::blobs::export_source_vanished(&err),
+        "precondition: a real vanished-source export error, got {err:?}"
+    );
+
+    let out = super::blobs::on_export_source_vanished(
+        &store,
+        tag,
+        tt.hash(),
+        "a.fits",
+        tt.hash(),
+        &target,
+        err,
+    )
+    .await;
+
+    assert!(
+        store.tags().get(tag.as_bytes()).await.unwrap().is_none(),
+        "the collection tag is dropped, so GC can purge the dead entry and a \
+         later retry re-downloads the blob"
+    );
+    assert!(
+        !crate::sharing::types::is_local_fault(&out),
+        "a vanished source is transfer-class: the row parks Waiting, it is never \
+         terminalized Failed"
+    );
+    let msg = format!("{out:#}");
+    assert!(msg.contains("source vanished"), "{msg}");
+}

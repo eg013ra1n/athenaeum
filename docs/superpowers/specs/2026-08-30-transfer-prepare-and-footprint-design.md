@@ -357,8 +357,26 @@ senders or batches, since the dedup handshake excludes what the catalog has:
   source. The fetch classifies that error as **transfer-class** (row parks
   `Waiting`, the sender's retry ladder re-announces) rather than
   `LocalFault`, with a `warn!(hash, path, "export source vanished; waiting for
-  GC")`. GC removes the dead entry; the retry re-downloads the blob. Self-heals
-  within one GC window; documented as a known limitation (§12 D5).
+  GC")`.
+
+  The heal needs one more step, because a `Waiting` park never calls `release`:
+  **the fetch drops its own collection tag on this error path**
+  (`on_export_source_vanished`). Without that, the receiver's tag would pin the
+  dead entry against GC indefinitely and every retry would re-run the same
+  failing export — a downloader skips a blob whose entry reads `Complete`, dead
+  file or not. The in-flight tag is already retired by then (it is deleted right
+  after the permanent tag is set), so that one delete leaves the entry untagged;
+  GC purges it within one window (≤ 15 min) and the sender's retry ladder then
+  re-fetches the blob for real. Self-heals within one GC window; documented as a
+  known limitation (§12 D5).
+
+  Known rough edge, upstream: while the entry is dead-but-not-yet-swept, a
+  re-fetch that touches it trips an iroh-blobs 0.103 panic in a store entity
+  actor (`bitfield()` on `BaoFileStorage::Poisoned`, reached through the fetch's
+  own per-file `observe`) and the fetch returns `unexpected end of stream`
+  instead of reaching the export. That is still an unmarked, transfer-class
+  error, so the row parks `Waiting` exactly as above and the heal is unchanged —
+  it costs one noisy retry, not correctness.
 
 ### 5.4 Progress
 

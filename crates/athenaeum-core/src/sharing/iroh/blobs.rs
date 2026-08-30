@@ -620,6 +620,57 @@ pub(crate) fn export_source_vanished(err: &iroh_blobs::api::RequestError) -> boo
     }
 }
 
+/// Handle the ONE export failure that is transfer-class (§5.3): the file the
+/// store references is gone. Drops the receiver's collection tag, logs, and
+/// returns the (deliberately un-[`LocalFault`]ed) error the fetch propagates.
+///
+/// **Why the tag has to go.** An unmarked error parks the inbound row `Waiting`,
+/// and a park never calls `release` — so OUR OWN collection tag, set a few lines
+/// above in [`fetch_collection_to_dir`], would pin the dead child entry against
+/// GC forever and every sender retry would re-run this same failing export (the
+/// downloader skips a blob whose entry reads `Complete`, dead file or not). With
+/// the tag gone the entry is untagged, GC (≤ 15 min) purges it, and a later
+/// retry's downloader fetches the blob again. The in-flight tag is ALREADY
+/// retired at this point — [`fetch_collection_to_dir`] deletes it immediately
+/// after setting the permanent tag, above the export loop — so this one delete
+/// leaves nothing of ours pinning the collection.
+///
+/// The tag delete is best-effort: a failure must not change the classification
+/// (the transfer-class error is the honest outcome either way), so it warns and
+/// returns the vanished error regardless. Never swallowed — both the delete
+/// failure and the vanish itself are logged.
+///
+/// Extracted from the loop body so the branch is unit-testable end to end (tag
+/// state + returned error) without a live peer: driving a real fetch into it is
+/// not possible, because a re-fetch over an entry whose external file is gone
+/// trips an iroh-blobs 0.103 panic (`bitfield()` on `BaoFileStorage::Poisoned`,
+/// via our own per-file `observe`) in phase 2, long before the export loop.
+pub(crate) async fn on_export_source_vanished(
+    store: &Store,
+    tag: &str,
+    root_hash: Hash,
+    name: &str,
+    blob_hash: Hash,
+    target: &Path,
+    err: iroh_blobs::api::RequestError,
+) -> anyhow::Error {
+    if let Err(te) = store.tags().delete(tag.as_bytes()).await {
+        tracing::warn!(
+            tag,
+            root_hash = %root_hash,
+            error = %format!("{te:#}"),
+            "delete collection tag after vanished export failed"
+        );
+    }
+    tracing::warn!(
+        hash = %blob_hash,
+        path = %target.display(),
+        error = %format!("{err:#}"),
+        "export source vanished; waiting for GC before retry"
+    );
+    anyhow::Error::new(err).context(format!("export {name}: source vanished"))
+}
+
 /// Download the collection identified by `root_hash` from `provider` into
 /// `store`, then export every entry to its `rel_path` under `dest_dir`,
 /// reconstructing the package directory.
@@ -862,21 +913,15 @@ pub async fn fetch_collection_to_dir(
             .finish()
             .await;
         if let Err(e) = res {
+            // §5.3: a same-hash sibling package's staged file was cleaned before
+            // this export ran and GC has not yet dropped the dead entry. NOT a
+            // local fault — the row parks `Waiting` and the sender retries; the
+            // handler drops our collection tag so GC can heal it (see its doc).
             if export_source_vanished(&e) {
-                // §5.3: a same-hash sibling package's staged file was cleaned
-                // before this export ran and GC has not yet dropped the dead
-                // entry. NOT a local fault: the row parks `Waiting`, the sender
-                // re-announces, GC (≤ 15 min) purges the entry and the retry
-                // re-downloads the blob.
-                tracing::warn!(
-                    hash = %blob_hash,
-                    path = %target.display(),
-                    error = %format!("{e:#}"),
-                    "export source vanished; waiting for GC before retry"
-                );
-                return Err(
-                    anyhow::Error::new(e).context(format!("export {name}: source vanished"))
-                );
+                return Err(on_export_source_vanished(
+                    store, tag, root_hash, name, *blob_hash, &target, e,
+                )
+                .await);
             }
             return Err(LocalFault(
                 anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
