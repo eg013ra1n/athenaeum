@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, UserCircle } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, UserCircle, ArrowLeftRight } from 'lucide-react';
 import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import LoggingSettings from '../components/settings/LoggingSettings';
 import AccountSection from '../components/settings/AccountSection';
 import SyncSection from '../components/settings/SyncSection';
+import TransfersSection from '../components/settings/TransfersSection';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
@@ -67,9 +68,9 @@ export default function Settings() {
   // "Open Plate-Solve Settings" CTA on the index-missing modal) land on the
   // right tab without an extra click.
   const [searchParams, setSearchParams] = useSearchParams();
-  type SettingsTab = 'general' | 'calibration' | 'analysis' | 'plate_solving';
+  type SettingsTab = 'general' | 'transfers' | 'calibration' | 'analysis' | 'plate_solving';
   const tabFromUrl = (searchParams.get('tab') ?? '') as SettingsTab | '';
-  const validTabs: readonly SettingsTab[] = ['general', 'calibration', 'analysis', 'plate_solving'];
+  const validTabs: readonly SettingsTab[] = ['general', 'transfers', 'calibration', 'analysis', 'plate_solving'];
   const initialTab: SettingsTab = validTabs.includes(tabFromUrl as SettingsTab)
     ? (tabFromUrl as SettingsTab)
     : 'general';
@@ -474,6 +475,17 @@ export default function Settings() {
           General
         </button>
         <button
+          onClick={() => setActiveTab('transfers')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'transfers'
+              ? 'bg-surface-elevated text-white border-b-2 border-accent'
+              : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'
+          }`}
+        >
+          <ArrowLeftRight size={18} />
+          Transfers
+        </button>
+        <button
           onClick={() => setActiveTab('calibration')}
           className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
             activeTab === 'calibration'
@@ -507,6 +519,21 @@ export default function Settings() {
           Plate Solving
         </button>
       </div>
+
+      {/* Transfers Tab — the two configurable transfer folders plus the
+          bandwidth / receiving / storage knobs (moved out of General → Sync). */}
+      {activeTab === 'transfers' && (
+        <div className="mb-6 bg-surface-elevated rounded-lg p-6">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <ArrowLeftRight size={20} />
+            Transfers
+          </h3>
+          <p className="text-xs text-content-muted mb-4">
+            Where transfers keep their working data, how fast they may upload, how many may arrive at once.
+          </p>
+          <TransfersSection />
+        </div>
+      )}
 
       {/* Calibration Tab. The calibration-folder picker lives in File
           Manager → Folders, on the Calibration Library rail entry. */}
@@ -592,7 +619,8 @@ export default function Settings() {
             </h3>
             <p className="text-xs text-content-muted mb-4">
               Send frames between your machines. A Capture device queues its frames to a paired
-              Primary; the Primary receives and ingests them.
+              Primary; the Primary receives and ingests them. Transfer folders, bandwidth and
+              storage live on the <span className="text-content-secondary">Transfers</span> tab.
             </p>
             <SyncSection />
           </div>
