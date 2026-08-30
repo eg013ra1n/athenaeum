@@ -736,7 +736,7 @@ export type BiasFallback = "subtractBias" | "skipFrame";
 
 export type Direction = "sent" | "received";
 
-export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
+export type OutboundState = "preparing" | "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
 
 export type InboundState = "announced" | "fetching" | "ingesting" | "waiting" | "done" | "failed" | "cancelled";
 
@@ -803,7 +803,12 @@ duplicate: number,
  * `byte_size` sum of the `duplicate` rows — subtract from the summary's
  * manifest-total `byte_size` to get the bytes that actually travel.
  */
-duplicateBytes: number, };
+duplicateBytes: number, 
+/**
+ * `byte_size` sum of every row — the manifest-free total a `preparing`
+ * row's summary falls back to (spec §3.8).
+ */
+totalBytes: number, };
 
 export type OutboundSummary = { 
 /**

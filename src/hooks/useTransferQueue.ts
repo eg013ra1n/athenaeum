@@ -125,7 +125,7 @@ export interface TransferRow {
    *  received-row "Perseus" origin badge. Informational — never gates anything. */
   peerKind: string | null;
   /** Backend-derived presentation state (§D5): outbound
-   *  `queued|preparing|transferring|uploaded|waiting|waiting_peer|queued_at_receiver|confirmed|cancelled|failed`,
+   *  `preparing|queued|announced|transferring|uploaded|waiting|waiting_peer|queued_at_receiver|confirmed|cancelled|failed`,
    *  inbound `announced|queued|fetching|ingesting|waiting_peer|done|failed|cancelled`.
    *  Non-exhaustive by design — `displayStateChip`'s default renders any new
    *  string verbatim in a muted chip. */
@@ -442,6 +442,9 @@ export function useTransferQueue(): UseTransferQueue {
                     failed: p.failed.length,
                     duplicate: 0,
                     duplicateBytes: 0,
+                    // No per-file byte figure in a finished event; the durable
+                    // row's counts carry the real total on the next poll.
+                    totalBytes: 0,
                   },
                   retrying: false,
                   resendable: true,
@@ -730,7 +733,16 @@ export function useTransferQueue(): UseTransferQueue {
         retrying: false,
         // Manifest counts from the announce: N files, none done yet. Same shape a
         // real announced row reports, so the progress line doesn't change on handoff.
-        fileCounts: { total: q.frameCount, done: 0, failed: 0, duplicate: 0, duplicateBytes: 0 },
+        fileCounts: {
+          total: q.frameCount,
+          done: 0,
+          failed: 0,
+          duplicate: 0,
+          duplicateBytes: 0,
+          // The announce's byte total lives on `byteSize` below; the ghost row
+          // has no per-file rows to sum, and the real row supersedes it.
+          totalBytes: 0,
+        },
         fileCount: q.frameCount,
         byteSize: q.byteSize,
         bytesDone: 0,

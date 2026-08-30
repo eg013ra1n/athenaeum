@@ -1886,7 +1886,19 @@ fn outbound_summary(
     file_counts: &HashMap<i64, TransferFileCounts>,
     receiver_busy: bool,
 ) -> OutboundSummary {
-    let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
+    // Manifest first; the per-file rows are the fallback (transfer-prepare spec
+    // §3.8). A `preparing` row has no package dir yet — and a row whose dir was
+    // cleaned up by retention has none any more — so `package_totals` reads
+    // `(0, 0)` there. Its own file rows, written in the enqueue transaction,
+    // already carry the full manifest, so the list shows "N files · X GB" from
+    // the click instead of a zeroed row that fills in minutes later.
+    let (file_count, byte_size) = match package_totals(Path::new(&row.package_ref)) {
+        (0, 0) => {
+            let c = file_counts.get(&row.id).copied().unwrap_or_default();
+            (c.total, c.total_bytes)
+        }
+        totals => totals,
+    };
     let peer_hex = node_id_hex(&row.peer);
     let display_state = outbound_display_state(
         row.state,
