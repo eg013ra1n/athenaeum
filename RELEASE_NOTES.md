@@ -1,50 +1,65 @@
-*Duplicate detection that actually finds your duplicates — and never invents them.*
+*Send an object to another node straight from its Export tab — lights only, with calibration frames, with masters, or already calibrated — and scans that never hash a file again.*
 
 ## What's New
 
-- **Duplicate detection has been rebuilt around what a frame is, not where it
-  sits.** The Duplicates view used to group files by size, timestamp and
-  filename — and a copy's timestamp changes the moment it crosses a drive or
-  an exFAT stick, so on real libraries the view quietly found nothing. Raw
-  sub-frames are now matched by their stored FITS/XISF header, which every
-  scan already records: copies match no matter how many times they were
-  moved, and on a 42 000-file test catalog the view went from 0 groups to
-  ~2 750 (170 GB of reclaimable space).
-- **Masters and processed files are matched by their full contents.**
-  Processing tools copy a header verbatim onto a different image, so a header
-  can never identify a master. Instead, the scan hashes the handful of
-  master candidates whose headers collide (a minute of work, not a
-  library-wide pass), and only byte-identical files are ever grouped. Two
-  different stacks that share a header will never be offered as copies of
-  each other.
-- **Deep verify remembers its work.** Verifying a duplicate pair already
-  reads both files byte by byte; that read is no longer thrown away. Files
-  proven identical keep their full-content hash in the catalog, so
-  re-verifying them is instant, and the stored hashes feed the master
-  matching above for free.
+- **Send an object to another node from the Export tab.** The tab now offers
+  four compositions, each with a file count and its own readiness check:
+  **Lights only** (new), **Lights + calibration sets**, **Lights + masters**
+  and **Calibrated lights**. A new **Send to node…** button sends the set as
+  one package in the same WBPP folder layout the export produces
+  (`camera_<x>/BIAS_…/DARKS_…/FLAT_…/lights`), so the batch folder opens in
+  WBPP on the receiving device as-is. Nothing changes about the export itself:
+  the four modes and **Export to WBPP** share the same readiness rule.
+- **The receiver integrates what it gets.** Raw calibration frames and master
+  files that arrive over a transfer now become calibration sets on the
+  receiving device automatically — until now they landed as bare frames that
+  no light could be matched against. Calibrated lights (`c_*.fits`) land
+  outside the catalog as calibrated artifacts, exactly as they live on the
+  sender: when the source light is cataloged on the receiver too, it shows
+  as *calibrated* there. Re-sending a batch is deduplicated — no `_2` copies.
+- **One readiness gate for export and send.** *Lights + masters* is strict:
+  it is refused while any linked calibration set still lacks a master, and
+  the message links to the Coverage tab with that set highlighted.
+  *Calibrated lights* requires every light to have a fresh calibrated output.
+  The tab never builds masters or calibrates lights for you — only ready
+  material is exportable or sendable; the preparation happens on the
+  Coverage tab, one click away.
+- **Scans read headers only.** The content index that powers transfer
+  deduplication and content-based duplicate grouping is built by its own
+  background job — after every scan when sync is set up or content grouping
+  is on, and on demand from a new **Build content index** button on the
+  Folders page. Settings gained one *Content index* card in place of two.
+- **Transfers remember the files they hash.** Every full read a send, a
+  receive or a deep verify pays is kept in the catalog, so masters that
+  travelled between devices show up in duplicate detection without another
+  read, and re-sending files a device has already confirmed costs no disk
+  I/O on the receiver.
 
 ## Changes
 
-- Folder similarity uses the same header identity as the Duplicates view, so
-  the two screens agree about the same pair of folders.
-- The Settings text for duplicate detection now describes what each mode
-  actually does, including an honest caveat about sampled hashing for
-  masters in content mode.
-- Duplicate grouping is protective by design: a renamed true copy, a file
-  with an unreadable header, or an unclassified frame type is skipped rather
-  than guessed at. A miss costs a re-scan; a wrong group could cost a frame.
+- **The app never deletes a sent source.** The desktop and web app carried a
+  hidden retention loop that could reclaim files after a confirmed send; it
+  is gone. Retention is a Perseus-only concept — the capture agent's per-file
+  fate rules are unchanged.
+- **Lights Analysis tab.** With nothing selected the Blink button now reads
+  **Blink all** and blinks every displayed frame; with a selection it reads
+  **Blink** and blinks that. The frame table supports Shift-click range
+  selection, and a plain click anywhere on a row toggles it, the way the file
+  browser already works. The tab's *Send to…* button is gone — on an object
+  page, **Send to node…** on the Export tab is the one place to send from;
+  the file browser's selection send is unchanged.
+- The catalog drops a duplicate-detection column it no longer uses; existing
+  catalogs are migrated once on startup.
 
 ## Bug Fixes
 
-- Calibration sets and sessions no longer keep counting frames that were
-  deleted: removing duplicates now updates the set's frame count everywhere,
-  and existing catalogs are corrected once on the next start.
-- Changing the keep rules while a deep verify was running used to hide the
-  progress bar while the verification kept reading disks in the background —
-  and then popped up a summary for a run you had discarded. It now stops the
-  run properly, and cancel works even if you press it just before a rules
-  change.
-- Processed files that keep their source's header (e.g. background-extracted
-  copies saved next to the original) are no longer grouped with it: the
-  grouping key includes the filename, and their divergent names keep them
-  apart.
+- A master recognised only by its filename (a `master_dark_*.fits` whose
+  `IMAGETYP` still reads *Dark*) travelled as a raw frame when sent from the
+  frame table. It now travels as a master.
+- A calibrated light the receiver refuses is removed from disk with the
+  reason recorded, instead of lingering as an untracked file that a later
+  scan would re-adopt — and an unreadable payload is reported as a read
+  failure, not as "not a calibrated light".
+- The desktop app now logs a refused export the way the web build already
+  did; a readiness or catalog failure could abort an export with nothing in
+  the log.

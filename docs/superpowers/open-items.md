@@ -62,6 +62,10 @@ instance on the same account as the receiver.
   sentence the tab shows.
 - The → Coverage link from a *flat* (or bias) set without a master lands on the matching
   library with that set highlighted, not the Dark library.
+- Lights Analysis tab (2026-08-30): no *Send to…* button; with nothing selected the
+  Blink button reads *Blink all* and blinks every displayed frame; Shift-click on a
+  row (or its checkbox) selects the range from the last plain click in the displayed
+  order, and a re-sort between the two clicks does not move the range.
 
 #### Follow-ups surfaced by review (not smokes)
 
@@ -357,27 +361,5 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 ## Release notes owed at the next tag
 
-- Duplicate detection now recognises copies whose timestamps changed in
-  transit — moving a night between drives no longer hides its duplicates.
-- Deep verify remembers its work: files proven byte-identical keep their
-  full-content hash, so re-verifying them is instant — and changing the keep
-  rules mid-verify now actually stops the run.
-  Masters and processed files are compared by their full contents, so two
-  different stacks that share a header are never mistaken for copies.
-- Rebuild master from the library: masters built in Athenaeum can be re-integrated
-  in place from their original source frames (Equipment → expanded master row).
-- Calibration sets and sessions no longer keep counting frames that were deleted;
-  existing catalogs are corrected once on startup.
-- The catalog drops a duplicate-detection column it no longer uses; existing
-  catalogs are migrated once on startup.
-- Transfers remember the files they hash: every full read a send, a receive
-  or a deep verify pays is kept, so masters that travelled between devices
-  show up in duplicate detection without another read, and re-sending files
-  a device already confirmed costs no disk I/O on the receiver.
-- Scans read headers only. The content index that powers transfer dedup and
-  content-based duplicate grouping is built by its own background job — after
-  every scan when sync is set up or content grouping is on, and from a new
-  "Build content index" button on the Folders page. Settings gained one
-  "Content index" card in place of two.
-
-(v0.5.1 lines were paid in full on 2026-08-24.)
+(Paid in full by v0.5.4 on 2026-08-30; the v0.5.1–v0.5.3 lines before it were paid
+at their own tags.)
