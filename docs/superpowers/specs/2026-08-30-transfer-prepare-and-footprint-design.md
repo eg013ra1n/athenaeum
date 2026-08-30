@@ -258,21 +258,29 @@ test — §10).
 
 The invariant TryReference demands — the file never changes after import — is
 already the app's: `packages/<uuid>` is written once by preparation and
-touched again only by `cleanup_package_payloads` (delete) after confirm. The
-order there is the reverse of what this section first assumed: the engine's
-confirmed path cleans the payloads FIRST and then fires `spawn_release`, a
-detached task nobody awaits (`sync/engine.rs`), so a release cannot gate the
-cleanup. Anything the release must protect has to be recoverable from somewhere
-other than the released package's own dir.
+touched again only by `cleanup_package_payloads` (delete) after confirm.
 
-That protection is `role_release` → `copy_shared_children_before_release`: any
-child of the released collection that ANOTHER live hash-seq tag also references
-is re-imported with `Copy` (source: our own file if it still exists, else the
-sharing package's), making it `Owned` before the tag goes away. Without it, two
-packages carrying the same frame share one entry whose first external path
-belongs to whichever finishes first — and the survivor's tag then keeps that
-dead entry alive past GC. The re-serve short-circuit probes for the same reason
-(it skips the import, hence the import's repair).
+Order on confirm is **protect → cleanup → release**, all three on one detached
+task (`engine.rs::spawn_protect_cleanup_release`; the event dispatch itself stays
+synchronous, so a package still cannot be confirmed twice by interleaving):
+
+1. `SharingTransport::protect_shared_before_cleanup` — a new hook with a no-op
+   default (loopback, Perseus, the legacy transport need nothing). The iroh
+   implementation copies into the store every child of this package that ANOTHER
+   live hash-seq tag also references, making it `Owned` (which wins the union
+   from both sides) while the payload files are still on disk. Without it, two
+   packages carrying the same frame share one entry whose first external path
+   belongs to whichever finishes first — and the survivor's tag then keeps that
+   dead entry alive past GC, so nothing would heal it. Source is our own file,
+   falling back to the sharing package's if ours is unexpectedly gone.
+2. Cleanup — **skipped** if step 1 failed: the payload stays on disk (Settings →
+   Sync's "clean up finished transfers" reclaims it later) rather than being
+   deleted out from under another transfer. `error!` either way; the row is
+   already confirmed.
+3. `release` — the tag delete, as before.
+
+The re-serve short-circuit probes for a related reason: it skips the import, and
+with it the import's own repair.
 
 Between cleanup and the next GC pass the store may hold entries whose external
 path is gone; nothing reads them (a manifest-only dir fails

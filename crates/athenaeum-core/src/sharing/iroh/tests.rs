@@ -2781,15 +2781,17 @@ async fn blob_readable(node: &SharedIrohNode, hash: Hash) -> bool {
         .is_ok()
 }
 
-/// Releasing a package must not strip another live package of its bytes.
+/// Deleting a confirmed package's payloads must not strip another live package
+/// of its bytes.
 ///
 /// Two packages carrying the same frame share ONE store entry, whose external
 /// path list is `[A's copy, B's copy]` sorted — so the read follows A's payload
-/// dir, which a confirm then deletes. B's tag keeps the entry alive past GC, so
-/// nothing would heal it. The release copies exactly the shared children into
-/// the store (`Owned`), and nothing else.
+/// dir, which the confirm then deletes. B's tag keeps the entry alive past GC, so
+/// nothing would heal it. `protect_shared_before_cleanup` — which the engine
+/// calls immediately before that deletion — copies exactly the shared children
+/// into the store (`Owned`), and nothing else.
 #[tokio::test]
-async fn release_copies_children_shared_with_another_live_package() {
+async fn protect_before_cleanup_copies_children_shared_with_another_live_package() {
     const SHARED: usize = 300_000;
     // A different size ⇒ different bytes ⇒ a different blob, so the two
     // `store_holds_payload_copy` probes below cannot answer for each other.
@@ -2811,8 +2813,12 @@ async fn release_copies_children_shared_with_another_live_package() {
     out.serve(&ann_b, &pkg_b, None).await.unwrap();
     let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
 
-    out.release(&ann_a.package_id).await.unwrap();
+    // The engine's order: protect, then delete the payloads, then release.
+    out.protect_shared_before_cleanup(&ann_a.package_id)
+        .await
+        .unwrap();
     std::fs::remove_dir_all(&pkg_a).unwrap();
+    out.release(&ann_a.package_id).await.unwrap();
 
     let store_dir = node_dir.join("blobs");
     assert!(
@@ -2831,13 +2837,12 @@ async fn release_copies_children_shared_with_another_live_package() {
     node.shutdown().await;
 }
 
-/// The app's confirmed path deletes the payload dir BEFORE it fires the
-/// (detached, never awaited) release, so the released package's own copy of a
-/// shared file is usually already gone when the protection runs. The sharing
-/// package's own payload is then the source — same bytes, still on disk because
-/// its tag is live.
+/// The protection's fallback source: if our own payload dir is already gone (a
+/// crash between cleanup and a resumed release, an out-of-band purge), the bytes
+/// come from the SHARING package's payload — same blob, still on disk because
+/// that package's tag is live.
 #[tokio::test]
-async fn release_copies_shared_children_from_the_sharer_when_our_dir_is_gone() {
+async fn protect_copies_shared_children_from_the_sharer_when_our_dir_is_gone() {
     const SHARED: usize = 300_000;
 
     let tmp = tempdir().unwrap();
@@ -2853,9 +2858,11 @@ async fn release_copies_shared_children_from_the_sharer_when_our_dir_is_gone() {
     out.serve(&ann_b, &pkg_b, None).await.unwrap();
     let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
 
-    // Payload cleanup first, release second — the real order.
+    // Our dir is already gone when the protection runs.
     std::fs::remove_dir_all(&pkg_a).unwrap();
-    out.release(&ann_a.package_id).await.unwrap();
+    out.protect_shared_before_cleanup(&ann_a.package_id)
+        .await
+        .unwrap();
 
     assert!(
         store_holds_payload_copy(&node_dir.join("blobs"), SHARED as u64),

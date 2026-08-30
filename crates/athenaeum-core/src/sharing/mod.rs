@@ -306,6 +306,20 @@ pub trait SharingTransport: Send + Sync {
     /// caller's state transition — callers log-and-continue on Err.
     async fn release(&self, package_id: &PackageId) -> anyhow::Result<()>;
 
+    /// Called by the engine right before it deletes a confirmed package's payload
+    /// files. A transport that references payloads in place (`TryReference`) must
+    /// make every blob this package shares with another live package outlive the
+    /// deletion (copy it into the store). Failure aborts the cleanup — the payload
+    /// stays on disk; nothing is lost.
+    ///
+    /// The default is a no-op: a transport that copies payloads into its own store
+    /// (Perseus, the legacy iroh transport) or holds no store at all (the
+    /// in-process loopback mock) has nothing to protect.
+    async fn protect_shared_before_cleanup(&self, package_id: &PackageId) -> anyhow::Result<()> {
+        let _ = package_id;
+        Ok(())
+    }
+
     /// List the wire [`PackageId`]s of the receiver-side **in-flight download
     /// tags** currently GC-protecting a partial collection in this transport's
     /// blob store (Transfers Batch Model §D4, B7 orphan reclaim).

@@ -2192,32 +2192,62 @@ impl SharedIrohNode {
         blobs::fetch_manifest_to_dir(&self.store, &endpoint, provider, root_hash, dest_dir).await
     }
 
-    /// Copy into the store every child of the package being released that ANOTHER
-    /// live collection still references — so those blobs survive the payload
-    /// cleanup that follows a terminal transfer (spec §4.2).
+    /// [`SharingTransport::protect_shared_before_cleanup`] for a role handle: make
+    /// this package's shared blobs outlive the payload deletion the engine is
+    /// about to perform (spec §4.2). Runs BEFORE the cleanup, so
+    /// `entry.src_dir` — the package's own payload dir — is still on disk.
+    async fn role_protect_shared_before_cleanup(
+        &self,
+        role: Role,
+        package_id: &PackageId,
+    ) -> Result<()> {
+        let tag = role_package_tag(role.prefix(), package_id);
+        let entry = self
+            .served
+            .lock()
+            .expect("served mutex poisoned")
+            .get(&tag)
+            .cloned();
+        let Some(entry) = entry else {
+            // Nothing served under this tag in THIS process (a restart, or a
+            // transport that never served it) — there is nothing to protect.
+            return Ok(());
+        };
+        let sizes = self
+            .served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .get(&tag)
+            .cloned()
+            .unwrap_or_default();
+        self.copy_shared_children(&tag, package_id, &entry, &sizes)
+            .await
+    }
+
+    /// Copy into the store every child of `entry` that ANOTHER live collection
+    /// also references, so those blobs stop depending on any payload dir.
     ///
     /// Under [`ImportMode::TryReference`] a served blob is a REFERENCE to a file
     /// under `packages/<uuid>`, and iroh keeps a sorted UNION of external paths
     /// per hash, reading `paths.first()`. Two packages carrying the same bytes
     /// therefore share one entry whose first path may belong to whichever of them
-    /// finishes first — and that one's dir is about to be deleted. The surviving
-    /// package's tag keeps the entry alive past GC, so nothing would ever heal it.
+    /// finishes first — and that one's dir is about to be deleted, while the
+    /// survivor's tag keeps the entry alive past GC so nothing would ever heal it.
     /// Re-importing the shared children with [`ImportMode::Copy`] makes them
-    /// `Owned`, which wins the union from both sides, so they no longer depend on
-    /// any payload dir.
+    /// `Owned`, which wins the union from both sides.
     ///
-    /// Sources are tried in order: this package's own file, then the sharing
-    /// package's file. The second is not a nicety — the app's confirmed path runs
-    /// the payload cleanup BEFORE it fires the (detached, never awaited) release,
-    /// so our own copy of the file is usually gone by the time we run.
+    /// Sources are tried in order: this package's own file (the caller runs before
+    /// the cleanup, so it is there), then the sharing package's file — the
+    /// fallback that keeps this correct if our dir is already gone (a crash
+    /// between cleanup and a resumed release, an out-of-band purge).
     ///
     /// Scope guards: `Copy` hosts (Perseus) own their blobs already and return
     /// immediately; children at or below the inline threshold are never external;
     /// a collection that no longer loads is skipped with a `debug!` (nothing left
     /// to protect). A child that is shared but has no readable source anywhere is
-    /// an `error!` + `Err`, which leaves the tag AND the served entries in place —
-    /// a leaked tag is strictly better than another package losing its bytes.
-    async fn copy_shared_children_before_release(
+    /// an `error!` + `Err` — the caller then keeps the payload on disk rather than
+    /// deleting bytes another package still needs.
+    async fn copy_shared_children(
         &self,
         tag: &str,
         package_id: &PackageId,
@@ -2505,29 +2535,6 @@ impl SharedIrohNode {
 
     async fn role_release(&self, role: Role, package_id: &PackageId) -> Result<()> {
         let tag = role_package_tag(role.prefix(), package_id);
-        // Release is the last moment we still know where this package's referenced
-        // bytes live. Any child another live collection also serves has to become
-        // store-owned now, or the payload cleanup that follows a terminal transfer
-        // takes that other package's data with it (spec §4.2). A failure here
-        // returns BEFORE the tag delete, so nothing is unpinned on a half-done
-        // protection pass.
-        let entry = self
-            .served
-            .lock()
-            .expect("served mutex poisoned")
-            .get(&tag)
-            .cloned();
-        if let Some(entry) = entry {
-            let sizes = self
-                .served_files
-                .lock()
-                .expect("served_files mutex poisoned")
-                .get(&tag)
-                .cloned()
-                .unwrap_or_default();
-            self.copy_shared_children_before_release(&tag, package_id, &entry, &sizes)
-                .await?;
-        }
         self.served
             .lock()
             .expect("served mutex poisoned")
@@ -3006,6 +3013,12 @@ impl SharingTransport for RoleHandle {
 
     async fn release(&self, package_id: &PackageId) -> Result<()> {
         self.node.role_release(self.role, package_id).await
+    }
+
+    async fn protect_shared_before_cleanup(&self, package_id: &PackageId) -> Result<()> {
+        self.node
+            .role_protect_shared_before_cleanup(self.role, package_id)
+            .await
     }
 
     async fn list_in_flight_tags(&self) -> Result<Vec<PackageId>> {

@@ -6125,3 +6125,166 @@ async fn cancel_with_dead_peer_revoke_does_not_stall() {
 
     engine.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Transfer-prepare §4.2: protect shared blobs BEFORE the payload cleanup.
+//
+// A transport that serves payloads in place (iroh `ImportMode::TryReference`)
+// keeps blobs pointing at the files inside `packages/<uuid>`, and two packages
+// carrying the same frame share ONE blob — so anything shared has to be copied
+// into the store before those files are deleted. That ordering is the engine's
+// to guarantee, and this pins it: the transport records what it saw.
+// ---------------------------------------------------------------------------
+
+/// Wraps a real loopback endpoint (so the package genuinely confirms) and
+/// records, at the moment `protect_shared_before_cleanup` is called, whether the
+/// package dir still held its payload copies. `false` would mean the engine
+/// cleaned first and handed the hook an empty dir — exactly the bug the hook
+/// exists to prevent.
+struct ProtectProbeTransport {
+    inner: LoopbackTransport,
+    /// The package dir under test.
+    dir: PathBuf,
+    /// Set when the hook runs at all.
+    hook_ran: Arc<AtomicBool>,
+    /// Set when the hook ran while the payload copies were still on disk.
+    payloads_present_at_hook: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for ProtectProbeTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        self.inner.start().await
+    }
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        batch_uuid: &str,
+        files: &[AnnounceFileEntry],
+        layout: PackageLayout,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .announce(to, a, batch_name, batch_uuid, files, layout)
+            .await
+    }
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+        sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        self.inner.fetch(from, pkg, dest, sink).await
+    }
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        self.inner.fetch_manifest(from, pkg, dest).await
+    }
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src: &Path,
+        want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        self.inner.serve(pkg, src, want).await
+    }
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        package_id: PackageId,
+        offer: Vec<OfferEntry>,
+        full_by_rel: HashMap<String, String>,
+    ) -> anyhow::Result<HashSet<String>> {
+        self.inner
+            .negotiate_want(to, package_id, offer, full_by_rel)
+            .await
+    }
+    async fn ack(&self, to: NodeId, pid: &PackageId, r: Vec<FrameReceipt>) -> anyhow::Result<()> {
+        self.inner.ack(to, pid, r).await
+    }
+    async fn release(&self, pid: &PackageId) -> anyhow::Result<()> {
+        self.inner.release(pid).await
+    }
+    async fn protect_shared_before_cleanup(&self, pid: &PackageId) -> anyhow::Result<()> {
+        let payloads = dir_entries(&self.dir)
+            .iter()
+            .any(|n| n != MANIFEST_FILENAME);
+        self.payloads_present_at_hook.store(payloads, SeqCst);
+        self.hook_ran.store(true, SeqCst);
+        self.inner.protect_shared_before_cleanup(pid).await
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.inner.events().await
+    }
+}
+
+/// The confirmed path calls `protect_shared_before_cleanup` BEFORE it deletes the
+/// payload copies — and the cleanup still happens afterwards.
+#[tokio::test]
+async fn confirm_protects_shared_blobs_before_cleaning_payloads() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(
+        &tmp.path().join("srcA"),
+        "uuid-a",
+        "frameA.fits",
+        "M42",
+        4096,
+    );
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let payloads_present_at_hook = Arc::new(AtomicBool::new(false));
+    let transport = Arc::new(ProtectProbeTransport {
+        inner: net.endpoint(),
+        dir: pkg.clone(),
+        hook_ran: Arc::clone(&hook_ran),
+        payloads_present_at_hook: Arc::clone(&payloads_present_at_hook),
+    });
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        transport.clone() as Arc<dyn SharingTransport>,
+        receiver_id,
+    );
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+    wait_until(|| hook_ran.load(SeqCst), WAIT).await;
+
+    assert!(
+        hook_ran.load(SeqCst),
+        "the confirmed path must give the transport its protection hook"
+    );
+    assert!(
+        payloads_present_at_hook.load(SeqCst),
+        "the hook must run while the payload copies are still on disk — after the \
+         cleanup it could no longer copy a shared blob into the store"
+    );
+
+    // And the cleanup still runs: protect → cleanup, not protect INSTEAD OF cleanup.
+    wait_until(
+        || dir_entries(&pkg) == vec![MANIFEST_FILENAME.to_string()],
+        WAIT,
+    )
+    .await;
+    assert_eq!(dir_entries(&pkg), vec![MANIFEST_FILENAME.to_string()]);
+
+    engine.shutdown().await;
+}

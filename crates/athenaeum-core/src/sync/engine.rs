@@ -2109,6 +2109,59 @@ impl Worker {
     /// is deliberately non-async) that triggered it — it only logs. `release`
     /// is idempotent, so a double-fire (e.g. a resumed-then-cancelled row) is
     /// harmless.
+    /// The confirmed-terminal tail, ordered and detached: **protect → cleanup →
+    /// release** (transfer-prepare spec §4.2).
+    ///
+    /// A transport that serves payloads in place (`ImportMode::TryReference`)
+    /// keeps blobs pointing at the files under the package dir, and two packages
+    /// carrying the same frame SHARE one blob — so a blob this package shares with
+    /// another live one has to be copied into the store BEFORE these files are
+    /// deleted. Hence the hook, and hence it running first.
+    ///
+    /// All three steps are detached because [`handle_event`](Self::handle_event) is
+    /// deliberately synchronous (a package can never be confirmed twice by
+    /// interleaving) while the hook is async. The row is already `Confirmed` when
+    /// this is spawned, so nothing here can fail the confirm — but the ORDER
+    /// within the task is guaranteed.
+    ///
+    /// A protection failure SKIPS the cleanup: the payload stays on disk (Settings
+    /// → Sync's "clean up finished transfers" reclaims it later) rather than being
+    /// deleted out from under another transfer. `release` runs either way — the
+    /// tag must not outlive the transfer.
+    fn spawn_protect_cleanup_release(&self, package_id: PackageId, row_id: i64, dir: PathBuf) {
+        let transport = Arc::clone(&self.transport);
+        let sink = self.cleanup_sink.clone();
+        tokio::spawn(async move {
+            match transport.protect_shared_before_cleanup(&package_id).await {
+                Ok(()) => match &sink {
+                    // Multi-target fan-out: the coordinator cleans once, after every
+                    // target is terminal. Same protection precedes it.
+                    Some(sink) => sink.on_terminal(&dir),
+                    None => match cleanup_package_payloads(&dir) {
+                        Ok(freed_bytes) => {
+                            tracing::info!(
+                                package_id = row_id,
+                                freed_bytes,
+                                "package payloads cleaned"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(package_id = row_id, error = %format!("{e:#}"), "package payload cleanup failed");
+                        }
+                    },
+                },
+                Err(e) => tracing::error!(
+                    package_id = row_id,
+                    error = %format!("{e:#}"),
+                    "shared-blob protection failed; keeping payload on disk"
+                ),
+            }
+            if let Err(e) = transport.release(&package_id).await {
+                tracing::warn!(package_id = %package_id.0, error = %format!("{e:#}"), "blob release failed");
+            }
+        });
+    }
+
     fn spawn_release(&self, package_id: PackageId) {
         let transport = Arc::clone(&self.transport);
         tokio::spawn(async move {
@@ -2878,28 +2931,15 @@ impl Worker {
         // confirm — that would strip a still-offline target's retry to a
         // manifest-only collection (silent data loss). Route the terminal signal
         // to the coordinator, which cleans exactly once after every target is
-        // terminal. Without a sink (app / single-target) the original in-line
-        // cleanup runs unchanged.
-        match &self.cleanup_sink {
-            Some(sink) => sink.on_terminal(&pending.dir),
-            None => match cleanup_package_payloads(&pending.dir) {
-                Ok(freed_bytes) => {
-                    tracing::info!(
-                        package_id = pending.id,
-                        freed_bytes,
-                        "package payloads cleaned"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
-                }
-            },
-        }
-        // Terminal: the package is confirmed; drop its served blobs so they do
-        // not outlive the transfer. `package_id` is the id the ack correlated
-        // against (== pending.announce.package_id). Fire-and-forget, never fails
-        // the confirm.
-        self.spawn_release(package_id);
+        // terminal. Without a sink (app / single-target) the direct
+        // `cleanup_package_payloads` runs instead.
+        //
+        // The cleanup is preceded by `protect_shared_before_cleanup` and followed
+        // by the release, all three on ONE detached task — see
+        // [`spawn_protect_cleanup_release`](Self::spawn_protect_cleanup_release)
+        // for why the order is load-bearing. `package_id` is the id the ack
+        // correlated against (== pending.announce.package_id).
+        self.spawn_protect_cleanup_release(package_id, pending.id, pending.dir.clone());
         tracing::info!(package_id = pending.id, state = "confirmed", "sync state");
         self.journal(pending.id, "confirmed", None);
         self.emit_finished(
