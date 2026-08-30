@@ -41,3 +41,6 @@ dist-ssr
 /target-agent/
 .superpowers/
 scripts/__pycache__/
+
+# Per-machine Claude Code permissions (paths bound to one machine)
+.claude/settings.local.json
