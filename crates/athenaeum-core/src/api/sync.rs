@@ -1274,12 +1274,8 @@ pub async fn autostart_if_enabled(
     // left by a crash is dead work whichever way the autostart decides, and a
     // non-terminal row is one the user cannot clear. Never fatal — a heal that
     // fails must not keep the transport down.
-    match crate::api::sync_prepare::heal_interrupted_preparations(ctx) {
-        Ok(0) => {}
-        Ok(n) => tracing::warn!(count = n, "healed interrupted preparations"),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "heal interrupted preparations failed")
-        }
+    if let Err(e) = crate::api::sync_prepare::heal_interrupted_preparations(ctx) {
+        tracing::error!(error = %format!("{e:#}"), "heal interrupted preparations failed");
     }
     let dev = dev_pairing_enabled(ctx)?;
     let signed_in = account_signed_in(ctx)?;
@@ -4160,12 +4156,16 @@ pub async fn send_now_sync_package(
 ///   `Invalid("package is not active")` for a terminal / unknown id (an
 ///   already-terminal package needs no cancel).
 ///
-/// The two routes cannot fight over one row: the worker drops the flag
-/// (`PrepareRuntime::finish`) before it promotes, so a cancel racing the
-/// handover either raises a flag the worker still reads or falls through to the
-/// engine — and one that lands on the engine in the gap between the two still
-/// wins, because the worker promotes with a compare-and-set on `preparing`,
-/// which a terminal row turns into a no-op.
+/// Where the handover falls: a flag raised at any point before the worker's
+/// final read of it — taken after staging, immediately before the row is
+/// promoted — is honoured by the worker, whether or not the staging loop itself
+/// ever saw it (it reads the flag at chunk boundaries only, so a cancel arriving
+/// after the last chunk is invisible to it). Raised after that read, the flag is
+/// never read again: `PrepareRuntime::cancel` no longer knows the row, so the
+/// command falls through to the engine's `cancel` on a row that is now `queued`
+/// — or, in the sliver where it is neither, on a `preparing` row the engine
+/// stamps terminal, which the worker's compare-and-set then declines to promote.
+/// Either way one terminal is written, by whoever holds the row.
 pub async fn cancel_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Result<(), ApiError> {
     if sender.prepare().cancel(id) {
         tracing::info!(package_id = id, "sync package cancel requested (preparing)");
@@ -10678,6 +10678,141 @@ mod tests {
             !sender.prepare().is_preparing(id),
             "the flag is dropped once the worker is done"
         );
+    }
+
+    /// Raises a preparation's cancel flag from INSIDE the worker's own progress
+    /// callback, at the one instant
+    /// [`a_cancel_after_the_last_chunk_still_cancels`] is about: the manifest is
+    /// on disk, so staging is over and its last chunk-boundary cancel check is
+    /// behind us, and the worker has not yet reached its ownership check. The
+    /// callback runs on the worker's own thread, so the flag is up before the
+    /// worker takes another step — no polling, no sleep, no race.
+    ///
+    /// Wraps a [`RecordingEmitter`] so the same instance can be handed to both
+    /// owners of the transfer and "exactly one finish" stays countable.
+    struct CancelWhenStaged {
+        inner: Arc<RecordingEmitter>,
+        sender: Arc<SyncSenderRuntime>,
+        pkg_dir: std::sync::Mutex<Option<PathBuf>>,
+    }
+
+    impl CancelWhenStaged {
+        fn new(sender: Arc<SyncSenderRuntime>) -> Self {
+            Self {
+                inner: Arc::new(RecordingEmitter::default()),
+                sender,
+                pkg_dir: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// The dir to watch for a manifest — known only once the row exists, and
+        /// set before the staging permit is released.
+        fn arm(&self, pkg_dir: PathBuf) {
+            *self.pkg_dir.lock().expect("pkg_dir mutex poisoned") = Some(pkg_dir);
+        }
+
+        fn named(&self, name: &str) -> Vec<serde_json::Value> {
+            self.inner.named(name)
+        }
+    }
+
+    impl crate::events::ProgressEmitter for CancelWhenStaged {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.inner.emit_json(event_name, payload.clone());
+            let staged = self
+                .pkg_dir
+                .lock()
+                .expect("pkg_dir mutex poisoned")
+                .as_ref()
+                .is_some_and(|d| d.join(package::MANIFEST_FILENAME).exists());
+            if !staged {
+                return;
+            }
+            if let Some(id) = payload
+                .get("packageId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                self.sender.prepare().cancel(id);
+            }
+        }
+    }
+
+    /// The cancel window does not close when the last chunk is copied. The flag
+    /// is read at chunk boundaries only, so a cancel raised after the final chunk
+    /// — while the manifest is being written, while the staging pass banks its
+    /// hashes — is never seen by the staging loop. Nothing else looked at it
+    /// either: the worker claimed the row, promoted it and announced the package
+    /// the user had already stopped. The worker therefore re-reads the flag after
+    /// staging and before promoting, and treats it as the cancel it is.
+    #[tokio::test]
+    async fn a_cancel_after_the_last_chunk_still_cancels() {
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let emitter = Arc::new(CancelWhenStaged::new(Arc::clone(&sender)));
+        let (tmp, ctx, engine, peer) = loopback_ctx_with_engine_emitting(Some(
+            Arc::clone(&emitter) as Arc<dyn crate::events::ProgressEmitter>,
+        ))
+        .await;
+        // One small payload: a single chunk, so every cancel check the staging
+        // loop makes is over before the manifest exists.
+        let frame_ids = seed_frames_on_disk(&ctx, &tmp.path().join("M31_data"), 1, 64_000);
+        let permit = sender.prepare().slot().acquire_owned().await.unwrap();
+
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &sync_dirs(&ctx).unwrap().packages_dir,
+            &frame_ids,
+            Some("Batch"),
+            None,
+            peer,
+            Some(Arc::clone(&emitter) as Arc<dyn crate::events::ProgressEmitter>),
+            Arc::clone(&sender),
+        )
+        .await
+        .unwrap();
+        let id = result.outbound_id.unwrap();
+        let db_path = sync_dirs(&ctx).unwrap().db_path;
+        let pkg_dir = PathBuf::from(
+            CatalogSyncStore::open(&db_path)
+                .unwrap()
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .package_ref,
+        );
+        emitter.arm(pkg_dir.clone());
+        drop(permit);
+
+        let row = wait_outbound(&ctx, id, OutboundState::Cancelled).await;
+        assert_eq!(row.package_ref, pkg_dir.to_string_lossy());
+        for _ in 0..500 {
+            if !sender.prepare().is_preparing(id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !sender.prepare().is_preparing(id),
+            "the flag is dropped once the worker is done"
+        );
+        assert!(
+            !pkg_dir.exists(),
+            "the staged package is removed, not announced: {}",
+            pkg_dir.display()
+        );
+        let finished = emitter.named("sync-finished");
+        assert_eq!(
+            finished.len(),
+            1,
+            "one transfer, one finish: {:?}",
+            finished
+        );
+        assert_eq!(finished[0]["outcome"], "cancelled");
+        let c = file_counts(&ctx, id);
+        assert_eq!(c.done, c.total, "every file row is settled");
+        assert_eq!(c.failed, 0, "a cancel is not a failure");
     }
 
     /// A verdict another owner already wrote is FINAL, whatever the copy went on

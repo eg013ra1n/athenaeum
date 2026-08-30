@@ -166,6 +166,31 @@ pub fn spawn_prepare(ctx: Arc<ServiceContext>, sender: Arc<SyncSenderRuntime>, j
         }
         match outcome {
             Ok(Ok(stats)) => {
+                // The staging loop reads the cancel flag at chunk boundaries
+                // only, so one raised after the last chunk — while the manifest
+                // was being written, while the pass banked its hashes, while
+                // this task was waiting to be scheduled — reached nobody, and
+                // the worker would go on to announce a package the user had
+                // already stopped. This is the authoritative read, and it is
+                // sound after `finish` above: `finish` only unregisters the
+                // flag, this `Arc` is the same one every `cancel` stores
+                // through, and the map lock the two share puts any store that
+                // answered the user `true` before this load.
+                if flag.load(Ordering::SeqCst) {
+                    tracing::info!(package_id = id, "preparation cancelled after staging");
+                    terminalize(
+                        &store,
+                        id,
+                        peer,
+                        &pkg_dir,
+                        OutboundState::Cancelled,
+                        None,
+                        "cancelled",
+                        None,
+                        emitter.as_deref(),
+                    );
+                    return;
+                }
                 // The claim above and this promotion are two statements, so the
                 // CAS carries the state the claim read into the WHERE clause: a
                 // verdict that landed in between (a cancel routed to the engine)
