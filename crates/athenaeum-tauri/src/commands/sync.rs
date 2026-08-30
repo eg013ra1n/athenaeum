@@ -10,8 +10,9 @@ use athenaeum_core::api::lights::{FlatNormMode, LightCalParams};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
     DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
-    TransferCleanup, TransferEventEntry, TransferStorage,
+    TransferCleanup, TransferEventEntry, TransferPaths, TransferStorage,
 };
+use athenaeum_core::api::PathPolicy;
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportMode;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
@@ -259,6 +260,43 @@ pub async fn cleanup_finished_transfers(
     state: State<'_, AppState>,
 ) -> Result<TransferCleanup, String> {
     api::cleanup_finished_transfers(&state.ctx, &state.sync)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The two Settings → Transfers folders with their effective/default values.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_transfer_paths(state: State<'_, AppState>) -> Result<TransferPaths, String> {
+    api::get_transfer_paths(&state.ctx, &state.sync)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Persist the two folders (`null` = default); validated before anything is written.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_transfer_paths(
+    state: State<'_, AppState>,
+    outgoing: Option<String>,
+    working: Option<String>,
+) -> Result<TransferPaths, String> {
+    api::set_transfer_paths(
+        &state.ctx,
+        &state.sync,
+        &PathPolicy::AllowAll,
+        outgoing,
+        working,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Remove transfer data left in the default / previous folders after a move.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cleanup_transfer_leftovers(state: State<'_, AppState>) -> Result<u64, String> {
+    api::cleanup_transfer_leftovers(&state.ctx, &state.sync)
         .await
         .map_err(|e| e.to_string())
 }

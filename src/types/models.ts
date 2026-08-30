@@ -1344,7 +1344,20 @@ blobsBytes: number,
  * next to includes what that button can actually move: on a receive-only
  * device the payload pass has nothing in scope by construction.
  */
-stagingBytes: number, };
+stagingBytes: number, 
+/**
+ * Effective outgoing staging folder (display).
+ */
+packagesDir: string, 
+/**
+ * Effective incoming working folder (display).
+ */
+workingDir: string, 
+/**
+ * Bytes still sitting in the default / previous folders after a move
+ * (transfer-prepare spec §6.5); 0 when nothing was moved.
+ */
+leftoverBytes: number, };
 
 export type TransferCleanup = { 
 /**
@@ -1369,6 +1382,24 @@ stagingDirs: number,
  * Bytes reclaimed by removing those staging trees (freed immediately).
  */
 stagingBytes: number, };
+
+export type TransferPaths = { outgoing: PathSetting, working: PathSetting, };
+
+export type PathSetting = { 
+/**
+ * The persisted value, `None` = default.
+ */
+configured: string | null, 
+/**
+ * What is in effect for the NEXT use (packages: next preparation; working:
+ * next transport start).
+ */
+effective: string, default: string, 
+/**
+ * Working dir only: the running node bound a different dir than the one in
+ * effect, so the change waits for a restart. Always `false` for outgoing.
+ */
+restartRequired: boolean, };
 
 export type DeviceCapability = "athenaeum" | "perseus";
 

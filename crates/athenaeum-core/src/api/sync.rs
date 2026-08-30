@@ -4798,6 +4798,233 @@ pub async fn sweep_transfer_orphans(ctx: Arc<ServiceContext>, sync: Arc<SyncRunt
     }
 }
 
+// ── Transfer folder settings (transfer-prepare spec §6.3–6.5) ────────────────
+
+/// One configurable transfer folder as the Settings UI needs it: what is
+/// persisted, what is in effect, what "Use default" restores, and whether the
+/// running transport is still on the old value.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PathSetting {
+    /// The persisted value, `None` = default.
+    pub configured: Option<String>,
+    /// What is in effect for the NEXT use (packages: next preparation; working:
+    /// next transport start).
+    pub effective: String,
+    pub default: String,
+    /// Working dir only: the running node bound a different dir than the one in
+    /// effect, so the change waits for a restart. Always `false` for outgoing.
+    pub restart_required: bool,
+}
+
+/// The pair of folders on Settings → Transfers.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferPaths {
+    pub outgoing: PathSetting,
+    pub working: PathSetting,
+}
+
+/// A path as the UI displays (and the settings row stores) it.
+fn path_string(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Read the two transfer folders with their effective/default values and the
+/// restart-required flag (spec §6.4).
+pub async fn get_transfer_paths(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+) -> Result<TransferPaths, ApiError> {
+    let dirs = sync_dirs(ctx)?;
+    let (out_cfg, work_cfg) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        (
+            configured_dir(&conn, keys::SYNC_OUTGOING_STAGING_DIR)?,
+            configured_dir(&conn, keys::SYNC_INCOMING_WORKING_DIR)?,
+        )
+    };
+    let bound = sync.bound_working_dir().await;
+    let restart_required = matches!(&bound, Some(b) if b != &dirs.working_dir);
+    Ok(TransferPaths {
+        outgoing: PathSetting {
+            configured: out_cfg.as_deref().map(path_string),
+            effective: path_string(&dirs.packages_dir),
+            default: path_string(&dirs.default_packages_dir()),
+            restart_required: false,
+        },
+        working: PathSetting {
+            configured: work_cfg.as_deref().map(path_string),
+            effective: path_string(&dirs.working_dir),
+            default: path_string(&dirs.default_working_dir()),
+            restart_required,
+        },
+    })
+}
+
+/// Persist the two folders (`None` = reset to default) after §6.3 validation.
+/// Nothing is written unless BOTH values validate. A working-dir change records
+/// the previous custom dir for the leftovers report (§6.5).
+pub async fn set_transfer_paths(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+    policy: &crate::api::PathPolicy,
+    outgoing: Option<String>,
+    working: Option<String>,
+) -> Result<TransferPaths, ApiError> {
+    let before = sync_dirs(ctx)?;
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        // `validate_transfer_dir` creates + normalizes the folder, so the value
+        // persisted below is already the resolved one.
+        let out_path = match outgoing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(validate_transfer_dir(
+                &conn,
+                policy,
+                raw,
+                "Outgoing staging folder",
+            )?),
+            None => None,
+        };
+        let work_path = match working.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(validate_transfer_dir(
+                &conn,
+                policy,
+                raw,
+                "Incoming working folder",
+            )?),
+            None => None,
+        };
+        let eff_out = out_path
+            .clone()
+            .unwrap_or_else(|| before.default_packages_dir());
+        let eff_work = work_path
+            .clone()
+            .unwrap_or_else(|| before.default_working_dir());
+        // Nesting the receive tree inside the outgoing staging tree would put
+        // live incoming data in reach of the payload sweeps.
+        if eff_work != eff_out && eff_work.starts_with(&eff_out) {
+            tracing::warn!(
+                outgoing = %eff_out.display(),
+                working = %eff_work.display(),
+                "rejected transfer folders: working inside outgoing"
+            );
+            return Err(ApiError::Invalid(
+                "Incoming working folder: must not be inside the outgoing staging folder".into(),
+            ));
+        }
+        let prev_work = configured_dir(&conn, keys::SYNC_INCOMING_WORKING_DIR)?;
+        if prev_work.as_ref() != work_path.as_ref() {
+            if let Some(prev) = prev_work {
+                crate::db::set_setting(
+                    &conn,
+                    keys::SYNC_INCOMING_WORKING_DIR_PREVIOUS,
+                    &path_string(&prev),
+                )?;
+            }
+        }
+        crate::db::set_setting(
+            &conn,
+            keys::SYNC_OUTGOING_STAGING_DIR,
+            &out_path.as_deref().map(path_string).unwrap_or_default(),
+        )?;
+        crate::db::set_setting(
+            &conn,
+            keys::SYNC_INCOMING_WORKING_DIR,
+            &work_path.as_deref().map(path_string).unwrap_or_default(),
+        )?;
+        tracing::info!(
+            outgoing = %eff_out.display(),
+            working = %eff_work.display(),
+            "transfer folders updated"
+        );
+    }
+    get_transfer_paths(ctx, sync).await
+}
+
+/// The dirs whose contents are leftovers: the default trio under `identity_dir`
+/// when it is not the effective working/packages dir, plus the same trio under
+/// the recorded previous custom working dir.
+fn leftover_dirs(ctx: &ServiceContext, dirs: &SyncDirs) -> Result<Vec<PathBuf>, ApiError> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if dirs.working_dir != dirs.identity_dir {
+        roots.push(dirs.identity_dir.clone());
+    }
+    let prev = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        configured_dir(&conn, keys::SYNC_INCOMING_WORKING_DIR_PREVIOUS)?
+    };
+    if let Some(p) = prev {
+        if p != dirs.working_dir && p != dirs.identity_dir {
+            roots.push(p);
+        }
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        for name in ["blobs", "staging", "packages"] {
+            let d = root.join(name);
+            // The default packages dir is a leftover only if packages moved away.
+            if name == "packages" && d == dirs.packages_dir {
+                continue;
+            }
+            if d.is_dir() {
+                out.push(d);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Delete the transfer data stranded in the default / previous folders after a
+/// move (spec §6.5) and return the bytes freed. Refuses while the running
+/// transport is still bound inside one of them — restart first.
+pub async fn cleanup_transfer_leftovers(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+) -> Result<u64, ApiError> {
+    let dirs = sync_dirs(ctx)?;
+    let targets = leftover_dirs(ctx, &dirs)?;
+    if let Some(bound) = sync.bound_working_dir().await {
+        if targets.iter().any(|t| t.starts_with(&bound)) {
+            tracing::warn!(
+                bound = %bound.display(),
+                count = targets.len(),
+                "leftover cleanup refused: transport still bound under a leftover folder"
+            );
+            return Err(ApiError::Conflict(
+                "The transport is still using the previous folder — restart Athenaeum first".into(),
+            ));
+        }
+    }
+    let mut freed = 0u64;
+    for t in &targets {
+        let bytes = dir_size_bytes(t);
+        match std::fs::remove_dir_all(t) {
+            Ok(()) => freed = freed.saturating_add(bytes),
+            Err(e) => {
+                tracing::error!(path = %t.display(), error = %e, "leftover cleanup failed");
+                return Err(ApiError::Internal(format!("remove {}: {e}", t.display())));
+            }
+        }
+    }
+    // Once nothing is left over, the "previous working dir" breadcrumb has done
+    // its job — drop it so the report stops pointing at an empty folder.
+    if leftover_dirs(ctx, &dirs)?.is_empty() {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::set_setting(&conn, keys::SYNC_INCOMING_WORKING_DIR_PREVIOUS, "")?;
+    }
+    tracing::info!(
+        freed_bytes = freed,
+        count = targets.len(),
+        "transfer leftovers removed"
+    );
+    Ok(freed)
+}
+
 /// On-disk footprint of the transfer machinery's temp data (Batch Model §D4, B7),
 /// for the Settings "Transfer storage" line. Walks `<sync>/packages/` (one entry
 /// per outbound package dir) and sums the blob store dir `<sync>/blobs/`.
@@ -4807,6 +5034,11 @@ pub async fn sweep_transfer_orphans(ctx: Arc<ServiceContext>, sync: Arc<SyncRunt
 /// honest on-disk figure (partial + complete blobs alike). It includes bytes still
 /// pinned by not-yet-swept GC roots, so right after a cleanup it can lag the
 /// eventual reclaimed size by up to one GC window (~15 min).
+///
+/// Every `<sync>/…` path named here is the **effective** folder from
+/// [`SyncDirs`], not a fixed layout: `packages_dir` / `working_dir` report where
+/// the walk actually went, and `leftover_bytes` covers what an earlier folder
+/// still holds after a move.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferStorage {
@@ -4822,14 +5054,23 @@ pub struct TransferStorage {
     /// next to includes what that button can actually move: on a receive-only
     /// device the payload pass has nothing in scope by construction.
     pub staging_bytes: u64,
+    /// Effective outgoing staging folder (display).
+    pub packages_dir: String,
+    /// Effective incoming working folder (display).
+    pub working_dir: String,
+    /// Bytes still sitting in the default / previous folders after a move
+    /// (transfer-prepare spec §6.5); 0 when nothing was moved.
+    pub leftover_bytes: u64,
 }
 
-/// Compute the [`TransferStorage`] footprint (see its doc). Pure fs walk — never
-/// touches the DB or the transport; a missing dir reads as empty (0).
+/// Compute the [`TransferStorage`] footprint (see its doc). Resolves the two
+/// configurable folders through [`sync_dirs`], then walks them; a missing dir
+/// reads as empty (0). The only DB reads are those folder settings — nothing
+/// here touches the transport.
 pub fn get_transfer_storage(ctx: &ServiceContext) -> Result<TransferStorage, ApiError> {
-    let (sync_dir, _db_path) = sync_paths(ctx)?;
-    let packages_dir = sync_dir.join("packages");
-    let blobs_dir = sync_dir.join("blobs");
+    let dirs = sync_dirs(ctx)?;
+    let packages_dir = dirs.packages_dir.clone();
+    let blobs_dir = dirs.blobs_dir();
 
     let mut packages_count = 0u32;
     let mut packages_bytes = 0u64;
@@ -4842,12 +5083,19 @@ pub fn get_transfer_storage(ctx: &ServiceContext) -> Result<TransferStorage, Api
         }
     }
     let blobs_bytes = dir_size_bytes(&blobs_dir);
-    let staging_bytes = dir_size_bytes(&sync_dir.join("staging"));
+    let staging_bytes = dir_size_bytes(&dirs.staging_root());
+    let leftover_bytes = leftover_dirs(ctx, &dirs)?
+        .iter()
+        .map(|d| dir_size_bytes(d))
+        .sum();
     Ok(TransferStorage {
         packages_bytes,
         packages_count,
         blobs_bytes,
         staging_bytes,
+        packages_dir: path_string(&packages_dir),
+        working_dir: path_string(&dirs.working_dir),
+        leftover_bytes,
     })
 }
 
@@ -10123,5 +10371,124 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
         assert!(root.is_dir(), "a pre-existing folder survives a rejection");
+    }
+
+    #[tokio::test]
+    async fn transfer_paths_roundtrip_defaults_and_custom() {
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let paths = get_transfer_paths(&ctx, &sync).await.unwrap();
+        assert!(paths.outgoing.configured.is_none());
+        assert_eq!(paths.outgoing.effective, paths.outgoing.default);
+        assert!(
+            !paths.working.restart_required,
+            "nothing bound, nothing configured"
+        );
+
+        let out = tmp.path().join("custom-out");
+        let work = tmp.path().join("custom-work");
+        let paths = set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            Some(out.to_str().unwrap().to_string()),
+            Some(work.to_str().unwrap().to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            paths.outgoing.configured.as_deref(),
+            Some(out.canonicalize().unwrap().to_str().unwrap())
+        );
+        assert_eq!(
+            PathBuf::from(&paths.working.effective),
+            work.canonicalize().unwrap()
+        );
+        // Not bound yet -> a configured working dir does not demand a restart.
+        assert!(!paths.working.restart_required);
+
+        // Bound elsewhere -> restart required.
+        sync.set_bound_working_dir(tmp.path().join("bound-elsewhere"))
+            .await;
+        let paths = get_transfer_paths(&ctx, &sync).await.unwrap();
+        assert!(paths.working.restart_required);
+
+        // Reset to default clears the key and records the previous working dir.
+        let paths = set_transfer_paths(&ctx, &sync, &crate::api::PathPolicy::AllowAll, None, None)
+            .await
+            .unwrap();
+        assert!(paths.outgoing.configured.is_none());
+        assert!(paths.working.configured.is_none());
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        assert_eq!(
+            crate::db::get_setting(&conn, keys::SYNC_INCOMING_WORKING_DIR_PREVIOUS)
+                .unwrap()
+                .as_deref(),
+            Some(work.canonicalize().unwrap().to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn set_transfer_paths_rejects_working_inside_outgoing() {
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let out = tmp.path().join("out");
+        let err = set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            Some(out.to_str().unwrap().to_string()),
+            Some(out.join("work").to_str().unwrap().to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m.contains("inside")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_report_counts_leftovers_after_a_move() {
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let dirs = sync_dirs(&ctx).unwrap();
+        // Data left in the DEFAULT working dir...
+        std::fs::create_dir_all(dirs.identity_dir.join("blobs")).unwrap();
+        std::fs::write(
+            dirs.identity_dir.join("blobs").join("x.data"),
+            vec![7u8; 4096],
+        )
+        .unwrap();
+        // ...after the operator moved the working dir elsewhere.
+        let work = tmp.path().join("work");
+        set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            None,
+            Some(work.to_str().unwrap().to_string()),
+        )
+        .await
+        .unwrap();
+        let report = get_transfer_storage(&ctx).unwrap();
+        assert_eq!(report.leftover_bytes, 4096);
+        assert_eq!(
+            PathBuf::from(&report.working_dir),
+            work.canonicalize().unwrap()
+        );
+
+        // Cleanup refuses while bound there, then frees when not.
+        sync.set_bound_working_dir(dirs.identity_dir.clone()).await;
+        assert!(matches!(
+            cleanup_transfer_leftovers(&ctx, &sync).await.unwrap_err(),
+            ApiError::Conflict(_)
+        ));
+        sync.set_bound_working_dir(work.clone()).await;
+        let freed = cleanup_transfer_leftovers(&ctx, &sync).await.unwrap();
+        assert_eq!(freed, 4096);
+        assert!(!dirs.identity_dir.join("blobs").exists());
+        assert_eq!(get_transfer_storage(&ctx).unwrap().leftover_bytes, 0);
     }
 }

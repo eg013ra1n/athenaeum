@@ -386,7 +386,11 @@ pub async fn set_scan_root_monitor_enabled(
 /// Empty `allowed_paths` (the common unsandboxed web deployment) yields
 /// `AllowAll`, matching the pre-conversion `if !allowed_paths.is_empty()`
 /// short-circuit.
-fn allowed_roots_policy(allowed_paths: &[PathBuf]) -> PathPolicy {
+///
+/// `pub(crate)` so every route that hands a user-supplied path to the shared
+/// `api` layer builds the SAME sandbox — the transfer-folder routes in
+/// [`crate::routes::sync`] included.
+pub(crate) fn allowed_roots_policy(allowed_paths: &[PathBuf]) -> PathPolicy {
     if allowed_paths.is_empty() {
         PathPolicy::AllowAll
     } else {

@@ -200,6 +200,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::sync::DeletedTransferRecord,
             crate::api::sync::TransferStorage,
             crate::api::sync::TransferCleanup,
+            crate::api::sync::TransferPaths,
+            crate::api::sync::PathSetting,
             crate::account::DeviceCapability,
             crate::account::EndpointAddrReport,
             crate::account::AccountDevice,

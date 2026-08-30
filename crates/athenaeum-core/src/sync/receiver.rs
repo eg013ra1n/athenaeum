@@ -3601,6 +3601,10 @@ pub struct SyncRuntime {
     /// refusal burst across either gate triggers at most one hub round-trip per
     /// gap.
     pub(crate) refusal: Arc<RefusalRefresher>,
+    /// The working dir the running node bound its blob store under (transfer-
+    /// prepare spec §6.4) — `None` until `ensure_started` binds. Compared with
+    /// the configured setting to raise the "restart required" badge.
+    bound_working_dir: tokio::sync::Mutex<Option<PathBuf>>,
 }
 
 impl SyncRuntime {
@@ -3612,12 +3616,27 @@ impl SyncRuntime {
             // 5-minute refusal debounce (spec): a machine just added to the
             // account is admitted within one gap of its first refused retry.
             refusal: Arc::new(RefusalRefresher::new(std::time::Duration::from_secs(300))),
+            bound_working_dir: tokio::sync::Mutex::new(None),
         }
     }
 
     /// Whether the transport has been started (a ticket exists).
     pub async fn is_started(&self) -> bool {
         self.inner.lock().await.is_some()
+    }
+
+    /// The working dir the running node actually bound under, or `None` when the
+    /// transport has never started this run. `get_transfer_paths` compares it
+    /// with the configured folder to decide whether a change needs a restart.
+    pub async fn bound_working_dir(&self) -> Option<PathBuf> {
+        self.bound_working_dir.lock().await.clone()
+    }
+
+    /// Record the working dir the transport bound under. Called by
+    /// [`ensure_started`](Self::ensure_started); tests set it directly to
+    /// simulate a running node.
+    pub(crate) async fn set_bound_working_dir(&self, dir: PathBuf) {
+        *self.bound_working_dir.lock().await = Some(dir);
     }
 
     /// The current pairing ticket, if started.
@@ -3698,6 +3717,9 @@ impl SyncRuntime {
 
         std::fs::create_dir_all(&sync_dir)
             .with_context(|| format!("create sync dir {}", sync_dir.display()))?;
+        // Remember what this run actually bound under: a later settings change
+        // only takes effect on the next start, and the UI says so (spec §6.4).
+        self.set_bound_working_dir(sync_dir.clone()).await;
         let store = Arc::new(
             CatalogSyncStore::open(&db_path)
                 .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
