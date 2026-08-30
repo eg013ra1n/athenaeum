@@ -2268,7 +2268,7 @@ impl Worker {
 
     /// Drive a durable row the API layer put in front of the worker — the shared
     /// body of [`Command::Resend`] and [`Command::Drive`], told apart only by the
-    /// `why` log field.
+    /// `reason` log field.
     ///
     /// `resend` (Transfers Batch Model §D1/§D3): `resend_transfer` has already
     /// reset the SAME row back to `Queued` — attempts++, a fresh per-attempt wire
@@ -2281,7 +2281,7 @@ impl Worker {
     /// transition), so a fresh [`start_package`](Self::start_package) is what picks
     /// it up — reading `wire_package_id` fresh, nothing cached across the reset.
     /// This mirrors the crash-resume drive, scoped to this engine's own peer.
-    async fn drive_package(&mut self, id: i64, why: &'static str) {
+    async fn drive_package(&mut self, id: i64, reason: &'static str) {
         // Already live (a fresh-built engine's crash-resume beat this command to the
         // row): just collapse its backoff so it re-announces now.
         if self.pending.contains_key(&id) {
@@ -2291,17 +2291,21 @@ impl Worker {
         let row = match self.store.get_outbound(id) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                tracing::warn!(package_id = id, why, "outbound row vanished; ignoring");
+                tracing::warn!(package_id = id, reason, "outbound row vanished; ignoring");
                 return;
             }
             Err(e) => {
-                tracing::error!(package_id = id, why, error = %format!("{e:#}"), "read outbound row failed");
+                tracing::error!(package_id = id, reason, error = %format!("{e:#}"), "read outbound row failed");
                 return;
             }
         };
         // Scope to this engine's peer (the shared store returns every peer's rows).
         if row.peer != self.peer {
-            tracing::warn!(package_id = id, why, "row targets another peer; ignoring");
+            tracing::warn!(
+                package_id = id,
+                reason,
+                "row targets another peer; ignoring"
+            );
             return;
         }
         // The API layer guards state eligibility + does the reset/insert; if the row
@@ -2309,7 +2313,7 @@ impl Worker {
         if row.state.is_terminal() {
             tracing::warn!(
                 package_id = id,
-                why,
+                reason,
                 state = row.state.as_str(),
                 "row is terminal; not driving"
             );
@@ -2317,7 +2321,7 @@ impl Worker {
         }
         let dir = PathBuf::from(&row.package_ref);
         if let Err(e) = self.start_package(id, dir, row.state).await {
-            tracing::error!(package_id = id, why, error = %format!("{e:#}"), "start_package failed");
+            tracing::error!(package_id = id, reason, error = %format!("{e:#}"), "start_package failed");
         }
     }
 

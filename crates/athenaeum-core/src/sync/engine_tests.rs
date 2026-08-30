@@ -6008,6 +6008,12 @@ async fn drive_picks_up_a_pre_inserted_queued_row_and_confirms_it() {
     )
     .await;
 
+    assert_eq!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "the driven row confirmed"
+    );
+
     let rows = files_of(&store, id);
     assert!(!rows.is_empty(), "the driven batch kept its per-file rows");
     assert!(
