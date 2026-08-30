@@ -781,31 +781,49 @@ fn content_mismatch_warns(existing_hash: Option<&str>, incoming_hash: &str) -> b
     matches!(existing_hash, Some(h) if h != incoming_hash)
 }
 
+/// Link `src` to `dest` (same volume: zero-copy, shares the inode) or, when the
+/// platform/volume refuses (`EXDEV`, SMB/NFS/exFAT, permission), copy. `force_copy`
+/// is the test seam for the fallback branch. Never fails a landing for a link
+/// refusal — copy was the behavior before transfer-prepare spec §5.2.
+fn link_or_copy(src: &Path, dest: &Path, force_copy: bool) -> Result<()> {
+    if !force_copy {
+        match std::fs::hard_link(src, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    src = %src.display(),
+                    dest = %dest.display(),
+                    error = %e,
+                    "hard link refused; copying instead"
+                );
+            }
+        }
+    }
+    std::fs::copy(src, dest).with_context(|| format!("copy payload to {}", dest.display()))?;
+    Ok(())
+}
+
 /// Land an accepted payload mirroring the sender's tree under `<landing_base>/<rel_path>`,
-/// tmp-copy + atomic rename, collision-suffixed. `landing_base` is the package's
-/// resolved landing directory (`<incoming_root>/<sender_slug>[/<batch_slug>]`,
+/// tmp-link (copy on refusal) + atomic rename, collision-suffixed. `landing_base` is the
+/// package's resolved landing directory (`<incoming_root>/<sender_slug>[/<batch_slug>]`,
 /// Transfers Status Model v2 §D2); `rel_path` is `validate_rel_path`-guarded in
 /// `process_frame`, so the join cannot escape `<landing_base>/`. Returns the final path.
-fn land_payload(
-    landing_base: &Path,
-    payload: &Path,
-    record: &ManifestRecord,
-) -> Result<PathBuf> {
+fn land_payload(landing_base: &Path, payload: &Path, record: &ManifestRecord) -> Result<PathBuf> {
     let dest = unique_path(&landing_base.join(Path::new(&record.rel_path)));
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create landing dir {}", parent.display()))?;
     }
 
-    // tmp + atomic rename: copy to a sibling temp, then rename into place.
-    // The staging payload lives under the same incoming_root, so this is normally
-    // an intra-filesystem move; the copy handles the cross-device case too.
+    // Link (or copy) to a sibling temp, then rename into place. The staged file
+    // stays until the package epilogue removes staging — the blob store references
+    // it (transfer-prepare spec §5.2), so it must outlive the collection's tag.
     let tmp = dest.with_extension(format!(
         "{}.tmp",
         dest.extension().and_then(|e| e.to_str()).unwrap_or("part")
     ));
-    std::fs::copy(payload, &tmp)
-        .with_context(|| format!("copy payload to {}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    link_or_copy(payload, &tmp, false)?;
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("rename landed file into {}", dest.display()))?;
     Ok(dest)
@@ -1186,5 +1204,58 @@ mod content_warn_tests {
     #[test]
     fn known_differing_hash_warns() {
         assert!(content_mismatch_warns(Some("abc123"), "def456"));
+    }
+}
+
+#[cfg(test)]
+mod land_payload_tests {
+    #[cfg(unix)]
+    #[test]
+    fn land_payload_hard_links_on_the_same_volume_and_keeps_staging() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staging").join("x.fits");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"payload").unwrap();
+        let landing = tmp.path().join("incoming");
+        let record = crate::package::ManifestRecord {
+            v: crate::package::MANIFEST_VERSION,
+            frame_uuid: "u".into(),
+            origin_catalog_uuid: "u".into(),
+            origin_device: "d".into(),
+            payload_kind: crate::package::PayloadKind::RawFrame,
+            rel_path: "sub/x.fits".into(),
+            byte_size: 7,
+            xxh3: crate::package::xxh3_full_file(&staged).unwrap(),
+            frame_meta: serde_json::json!({}),
+            analysis: None,
+            app_version: "t".into(),
+            project: None,
+        };
+        let landed = super::land_payload(&landing, &staged, &record).unwrap();
+        assert_eq!(landed, landing.join("sub").join("x.fits"));
+        assert!(
+            staged.exists(),
+            "staging copy left in place until the package epilogue"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().ino(),
+            std::fs::metadata(&landed).unwrap().ino(),
+            "same inode: linked, not copied"
+        );
+        assert!(!landing.join("sub").join("x.fits.tmp").exists());
+    }
+
+    #[test]
+    fn land_payload_falls_back_to_copy_when_linking_fails() {
+        // A link target on a path whose parent is a FILE cannot be linked or created
+        // — use the copy fallback seam instead: link to a dest inside a read-only
+        // dir is platform-dependent, so exercise the fallback through the helper.
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("x.fits");
+        std::fs::write(&staged, b"payload").unwrap();
+        let tmp_dest = tmp.path().join("x.fits.tmp");
+        super::link_or_copy(&staged, &tmp_dest, true).unwrap();
+        assert_eq!(std::fs::read(&tmp_dest).unwrap(), b"payload");
     }
 }
