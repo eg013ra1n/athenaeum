@@ -1355,7 +1355,10 @@ packagesDir: string,
 workingDir: string, 
 /**
  * Bytes still sitting in the default / previous folders after a move
- * (transfer-prepare spec §6.5); 0 when nothing was moved.
+ * (transfer-prepare spec §6.5); 0 when nothing was moved. Counts exactly
+ * what `cleanup_transfer_leftovers` would remove — receive-side `blobs/` +
+ * `staging/` of a superseded working dir, and only the ROW-LESS payload
+ * dirs of a superseded packages dir.
  */
 leftoverBytes: number, };
 

@@ -4903,9 +4903,22 @@ pub async fn set_transfer_paths(
         let eff_work = work_path
             .clone()
             .unwrap_or_else(|| before.default_working_dir());
+        // One folder for both would put the receive tree's `blobs`/`staging`
+        // beside the payload dirs the outgoing sweeps own, and would make the
+        // leftovers legs below indistinguishable.
+        if eff_work == eff_out {
+            tracing::warn!(
+                outgoing = %eff_out.display(),
+                "rejected transfer folders: outgoing and working are the same folder"
+            );
+            return Err(ApiError::Invalid(
+                "Incoming working folder: must not be the same folder as the outgoing staging folder"
+                    .into(),
+            ));
+        }
         // Nesting the receive tree inside the outgoing staging tree would put
         // live incoming data in reach of the payload sweeps.
-        if eff_work != eff_out && eff_work.starts_with(&eff_out) {
+        if eff_work.starts_with(&eff_out) {
             tracing::warn!(
                 outgoing = %eff_out.display(),
                 working = %eff_work.display(),
@@ -4944,34 +4957,97 @@ pub async fn set_transfer_paths(
     get_transfer_paths(ctx, sync).await
 }
 
-/// The dirs whose contents are leftovers: the default trio under `identity_dir`
-/// when it is not the effective working/packages dir, plus the same trio under
-/// the recorded previous custom working dir.
+/// Every absolute payload-dir path named by a `sync_outbound` row, in ANY state
+/// — the set the leftovers pass must never touch. A terminal row keeps its
+/// payload for Resend and a non-terminal row needs it for its live attempt;
+/// reclaiming the terminal ones is [`cleanup_finished_transfers`]'s job, not
+/// this one.
+///
+/// Full paths, unlike the basename-keyed [`referenced_package_keys`]: a leftover
+/// packages root and the effective one can hold identically-named `<uuid>` dirs,
+/// and a basename match there would spare a genuine leftover. Both sides go
+/// through [`crate::api::scan_roots::normalize_path`] so a Windows verbatim
+/// prefix on one side cannot hide a match.
+fn referenced_package_paths(ctx: &ServiceContext) -> Result<HashSet<PathBuf>, ApiError> {
+    use crate::sync::store::outbound_ref_states;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(outbound_ref_states(&conn)?
+        .into_iter()
+        .map(|(_, package_ref, _)| crate::api::scan_roots::normalize_path(Path::new(&package_ref)))
+        .collect())
+}
+
+/// The concrete directories the leftovers report counts and the cleanup removes
+/// — ONE enumeration shared by [`get_transfer_storage`] and
+/// [`cleanup_transfer_leftovers`], so the figure the card shows is exactly what
+/// the button frees.
+///
+/// The legs are gated **independently** (review fix): `blobs/` and `staging/`
+/// belong to the receive side and follow the WORKING dir, `packages/` belongs to
+/// the send side and follows the OUTGOING dir. Keying all three on the working
+/// dir was wrong twice over — it hid `<identity>/packages` leftovers when only
+/// the outgoing folder moved, and, when both had moved, it offered the whole
+/// `packages/` tree for deletion including the payload dirs of live
+/// `sync_outbound` rows, quietly making a pending or resendable transfer
+/// undeliverable.
+///
+/// So a leftover packages root contributes only its ROW-LESS top-level dirs (see
+/// [`referenced_package_paths`]), listed individually; `blobs/` and `staging/`
+/// contribute whole.
 fn leftover_dirs(ctx: &ServiceContext, dirs: &SyncDirs) -> Result<Vec<PathBuf>, ApiError> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if dirs.working_dir != dirs.identity_dir {
-        roots.push(dirs.identity_dir.clone());
-    }
     let prev = {
         let db = db(ctx)?;
         let conn = db.conn();
         configured_dir(&conn, keys::SYNC_INCOMING_WORKING_DIR_PREVIOUS)?
     };
+
+    // Roots whose receive-side legs are stale…
+    let mut working_roots: Vec<PathBuf> = Vec::new();
+    // …and roots whose send-side `packages/` is stale. A root can be in either,
+    // both, or neither.
+    let mut packages_roots: Vec<PathBuf> = Vec::new();
+    if dirs.working_dir != dirs.identity_dir {
+        working_roots.push(dirs.identity_dir.clone());
+    }
+    if dirs.packages_dir != dirs.default_packages_dir() {
+        packages_roots.push(dirs.identity_dir.clone());
+    }
     if let Some(p) = prev {
         if p != dirs.working_dir && p != dirs.identity_dir {
-            roots.push(p);
+            if p.join("packages") != dirs.packages_dir {
+                packages_roots.push(p.clone());
+            }
+            working_roots.push(p);
         }
     }
+
     let mut out = Vec::new();
-    for root in roots {
-        for name in ["blobs", "staging", "packages"] {
+    for root in &working_roots {
+        for name in ["blobs", "staging"] {
             let d = root.join(name);
-            // The default packages dir is a leftover only if packages moved away.
-            if name == "packages" && d == dirs.packages_dir {
-                continue;
-            }
             if d.is_dir() {
                 out.push(d);
+            }
+        }
+    }
+    if !packages_roots.is_empty() {
+        // Read once for the whole pass, not per root.
+        let referenced = referenced_package_paths(ctx)?;
+        for root in &packages_roots {
+            let dir = root.join("packages");
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if referenced.contains(&crate::api::scan_roots::normalize_path(&p)) {
+                    continue;
+                }
+                out.push(p);
             }
         }
     }
@@ -4979,8 +5055,10 @@ fn leftover_dirs(ctx: &ServiceContext, dirs: &SyncDirs) -> Result<Vec<PathBuf>, 
 }
 
 /// Delete the transfer data stranded in the default / previous folders after a
-/// move (spec §6.5) and return the bytes freed. Refuses while the running
-/// transport is still bound inside one of them — restart first.
+/// move (spec §6.5) and return the bytes freed. Removes exactly what
+/// [`leftover_dirs`] enumerates — so never a payload dir a `sync_outbound` row
+/// still names. Refuses while the running transport is bound at, under, or above
+/// one of the targets — restart first.
 pub async fn cleanup_transfer_leftovers(
     ctx: &ServiceContext,
     sync: &SyncRuntime,
@@ -4988,7 +5066,15 @@ pub async fn cleanup_transfer_leftovers(
     let dirs = sync_dirs(ctx)?;
     let targets = leftover_dirs(ctx, &dirs)?;
     if let Some(bound) = sync.bound_working_dir().await {
-        if targets.iter().any(|t| t.starts_with(&bound)) {
+        // Symmetric on purpose: refuse both when a target sits under the live
+        // store (deleting it would take the store with it) and when the live
+        // store sits under a target (`bound = <identity>/blobs/x` with
+        // `<identity>/blobs` queued for removal). Either direction is a delete
+        // through a folder the transport still holds open.
+        if targets
+            .iter()
+            .any(|t| t.starts_with(&bound) || bound.starts_with(t))
+        {
             tracing::warn!(
                 bound = %bound.display(),
                 count = targets.len(),
@@ -5059,7 +5145,10 @@ pub struct TransferStorage {
     /// Effective incoming working folder (display).
     pub working_dir: String,
     /// Bytes still sitting in the default / previous folders after a move
-    /// (transfer-prepare spec §6.5); 0 when nothing was moved.
+    /// (transfer-prepare spec §6.5); 0 when nothing was moved. Counts exactly
+    /// what `cleanup_transfer_leftovers` would remove — receive-side `blobs/` +
+    /// `staging/` of a superseded working dir, and only the ROW-LESS payload
+    /// dirs of a superseded packages dir.
     pub leftover_bytes: u64,
 }
 
@@ -10447,6 +10536,129 @@ mod tests {
             matches!(err, ApiError::Invalid(ref m) if m.contains("inside")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_transfer_paths_rejects_equal_outgoing_and_working() {
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let both = tmp.path().join("one-folder");
+        let err = set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            Some(both.to_str().unwrap().to_string()),
+            Some(both.to_str().unwrap().to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m.contains("same folder")),
+            "{err:?}"
+        );
+        // The rejection is a full abort: neither key was written.
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        assert_eq!(
+            configured_dir(&conn, keys::SYNC_OUTGOING_STAGING_DIR).unwrap(),
+            None
+        );
+        assert_eq!(
+            configured_dir(&conn, keys::SYNC_INCOMING_WORKING_DIR).unwrap(),
+            None
+        );
+    }
+
+    /// Moving ONLY the outgoing folder strands `<identity>/packages` — and the
+    /// pass must still spare any payload dir a `sync_outbound` row names.
+    #[tokio::test]
+    async fn leftovers_after_moving_only_the_outgoing_folder() {
+        use crate::sharing::AnnounceFileEntry;
+        use crate::sync::store::insert_outbound_with_files;
+
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let dirs = sync_dirs(&ctx).unwrap();
+
+        // Two payload dirs in the DEFAULT packages dir: A row-less, B referenced.
+        let pkg_a = dirs.default_packages_dir().join("uuid-a");
+        let pkg_b = dirs.default_packages_dir().join("uuid-b");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::create_dir_all(&pkg_b).unwrap();
+        std::fs::write(pkg_a.join("a.fits"), vec![1u8; 4096]).unwrap();
+        std::fs::write(pkg_b.join("b.fits"), vec![2u8; 2048]).unwrap();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            insert_outbound_with_files(
+                &conn,
+                pkg_b.to_str().unwrap(),
+                &"cc".repeat(32),
+                None,
+                &[AnnounceFileEntry {
+                    rel_path: "Lights/b.fits".into(),
+                    byte_size: 2048,
+                    frame_uuid: "b".into(),
+                }],
+                PackageLayout::Batch,
+            )
+            .unwrap();
+        }
+
+        // Move ONLY the outgoing folder; the working dir stays at its default.
+        let out = tmp.path().join("moved-out");
+        set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            Some(out.to_str().unwrap().to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let report = get_transfer_storage(&ctx).unwrap();
+        assert_eq!(
+            report.leftover_bytes, 4096,
+            "the row-less dir counts, the referenced one does not"
+        );
+
+        let freed = cleanup_transfer_leftovers(&ctx, &sync).await.unwrap();
+        assert_eq!(freed, 4096);
+        assert!(!pkg_a.exists(), "the row-less payload dir is gone");
+        assert!(
+            pkg_b.is_dir(),
+            "a payload dir a sync_outbound row still names is never removed"
+        );
+        assert_eq!(get_transfer_storage(&ctx).unwrap().leftover_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_when_the_bound_dir_is_under_a_target() {
+        let (tmp, ctx) = test_ctx();
+        let sync = crate::sync::SyncRuntime::new();
+        let dirs = sync_dirs(&ctx).unwrap();
+        std::fs::create_dir_all(dirs.identity_dir.join("blobs")).unwrap();
+        let work = tmp.path().join("work");
+        set_transfer_paths(
+            &ctx,
+            &sync,
+            &crate::api::PathPolicy::AllowAll,
+            None,
+            Some(work.to_str().unwrap().to_string()),
+        )
+        .await
+        .unwrap();
+
+        // The live store sits BELOW a queued target — the mirror image of the
+        // target-below-bound case, and just as unsafe to delete through.
+        sync.set_bound_working_dir(dirs.identity_dir.join("blobs").join("x"))
+            .await;
+        assert!(matches!(
+            cleanup_transfer_leftovers(&ctx, &sync).await.unwrap_err(),
+            ApiError::Conflict(_)
+        ));
+        assert!(dirs.identity_dir.join("blobs").is_dir(), "nothing removed");
     }
 
     #[tokio::test]
