@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::api::blobs::{AddPathOptions, AddProgressItem, ImportMode};
+use iroh_blobs::api::blobs::{
+    AddPathOptions, AddProgressItem, ExportMode, ExportOptions, ImportMode,
+};
 use iroh_blobs::api::downloader::{DownloadProgressItem, DownloadRequest, Shuffled, SplitStrategy};
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
@@ -581,6 +583,43 @@ pub(crate) fn in_flight_tag(permanent_tag: &str) -> String {
     format!("in-flight/{permanent_tag}")
 }
 
+/// An export that failed because the blob's data file is gone from the path the
+/// store references — the ONE export failure that is a transfer-class error and
+/// never a [`LocalFault`].
+///
+/// Transfer-prepare spec §5.3: with [`ExportMode::TryReference`] the store stops
+/// owning a copy and points at the staged file instead. Two in-flight inbound
+/// packages that share a byte-identical file therefore share one entry, and if
+/// the first is confirmed and its staging cleaned before the second exports,
+/// that second export finds the referenced file gone while GC (≤ 15 min) has not
+/// yet dropped the dead entry. Classifying that as a local fault would
+/// terminalize the row `Failed`; it has to park `Waiting` so the sender's retry
+/// re-downloads the blob after GC.
+///
+/// iroh-blobs surfaces it as an io `NotFound` inside
+/// [`iroh_blobs::api::RequestError::Inner`] — the store opens the referenced
+/// path (`reflink_or_copy`, or the "no external data path"/"no entry found"
+/// guards) and that open fails. An RPC-layer failure is never this case. The
+/// string check is a belt-and-braces fallback for a NotFound that arrives
+/// wrapped in `io::Error::other` rather than as a kind.
+pub(crate) fn export_source_vanished(err: &iroh_blobs::api::RequestError) -> bool {
+    match err {
+        iroh_blobs::api::RequestError::Inner {
+            source: iroh_blobs::api::Error::Io(io_err),
+            ..
+        } => {
+            io_err.kind() == std::io::ErrorKind::NotFound || {
+                let text = io_err.to_string();
+                text.contains("No such file") || text.contains("os error 2")
+            }
+        }
+        // An rpc-layer failure is a transport/actor problem, never a missing
+        // source file. (`RequestError` is `#[non_exhaustive]`, hence the
+        // wildcard rather than a named `Rpc` arm.)
+        _ => false,
+    }
+}
+
 /// Download the collection identified by `root_hash` from `provider` into
 /// `store`, then export every entry to its `rel_path` under `dest_dir`,
 /// reconstructing the package directory.
@@ -809,15 +848,41 @@ pub async fn fetch_collection_to_dir(
                 )
             })?;
         }
-        store
+        // Transfer-prepare spec §5.1: MOVE the store-owned data file into staging
+        // (rename; EXDEV → copy, and iroh drops its own copy either way). The
+        // store then REFERENCES the staged file, so the receiver holds one copy
+        // of the payload instead of two while the package awaits confirmation.
+        let res = store
             .blobs()
-            .export(*blob_hash, &target)
-            .await
-            .map_err(|e| {
-                LocalFault(
-                    anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
-                )
-            })?;
+            .export_with_opts(ExportOptions {
+                hash: *blob_hash,
+                mode: ExportMode::TryReference,
+                target: target.clone(),
+            })
+            .finish()
+            .await;
+        if let Err(e) = res {
+            if export_source_vanished(&e) {
+                // §5.3: a same-hash sibling package's staged file was cleaned
+                // before this export ran and GC has not yet dropped the dead
+                // entry. NOT a local fault: the row parks `Waiting`, the sender
+                // re-announces, GC (≤ 15 min) purges the entry and the retry
+                // re-downloads the blob.
+                tracing::warn!(
+                    hash = %blob_hash,
+                    path = %target.display(),
+                    error = %format!("{e:#}"),
+                    "export source vanished; waiting for GC before retry"
+                );
+                return Err(
+                    anyhow::Error::new(e).context(format!("export {name}: source vanished"))
+                );
+            }
+            return Err(LocalFault(
+                anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
+            )
+            .into());
+        }
     }
 
     tracing::debug!(

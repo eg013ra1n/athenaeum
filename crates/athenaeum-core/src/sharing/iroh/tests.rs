@@ -3042,3 +3042,79 @@ async fn protect_skips_the_synthesized_subset_manifest() {
 
     node.shutdown().await;
 }
+
+/// Transfer-prepare spec §5.1/§5.3: the receiver's export MOVES the store-owned
+/// data file into staging (`ExportMode::TryReference`) instead of copying it, so
+/// an inbound package never costs two copies of every frame on disk. The store
+/// then references the staged file — and once that external path is gone (a
+/// same-hash sibling package's staged file cleaned before this export ran, GC not
+/// yet caught up), the export fails with a *vanished source*, which
+/// [`export_source_vanished`] must recognize so the row parks `Waiting` instead
+/// of being terminalized `Failed`.
+#[tokio::test]
+async fn export_try_reference_leaves_no_owned_copy_in_the_store() {
+    use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    let bytes: Vec<u8> = (0..500_000u32).map(|i| (i % 249) as u8).collect();
+    let tag = store
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    assert!(
+        store_holds_payload_copy(&tmp.path().join("s"), 500_000),
+        "owned before export"
+    );
+    let target = tmp.path().join("staging").join("a.fits");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tag.hash(),
+            mode: ExportMode::TryReference,
+            target: target.clone(),
+        })
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    assert!(
+        !store_holds_payload_copy(&tmp.path().join("s"), 500_000),
+        "moved out: the store no longer owns a copy"
+    );
+    // A second export of the same hash copies FROM the external path.
+    let target2 = tmp.path().join("staging").join("b.fits");
+    store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tag.hash(),
+            mode: ExportMode::TryReference,
+            target: target2.clone(),
+        })
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&target2).unwrap(), bytes);
+    // And once that external path is gone, the export fails with a vanished source.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::remove_file(&target2).unwrap();
+    let target3 = tmp.path().join("staging").join("c.fits");
+    let err = store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tag.hash(),
+            mode: ExportMode::TryReference,
+            target: target3,
+        })
+        .finish()
+        .await
+        .unwrap_err();
+    assert!(
+        crate::sharing::iroh::blobs::export_source_vanished(&err),
+        "{err:?}"
+    );
+}
