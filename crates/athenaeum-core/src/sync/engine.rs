@@ -2102,13 +2102,6 @@ impl Worker {
         tracing::info!(package_id = id, "kick: immediate retry");
     }
 
-    /// Fire-and-forget blob release for a package that has reached a terminal
-    /// state (confirmed / failed / cancelled). Runs on a detached task over a
-    /// clone of the transport `Arc`, so a release failure can never block or
-    /// fail the synchronous state transition ([`handle_event`](Self::handle_event)
-    /// is deliberately non-async) that triggered it — it only logs. `release`
-    /// is idempotent, so a double-fire (e.g. a resumed-then-cancelled row) is
-    /// harmless.
     /// The confirmed-terminal tail, ordered and detached: **protect → cleanup →
     /// release** (transfer-prepare spec §4.2).
     ///
@@ -2162,6 +2155,16 @@ impl Worker {
         });
     }
 
+    /// Fire-and-forget blob release for a package that has reached a terminal
+    /// state that KEEPS its payload (failed / cancelled / cancelled-by-receiver;
+    /// the confirmed path goes through
+    /// [`spawn_protect_cleanup_release`](Self::spawn_protect_cleanup_release)
+    /// instead, since only it deletes anything). Runs on a detached task over a
+    /// clone of the transport `Arc`, so a release failure can never block or
+    /// fail the synchronous state transition ([`handle_event`](Self::handle_event)
+    /// is deliberately non-async) that triggered it — it only logs. `release`
+    /// is idempotent, so a double-fire (e.g. a resumed-then-cancelled row) is
+    /// harmless.
     fn spawn_release(&self, package_id: PackageId) {
         let transport = Arc::clone(&self.transport);
         tokio::spawn(async move {

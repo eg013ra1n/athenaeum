@@ -2332,6 +2332,15 @@ impl SharedIrohNode {
             if !shared.contains(child) {
                 continue;
             }
+            // A want-subset serve synthesizes its `manifest.ndjson` in memory
+            // (`import_subset_collection`'s `add_bytes`), so that child is never
+            // `External` — nothing to protect — and `src_dir/manifest.ndjson` holds
+            // the FULL manifest, i.e. different bytes under the same entry name.
+            // Copying that would be a hash mismatch, i.e. a hard error on a
+            // perfectly healthy package.
+            if entry.want_fingerprint.is_some() && name == crate::package::MANIFEST_FILENAME {
+                continue;
+            }
             // Unknown size ⇒ treat as external and protect it (conservative).
             if size_by_name.get(name.as_str()).copied().unwrap_or(u64::MAX)
                 <= blobs::INLINE_BLOB_MAX_BYTES

@@ -2911,3 +2911,70 @@ async fn reserve_after_a_dead_path_repairs_it() {
 
     node.shutdown().await;
 }
+
+/// A want-subset serve's `manifest.ndjson` is SYNTHESIZED in memory
+/// (`import_subset_collection` filters the records and `add_bytes` them), so the
+/// file of that name under `src_dir` is a different document — the full manifest.
+/// Two subset serves of the same frames with the same want set produce the
+/// identical filtered manifest (no record carries a package-unique field), so it
+/// looks "shared"; above the inline threshold the protection would then copy the
+/// wrong file, mismatch the hash and fail the whole pass — permanently skipping
+/// the cleanup of a healthy confirmed package. An `add_bytes` blob is never
+/// external, so it is skipped instead.
+#[tokio::test]
+async fn protect_skips_the_synthesized_subset_manifest() {
+    const BIG: usize = 300_000;
+    const RECORDS: usize = 200;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    // Enough records that the filtered manifest is well above the 16 KiB inline
+    // threshold, plus one real payload big enough to be external.
+    let mut files: Vec<(String, usize)> = (0..RECORDS - 1)
+        .map(|i| (format!("f{i:03}.fits"), 100 + i))
+        .collect();
+    files.push(("big.fits".to_string(), BIG));
+    let files: Vec<(&str, usize)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+
+    let (pkg_a, ann_a) = write_test_package_announced(&tmp.path().join("aaa"), &files);
+    let (pkg_b, ann_b) = write_test_package_announced(&tmp.path().join("zzz"), &files);
+    assert!(
+        std::fs::metadata(pkg_a.join("manifest.ndjson"))
+            .unwrap()
+            .len()
+            > 16 * 1024,
+        "the manifest must exceed the inline threshold or this test proves nothing"
+    );
+
+    // A STRICT subset, so the filtered manifest differs from the on-disk one.
+    let want: std::collections::HashSet<String> = files
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .filter(|n| n != "f000.fits")
+        .collect();
+    out.serve(&ann_a, &pkg_a, Some(&want)).await.unwrap();
+    out.serve(&ann_b, &pkg_b, Some(&want)).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "big.fits").await;
+
+    // Before the skip this returned Err on the manifest's hash mismatch.
+    out.protect_shared_before_cleanup(&ann_a.package_id)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    out.release(&ann_a.package_id).await.unwrap();
+
+    assert!(
+        store_holds_payload_copy(&node_dir.join("blobs"), BIG as u64),
+        "the shared payload child is still protected — the manifest skip must not \
+         short-circuit the rest of the pass"
+    );
+    assert!(
+        blob_readable(&node, shared_hash).await,
+        "B still serves the shared payload after A's dir is gone"
+    );
+
+    node.shutdown().await;
+}
