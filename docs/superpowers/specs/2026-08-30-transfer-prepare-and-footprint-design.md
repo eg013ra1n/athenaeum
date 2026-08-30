@@ -258,8 +258,22 @@ test — §10).
 
 The invariant TryReference demands — the file never changes after import — is
 already the app's: `packages/<uuid>` is written once by preparation and
-touched again only by `cleanup_package_payloads` (delete) after confirm. Order
-on confirm is unchanged: `transport.release` (tag delete) → payload cleanup.
+touched again only by `cleanup_package_payloads` (delete) after confirm. The
+order there is the reverse of what this section first assumed: the engine's
+confirmed path cleans the payloads FIRST and then fires `spawn_release`, a
+detached task nobody awaits (`sync/engine.rs`), so a release cannot gate the
+cleanup. Anything the release must protect has to be recoverable from somewhere
+other than the released package's own dir.
+
+That protection is `role_release` → `copy_shared_children_before_release`: any
+child of the released collection that ANOTHER live hash-seq tag also references
+is re-imported with `Copy` (source: our own file if it still exists, else the
+sharing package's), making it `Owned` before the tag goes away. Without it, two
+packages carrying the same frame share one entry whose first external path
+belongs to whichever finishes first — and the survivor's tag then keeps that
+dead entry alive past GC. The re-serve short-circuit probes for the same reason
+(it skips the import, hence the import's repair).
+
 Between cleanup and the next GC pass the store may hold entries whose external
 path is gone; nothing reads them (a manifest-only dir fails
 `package_has_payload`, so it can never be re-served). A later import of the

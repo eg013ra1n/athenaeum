@@ -95,11 +95,19 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
     Ok(out)
 }
 
+/// iroh's fs store inlines a payload at or below this size into its metadata DB
+/// (`Options.inline.max_data_inlined`, 16 KiB by default), regardless of
+/// [`ImportMode`] — such a child has no external path and can never go dead, so
+/// the readability probe skips it. Being wrong here is never unsafe: too low
+/// costs a needless one-byte read, too high skips a probe on a blob that is in
+/// fact external (which the next serve's fresh import would repair anyway).
+pub(crate) const INLINE_BLOB_MAX_BYTES: u64 = 16 * 1024;
+
 /// Read one byte of `hash` back out of the store — the ONLY call that notices a
 /// dead external path. `has`/`status` answer from the metadata row and happily
 /// report `Complete` for an entry whose file is gone; a range read is what opens
 /// the file. One byte, no temp file, no full read.
-async fn probe_first_byte(store: &Store, hash: Hash) -> Result<()> {
+pub(crate) async fn probe_first_byte(store: &Store, hash: Hash) -> Result<()> {
     store
         .blobs()
         .export_ranges(hash, 0..1u64)

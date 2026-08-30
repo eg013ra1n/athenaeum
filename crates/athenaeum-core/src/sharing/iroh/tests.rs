@@ -2470,6 +2470,15 @@ async fn bind_with_keeps_identity_in_identity_dir_and_blobs_in_working_dir() {
 /// so the store must genuinely either copy the bytes in or reference them where
 /// they lie — which is what the import-mode tests below measure.
 fn write_test_package(root: &std::path::Path, files: &[(&str, usize)]) -> std::path::PathBuf {
+    write_test_package_announced(root, files).0
+}
+
+/// [`write_test_package`] plus the [`PackageAnnounce`] `write_package` minted for
+/// it (a fresh uuid per call, so two packages never collide on a serve tag).
+fn write_test_package_announced(
+    root: &std::path::Path,
+    files: &[(&str, usize)],
+) -> (std::path::PathBuf, PackageAnnounce) {
     use crate::package::{write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -2497,8 +2506,8 @@ fn write_test_package(root: &std::path::Path, files: &[(&str, usize)]) -> std::p
         ));
     }
     let pkg = root.join("pkg");
-    write_package(&pkg, records).unwrap();
-    pkg
+    let announce = write_package(&pkg, records).unwrap();
+    (pkg, announce)
 }
 
 /// Does the blob store hold a file of exactly `size` bytes — i.e. a second copy
@@ -2595,10 +2604,10 @@ async fn add_by_reference(
 ///   unreadable from disk until GC drops it.
 ///
 /// The last bullet is a real exposure for repeat sends of the same bytes from
-/// two different `packages/<uuid>` dirs (and for the declined-divert rename);
-/// pinned here because the spec's §4.2 prose assumes a re-point. In-process it
-/// is masked — an import always leaves the handle holding the live file's
-/// descriptor — which is exactly why only a from-disk read exposes it.
+/// two different `packages/<uuid>` dirs (and for the declined-divert rename).
+/// It bites immediately — the failure is not deferred to a restart — which is
+/// what makes the one-byte probe in `blobs::ensure_child_readable` able to catch
+/// and repair it at import time.
 #[tokio::test]
 async fn reimport_of_a_known_hash_unions_external_paths_and_reads_the_first() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2728,4 +2737,170 @@ async fn dead_first_external_path_is_repaired_by_a_copy_reimport() {
         readable(&store2, hash2).await,
         "still served from the live package path"
     );
+}
+
+/// A node that imports serves BY REFERENCE, the way the app's
+/// `ensure_iroh_node` binds it (`SharedIrohNode::bind` — Perseus and the other
+/// tests here — stays `Copy`).
+async fn bind_try_reference(dir: &Path) -> Arc<SharedIrohNode> {
+    SharedIrohNode::bind_with(
+        dir,
+        dir,
+        RelayMode::Disabled,
+        NodeOptions {
+            serve_import_mode: iroh_blobs::api::blobs::ImportMode::TryReference,
+        },
+    )
+    .await
+    .expect("bind relay-disabled TryReference node")
+}
+
+/// The child hash a served collection carries under `rel_path`.
+async fn served_child_hash(node: &SharedIrohNode, package_id: &PackageId, rel_path: &str) -> Hash {
+    let root = node
+        .resolve_served_hash_for_test(Role::Out, package_id)
+        .expect("package is served");
+    let coll = Collection::load(root, node.store())
+        .await
+        .expect("load served collection");
+    let found = coll
+        .iter()
+        .find(|(name, _)| name == rel_path)
+        .map(|(_, h)| *h);
+    found.unwrap_or_else(|| panic!("{rel_path} not in the served collection"))
+}
+
+/// Can the store still read this blob's first byte? (`has`/`status` cannot tell
+/// — they answer from the metadata row.)
+async fn blob_readable(node: &SharedIrohNode, hash: Hash) -> bool {
+    node.store()
+        .blobs()
+        .export_ranges(hash, 0..1u64)
+        .concatenate()
+        .await
+        .is_ok()
+}
+
+/// Releasing a package must not strip another live package of its bytes.
+///
+/// Two packages carrying the same frame share ONE store entry, whose external
+/// path list is `[A's copy, B's copy]` sorted — so the read follows A's payload
+/// dir, which a confirm then deletes. B's tag keeps the entry alive past GC, so
+/// nothing would heal it. The release copies exactly the shared children into
+/// the store (`Owned`), and nothing else.
+#[tokio::test]
+async fn release_copies_children_shared_with_another_live_package() {
+    const SHARED: usize = 300_000;
+    // A different size ⇒ different bytes ⇒ a different blob, so the two
+    // `store_holds_payload_copy` probes below cannot answer for each other.
+    const ONLY_A: usize = 290_000;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    // "aaa" < "zzz", so A's payload path is the one the union reads.
+    let (pkg_a, ann_a) = write_test_package_announced(
+        &tmp.path().join("aaa"),
+        &[("X.fits", SHARED), ("only_a.fits", ONLY_A)],
+    );
+    let (pkg_b, ann_b) =
+        write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
+    out.serve(&ann_a, &pkg_a, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
+
+    out.release(&ann_a.package_id).await.unwrap();
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+
+    let store_dir = node_dir.join("blobs");
+    assert!(
+        store_holds_payload_copy(&store_dir, SHARED as u64),
+        "the child B also serves was copied into the store before the release"
+    );
+    assert!(
+        !store_holds_payload_copy(&store_dir, ONLY_A as u64),
+        "a child only the released package served is left referenced — no blanket copy"
+    );
+    assert!(
+        blob_readable(&node, shared_hash).await,
+        "B still serves the shared blob after A's payload dir is gone"
+    );
+
+    node.shutdown().await;
+}
+
+/// The app's confirmed path deletes the payload dir BEFORE it fires the
+/// (detached, never awaited) release, so the released package's own copy of a
+/// shared file is usually already gone when the protection runs. The sharing
+/// package's own payload is then the source — same bytes, still on disk because
+/// its tag is live.
+#[tokio::test]
+async fn release_copies_shared_children_from_the_sharer_when_our_dir_is_gone() {
+    const SHARED: usize = 300_000;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    let (pkg_a, ann_a) =
+        write_test_package_announced(&tmp.path().join("aaa"), &[("X.fits", SHARED)]);
+    let (pkg_b, ann_b) =
+        write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
+    out.serve(&ann_a, &pkg_a, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
+
+    // Payload cleanup first, release second — the real order.
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    out.release(&ann_a.package_id).await.unwrap();
+
+    assert!(
+        store_holds_payload_copy(&node_dir.join("blobs"), SHARED as u64),
+        "copied from the sharing package's payload"
+    );
+    assert!(blob_readable(&node, shared_hash).await);
+
+    node.shutdown().await;
+}
+
+/// The re-serve short-circuit reuses an already-imported collection and so skips
+/// the import's `ensure_child_readable` repair. It therefore probes first: a
+/// collection whose referenced files went away is re-imported rather than
+/// re-announced dead.
+#[tokio::test]
+async fn reserve_after_a_dead_path_repairs_it() {
+    const SHARED: usize = 300_000;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    let (pkg_a, ann_a) =
+        write_test_package_announced(&tmp.path().join("aaa"), &[("X.fits", SHARED)]);
+    let (pkg_b, ann_b) =
+        write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
+    out.serve(&ann_a, &pkg_a, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
+
+    // The window the release protection does not cover: A's dir vanishes with no
+    // release at all (a crash between cleanup and release, a manual purge).
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    assert!(
+        !blob_readable(&node, shared_hash).await,
+        "precondition: the shared entry now reads A's deleted path"
+    );
+
+    // A retry re-serves B with the same want — the short-circuit must notice.
+    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    assert!(
+        blob_readable(&node, shared_hash).await,
+        "the re-serve re-imported and repaired the dead path"
+    );
+
+    node.shutdown().await;
 }

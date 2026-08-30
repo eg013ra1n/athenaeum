@@ -330,6 +330,13 @@ fn recv_in_flight_package_id(tag: &str) -> Option<&str> {
 struct ServedCollection {
     hash: Hash,
     want_fingerprint: Option<String>,
+    /// The on-disk dir this collection was imported from — `packages/<uuid>` for a
+    /// role serve, the retained package dir for a project seed. Under
+    /// [`ImportMode::TryReference`] the store REFERENCES files under here, so
+    /// `src_dir.join(rel_path)` is where a child's bytes actually live; that is
+    /// what lets [`copy_shared_children_before_release`](SharedIrohNode::copy_shared_children_before_release)
+    /// find a live source for a blob another package still needs.
+    src_dir: PathBuf,
 }
 
 /// Stable fingerprint of a serve's want-subset: `None` for a full package, else
@@ -2185,6 +2192,238 @@ impl SharedIrohNode {
         blobs::fetch_manifest_to_dir(&self.store, &endpoint, provider, root_hash, dest_dir).await
     }
 
+    /// Copy into the store every child of the package being released that ANOTHER
+    /// live collection still references — so those blobs survive the payload
+    /// cleanup that follows a terminal transfer (spec §4.2).
+    ///
+    /// Under [`ImportMode::TryReference`] a served blob is a REFERENCE to a file
+    /// under `packages/<uuid>`, and iroh keeps a sorted UNION of external paths
+    /// per hash, reading `paths.first()`. Two packages carrying the same bytes
+    /// therefore share one entry whose first path may belong to whichever of them
+    /// finishes first — and that one's dir is about to be deleted. The surviving
+    /// package's tag keeps the entry alive past GC, so nothing would ever heal it.
+    /// Re-importing the shared children with [`ImportMode::Copy`] makes them
+    /// `Owned`, which wins the union from both sides, so they no longer depend on
+    /// any payload dir.
+    ///
+    /// Sources are tried in order: this package's own file, then the sharing
+    /// package's file. The second is not a nicety — the app's confirmed path runs
+    /// the payload cleanup BEFORE it fires the (detached, never awaited) release,
+    /// so our own copy of the file is usually gone by the time we run.
+    ///
+    /// Scope guards: `Copy` hosts (Perseus) own their blobs already and return
+    /// immediately; children at or below the inline threshold are never external;
+    /// a collection that no longer loads is skipped with a `debug!` (nothing left
+    /// to protect). A child that is shared but has no readable source anywhere is
+    /// an `error!` + `Err`, which leaves the tag AND the served entries in place —
+    /// a leaked tag is strictly better than another package losing its bytes.
+    async fn copy_shared_children_before_release(
+        &self,
+        tag: &str,
+        package_id: &PackageId,
+        entry: &ServedCollection,
+        sizes: &[(String, u64)],
+    ) -> Result<()> {
+        use iroh_blobs::api::blobs::AddPathOptions;
+        use iroh_blobs::format::collection::Collection;
+        use iroh_blobs::BlobFormat;
+        use n0_future::StreamExt as _;
+
+        if !matches!(self.serve_import_mode, ImportMode::TryReference) {
+            return Ok(());
+        }
+        let mine = match Collection::load(entry.hash, &self.store).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    package_id = %package_id.0,
+                    root_hash = %entry.hash,
+                    error = %e,
+                    "released collection no longer loads; nothing to protect"
+                );
+                return Ok(());
+            }
+        };
+        let size_by_name: HashMap<&str, u64> =
+            sizes.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+
+        // Every OTHER live hash-seq tag is a collection that may reference our
+        // children. Listing only `HashSeq` tags is the same namespace contract the
+        // in-flight/seed tags already rely on; a tag whose collection cannot be
+        // loaded (a partial receive, a half-swept root) simply contributes nothing.
+        let mut other_tags: Vec<(String, Hash)> = Vec::new();
+        let mut stream = self
+            .store
+            .tags()
+            .list_hash_seq()
+            .await
+            .map_err(|e| anyhow!("list hash-seq tags: {e}"))?;
+        while let Some(info) = stream.next().await {
+            let info = info.map_err(|e| anyhow!("list hash-seq tag entry: {e}"))?;
+            let name = String::from_utf8_lossy(info.name.as_ref()).into_owned();
+            if name != tag {
+                other_tags.push((name, info.hash));
+            }
+        }
+
+        let mut shared: HashSet<Hash> = HashSet::new();
+        // A live file for a shared child that is NOT under our own dir: the sharing
+        // package's own payload, which by definition still exists (its tag is live).
+        let mut alt_source: HashMap<Hash, PathBuf> = HashMap::new();
+        for (other_tag, other_hash) in other_tags {
+            let coll = match Collection::load(other_hash, &self.store).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(
+                        tag = %other_tag,
+                        root_hash = %other_hash,
+                        error = %e,
+                        "live tag's collection does not load; skipped when scanning for shared blobs"
+                    );
+                    continue;
+                }
+            };
+            let other_dir = self
+                .served
+                .lock()
+                .expect("served mutex poisoned")
+                .get(&other_tag)
+                .map(|e| e.src_dir.clone());
+            for (name, child) in coll.iter() {
+                shared.insert(*child);
+                if let Some(dir) = &other_dir {
+                    alt_source.entry(*child).or_insert_with(|| dir.join(name));
+                }
+            }
+        }
+
+        let mut copied = 0usize;
+        for (name, child) in mine.iter() {
+            if !shared.contains(child) {
+                continue;
+            }
+            // Unknown size ⇒ treat as external and protect it (conservative).
+            if size_by_name.get(name.as_str()).copied().unwrap_or(u64::MAX)
+                <= blobs::INLINE_BLOB_MAX_BYTES
+            {
+                continue;
+            }
+            // An already-owned child would be copied again here — there is no public
+            // API to ask where a blob lives, and a successful read proves nothing
+            // (it may be reading OUR file, the one about to be deleted). The waste is
+            // bounded to blobs two live packages genuinely share.
+            let own = entry.src_dir.join(name);
+            let src = if own.is_file() {
+                own
+            } else {
+                match alt_source.get(child) {
+                    Some(p) if p.is_file() => p.clone(),
+                    _ => {
+                        tracing::error!(
+                            package_id = %package_id.0,
+                            hash = %child,
+                            path = %own.display(),
+                            "shared blob has no readable source; refusing to release it"
+                        );
+                        anyhow::bail!(
+                            "no readable source for shared blob {child} ({})",
+                            own.display()
+                        );
+                    }
+                }
+            };
+            let tt = self
+                .store
+                .blobs()
+                .add_path_with_opts(AddPathOptions {
+                    path: src.clone(),
+                    format: BlobFormat::Raw,
+                    mode: ImportMode::Copy,
+                })
+                .temp_tag()
+                .await
+                .with_context(|| format!("copy shared blob {}", src.display()))?;
+            if tt.hash() != *child {
+                tracing::error!(
+                    package_id = %package_id.0,
+                    hash = %child,
+                    copied_hash = %tt.hash(),
+                    path = %src.display(),
+                    "shared blob source changed on disk; refusing to release it"
+                );
+                anyhow::bail!(
+                    "shared blob source {} changed on disk ({} → {})",
+                    src.display(),
+                    child,
+                    tt.hash()
+                );
+            }
+            // Dropping the temp tag is safe: the sharing package's tag pins the hash,
+            // and the bytes are store-owned now.
+            copied += 1;
+        }
+        if copied > 0 {
+            tracing::info!(
+                package_id = %package_id.0,
+                count = copied,
+                "shared blobs copied into the store before release"
+            );
+        }
+        Ok(())
+    }
+
+    /// Is every child of an already-imported collection still readable? The
+    /// re-serve short-circuit's guard.
+    ///
+    /// Reusing a `served` entry skips the import — and with it
+    /// [`blobs::ensure_child_readable`], the thing that repairs a dead external
+    /// path. A package whose sibling was released and cleaned in the meantime can
+    /// therefore be re-announced pointing at deleted files. One byte per
+    /// above-inline child answers it; `false` sends the caller through a fresh
+    /// import, which repairs. `Copy` hosts never have external children, so they
+    /// short-circuit to `true` without reading anything.
+    async fn served_collection_is_readable(&self, tag: &str, hash: Hash) -> bool {
+        use iroh_blobs::format::collection::Collection;
+
+        if !matches!(self.serve_import_mode, ImportMode::TryReference) {
+            return true;
+        }
+        let sizes: HashMap<String, u64> = self
+            .served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .get(tag)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
+        let coll = match Collection::load(hash, &self.store).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    tag,
+                    root_hash = %hash,
+                    error = %e,
+                    "served collection no longer loads; re-importing"
+                );
+                return false;
+            }
+        };
+        for (name, child) in coll.iter() {
+            if sizes.get(name).copied().unwrap_or(u64::MAX) <= blobs::INLINE_BLOB_MAX_BYTES {
+                continue;
+            }
+            if let Err(e) = blobs::probe_first_byte(&self.store, *child).await {
+                tracing::debug!(
+                    tag,
+                    hash = %child,
+                    error = %format!("{e:#}"),
+                    "served child is unreadable"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     async fn role_serve(
         &self,
         role: Role,
@@ -2204,18 +2443,32 @@ impl SharedIrohNode {
         // a restart the map is empty so the first serve imports again — correct,
         // because the blob store's tags may have been swept meanwhile.
         let fingerprint = want_fingerprint(want);
-        {
+        let reusable = {
             let served = self.served.lock().expect("served mutex poisoned");
-            if let Some(entry) = served.get(&tag) {
-                if entry.want_fingerprint == fingerprint {
-                    tracing::debug!(
-                        package_id = %pkg.package_id.0,
-                        root_hash = %entry.hash,
-                        "serve reuses the already-imported collection"
-                    );
-                    return Ok(());
-                }
+            served
+                .get(&tag)
+                .filter(|entry| entry.want_fingerprint == fingerprint)
+                .map(|entry| entry.hash)
+        };
+        if let Some(hash) = reusable {
+            // The short-circuit skips the import, and with it the repair
+            // `ensure_child_readable` performs — so a collection whose referenced
+            // files went away since (a sibling package released + cleaned) would be
+            // re-announced dead. Probe before trusting it.
+            if self.served_collection_is_readable(&tag, hash).await {
+                tracing::debug!(
+                    package_id = %pkg.package_id.0,
+                    root_hash = %hash,
+                    "serve reuses the already-imported collection"
+                );
+                return Ok(());
             }
+            tracing::warn!(
+                package_id = %pkg.package_id.0,
+                root_hash = %hash,
+                "served collection reads a dead path; re-importing"
+            );
+            self.forget_served_tag(&tag);
         }
         // The host's import mode (spec §4.1): the app references its immutable
         // `packages/<uuid>` in place, Perseus copies (its resend rewrites the same
@@ -2233,6 +2486,7 @@ impl SharedIrohNode {
             ServedCollection {
                 hash,
                 want_fingerprint: fingerprint,
+                src_dir: src_dir.to_path_buf(),
             },
         );
         self.served_files
@@ -2251,6 +2505,29 @@ impl SharedIrohNode {
 
     async fn role_release(&self, role: Role, package_id: &PackageId) -> Result<()> {
         let tag = role_package_tag(role.prefix(), package_id);
+        // Release is the last moment we still know where this package's referenced
+        // bytes live. Any child another live collection also serves has to become
+        // store-owned now, or the payload cleanup that follows a terminal transfer
+        // takes that other package's data with it (spec §4.2). A failure here
+        // returns BEFORE the tag delete, so nothing is unpinned on a half-done
+        // protection pass.
+        let entry = self
+            .served
+            .lock()
+            .expect("served mutex poisoned")
+            .get(&tag)
+            .cloned();
+        if let Some(entry) = entry {
+            let sizes = self
+                .served_files
+                .lock()
+                .expect("served_files mutex poisoned")
+                .get(&tag)
+                .cloned()
+                .unwrap_or_default();
+            self.copy_shared_children_before_release(&tag, package_id, &entry, &sizes)
+                .await?;
+        }
         self.served
             .lock()
             .expect("served mutex poisoned")
@@ -2350,6 +2627,7 @@ impl SharedIrohNode {
             ServedCollection {
                 hash,
                 want_fingerprint: None,
+                src_dir: pkg_dir.to_path_buf(),
             },
         );
         self.served_files
