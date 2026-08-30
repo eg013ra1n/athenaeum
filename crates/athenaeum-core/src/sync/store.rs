@@ -592,6 +592,21 @@ pub trait SyncStore: Send + Sync {
     /// Force one outbound row to a new state.
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()>;
 
+    /// Compare-and-set: move row `id` to `new` only while its state is still
+    /// `expect`. `Ok(true)` when the row moved; `Ok(false)` when it did not —
+    /// someone else wrote this transfer's verdict first (a cancel, a restart
+    /// heal), so the caller's own read of the state is stale and it must not
+    /// write.
+    ///
+    /// The preparation worker promotes `preparing` → `queued` with this rather
+    /// than [`set_state`](Self::set_state): its ownership check and its
+    /// promotion are two statements, and a verdict landing between them would
+    /// otherwise be silently overwritten — the package the user stopped
+    /// announced anyway. It deliberately does NOT carry `set_state`'s
+    /// terminal-transition housekeeping (clearing `next_retry_at`), so a
+    /// terminal write still belongs on `set_state`.
+    fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool>;
+
     /// Record the most recent failed-attempt reason for a package (Task 9), or
     /// clear it with `None` on success. Best-effort diagnostic surfaced beside
     /// `attempts` on the Perseus status page; [`confirm`](Self::confirm) also clears
@@ -1730,6 +1745,30 @@ pub fn replace_inbound_files(
     Ok(())
 }
 
+/// The one CAS both stores' [`SyncStore::set_state_if`] delegate to: the state
+/// the caller read is part of the WHERE clause, so the move happens in the same
+/// statement that checks for it. Returns whether a row changed.
+fn set_outbound_state_if(
+    conn: &Connection,
+    id: i64,
+    expect: OutboundState,
+    new: OutboundState,
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE sync_outbound SET state = ?1 WHERE id = ?2 AND state = ?3",
+            params![new.as_str(), id, expect.as_str()],
+        )
+        .with_context(|| {
+            format!(
+                "set state {} for outbound {id} while {}",
+                new.as_str(),
+                expect.as_str()
+            )
+        })?;
+    Ok(changed > 0)
+}
+
 /// Update one outbound file's mutable fields — `state`, `bytes_done`, `outcome`,
 /// `error` — stamping a fresh `updated_at` (Transfers Status Model v2 §D4). Keyed
 /// on `(outbound_id, rel_path)`; the row is created up front by
@@ -1969,6 +2008,62 @@ pub fn list_outbound_files(conn: &Connection, outbound_id: i64) -> Result<Vec<Ou
     raws.into_iter().map(to_outbound_file).collect()
 }
 
+/// Batch-terminal settle callable from the API layer (transfer-prepare spec §3):
+/// a preparation that failed or was cancelled never reached the engine, so
+/// nothing else will ever close its per-file rows.
+///
+/// Every row not yet [`Done`](OutboundFileState::Done) gets
+/// `done`/`outcome`; `culprit = (rel_path, error)` instead gets
+/// [`Failed`](OutboundFileState::Failed) with that error, so the detail view can
+/// name the one file that broke the run. Rows already `done` keep their own
+/// verdict — the same "an already-settled row wins" rule the receive-side
+/// [`settle_unsettled_inbound_files`] follows.
+///
+/// ONE TRANSACTION, like that receive-side twin (which settles in a single
+/// UPDATE): the read and every write run on `tx`, so a crash mid-settle rolls
+/// the whole thing back rather than leaving a terminal batch with half its file
+/// rows still `pending` — a shape no heal revisits, since the batch row itself
+/// is already terminal. The per-row loop (rather than one UPDATE) is what the
+/// culprit split needs: exactly one row takes a different state + its own error.
+pub fn settle_outbound_files_terminal(
+    conn: &Connection,
+    outbound_id: i64,
+    outcome: &str,
+    culprit: Option<(&str, &str)>,
+) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin settle_outbound_files_terminal")?;
+    for row in list_outbound_files(&tx, outbound_id)? {
+        if row.state == OutboundFileState::Done {
+            continue;
+        }
+        match culprit {
+            Some((rel, err)) if rel == row.rel_path => set_outbound_file_state(
+                &tx,
+                outbound_id,
+                &row.rel_path,
+                OutboundFileState::Failed,
+                row.bytes_done,
+                Some("failed"),
+                Some(err),
+            )?,
+            _ => set_outbound_file_state(
+                &tx,
+                outbound_id,
+                &row.rel_path,
+                OutboundFileState::Done,
+                row.bytes_done,
+                Some(outcome),
+                None,
+            )?,
+        }
+    }
+    tx.commit()
+        .context("commit settle_outbound_files_terminal")?;
+    Ok(())
+}
+
 /// Every per-file row for an inbound batch, ordered by `rel_path` (Transfers
 /// Status Model v2 §D4).
 pub fn list_inbound_files(conn: &Connection, inbound_id: i64) -> Result<Vec<InboundFileRow>> {
@@ -2025,6 +2120,15 @@ pub fn inbound_file_counts(
 /// `done` CASE via three-valued logic), so an `uploaded`/`fetched` file with no
 /// outcome still counts as done — that pair is the same rung on the two sides
 /// (D2 §3.4), which is why one CASE serves both directions.
+///
+/// The two `duplicate` columns (count + `byte_size` sum over
+/// `outcome = 'duplicate'` rows) ride the same statement: they are a subset of
+/// `done` that the send-side progress line subtracts (see
+/// [`TransferFileCounts`]), so they must come from the same snapshot as `done`
+/// or the subtraction could go negative mid-settle. The trailing
+/// `SUM(byte_size)` is the state-blind batch total — the figure a `preparing`
+/// row's summary falls back to before a manifest exists (transfer-prepare spec
+/// §3.8); it rides here for the same reason, one statement per poll.
 fn grouped_file_counts(
     conn: &Connection,
     table: &str,
@@ -2045,7 +2149,10 @@ fn grouped_file_counts(
                          THEN 1 ELSE 0 END), \
                 SUM(CASE WHEN (state = 'done' OR state = 'uploaded' OR state = 'fetched') \
                           AND NOT (state = 'failed' OR COALESCE(outcome,'') LIKE 'rejected%') \
-                         THEN 1 ELSE 0 END) \
+                         THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN COALESCE(outcome,'') = 'duplicate' THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN COALESCE(outcome,'') = 'duplicate' THEN byte_size ELSE 0 END), \
+                SUM(byte_size) \
          FROM {table} WHERE {id_col} IN ({placeholders}) GROUP BY {id_col}"
     );
     let mut stmt = conn.prepare(&sql).context("prepare grouped_file_counts")?;
@@ -2055,18 +2162,33 @@ fn grouped_file_counts(
             let total: i64 = r.get(1)?;
             let failed: i64 = r.get(2)?;
             let done: i64 = r.get(3)?;
-            Ok((id, total, done, failed))
+            let duplicate: i64 = r.get(4)?;
+            let duplicate_bytes: i64 = r.get(5)?;
+            let total_bytes: i64 = r.get(6)?;
+            Ok((
+                id,
+                total,
+                done,
+                failed,
+                duplicate,
+                duplicate_bytes,
+                total_bytes,
+            ))
         })
         .context("query grouped_file_counts")?;
     let mut map = HashMap::new();
     for row in rows {
-        let (id, total, done, failed) = row.context("row grouped_file_counts")?;
+        let (id, total, done, failed, duplicate, duplicate_bytes, total_bytes) =
+            row.context("row grouped_file_counts")?;
         map.insert(
             id,
             TransferFileCounts {
                 total: total.max(0) as u32,
                 done: done.max(0) as u32,
                 failed: failed.max(0) as u32,
+                duplicate: duplicate.max(0) as u32,
+                duplicate_bytes: duplicate_bytes.max(0) as u64,
+                total_bytes: total_bytes.max(0) as u64,
             },
         );
     }
@@ -2395,6 +2517,36 @@ pub fn insert_outbound_with_files(
     files: &[AnnounceFileEntry],
     layout: PackageLayout,
 ) -> Result<i64> {
+    insert_outbound_with_files_in_state(
+        conn,
+        package_ref,
+        peer_hex,
+        display_name,
+        files,
+        layout,
+        OutboundState::Queued,
+    )
+}
+
+/// [`insert_outbound_with_files`] with the initial state chosen by the caller —
+/// the same one transaction, the same row + name + file-manifest invariant.
+///
+/// Exists for the async-preparation path (transfer-prepare spec §3), which
+/// inserts the row in [`Preparing`](OutboundState::Preparing) BEFORE a byte of
+/// payload is staged, so the Transfers list can show the transfer (and its byte
+/// total, from these very file rows) from the click. `state` is the ONLY
+/// difference: a `preparing` row carries its full manifest exactly like a
+/// `queued` one, because the preparation worker copies against that manifest and
+/// the failure path settles those same rows.
+pub fn insert_outbound_with_files_in_state(
+    conn: &Connection,
+    package_ref: &str,
+    peer_hex: &str,
+    display_name: Option<&str>,
+    files: &[AnnounceFileEntry],
+    layout: PackageLayout,
+    state: OutboundState,
+) -> Result<i64> {
     let tx = conn
         .unchecked_transaction()
         .context("begin insert_outbound_with_files")?;
@@ -2405,7 +2557,7 @@ pub fn insert_outbound_with_files(
         params![
             package_ref,
             peer_hex,
-            OutboundState::Queued.as_str(),
+            state.as_str(),
             now_iso(),
             display_name,
             layout.as_str(),
@@ -2631,6 +2783,11 @@ impl SyncStore for StandaloneSyncStore {
         }
         .with_context(|| format!("set state {} for outbound {id}", s.as_str()))?;
         Ok(())
+    }
+
+    fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        set_outbound_state_if(&conn, id, expect, new)
     }
 
     fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
@@ -2899,6 +3056,47 @@ impl CatalogSyncStore {
         let conn = self.lock_conn();
         all_outbound_rows(&conn, limit)
     }
+
+    /// Insert the transfer's row in [`Preparing`](OutboundState::Preparing) with
+    /// its full manifest, BEFORE any payload is staged (transfer-prepare spec
+    /// §3) — the send's first durable write, so the Transfers list shows the
+    /// transfer from the click instead of after the copy.
+    ///
+    /// Deliberately NOT [`SyncStore::enqueue`]: that trait method is the
+    /// engine's "here is a ready package" seam, and a `preparing` row is
+    /// explicitly not ready. The preparation worker hands the same row to the
+    /// engine itself once the dir is staged.
+    pub fn enqueue_preparing(
+        &self,
+        package_ref: &str,
+        peer: NodeId,
+        display_name: Option<&str>,
+        files: &[AnnounceFileEntry],
+        layout: PackageLayout,
+    ) -> Result<i64> {
+        let conn = self.lock_conn();
+        insert_outbound_with_files_in_state(
+            &conn,
+            package_ref,
+            &node_id_hex(&peer),
+            display_name,
+            files,
+            layout,
+            OutboundState::Preparing,
+        )
+    }
+
+    /// Close every unfinished per-file row of a batch the engine never got —
+    /// see [`settle_outbound_files_terminal`] for the exact rule.
+    pub fn settle_files_terminal(
+        &self,
+        id: i64,
+        outcome: &str,
+        culprit: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let conn = self.lock_conn();
+        settle_outbound_files_terminal(&conn, id, outcome, culprit)
+    }
 }
 
 impl SyncStore for CatalogSyncStore {
@@ -2976,6 +3174,11 @@ impl SyncStore for CatalogSyncStore {
         }
         .with_context(|| format!("set state {} for outbound {id}", s.as_str()))?;
         Ok(())
+    }
+
+    fn set_state_if(&self, id: i64, expect: OutboundState, new: OutboundState) -> Result<bool> {
+        let conn = self.lock_conn();
+        set_outbound_state_if(&conn, id, expect, new)
     }
 
     fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
@@ -4063,6 +4266,139 @@ mod tests {
         );
     }
 
+    /// Transfer-prepare §3: the pre-copy enqueue lands a REAL row — state
+    /// `preparing`, its whole manifest already as per-file rows — so the
+    /// Transfers list shows the transfer (with its byte total) from the click,
+    /// before a single byte has been staged. Non-terminal, so crash-resume sees
+    /// it.
+    #[test]
+    fn enqueue_preparing_inserts_row_and_files_in_preparing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let files = vec![
+            AnnounceFileEntry {
+                rel_path: "a.fits".into(),
+                byte_size: 10,
+                frame_uuid: "ua".into(),
+            },
+            AnnounceFileEntry {
+                rel_path: "b.fits".into(),
+                byte_size: 30,
+                frame_uuid: "ub".into(),
+            },
+        ];
+        let id = store
+            .enqueue_preparing("/pkg/x", PEER, Some("Batch"), &files, PackageLayout::Batch)
+            .unwrap();
+
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.state, OutboundState::Preparing);
+        assert_eq!(row.display_name.as_deref(), Some("Batch"));
+        assert!(
+            store.non_terminal().unwrap().iter().any(|r| r.id == id),
+            "a preparing row is live work the resume path must see"
+        );
+
+        let conn = store.lock_conn();
+        let counts = outbound_file_counts(&conn, &[id]).unwrap();
+        assert_eq!(counts[&id].total, 2);
+        assert_eq!(
+            counts[&id].total_bytes, 40,
+            "the manifest-free byte total the summary falls back to"
+        );
+    }
+
+    /// The compare-and-set the preparation worker promotes with: it moves the
+    /// row only while the state it read is still the state on disk. Without it,
+    /// a verdict written between the worker's ownership check and its promotion
+    /// (a cancel, a restart heal) would be flipped back to `queued` and the
+    /// package the user stopped would be announced anyway.
+    #[test]
+    fn set_state_if_moves_the_row_only_while_the_expected_state_still_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let files = vec![AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "ua".into(),
+        }];
+        let id = store
+            .enqueue_preparing("/pkg/x", PEER, None, &files, PackageLayout::Batch)
+            .unwrap();
+
+        assert!(
+            store
+                .set_state_if(id, OutboundState::Preparing, OutboundState::Queued)
+                .unwrap(),
+            "the expected state held, so the row moved"
+        );
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().state,
+            OutboundState::Queued
+        );
+
+        assert!(
+            !store
+                .set_state_if(id, OutboundState::Preparing, OutboundState::Cancelled)
+                .unwrap(),
+            "the expected state no longer holds, so nothing moved"
+        );
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().state,
+            OutboundState::Queued,
+            "a failed CAS leaves the row exactly as it found it"
+        );
+    }
+
+    /// Transfer-prepare §3: a preparation that failed or was cancelled never
+    /// reached the engine, so the API layer closes the per-file rows itself —
+    /// every unfinished row lands `done`/<outcome>, and the one file that broke
+    /// the run lands `failed` with its own error. All in ONE transaction, so the
+    /// batch can never end terminal with half its rows still `pending`.
+    #[test]
+    fn settle_outbound_files_terminal_marks_culprit_failed_and_rest_settled_with_the_outcome() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_OUTBOUND_FILES, []).unwrap();
+        let row = |rel: &str| OutboundFileRow {
+            outbound_id: 1,
+            rel_path: rel.into(),
+            byte_size: 10,
+            frame_uuid: format!("u-{rel}"),
+            state: OutboundFileState::Pending,
+            bytes_done: 0,
+            outcome: None,
+            error: None,
+            updated_at: "2026-08-30T00:00:00.000Z".into(),
+        };
+        replace_outbound_files(&conn, 1, &[row("a.fits"), row("b.fits")]).unwrap();
+
+        settle_outbound_files_terminal(&conn, 1, "failed", Some(("b.fits", "read error"))).unwrap();
+
+        let rows = list_outbound_files(&conn, 1).unwrap();
+        let a = rows.iter().find(|r| r.rel_path == "a.fits").unwrap();
+        let b = rows.iter().find(|r| r.rel_path == "b.fits").unwrap();
+        assert_eq!(
+            (a.state, a.outcome.as_deref()),
+            (OutboundFileState::Done, Some("failed"))
+        );
+        assert_eq!(
+            (b.state, b.error.as_deref()),
+            (OutboundFileState::Failed, Some("read error"))
+        );
+        // The settle is one transaction: it either lands whole or not at all, so
+        // no row is left behind in flight.
+        assert!(
+            rows.iter()
+                .all(|r| matches!(r.state, OutboundFileState::Done | OutboundFileState::Failed)),
+            "every row settled: {:?}",
+            rows.iter()
+                .map(|r| (r.rel_path.clone(), r.state))
+                .collect::<Vec<_>>()
+        );
+        let c = outbound_file_counts(&conn, &[1]).unwrap();
+        assert_eq!((c[&1].done, c[&1].failed), (1, 1));
+    }
+
     /// tv2 §D4: inbound per-file CRUD — the receive-side twin of the outbound
     /// roundtrip.
     #[test]
@@ -4175,6 +4511,15 @@ mod tests {
                     OutboundFileState::Done,
                     Some("cancelled"),
                 ),
+                // §D4 negotiate-time exclusion: the peer already had it, settled
+                // done/duplicate before a byte moved → done AND duplicate (a
+                // subset of done, not a sibling).
+                row(
+                    1,
+                    "duplicate.fits",
+                    OutboundFileState::Done,
+                    Some("duplicate"),
+                ),
             ],
         )
         .unwrap();
@@ -4188,15 +4533,23 @@ mod tests {
 
         let counts = outbound_file_counts(&conn, &[1, 2, 999]).unwrap();
         let p1 = counts.get(&1).expect("parent 1 present");
-        assert_eq!(p1.total, 6);
-        // done = uploaded + ingested + cancelled = 3.
-        assert_eq!(p1.done, 3, "uploaded/ingested/cancelled are done");
+        assert_eq!(p1.total, 7);
+        // done = uploaded + ingested + cancelled + duplicate = 4.
+        assert_eq!(p1.done, 4, "uploaded/ingested/cancelled/duplicate are done");
         // failed = rejected = 1.
         assert_eq!(p1.failed, 1, "rejected is failed, not done");
-        // in-flight remainder = pending + sending = 6 - 3 - 1 = 2.
+        // in-flight remainder = pending + sending = 7 - 4 - 1 = 2.
         assert_eq!(p1.total - p1.done - p1.failed, 2);
+        // The split the sender's progress line subtracts: 1 file, its 10 bytes.
+        assert_eq!(p1.duplicate, 1, "the duplicate row is counted inside done");
+        assert_eq!(p1.duplicate_bytes, 10, "and its byte_size is summed");
+        // The manifest-free total (transfer-prepare §3.8): every row's byte_size,
+        // whatever its state — 7 rows × 10.
+        assert_eq!(p1.total_bytes, 70);
 
-        assert_eq!(counts.get(&2).unwrap().total, 1);
+        let p2 = counts.get(&2).unwrap();
+        assert_eq!(p2.total, 1);
+        assert_eq!((p2.duplicate, p2.duplicate_bytes), (0, 0));
         assert!(!counts.contains_key(&999), "an id with no rows is absent");
 
         // Empty id set → no query, empty map.
@@ -4229,13 +4582,16 @@ mod tests {
         ins("ingested.fits", "done", Some("ingested"));
         ins("failed.fits", "failed", None);
         ins("rejected.fits", "done", Some("rejected:bad hash"));
+        // An ingest-time duplicate (the file travelled, the catalog already had
+        // it): done, and reported in the shared `duplicate` columns.
+        ins("duplicate.fits", "done", Some("duplicate"));
 
         let counts = inbound_file_counts(&conn, &[1]).unwrap();
         let c = counts.get(&1).expect("parent present");
-        assert_eq!(c.total, 6);
+        assert_eq!(c.total, 7);
         assert_eq!(
-            c.done, 2,
-            "fetched + ingested — a rejected done is not done"
+            c.done, 3,
+            "fetched + ingested + duplicate — a rejected done is not done"
         );
         assert_eq!(c.failed, 2, "the failed row and the rejected-outcome row");
         assert_eq!(
@@ -4243,6 +4599,8 @@ mod tests {
             2,
             "announced + fetching remain in flight"
         );
+        assert_eq!((c.duplicate, c.duplicate_bytes), (1, 10));
+        assert_eq!(c.total_bytes, 70, "every row's byte_size, 7 × 10");
     }
 
     /// D2 §3.4: `settle_unsettled_inbound_files` keys on `state <> 'done'`, so a

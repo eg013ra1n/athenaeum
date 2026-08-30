@@ -37,6 +37,10 @@ if [[ -d "$APP_PATH" ]]; then
     found+=("$APP_PATH")
 fi
 
+# Custom transfer folders (Settings -> Transfers: outgoing staging / incoming
+# working) live wherever the user pointed them, so they are outside $DATA_DIR and
+# this script does NOT remove them. Only the defaults, which sit under
+# $DATA_DIR/sync, go with the data dir below.
 if [[ -d "$DATA_DIR" ]]; then
     size=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
     echo "  User data:    $DATA_DIR ($size, includes logs/)"

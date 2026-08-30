@@ -397,6 +397,7 @@ dependencies = [
  "quick-xml",
  "r2d2",
  "rayon",
+ "reflink-copy",
  "reqwest",
  "rusqlite",
  "rustafits",

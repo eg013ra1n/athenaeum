@@ -47,6 +47,7 @@ import type {
   SyncFinishedEvent,
   SyncProgressEvent,
   TerminalTransfers,
+  TransferFileCounts,
 } from '../types/models';
 
 /** Leading chars of a node-id hex, enough to disambiguate (mirrors useSyncStatus/TransfersPanel). */
@@ -62,22 +63,42 @@ function shortId(s: string): string {
 
 /** EMA smoothing factor tuned for "~3 samples" per the approved design. */
 const SPEED_EMA_ALPHA = 2 / (3 + 1);
+/** How many instantaneous-rate samples feed the ETA median. At the backend's
+ *  ~300 ms tick cadence this is roughly the last 15–40 s of transfer. */
+const SPEED_MEDIAN_WINDOW = 48;
+/** Below this many samples the median is meaningless; the ETA stays hidden. */
+const SPEED_MEDIAN_MIN_SAMPLES = 6;
 
 interface LiveBytes {
   bytesDone: number;
   bytesTotal: number;
-  /** Smoothed bytes/sec, `null` until at least two increasing samples arrive. */
+  /** Smoothed bytes/sec for the speed label (EMA, ~3 samples). */
   speedBps: number | null;
+  /** Median bytes/sec over the recent window — the ETA's basis. `null` until
+   *  `SPEED_MEDIAN_MIN_SAMPLES` increasing samples have arrived. */
+  etaBps: number | null;
 }
 
 interface SpeedTrackerEntry {
   lastTs: number;
   lastBytes: number;
   ema: number | null;
+  /** Ring of the last `SPEED_MEDIAN_WINDOW` instantaneous rates (bytes/sec). */
+  samples: number[];
+}
+
+/** Median of a non-empty array (copy + sort; the window is tiny). */
+function medianOf(samples: number[]): number {
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 /** Push one (time, bytes) sample into `store[key]`'s tracker and return the
- * live-bytes reading (merging the raw bytes with the freshly computed EMA). */
+ * live-bytes reading: the raw bytes, the freshly computed EMA (the speed label)
+ * and the median of the recent window (the ETA). The two differ on purpose — a
+ * single-stream QUIC transfer swings minute to minute, which the speed label
+ * SHOULD show and the ETA should not. */
 function trackBytes(
   store: Map<string, SpeedTrackerEntry>,
   key: string,
@@ -87,12 +108,16 @@ function trackBytes(
   const now = Date.now();
   const prev = store.get(key);
   let ema = prev?.ema ?? null;
+  const samples = prev?.samples ?? [];
   if (prev && bytesDone > prev.lastBytes && now > prev.lastTs) {
     const rate = ((bytesDone - prev.lastBytes) / (now - prev.lastTs)) * 1000;
     ema = ema == null ? rate : SPEED_EMA_ALPHA * rate + (1 - SPEED_EMA_ALPHA) * ema;
+    samples.push(rate);
+    if (samples.length > SPEED_MEDIAN_WINDOW) samples.splice(0, samples.length - SPEED_MEDIAN_WINDOW);
   }
-  store.set(key, { lastTs: now, lastBytes: bytesDone, ema });
-  return { bytesDone, bytesTotal, speedBps: ema };
+  store.set(key, { lastTs: now, lastBytes: bytesDone, ema, samples });
+  const etaBps = samples.length >= SPEED_MEDIAN_MIN_SAMPLES ? medianOf(samples) : null;
+  return { bytesDone, bytesTotal, speedBps: ema, etaBps };
 }
 
 export type TransferRowKind = 'outbound' | 'inbound';
@@ -124,7 +149,7 @@ export interface TransferRow {
    *  received-row "Perseus" origin badge. Informational — never gates anything. */
   peerKind: string | null;
   /** Backend-derived presentation state (§D5): outbound
-   *  `queued|preparing|transferring|uploaded|waiting|waiting_peer|queued_at_receiver|confirmed|cancelled|failed`,
+   *  `preparing|queued|announced|transferring|uploaded|waiting|waiting_peer|queued_at_receiver|confirmed|cancelled|failed`,
    *  inbound `announced|queued|fetching|ingesting|waiting_peer|done|failed|cancelled`.
    *  Non-exhaustive by design — `displayStateChip`'s default renders any new
    *  string verbatim in a muted chip. */
@@ -133,8 +158,9 @@ export interface TransferRow {
   stalledUntil: string | null;
   /** Whether a retry is armed (`next_retry_at` set) — gates the error-reason line. NOT `attempts`. */
   retrying: boolean;
-  /** Per-file rollup for the "N of M files" progress line. */
-  fileCounts: { total: number; done: number; failed: number };
+  /** Per-file rollup for the "N of M files" progress line (the generated
+   *  shape — `duplicate`/`duplicateBytes` drive the send-side §D4 split). */
+  fileCounts: TransferFileCounts;
   fileCount: number;
   byteSize: number;
   bytesDone: number;
@@ -168,6 +194,10 @@ export interface TransferRow {
    * cleared on `sync-finished`. Outbound-only; `null` for inbound/terminal rows. */
   liveStage: string | null;
   speedBps: number | null;
+  /** Median bytes/sec over the recent window — what the ETA divides by, kept
+   *  apart from the EMA `speedBps` that drives the speed label. `null` until
+   *  the window has enough samples, which HIDES the ETA (never an "∞"). */
+  etaBps: number | null;
   isTransferring: boolean;
   /** Bumped on every `sync-finished` for this package — a selected/expanded row
    * watches this to know its cached `list_transfer_files` detail needs a re-fetch. */
@@ -229,6 +259,11 @@ export function useTransferQueue(): UseTransferQueue {
   >(new Map());
   const outSpeedRef = useRef<Map<string, SpeedTrackerEntry>>(new Map());
   const inSpeedRef = useRef<Map<string, SpeedTrackerEntry>>(new Map());
+  // Mirror of `liveOutboundStage` in a ref: the `sync-progress` listener below is
+  // mounted once (`[]` deps), so its closure can never read the live state Map —
+  // and it must know the PREVIOUS stage synchronously (see the reset there).
+  // Outbound only; the receive side has one stage and needs no such bookkeeping.
+  const outStageRef = useRef<Map<number, string>>(new Map());
 
   // Bumped per row `key` (`out:<id>` / `in:<packageId>`) on every `sync-finished`
   // for that package — lets an already-expanded row (same component instance,
@@ -344,6 +379,16 @@ export function useTransferQueue(): UseTransferQueue {
         if (p.direction === 'sent') {
           const id = Number(p.packageId);
           if (!Number.isFinite(id)) return;
+          // Transfer-prepare spec: `preparing` (staging copy+hash), `indexing`
+          // (the serve import) and `transferring` (the wire) are three different
+          // pipes with three different speeds, and each restarts its byte counter
+          // from zero. Drop the tracker on a stage change — BEFORE the sample
+          // below — so the EMA restarts from this stage's first sample instead of
+          // carrying the previous stage's rate forward.
+          if (outStageRef.current.get(id) !== p.stage) {
+            outStageRef.current.set(id, p.stage);
+            outSpeedRef.current.delete(`out:${id}`);
+          }
           const live = trackBytes(outSpeedRef.current, `out:${id}`, p.bytesDone, p.bytesTotal);
           setLiveOutboundBytes((prev) => new Map(prev).set(id, live));
           // Record the stage for the row's post-upload/pre-ack label; a later
@@ -385,6 +430,7 @@ export function useTransferQueue(): UseTransferQueue {
           if (!Number.isFinite(id)) return;
           bumpFinishNonce(`out:${id}`);
           outSpeedRef.current.delete(`out:${id}`);
+          outStageRef.current.delete(id);
           setLiveOutboundBytes((prev) => {
             if (!prev.has(id)) return prev;
             const next = new Map(prev);
@@ -430,10 +476,19 @@ export function useTransferQueue(): UseTransferQueue {
                   deviceName: null,
                   displayState: outcome,
                   stalledUntil: null,
+                  // `okCount` is the receipt count — already the want-subset
+                  // (the §D4 duplicates were never announced, so the peer never
+                  // acks them), hence no split to record here. The durable row's
+                  // counts, which DO carry it, supersede on the next poll.
                   fileCounts: {
                     total: p.okCount + p.failed.length,
                     done: p.okCount,
                     failed: p.failed.length,
+                    duplicate: 0,
+                    duplicateBytes: 0,
+                    // No per-file byte figure in a finished event; the durable
+                    // row's counts carry the real total on the next poll.
+                    totalBytes: 0,
                   },
                   retrying: false,
                   resendable: true,
@@ -477,6 +532,17 @@ export function useTransferQueue(): UseTransferQueue {
     for (const s of status?.sender.active ?? []) {
       activeOutboundIds.add(s.id);
       const live = liveOutboundBytes.get(s.id);
+      const liveStage = liveOutboundStage.get(s.id) ?? null;
+      // Transfer-prepare spec §7.1: the serve import has no state of its own — the
+      // row stays `queued` until the announce goes out — so "indexing now" is the
+      // PAIR "`queued` + the last live tick was the import", never the bare stage.
+      // The bare stage goes stale: indexing emits its final tick before the
+      // announce and nothing ticks again until the peer pulls, so `liveStage`
+      // still reads `'indexing'` through the whole `announced` window (and through
+      // any `waiting`/`waiting_peer` after a failed announce). Gating throughput on
+      // it alone painted the last indexing EMA — "320 MB/s" — under a chip that
+      // says the transfer is waiting on the peer.
+      const indexingNow = s.displayState === 'queued' && liveStage === 'indexing';
       out.push({
         key: `out:${s.id}`,
         kind: 'outbound',
@@ -487,7 +553,9 @@ export function useTransferQueue(): UseTransferQueue {
         displayName: s.displayName,
         deviceName: s.deviceName,
         peerKind: null,
-        displayState: s.displayState,
+        // An indexing row wears the `indexing` label (same chip as `preparing`,
+        // its own subline); every other state passes through untouched.
+        displayState: indexingNow ? 'indexing' : s.displayState,
         stalledUntil: s.stalledUntil,
         retrying: s.retrying,
         fileCounts: s.fileCounts,
@@ -503,9 +571,18 @@ export function useTransferQueue(): UseTransferQueue {
         nextRetryAt: s.nextRetryAt,
         terminal: false,
         resendable: false,
-        liveStage: liveOutboundStage.get(s.id) ?? null,
-        speedBps: s.state === 'transferring' ? (live?.speedBps ?? null) : null,
-        isTransferring: s.state === 'transferring',
+        liveStage,
+        // Preparing and indexing move real bytes (locally), so they get a live
+        // speed + a moving bar exactly like the wire stage does.
+        speedBps:
+          s.state === 'transferring' || s.state === 'preparing' || indexingNow
+            ? (live?.speedBps ?? null)
+            : null,
+        etaBps:
+          s.state === 'transferring' || s.state === 'preparing' || indexingNow
+            ? (live?.etaBps ?? null)
+            : null,
+        isTransferring: s.state === 'transferring' || s.state === 'preparing' || indexingNow,
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
     }
@@ -557,6 +634,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: summary.resendable,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`out:${summary.id}`) ?? 0,
       });
@@ -601,6 +679,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: s.resendable,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
@@ -639,6 +718,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: false,
         liveStage: null,
         speedBps: s.state === 'fetching' ? (live?.speedBps ?? null) : null,
+        etaBps: s.state === 'fetching' ? (live?.etaBps ?? null) : null,
         isTransferring: s.state === 'fetching',
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
@@ -679,6 +759,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: false,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
@@ -722,7 +803,16 @@ export function useTransferQueue(): UseTransferQueue {
         retrying: false,
         // Manifest counts from the announce: N files, none done yet. Same shape a
         // real announced row reports, so the progress line doesn't change on handoff.
-        fileCounts: { total: q.frameCount, done: 0, failed: 0 },
+        fileCounts: {
+          total: q.frameCount,
+          done: 0,
+          failed: 0,
+          duplicate: 0,
+          duplicateBytes: 0,
+          // The announce's byte total lives on `byteSize` below; the ghost row
+          // has no per-file rows to sum, and the real row supersedes it.
+          totalBytes: 0,
+        },
         fileCount: q.frameCount,
         byteSize: q.byteSize,
         bytesDone: 0,
@@ -737,6 +827,7 @@ export function useTransferQueue(): UseTransferQueue {
         resendable: false,
         liveStage: null,
         speedBps: null,
+        etaBps: null,
         isTransferring: false,
         finishNonce: 0,
       });

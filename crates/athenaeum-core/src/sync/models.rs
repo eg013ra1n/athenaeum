@@ -18,10 +18,17 @@ use crate::sharing::types::{NodeId, PackageLayout};
 /// but is never written by the engine, which learns completion from the peer's
 /// ack. Terminal states are [`Confirmed`](Self::Confirmed),
 /// [`Failed`](Self::Failed) and [`Cancelled`](Self::Cancelled); everything else
-/// is non-terminal and re-driven on crash-resume.
+/// is non-terminal and re-driven on crash-resume — except
+/// [`Preparing`](Self::Preparing), whose in-progress staging a restart cannot
+/// resume, so the startup heal fails it instead of re-driving it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboundState {
+    /// Row inserted, payload not yet staged: the preparation worker is copying +
+    /// hashing into `package_ref` (transfer-prepare spec §3). Cancellable; a
+    /// restart heals it to [`Failed`](Self::Failed) — a half-staged package dir
+    /// is never handed to the engine.
+    Preparing,
     /// Persisted, not yet advertised to the peer.
     Queued,
     /// Announced to the peer; awaiting pull.
@@ -56,6 +63,7 @@ impl OutboundState {
     /// Stable lowercase text stored in the `state` column.
     pub fn as_str(&self) -> &'static str {
         match self {
+            OutboundState::Preparing => "preparing",
             OutboundState::Queued => "queued",
             OutboundState::Announced => "announced",
             OutboundState::Transferring => "transferring",
@@ -70,6 +78,7 @@ impl OutboundState {
     /// silently coercing.
     pub fn from_db(s: &str) -> Result<Self> {
         Ok(match s {
+            "preparing" => OutboundState::Preparing,
             "queued" => OutboundState::Queued,
             "announced" => OutboundState::Announced,
             "transferring" => OutboundState::Transferring,
@@ -460,7 +469,9 @@ pub struct HistoryQuery {
 /// §D4). Mirrors [`OutboundState`]'s `as_str`/`from_db` shape: a file walks
 /// `Pending → Sending → Uploaded → Done`. `Uploaded` means "the sender finished
 /// serving this file's bytes"; `Done` means the batch ack recorded the receiver's
-/// per-frame verdict for it.
+/// per-frame verdict for it. [`Failed`](Self::Failed) is the one rung off that
+/// walk — terminal, and the only ERROR state: the file whose staging broke a
+/// preparation that never reached the engine (transfer-prepare spec §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboundFileState {
@@ -472,6 +483,17 @@ pub enum OutboundFileState {
     Uploaded,
     /// The batch ack recorded this file's per-frame receipt — terminal.
     Done,
+    /// This file broke its transfer — terminal, and an ERROR (unlike
+    /// [`Done`](Self::Done), which covers cancelled/duplicate verdicts too).
+    /// Written only by the API-layer settle
+    /// ([`settle_outbound_files_terminal`](super::store::settle_outbound_files_terminal)),
+    /// for the one file whose staging failed before the batch ever reached the
+    /// engine (transfer-prepare spec §3); the engine itself never produces it.
+    /// The grouped-counts SQL
+    /// ([`outbound_file_counts`](super::store::outbound_file_counts)) has always
+    /// classified `state = 'failed'` as failed on both directions — this variant
+    /// makes the value writable and readable rather than a parse error.
+    Failed,
 }
 
 impl OutboundFileState {
@@ -482,6 +504,7 @@ impl OutboundFileState {
             OutboundFileState::Sending => "sending",
             OutboundFileState::Uploaded => "uploaded",
             OutboundFileState::Done => "done",
+            OutboundFileState::Failed => "failed",
         }
     }
 
@@ -493,6 +516,7 @@ impl OutboundFileState {
             "sending" => OutboundFileState::Sending,
             "uploaded" => OutboundFileState::Uploaded,
             "done" => OutboundFileState::Done,
+            "failed" => OutboundFileState::Failed,
             other => return Err(anyhow!("unknown outbound file state: {other}")),
         })
     }
@@ -615,4 +639,22 @@ pub struct SyncEventRow {
     pub kind: String,
     /// Optional human detail (e.g. a class-tagged error). `None` for a bare event.
     pub detail: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Transfer-prepare spec §3: the async-preparation state is a real,
+    /// round-trippable `sync_outbound.state` value and is NOT terminal — the row
+    /// is live work a restart has to heal, not a finished verdict.
+    #[test]
+    fn preparing_roundtrips_and_is_not_terminal() {
+        assert_eq!(OutboundState::Preparing.as_str(), "preparing");
+        assert_eq!(
+            OutboundState::from_db("preparing").unwrap(),
+            OutboundState::Preparing
+        );
+        assert!(!OutboundState::Preparing.is_terminal());
+    }
 }

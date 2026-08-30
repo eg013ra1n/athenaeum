@@ -80,7 +80,7 @@ async fn loopback_announce_fetch_ack_roundtrip() {
     let blob = write_blob(src.path(), "frame_0001.fits", 64 * 1024);
     let pkg = sample_announce();
 
-    provider.serve(&pkg, src.path(), None).await.unwrap();
+    provider.serve(&pkg, src.path(), None, None).await.unwrap();
     provider
         .announce(receiver_info.node_id, &pkg, "", "", &[], PackageLayout::Batch)
         .await
@@ -253,7 +253,7 @@ async fn loopback_release_makes_package_unfetchable() {
     let src = tempdir().unwrap();
     write_blob(src.path(), "frame_0001.fits", 64 * 1024);
     let pkg = sample_announce();
-    provider.serve(&pkg, src.path(), None).await.unwrap();
+    provider.serve(&pkg, src.path(), None, None).await.unwrap();
 
     // Served → fetch succeeds.
     let dest1 = tempdir().unwrap();
@@ -289,7 +289,7 @@ async fn loopback_fault_abort_mid_fetch_then_resume() {
     let src = tempdir().unwrap();
     let blob = write_blob(src.path(), "frame_0001.fits", 256 * 1024);
     let pkg = sample_announce();
-    provider.serve(&pkg, src.path(), None).await.unwrap();
+    provider.serve(&pkg, src.path(), None, None).await.unwrap();
 
     // Arm the one-shot fault: abort after 32 KiB copied.
     receiver.set_fault(FaultPlan {
@@ -420,7 +420,7 @@ async fn subset_serve_transfers_only_want_frames() {
     // Want only frame1 + frame3 (drop frame2 as an already-had duplicate).
     let want: HashSet<String> = [rels[0].clone(), rels[2].clone()].into_iter().collect();
     provider
-        .serve(&announce, &pkg_dir, Some(&want))
+        .serve(&announce, &pkg_dir, Some(&want), None)
         .await
         .unwrap();
 
@@ -466,7 +466,7 @@ async fn loopback_fetch_reports_monotonic_per_file_progress() {
 
     let tmp = tempdir().unwrap();
     let (pkg_dir, announce, _rels) = build_three_frame_package(&tmp.path().join("src"));
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     let (sink, events) = recording_sink();
     let dest = tempdir().unwrap();

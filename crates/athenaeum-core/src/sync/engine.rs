@@ -60,7 +60,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     ReceiptOutcome, RevokeReason, TransportEvent,
 };
-use crate::sharing::SharingTransport;
+use crate::sharing::{ImportProgressSink, SharingTransport};
 
 use super::diagnostics::{classify_send_error, ConnectClass};
 use super::models::{Direction, HistoryRow, OutboundFileState, OutboundRow, OutboundState};
@@ -264,6 +264,11 @@ enum Command {
     /// cannot reach it. This tells the worker to read the fresh row and re-drive it
     /// exactly like a crash-resume.
     Resend(i64),
+    /// Drive a row the API layer already inserted as `Queued` (a finished
+    /// preparation, transfer-prepare spec §3.3): read it and start it like a
+    /// crash-resume. The row is NOT in the in-memory `pending` map (it never
+    /// passed through `Process`), so a `Kick` could not reach it.
+    Drive(i64),
     /// Kick one in-flight package: collapse its retry deadline to now and reset
     /// its backoff rung so the next worker pass re-announces immediately (spec §2
     /// wake event / send-now). A no-op for an id with no pending slot.
@@ -728,6 +733,22 @@ impl SyncEngineHandle {
         Ok(())
     }
 
+    /// Drive a row the API layer already inserted as `Queued` — a finished
+    /// preparation (transfer-prepare spec §3.3): the package dir exists on disk
+    /// and its row is in the DB, so the worker reads it and starts it like a
+    /// crash-resume. Same shape as [`resend`](Self::resend) (both pick a row up
+    /// from the store rather than minting one), and distinct from
+    /// [`kick`](Self::kick) for the same reason: the row never passed through
+    /// `Command::Process`, so it owns no slot in the worker's `pending` map and a
+    /// kick would be a no-op.
+    pub async fn drive(&self, id: i64) -> Result<()> {
+        self.cmd_tx
+            .send(Command::Drive(id))
+            .await
+            .map_err(|_| anyhow!("sync engine worker stopped"))?;
+        Ok(())
+    }
+
     /// Kick one in-flight package (send-now / spec §2 wake event): wake it out of
     /// its backoff so the worker re-announces on the next pass. A no-op on the
     /// worker side if the id has no pending slot (already terminal / unknown).
@@ -896,6 +917,20 @@ impl Worker {
                     if row.peer != self.peer {
                         continue;
                     }
+                    // A `preparing` row is the preparation worker's (transfer-prepare
+                    // spec §3.3): its package dir is half-staged and its manifest is
+                    // not written yet, so announcing it would ship a package that does
+                    // not exist. The worker hands the row over itself, via
+                    // `Command::Drive`, once the dir is whole; a preparation the
+                    // process did not survive is healed to `failed` at startup by
+                    // `api::sync_prepare::heal_interrupted_preparations`, never here.
+                    if row.state == OutboundState::Preparing {
+                        tracing::debug!(
+                            package_id = row.id,
+                            "preparing row belongs to the preparation worker; not resumed"
+                        );
+                        continue;
+                    }
                     let dir = PathBuf::from(&row.package_ref);
                     if let Err(e) = self.start_package(row.id, dir, row.state).await {
                         tracing::error!(package_id = row.id, error = %e, "resume re-announce failed");
@@ -1018,7 +1053,8 @@ impl Worker {
                             tracing::error!(package_id = id, error = %e, "sync cancel failed");
                         }
                     }
-                    Some(Command::Resend(id)) => self.resend_package(id).await,
+                    Some(Command::Resend(id)) => self.drive_package(id, "resend").await,
+                    Some(Command::Drive(id)) => self.drive_package(id, "drive").await,
                     Some(Command::PeerPresent) => {
                         self.peer_reachable("presence", ReachabilityProof::Beacon)
                     }
@@ -1463,13 +1499,46 @@ impl Worker {
                 .collect()
         };
 
+        // Transfer-prepare spec §4.4: the serve import hashes the whole package
+        // BEFORE the peer is told it exists — minutes of work on a multi-GB send.
+        // The sink is threaded INTO `serve` rather than routed through the
+        // transport's `TransportEvent` channel on purpose: this worker awaits
+        // `serve` inline (the `events.recv()` arm of `run`'s select is not polled
+        // meanwhile), so a tick sent through that channel could only be handled
+        // AFTER the import it describes had already finished. Called from the
+        // import's own task, it cannot touch `&self`, so it emits the same
+        // `SyncProgressEvent` `emit_progress_bytes` would, with everything it needs
+        // captured by value. `None` emitter ⇒ no sink ⇒ the import skips the work.
+        let import_progress: Option<ImportProgressSink> = self.emitter.as_ref().map(|em| {
+            let em = Arc::clone(em);
+            let package_id = id.to_string();
+            let peer_device = node_id_hex(&self.peer);
+            let frame_count = announce.frame_count;
+            let sink: ImportProgressSink = Arc::new(move |bytes_done: u64, bytes_total: u64| {
+                emit_event(
+                    em.as_ref(),
+                    "sync-progress",
+                    &SyncProgressEvent {
+                        package_id: package_id.clone(),
+                        direction: Direction::Sent,
+                        stage: "indexing".to_string(),
+                        peer_device: peer_device.clone(),
+                        frame_count,
+                        project_id: None,
+                        bytes_done: Some(bytes_done),
+                        bytes_total: Some(bytes_total),
+                    },
+                );
+            });
+            sink
+        });
         // Provider side: register the served dir (the negotiated want-subset when
         // `Some`, the full package when `None`), then advertise it to the peer. A
         // failure here (e.g. the peer is offline) is retryable, not fatal:
         // remember the announce + want and arm a retry deadline.
         let serve_announce = async {
             self.transport
-                .serve(&announce, &dir, want.as_ref())
+                .serve(&announce, &dir, want.as_ref(), import_progress)
                 .await
                 .context("serve package")?;
             match &project {
@@ -2102,8 +2171,64 @@ impl Worker {
         tracing::info!(package_id = id, "kick: immediate retry");
     }
 
+    /// The confirmed-terminal tail, ordered and detached: **protect → cleanup →
+    /// release** (transfer-prepare spec §4.2).
+    ///
+    /// A transport that serves payloads in place (`ImportMode::TryReference`)
+    /// keeps blobs pointing at the files under the package dir, and two packages
+    /// carrying the same frame SHARE one blob — so a blob this package shares with
+    /// another live one has to be copied into the store BEFORE these files are
+    /// deleted. Hence the hook, and hence it running first.
+    ///
+    /// All three steps are detached because [`handle_event`](Self::handle_event) is
+    /// deliberately synchronous (a package can never be confirmed twice by
+    /// interleaving) while the hook is async. The row is already `Confirmed` when
+    /// this is spawned, so nothing here can fail the confirm — but the ORDER
+    /// within the task is guaranteed.
+    ///
+    /// A protection failure SKIPS the cleanup: the payload stays on disk (Settings
+    /// → Sync's "clean up finished transfers" reclaims it later) rather than being
+    /// deleted out from under another transfer. `release` runs either way — the
+    /// tag must not outlive the transfer.
+    fn spawn_protect_cleanup_release(&self, package_id: PackageId, row_id: i64, dir: PathBuf) {
+        let transport = Arc::clone(&self.transport);
+        let sink = self.cleanup_sink.clone();
+        tokio::spawn(async move {
+            match transport.protect_shared_before_cleanup(&package_id).await {
+                Ok(()) => match &sink {
+                    // Multi-target fan-out: the coordinator cleans once, after every
+                    // target is terminal. Same protection precedes it.
+                    Some(sink) => sink.on_terminal(&dir),
+                    None => match cleanup_package_payloads(&dir) {
+                        Ok(freed_bytes) => {
+                            tracing::info!(
+                                package_id = row_id,
+                                freed_bytes,
+                                "package payloads cleaned"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(package_id = row_id, error = %format!("{e:#}"), "package payload cleanup failed");
+                        }
+                    },
+                },
+                Err(e) => tracing::error!(
+                    package_id = row_id,
+                    error = %format!("{e:#}"),
+                    "shared-blob protection failed; keeping payload on disk"
+                ),
+            }
+            if let Err(e) = transport.release(&package_id).await {
+                tracing::warn!(package_id = %package_id.0, error = %format!("{e:#}"), "blob release failed");
+            }
+        });
+    }
+
     /// Fire-and-forget blob release for a package that has reached a terminal
-    /// state (confirmed / failed / cancelled). Runs on a detached task over a
+    /// state that KEEPS its payload (failed / cancelled / cancelled-by-receiver;
+    /// the confirmed path goes through
+    /// [`spawn_protect_cleanup_release`](Self::spawn_protect_cleanup_release)
+    /// instead, since only it deletes anything). Runs on a detached task over a
     /// clone of the transport `Arc`, so a release failure can never block or
     /// fail the synchronous state transition ([`handle_event`](Self::handle_event)
     /// is deliberately non-async) that triggered it — it only logs. `release`
@@ -2155,14 +2280,22 @@ impl Worker {
         });
     }
 
-    /// (Re)drive a resent transfer ([`Command::Resend`]). `resend_transfer` (API
-    /// layer) has already reset the SAME durable row back to `Queued` — attempts++,
-    /// a fresh per-attempt wire id, per-file rows → `pending` — while the row was
-    /// terminal, so its slot is NOT in `pending` and a fresh
-    /// [`start_package`](Self::start_package) is what picks the new attempt up
-    /// (reading `wire_package_id` fresh; nothing is cached across the reset). This
-    /// mirrors the crash-resume drive, scoped to this engine's own peer.
-    async fn resend_package(&mut self, id: i64) {
+    /// Drive a durable row the API layer put in front of the worker — the shared
+    /// body of [`Command::Resend`] and [`Command::Drive`], told apart only by the
+    /// `reason` log field.
+    ///
+    /// `resend` (Transfers Batch Model §D1/§D3): `resend_transfer` has already
+    /// reset the SAME row back to `Queued` — attempts++, a fresh per-attempt wire
+    /// id, per-file rows → `pending` — while the row was terminal.
+    /// `drive` (transfer-prepare §3.3): the preparation worker inserted/flipped
+    /// the row to `Queued` after staging its payloads.
+    ///
+    /// Either way the row's slot is NOT in `pending` (it never passed through
+    /// [`Command::Process`], or its slot was dropped on the earlier terminal
+    /// transition), so a fresh [`start_package`](Self::start_package) is what picks
+    /// it up — reading `wire_package_id` fresh, nothing cached across the reset.
+    /// This mirrors the crash-resume drive, scoped to this engine's own peer.
+    async fn drive_package(&mut self, id: i64, reason: &'static str) {
         // Already live (a fresh-built engine's crash-resume beat this command to the
         // row): just collapse its backoff so it re-announces now.
         if self.pending.contains_key(&id) {
@@ -2172,11 +2305,11 @@ impl Worker {
         let row = match self.store.get_outbound(id) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                tracing::warn!(package_id = id, "resend: outbound row vanished; ignoring");
+                tracing::warn!(package_id = id, reason, "outbound row vanished; ignoring");
                 return;
             }
             Err(e) => {
-                tracing::error!(package_id = id, error = %format!("{e:#}"), "resend: read outbound row failed");
+                tracing::error!(package_id = id, reason, error = %format!("{e:#}"), "read outbound row failed");
                 return;
             }
         };
@@ -2184,23 +2317,37 @@ impl Worker {
         if row.peer != self.peer {
             tracing::warn!(
                 package_id = id,
-                "resend: row targets another peer; ignoring"
+                reason,
+                "row targets another peer; ignoring"
             );
             return;
         }
-        // The API layer guards terminal-state eligibility + does the reset; if the
-        // row is still terminal here the reset never ran — do not re-drive.
+        // The API layer guards state eligibility + does the reset/insert; if the row
+        // is terminal here that never ran — do not drive it.
         if row.state.is_terminal() {
             tracing::warn!(
                 package_id = id,
+                reason,
                 state = row.state.as_str(),
-                "resend: row still terminal; not re-driving"
+                "row is terminal; not driving"
+            );
+            return;
+        }
+        // Still staging: the preparation worker flips the row to `Queued` itself
+        // and only then drives it, so a `Preparing` row here means someone drove
+        // a package whose dir is not written yet. Refusing is the same rule the
+        // startup sweep applies — an engine must never announce a half-staged dir.
+        if row.state == OutboundState::Preparing {
+            tracing::warn!(
+                package_id = id,
+                reason,
+                "row is still preparing; not driving"
             );
             return;
         }
         let dir = PathBuf::from(&row.package_ref);
         if let Err(e) = self.start_package(id, dir, row.state).await {
-            tracing::error!(package_id = id, error = %format!("{e:#}"), "resend: start_package failed");
+            tracing::error!(package_id = id, reason, error = %format!("{e:#}"), "start_package failed");
         }
     }
 
@@ -2878,28 +3025,15 @@ impl Worker {
         // confirm — that would strip a still-offline target's retry to a
         // manifest-only collection (silent data loss). Route the terminal signal
         // to the coordinator, which cleans exactly once after every target is
-        // terminal. Without a sink (app / single-target) the original in-line
-        // cleanup runs unchanged.
-        match &self.cleanup_sink {
-            Some(sink) => sink.on_terminal(&pending.dir),
-            None => match cleanup_package_payloads(&pending.dir) {
-                Ok(freed_bytes) => {
-                    tracing::info!(
-                        package_id = pending.id,
-                        freed_bytes,
-                        "package payloads cleaned"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
-                }
-            },
-        }
-        // Terminal: the package is confirmed; drop its served blobs so they do
-        // not outlive the transfer. `package_id` is the id the ack correlated
-        // against (== pending.announce.package_id). Fire-and-forget, never fails
-        // the confirm.
-        self.spawn_release(package_id);
+        // terminal. Without a sink (app / single-target) the direct
+        // `cleanup_package_payloads` runs instead.
+        //
+        // The cleanup is preceded by `protect_shared_before_cleanup` and followed
+        // by the release, all three on ONE detached task — see
+        // [`spawn_protect_cleanup_release`](Self::spawn_protect_cleanup_release)
+        // for why the order is load-bearing. `package_id` is the id the ack
+        // correlated against (== pending.announce.package_id).
+        self.spawn_protect_cleanup_release(package_id, pending.id, pending.dir.clone());
         tracing::info!(package_id = pending.id, state = "confirmed", "sync state");
         self.journal(pending.id, "confirmed", None);
         self.emit_finished(

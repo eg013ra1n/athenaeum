@@ -292,36 +292,7 @@ pub fn add_scan_root(
     policy.check(&new_path)?;
 
     // 4. Get existing scan roots and check for overlaps
-    let existing_roots = crate::db::get_scan_roots(&conn)?;
-
-    for root in existing_roots.iter() {
-        let existing_path = normalize_path(&Path::new(&root.path).canonicalize().map_err(|e| {
-            ApiError::Internal(format!("Failed to resolve existing root path: {}", e))
-        })?);
-
-        // Check exact match
-        if new_path == existing_path {
-            return Err(ApiError::Conflict(
-                "This directory is already being monitored".to_string(),
-            ));
-        }
-
-        // Check if new path is a subdirectory of existing root
-        if new_path.starts_with(&existing_path) {
-            return Err(ApiError::Conflict(format!(
-                "Cannot add directory: it is a subdirectory of existing scan root '{}'",
-                root.path
-            )));
-        }
-
-        // Check if new path is a parent of existing root
-        if existing_path.starts_with(&new_path) {
-            return Err(ApiError::Conflict(format!(
-                "Cannot add directory: existing scan root '{}' is a subdirectory of it",
-                root.path
-            )));
-        }
-    }
+    check_scan_root_overlap(&conn, &new_path)?;
 
     // 5. Single-special-root enforcement — checked after overlap validation
     //    so a doomed-anyway overlapping add doesn't get misreported as a
@@ -347,6 +318,58 @@ pub fn add_scan_root(
         monitor_enabled: false,
         kind,
     })
+}
+
+/// Reject `new_path` (already canonicalized + normalized) when it equals, sits
+/// inside, or contains any existing scan root — the shared guard behind
+/// `add_scan_root` and the transfer-folder settings (a folder the scanner
+/// watches would ingest transfer copies as duplicates).
+///
+/// An existing root that cannot be resolved is compared by its STORED path
+/// instead of aborting the whole check: a root on an unplugged external drive
+/// stays registered (missing ≠ orphan), and one offline drive must not block
+/// every other root/transfer-folder decision. `add_scan_root` persists the
+/// canonicalized path, so the stored spelling is the right thing to compare.
+pub fn check_scan_root_overlap(
+    conn: &rusqlite::Connection,
+    new_path: &Path,
+) -> Result<(), ApiError> {
+    let existing_roots = crate::db::get_scan_roots(conn)?;
+
+    for root in existing_roots.iter() {
+        let existing_path = match Path::new(&root.path).canonicalize() {
+            Ok(p) => normalize_path(&p),
+            Err(e) => {
+                tracing::warn!(path = %root.path, error = %e, "scan root not resolvable; comparing by its stored path");
+                normalize_path(Path::new(&root.path))
+            }
+        };
+
+        // Check exact match
+        if new_path == existing_path {
+            return Err(ApiError::Conflict(
+                "This directory is already being monitored".to_string(),
+            ));
+        }
+
+        // Check if new path is a subdirectory of existing root
+        if new_path.starts_with(&existing_path) {
+            return Err(ApiError::Conflict(format!(
+                "Cannot add directory: it is a subdirectory of existing scan root '{}'",
+                root.path
+            )));
+        }
+
+        // Check if new path is a parent of existing root
+        if existing_path.starts_with(new_path) {
+            return Err(ApiError::Conflict(format!(
+                "Cannot add directory: existing scan root '{}' is a subdirectory of it",
+                root.path
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// The (single) calibration library root, if configured. Legacy accessor —

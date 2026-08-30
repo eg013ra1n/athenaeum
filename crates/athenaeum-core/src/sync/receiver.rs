@@ -3601,6 +3601,10 @@ pub struct SyncRuntime {
     /// refusal burst across either gate triggers at most one hub round-trip per
     /// gap.
     pub(crate) refusal: Arc<RefusalRefresher>,
+    /// The working dir the running node bound its blob store under (transfer-
+    /// prepare spec §6.4) — `None` until `ensure_started` binds. Compared with
+    /// the configured setting to raise the "restart required" badge.
+    bound_working_dir: tokio::sync::Mutex<Option<PathBuf>>,
 }
 
 impl SyncRuntime {
@@ -3612,12 +3616,27 @@ impl SyncRuntime {
             // 5-minute refusal debounce (spec): a machine just added to the
             // account is admitted within one gap of its first refused retry.
             refusal: Arc::new(RefusalRefresher::new(std::time::Duration::from_secs(300))),
+            bound_working_dir: tokio::sync::Mutex::new(None),
         }
     }
 
     /// Whether the transport has been started (a ticket exists).
     pub async fn is_started(&self) -> bool {
         self.inner.lock().await.is_some()
+    }
+
+    /// The working dir the running node actually bound under, or `None` when the
+    /// transport has never started this run. `get_transfer_paths` compares it
+    /// with the configured folder to decide whether a change needs a restart.
+    pub async fn bound_working_dir(&self) -> Option<PathBuf> {
+        self.bound_working_dir.lock().await.clone()
+    }
+
+    /// Record the working dir the transport bound under. Called by
+    /// [`ensure_started`](Self::ensure_started); tests set it directly to
+    /// simulate a running node.
+    pub(crate) async fn set_bound_working_dir(&self, dir: PathBuf) {
+        *self.bound_working_dir.lock().await = Some(dir);
     }
 
     /// The current pairing ticket, if started.
@@ -3670,21 +3689,22 @@ impl SyncRuntime {
         });
     }
 
-    /// Lazily build the iroh transport under `sync_dir`, spawn one receiver that
-    /// ingests into the catalog at `db_path`, and return the pairing ticket.
-    /// Idempotent — a second call returns the existing ticket without starting a
-    /// second transport.
+    /// Lazily build the iroh transport under `working_dir` — the data dir: blob
+    /// store, staging, collab (the device identity lives elsewhere, see
+    /// [`crate::api::sync::SyncDirs`]) — spawn one receiver that ingests into the
+    /// catalog at `db_path`, and return the pairing ticket. Idempotent — a second
+    /// call returns the existing ticket without starting a second transport.
     ///
     /// The `node` is the process-wide [`SharedIrohNode`] (bound by
     /// [`crate::api::sync::ensure_iroh_node`], which resolves the relay mode once):
     /// the receiver rides it as its `Recv` role handle, sharing the single
-    /// endpoint + `<sync>/blobs` store with the personal + collab senders (C1
+    /// endpoint + `<working>/blobs` store with the personal + collab senders (C1
     /// fix). This method installs the dedup responder + connect gate on that
     /// shared node and spawns one receiver over its `Recv` handle.
     pub async fn ensure_started(
         &self,
         node: Arc<SharedIrohNode>,
-        sync_dir: PathBuf,
+        working_dir: PathBuf,
         db_path: PathBuf,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
@@ -3696,8 +3716,11 @@ impl SyncRuntime {
             return Ok(started.ticket.clone());
         }
 
-        std::fs::create_dir_all(&sync_dir)
-            .with_context(|| format!("create sync dir {}", sync_dir.display()))?;
+        std::fs::create_dir_all(&working_dir)
+            .with_context(|| format!("create sync working dir {}", working_dir.display()))?;
+        // Remember what this run actually bound under: a later settings change
+        // only takes effect on the next start, and the UI says so (spec §6.4).
+        self.set_bound_working_dir(working_dir.clone()).await;
         let store = Arc::new(
             CatalogSyncStore::open(&db_path)
                 .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
@@ -3732,11 +3755,11 @@ impl SyncRuntime {
         // operator's number, not at the default until someone re-saves the setting.
         apply_receive_limit(&control, hooks.max_concurrent_receives);
 
-        // Staging lives under the sync dir; the landing root is resolved live per
-        // package by the caller-supplied resolver (task 5).
+        // Staging lives under the working dir; the landing root is resolved live
+        // per package by the caller-supplied resolver (task 5).
         let (info, receiver) = SyncReceiver::spawn(
             store,
-            sync_dir.clone(),
+            working_dir.clone(),
             incoming,
             authorized,
             ProjectReceiveHooks {
@@ -4261,7 +4284,7 @@ mod tests {
 
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
         assert!(announce.byte_size > 0, "fixture package has non-zero bytes");
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
@@ -4374,7 +4397,7 @@ mod tests {
         .unwrap();
 
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
@@ -4439,7 +4462,7 @@ mod tests {
         .unwrap();
 
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
@@ -4513,7 +4536,7 @@ mod tests {
         // triggering the ingest-error early return, not the (already-covered)
         // per-frame-rejected "all frames rejected" path.
         std::fs::remove_file(pkg_dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
@@ -4603,7 +4626,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         let wire = announce.package_id.0.clone();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         // Fetch and ingest both succeed; only the receipt hand-back fails.
         receiver_ep.set_fault(FaultPlan {
             fail_ack_once: true,
@@ -4788,7 +4811,7 @@ mod tests {
         .unwrap();
 
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Cancel BEFORE the announce, then announce.
         control.request_cancel(&announce.package_id.0);
@@ -5321,7 +5344,7 @@ mod tests {
         .unwrap();
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -5530,7 +5553,7 @@ mod tests {
                 ("M31/L_0002.fits", "frame-mirror-a2", 0.5),
             ],
         );
-        sender.serve(&ann_a, &dir_a, None).await.unwrap();
+        sender.serve(&ann_a, &dir_a, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -5550,7 +5573,7 @@ mod tests {
             "pkg-mirror-b",
             &[("M31/L_0003.fits", "frame-mirror-b1", 0.75)],
         );
-        sender.serve(&ann_b, &dir_b, None).await.unwrap();
+        sender.serve(&ann_b, &dir_b, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -5634,7 +5657,7 @@ mod tests {
             "pkg-mirror-c",
             &[("M31/L_0001.fits", "frame-mirror-c1", 0.125)],
         );
-        sender.serve(&ann_c, &dir_c, None).await.unwrap();
+        sender.serve(&ann_c, &dir_c, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -5702,7 +5725,7 @@ mod tests {
         .unwrap();
 
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         // v1: blank name, empty manifest (the loopback delivers Some("")/Some(vec![])).
         sender
             .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
@@ -5772,7 +5795,7 @@ mod tests {
         .unwrap();
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Cancel BEFORE the announce → the epilogue runs (manifest still recorded).
         control.request_cancel(&announce.package_id.0);
@@ -6121,7 +6144,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         let wire = announce.package_id.0.clone();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         // Kill the payload transfer mid-flight — the loopback stand-in for "the
         // sender's app was closed while we were downloading".
         receiver_ep.set_fault(FaultPlan {
@@ -6229,7 +6252,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         let wire = announce.package_id.0.clone();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         // Everything transfers; writing it out fails. The real transport's
         // materialize phase (dest-dir creation / blob export) is where this lives.
         receiver_ep.set_fault(FaultPlan {
@@ -6323,7 +6346,10 @@ mod tests {
 
         // Attempt 1: serve + announce with the fetch armed to abort (one-shot). No
         // payload lands; the row is stamped Failed.
-        sender.serve(&announce1, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce1, &pkg_dir, None, None)
+            .await
+            .unwrap();
         receiver_ep.set_fault(FaultPlan {
             abort_after_bytes: Some(1),
             ..Default::default()
@@ -6368,7 +6394,10 @@ mod tests {
             frame_count: announce1.frame_count,
         };
         let w2 = announce2.package_id.0.clone();
-        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce2, &pkg_dir, None, None)
+            .await
+            .unwrap();
         sender
             .announce(
                 receiver_node,
@@ -6492,7 +6521,10 @@ mod tests {
         );
 
         // Attempt 1: fetch armed to abort → nothing lands, no history written.
-        sender.serve(&announce1, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce1, &pkg_dir, None, None)
+            .await
+            .unwrap();
         receiver_ep.set_fault(FaultPlan {
             abort_after_bytes: Some(1),
             ..Default::default()
@@ -6522,7 +6554,10 @@ mod tests {
             w2, BATCH,
             "the resend wire id must differ from the batch_uuid"
         );
-        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce2, &pkg_dir, None, None)
+            .await
+            .unwrap();
         sender
             .announce(
                 receiver_node,
@@ -6609,7 +6644,10 @@ mod tests {
 
         // Attempt 1: cancel BEFORE the announce → the cancel epilogue runs (row
         // Cancelled + a Cancelled receipt per frame under w1).
-        sender.serve(&announce1, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce1, &pkg_dir, None, None)
+            .await
+            .unwrap();
         control.request_cancel(&w1);
         sender
             .announce(
@@ -6652,7 +6690,10 @@ mod tests {
             frame_count: announce1.frame_count,
         };
         let w2 = announce2.package_id.0.clone();
-        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce2, &pkg_dir, None, None)
+            .await
+            .unwrap();
         sender
             .announce(
                 receiver_node,
@@ -6797,7 +6838,10 @@ mod tests {
 
         // Attempt 2 (the sender's resend): fresh wire id, SAME batch_uuid, fully
         // served. The receiver must reset the row and deliver — not re-ack cancelled.
-        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce2, &pkg_dir, None, None)
+            .await
+            .unwrap();
         sender
             .announce(
                 receiver_node,
@@ -6910,7 +6954,10 @@ mod tests {
 
         // The straggler: the SAME wire id re-announced after the revoke (served, so
         // a wrongly-diverted epilogue would be distinguishable from a delivery).
-        sender.serve(&announce1, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce1, &pkg_dir, None, None)
+            .await
+            .unwrap();
         sender
             .announce(
                 receiver_node,
@@ -7023,7 +7070,10 @@ mod tests {
         // The sender's resend (fresh wire id, same batch, fully served): the
         // declined transfer must be re-acked cancelled by the epilogue — receipts
         // under w2, anchor rotated, NO files landed.
-        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender
+            .serve(&announce2, &pkg_dir, None, None)
+            .await
+            .unwrap();
         sender
             .announce(
                 receiver_node,
@@ -7668,7 +7718,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         let wire = announce.package_id.0.clone();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -8253,7 +8303,7 @@ mod tests {
 
         let (dir_a, ann_a, files_a) = build_lane_fixture(tmp.path(), "slow", 3);
         let wire_a = ann_a.package_id.0.clone();
-        slow_sender.serve(&ann_a, &dir_a, None).await.unwrap();
+        slow_sender.serve(&ann_a, &dir_a, None, None).await.unwrap();
         slow_sender
             .announce(
                 receiver_node,
@@ -8272,7 +8322,7 @@ mod tests {
 
         let (dir_b, ann_b, files_b) = build_lane_fixture(tmp.path(), "fast", 1);
         let wire_b = ann_b.package_id.0.clone();
-        fast_sender.serve(&ann_b, &dir_b, None).await.unwrap();
+        fast_sender.serve(&ann_b, &dir_b, None, None).await.unwrap();
         fast_sender
             .announce(
                 receiver_node,
@@ -8454,7 +8504,7 @@ mod tests {
 
         let (dir_1, ann_1, files_1) = build_lane_fixture(tmp.path(), "busy", 3);
         let wire_1 = ann_1.package_id.0.clone();
-        sender.serve(&ann_1, &dir_1, None).await.unwrap();
+        sender.serve(&ann_1, &dir_1, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -8474,7 +8524,7 @@ mod tests {
 
         let (dir_2, ann_2, files_2) = build_lane_fixture(tmp.path(), "queued", 1);
         let wire_2 = ann_2.package_id.0.clone();
-        sender.serve(&ann_2, &dir_2, None).await.unwrap();
+        sender.serve(&ann_2, &dir_2, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -8594,7 +8644,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_lane_fixture(tmp.path(), "abort", 3);
         let wire = announce.package_id.0.clone();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -8688,7 +8738,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_lane_fixture(tmp.path(), "fifo", 3);
         let wire = announce.package_id.0.clone();
-        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
         sender
             .announce(
                 receiver_node,
@@ -8839,7 +8889,7 @@ mod tests {
             sender.start().await.unwrap();
             let (dir, ann, files) = build_lane_fixture(tmp.path(), tag, 2);
             let wire = ann.package_id.0.clone();
-            sender.serve(&ann, &dir, None).await.unwrap();
+            sender.serve(&ann, &dir, None, None).await.unwrap();
             sender
                 .announce(
                     receiver_node,
@@ -8981,7 +9031,7 @@ mod tests {
         sender_a.start().await.unwrap();
         let (dir_a, ann_a, files_a) = build_lane_fixture(tmp.path(), "replay", 1);
         let wire_a = ann_a.package_id.0.clone();
-        sender_a.serve(&ann_a, &dir_a, None).await.unwrap();
+        sender_a.serve(&ann_a, &dir_a, None, None).await.unwrap();
         sender_a
             .announce(
                 receiver_node,
@@ -9008,7 +9058,7 @@ mod tests {
             sender.start().await.unwrap();
             let (dir, ann, files) = build_lane_fixture(tmp.path(), tag, 3);
             let wire = ann.package_id.0.clone();
-            sender.serve(&ann, &dir, None).await.unwrap();
+            sender.serve(&ann, &dir, None, None).await.unwrap();
             sender
                 .announce(
                     receiver_node,
@@ -9105,7 +9155,7 @@ mod tests {
             sender.start().await.unwrap();
             let (dir, ann, files) = build_lane_fixture(root, &tag, 3);
             let wire = ann.package_id.0.clone();
-            sender.serve(&ann, &dir, None).await.unwrap();
+            sender.serve(&ann, &dir, None, None).await.unwrap();
             sender
                 .announce(
                     receiver_node,
@@ -9381,7 +9431,7 @@ mod tests {
             sender.start().await.unwrap();
             let (dir, ann, files) = build_lane_fixture(tmp.path(), tag, 2);
             let wire = ann.package_id.0.clone();
-            sender.serve(&ann, &dir, None).await.unwrap();
+            sender.serve(&ann, &dir, None, None).await.unwrap();
             sender
                 .announce(
                     receiver_node,
@@ -9541,7 +9591,7 @@ mod tests {
         victim.start().await.unwrap();
         let (dir, ann, files) = build_lane_fixture(tmp.path(), "revoked", 2);
         let wire = ann.package_id.0.clone();
-        victim.serve(&ann, &dir, None).await.unwrap();
+        victim.serve(&ann, &dir, None, None).await.unwrap();
         victim
             .announce(
                 receiver_node,

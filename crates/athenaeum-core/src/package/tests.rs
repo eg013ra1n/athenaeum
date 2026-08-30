@@ -12,9 +12,11 @@ use crate::fits_writer::{write_fits_f32, Card, CardValue};
 use crate::models::Frame;
 
 use super::manifest::MANIFEST_VERSION;
+use super::writer::stage_payload_with_reflink;
 use super::{
-    read_manifest, validate_package, validate_package_id, validate_rel_path, write_package,
-    write_package_with_root_hash, xxh3_full_file, ManifestRecord, PayloadKind, MANIFEST_FILENAME,
+    read_manifest, stage_payload, validate_package, validate_package_id, validate_rel_path,
+    write_manifest, write_package, write_package_with_root_hash, xxh3_full_file, ManifestRecord,
+    PayloadKind, StageCancelled, MANIFEST_FILENAME,
 };
 
 /// Fabricate a tiny valid FITS (4x4 float image) at `path`.
@@ -122,7 +124,10 @@ fn root_hash_provider_overrides_placeholder() {
     // supplies the opaque root_hash — this is the seam A5's iroh transport uses
     // to inject the collection hash.
     let provider = |dir: &std::path::Path| {
-        assert!(dir.join(MANIFEST_FILENAME).exists(), "manifest written before provider runs");
+        assert!(
+            dir.join(MANIFEST_FILENAME).exists(),
+            "manifest written before provider runs"
+        );
         Ok("collection-hash-stub".to_string())
     };
     let announce =
@@ -264,4 +269,152 @@ fn xxh3_full_file_is_read_size_independent() {
 
     let expect = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
     assert_eq!(xxh3_full_file(&path).unwrap(), expect);
+}
+
+// --- stage_payload / write_manifest (transfer-prepare spec §3.3) ------------
+//
+// These assert on RESULTS (bytes, digest, staged content, terminal progress
+// tick), never on which branch ran: `stage_payload` reflinks when the
+// filesystem can clone (APFS, Btrfs, XFS, ReFS) and stream-copies when it
+// cannot (ext4, exFAT, cross-device). Both paths must produce the same staged
+// file, the same digest and the same terminal tick, so the same assertions hold
+// on every developer machine and CI runner.
+
+#[test]
+fn stage_payload_copies_hashes_and_reports_progress() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let dest = tmp.path().join("pkg").join("sub").join("dst.bin");
+    let mut ticks = Vec::new();
+    let staged = stage_payload(&src, &dest, bytes.len() as u64, &|| false, &mut |done| {
+        ticks.push(done)
+    })
+    .unwrap();
+    assert_eq!(staged.bytes, bytes.len() as u64);
+    assert_eq!(staged.xxh3, xxh3_full_file(&src).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert_eq!(
+        *ticks.last().unwrap(),
+        bytes.len() as u64,
+        "terminal tick == size"
+    );
+}
+
+#[test]
+fn stage_payload_rejects_a_size_drift_and_removes_the_partial_file() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, vec![1u8; 100]).unwrap();
+    let dest = tmp.path().join("dst.bin");
+    let err = stage_payload(&src, &dest, 200, &|| false, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("size mismatch"), "{err:#}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn stage_payload_honors_cancellation() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, vec![9u8; 5_000_000]).unwrap();
+    let dest = tmp.path().join("dst.bin");
+    let err = stage_payload(&src, &dest, 5_000_000, &|| true, &mut |_| {}).unwrap_err();
+    assert!(err.downcast_ref::<StageCancelled>().is_some(), "{err:#}");
+    assert!(!dest.exists());
+}
+
+/// The stream copy+hash branch — what ext4 / NTFS / a Docker overlay takes —
+/// forced through the `allow_reflink` seam so a reflink-capable dev machine
+/// (APFS here) exercises it too. Same assertions as the reflink test, plus the
+/// progress contract the reflink test cannot pin on a one-chunk file: at least
+/// two ticks, non-decreasing, terminal == size.
+#[test]
+fn stage_payload_stream_branch_copies_hashes_and_reports_progress() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    // 10 MB > two 4 MiB read chunks, so the copy reports three ticks.
+    let bytes: Vec<u8> = (0..10_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let dest = tmp.path().join("pkg").join("sub").join("dst.bin");
+    let mut ticks = Vec::new();
+    let staged = stage_payload_with_reflink(
+        &src,
+        &dest,
+        bytes.len() as u64,
+        false,
+        &|| false,
+        &mut |done| ticks.push(done),
+    )
+    .unwrap();
+    assert_eq!(staged.bytes, bytes.len() as u64);
+    assert_eq!(staged.xxh3, xxh3_full_file(&src).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert!(ticks.len() >= 2, "expected several chunks, got {ticks:?}");
+    assert!(
+        ticks.windows(2).all(|w| w[0] <= w[1]),
+        "ticks must not go backwards: {ticks:?}"
+    );
+    assert_eq!(
+        *ticks.last().unwrap(),
+        bytes.len() as u64,
+        "terminal tick == size"
+    );
+}
+
+/// Cancelling *mid-copy*, not before the first byte: the flag flips on the
+/// first progress tick, so the stream branch must notice at the next chunk
+/// boundary and leave no partial payload behind.
+#[test]
+fn stage_payload_stream_branch_honors_cancellation_mid_copy() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, vec![9u8; 20_000_000]).unwrap();
+    let dest = tmp.path().join("dst.bin");
+    let stop = AtomicBool::new(false);
+    let mut ticks = 0usize;
+    let err = stage_payload_with_reflink(
+        &src,
+        &dest,
+        20_000_000,
+        false,
+        &|| stop.load(Ordering::SeqCst),
+        &mut |_| {
+            ticks += 1;
+            stop.store(true, Ordering::SeqCst);
+        },
+    )
+    .unwrap_err();
+    assert!(err.downcast_ref::<StageCancelled>().is_some(), "{err:#}");
+    assert_eq!(ticks, 1, "cancelled at the first chunk boundary, mid-copy");
+    assert!(!dest.exists(), "no partial payload left behind");
+}
+
+/// Staging a file onto itself would delete the user's original (the stale-dest
+/// cleanup runs before the copy). It is refused, and the source survives.
+#[test]
+fn stage_payload_refuses_src_equal_dest() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src.bin");
+    std::fs::write(&src, vec![4u8; 64]).unwrap();
+    let err = stage_payload(&src, &src, 64, &|| false, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("onto itself"), "{err:#}");
+    assert_eq!(std::fs::read(&src).unwrap(), vec![4u8; 64]);
+}
+
+/// `write_manifest` alone writes the NDJSON `write_package` has always written —
+/// the split must not change a byte of the on-disk format.
+#[test]
+fn write_package_still_writes_the_same_manifest() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("a.fits");
+    write_fixture_fits(&src);
+    let rec = sample_record(&src, "a.fits");
+    write_manifest(tmp.path(), std::slice::from_ref(&rec)).unwrap();
+    let back = read_manifest(tmp.path()).unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].rel_path, "a.fits");
+    assert_eq!(back[0], rec);
 }

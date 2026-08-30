@@ -32,8 +32,11 @@ export function formatCountdown(deadlineIso: string, now: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-/** ETA from remaining bytes + smoothed speed. `∞` when nothing is moving
- *  (speed ≈ 0) — an honest "unestimable", never a fake number. */
+/** ETA from remaining bytes + the caller's MEDIAN rate over the recent window
+ *  (not the EMA that drives the speed label — one QUIC stream swings too far
+ *  minute to minute for a 3-sample ETA). `∞` when nothing is moving (rate
+ *  ≈ 0) — an honest "unestimable", never a fake number; callers with no
+ *  median yet pass nothing at all and hide the ETA instead. */
 export function formatEta(remainingBytes: number, speedBps: number | null): string {
   if (speedBps == null || !isFinite(speedBps) || speedBps <= 0) return '∞';
   const secs = remainingBytes / speedBps;
@@ -163,6 +166,12 @@ export function displayStateChip(displayState: string): StateChip {
       return { label: 'queued', className: CHIP_MUTED };
     case 'preparing':
       return { label: 'preparing', className: CHIP_MUTED };
+    // Transfer-prepare spec §7.1: `indexing` (the iroh serve import hashing the
+    // staged payload) is the SECOND half of the same pre-transfer wait, so it
+    // wears the `preparing` label — the user sees one continuous "getting it
+    // ready" phase. Only the subline (below) distinguishes the two.
+    case 'indexing':
+      return { label: 'preparing', className: CHIP_MUTED };
     case 'announced':
       return { label: 'announced', className: CHIP_MUTED };
     case 'transferring':
@@ -219,6 +228,13 @@ export function displayStateSubline(
   kind?: 'outbound' | 'inbound',
 ): string | null {
   if (displayState === 'uploaded') return 'awaiting confirmation';
+  // Transfer-prepare spec §7.1: the two pre-transfer waits, which share one
+  // `preparing` chip. `indexing` says what the second one is doing (nothing has
+  // left this device yet); an outbound `announced` says the ball is in the
+  // peer's court — the bytes are staged and offered, we are waiting on them.
+  if (displayState === 'indexing') return 'indexing — hashing the package for transfer';
+  if (displayState === 'announced' && kind === 'outbound')
+    return 'waiting for the peer to start pulling';
   // D1: says WHY there is no countdown. The transfer resumes the moment the peer
   // announces itself — which is a signal, not an instant we could name.
   if (displayState === 'waiting_peer') return 'device unreachable — resumes when it is back';

@@ -41,7 +41,10 @@ pub use manifest::{ManifestRecord, PayloadKind, ProjectStamp, MANIFEST_VERSION};
 pub use reader::{read_manifest, validate_package};
 // `validate_rel_path` / `validate_package_id` are defined below and re-exported
 // implicitly (same module); listed here for discoverability alongside the reader.
-pub use writer::{write_package, write_package_with_root_hash, RootHashProvider};
+pub use writer::{
+    stage_payload, write_manifest, write_package, write_package_with_root_hash, RootHashProvider,
+    StageCancelled, StagedPayload,
+};
 
 /// Name of the manifest file inside a package directory.
 pub const MANIFEST_FILENAME: &str = "manifest.ndjson";

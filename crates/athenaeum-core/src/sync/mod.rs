@@ -104,7 +104,7 @@ pub use receiver::{
     DEFAULT_MAX_CONCURRENT_RECEIVES,
 };
 pub use responder::{CatalogDedupResponder, DedupResponder};
-pub use sender::{StartedSender, SyncSenderRuntime};
+pub use sender::{PrepareRuntime, StartedSender, SyncSenderRuntime};
 pub use status::{
     InboundSummary, OutboundSummary, QueuedInboundSummary, SyncReceiverStatus, SyncSenderStatus,
     SyncStatus, TransferFileCounts, TransferFileEntry, TransportHealth,

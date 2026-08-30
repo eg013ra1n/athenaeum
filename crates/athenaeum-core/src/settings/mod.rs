@@ -138,6 +138,20 @@ pub mod keys {
     /// interrupts a transfer already in flight.
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "sync.max_concurrent_receives";
 
+    /// Absolute path of the folder that holds prepared outgoing packages
+    /// (`<dir>/<uuid>/…`). Empty/unset = `<identity_dir>/packages`
+    /// (transfer-prepare spec §6.1). Applies to the next preparation.
+    pub const SYNC_OUTGOING_STAGING_DIR: &str = "sync.outgoing_staging_dir";
+    /// Absolute path of the folder that holds the iroh blob store (`blobs/`),
+    /// receive staging (`staging/`), the incoming fallback and collab dirs.
+    /// Empty/unset = `<identity_dir>`. Applies at the next transport start
+    /// (spec §6.4).
+    pub const SYNC_INCOMING_WORKING_DIR: &str = "sync.incoming_working_dir";
+    /// The previous custom working dir, recorded by `set_transfer_paths` when
+    /// the working dir changes, so the storage report can count its leftovers
+    /// (spec §6.5). Cleared when nothing is left there.
+    pub const SYNC_INCOMING_WORKING_DIR_PREVIOUS: &str = "sync.incoming_working_dir_previous";
+
     // Account layer (task B4). Non-secret account state persisted so
     // `account_status` works offline. The device TOKEN is never here — it lives
     // in the OS keychain (`account::token_store`). Cleared on sign-out.

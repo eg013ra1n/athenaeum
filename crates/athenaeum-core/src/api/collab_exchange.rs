@@ -468,13 +468,15 @@ pub async fn handle_project_request(
     package_id: String,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<()> {
-    let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx)?;
+    // The reconstructed serve dir is collab DATA, so it follows the working dir.
+    let working_dir = crate::api::sync::sync_dirs(ctx)?.working_dir;
 
     // Decide + reconstruct with the DB borrow scoped OUT before any `.await`.
     let dir = {
         let db = db(ctx)?;
         let conn = db.conn();
-        match authorize_and_reconstruct_serve(&conn, &sync_dir, &from, &project_id, &package_id)? {
+        match authorize_and_reconstruct_serve(&conn, &working_dir, &from, &project_id, &package_id)?
+        {
             Some(dir) => dir,
             None => return Ok(()), // silently refused (already warned)
         }
@@ -529,10 +531,10 @@ pub async fn ensure_collab_sender_engine(
     // Relay URLs for the dial hint (a bare account/membership-resolved dest is
     // undialable without one); the shared node resolves the relay MODE once.
     let (_relay_mode, relay_urls) = crate::api::sync::resolve_relay_mode(ctx).await?;
-    let (_sync_dir, db_path) = crate::api::sync::sync_paths(ctx)?;
+    let db_path = crate::api::sync::sync_dirs(ctx)?.db_path;
 
     // The ONE shared iroh node (C1 fix): the collab sender is its `Collab` role
-    // handle, sharing the single endpoint + `<sync>/blobs` store with the
+    // handle, sharing the single endpoint + `<working>/blobs` store with the
     // receiver and the personal sender. Role-prefixed blob tags (Д3) keep the
     // three roles from clobbering each other's tags on the shared store — this
     // replaces the old dedicated `blobs_collab` `FsStore` (audit m7), which only
@@ -1102,8 +1104,9 @@ pub async fn seed_ingested_package(ctx: &ServiceContext, package_id: &str) {
         tracing::debug!(package_id, "project seed skipped: no iroh node bound");
         return;
     };
-    let (sync_dir, _db_path) = match crate::api::sync::sync_paths(ctx) {
-        Ok(p) => p,
+    // Seed dirs are collab DATA — they follow the working dir.
+    let working_dir = match crate::api::sync::sync_dirs(ctx) {
+        Ok(dirs) => dirs.working_dir,
         Err(e) => {
             tracing::warn!(package_id, error = %format!("{e}"), "project seed skipped: sync paths unavailable");
             return;
@@ -1151,7 +1154,7 @@ pub async fn seed_ingested_package(ctx: &ServiceContext, package_id: &str) {
             );
             return;
         }
-        match reconstruct_seed_dir(&conn, &sync_dir, package_id) {
+        match reconstruct_seed_dir(&conn, &working_dir, package_id) {
             Ok(dir) => (row.project_id, dir),
             Err(e) => {
                 tracing::warn!(package_id, error = %format!("{e:#}"), "project seed skipped: seed dir unavailable");
@@ -1240,8 +1243,8 @@ pub async fn unseed_package_local_data(ctx: &ServiceContext, project_id: &str, p
         return;
     };
     node.unseed_project_package(project_id, package_id).await;
-    if let Ok((sync_dir, _db_path)) = crate::api::sync::sync_paths(ctx) {
-        remove_seed_dir(&sync_dir, package_id);
+    if let Ok(dirs) = crate::api::sync::sync_dirs(ctx) {
+        remove_seed_dir(&dirs.working_dir, package_id);
     }
 }
 
@@ -1254,7 +1257,7 @@ pub async fn unseed_project_local_data(ctx: &ServiceContext, project_id: &str) {
         return;
     };
     node.unseed_project(project_id).await;
-    let Ok((sync_dir, _db_path)) = crate::api::sync::sync_paths(ctx) else {
+    let Ok(dirs) = crate::api::sync::sync_dirs(ctx) else {
         return;
     };
     let package_ids: Vec<String> = match db(ctx) {
@@ -1271,7 +1274,7 @@ pub async fn unseed_project_local_data(ctx: &ServiceContext, project_id: &str) {
         }
     };
     for package_id in package_ids {
-        remove_seed_dir(&sync_dir, &package_id);
+        remove_seed_dir(&dirs.working_dir, &package_id);
     }
 }
 
@@ -1611,13 +1614,15 @@ pub async fn download_project_package(
             return Ok(());
         }
     };
-    let (sync_dir, db_path) = crate::api::sync::sync_paths(ctx)?;
+    let dirs = crate::api::sync::sync_dirs(ctx)?;
+    let db_path = dirs.db_path.clone();
 
     // ── Role guard (fail-closed) ─────────────────────────────────────────────
     // Only a send_receive member or the coordinator may pull. Own membership is
     // resolved by matching THIS device's node id in the cached snapshot (the
-    // account id is not part of the snapshot keying).
-    let own_node = DeviceKey::load_or_create(&device_key_path(&sync_dir))
+    // account id is not part of the snapshot keying). The key is IDENTITY, so it
+    // is read from the identity dir — never from the relocatable working dir.
+    let own_node = DeviceKey::load_or_create(&device_key_path(&dirs.identity_dir))
         .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
         .node_id();
     {
@@ -1769,7 +1774,8 @@ pub async fn download_project_package(
             package_id,
             &ann.root_hash,
             ann.byte_size.max(0) as u64,
-            &sync_dir,
+            // Swarm staging (`collab_swarm/<pkg>`) is DATA → working dir.
+            &dirs.working_dir,
             &db_path,
             emitter.as_deref(),
         )
@@ -2839,8 +2845,9 @@ pub async fn export_project_for_wbpp(
 
         // Resolve own_display (Д2) + the WBPP config with the DB borrow scoped out
         // before the spawn_blocking/await.
-        let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx)?;
-        let own_node = DeviceKey::load_or_create(&device_key_path(&sync_dir))
+        // The device key is IDENTITY — always the identity dir.
+        let identity_dir = crate::api::sync::sync_dirs(ctx)?.identity_dir;
+        let own_node = DeviceKey::load_or_create(&device_key_path(&identity_dir))
             .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
             .node_id();
         let (own_display, config) = {
@@ -3839,8 +3846,8 @@ mod tests {
     /// This device's node id for `ctx`'s sync dir — the identity the download
     /// role guard resolves against the cached membership snapshot.
     fn own_node_for(ctx: &ServiceContext) -> NodeId {
-        let (sync_dir, _) = crate::api::sync::sync_paths(ctx).unwrap();
-        DeviceKey::load_or_create(&device_key_path(&sync_dir))
+        let identity_dir = crate::api::sync::sync_dirs(ctx).unwrap().identity_dir;
+        DeviceKey::load_or_create(&device_key_path(&identity_dir))
             .unwrap()
             .node_id()
     }
@@ -4419,7 +4426,8 @@ mod tests {
 
         let (dtmp, ctx) = test_ctx();
         let own_node = own_node_for(&ctx);
-        let (d_sync_dir, d_db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
+        let d_dirs = crate::api::sync::sync_dirs(&ctx).unwrap();
+        let (d_sync_dir, d_db_path) = (d_dirs.working_dir.clone(), d_dirs.db_path.clone());
 
         // ── A: a received-complete package + its reconstructed serve dir. ──────
         let a_tmp = tempfile::tempdir().unwrap();
@@ -4776,7 +4784,7 @@ mod tests {
 
         let (tmp, ctx) = test_ctx();
         let own = own_node_for(&ctx);
-        let (sync_dir, _db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
+        let sync_dir = crate::api::sync::sync_dirs(&ctx).unwrap().working_dir;
         {
             let conn = db(&ctx).unwrap().conn();
             let members = serde_json::json!([
@@ -4881,12 +4889,17 @@ mod tests {
     async fn bind_node_into(
         ctx: &ServiceContext,
     ) -> Arc<crate::sharing::iroh::node::SharedIrohNode> {
-        let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx).unwrap();
-        std::fs::create_dir_all(&sync_dir).unwrap();
-        let node =
-            crate::sharing::iroh::node::SharedIrohNode::bind(&sync_dir, iroh::RelayMode::Disabled)
-                .await
-                .expect("bind relay-disabled node");
+        let dirs = crate::api::sync::sync_dirs(ctx).unwrap();
+        std::fs::create_dir_all(&dirs.identity_dir).unwrap();
+        std::fs::create_dir_all(&dirs.working_dir).unwrap();
+        let node = crate::sharing::iroh::node::SharedIrohNode::bind_with(
+            &dirs.identity_dir,
+            &dirs.working_dir,
+            iroh::RelayMode::Disabled,
+            crate::sharing::iroh::node::NodeOptions::default(),
+        )
+        .await
+        .expect("bind relay-disabled node");
         *ctx.iroh_node.lock().await = Some(Arc::clone(&node));
         node
     }
@@ -4975,7 +4988,7 @@ mod tests {
             .expect("the post-ingest hook seeds the package");
 
         // The seed target is NOT the serve dir.
-        let (sync_dir, _db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
+        let sync_dir = crate::api::sync::sync_dirs(&ctx).unwrap().working_dir;
         let seed_dir = sync_dir.join(SEED_DIR).join(HUB);
         assert!(
             seed_dir.join("L_0001.fits").exists(),
@@ -5179,7 +5192,8 @@ mod tests {
 
         // ── B: a real downloader — fetch, ingest, seed through the T4 hook ────
         let (b_tmp, b_ctx) = test_ctx();
-        let (b_sync_dir, b_db_path) = crate::api::sync::sync_paths(&b_ctx).unwrap();
+        let b_dirs = crate::api::sync::sync_dirs(&b_ctx).unwrap();
+        let (b_sync_dir, b_db_path) = (b_dirs.working_dir.clone(), b_dirs.db_path.clone());
         {
             let conn = db(&b_ctx).unwrap().conn();
             seed_project(&conn, PROJECT, &members_json());

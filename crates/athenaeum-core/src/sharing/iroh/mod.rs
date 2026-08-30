@@ -64,7 +64,7 @@ use super::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
     PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
 };
-use super::{FetchSink, SharingTransport};
+use super::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::DedupResponder;
 
 pub mod blobs;
@@ -1397,20 +1397,36 @@ impl SharingTransport for IrohTransport {
             .await
     }
 
+    /// The legacy transport predates the `indexing` stage and has no sender engine
+    /// waiting on it, so `_progress` is accepted and ignored (the shared node is the
+    /// one that reports import bytes).
     async fn serve(
         &self,
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> Result<()> {
         let tag = package_tag(&pkg.package_id);
         // `None` → full package (pre-dedup). `Some(w)` → the negotiated subset:
         // only those payloads plus a manifest filtered to exactly them.
         // The legacy transport surfaces no per-file progress, so the ordered
-        // entries are discarded here (only the shared node records them).
+        // entries are discarded here (only the shared node records them); it has
+        // no `NodeOptions` either, so both paths keep the historic `Copy` import
+        // (the shared node is the one that references payloads in place).
         let (hash, _entries) = match want {
             None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
-            Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
+            Some(w) => {
+                blobs::import_subset_collection(
+                    &self.store,
+                    src_dir,
+                    w,
+                    &tag,
+                    iroh_blobs::api::blobs::ImportMode::Copy,
+                    None,
+                )
+                .await?
+            }
         };
         self.served
             .lock()

@@ -3682,8 +3682,10 @@ fn outbound_package_ref(db: &Database, id: i64) -> String {
 }
 
 /// The current wire id (`sync_outbound.wire_package_id`) for an outbound row — the
-/// per-attempt id a resend rotates.
-fn outbound_wire_id(db: &Database, id: i64) -> String {
+/// per-attempt id a resend rotates. `None` while the row is still `preparing`: the
+/// wire id is minted later, when the preparation worker promotes the row to
+/// `queued` and the engine drives it.
+fn outbound_wire_id(db: &Database, id: i64) -> Option<String> {
     db.conn()
         .query_row(
             "SELECT wire_package_id FROM sync_outbound WHERE id = ?1",
@@ -4142,7 +4144,7 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
         resend_id, out_id,
         "resend-as-reset returns the SAME outbound row"
     );
-    let wire_resend = outbound_wire_id(cdb, out_id);
+    let wire_resend = outbound_wire_id(cdb, out_id).expect("wire id minted");
     assert_ne!(wire_resend, wire_attempt1, "the resend rotates the wire id");
 
     wait_until(|| outbound_state(cdb, out_id) == "confirmed", WAIT).await;
@@ -5355,8 +5357,8 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
 
     // Map each transfer to its inbound row: the sender's own wire id IS the
     // receiver's `package_id`.
-    let wire1 = outbound_wire_id(db1, out1);
-    let wire2 = outbound_wire_id(db2, out2);
+    let wire1 = outbound_wire_id(db1, out1).expect("wire id minted");
+    let wire2 = outbound_wire_id(db2, out2).expect("wire id minted");
     assert_ne!(wire1, wire2, "two transfers, two wire ids");
     wait_until(
         || matches!(inbound_row(rdb, &wire1), Some((s, _, _)) if s == "done"),
@@ -5588,7 +5590,10 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
     let mut wire_a = String::new();
     wait_until(
         || {
-            let w = outbound_wire_id(dba, out_a);
+            // Still `preparing` — the wire id is not minted yet; keep waiting.
+            let Some(w) = outbound_wire_id(dba, out_a) else {
+                return false;
+            };
             match inbound_row(rdb, &w) {
                 Some((s, _, _)) if s == "fetching" => {
                     wire_a = w;
@@ -5623,7 +5628,10 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
     let mut wire_b = String::new();
     wait_until(
         || {
-            let w = outbound_wire_id(dbb, out_b);
+            // Still `preparing` — the wire id is not minted yet; keep waiting.
+            let Some(w) = outbound_wire_id(dbb, out_b) else {
+                return false;
+            };
             match inbound_row(rdb, &w) {
                 Some((s, _, _)) if s == "fetching" => {
                     wire_b = w;

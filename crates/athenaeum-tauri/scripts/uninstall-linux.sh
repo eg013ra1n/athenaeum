@@ -62,6 +62,10 @@ while IFS= read -r -d '' icon; do
     sys_found+=("$icon")
 done < <(find "$SYS_ICONS" -name "$APP_NAME.png" -print0 2>/dev/null || true)
 
+# Custom transfer folders (Settings -> Transfers: outgoing staging / incoming
+# working) live wherever the user pointed them, so they are outside $USER_DATA and
+# this script does NOT remove them. Only the defaults, which sit under
+# $USER_DATA/sync, go with the data dir below.
 if [[ -d "$USER_DATA" ]]; then
     size=$(du -sh "$USER_DATA" 2>/dev/null | cut -f1)
     echo "  User data:       $USER_DATA ($size, includes logs/)"

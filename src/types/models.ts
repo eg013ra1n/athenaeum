@@ -736,7 +736,7 @@ export type BiasFallback = "subtractBias" | "skipFrame";
 
 export type Direction = "sent" | "received";
 
-export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
+export type OutboundState = "preparing" | "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
 
 export type InboundState = "announced" | "fetching" | "ingesting" | "waiting" | "done" | "failed" | "cancelled";
 
@@ -793,7 +793,22 @@ done: number,
 /**
  * Files that failed or were rejected by the peer.
  */
-failed: number, };
+failed: number, 
+/**
+ * Files the peer already held (`outcome = 'duplicate'`) — counted INSIDE
+ * `total` and `done`; see the struct doc for the send-side split.
+ */
+duplicate: number, 
+/**
+ * `byte_size` sum of the `duplicate` rows — subtract from the summary's
+ * manifest-total `byte_size` to get the bytes that actually travel.
+ */
+duplicateBytes: number, 
+/**
+ * `byte_size` sum of every row — the manifest-free total a `preparing`
+ * row's summary falls back to (spec §3.8).
+ */
+totalBytes: number, };
 
 export type OutboundSummary = { 
 /**
@@ -1284,7 +1299,17 @@ totalCount: number,
 /**
  * Frames that could not be sent, each with a reason. Never silently dropped.
  */
-ineligible: Array<IneligibleFrame>, };
+ineligible: Array<IneligibleFrame>, 
+/**
+ * The `sync_outbound` row this send created (transfer-prepare spec §3), so
+ * the caller can address the transfer — cancel it, watch it — while it is
+ * still being staged. `None` when nothing was eligible and no row was
+ * written. Additive: absent from the JSON when there is no row. `default`
+ * rides along with `skip_serializing_if` so ts-rs generates the field as
+ * optional (`outboundId?`) rather than merely nullable — the same pairing
+ * every other omitted field in this module uses.
+ */
+outboundId?: number | null, };
 
 export type TransferEventEntry = { 
 /**
@@ -1334,7 +1359,23 @@ blobsBytes: number,
  * next to includes what that button can actually move: on a receive-only
  * device the payload pass has nothing in scope by construction.
  */
-stagingBytes: number, };
+stagingBytes: number, 
+/**
+ * Effective outgoing staging folder (display).
+ */
+packagesDir: string, 
+/**
+ * Effective incoming working folder (display).
+ */
+workingDir: string, 
+/**
+ * Bytes still sitting in the default / previous folders after a move
+ * (transfer-prepare spec §6.5); 0 when nothing was moved. Counts exactly
+ * what `cleanup_transfer_leftovers` would remove — receive-side `blobs/` +
+ * `staging/` of a superseded working dir, and only the ROW-LESS payload
+ * dirs of a superseded packages dir.
+ */
+leftoverBytes: number, };
 
 export type TransferCleanup = { 
 /**
@@ -1359,6 +1400,24 @@ stagingDirs: number,
  * Bytes reclaimed by removing those staging trees (freed immediately).
  */
 stagingBytes: number, };
+
+export type TransferPaths = { outgoing: PathSetting, working: PathSetting, };
+
+export type PathSetting = { 
+/**
+ * The persisted value, `None` = default.
+ */
+configured: string | null, 
+/**
+ * What is in effect for the NEXT use (packages: next preparation; working:
+ * next transport start).
+ */
+effective: string, default: string, 
+/**
+ * Working dir only: the running node bound a different dir than the one in
+ * effect, so the change waits for a restart. Always `false` for outgoing.
+ */
+restartRequired: boolean, };
 
 export type DeviceCapability = "athenaeum" | "perseus";
 

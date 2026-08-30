@@ -30,7 +30,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
+use crate::sharing::{noop_fetch_sink, FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::diagnostics::ConnectClass;
 
 use super::cleanup_coord::SharedPackageCleanup;
@@ -694,6 +694,166 @@ async fn sent_progress_carries_bytes() {
     assert_eq!(tick.1["stage"].as_str(), Some("transferring"));
     assert_eq!(tick.1["bytesDone"].as_u64(), Some(expected_bytes));
     assert_eq!(tick.1["bytesTotal"].as_u64(), Some(expected_bytes));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Wraps a real loopback endpoint (so the package genuinely confirms) and raises
+/// two synthetic import ticks from INSIDE `serve`, the way the iroh import
+/// reports its outboard-hashing bytes. The loopback stores no blobs and hashes
+/// nothing, so this stands in for that work.
+struct ImportTickTransport {
+    inner: LoopbackTransport,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for ImportTickTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        self.inner.start().await
+    }
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        batch_uuid: &str,
+        files: &[AnnounceFileEntry],
+        layout: PackageLayout,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .announce(to, a, batch_name, batch_uuid, files, layout)
+            .await
+    }
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+        sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        self.inner.fetch(from, pkg, dest, sink).await
+    }
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        self.inner.fetch_manifest(from, pkg, dest).await
+    }
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src: &Path,
+        want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
+    ) -> anyhow::Result<()> {
+        // Raised BEFORE the delegate returns — the whole point of threading the
+        // sink into `serve`: the engine is parked on this await and cannot drain
+        // its event channel, so a tick routed through that channel would arrive
+        // only after the import it describes had already finished.
+        if let Some(sink) = &progress {
+            sink(1, 2);
+            sink(2, 2);
+        }
+        self.inner.serve(pkg, src, want, progress).await
+    }
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        package_id: PackageId,
+        offer: Vec<OfferEntry>,
+        full_by_rel: HashMap<String, String>,
+    ) -> anyhow::Result<HashSet<String>> {
+        self.inner
+            .negotiate_want(to, package_id, offer, full_by_rel)
+            .await
+    }
+    async fn ack(&self, to: NodeId, pid: &PackageId, r: Vec<FrameReceipt>) -> anyhow::Result<()> {
+        self.inner.ack(to, pid, r).await
+    }
+    async fn release(&self, pid: &PackageId) -> anyhow::Result<()> {
+        self.inner.release(pid).await
+    }
+    async fn protect_shared_before_cleanup(&self, pid: &PackageId) -> anyhow::Result<()> {
+        self.inner.protect_shared_before_cleanup(pid).await
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.inner.events().await
+    }
+}
+
+/// Transfer-prepare spec §4.4: the serve import's byte progress reaches the
+/// sender as `sync-progress` `indexing` ticks carrying `(bytesDone, bytesTotal)`.
+///
+/// This pins the hand-off the sink exists for. The import runs INSIDE the awaited
+/// `serve`, and the engine's `run` loop is a single `select!` — while it is in
+/// `serve` its `events.recv()` arm is not polled, so the same figures routed
+/// through the transport's `TransportEvent` channel could only have been handled
+/// after the import had already finished (and after the announce had flipped the
+/// row to `transferring`). A tick raised from inside `serve` and observed on the
+/// emitter is exactly what the channel shape could not deliver.
+#[tokio::test]
+async fn import_progress_reaches_the_sender_as_indexing_ticks() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(
+        &tmp.path().join("src_index"),
+        "uuid-index",
+        "index.fits",
+        "M42",
+        4096,
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(ImportTickTransport {
+            inner: net.endpoint(),
+        }),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    let evts = events.lock().unwrap();
+    let indexing: Vec<&serde_json::Value> = evts
+        .iter()
+        .filter(|(n, p)| n == "sync-progress" && p["stage"].as_str() == Some("indexing"))
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        indexing.len(),
+        2,
+        "both import ticks reached the emitter, got {evts:?}"
+    );
+    for tick in &indexing {
+        assert_eq!(tick["direction"].as_str(), Some("sent"));
+        assert_eq!(tick["packageId"].as_str(), Some(id.to_string().as_str()));
+        assert_eq!(tick["bytesTotal"].as_u64(), Some(2));
+    }
+    assert_eq!(indexing[0]["bytesDone"].as_u64(), Some(1));
+    assert_eq!(indexing[1]["bytesDone"].as_u64(), Some(2));
     drop(evts);
 
     engine.shutdown().await;
@@ -3117,8 +3277,9 @@ impl SharingTransport for NegotiateErrTransport {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
-        self.0.serve(pkg, src_dir, want).await
+        self.0.serve(pkg, src_dir, want, progress).await
     }
     async fn ack(
         &self,
@@ -3583,6 +3744,7 @@ impl SharingTransport for RetryProbeTransport {
         _pkg: &PackageAnnounce,
         _src: &Path,
         _want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -3769,6 +3931,7 @@ impl SharingTransport for ServeTickTransport {
         _pkg: &PackageAnnounce,
         _src: &Path,
         _want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -4422,6 +4585,7 @@ impl SharingTransport for ReplaceProbeTransport {
         _pkg: &PackageAnnounce,
         _src: &Path,
         _want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -5765,6 +5929,101 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
     engine.shutdown().await;
 }
 
+/// Transfer-prepare §3.3: `drive` picks up a row the API layer inserted itself.
+///
+/// A finished preparation flips its `Preparing` row to `Queued` OUTSIDE the
+/// worker — the row never passed through `Command::Process`, so it owns no slot
+/// in the worker's `pending` map and a `Kick` cannot reach it. `drive` is the
+/// command that reads such a row off disk and starts it exactly like a
+/// crash-resume; here it must carry a store-inserted `Queued` row all the way to
+/// `Confirmed` over loopback.
+///
+/// The barrier enqueue is load-bearing: `enqueue_package` awaits the worker's own
+/// id reply, which the worker can only send AFTER its startup crash-resume
+/// enumeration has run. Inserting the target row after that reply proves the row
+/// confirms because of `drive`, not because the resume swept it up.
+#[tokio::test]
+async fn drive_picks_up_a_pre_inserted_queued_row_and_confirms_it() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    // Barrier: the worker is past its crash-resume enumeration once it has
+    // replied to a command.
+    let barrier = build_package(
+        &tmp.path().join("src-barrier"),
+        "uuid-barrier",
+        "barrier.fits",
+        "M42",
+        1024,
+    );
+    let barrier_id = engine
+        .enqueue_package(&barrier, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, barrier_id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    // The API layer inserted the row itself (as the preparation worker will).
+    let pkg = build_package(
+        &tmp.path().join("src-drive"),
+        "uuid-drive",
+        "a.fits",
+        "M31",
+        4096,
+    );
+    let files = announce_files_of(&pkg);
+    let id = store
+        .enqueue(
+            &pkg.to_string_lossy(),
+            receiver_id,
+            Some("Prepared batch"),
+            &files,
+            PackageLayout::Batch,
+        )
+        .unwrap();
+    assert_eq!(
+        state_of(&store, id),
+        Some(OutboundState::Queued),
+        "the API layer's row starts out queued, unknown to the worker"
+    );
+
+    engine.drive(id).await.unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "the driven row confirmed"
+    );
+
+    let rows = files_of(&store, id);
+    assert!(!rows.is_empty(), "the driven batch kept its per-file rows");
+    assert!(
+        rows.iter().all(|r| r.state == OutboundFileState::Done),
+        "every file of the driven row settled, got {rows:?}"
+    );
+
+    engine.shutdown().await;
+}
+
 /// Attempt-isolation (§D1, item 5): a resend mints a fresh wire id, so an ack
 /// carrying the OLD attempt's wire id can NEVER short-circuit the new attempt.
 /// Seeds a stale `Ingested` ack keyed by the cancelled attempt's wire id and
@@ -6061,8 +6320,9 @@ impl SharingTransport for SlowRevokeTransport {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
-        self.0.serve(pkg, src_dir, want).await
+        self.0.serve(pkg, src_dir, want, progress).await
     }
     async fn ack(
         &self,
@@ -6121,6 +6381,261 @@ async fn cancel_with_dead_peer_revoke_does_not_stall() {
     assert!(
         elapsed < Duration::from_secs(5),
         "cancel must not stall on the slow revoke (took {elapsed:?})",
+    );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Transfer-prepare §4.2: protect shared blobs BEFORE the payload cleanup.
+//
+// A transport that serves payloads in place (iroh `ImportMode::TryReference`)
+// keeps blobs pointing at the files inside `packages/<uuid>`, and two packages
+// carrying the same frame share ONE blob — so anything shared has to be copied
+// into the store before those files are deleted. That ordering is the engine's
+// to guarantee, and this pins it: the transport records what it saw.
+// ---------------------------------------------------------------------------
+
+/// Wraps a real loopback endpoint (so the package genuinely confirms) and
+/// records, at the moment `protect_shared_before_cleanup` is called, whether the
+/// package dir still held its payload copies. `false` would mean the engine
+/// cleaned first and handed the hook an empty dir — exactly the bug the hook
+/// exists to prevent.
+struct ProtectProbeTransport {
+    inner: LoopbackTransport,
+    /// The package dir under test.
+    dir: PathBuf,
+    /// Set when the hook runs at all.
+    hook_ran: Arc<AtomicBool>,
+    /// Set when the hook ran while the payload copies were still on disk.
+    payloads_present_at_hook: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for ProtectProbeTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        self.inner.start().await
+    }
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        batch_uuid: &str,
+        files: &[AnnounceFileEntry],
+        layout: PackageLayout,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .announce(to, a, batch_name, batch_uuid, files, layout)
+            .await
+    }
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+        sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        self.inner.fetch(from, pkg, dest, sink).await
+    }
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        self.inner.fetch_manifest(from, pkg, dest).await
+    }
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src: &Path,
+        want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
+    ) -> anyhow::Result<()> {
+        self.inner.serve(pkg, src, want, progress).await
+    }
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        package_id: PackageId,
+        offer: Vec<OfferEntry>,
+        full_by_rel: HashMap<String, String>,
+    ) -> anyhow::Result<HashSet<String>> {
+        self.inner
+            .negotiate_want(to, package_id, offer, full_by_rel)
+            .await
+    }
+    async fn ack(&self, to: NodeId, pid: &PackageId, r: Vec<FrameReceipt>) -> anyhow::Result<()> {
+        self.inner.ack(to, pid, r).await
+    }
+    async fn release(&self, pid: &PackageId) -> anyhow::Result<()> {
+        self.inner.release(pid).await
+    }
+    async fn protect_shared_before_cleanup(&self, pid: &PackageId) -> anyhow::Result<()> {
+        let payloads = dir_entries(&self.dir)
+            .iter()
+            .any(|n| n != MANIFEST_FILENAME);
+        self.payloads_present_at_hook.store(payloads, SeqCst);
+        self.hook_ran.store(true, SeqCst);
+        self.inner.protect_shared_before_cleanup(pid).await
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.inner.events().await
+    }
+}
+
+/// The confirmed path calls `protect_shared_before_cleanup` BEFORE it deletes the
+/// payload copies — and the cleanup still happens afterwards.
+#[tokio::test]
+async fn confirm_protects_shared_blobs_before_cleaning_payloads() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(
+        &tmp.path().join("srcA"),
+        "uuid-a",
+        "frameA.fits",
+        "M42",
+        4096,
+    );
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let payloads_present_at_hook = Arc::new(AtomicBool::new(false));
+    let transport = Arc::new(ProtectProbeTransport {
+        inner: net.endpoint(),
+        dir: pkg.clone(),
+        hook_ran: Arc::clone(&hook_ran),
+        payloads_present_at_hook: Arc::clone(&payloads_present_at_hook),
+    });
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        transport.clone() as Arc<dyn SharingTransport>,
+        receiver_id,
+    );
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+    wait_until(|| hook_ran.load(SeqCst), WAIT).await;
+
+    assert!(
+        hook_ran.load(SeqCst),
+        "the confirmed path must give the transport its protection hook"
+    );
+    assert!(
+        payloads_present_at_hook.load(SeqCst),
+        "the hook must run while the payload copies are still on disk — after the \
+         cleanup it could no longer copy a shared blob into the store"
+    );
+
+    // And the cleanup still runs: protect → cleanup, not protect INSTEAD OF cleanup.
+    wait_until(
+        || dir_entries(&pkg) == vec![MANIFEST_FILENAME.to_string()],
+        WAIT,
+    )
+    .await;
+    assert_eq!(dir_entries(&pkg), vec![MANIFEST_FILENAME.to_string()]);
+
+    engine.shutdown().await;
+}
+
+/// Transfer-prepare §3.3: a `preparing` row belongs to the preparation worker,
+/// not to the engine. Its package dir is half-staged and carries no manifest, so
+/// neither the fresh-engine crash-resume sweep nor an explicit
+/// [`SyncEngineHandle::drive`] may pick it up — an announce of that dir would
+/// offer the peer a package that does not exist yet.
+///
+/// The barrier is a REAL package enqueued after the drive: the worker processes
+/// its commands in order, so once that one confirms both the startup sweep and
+/// the `Drive` have run — and the receiver saw exactly one announce.
+#[tokio::test]
+async fn a_preparing_row_is_neither_resumed_nor_driven() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let db_path = tmp.path().join("sync.db");
+    let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+
+    // The worker's dir at its most dangerous instant: the manifest is already
+    // written (so the package IS announceable) but the row has not been flipped
+    // to `queued` and handed over yet — the real window between `write_manifest`
+    // and `set_state(Queued)`. A dir that is merely half-copied would fail to
+    // announce all by itself and prove nothing.
+    let worker_dir = build_package(
+        &tmp.path().join("src-preparing"),
+        "uuid-preparing",
+        "preparing.fits",
+        "M42",
+        4096,
+    );
+    let preparing_id = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        crate::sync::store::insert_outbound_with_files_in_state(
+            &conn,
+            &worker_dir.to_string_lossy(),
+            &crate::sync::node_id_hex(&receiver_id),
+            Some("Preparing batch"),
+            &[AnnounceFileEntry {
+                rel_path: "preparing.fits".to_string(),
+                byte_size: 4096,
+                frame_uuid: "uuid-preparing".to_string(),
+            }],
+            PackageLayout::Batch,
+            OutboundState::Preparing,
+        )
+        .unwrap()
+    };
+
+    // Built AFTER the row exists, so the startup `non_terminal()` sweep sees it.
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+    engine.drive(preparing_id).await.unwrap();
+
+    let pkg = build_package(
+        &tmp.path().join("src1"),
+        "uuid-1",
+        "frame1.fits",
+        "M42",
+        4096,
+    );
+    let ok_id = engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, ok_id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    assert_eq!(
+        state_of(&store, preparing_id),
+        Some(OutboundState::Preparing),
+        "the preparing row is still the worker's, untouched by resume or drive"
+    );
+    assert_eq!(
+        stats.attempts.load(SeqCst),
+        1,
+        "only the real package was ever announced"
     );
 
     engine.shutdown().await;

@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
+use iroh_blobs::api::blobs::{
+    AddPathOptions, AddProgressItem, ExportMode, ExportOptions, ImportMode,
+};
 use iroh_blobs::api::downloader::{DownloadProgressItem, DownloadRequest, Shuffled, SplitStrategy};
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
@@ -25,7 +27,7 @@ use n0_future::StreamExt as _;
 
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::types::{FetchEvent, LocalFault};
-use crate::sharing::{FetchSink, ProviderEvent, ProviderTelemetrySink};
+use crate::sharing::{FetchSink, ImportProgressSink, ProviderEvent, ProviderTelemetrySink};
 
 /// Minimum wall-clock gap between two throttled [`FetchEvent`]s from the same
 /// source — applied per-file (each observer) AND to the aggregate batch stream.
@@ -33,6 +35,13 @@ use crate::sharing::{FetchSink, ProviderEvent, ProviderTelemetrySink};
 /// throttle or not, so the sink never misses a terminal value. Progress is UI
 /// event data, never a log.
 const FETCH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Minimum wall-clock gap between two [`ImportProgressSink`] ticks. Same figure
+/// and same reasoning as [`FETCH_PROGRESS_MIN_INTERVAL`]: iroh-blobs emits
+/// copy/outboard offsets far faster than any UI can consume them. The terminal
+/// `(total, total)` tick is emitted unconditionally, throttle or not, so a
+/// consumer never misses the completion figure.
+const IMPORT_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Aborts every spawned per-file observer task on drop — the ONE place that
 /// covers all exit paths from [`fetch_collection_to_dir`]: an early `?`
@@ -95,25 +104,237 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
     Ok(out)
 }
 
+/// iroh's fs store inlines a payload at or below this size into its metadata DB
+/// (`Options.inline.max_data_inlined`, 16 KiB by default), regardless of
+/// [`ImportMode`] — such a child has no external path and can never go dead, so
+/// the readability probe skips it. Being wrong here is never unsafe: too low
+/// costs a needless one-byte read, too high skips a probe on a blob that is in
+/// fact external (which the next serve's fresh import would repair anyway).
+pub(crate) const INLINE_BLOB_MAX_BYTES: u64 = 16 * 1024;
+
+/// Read one byte of `hash` back out of the store — the ONLY call that notices a
+/// dead external path. `has`/`status` answer from the metadata row and happily
+/// report `Complete` for an entry whose file is gone; a range read is what opens
+/// the file. One byte, no temp file, no full read.
+pub(crate) async fn probe_first_byte(store: &Store, hash: Hash) -> Result<()> {
+    store
+        .blobs()
+        .export_ranges(hash, 0..1u64)
+        .concatenate()
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("read first byte of {hash}: {e}"))
+}
+
+/// Throttled cumulative-byte accounting for ONE package import, shared by the
+/// full-package and want-subset paths.
+///
+/// `bytes_done` is monotonically non-decreasing by construction: iroh-blobs
+/// reports the copy phase and the outboard phase as two separate `0..len` ramps
+/// over the SAME child (`Size → CopyProgress* → CopyDone → OutboardProgress* →
+/// Done`), so a naive `before + offset` would rewind once per child under
+/// [`ImportMode::Copy`]. `reported` is the floor that keeps a bar from walking
+/// backwards.
+struct ImportProgressMeter {
+    sink: Option<ImportProgressSink>,
+    /// Every byte this import will read off disk (all children summed).
+    total: u64,
+    /// Bytes of the children already fully imported.
+    before: u64,
+    /// Highest figure handed to the sink so far.
+    reported: u64,
+    last_tick: Instant,
+}
+
+impl ImportProgressMeter {
+    fn new(sink: Option<ImportProgressSink>, total: u64) -> Self {
+        Self {
+            sink,
+            total,
+            before: 0,
+            reported: 0,
+            last_tick: Instant::now(),
+        }
+    }
+
+    /// One in-child offset off the import stream. Dropped when it adds nothing
+    /// (the second ramp over the same child) or when the throttle window has not
+    /// elapsed — progress is best-effort UI data.
+    fn tick(&mut self, offset: u64, child_len: u64) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let done = self.before.saturating_add(offset.min(child_len));
+        if done <= self.reported || self.last_tick.elapsed() < IMPORT_PROGRESS_MIN_INTERVAL {
+            return;
+        }
+        self.reported = done;
+        self.last_tick = Instant::now();
+        sink(done, self.total);
+    }
+
+    /// A child finished importing: its full length is now behind us.
+    fn child_done(&mut self, child_len: u64) {
+        self.before = self.before.saturating_add(child_len);
+    }
+
+    /// The terminal tick, emitted unconditionally (throttle or not) so a consumer
+    /// always sees `done == total` at the end of a successful import.
+    fn finish(&mut self) {
+        if let Some(sink) = &self.sink {
+            self.reported = self.total;
+            sink(self.total, self.total);
+        }
+    }
+}
+
+/// Import ONE payload file as a blob, streaming the import so its copy/outboard
+/// offsets reach `meter`, and return the child's temp tag.
+///
+/// The non-streaming `.temp_tag()` shorthand this replaces drains this very same
+/// stream and returns its `Done` tag; the only difference here is that the
+/// intermediate items are observed instead of discarded. A stream that ends with
+/// neither `Done` nor `Error` violates the iroh-blobs contract — it fails loudly
+/// rather than silently importing nothing.
+async fn add_path_child(
+    store: &Store,
+    abs: &Path,
+    child_len: u64,
+    mode: ImportMode,
+    meter: &mut ImportProgressMeter,
+) -> Result<TempTag> {
+    let mut stream = store
+        .blobs()
+        .add_path_with_opts(AddPathOptions {
+            path: abs.to_path_buf(),
+            format: BlobFormat::Raw,
+            mode,
+        })
+        .stream()
+        .await;
+    let mut done: Option<TempTag> = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            AddProgressItem::CopyProgress(offset) | AddProgressItem::OutboardProgress(offset) => {
+                meter.tick(offset, child_len)
+            }
+            AddProgressItem::Done(tt) => done = Some(tt),
+            AddProgressItem::Error(e) => {
+                tracing::error!(
+                    path = %abs.display(),
+                    error = %e,
+                    "import blob failed"
+                );
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("import blob {}", abs.display()));
+            }
+            AddProgressItem::Size(_) | AddProgressItem::CopyDone => {}
+        }
+    }
+    let tt = done.with_context(|| {
+        format!(
+            "import blob {}: progress stream ended without Done",
+            abs.display()
+        )
+    })?;
+    meter.child_done(child_len);
+    Ok(tt)
+}
+
+/// Guarantee the just-imported child is actually readable, repairing it if not.
+///
+/// A `TryReference` import of a hash the store ALREADY holds does not re-point
+/// the entry: iroh-blobs 0.103 UNIONS the external path list, sorts it and reads
+/// `paths.first()` (`store/fs/entry_state.rs:44`, via `meta.rs::handle_update`).
+/// So a path that has since been deleted — the previous send's
+/// `packages/<uuid>` — keeps winning the read while a live tag pins the entry
+/// against GC. Probing one byte detects it (in-process too: the failure is
+/// immediate, not restart-only); re-importing the same file with `Copy` repairs
+/// it for good, because `Owned` beats `External` in that union from BOTH sides
+/// (`entry_state.rs:58`/`:63`) — the store then owns the bytes and no path list
+/// survives.
+///
+/// Costs one byte per child on the happy path. `Copy` mode needs no probe (it
+/// never produces an external entry), and a zero-byte payload has no byte to
+/// read — both return the original tag untouched.
+async fn ensure_child_readable(
+    store: &Store,
+    abs: &Path,
+    hash: Hash,
+    size: u64,
+    mode: ImportMode,
+    tt: TempTag,
+) -> Result<TempTag> {
+    if !matches!(mode, ImportMode::TryReference) || size == 0 {
+        return Ok(tt);
+    }
+    if probe_first_byte(store, hash).await.is_ok() {
+        return Ok(tt);
+    }
+    tracing::warn!(
+        hash = %hash,
+        path = %abs.display(),
+        "reference import reads a dead path; copying instead"
+    );
+    let copied = store
+        .blobs()
+        .add_path_with_opts(AddPathOptions {
+            path: abs.to_path_buf(),
+            format: BlobFormat::Raw,
+            mode: ImportMode::Copy,
+        })
+        .temp_tag()
+        .await
+        .with_context(|| format!("copy-import blob {}", abs.display()))?;
+    if copied.hash() != hash {
+        tracing::error!(
+            hash = %hash,
+            copied_hash = %copied.hash(),
+            path = %abs.display(),
+            "file changed between the reference and copy imports"
+        );
+        anyhow::bail!(
+            "{} changed between the reference and copy imports ({} → {})",
+            abs.display(),
+            hash,
+            copied.hash()
+        );
+    }
+    if let Err(e) = probe_first_byte(store, hash).await {
+        tracing::error!(
+            hash = %hash,
+            path = %abs.display(),
+            error = %e,
+            "copy re-import did not make the blob readable"
+        );
+        return Err(e.context(format!("repair blob {}", abs.display())));
+    }
+    Ok(copied)
+}
+
 /// Import every file under `pkg_dir` into `store` and assemble them into a
 /// collection, COPYING each payload into the store ([`ImportMode::Copy`]) — the
-/// safe default for a dir the app may rebuild or mutate (a Perseus resend
-/// rewrites its payloads in place). Returns the collection [`Hash`] (the package
-/// `root_hash`) plus the ORDERED collection entries `(rel_path, byte_size)` — in
-/// the exact order [`Collection::from_iter`] stores them (the sorted-name walk
-/// order) — so the provider-upload-events consumer (Task 2.2) can attribute a
-/// served child to its entry by hash-seq index. Pins the collection under the
-/// deterministic `tag` name so it survives garbage collection and is serveable to
-/// peers — and so `release` can later delete it by that exact name.
+/// safe default for a dir whose payloads may be rewritten in place, which is
+/// exactly why Perseus keeps this mode (its resend rebuilds the same dir). The
+/// app passes `TryReference` at bind instead (transfer-prepare spec §4.1): its
+/// `packages/<uuid>` is an immutable snapshot. Returns the collection [`Hash`]
+/// (the package `root_hash`) plus the ORDERED collection entries
+/// `(rel_path, byte_size)` — in the exact order [`Collection::from_iter`] stores
+/// them (the sorted-name walk order) — so the provider-upload-events consumer
+/// (Task 2.2) can attribute a served child to its entry by hash-seq index. Pins
+/// the collection under the deterministic `tag` name so it survives garbage
+/// collection and is serveable to peers — and so `release` can later delete it by
+/// that exact name.
 ///
 /// [`import_package_collection_with_mode`] is the same import under a caller-
-/// chosen [`ImportMode`]; project seeding (D3) uses `TryReference` there.
+/// chosen [`ImportMode`]; project seeding (D3) and the app's serve use
+/// `TryReference` there.
 pub async fn import_package_collection(
     store: &Store,
     pkg_dir: &Path,
     tag: &str,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
-    import_package_collection_with_mode(store, pkg_dir, tag, ImportMode::Copy).await
+    import_package_collection_with_mode(store, pkg_dir, tag, ImportMode::Copy, None).await
 }
 
 /// [`import_package_collection`] under an explicit [`ImportMode`].
@@ -127,14 +348,22 @@ pub async fn import_package_collection(
 /// (it inlines small files regardless of mode), which is why this is a hint, and
 /// the mode never affects the resulting hashes — an identical package always
 /// yields the identical collection hash either way.
+///
+/// `progress`, when set, receives throttled cumulative `(bytes_done,
+/// bytes_total)` ticks across the whole import plus one terminal
+/// `(total, total)` — the `indexing` stage a sender surfaces while this pass
+/// hashes the package (transfer-prepare spec §4.4). `bytes_total` counts every
+/// file the import reads off disk, `manifest.ndjson` included.
 pub async fn import_package_collection_with_mode(
     store: &Store,
     pkg_dir: &Path,
     tag: &str,
     mode: ImportMode,
+    progress: Option<ImportProgressSink>,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
     let files = collect_files(pkg_dir)?;
     let count = files.len();
+    let mut meter = ImportProgressMeter::new(progress, files.iter().map(|f| f.len).sum());
 
     // Hold each child's temp tag alive until the collection is stored + tagged,
     // so nothing it references can be collected mid-assembly.
@@ -145,20 +374,15 @@ pub async fn import_package_collection_with_mode(
     // attribution map for Task 2.2.
     let mut entries: Vec<(String, u64)> = Vec::with_capacity(count);
     for f in &files {
-        let tt = store
-            .blobs()
-            .add_path_with_opts(AddPathOptions {
-                path: f.abs.clone(),
-                format: BlobFormat::Raw,
-                mode,
-            })
-            .temp_tag()
-            .await
-            .with_context(|| format!("import blob {}", f.abs.display()))?;
-        items.push((f.name.clone(), tt.hash()));
+        let tt = add_path_child(store, &f.abs, f.len, mode, &mut meter).await?;
+        let hash = tt.hash();
+        // A referenced child must be readable before we hand its hash to a peer.
+        let tt = ensure_child_readable(store, &f.abs, hash, f.len, mode, tt).await?;
+        items.push((f.name.clone(), hash));
         entries.push((f.name.clone(), f.len));
         child_tags.push(tt);
     }
+    meter.finish();
 
     let hash = store_and_tag_collection(store, items, child_tags, tag).await?;
     tracing::debug!(
@@ -215,11 +439,25 @@ async fn store_and_tag_collection(
 /// `want` must be non-empty — an all-duplicate package is dropped before serve,
 /// never served empty; an empty (or manifest-matching-nothing) want is a caller
 /// error and returns `Err`.
+///
+/// `mode` applies to the payloads exactly as in
+/// [`import_package_collection_with_mode`] — the filtered manifest is always an
+/// in-memory blob, so only the payload imports can reference. Before
+/// transfer-prepare spec §4.1 this path hardcoded `add_path` (= `Copy`), so an
+/// app send that dedup narrowed to a subset silently paid a second copy of every
+/// wanted frame while the full-package path was already mode-aware.
+///
+/// `progress` behaves exactly as in [`import_package_collection_with_mode`],
+/// except that `bytes_total` is the wanted PAYLOAD bytes only: the filtered
+/// manifest never touches the disk here (it is added from memory), so it
+/// contributes no work to report.
 pub async fn import_subset_collection(
     store: &Store,
     pkg_dir: &Path,
     want: &HashSet<String>,
     tag: &str,
+    mode: ImportMode,
+    progress: Option<ImportProgressSink>,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
     if want.is_empty() {
         anyhow::bail!(
@@ -253,18 +491,28 @@ pub async fn import_subset_collection(
     enum Src {
         /// Filtered `manifest.ndjson`, added straight from memory.
         ManifestBytes(Vec<u8>),
-        /// A wanted payload file at its absolute on-disk path.
-        Payload(PathBuf),
+        /// A wanted payload file at its absolute on-disk path, with the size the
+        /// import will read (stat'd once here, so the progress meter knows the
+        /// total before the first byte is hashed).
+        Payload { abs: PathBuf, size: u64 },
     }
     let mut entries: Vec<(String, Src)> = Vec::with_capacity(kept.len() + 1);
     entries.push((
         MANIFEST_FILENAME.to_string(),
         Src::ManifestBytes(manifest_ndjson.into_bytes()),
     ));
+    let mut payload_bytes: u64 = 0;
     for r in &kept {
-        entries.push((r.rel_path.clone(), Src::Payload(pkg_dir.join(&r.rel_path))));
+        let abs = pkg_dir.join(&r.rel_path);
+        let size = tokio::fs::metadata(&abs)
+            .await
+            .with_context(|| format!("stat {}", abs.display()))?
+            .len();
+        payload_bytes = payload_bytes.saturating_add(size);
+        entries.push((r.rel_path.clone(), Src::Payload { abs, size }));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut meter = ImportProgressMeter::new(progress, payload_bytes);
 
     let mut child_tags: Vec<TempTag> = Vec::with_capacity(entries.len());
     let mut items: Vec<(String, Hash)> = Vec::with_capacity(entries.len());
@@ -285,17 +533,12 @@ pub async fn import_subset_collection(
                     .context("import filtered manifest blob")?;
                 (tt, size)
             }
-            Src::Payload(abs) => {
-                let size = tokio::fs::metadata(&abs)
-                    .await
-                    .with_context(|| format!("stat {}", abs.display()))?
-                    .len();
-                let tt = store
-                    .blobs()
-                    .add_path(&abs)
-                    .temp_tag()
-                    .await
-                    .with_context(|| format!("import blob {}", abs.display()))?;
+            Src::Payload { abs, size } => {
+                let tt = add_path_child(store, &abs, size, mode, &mut meter).await?;
+                // Same guard as the full-package path: a referenced child must be
+                // readable before its hash goes into the served collection.
+                let hash = tt.hash();
+                let tt = ensure_child_readable(store, &abs, hash, size, mode, tt).await?;
                 (tt, size)
             }
         };
@@ -303,6 +546,7 @@ pub async fn import_subset_collection(
         ordered.push((name, size));
         child_tags.push(tt);
     }
+    meter.finish();
 
     let count = items.len();
     let hash = store_and_tag_collection(store, items, child_tags, tag).await?;
@@ -311,6 +555,7 @@ pub async fn import_subset_collection(
         count,
         want = kept.len(),
         root_hash = %hash,
+        reference = matches!(mode, ImportMode::TryReference),
         "package subset imported as collection"
     );
     Ok((hash, ordered))
@@ -336,6 +581,152 @@ pub async fn import_subset_collection(
 ///   [`super::node`]/[`super`] for how a stale in-flight tag is reclaimed.
 pub(crate) fn in_flight_tag(permanent_tag: &str) -> String {
     format!("in-flight/{permanent_tag}")
+}
+
+/// An export that failed because the blob's data file is gone from the path the
+/// store references — the ONE export failure that is a transfer-class error and
+/// never a [`LocalFault`].
+///
+/// Transfer-prepare spec §5.3: with [`ExportMode::TryReference`] the store stops
+/// owning a copy and points at the staged file instead. Two in-flight inbound
+/// packages that share a byte-identical file therefore share one entry, and if
+/// the first is confirmed and its staging cleaned before the second exports,
+/// that second export finds the referenced file gone while GC (≤ 15 min) has not
+/// yet dropped the dead entry. Classifying that as a local fault would
+/// terminalize the row `Failed`; it has to park `Waiting` so the sender's retry
+/// re-downloads the blob after GC.
+///
+/// iroh-blobs surfaces it as an io `NotFound` inside
+/// [`iroh_blobs::api::RequestError::Inner`] — the store opens the referenced
+/// path (`reflink_or_copy`, or the "no external data path"/"no entry found"
+/// guards) and that open fails. An RPC-layer failure is never this case. The
+/// string check is a belt-and-braces fallback for a NotFound that arrives
+/// wrapped in `io::Error::other` rather than as a kind.
+pub(crate) fn export_source_vanished(err: &iroh_blobs::api::RequestError) -> bool {
+    match err {
+        iroh_blobs::api::RequestError::Inner {
+            source: iroh_blobs::api::Error::Io(io_err),
+            ..
+        } => {
+            io_err.kind() == std::io::ErrorKind::NotFound || {
+                let text = io_err.to_string();
+                text.contains("No such file") || text.contains("os error 2")
+            }
+        }
+        // An rpc-layer failure is a transport/actor problem, never a missing
+        // source file. (`RequestError` is `#[non_exhaustive]`, hence the
+        // wildcard rather than a named `Rpc` arm.)
+        _ => false,
+    }
+}
+
+/// What one child export did: `Ok(())` landed, `Err` is iroh's own failure for
+/// the caller to classify (§5.3) with the collection tag in hand.
+type ExportOutcome = std::result::Result<(), iroh_blobs::api::RequestError>;
+
+/// One child of [`fetch_collection_to_dir`]'s export loop: clear a stale target
+/// left by an earlier attempt, then export the blob BY REFERENCE.
+///
+/// **Why the remove.** The receiver derives staging from the wire id
+/// (`<root>/staging/<wire_id>`) and does NOT clean it when a transfer parks
+/// `Waiting`, so a retry re-runs this loop over children an earlier attempt
+/// already exported. Such a child's entry is `External([that exact target])`, and
+/// upstream's non-empty-external arm (`store/fs.rs:1284-1290`) then calls
+/// `reflink_or_copy(source_path, target)` with `source_path == target`:
+/// `File::create(to)` truncates the inode to ZERO before the read, so the export
+/// fails `UnexpectedEof` — a non-`NotFound` io error, hence `LocalFault`, hence a
+/// row wrongly terminalized `Failed` when the truth is recoverable — AND leaves
+/// the entry pointing at a 0-byte file, wedging every sibling package that shares
+/// the hash. Removing the target first makes that impossible: if it was the
+/// entry's only external path the export now fails as a *vanished source*, which
+/// is already the correct, self-healing classification (§5.3); otherwise this is
+/// simply stale-file cleanup from the earlier attempt.
+///
+/// `Err` is returned ONLY for that local pre-step: a target we cannot remove is a
+/// [`LocalFault`], because exporting over a file we failed to clear is exactly
+/// the truncation this guards against.
+pub(crate) async fn export_child(
+    store: &Store,
+    hash: Hash,
+    target: &Path,
+) -> Result<ExportOutcome> {
+    match tokio::fs::remove_file(target).await {
+        Ok(()) => {}
+        // Nothing there is the normal case (a first attempt).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(LocalFault(
+                anyhow::Error::new(e)
+                    .context(format!("remove stale export target {}", target.display())),
+            )
+            .into())
+        }
+    }
+    // Transfer-prepare spec §5.1: MOVE the store-owned data file into staging
+    // (rename; EXDEV → copy, and iroh drops its own copy either way). The store
+    // then REFERENCES the staged file, so the receiver holds one copy of the
+    // payload instead of two while the package awaits confirmation.
+    Ok(store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash,
+            mode: ExportMode::TryReference,
+            target: target.to_path_buf(),
+        })
+        .finish()
+        .await
+        .map(|_| ()))
+}
+
+/// Handle the ONE export failure that is transfer-class (§5.3): the file the
+/// store references is gone. Drops the receiver's collection tag, logs, and
+/// returns the (deliberately un-[`LocalFault`]ed) error the fetch propagates.
+///
+/// **Why the tag has to go.** An unmarked error parks the inbound row `Waiting`,
+/// and a park never calls `release` — so OUR OWN collection tag, set a few lines
+/// above in [`fetch_collection_to_dir`], would pin the dead child entry against
+/// GC forever and every sender retry would re-run this same failing export (the
+/// downloader skips a blob whose entry reads `Complete`, dead file or not). With
+/// the tag gone the entry is untagged, GC (≤ 15 min) purges it, and a later
+/// retry's downloader fetches the blob again. The in-flight tag is ALREADY
+/// retired at this point — [`fetch_collection_to_dir`] deletes it immediately
+/// after setting the permanent tag, above the export loop — so this one delete
+/// leaves nothing of ours pinning the collection.
+///
+/// The tag delete is best-effort: a failure must not change the classification
+/// (the transfer-class error is the honest outcome either way), so it warns and
+/// returns the vanished error regardless. Never swallowed — both the delete
+/// failure and the vanish itself are logged.
+///
+/// Extracted from the loop body so the branch is unit-testable end to end (tag
+/// state + returned error) without a live peer: driving a real fetch into it is
+/// not possible, because a re-fetch over an entry whose external file is gone
+/// trips an iroh-blobs 0.103 panic (`bitfield()` on `BaoFileStorage::Poisoned`,
+/// via our own per-file `observe`) in phase 2, long before the export loop.
+pub(crate) async fn on_export_source_vanished(
+    store: &Store,
+    tag: &str,
+    root_hash: Hash,
+    name: &str,
+    blob_hash: Hash,
+    target: &Path,
+    err: iroh_blobs::api::RequestError,
+) -> anyhow::Error {
+    if let Err(te) = store.tags().delete(tag.as_bytes()).await {
+        tracing::warn!(
+            collection_tag = tag,
+            root_hash = %root_hash,
+            error = %format!("{te:#}"),
+            "delete collection tag after vanished export failed"
+        );
+    }
+    tracing::warn!(
+        hash = %blob_hash,
+        path = %target.display(),
+        error = %format!("{err:#}"),
+        "export source vanished; waiting for GC before retry"
+    );
+    anyhow::Error::new(err).context(format!("export {name}: source vanished"))
 }
 
 /// Download the collection identified by `root_hash` from `provider` into
@@ -566,15 +957,22 @@ pub async fn fetch_collection_to_dir(
                 )
             })?;
         }
-        store
-            .blobs()
-            .export(*blob_hash, &target)
-            .await
-            .map_err(|e| {
-                LocalFault(
-                    anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
+        if let Err(e) = export_child(store, *blob_hash, &target).await? {
+            // §5.3: a same-hash sibling package's staged file was cleaned before
+            // this export ran and GC has not yet dropped the dead entry. NOT a
+            // local fault — the row parks `Waiting` and the sender retries; the
+            // handler drops our collection tag so GC can heal it (see its doc).
+            if export_source_vanished(&e) {
+                return Err(on_export_source_vanished(
+                    store, tag, root_hash, name, *blob_hash, &target, e,
                 )
-            })?;
+                .await);
+            }
+            return Err(LocalFault(
+                anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
+            )
+            .into());
+        }
     }
 
     tracing::debug!(

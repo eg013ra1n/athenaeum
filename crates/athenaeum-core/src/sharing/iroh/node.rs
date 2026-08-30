@@ -58,7 +58,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
     PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{FetchSink, ProviderTelemetrySink, SharingTransport};
+use crate::sharing::{FetchSink, ImportProgressSink, ProviderTelemetrySink, SharingTransport};
 use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
@@ -330,6 +330,13 @@ fn recv_in_flight_package_id(tag: &str) -> Option<&str> {
 struct ServedCollection {
     hash: Hash,
     want_fingerprint: Option<String>,
+    /// The on-disk dir this collection was imported from — `packages/<uuid>` for a
+    /// role serve, the retained package dir for a project seed. Under
+    /// [`ImportMode::TryReference`] the store REFERENCES files under here, so
+    /// `src_dir.join(rel_path)` is where a child's bytes actually live; that is
+    /// what lets [`copy_shared_children_before_release`](SharedIrohNode::copy_shared_children_before_release)
+    /// find a live source for a blob another package still needs.
+    src_dir: PathBuf,
 }
 
 /// Stable fingerprint of a serve's want-subset: `None` for a full package, else
@@ -892,26 +899,76 @@ pub struct SharedIrohNode {
     /// every role handle, every peer, every concurrent GET — and a limit change
     /// lands on the next chunk without a rebind.
     upload_pacer: Arc<UploadPacer>,
+    /// The data dir this node was bound at — blob store, and the root every
+    /// host-side data path hangs off (transfer-prepare spec §4.1). Equal to the
+    /// identity dir for the single-dir [`bind`](Self::bind).
+    working_dir: PathBuf,
+    /// How [`serve`](SharingTransport::serve) imports a package dir into the blob
+    /// store; chosen by the host at bind, see [`NodeOptions`].
+    serve_import_mode: ImportMode,
+}
+
+/// Host-chosen node behavior (transfer-prepare spec §4.1).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeOptions {
+    /// How `serve` imports a package dir into the blob store. `TryReference`
+    /// (the app: `packages/<uuid>` is an immutable snapshot) references the
+    /// payload in place and stores only the outboard; `Copy` (Perseus: a resend
+    /// rewrites its payloads in place) copies it into the store.
+    pub serve_import_mode: ImportMode,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self {
+            serve_import_mode: ImportMode::Copy,
+        }
+    }
 }
 
 impl SharedIrohNode {
-    /// Bind the ONE endpoint for this process from the install's device key.
+    /// Single-dir bind: identity and data under the same `sync_dir`, `Copy`
+    /// imports — Perseus and every existing test keep this shape.
+    pub async fn bind(sync_dir: &Path, relay_mode: RelayMode) -> Result<Arc<Self>> {
+        Self::bind_with(sync_dir, sync_dir, relay_mode, NodeOptions::default()).await
+    }
+
+    /// The data dir this node bound at (its blob store's parent).
+    pub fn working_dir(&self) -> &Path {
+        &self.working_dir
+    }
+
+    /// The import mode [`serve`](SharingTransport::serve) uses for package dirs.
+    pub fn serve_import_mode(&self) -> ImportMode {
+        self.serve_import_mode
+    }
+
+    /// Bind the ONE endpoint for this process from the install's device key,
+    /// with the IDENTITY and the DATA dirs split (transfer-prepare spec §4.1):
+    /// the device key + its advisory-lock sidecar live under `identity_dir` and
+    /// never move, while the blob store follows `working_dir` — so relocating
+    /// the transfer working folder relocates bytes, never the identity.
     ///
     /// Takes the device-key advisory lock (fail ⇒ actionable, key-material-free
     /// error, I4/S2); builds the endpoint (`presets::Minimal` + secret +
     /// `relay_mode` + [`MemoryLookup`](iroh::address_lookup::memory::MemoryLookup));
-    /// opens the single [`FsStore`] at `<sync_dir>/blobs` (GC enabled once);
+    /// opens the single [`FsStore`] at `<working_dir>/blobs` (GC enabled once);
     /// mounts the [`Router`] with both ALPNs once; spawns the home-relay-status
     /// watcher. `relay_mode` is [`RelayMode::Default`] for production or
     /// [`RelayMode::Disabled`] for direct-only / in-process tests.
-    pub async fn bind(sync_dir: &Path, relay_mode: RelayMode) -> Result<Arc<Self>> {
+    pub async fn bind_with(
+        identity_dir: &Path,
+        working_dir: &Path,
+        relay_mode: RelayMode,
+        opts: NodeOptions,
+    ) -> Result<Arc<Self>> {
         // The one device identity (task B4): the endpoint binds this secret and
         // the advisory lock is on the `device_key.lock` sidecar (NOT the key
         // file — a mandatory Windows lock there blocks account sign-in, os
         // error 33), so a second install started from a copied key fails here
         // instead of dueling on the relay (I4).
-        let key = DeviceKey::load_or_create_in(sync_dir).context("load device key")?;
-        let key_lock = DeviceKeyLock::acquire(&device_key_lock_path(sync_dir))?;
+        let key = DeviceKey::load_or_create_in(identity_dir).context("load device key")?;
+        let key_lock = DeviceKeyLock::acquire(&device_key_lock_path(identity_dir))?;
 
         let demux = EventDemux::new();
         let secret_key = SecretKey::from_bytes(&key.secret_bytes());
@@ -947,11 +1004,11 @@ impl SharedIrohNode {
             "shared iroh node relay configuration"
         );
 
-        // One `FsStore` at `<sync_dir>/blobs` for all roles (spec §2). Mirror
+        // One `FsStore` at `<working_dir>/blobs` for all roles (spec §2). Mirror
         // `FsStore::load`'s internals but with GC on (load() hardcodes gc: None,
         // so released blobs would leak forever). Interval is slack (see
         // `GC_INTERVAL`) so an in-flight transfer never races collection.
-        let blob_dir = sync_dir.join("blobs");
+        let blob_dir = working_dir.join("blobs");
         std::fs::create_dir_all(&blob_dir)
             .with_context(|| format!("create blob dir {}", blob_dir.display()))?;
         let db_path = blob_dir.join("blobs.db");
@@ -1076,6 +1133,8 @@ impl SharedIrohNode {
             counters_at_bind,
             presence,
             upload_pacer,
+            working_dir: working_dir.to_path_buf(),
+            serve_import_mode: opts.serve_import_mode,
         }))
     }
 
@@ -2133,12 +2192,284 @@ impl SharedIrohNode {
         blobs::fetch_manifest_to_dir(&self.store, &endpoint, provider, root_hash, dest_dir).await
     }
 
+    /// [`SharingTransport::protect_shared_before_cleanup`] for a role handle: make
+    /// this package's shared blobs outlive the payload deletion the engine is
+    /// about to perform (spec §4.2). Runs BEFORE the cleanup, so
+    /// `entry.src_dir` — the package's own payload dir — is still on disk.
+    async fn role_protect_shared_before_cleanup(
+        &self,
+        role: Role,
+        package_id: &PackageId,
+    ) -> Result<()> {
+        let tag = role_package_tag(role.prefix(), package_id);
+        let entry = self
+            .served
+            .lock()
+            .expect("served mutex poisoned")
+            .get(&tag)
+            .cloned();
+        let Some(entry) = entry else {
+            // Nothing served under this tag in THIS process (a restart, or a
+            // transport that never served it) — there is nothing to protect.
+            return Ok(());
+        };
+        let sizes = self
+            .served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .get(&tag)
+            .cloned()
+            .unwrap_or_default();
+        self.copy_shared_children(&tag, package_id, &entry, &sizes)
+            .await
+    }
+
+    /// Copy into the store every child of `entry` that ANOTHER live collection
+    /// also references, so those blobs stop depending on any payload dir.
+    ///
+    /// Under [`ImportMode::TryReference`] a served blob is a REFERENCE to a file
+    /// under `packages/<uuid>`, and iroh keeps a sorted UNION of external paths
+    /// per hash, reading `paths.first()`. Two packages carrying the same bytes
+    /// therefore share one entry whose first path may belong to whichever of them
+    /// finishes first — and that one's dir is about to be deleted, while the
+    /// survivor's tag keeps the entry alive past GC so nothing would ever heal it.
+    /// Re-importing the shared children with [`ImportMode::Copy`] makes them
+    /// `Owned`, which wins the union from both sides.
+    ///
+    /// Sources are tried in order: this package's own file (the caller runs before
+    /// the cleanup, so it is there), then the sharing package's file — the
+    /// fallback that keeps this correct if our dir is already gone (a crash
+    /// between cleanup and a resumed release, an out-of-band purge).
+    ///
+    /// Scope guards: `Copy` hosts (Perseus) own their blobs already and return
+    /// immediately; children at or below the inline threshold are never external;
+    /// a collection that no longer loads is skipped with a `debug!` (nothing left
+    /// to protect). A child that is shared but has no readable source anywhere is
+    /// an `error!` + `Err` — the caller then keeps the payload on disk rather than
+    /// deleting bytes another package still needs.
+    async fn copy_shared_children(
+        &self,
+        tag: &str,
+        package_id: &PackageId,
+        entry: &ServedCollection,
+        sizes: &[(String, u64)],
+    ) -> Result<()> {
+        use iroh_blobs::api::blobs::AddPathOptions;
+        use iroh_blobs::format::collection::Collection;
+        use iroh_blobs::BlobFormat;
+        use n0_future::StreamExt as _;
+
+        if !matches!(self.serve_import_mode, ImportMode::TryReference) {
+            return Ok(());
+        }
+        let mine = match Collection::load(entry.hash, &self.store).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    package_id = %package_id.0,
+                    root_hash = %entry.hash,
+                    error = %e,
+                    "released collection no longer loads; nothing to protect"
+                );
+                return Ok(());
+            }
+        };
+        let size_by_name: HashMap<&str, u64> =
+            sizes.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+
+        // Every OTHER live hash-seq tag is a collection that may reference our
+        // children. Listing only `HashSeq` tags is the same namespace contract the
+        // in-flight/seed tags already rely on; a tag whose collection cannot be
+        // loaded (a partial receive, a half-swept root) simply contributes nothing.
+        let mut other_tags: Vec<(String, Hash)> = Vec::new();
+        let mut stream = self
+            .store
+            .tags()
+            .list_hash_seq()
+            .await
+            .map_err(|e| anyhow!("list hash-seq tags: {e}"))?;
+        while let Some(info) = stream.next().await {
+            let info = info.map_err(|e| anyhow!("list hash-seq tag entry: {e}"))?;
+            let name = String::from_utf8_lossy(info.name.as_ref()).into_owned();
+            if name != tag {
+                other_tags.push((name, info.hash));
+            }
+        }
+
+        let mut shared: HashSet<Hash> = HashSet::new();
+        // A live file for a shared child that is NOT under our own dir: the sharing
+        // package's own payload, which by definition still exists (its tag is live).
+        let mut alt_source: HashMap<Hash, PathBuf> = HashMap::new();
+        for (other_tag, other_hash) in other_tags {
+            let coll = match Collection::load(other_hash, &self.store).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(
+                        tag = %other_tag,
+                        root_hash = %other_hash,
+                        error = %e,
+                        "live tag's collection does not load; skipped when scanning for shared blobs"
+                    );
+                    continue;
+                }
+            };
+            let other_dir = self
+                .served
+                .lock()
+                .expect("served mutex poisoned")
+                .get(&other_tag)
+                .map(|e| e.src_dir.clone());
+            for (name, child) in coll.iter() {
+                shared.insert(*child);
+                if let Some(dir) = &other_dir {
+                    alt_source.entry(*child).or_insert_with(|| dir.join(name));
+                }
+            }
+        }
+
+        let mut copied = 0usize;
+        for (name, child) in mine.iter() {
+            if !shared.contains(child) {
+                continue;
+            }
+            // A want-subset serve synthesizes its `manifest.ndjson` in memory
+            // (`import_subset_collection`'s `add_bytes`), so that child is never
+            // `External` — nothing to protect — and `src_dir/manifest.ndjson` holds
+            // the FULL manifest, i.e. different bytes under the same entry name.
+            // Copying that would be a hash mismatch, i.e. a hard error on a
+            // perfectly healthy package.
+            if entry.want_fingerprint.is_some() && name == crate::package::MANIFEST_FILENAME {
+                continue;
+            }
+            // Unknown size ⇒ treat as external and protect it (conservative).
+            if size_by_name.get(name.as_str()).copied().unwrap_or(u64::MAX)
+                <= blobs::INLINE_BLOB_MAX_BYTES
+            {
+                continue;
+            }
+            // An already-owned child would be copied again here — there is no public
+            // API to ask where a blob lives, and a successful read proves nothing
+            // (it may be reading OUR file, the one about to be deleted). The waste is
+            // bounded to blobs two live packages genuinely share.
+            let own = entry.src_dir.join(name);
+            let src = if own.is_file() {
+                own
+            } else {
+                match alt_source.get(child) {
+                    Some(p) if p.is_file() => p.clone(),
+                    _ => {
+                        tracing::error!(
+                            package_id = %package_id.0,
+                            hash = %child,
+                            path = %own.display(),
+                            "shared blob has no readable source; refusing to release it"
+                        );
+                        anyhow::bail!(
+                            "no readable source for shared blob {child} ({})",
+                            own.display()
+                        );
+                    }
+                }
+            };
+            let tt = self
+                .store
+                .blobs()
+                .add_path_with_opts(AddPathOptions {
+                    path: src.clone(),
+                    format: BlobFormat::Raw,
+                    mode: ImportMode::Copy,
+                })
+                .temp_tag()
+                .await
+                .with_context(|| format!("copy shared blob {}", src.display()))?;
+            if tt.hash() != *child {
+                tracing::error!(
+                    package_id = %package_id.0,
+                    hash = %child,
+                    copied_hash = %tt.hash(),
+                    path = %src.display(),
+                    "shared blob source changed on disk; refusing to release it"
+                );
+                anyhow::bail!(
+                    "shared blob source {} changed on disk ({} → {})",
+                    src.display(),
+                    child,
+                    tt.hash()
+                );
+            }
+            // Dropping the temp tag is safe: the sharing package's tag pins the hash,
+            // and the bytes are store-owned now.
+            copied += 1;
+        }
+        if copied > 0 {
+            tracing::info!(
+                package_id = %package_id.0,
+                count = copied,
+                "shared blobs copied into the store before release"
+            );
+        }
+        Ok(())
+    }
+
+    /// Is every child of an already-imported collection still readable? The
+    /// re-serve short-circuit's guard.
+    ///
+    /// Reusing a `served` entry skips the import — and with it
+    /// [`blobs::ensure_child_readable`], the thing that repairs a dead external
+    /// path. A package whose sibling was released and cleaned in the meantime can
+    /// therefore be re-announced pointing at deleted files. One byte per
+    /// above-inline child answers it; `false` sends the caller through a fresh
+    /// import, which repairs. `Copy` hosts never have external children, so they
+    /// short-circuit to `true` without reading anything.
+    async fn served_collection_is_readable(&self, tag: &str, hash: Hash) -> bool {
+        use iroh_blobs::format::collection::Collection;
+
+        if !matches!(self.serve_import_mode, ImportMode::TryReference) {
+            return true;
+        }
+        let sizes: HashMap<String, u64> = self
+            .served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .get(tag)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
+        let coll = match Collection::load(hash, &self.store).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    tag,
+                    root_hash = %hash,
+                    error = %e,
+                    "served collection no longer loads; re-importing"
+                );
+                return false;
+            }
+        };
+        for (name, child) in coll.iter() {
+            if sizes.get(name).copied().unwrap_or(u64::MAX) <= blobs::INLINE_BLOB_MAX_BYTES {
+                continue;
+            }
+            if let Err(e) = blobs::probe_first_byte(&self.store, *child).await {
+                tracing::debug!(
+                    tag,
+                    hash = %child,
+                    error = %format!("{e:#}"),
+                    "served child is unreadable"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     async fn role_serve(
         &self,
         role: Role,
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> Result<()> {
         let tag = role_package_tag(role.prefix(), &pkg.package_id);
         // The import returns the collection hash PLUS the ordered `(rel_path, size)`
@@ -2152,28 +2483,69 @@ impl SharedIrohNode {
         // a restart the map is empty so the first serve imports again — correct,
         // because the blob store's tags may have been swept meanwhile.
         let fingerprint = want_fingerprint(want);
-        {
+        let reusable = {
             let served = self.served.lock().expect("served mutex poisoned");
-            if let Some(entry) = served.get(&tag) {
-                if entry.want_fingerprint == fingerprint {
-                    tracing::debug!(
-                        package_id = %pkg.package_id.0,
-                        root_hash = %entry.hash,
-                        "serve reuses the already-imported collection"
-                    );
-                    return Ok(());
-                }
+            served
+                .get(&tag)
+                .filter(|entry| entry.want_fingerprint == fingerprint)
+                .map(|entry| entry.hash)
+        };
+        if let Some(hash) = reusable {
+            // The short-circuit skips the import, and with it the repair
+            // `ensure_child_readable` performs — so a collection whose referenced
+            // files went away since (a sibling package released + cleaned) would be
+            // re-announced dead. Probe before trusting it.
+            if self.served_collection_is_readable(&tag, hash).await {
+                tracing::debug!(
+                    package_id = %pkg.package_id.0,
+                    root_hash = %hash,
+                    "serve reuses the already-imported collection"
+                );
+                // Nothing is hashed on this path, so `progress` is never called —
+                // a re-serve emits no `indexing` ticks at all, which is honest:
+                // there is no work to show.
+                return Ok(());
             }
+            tracing::warn!(
+                package_id = %pkg.package_id.0,
+                root_hash = %hash,
+                "served collection reads a dead path; re-importing"
+            );
+            self.forget_served_tag(&tag);
         }
+        // The host's import mode (spec §4.1): the app references its immutable
+        // `packages/<uuid>` in place, Perseus copies (its resend rewrites the same
+        // dir). Both import paths honor it — a dedup-narrowed subset send must not
+        // fall back to a copy.
+        let mode = self.serve_import_mode;
+        // Transfer-prepare spec §4.4: the import hashes every payload before the
+        // peer is even told the package exists, so a multi-GB send would otherwise
+        // sit frozen. `progress` carries those bytes straight back to the caller
+        // (the sender engine's `indexing` stage) — synchronously, from inside this
+        // awaited call, which is the whole point: the engine does not drain its
+        // event channel while it is here.
         let (hash, entries) = match want {
-            None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
-            Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
+            None => {
+                blobs::import_package_collection_with_mode(
+                    &self.store,
+                    src_dir,
+                    &tag,
+                    mode,
+                    progress,
+                )
+                .await?
+            }
+            Some(w) => {
+                blobs::import_subset_collection(&self.store, src_dir, w, &tag, mode, progress)
+                    .await?
+            }
         };
         self.served.lock().expect("served mutex poisoned").insert(
             tag.clone(),
             ServedCollection {
                 hash,
                 want_fingerprint: fingerprint,
+                src_dir: src_dir.to_path_buf(),
             },
         );
         self.served_files
@@ -2278,11 +2650,14 @@ impl SharedIrohNode {
                 return Ok(entry.hash);
             }
         }
+        // No progress sink: project seeding (D3) is not an announced transfer, so
+        // there is no sender row waiting on an `indexing` stage.
         let (hash, entries) = blobs::import_package_collection_with_mode(
             &self.store,
             pkg_dir,
             &tag,
             ImportMode::TryReference,
+            None,
         )
         .await
         .with_context(|| format!("seed project package {package_id}"))?;
@@ -2291,6 +2666,7 @@ impl SharedIrohNode {
             ServedCollection {
                 hash,
                 want_fingerprint: None,
+                src_dir: pkg_dir.to_path_buf(),
             },
         );
         self.served_files
@@ -2615,8 +2991,11 @@ impl SharingTransport for RoleHandle {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> Result<()> {
-        self.node.role_serve(self.role, pkg, src_dir, want).await
+        self.node
+            .role_serve(self.role, pkg, src_dir, want, progress)
+            .await
     }
 
     async fn ack(
@@ -2669,6 +3048,12 @@ impl SharingTransport for RoleHandle {
 
     async fn release(&self, package_id: &PackageId) -> Result<()> {
         self.node.role_release(self.role, package_id).await
+    }
+
+    async fn protect_shared_before_cleanup(&self, package_id: &PackageId) -> Result<()> {
+        self.node
+            .role_protect_shared_before_cleanup(self.role, package_id)
+            .await
     }
 
     async fn list_in_flight_tags(&self) -> Result<Vec<PackageId>> {
@@ -3086,13 +3471,13 @@ mod tests {
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
         let handle = node.role_handle(Role::Out);
 
-        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None, None).await.unwrap();
         let first_hash = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("the first serve records a collection hash");
 
         std::fs::write(pkg_dir.join("frame.fits"), b"completely different bytes").unwrap();
-        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None, None).await.unwrap();
         let second_hash = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("the second serve keeps a collection hash");
@@ -3106,7 +3491,7 @@ mod tests {
         // Releasing forgets the collection, so a rebuilt payload — Perseus's resend
         // path — imports for real again rather than serving stale bytes.
         handle.release(&announce.package_id).await.unwrap();
-        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None, None).await.unwrap();
         let after_release = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("the post-release serve records a hash");
@@ -3133,7 +3518,7 @@ mod tests {
 
         let full = HashSet::from(["frame_a.fits".to_string(), "frame_b.fits".to_string()]);
         handle
-            .serve(&announce, &pkg_dir, Some(&full))
+            .serve(&announce, &pkg_dir, Some(&full), None)
             .await
             .unwrap();
         let full_hash = node
@@ -3142,7 +3527,7 @@ mod tests {
 
         let subset = HashSet::from(["frame_a.fits".to_string()]);
         handle
-            .serve(&announce, &pkg_dir, Some(&subset))
+            .serve(&announce, &pkg_dir, Some(&subset), None)
             .await
             .unwrap();
         let subset_hash = node
@@ -3158,7 +3543,7 @@ mod tests {
         // content, not by the HashSet's iteration order.
         let same_subset_again = HashSet::from(["frame_a.fits".to_string()]);
         handle
-            .serve(&announce, &pkg_dir, Some(&same_subset_again))
+            .serve(&announce, &pkg_dir, Some(&same_subset_again), None)
             .await
             .unwrap();
         assert_eq!(
@@ -3252,7 +3637,7 @@ mod tests {
             .unwrap();
         copy_node
             .role_handle(Role::Out)
-            .serve(&announce, &pkg_dir, None)
+            .serve(&announce, &pkg_dir, None, None)
             .await
             .unwrap();
         copy_node.shutdown().await;
@@ -3749,7 +4134,7 @@ mod tests {
 
         // Functional proof: import via Out, read the resulting tag via Recv.
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         let tag = format!("out/pkg/{}", announce.package_id.0);
         assert!(
@@ -3772,7 +4157,7 @@ mod tests {
 
         let out = node.role_handle(Role::Out);
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // The collection root hash the serve registered, read back off its tag.
         let tag = format!("out/pkg/{}", announce.package_id.0);
@@ -3823,7 +4208,7 @@ mod tests {
         // Two frames of clearly different sizes (4 KiB, 64 KiB) so a per-blob
         // (not cumulative) bug would visibly undershoot the full byte_size.
         let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Register both handles' consumers BEFORE announcing (same ordering the
         // other demux tests use): `out.events()` registers the ack-claim channel
@@ -3933,7 +4318,7 @@ mod tests {
         pair(&s, &s_info, &r, &r_info);
 
         let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Register consumers BEFORE announcing so the ack-claim channel exists for
         // route_serve_progress / route_serve_complete to target.
@@ -4075,7 +4460,7 @@ mod tests {
         pair(&s, &s_info, &r, &r_info);
 
         let (pkg_dir, announce, expected) = build_three_frame_dup_package(ds.path());
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Register consumers BEFORE announcing so the ack-claim channel exists for
         // route_serve_file_progress to target.
@@ -4165,7 +4550,7 @@ mod tests {
 
         // frame_a = 4 KiB, frame_b = 64 KiB; announced byte_size = 68 KiB.
         let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Pre-seed the receiver store with the 64 KiB frame so the fetch resumes,
         // pulling only the 4 KiB frame — far fewer bytes than the 68 KiB byte_size.

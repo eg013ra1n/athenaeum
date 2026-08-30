@@ -26,11 +26,98 @@
 //! populated entry.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::sharing::types::NodeId;
 
 use super::engine::SyncEngineHandle;
+
+/// Preparation admission + cancel flags (transfer-prepare spec §3.3/§3.4).
+///
+/// A send now inserts its `preparing` row first and stages the package in the
+/// background, so two things need a home outside the worker task: how many
+/// packages may stage at once (`slot` — exactly one, so a second send queues
+/// instead of thrashing the same disk), and how a cancel reaches a copy already
+/// in flight (`cancels`, one flag per outbound row id, raised by
+/// `cancel_sync_package` and read at every 4 MiB chunk by
+/// [`stage_payload`](crate::package::stage_payload)).
+///
+/// Kept beside the engines in [`SyncSenderRuntime`] because it shares their
+/// lifetime exactly: process-wide, one instance, reachable from every send
+/// command.
+pub struct PrepareRuntime {
+    slot: Arc<tokio::sync::Semaphore>,
+    cancels: std::sync::Mutex<HashMap<i64, Arc<AtomicBool>>>,
+}
+
+impl PrepareRuntime {
+    /// A runtime with a free slot and no preparations in flight.
+    pub fn new() -> Self {
+        Self {
+            slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            cancels: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The single-permit admission semaphore. Handed out (rather than acquired
+    /// here) so the worker can hold an owned permit across its whole staging
+    /// task without borrowing the runtime.
+    pub fn slot(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.slot)
+    }
+
+    /// Register `id` as preparing and return its cancel flag. Called
+    /// synchronously by `spawn_prepare` BEFORE the task is spawned, so a cancel
+    /// issued the instant the enqueue command returns can never miss the flag.
+    pub fn register(&self, id: i64) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancels
+            .lock()
+            .expect("prepare mutex poisoned")
+            .insert(id, Arc::clone(&flag));
+        flag
+    }
+
+    /// Raise the flag; `false` when `id` is not preparing (already handed to the
+    /// engine, or terminal) — the caller then routes the cancel to the engine.
+    pub fn cancel(&self, id: i64) -> bool {
+        match self
+            .cancels
+            .lock()
+            .expect("prepare mutex poisoned")
+            .get(&id)
+        {
+            Some(f) => {
+                f.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a preparation for `id` is in flight.
+    pub fn is_preparing(&self, id: i64) -> bool {
+        self.cancels
+            .lock()
+            .expect("prepare mutex poisoned")
+            .contains_key(&id)
+    }
+
+    /// Drop `id`'s cancel flag — the preparation is over, whatever its outcome.
+    pub fn finish(&self, id: i64) {
+        self.cancels
+            .lock()
+            .expect("prepare mutex poisoned")
+            .remove(&id);
+    }
+}
+
+impl Default for PrepareRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// One started sender bundle held by [`SyncSenderRuntime`].
 pub struct StartedSender {
@@ -49,6 +136,9 @@ pub struct StartedSender {
 /// by the destination [`NodeId`].
 pub struct SyncSenderRuntime {
     inner: tokio::sync::Mutex<HashMap<NodeId, StartedSender>>,
+    /// Background package preparation: the one staging slot + the in-flight
+    /// cancel flags (transfer-prepare spec §3.3/§3.4).
+    prepare: Arc<PrepareRuntime>,
 }
 
 impl SyncSenderRuntime {
@@ -56,7 +146,13 @@ impl SyncSenderRuntime {
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::Mutex::new(HashMap::new()),
+            prepare: Arc::new(PrepareRuntime::new()),
         }
+    }
+
+    /// The preparation runtime shared by every send from this device.
+    pub fn prepare(&self) -> &Arc<PrepareRuntime> {
+        &self.prepare
     }
 
     /// Whether at least one peer engine has been started.

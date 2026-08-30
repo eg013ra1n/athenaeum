@@ -52,7 +52,7 @@ use crate::sharing::{
 };
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
-use super::node::{Role, SharedIrohNode};
+use super::node::{NodeOptions, Role, SharedIrohNode};
 use super::{random_secret, BlobStore, IrohTransport};
 
 /// A [`FetchSink`] that appends every event into a shared vec, plus the vec so a
@@ -205,7 +205,10 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
         128 * 1024,
     );
 
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -352,7 +355,7 @@ async fn release_deletes_package_tags_on_both_sides() {
     let tmp = tempdir().unwrap();
     let (dir, announce) =
         build_package(&tmp.path().join("src"), "uuid-gc-1", "gc.fits", "M1", 4096);
-    provider.serve(&announce, &dir, None).await.unwrap();
+    provider.serve(&announce, &dir, None, None).await.unwrap();
 
     let tag = package_tag(&announce.package_id);
     // Provider pinned under the deterministic name.
@@ -438,7 +441,7 @@ async fn start_sweeps_stale_tags() {
     t1.start().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let (dir, announce) = build_package(tmp.path(), "uuid-sweep-1", "s.fits", "M1", 2048);
-    t1.serve(&announce, &dir, None).await.unwrap();
+    t1.serve(&announce, &dir, None, None).await.unwrap();
     t1.shutdown().await;
 
     // New process over the same store: the old tag must be gone after start().
@@ -483,7 +486,7 @@ async fn split_blob_dirs_prevent_startup_sweep_interference() {
     // Serve a package on the receiver-half store so it pins a live `pkg/<id>`.
     let tmp = tempfile::tempdir().unwrap();
     let (dir, announce) = build_package(tmp.path(), "uuid-split-1", "split.fits", "M1", 2048);
-    receiver.serve(&announce, &dir, None).await.unwrap();
+    receiver.serve(&announce, &dir, None, None).await.unwrap();
     let tag = package_tag(&announce.package_id);
     assert!(
         receiver
@@ -565,7 +568,10 @@ async fn iroh_resume_after_endpoint_restart() {
         "M31",
         16 * 1024 * 1024,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -889,7 +895,7 @@ async fn bare_node_id_without_a_peer_address_is_undialable() {
         "M1",
         4096,
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     let err = sender
         .announce(
@@ -1123,7 +1129,10 @@ async fn connection_path_established_line_carries_conn_type_field() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     // `announce` dials an outgoing control connection (logged inline on this
     // task) AND drives the receiver's inbound accept (logged on its own task) —
     // both emit the establishment line.
@@ -1359,7 +1368,7 @@ async fn subset_serve_transfers_only_want_frames() {
     // Want only frame1 + frame3 (frame2 already held by the peer).
     let want: HashSet<String> = [rels[0].clone(), rels[2].clone()].into_iter().collect();
     provider
-        .serve(&announce, &pkg_dir, Some(&want))
+        .serve(&announce, &pkg_dir, Some(&want), None)
         .await
         .unwrap();
     provider
@@ -1432,7 +1441,7 @@ async fn subset_serve_empty_want_is_error() {
 
     let empty: HashSet<String> = HashSet::new();
     let err = provider
-        .serve(&announce, &pkg_dir, Some(&empty))
+        .serve(&announce, &pkg_dir, Some(&empty), None)
         .await
         .expect_err("an empty want set must be rejected");
     let msg = format!("{err:#}");
@@ -1477,7 +1486,10 @@ async fn connect_gate_refuses_control_dispatch_and_blocks_announce() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
 
     // The refusing gate closes the connection at the TOP of
     // `SyncControlProtocol::accept` — before a single `Msg` is decoded — so the
@@ -1535,7 +1547,10 @@ async fn connect_gate_permits_when_predicate_allows() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
 
     provider
         .announce(
@@ -1579,7 +1594,10 @@ async fn connect_gate_refuses_blob_fetch() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     // Deliver the announce BEFORE gating the provider, so the receiver learns
     // the real iroh collection hash — this test's point is the BLOB path, not
     // the control path (already covered above).
@@ -1806,7 +1824,10 @@ async fn successful_fetch_clears_in_flight_tag() {
         "M27",
         64 * 1024,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -1887,7 +1908,10 @@ async fn throttle_intercept_zero_rate_transfer_completes() {
         600 * 1024,
     );
 
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -1954,7 +1978,10 @@ async fn upload_pacer_limits_real_transfer_wall_clock() {
         3 * 1024 * 1024,
     );
 
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -2197,8 +2224,8 @@ async fn multi_fetch_uses_both_providers() {
     const FILES: usize = 14;
     let (pkg_dir, announce) =
         build_many_file_package(&src.path().join("src"), "swarm", FILES, 96 * 1024);
-    a_out.serve(&announce, &pkg_dir, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     let root_a = a
         .resolve_served_hash_for_test(Role::Out, &announce.package_id)
@@ -2286,8 +2313,8 @@ async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
     const FILES: usize = 16;
     let (pkg_dir, announce) =
         build_many_file_package(&src.path().join("src"), "dying", FILES, 512 * 1024);
-    a_out.serve(&announce, &pkg_dir, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
     let root = a
         .resolve_served_hash_for_test(Role::Out, &announce.package_id)
         .expect("provider A recorded a served collection hash");
@@ -2426,4 +2453,857 @@ async fn multi_fetch_with_all_dead_providers_fails_cleanly() {
     );
 
     c.shutdown().await;
+}
+
+/// Transfer-prepare spec §4.1: the two-dir bind keeps the device IDENTITY under
+/// `identity_dir` (the key and its advisory-lock sidecar never move, so a
+/// relocated working folder can never mint a second identity) while every byte
+/// of data — the blob store here — follows `working_dir`.
+#[tokio::test]
+async fn bind_with_keeps_identity_in_identity_dir_and_blobs_in_working_dir() {
+    let tmp = tempdir().unwrap();
+    let identity = tmp.path().join("identity");
+    let working = tmp.path().join("working");
+    let node = SharedIrohNode::bind_with(
+        &identity,
+        &working,
+        RelayMode::Disabled,
+        NodeOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        identity.join("device_key").is_file(),
+        "key under identity dir"
+    );
+    assert!(
+        !working.join("device_key").exists(),
+        "no key under working dir"
+    );
+    assert!(
+        working.join("blobs").join("blobs.db").is_file(),
+        "store under working dir"
+    );
+    assert_eq!(node.working_dir(), working.as_path());
+    assert_eq!(
+        node.serve_import_mode(),
+        iroh_blobs::api::blobs::ImportMode::Copy
+    );
+    node.shutdown().await;
+}
+
+/// Build a package under `root/pkg` from synthetic payloads written to
+/// `root/src`. Each payload is above the fs store's inline threshold (16 KiB),
+/// so the store must genuinely either copy the bytes in or reference them where
+/// they lie — which is what the import-mode tests below measure.
+fn write_test_package(root: &std::path::Path, files: &[(&str, usize)]) -> std::path::PathBuf {
+    write_test_package_announced(root, files).0
+}
+
+/// [`write_test_package`] plus the [`PackageAnnounce`] `write_package` minted for
+/// it (a fresh uuid per call, so two packages never collide on a serve tag).
+fn write_test_package_announced(
+    root: &std::path::Path,
+    files: &[(&str, usize)],
+) -> (std::path::PathBuf, PackageAnnounce) {
+    use crate::package::{write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut records = Vec::new();
+    for (name, size) in files {
+        let p = src.join(name);
+        let bytes: Vec<u8> = (0..*size).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&p, &bytes).unwrap();
+        records.push((
+            p.clone(),
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("u-{name}"),
+                origin_catalog_uuid: format!("u-{name}"),
+                origin_device: "dev".into(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: name.to_string(),
+                byte_size: *size as u64,
+                xxh3: crate::package::xxh3_full_file(&p).unwrap(),
+                frame_meta: serde_json::json!({}),
+                analysis: None,
+                app_version: "test".into(),
+                project: None,
+            },
+        ));
+    }
+    let pkg = root.join("pkg");
+    let announce = write_package(&pkg, records).unwrap();
+    (pkg, announce)
+}
+
+/// Does the blob store hold a file of exactly `size` bytes — i.e. a second copy
+/// of a payload? `TryReference` stores only the outboard (64 B per 16 KiB), so a
+/// referenced payload never shows up here.
+fn store_holds_payload_copy(blob_dir: &std::path::Path, size: u64) -> bool {
+    walkdir::WalkDir::new(blob_dir)
+        .into_iter()
+        .flatten()
+        .any(|e| e.file_type().is_file() && e.metadata().map(|m| m.len() == size).unwrap_or(false))
+}
+
+/// Transfer-prepare spec §4.1: an app-host serve imports the prepared package
+/// dir by REFERENCE — the store gains metadata (collection, hash-seq, outboards),
+/// not a second copy of every frame — and the mode never moves the hash, so the
+/// announced `root_hash` is identical either way. The want-subset import (the
+/// dedup-negotiated send) honors the same mode; it used to call `add_path`,
+/// i.e. an unconditional Copy on every subset send.
+#[tokio::test]
+async fn try_reference_import_yields_same_hash_and_no_store_copy() {
+    use crate::sharing::iroh::blobs::{
+        import_package_collection_with_mode, import_subset_collection,
+    };
+    use iroh_blobs::api::blobs::ImportMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = write_test_package(tmp.path(), &[("a.fits", 300_000), ("b.fits", 300_000)]);
+
+    let copy_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("copy"))
+        .await
+        .unwrap();
+    let ref_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("reference"))
+        .await
+        .unwrap();
+    let (h_copy, _) =
+        import_package_collection_with_mode(&copy_store, &pkg, "t", ImportMode::Copy, None)
+            .await
+            .unwrap();
+    let (h_ref, _) =
+        import_package_collection_with_mode(&ref_store, &pkg, "t", ImportMode::TryReference, None)
+            .await
+            .unwrap();
+    assert_eq!(h_copy, h_ref, "mode never changes the collection hash");
+    assert!(store_holds_payload_copy(&tmp.path().join("copy"), 300_000));
+    assert!(
+        !store_holds_payload_copy(&tmp.path().join("reference"), 300_000),
+        "reference: no 300 000-byte file in the store"
+    );
+
+    // The want-subset import honors the mode too (it used to call add_path = Copy).
+    let sub_store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("subset"))
+        .await
+        .unwrap();
+    let want: std::collections::HashSet<String> = ["a.fits".to_string()].into_iter().collect();
+    import_subset_collection(&sub_store, &pkg, &want, "t", ImportMode::TryReference, None)
+        .await
+        .unwrap();
+    assert!(!store_holds_payload_copy(
+        &tmp.path().join("subset"),
+        300_000
+    ));
+}
+
+/// Import a file by reference and return its temp tag — the one-liner the
+/// re-import test repeats.
+async fn add_by_reference(
+    store: &iroh_blobs::store::fs::FsStore,
+    path: &std::path::Path,
+) -> iroh_blobs::api::TempTag {
+    use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
+    store
+        .blobs()
+        .add_path_with_opts(AddPathOptions {
+            path: path.to_path_buf(),
+            format: iroh_blobs::BlobFormat::Raw,
+            mode: ImportMode::TryReference,
+        })
+        .temp_tag()
+        .await
+        .unwrap()
+}
+
+/// What re-importing a KNOWN hash from a new path actually does in iroh-blobs
+/// 0.103 — the lifecycle question `TryReference` hangs on (spec §4.2).
+///
+/// It does NOT re-point the entry. `finish_import_impl` builds
+/// `DataLocation::External(vec![new_path], size)`, but the meta actor
+/// (`handle_update` → `EntryState::union` → `DataLocation::union`) UNIONS it
+/// with what was there, then **sorts and dedups** the path list; every reader
+/// (`export_path_impl`, and `BaoFileStorage::open` when the in-memory handle has
+/// to be reloaded) takes `paths.first()`. So:
+///
+/// - re-importing the SAME path is idempotent (dedup) — the cancel/resend case;
+/// - re-importing a live path that sorts BEFORE a vanished one heals the entry;
+/// - a vanished path that sorts FIRST keeps losing, and the entry stays
+///   unreadable from disk until GC drops it.
+///
+/// The last bullet is a real exposure for repeat sends of the same bytes from
+/// two different `packages/<uuid>` dirs (and for the declined-divert rename).
+/// It bites immediately — the failure is not deferred to a restart — which is
+/// what makes the one-byte probe in `blobs::ensure_child_readable` able to catch
+/// and repair it at import time.
+#[tokio::test]
+async fn reimport_of_a_known_hash_unions_external_paths_and_reads_the_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+    // The live path sorts FIRST: the entry heals, the blob reads back.
+    let healed = iroh_blobs::store::fs::FsStore::load(tmp.path().join("healed"))
+        .await
+        .unwrap();
+    let stale = tmp.path().join("z_stale.bin");
+    let live = tmp.path().join("a_live.bin");
+    std::fs::write(&stale, &bytes).unwrap();
+    let tag1 = add_by_reference(&healed, &stale).await;
+    std::fs::remove_file(&stale).unwrap();
+    std::fs::write(&live, &bytes).unwrap();
+    let tag2 = add_by_reference(&healed, &live).await;
+    assert_eq!(tag1.hash(), tag2.hash(), "path never moves the hash");
+    let out = tmp.path().join("out.bin");
+    healed.blobs().export(tag2.hash(), &out).await.unwrap();
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        bytes,
+        "read from the live path once it sorts first"
+    );
+
+    // Same bytes, same sequence, only the names swapped so the VANISHED path
+    // sorts first — the re-import does not displace it and the read fails.
+    let stuck = iroh_blobs::store::fs::FsStore::load(tmp.path().join("stuck"))
+        .await
+        .unwrap();
+    let stale2 = tmp.path().join("a_stale.bin");
+    let live2 = tmp.path().join("z_live.bin");
+    std::fs::write(&stale2, &bytes).unwrap();
+    let tag3 = add_by_reference(&stuck, &stale2).await;
+    std::fs::remove_file(&stale2).unwrap();
+    std::fs::write(&live2, &bytes).unwrap();
+    let tag4 = add_by_reference(&stuck, &live2).await;
+    assert_eq!(tag3.hash(), tag4.hash());
+    let out2 = tmp.path().join("out2.bin");
+    assert!(
+        stuck.blobs().export(tag4.hash(), &out2).await.is_err(),
+        "union, not re-point: the stale first path still wins the read"
+    );
+
+    // Re-importing the SAME path is idempotent — the resend-the-same-dir case.
+    let again = add_by_reference(&healed, &live).await;
+    assert_eq!(again.hash(), tag2.hash());
+    let out3 = tmp.path().join("out3.bin");
+    healed.blobs().export(tag2.hash(), &out3).await.unwrap();
+    assert_eq!(std::fs::read(&out3).unwrap(), bytes);
+}
+
+/// The mitigation for the union semantics pinned above: after a `TryReference`
+/// import the app probes one byte per child, and a child that reads a DEAD path
+/// is re-imported with `Copy` — `Owned` wins the union, so the entry is repaired
+/// permanently instead of staying unreadable until GC.
+///
+/// Both directions are asserted, because the probe (not an unconditional copy)
+/// is what gates the repair: with the stale path sorting FIRST the store ends up
+/// holding an owned copy and reads survive deleting every source file; with the
+/// stale path sorting LAST nothing is copied and reads work as they always did.
+#[tokio::test]
+async fn dead_first_external_path_is_repaired_by_a_copy_reimport() {
+    use crate::sharing::iroh::blobs::import_package_collection_with_mode;
+    use iroh_blobs::api::blobs::ImportMode;
+    use iroh_blobs::store::fs::FsStore;
+
+    const SIZE: usize = 300_000;
+    // Byte-for-byte what `write_test_package` writes, so the stale file and the
+    // package payload are the same blob.
+    let payload: Vec<u8> = (0..SIZE).map(|i| (i % 253) as u8).collect();
+
+    async fn readable(store: &FsStore, hash: Hash) -> bool {
+        store
+            .blobs()
+            .export_ranges(hash, 0..1u64)
+            .concatenate()
+            .await
+            .is_ok()
+    }
+
+    // --- stale path sorts FIRST ("aaa_stale.bin" < "pkg/a.fits") → repair runs.
+    let tmp = tempdir().unwrap();
+    let pkg = write_test_package(tmp.path(), &[("a.fits", SIZE)]);
+    let store_dir = tmp.path().join("store");
+    let store = FsStore::load(&store_dir).await.unwrap();
+    let stale = tmp.path().join("aaa_stale.bin");
+    std::fs::write(&stale, &payload).unwrap();
+    let hash = add_by_reference(&store, &stale).await.hash();
+    std::fs::remove_file(&stale).unwrap();
+    assert!(
+        !readable(&store, hash).await,
+        "precondition: the entry reads the now-deleted first path"
+    );
+
+    import_package_collection_with_mode(&store, &pkg, "t", ImportMode::TryReference, None)
+        .await
+        .unwrap();
+    assert!(
+        store_holds_payload_copy(&store_dir, SIZE as u64),
+        "a dead first path is repaired by copying the payload into the store"
+    );
+    std::fs::remove_file(pkg.join("a.fits")).unwrap();
+    assert!(
+        readable(&store, hash).await,
+        "owned after the repair: readable with no source file left on disk"
+    );
+
+    // --- stale path sorts LAST ("pkg/a.fits" < "zzz_stale.bin") → no repair.
+    let tmp2 = tempdir().unwrap();
+    let pkg2 = write_test_package(tmp2.path(), &[("a.fits", SIZE)]);
+    let store_dir2 = tmp2.path().join("store");
+    let store2 = FsStore::load(&store_dir2).await.unwrap();
+    let stale2 = tmp2.path().join("zzz_stale.bin");
+    std::fs::write(&stale2, &payload).unwrap();
+    let hash2 = add_by_reference(&store2, &stale2).await.hash();
+    std::fs::remove_file(&stale2).unwrap();
+
+    import_package_collection_with_mode(&store2, &pkg2, "t", ImportMode::TryReference, None)
+        .await
+        .unwrap();
+    assert!(
+        !store_holds_payload_copy(&store_dir2, SIZE as u64),
+        "a healthy probe takes no copy — the probe is the gate, not the mode"
+    );
+    assert!(
+        readable(&store2, hash2).await,
+        "still served from the live package path"
+    );
+}
+
+/// Transfer-prepare spec §4.4: the serve import reports byte progress so a
+/// multi-GB package's outboard-hashing pass is visible as the `indexing` stage
+/// instead of a frozen row. Ticks are throttled, so the only figure a consumer
+/// can rely on is the terminal one — which must pin `done == total`, and `total`
+/// must be everything the import actually read off disk (payloads AND the
+/// package's own `manifest.ndjson`, which `collect_files` walks like any other
+/// file).
+#[tokio::test]
+async fn import_reports_byte_progress_reaching_the_total() {
+    use crate::sharing::iroh::blobs::import_package_collection_with_mode;
+    use iroh_blobs::api::blobs::ImportMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = write_test_package(tmp.path(), &[("a.fits", 2_000_000), ("b.fits", 2_000_000)]);
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = {
+        let seen = seen.clone();
+        std::sync::Arc::new(move |done: u64, total: u64| seen.lock().unwrap().push((done, total)))
+    };
+    import_package_collection_with_mode(&store, &pkg, "t", ImportMode::TryReference, Some(sink))
+        .await
+        .unwrap();
+    let ticks = seen.lock().unwrap().clone();
+    let last = ticks.last().copied().expect("at least the terminal tick");
+    assert_eq!(
+        last.1,
+        4_000_000
+            + std::fs::metadata(pkg.join("manifest.ndjson"))
+                .unwrap()
+                .len()
+    );
+    assert_eq!(last.0, last.1, "terminal tick pins done == total");
+}
+
+/// A node that imports serves BY REFERENCE, the way the app's
+/// `ensure_iroh_node` binds it (`SharedIrohNode::bind` — Perseus and the other
+/// tests here — stays `Copy`).
+async fn bind_try_reference(dir: &Path) -> Arc<SharedIrohNode> {
+    SharedIrohNode::bind_with(
+        dir,
+        dir,
+        RelayMode::Disabled,
+        NodeOptions {
+            serve_import_mode: iroh_blobs::api::blobs::ImportMode::TryReference,
+        },
+    )
+    .await
+    .expect("bind relay-disabled TryReference node")
+}
+
+/// The child hash a served collection carries under `rel_path`.
+async fn served_child_hash(node: &SharedIrohNode, package_id: &PackageId, rel_path: &str) -> Hash {
+    let root = node
+        .resolve_served_hash_for_test(Role::Out, package_id)
+        .expect("package is served");
+    let coll = Collection::load(root, node.store())
+        .await
+        .expect("load served collection");
+    let found = coll
+        .iter()
+        .find(|(name, _)| name == rel_path)
+        .map(|(_, h)| *h);
+    found.unwrap_or_else(|| panic!("{rel_path} not in the served collection"))
+}
+
+/// Can the store still read this blob's first byte? (`has`/`status` cannot tell
+/// — they answer from the metadata row.)
+async fn blob_readable(node: &SharedIrohNode, hash: Hash) -> bool {
+    node.store()
+        .blobs()
+        .export_ranges(hash, 0..1u64)
+        .concatenate()
+        .await
+        .is_ok()
+}
+
+/// Deleting a confirmed package's payloads must not strip another live package
+/// of its bytes.
+///
+/// Two packages carrying the same frame share ONE store entry, whose external
+/// path list is `[A's copy, B's copy]` sorted — so the read follows A's payload
+/// dir, which the confirm then deletes. B's tag keeps the entry alive past GC, so
+/// nothing would heal it. `protect_shared_before_cleanup` — which the engine
+/// calls immediately before that deletion — copies exactly the shared children
+/// into the store (`Owned`), and nothing else.
+#[tokio::test]
+async fn protect_before_cleanup_copies_children_shared_with_another_live_package() {
+    const SHARED: usize = 300_000;
+    // A different size ⇒ different bytes ⇒ a different blob, so the two
+    // `store_holds_payload_copy` probes below cannot answer for each other.
+    const ONLY_A: usize = 290_000;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    // "aaa" < "zzz", so A's payload path is the one the union reads.
+    let (pkg_a, ann_a) = write_test_package_announced(
+        &tmp.path().join("aaa"),
+        &[("X.fits", SHARED), ("only_a.fits", ONLY_A)],
+    );
+    let (pkg_b, ann_b) =
+        write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
+    out.serve(&ann_a, &pkg_a, None, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
+
+    // The engine's order: protect, then delete the payloads, then release.
+    out.protect_shared_before_cleanup(&ann_a.package_id)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    out.release(&ann_a.package_id).await.unwrap();
+
+    let store_dir = node_dir.join("blobs");
+    assert!(
+        store_holds_payload_copy(&store_dir, SHARED as u64),
+        "the child B also serves was copied into the store before the release"
+    );
+    assert!(
+        !store_holds_payload_copy(&store_dir, ONLY_A as u64),
+        "a child only the released package served is left referenced — no blanket copy"
+    );
+    assert!(
+        blob_readable(&node, shared_hash).await,
+        "B still serves the shared blob after A's payload dir is gone"
+    );
+
+    node.shutdown().await;
+}
+
+/// The protection's fallback source: if our own payload dir is already gone (a
+/// crash between cleanup and a resumed release, an out-of-band purge), the bytes
+/// come from the SHARING package's payload — same blob, still on disk because
+/// that package's tag is live.
+#[tokio::test]
+async fn protect_copies_shared_children_from_the_sharer_when_our_dir_is_gone() {
+    const SHARED: usize = 300_000;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    let (pkg_a, ann_a) =
+        write_test_package_announced(&tmp.path().join("aaa"), &[("X.fits", SHARED)]);
+    let (pkg_b, ann_b) =
+        write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
+    out.serve(&ann_a, &pkg_a, None, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
+
+    // Our dir is already gone when the protection runs.
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    out.protect_shared_before_cleanup(&ann_a.package_id)
+        .await
+        .unwrap();
+
+    assert!(
+        store_holds_payload_copy(&node_dir.join("blobs"), SHARED as u64),
+        "copied from the sharing package's payload"
+    );
+    assert!(blob_readable(&node, shared_hash).await);
+
+    node.shutdown().await;
+}
+
+/// The re-serve short-circuit reuses an already-imported collection and so skips
+/// the import's `ensure_child_readable` repair. It therefore probes first: a
+/// collection whose referenced files went away is re-imported rather than
+/// re-announced dead.
+#[tokio::test]
+async fn reserve_after_a_dead_path_repairs_it() {
+    const SHARED: usize = 300_000;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    let (pkg_a, ann_a) =
+        write_test_package_announced(&tmp.path().join("aaa"), &[("X.fits", SHARED)]);
+    let (pkg_b, ann_b) =
+        write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
+    out.serve(&ann_a, &pkg_a, None, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
+
+    // The window the release protection does not cover: A's dir vanishes with no
+    // release at all (a crash between cleanup and release, a manual purge).
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    assert!(
+        !blob_readable(&node, shared_hash).await,
+        "precondition: the shared entry now reads A's deleted path"
+    );
+
+    // A retry re-serves B with the same want — the short-circuit must notice.
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
+    assert!(
+        blob_readable(&node, shared_hash).await,
+        "the re-serve re-imported and repaired the dead path"
+    );
+
+    node.shutdown().await;
+}
+
+/// A want-subset serve's `manifest.ndjson` is SYNTHESIZED in memory
+/// (`import_subset_collection` filters the records and `add_bytes` them), so the
+/// file of that name under `src_dir` is a different document — the full manifest.
+/// Two subset serves of the same frames with the same want set produce the
+/// identical filtered manifest (no record carries a package-unique field), so it
+/// looks "shared"; above the inline threshold the protection would then copy the
+/// wrong file, mismatch the hash and fail the whole pass — permanently skipping
+/// the cleanup of a healthy confirmed package. An `add_bytes` blob is never
+/// external, so it is skipped instead.
+#[tokio::test]
+async fn protect_skips_the_synthesized_subset_manifest() {
+    const BIG: usize = 300_000;
+    const RECORDS: usize = 200;
+
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node");
+    let node = bind_try_reference(&node_dir).await;
+    let out = node.handle(Role::Out);
+
+    // Enough records that the filtered manifest is well above the 16 KiB inline
+    // threshold, plus one real payload big enough to be external.
+    let mut files: Vec<(String, usize)> = (0..RECORDS - 1)
+        .map(|i| (format!("f{i:03}.fits"), 100 + i))
+        .collect();
+    files.push(("big.fits".to_string(), BIG));
+    let files: Vec<(&str, usize)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+
+    let (pkg_a, ann_a) = write_test_package_announced(&tmp.path().join("aaa"), &files);
+    let (pkg_b, ann_b) = write_test_package_announced(&tmp.path().join("zzz"), &files);
+    assert!(
+        std::fs::metadata(pkg_a.join("manifest.ndjson"))
+            .unwrap()
+            .len()
+            > 16 * 1024,
+        "the manifest must exceed the inline threshold or this test proves nothing"
+    );
+
+    // A STRICT subset, so the filtered manifest differs from the on-disk one.
+    let want: std::collections::HashSet<String> = files
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .filter(|n| n != "f000.fits")
+        .collect();
+    out.serve(&ann_a, &pkg_a, Some(&want), None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, Some(&want), None).await.unwrap();
+    let shared_hash = served_child_hash(&node, &ann_b.package_id, "big.fits").await;
+
+    // Before the skip this returned Err on the manifest's hash mismatch.
+    out.protect_shared_before_cleanup(&ann_a.package_id)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&pkg_a).unwrap();
+    out.release(&ann_a.package_id).await.unwrap();
+
+    assert!(
+        store_holds_payload_copy(&node_dir.join("blobs"), BIG as u64),
+        "the shared payload child is still protected — the manifest skip must not \
+         short-circuit the rest of the pass"
+    );
+    assert!(
+        blob_readable(&node, shared_hash).await,
+        "B still serves the shared payload after A's dir is gone"
+    );
+
+    node.shutdown().await;
+}
+
+/// Transfer-prepare spec §5.1/§5.3: the receiver's export MOVES the store-owned
+/// data file into staging (`ExportMode::TryReference`) instead of copying it, so
+/// an inbound package never costs two copies of every frame on disk. The store
+/// then references the staged file — and once that external path is gone (a
+/// same-hash sibling package's staged file cleaned before this export ran, GC not
+/// yet caught up), the export fails with a *vanished source*, which
+/// [`export_source_vanished`] must recognize so the row parks `Waiting` instead
+/// of being terminalized `Failed`.
+#[tokio::test]
+async fn export_try_reference_leaves_no_owned_copy_in_the_store() {
+    use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    let bytes: Vec<u8> = (0..500_000u32).map(|i| (i % 249) as u8).collect();
+    let tag = store
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    assert!(
+        store_holds_payload_copy(&tmp.path().join("s"), 500_000),
+        "owned before export"
+    );
+    let target = tmp.path().join("staging").join("a.fits");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tag.hash(),
+            mode: ExportMode::TryReference,
+            target: target.clone(),
+        })
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    assert!(
+        !store_holds_payload_copy(&tmp.path().join("s"), 500_000),
+        "moved out: the store no longer owns a copy"
+    );
+    // A second export of the same hash copies FROM the external path.
+    let target2 = tmp.path().join("staging").join("b.fits");
+    store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tag.hash(),
+            mode: ExportMode::TryReference,
+            target: target2.clone(),
+        })
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&target2).unwrap(), bytes);
+    // And once that external path is gone, the export fails with a vanished source.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::remove_file(&target2).unwrap();
+    let target3 = tmp.path().join("staging").join("c.fits");
+    let err = store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tag.hash(),
+            mode: ExportMode::TryReference,
+            target: target3,
+        })
+        .finish()
+        .await
+        .unwrap_err();
+    assert!(
+        crate::sharing::iroh::blobs::export_source_vanished(&err),
+        "{err:?}"
+    );
+}
+
+/// Transfer-prepare spec §5.3: a vanished-source export must leave the receiver
+/// able to HEAL. An unmarked (transfer-class) error parks the inbound row
+/// `Waiting`, and a park never calls `release` — so if the fetch kept its own
+/// collection tag, the dead child entry would stay pinned against GC and every
+/// sender retry would re-run the same failing export (the downloader skips a blob
+/// whose entry reads `Complete`, dead file or not). `on_export_source_vanished`
+/// therefore drops that tag, leaving the entry untagged for the next GC pass.
+///
+/// The error handed to it here is a REAL one: a `TryReference` export of a blob
+/// whose only external path has been deleted, exactly as the export loop
+/// produces it. Driving the whole of `fetch_collection_to_dir` into this branch
+/// is not possible — a re-fetch over such an entry trips an iroh-blobs 0.103
+/// panic (`bitfield()` on `BaoFileStorage::Poisoned`, reached through our own
+/// per-file `observe`) during phase 2, before the export loop runs.
+#[tokio::test]
+async fn vanished_export_drops_the_collection_tag() {
+    use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
+    use iroh_blobs::HashAndFormat;
+
+    let tmp = tempdir().unwrap();
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    // Above the inline threshold, so the store keeps a real data file that
+    // `TryReference` can move out and then reference.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let tt = store
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    let target = tmp.path().join("staging").join("a.fits");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tt.hash(),
+            mode: ExportMode::TryReference,
+            target: target.clone(),
+        })
+        .finish()
+        .await
+        .unwrap();
+
+    // The tag the fetch sets on the collection just before the export loop.
+    let tag = "pkg/vanished-probe";
+    store
+        .tags()
+        .set(tag, HashAndFormat::hash_seq(tt.hash()))
+        .await
+        .unwrap();
+    assert!(
+        store.tags().get(tag.as_bytes()).await.unwrap().is_some(),
+        "precondition: the fetch has pinned the collection"
+    );
+
+    // Now the staged file the store references is cleaned by a sibling package —
+    // §5.3 — and the next export of that hash finds nothing to read.
+    std::fs::remove_file(&target).unwrap();
+    let err = store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash: tt.hash(),
+            mode: ExportMode::TryReference,
+            target: tmp.path().join("staging").join("b.fits"),
+        })
+        .finish()
+        .await
+        .unwrap_err();
+    assert!(
+        super::blobs::export_source_vanished(&err),
+        "precondition: a real vanished-source export error, got {err:?}"
+    );
+
+    let out = super::blobs::on_export_source_vanished(
+        &store,
+        tag,
+        tt.hash(),
+        "a.fits",
+        tt.hash(),
+        &target,
+        err,
+    )
+    .await;
+
+    assert!(
+        store.tags().get(tag.as_bytes()).await.unwrap().is_none(),
+        "the collection tag is dropped, so GC can purge the dead entry and a \
+         later retry re-downloads the blob"
+    );
+    assert!(
+        !crate::sharing::types::is_local_fault(&out),
+        "a vanished source is transfer-class: the row parks Waiting, it is never \
+         terminalized Failed"
+    );
+    let msg = format!("{out:#}");
+    assert!(msg.contains("source vanished"), "{msg}");
+}
+
+/// A retry re-runs the export loop over a staging dir nobody cleaned (a `Waiting`
+/// park leaves `<root>/staging/<wire_id>` in place), so a child an earlier attempt
+/// already exported is re-exported into the SAME target — and that target is now
+/// the entry's own external path. Upstream would take its non-empty-external arm
+/// and `reflink_or_copy(source_path, target)` with `source_path == target`:
+/// `File::create(to)` truncates the inode to zero before the read, which both
+/// fails the export with a NON-`NotFound` io error (⇒ `LocalFault` ⇒ the row is
+/// terminalized `Failed`, when the truth is recoverable) and leaves the entry
+/// pointing at a 0-byte file, wedging every sibling package sharing that hash.
+///
+/// `export_child` — the exact code the loop runs — removes a stale target first,
+/// so the pathological self-copy cannot happen: the re-export degrades to the
+/// vanished-source class, which self-heals (§5.3). Exporting to a DIFFERENT target
+/// still works, so the guard costs the legitimate copy path nothing.
+#[tokio::test]
+async fn re_export_into_the_same_staging_target_does_not_truncate_it() {
+    let tmp = tempdir().unwrap();
+    let store = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s"))
+        .await
+        .unwrap();
+    // Above the inline threshold, so the store keeps a real data file that
+    // `TryReference` moves out and then references.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let tt = store
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let target = staging.join("a.fits");
+
+    // First attempt: the payload moves out of the store into staging.
+    super::blobs::export_child(&store, tt.hash(), &target)
+        .await
+        .expect("no local pre-step failure")
+        .expect("the first export lands");
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+
+    // The retry: same child, same target, which is now the entry's only external
+    // path. Pre-fix this truncated `target` to 0 bytes and reported a LocalFault.
+    let err = super::blobs::export_child(&store, tt.hash(), &target)
+        .await
+        .expect("no local pre-step failure")
+        .expect_err("re-exporting onto the entry's own external path cannot succeed");
+    assert!(
+        super::blobs::export_source_vanished(&err),
+        "the re-export degrades to the self-healing vanished class, never a \
+         LocalFault that terminalizes the row: {err:?}"
+    );
+    match std::fs::metadata(&target) {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::NotFound,
+            "target is either gone or intact — nothing else"
+        ),
+        Ok(m) => assert_eq!(
+            m.len(),
+            bytes.len() as u64,
+            "the target must never be left truncated"
+        ),
+    }
+
+    // And the legitimate multi-target path is untouched: a fresh entry exported
+    // to two DIFFERENT targets copies from the external path and lands intact.
+    let store2 = iroh_blobs::store::fs::FsStore::load(tmp.path().join("s2"))
+        .await
+        .unwrap();
+    let tt2 = store2
+        .blobs()
+        .add_bytes(bytes.clone())
+        .temp_tag()
+        .await
+        .unwrap();
+    let t1 = staging.join("t1.fits");
+    let t2 = staging.join("t2.fits");
+    super::blobs::export_child(&store2, tt2.hash(), &t1)
+        .await
+        .unwrap()
+        .unwrap();
+    super::blobs::export_child(&store2, tt2.hash(), &t2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(&t1).unwrap(), bytes);
+    assert_eq!(std::fs::read(&t2).unwrap(), bytes);
 }

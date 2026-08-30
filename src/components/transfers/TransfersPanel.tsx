@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
-import { plainTransferError, displayStateChip, displayStateSubline } from './presentation';
+import { plainTransferError, displayStateChip, displayStateSubline, formatBytes } from './presentation';
 import { transportHealthView } from './transportHealth';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
@@ -13,11 +13,29 @@ import type {
   OutboundSummary,
   ProjectCard,
   QueuedInboundSummary,
+  SyncFinishedEvent,
   SyncHistoryQuery,
+  SyncProgressEvent,
 } from '../../types/models';
 
 type Tab = 'active' | 'history';
 type DirFilter = 'all' | Direction;
+
+/** One outbound package's live PRE-TRANSFER byte counter (transfer-prepare spec
+ *  §7.1), harvested from `sync-progress` by the panel itself. The polled
+ *  `OutboundSummary` carries no `bytesDone` — only the event stream does — and
+ *  without it a staging row's mini-line would sit frozen at "0 of 340" for the
+ *  whole preparation, which is the exact "is it doing anything?" gap this cycle
+ *  closes. An entry appears on a `preparing`/`indexing` tick and is dropped on
+ *  the first tick of any other sender stage, or on `sync-finished`. */
+interface PreparingBytes {
+  bytesDone: number;
+  /** The tick's own view of the package total. Kept for parity with
+   *  `useTransferQueue`'s `LiveBytes`, but NOT what the mini-row divides by —
+   *  see the render site: the denominator is the row's §D4-adjusted manifest
+   *  total so both Transfers surfaces quote the same "/ Y". */
+  bytesTotal: number;
+}
 
 const HISTORY_LIMIT = 200;
 const POLL_MS = 5_000;
@@ -95,6 +113,7 @@ export function TransfersPanel() {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [search, setSearch] = useState('');
   const [dirFilter, setDirFilter] = useState<DirFilter>('all');
+  const [preparingBytes, setPreparingBytes] = useState<Map<number, PreparingBytes>>(new Map());
   const mounted = useRef(true);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
 
@@ -167,6 +186,74 @@ export function TransfersPanel() {
       cancelled = true;
     };
   }, [open]);
+
+  // Live pre-transfer bytes for the outbound mini-rows (spec §7.1). Mount-scoped,
+  // NOT gated on `open`: the panel is rendered unconditionally at app root, so
+  // the counter is already warm when the user opens it mid-preparation.
+  //
+  // The map is self-bounding — an id enters only on a `preparing`/`indexing`
+  // tick and is dropped again on ANY other sender stage (the `transferring`
+  // counter restarts from zero and the row leaves the preparing-family branch)
+  // or on `sync-finished`, so a cancelled/failed preparation leaves nothing
+  // stale behind. Cancelled-flag listener form per CLAUDE.md (StrictMode-safe).
+  //
+  // The `sync-finished` arm is deliberately NOT folded into the panel's existing
+  // one below: that listener is gated on `open` (it drives the re-poll), so a
+  // preparation that ends while the slide-over is closed would leave its entry
+  // behind. This one lives for the panel's whole mount, like the counter it clears.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenFinished: (() => void) | undefined;
+
+    const dropEntry = (id: number) =>
+      setPreparingBytes((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Map(prev);
+        next.delete(id);
+        return next;
+      });
+
+    api
+      .listen<SyncProgressEvent>('sync-progress', (p) => {
+        if (cancelled || p.direction !== 'sent') return;
+        const id = Number(p.packageId);
+        if (!Number.isFinite(id)) return;
+        if (p.stage !== 'preparing' && p.stage !== 'indexing') {
+          dropEntry(id);
+          return;
+        }
+        if (p.bytesDone == null || p.bytesTotal == null) return;
+        const entry: PreparingBytes = { bytesDone: p.bytesDone, bytesTotal: p.bytesTotal };
+        setPreparingBytes((prev) => new Map(prev).set(id, entry));
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenProgress = fn;
+      })
+      .catch((err) => console.error('[TransfersPanel] sync-progress listen failed:', err));
+
+    api
+      .listen<SyncFinishedEvent>('sync-finished', (p) => {
+        if (cancelled || p.direction !== 'sent') return;
+        const id = Number(p.packageId);
+        if (!Number.isFinite(id)) return;
+        dropEntry(id);
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenFinished = fn;
+      })
+      .catch((err) =>
+        console.error('[TransfersPanel] preparing-bytes sync-finished listen failed:', err),
+      );
+
+    return () => {
+      cancelled = true;
+      unlistenProgress?.();
+      unlistenFinished?.();
+    };
+  }, []);
 
   // Escape closes the panel (mirrors NotificationPanel), focus the close button.
   useEffect(() => {
@@ -310,7 +397,12 @@ export function TransfersPanel() {
 
         <div className="flex-1 overflow-y-auto">
           {tab === 'active' ? (
-            <ActiveTab active={active} incoming={incoming} incomingQueued={incomingQueued} />
+            <ActiveTab
+              active={active}
+              incoming={incoming}
+              incomingQueued={incomingQueued}
+              preparingBytes={preparingBytes}
+            />
           ) : (
             <HistoryTab
               rows={filteredHistory}
@@ -333,11 +425,15 @@ function ActiveTab({
   active,
   incoming,
   incomingQueued,
+  preparingBytes,
 }: {
   active: OutboundSummary[];
   incoming: InboundSummary[];
   /** Variant-B lane-queue ghosts — announced, no `sync_inbound` row yet. */
   incomingQueued: QueuedInboundSummary[];
+  /** Live pre-transfer bytes per outbound row id (spec §7.1), empty for every
+   *  package that is not currently staging. */
+  preparingBytes: Map<number, PreparingBytes>;
 }) {
   if (active.length === 0 && incoming.length === 0 && incomingQueued.length === 0) {
     return (
@@ -350,9 +446,42 @@ function ActiveTab({
           name, device name, `displayState` chip incl. neutral waiting). The full
           unified view with actions + per-file detail lives on /transfers. */}
       {active.map((row) => {
-        const chip = displayStateChip(row.displayState);
         const subline = displayStateSubline(row.displayState, 'outbound');
         const total = row.fileCounts.total || row.fileCount;
+        // Same §D4 split as the page row (`TransferRow`): count what travels,
+        // not the manifest — the peer's duplicates are settled `done` up front
+        // and would otherwise read as progress. Tooltip carries the remainder;
+        // the 10px line has no room for the suffix.
+        const dup = row.fileCounts.duplicate;
+        // Transfer-prepare spec §7.1: before the announce goes out no file has
+        // moved, so "0 of 340" would sit frozen for the whole preparation. Show
+        // the live byte fraction instead — the one thing actually advancing.
+        // Denominator is the row's own §D4-adjusted manifest total (NOT the
+        // tick's `bytesTotal`), so the mini-row and the full /transfers row
+        // always quote the same "/ Y".
+        //
+        // The predicate keys off the LIVE tick, because `displayState` here comes
+        // from the polled `OutboundSummary` and never says `indexing`: the serve
+        // import has no state of its own, so the row reads `queued` for all of it
+        // (the derived `indexing` label lives only in `useTransferQueue`). Both
+        // halves earn their place — `queued` keeps the leftover entry (it lingers
+        // until the first `transferring` tick or `sync-finished`) off an
+        // `announced`/`waiting` row, and the entry's presence keeps a row that is
+        // genuinely just queued, having never ticked, on the honest "N of M".
+        const prepared = preparingBytes.get(row.id);
+        const preparingLike =
+          row.displayState === 'preparing' ||
+          (row.displayState === 'queued' && prepared !== undefined);
+        // Same predicate drives the CHIP (spec §7.1: one label on both surfaces).
+        // A row still `queued` while its serve import hashes reads `indexing`,
+        // which `displayStateChip` renders as the same muted "preparing" the
+        // /transfers row shows — the sidebar must not say "queued" for that whole
+        // phase.
+        const chip = displayStateChip(
+          preparingLike && row.displayState === 'queued' ? 'indexing' : row.displayState,
+        );
+        const travelFiles = Math.max(0, total - dup);
+        const travelBytes = Math.max(0, row.byteSize - row.fileCounts.duplicateBytes);
         return (
           <li key={`out-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
             <div className="min-w-0">
@@ -363,8 +492,13 @@ function ActiveTab({
                 <ArrowUp size={9} className="shrink-0 text-accent" />
                 <span className="truncate">{row.deviceName ?? row.peerShort}</span>
                 <span aria-hidden="true">·</span>
-                <span className="shrink-0 tabular-nums">
-                  {row.fileCounts.done} of {total}
+                <span
+                  className="shrink-0 tabular-nums"
+                  title={dup > 0 ? `${dup} already on peer` : undefined}
+                >
+                  {preparingLike
+                    ? `${formatBytes(prepared?.bytesDone ?? 0)} / ${formatBytes(travelBytes)}`
+                    : `${Math.max(0, row.fileCounts.done - dup)} of ${travelFiles}`}
                 </span>
               </p>
               {row.displayState === 'waiting' && (

@@ -10,7 +10,7 @@ use athenaeum_core::api::lights::{FlatNormMode, LightCalParams};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
     DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
-    TransferCleanup, TransferEventEntry, TransferStorage,
+    TransferCleanup, TransferEventEntry, TransferPaths, TransferStorage,
 };
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportMode;
@@ -356,6 +356,64 @@ pub async fn cleanup_finished_transfers(
     _body: Json<serde_json::Value>,
 ) -> Result<Json<TransferCleanup>, (StatusCode, String)> {
     api::cleanup_finished_transfers(&state.ctx, &state.sync)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/get_transfer_paths
+///
+/// The two Settings → Transfers folders with their effective/default values.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_transfer_paths(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<TransferPaths>, (StatusCode, String)> {
+    api::get_transfer_paths(&state.ctx, &state.sync)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTransferPathsArgs {
+    pub outgoing: Option<String>,
+    pub working: Option<String>,
+}
+
+/// POST /api/set_transfer_paths
+///
+/// Persist the two folders (`null` = default); validated before anything is
+/// written. The `allowed_paths` sandbox applies, built by the same
+/// `scan_roots::allowed_roots_policy` every other path-taking route uses.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_transfer_paths(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetTransferPathsArgs>,
+) -> Result<Json<TransferPaths>, (StatusCode, String)> {
+    let policy = crate::routes::scan_roots::allowed_roots_policy(&state.allowed_paths);
+    api::set_transfer_paths(
+        &state.ctx,
+        &state.sync,
+        &policy,
+        args.outgoing,
+        args.working,
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// POST /api/cleanup_transfer_leftovers
+///
+/// Remove transfer data left in the default / previous folders after a move.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cleanup_transfer_leftovers(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<u64>, (StatusCode, String)> {
+    api::cleanup_transfer_leftovers(&state.ctx, &state.sync)
         .await
         .map(Json)
         .map_err(api_err)
