@@ -130,6 +130,69 @@ pub(crate) fn sync_paths(ctx: &ServiceContext) -> Result<(PathBuf, PathBuf), Api
     Ok((sync_dir, db_path))
 }
 
+/// Every directory the transfer machinery writes, resolved once per call
+/// (transfer-prepare spec §6.2). `identity_dir` (`<db dir>/sync`) holds the
+/// device key + its lock and NEVER moves; `packages_dir` and `working_dir`
+/// follow the two Settings → Transfers folders, defaulting under `identity_dir`
+/// so an install that never touches the tab keeps today's layout.
+#[derive(Debug, Clone)]
+pub struct SyncDirs {
+    pub identity_dir: PathBuf,
+    /// Prepared outgoing packages: `<packages_dir>/<uuid>/…`.
+    pub packages_dir: PathBuf,
+    /// Blob store, receive staging, incoming fallback, collab dirs.
+    pub working_dir: PathBuf,
+    pub db_path: PathBuf,
+}
+
+impl SyncDirs {
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.working_dir.join("blobs")
+    }
+    pub fn staging_root(&self) -> PathBuf {
+        self.working_dir.join("staging")
+    }
+    pub fn incoming_fallback(&self) -> PathBuf {
+        self.working_dir.join("incoming")
+    }
+    /// The defaults for the two configurable folders — what "Use default" restores.
+    pub fn default_packages_dir(&self) -> PathBuf {
+        self.identity_dir.join("packages")
+    }
+    pub fn default_working_dir(&self) -> PathBuf {
+        self.identity_dir.clone()
+    }
+}
+
+/// A configured folder setting: `Some(path)` when the key holds a non-blank
+/// value, else `None` (= default).
+fn configured_dir(conn: &rusqlite::Connection, key: &str) -> Result<Option<PathBuf>, ApiError> {
+    Ok(crate::db::get_setting(conn, key)?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from))
+}
+
+pub(crate) fn sync_dirs(ctx: &ServiceContext) -> Result<SyncDirs, ApiError> {
+    let db = db(ctx)?;
+    let db_path = db.path().to_path_buf();
+    let identity_dir = db_path
+        .parent()
+        .map(|p| p.join("sync"))
+        .unwrap_or_else(|| PathBuf::from("sync"));
+    let conn = db.conn();
+    let packages_dir = configured_dir(&conn, keys::SYNC_OUTGOING_STAGING_DIR)?
+        .unwrap_or_else(|| identity_dir.join("packages"));
+    let working_dir = configured_dir(&conn, keys::SYNC_INCOMING_WORKING_DIR)?
+        .unwrap_or_else(|| identity_dir.clone());
+    Ok(SyncDirs {
+        identity_dir,
+        packages_dir,
+        working_dir,
+        db_path,
+    })
+}
+
 /// Build the receiver's live per-package landing resolver. It re-reads the
 /// designated `sync_incoming` scan root from the catalog on **every** package —
 /// so designating or clearing that root (task 4) takes effect on the next
@@ -2916,7 +2979,9 @@ fn bank_manifest_hashes(conn: &rusqlite::Connection, bank: &[(i64, String)]) {
     };
     match write() {
         Ok(n) => tracing::debug!(count = n, "manifest build: strong_hash banked"),
-        Err(e) => tracing::error!(error = %e, count = bank.len(), "manifest build: strong_hash bank failed"),
+        Err(e) => {
+            tracing::error!(error = %e, count = bank.len(), "manifest build: strong_hash bank failed")
+        }
     }
 }
 
@@ -7623,10 +7688,15 @@ mod tests {
         .unwrap();
         // The stale row keeps the fixture's fictional mtime AND lies about its size.
         let stale_file_id: i64 = conn
-            .query_row("SELECT file_id FROM frames WHERE id = ?1", [stale], |r| r.get(0))
+            .query_row("SELECT file_id FROM frames WHERE id = ?1", [stale], |r| {
+                r.get(0)
+            })
             .unwrap();
-        conn.execute("UPDATE files SET size = size + 7 WHERE id = ?1", [stale_file_id])
-            .unwrap();
+        conn.execute(
+            "UPDATE files SET size = size + 7 WHERE id = ?1",
+            [stale_file_id],
+        )
+        .unwrap();
 
         let pkg_root = dir.join("packages");
         let built = build_selection_package(
@@ -7638,17 +7708,36 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(built.eligible.len(), 2, "both files exist on disk, both are packaged");
+        assert_eq!(
+            built.eligible.len(),
+            2,
+            "both files exist on disk, both are packaged"
+        );
         let expect = crate::package::xxh3_full_file(std::path::Path::new(&current_path)).unwrap();
 
         let banked: Option<String> = conn
-            .query_row("SELECT strong_hash FROM files WHERE id = ?1", [current_file_id], |r| r.get(0))
+            .query_row(
+                "SELECT strong_hash FROM files WHERE id = ?1",
+                [current_file_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(banked.as_deref(), Some(expect.as_str()), "current row banks the manifest hash");
+        assert_eq!(
+            banked.as_deref(),
+            Some(expect.as_str()),
+            "current row banks the manifest hash"
+        );
         let untouched: Option<String> = conn
-            .query_row("SELECT strong_hash FROM files WHERE id = ?1", [stale_file_id], |r| r.get(0))
+            .query_row(
+                "SELECT strong_hash FROM files WHERE id = ?1",
+                [stale_file_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(untouched, None, "a row the disk does not vouch for is never written");
+        assert_eq!(
+            untouched, None,
+            "a row the disk does not vouch for is never written"
+        );
     }
 
     /// Step 1: ineligible files (missing on disk, or an unknown id) are reported
@@ -9702,6 +9791,64 @@ mod tests {
             configured_max_concurrent_receives(&ctx),
             Some(3),
             "the next start reads it back"
+        );
+    }
+
+    #[test]
+    fn sync_dirs_defaults_under_the_db_dir() {
+        let (tmp, ctx) = test_ctx();
+        let dirs = sync_dirs(&ctx).unwrap();
+        let identity = dirs.db_path.parent().unwrap().join("sync");
+        assert_eq!(dirs.identity_dir, identity);
+        assert_eq!(dirs.packages_dir, identity.join("packages"));
+        assert_eq!(dirs.working_dir, identity);
+        assert_eq!(dirs.blobs_dir(), identity.join("blobs"));
+        assert_eq!(dirs.staging_root(), identity.join("staging"));
+        assert_eq!(dirs.incoming_fallback(), identity.join("incoming"));
+        drop(tmp);
+    }
+
+    #[test]
+    fn sync_dirs_honors_both_settings_and_ignores_blank_values() {
+        let (tmp, ctx) = test_ctx();
+        let out = tmp.path().join("out");
+        let work = tmp.path().join("work");
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(
+                &conn,
+                keys::SYNC_OUTGOING_STAGING_DIR,
+                out.to_str().unwrap(),
+            )
+            .unwrap();
+            crate::db::set_setting(
+                &conn,
+                keys::SYNC_INCOMING_WORKING_DIR,
+                work.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+        let dirs = sync_dirs(&ctx).unwrap();
+        assert_eq!(dirs.packages_dir, out);
+        assert_eq!(dirs.working_dir, work);
+        assert_eq!(dirs.blobs_dir(), work.join("blobs"));
+        // identity never follows the working dir
+        assert_eq!(
+            dirs.identity_dir,
+            dirs.db_path.parent().unwrap().join("sync")
+        );
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::SYNC_OUTGOING_STAGING_DIR, "   ").unwrap();
+        }
+        let dirs = sync_dirs(&ctx).unwrap();
+        assert_eq!(
+            dirs.packages_dir,
+            dirs.identity_dir.join("packages"),
+            "blank = default"
         );
     }
 }
