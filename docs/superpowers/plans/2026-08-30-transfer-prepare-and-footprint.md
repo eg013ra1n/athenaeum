@@ -2877,6 +2877,108 @@ git commit -m "docs: transfer-prepare cycle — smoke list, release-note lines, 
 
 ---
 
+### Task 17: ETA from the median speed, not the live EMA (owner request, 2026-08-30)
+
+**Files:**
+- Modify: `src/hooks/useTransferQueue.ts:60-100` (`LiveBytes`, `SpeedTrackerEntry`, `trackBytes`), the `sync-progress` listener (~line 340), the row-model type (~line 172) and every `speedBps:` literal (~515, 567, 611, 649, 689, 747)
+- Modify: `src/components/transfers/TransferRow.tsx:234-236`
+- Modify: `src/components/transfers/presentation.ts:37-48` (`formatEta` doc only)
+
+**Interfaces:**
+- Produces: `LiveBytes.etaBps: number | null` (median of the recent instantaneous rates; `null` until `SPEED_MEDIAN_MIN_SAMPLES` samples exist); `TransferRowModel.etaBps: number | null`. `speedBps` (EMA) keeps driving the speed label unchanged.
+- Rationale: the EMA over ~3 samples is right for the *speed* label (it should move) but wrong for the ETA — a single-stream QUIC transfer swings 0.5–5 MB/s minute to minute (measured on the LDN 1272 send), so a 3-sample ETA jumps between "40m" and "4h". A median over a longer window is robust to those swings and to the zero-progress ticks between files.
+
+- [ ] **Step 1: Extend the tracker** (`useTransferQueue.ts`)
+
+```ts
+/** How many instantaneous-rate samples feed the ETA median. At the backend's
+ *  ~300 ms tick cadence this is roughly the last 15–40 s of transfer. */
+const SPEED_MEDIAN_WINDOW = 48;
+/** Below this many samples the median is meaningless; the ETA stays hidden. */
+const SPEED_MEDIAN_MIN_SAMPLES = 6;
+
+interface LiveBytes {
+  bytesDone: number;
+  bytesTotal: number;
+  /** Smoothed bytes/sec for the speed label (EMA, ~3 samples). */
+  speedBps: number | null;
+  /** Median bytes/sec over the recent window — the ETA's basis. `null` until
+   *  `SPEED_MEDIAN_MIN_SAMPLES` increasing samples have arrived. */
+  etaBps: number | null;
+}
+
+interface SpeedTrackerEntry {
+  lastTs: number;
+  lastBytes: number;
+  ema: number | null;
+  /** Ring of the last `SPEED_MEDIAN_WINDOW` instantaneous rates (bytes/sec). */
+  samples: number[];
+}
+
+/** Median of a non-empty array (copy + sort; the window is tiny). */
+function medianOf(samples: number[]): number {
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function trackBytes(
+  store: Map<string, SpeedTrackerEntry>,
+  key: string,
+  bytesDone: number,
+  bytesTotal: number,
+): LiveBytes {
+  const now = Date.now();
+  const prev = store.get(key);
+  let ema = prev?.ema ?? null;
+  const samples = prev?.samples ?? [];
+  if (prev && bytesDone > prev.lastBytes && now > prev.lastTs) {
+    const rate = ((bytesDone - prev.lastBytes) / (now - prev.lastTs)) * 1000;
+    ema = ema == null ? rate : SPEED_EMA_ALPHA * rate + (1 - SPEED_EMA_ALPHA) * ema;
+    samples.push(rate);
+    if (samples.length > SPEED_MEDIAN_WINDOW) samples.splice(0, samples.length - SPEED_MEDIAN_WINDOW);
+  }
+  store.set(key, { lastTs: now, lastBytes: bytesDone, ema, samples });
+  const etaBps = samples.length >= SPEED_MEDIAN_MIN_SAMPLES ? medianOf(samples) : null;
+  return { bytesDone, bytesTotal, speedBps: ema, etaBps };
+}
+```
+
+- [ ] **Step 2: Reset the window on a stage change**
+
+In the `sync-progress` listener, before calling `trackBytes` for an outbound package, compare `p.stage` with the last recorded stage (`liveOutboundStage`); when it differs (`preparing` → `indexing` → `transferring` are different pipes with different speeds), `outSpeedRef.current.delete(`out:${id}`)` first so the median restarts. Inbound has one stage (`fetching`); no reset needed there.
+
+- [ ] **Step 3: Thread `etaBps` through the row model**
+
+Add `etaBps: number | null` to `TransferRowModel` next to `speedBps`, and in every row construction set it the same way `speedBps` is set (`live?.etaBps ?? null` where `speedBps` reads `live?.speedBps`, `null` where `speedBps` is `null`).
+
+- [ ] **Step 4: Use it for the ETA only** (`TransferRow.tsx`)
+
+```ts
+  const speedLabel = row.isTransferring ? formatSpeed(row.speedBps) : null;
+  const remaining = Math.max(0, travelBytes - row.bytesDone);
+  // ETA from the median (robust to the minute-scale swings of one QUIC stream);
+  // hidden until the window has enough samples — never an "∞" or a wild first guess.
+  const eta =
+    row.isTransferring && remaining > 0 && row.etaBps != null
+      ? formatEta(remaining, row.etaBps)
+      : null;
+```
+Update `formatEta`'s doc comment in `presentation.ts` to say the caller passes the median rate.
+
+- [ ] **Step 5: Gate**
+
+Run: `npx tsc --noEmit`. Run the app and send/receive a multi-GB batch: the speed label keeps moving; the ETA appears after ~6 progress ticks and stays within a narrow band instead of jumping with every burst; after a stage change (`preparing` → `transferring`) the ETA disappears and returns once the new window fills.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src
+git commit -m "feat(ui): transfer ETA from the median speed window instead of the live EMA"
+```
+
+---
+
 ## Self-review
 
 **Spec coverage.** §3.1 → T9; §3.2 → T12 (`plan_selection_package`, `enqueue_planned`); §3.3 worker/reflink/progress → T10 + T12; §3.4 cancel → T12/T13; §3.5 failure → T12 (`terminalize`); §3.6 heal → T12/T13; §3.7 (no change); §3.8 `total_bytes` → T9; §4.1 mode/subset → T5; §4.2 lifecycle (no code); §4.3 Perseus (bind wrapper, T4); §4.4 indexing → T6; §5.1 → T7; §5.2 → T8; §5.3 → T7; §5.5 (no change); §6.1–6.2 → T1; §6.3 → T2; §6.4 restart flag → T3; §6.5 leftovers → T3; §6.6 commands → T3; §7.1 → T14; §7.2 (dialog unchanged; notification title tweak folded into T14 if desired); §7.3 → T15; §8 compat → T9/T3; §9 → across tasks; §10 tests → each task; §11 files → file map; §12 decisions → no code.
