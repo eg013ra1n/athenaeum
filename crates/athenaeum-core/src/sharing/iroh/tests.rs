@@ -205,7 +205,10 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
         128 * 1024,
     );
 
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -352,7 +355,7 @@ async fn release_deletes_package_tags_on_both_sides() {
     let tmp = tempdir().unwrap();
     let (dir, announce) =
         build_package(&tmp.path().join("src"), "uuid-gc-1", "gc.fits", "M1", 4096);
-    provider.serve(&announce, &dir, None).await.unwrap();
+    provider.serve(&announce, &dir, None, None).await.unwrap();
 
     let tag = package_tag(&announce.package_id);
     // Provider pinned under the deterministic name.
@@ -438,7 +441,7 @@ async fn start_sweeps_stale_tags() {
     t1.start().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let (dir, announce) = build_package(tmp.path(), "uuid-sweep-1", "s.fits", "M1", 2048);
-    t1.serve(&announce, &dir, None).await.unwrap();
+    t1.serve(&announce, &dir, None, None).await.unwrap();
     t1.shutdown().await;
 
     // New process over the same store: the old tag must be gone after start().
@@ -483,7 +486,7 @@ async fn split_blob_dirs_prevent_startup_sweep_interference() {
     // Serve a package on the receiver-half store so it pins a live `pkg/<id>`.
     let tmp = tempfile::tempdir().unwrap();
     let (dir, announce) = build_package(tmp.path(), "uuid-split-1", "split.fits", "M1", 2048);
-    receiver.serve(&announce, &dir, None).await.unwrap();
+    receiver.serve(&announce, &dir, None, None).await.unwrap();
     let tag = package_tag(&announce.package_id);
     assert!(
         receiver
@@ -565,7 +568,10 @@ async fn iroh_resume_after_endpoint_restart() {
         "M31",
         16 * 1024 * 1024,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -889,7 +895,7 @@ async fn bare_node_id_without_a_peer_address_is_undialable() {
         "M1",
         4096,
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     let err = sender
         .announce(
@@ -1123,7 +1129,10 @@ async fn connection_path_established_line_carries_conn_type_field() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     // `announce` dials an outgoing control connection (logged inline on this
     // task) AND drives the receiver's inbound accept (logged on its own task) —
     // both emit the establishment line.
@@ -1359,7 +1368,7 @@ async fn subset_serve_transfers_only_want_frames() {
     // Want only frame1 + frame3 (frame2 already held by the peer).
     let want: HashSet<String> = [rels[0].clone(), rels[2].clone()].into_iter().collect();
     provider
-        .serve(&announce, &pkg_dir, Some(&want))
+        .serve(&announce, &pkg_dir, Some(&want), None)
         .await
         .unwrap();
     provider
@@ -1432,7 +1441,7 @@ async fn subset_serve_empty_want_is_error() {
 
     let empty: HashSet<String> = HashSet::new();
     let err = provider
-        .serve(&announce, &pkg_dir, Some(&empty))
+        .serve(&announce, &pkg_dir, Some(&empty), None)
         .await
         .expect_err("an empty want set must be rejected");
     let msg = format!("{err:#}");
@@ -1477,7 +1486,10 @@ async fn connect_gate_refuses_control_dispatch_and_blocks_announce() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
 
     // The refusing gate closes the connection at the TOP of
     // `SyncControlProtocol::accept` — before a single `Msg` is decoded — so the
@@ -1535,7 +1547,10 @@ async fn connect_gate_permits_when_predicate_allows() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
 
     provider
         .announce(
@@ -1579,7 +1594,10 @@ async fn connect_gate_refuses_blob_fetch() {
         "M1",
         4096,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     // Deliver the announce BEFORE gating the provider, so the receiver learns
     // the real iroh collection hash — this test's point is the BLOB path, not
     // the control path (already covered above).
@@ -1806,7 +1824,10 @@ async fn successful_fetch_clears_in_flight_tag() {
         "M27",
         64 * 1024,
     );
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -1887,7 +1908,10 @@ async fn throttle_intercept_zero_rate_transfer_completes() {
         600 * 1024,
     );
 
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -1954,7 +1978,10 @@ async fn upload_pacer_limits_real_transfer_wall_clock() {
         3 * 1024 * 1024,
     );
 
-    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .serve(&announce, &pkg_dir, None, None)
+        .await
+        .unwrap();
     provider
         .announce(
             receiver_info.node_id,
@@ -2197,8 +2224,8 @@ async fn multi_fetch_uses_both_providers() {
     const FILES: usize = 14;
     let (pkg_dir, announce) =
         build_many_file_package(&src.path().join("src"), "swarm", FILES, 96 * 1024);
-    a_out.serve(&announce, &pkg_dir, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     let root_a = a
         .resolve_served_hash_for_test(Role::Out, &announce.package_id)
@@ -2286,8 +2313,8 @@ async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
     const FILES: usize = 16;
     let (pkg_dir, announce) =
         build_many_file_package(&src.path().join("src"), "dying", FILES, 512 * 1024);
-    a_out.serve(&announce, &pkg_dir, None).await.unwrap();
-    b_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
     let root = a
         .resolve_served_hash_for_test(Role::Out, &announce.package_id)
         .expect("provider A recorded a served collection hash");
@@ -2846,8 +2873,8 @@ async fn protect_before_cleanup_copies_children_shared_with_another_live_package
     );
     let (pkg_b, ann_b) =
         write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
-    out.serve(&ann_a, &pkg_a, None).await.unwrap();
-    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    out.serve(&ann_a, &pkg_a, None, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
     let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
 
     // The engine's order: protect, then delete the payloads, then release.
@@ -2891,8 +2918,8 @@ async fn protect_copies_shared_children_from_the_sharer_when_our_dir_is_gone() {
         write_test_package_announced(&tmp.path().join("aaa"), &[("X.fits", SHARED)]);
     let (pkg_b, ann_b) =
         write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
-    out.serve(&ann_a, &pkg_a, None).await.unwrap();
-    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    out.serve(&ann_a, &pkg_a, None, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
     let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
 
     // Our dir is already gone when the protection runs.
@@ -2927,8 +2954,8 @@ async fn reserve_after_a_dead_path_repairs_it() {
         write_test_package_announced(&tmp.path().join("aaa"), &[("X.fits", SHARED)]);
     let (pkg_b, ann_b) =
         write_test_package_announced(&tmp.path().join("zzz"), &[("X.fits", SHARED)]);
-    out.serve(&ann_a, &pkg_a, None).await.unwrap();
-    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    out.serve(&ann_a, &pkg_a, None, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
     let shared_hash = served_child_hash(&node, &ann_b.package_id, "X.fits").await;
 
     // The window the release protection does not cover: A's dir vanishes with no
@@ -2940,7 +2967,7 @@ async fn reserve_after_a_dead_path_repairs_it() {
     );
 
     // A retry re-serves B with the same want — the short-circuit must notice.
-    out.serve(&ann_b, &pkg_b, None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, None, None).await.unwrap();
     assert!(
         blob_readable(&node, shared_hash).await,
         "the re-serve re-imported and repaired the dead path"
@@ -2992,8 +3019,8 @@ async fn protect_skips_the_synthesized_subset_manifest() {
         .map(|(n, _)| n.to_string())
         .filter(|n| n != "f000.fits")
         .collect();
-    out.serve(&ann_a, &pkg_a, Some(&want)).await.unwrap();
-    out.serve(&ann_b, &pkg_b, Some(&want)).await.unwrap();
+    out.serve(&ann_a, &pkg_a, Some(&want), None).await.unwrap();
+    out.serve(&ann_b, &pkg_b, Some(&want), None).await.unwrap();
     let shared_hash = served_child_hash(&node, &ann_b.package_id, "big.fits").await;
 
     // Before the skip this returned Err on the manifest's hash mismatch.

@@ -11,7 +11,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,7 +25,7 @@ use n0_future::StreamExt as _;
 
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::types::{FetchEvent, LocalFault};
-use crate::sharing::{FetchSink, ProviderEvent, ProviderTelemetrySink};
+use crate::sharing::{FetchSink, ImportProgressSink, ProviderEvent, ProviderTelemetrySink};
 
 /// Minimum wall-clock gap between two throttled [`FetchEvent`]s from the same
 /// source — applied per-file (each observer) AND to the aggregate batch stream.
@@ -41,19 +40,6 @@ const FETCH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
 /// `(total, total)` tick is emitted unconditionally, throttle or not, so a
 /// consumer never misses the completion figure.
 const IMPORT_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
-
-/// Byte progress of a package import, reported as `(bytes_done, bytes_total)`
-/// over the WHOLE import (every child, cumulative), not per child.
-///
-/// Importing a package hashes every payload (BLAKE3 outboard) and, in
-/// [`ImportMode::Copy`], copies it into the store first — a multi-GB read that
-/// happens BEFORE the peer is even told the package exists (transfer-prepare
-/// spec §4.4). Without this the sender's row sits frozen for minutes; with it,
-/// the same pass surfaces as the `indexing` stage.
-///
-/// Progress is UI event data, never a log: the sink is called on the import's
-/// own task and must not block. `bytes_done` is monotonically non-decreasing.
-pub type ImportProgressSink = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Aborts every spawned per-file observer task on drop — the ONE place that
 /// covers all exit paths from [`fetch_collection_to_dir`]: an early `?`

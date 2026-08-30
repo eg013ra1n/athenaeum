@@ -6841,7 +6841,7 @@ mod tests {
             byte_size: 10,
             frame_count: 1,
         };
-        ep.serve(&announce, &src, None).await.unwrap();
+        ep.serve(&announce, &src, None, None).await.unwrap();
         assert!(ep.is_serving(wire), "the wire id is served before delete");
 
         let deleted =

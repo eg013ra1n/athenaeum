@@ -212,7 +212,7 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         "M31/2026-07-10/lights/L_0001.fits",
         "deadbeefdeadbeefdeadbeefdeadbeef", // decoy origin_device
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
     sender
         .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
@@ -1394,7 +1394,7 @@ async fn ack_replay_from_receipt_log() {
         "NGC7000",
         "2026-01-16T10:00:00.000Z",
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     // First delivery: announce → receiver fetches, ingests, acks.
     sender
@@ -1543,7 +1543,7 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
         "NGC6888",
         "2026-01-17T10:00:00.000Z",
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
     // First delivery: fetch → ingest → ack (Done). Snapshot generation + state.
     sender
@@ -2272,7 +2272,7 @@ async fn landing_root_is_resolved_live_per_package() {
     // content per package so both genuinely ingest (never a content dup).
     let (pkg1, announce1) =
         build_fixture_package_val(tmp.path(), "frame-live-a", "L_live_a.fits", "M42", 0.0);
-    sender.serve(&announce1, &pkg1, None).await.unwrap();
+    sender.serve(&announce1, &pkg1, None, None).await.unwrap();
     sender
         .announce(receiver_node, &announce1, "", "", &[], PackageLayout::Batch)
         .await
@@ -2300,7 +2300,7 @@ async fn landing_root_is_resolved_live_per_package() {
 
     let (pkg2, announce2) =
         build_fixture_package_val(tmp.path(), "frame-live-b", "L_live_b.fits", "NGC7000", 1.0);
-    sender.serve(&announce2, &pkg2, None).await.unwrap();
+    sender.serve(&announce2, &pkg2, None, None).await.unwrap();
     sender
         .announce(receiver_node, &announce2, "", "", &[], PackageLayout::Batch)
         .await
@@ -2384,7 +2384,7 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
         "M42",
         "2026-01-16T10:00:00.000Z",
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
     sender
         .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
@@ -2447,7 +2447,7 @@ async fn receiver_ingests_from_authorized_peer() {
         "M42",
         "2026-01-16T10:00:00.000Z",
     );
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
     sender
         .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
@@ -2680,7 +2680,7 @@ async fn project_package_lands_contributions_and_acks() {
     .unwrap();
 
     // A serves (full) + project-announces to B.
-    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None, None).await.unwrap();
     sender
         .announce_project(receiver_node, PROJECT_ID, HUB_PACKAGE_ID, &announce)
         .await

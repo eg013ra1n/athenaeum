@@ -30,7 +30,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
+use crate::sharing::{noop_fetch_sink, FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::diagnostics::ConnectClass;
 
 use super::cleanup_coord::SharedPackageCleanup;
@@ -694,6 +694,166 @@ async fn sent_progress_carries_bytes() {
     assert_eq!(tick.1["stage"].as_str(), Some("transferring"));
     assert_eq!(tick.1["bytesDone"].as_u64(), Some(expected_bytes));
     assert_eq!(tick.1["bytesTotal"].as_u64(), Some(expected_bytes));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Wraps a real loopback endpoint (so the package genuinely confirms) and raises
+/// two synthetic import ticks from INSIDE `serve`, the way the iroh import
+/// reports its outboard-hashing bytes. The loopback stores no blobs and hashes
+/// nothing, so this stands in for that work.
+struct ImportTickTransport {
+    inner: LoopbackTransport,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for ImportTickTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        self.inner.start().await
+    }
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        batch_uuid: &str,
+        files: &[AnnounceFileEntry],
+        layout: PackageLayout,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .announce(to, a, batch_name, batch_uuid, files, layout)
+            .await
+    }
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+        sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        self.inner.fetch(from, pkg, dest, sink).await
+    }
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        self.inner.fetch_manifest(from, pkg, dest).await
+    }
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src: &Path,
+        want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
+    ) -> anyhow::Result<()> {
+        // Raised BEFORE the delegate returns — the whole point of threading the
+        // sink into `serve`: the engine is parked on this await and cannot drain
+        // its event channel, so a tick routed through that channel would arrive
+        // only after the import it describes had already finished.
+        if let Some(sink) = &progress {
+            sink(1, 2);
+            sink(2, 2);
+        }
+        self.inner.serve(pkg, src, want, progress).await
+    }
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        package_id: PackageId,
+        offer: Vec<OfferEntry>,
+        full_by_rel: HashMap<String, String>,
+    ) -> anyhow::Result<HashSet<String>> {
+        self.inner
+            .negotiate_want(to, package_id, offer, full_by_rel)
+            .await
+    }
+    async fn ack(&self, to: NodeId, pid: &PackageId, r: Vec<FrameReceipt>) -> anyhow::Result<()> {
+        self.inner.ack(to, pid, r).await
+    }
+    async fn release(&self, pid: &PackageId) -> anyhow::Result<()> {
+        self.inner.release(pid).await
+    }
+    async fn protect_shared_before_cleanup(&self, pid: &PackageId) -> anyhow::Result<()> {
+        self.inner.protect_shared_before_cleanup(pid).await
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.inner.events().await
+    }
+}
+
+/// Transfer-prepare spec §4.4: the serve import's byte progress reaches the
+/// sender as `sync-progress` `indexing` ticks carrying `(bytesDone, bytesTotal)`.
+///
+/// This pins the hand-off the sink exists for. The import runs INSIDE the awaited
+/// `serve`, and the engine's `run` loop is a single `select!` — while it is in
+/// `serve` its `events.recv()` arm is not polled, so the same figures routed
+/// through the transport's `TransportEvent` channel could only have been handled
+/// after the import had already finished (and after the announce had flipped the
+/// row to `transferring`). A tick raised from inside `serve` and observed on the
+/// emitter is exactly what the channel shape could not deliver.
+#[tokio::test]
+async fn import_progress_reaches_the_sender_as_indexing_ticks() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(
+        &tmp.path().join("src_index"),
+        "uuid-index",
+        "index.fits",
+        "M42",
+        4096,
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(ImportTickTransport {
+            inner: net.endpoint(),
+        }),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    let evts = events.lock().unwrap();
+    let indexing: Vec<&serde_json::Value> = evts
+        .iter()
+        .filter(|(n, p)| n == "sync-progress" && p["stage"].as_str() == Some("indexing"))
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(
+        indexing.len(),
+        2,
+        "both import ticks reached the emitter, got {evts:?}"
+    );
+    for tick in &indexing {
+        assert_eq!(tick["direction"].as_str(), Some("sent"));
+        assert_eq!(tick["packageId"].as_str(), Some(id.to_string().as_str()));
+        assert_eq!(tick["bytesTotal"].as_u64(), Some(2));
+    }
+    assert_eq!(indexing[0]["bytesDone"].as_u64(), Some(1));
+    assert_eq!(indexing[1]["bytesDone"].as_u64(), Some(2));
     drop(evts);
 
     engine.shutdown().await;
@@ -3117,8 +3277,9 @@ impl SharingTransport for NegotiateErrTransport {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
-        self.0.serve(pkg, src_dir, want).await
+        self.0.serve(pkg, src_dir, want, progress).await
     }
     async fn ack(
         &self,
@@ -3583,6 +3744,7 @@ impl SharingTransport for RetryProbeTransport {
         _pkg: &PackageAnnounce,
         _src: &Path,
         _want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -3769,6 +3931,7 @@ impl SharingTransport for ServeTickTransport {
         _pkg: &PackageAnnounce,
         _src: &Path,
         _want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -4422,6 +4585,7 @@ impl SharingTransport for ReplaceProbeTransport {
         _pkg: &PackageAnnounce,
         _src: &Path,
         _want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -6061,8 +6225,9 @@ impl SharingTransport for SlowRevokeTransport {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
-        self.0.serve(pkg, src_dir, want).await
+        self.0.serve(pkg, src_dir, want, progress).await
     }
     async fn ack(
         &self,
@@ -6191,8 +6356,9 @@ impl SharingTransport for ProtectProbeTransport {
         pkg: &PackageAnnounce,
         src: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
-        self.inner.serve(pkg, src, want).await
+        self.inner.serve(pkg, src, want, progress).await
     }
     async fn negotiate_want(
         &self,

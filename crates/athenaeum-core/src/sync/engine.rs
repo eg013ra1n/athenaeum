@@ -60,7 +60,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     ReceiptOutcome, RevokeReason, TransportEvent,
 };
-use crate::sharing::SharingTransport;
+use crate::sharing::{ImportProgressSink, SharingTransport};
 
 use super::diagnostics::{classify_send_error, ConnectClass};
 use super::models::{Direction, HistoryRow, OutboundFileState, OutboundRow, OutboundState};
@@ -1463,13 +1463,46 @@ impl Worker {
                 .collect()
         };
 
+        // Transfer-prepare spec §4.4: the serve import hashes the whole package
+        // BEFORE the peer is told it exists — minutes of work on a multi-GB send.
+        // The sink is threaded INTO `serve` rather than routed through the
+        // transport's `TransportEvent` channel on purpose: this worker awaits
+        // `serve` inline (the `events.recv()` arm of `run`'s select is not polled
+        // meanwhile), so a tick sent through that channel could only be handled
+        // AFTER the import it describes had already finished. Called from the
+        // import's own task, it cannot touch `&self`, so it emits the same
+        // `SyncProgressEvent` `emit_progress_bytes` would, with everything it needs
+        // captured by value. `None` emitter ⇒ no sink ⇒ the import skips the work.
+        let import_progress: Option<ImportProgressSink> = self.emitter.as_ref().map(|em| {
+            let em = Arc::clone(em);
+            let package_id = id.to_string();
+            let peer_device = node_id_hex(&self.peer);
+            let frame_count = announce.frame_count;
+            let sink: ImportProgressSink = Arc::new(move |bytes_done: u64, bytes_total: u64| {
+                emit_event(
+                    em.as_ref(),
+                    "sync-progress",
+                    &SyncProgressEvent {
+                        package_id: package_id.clone(),
+                        direction: Direction::Sent,
+                        stage: "indexing".to_string(),
+                        peer_device: peer_device.clone(),
+                        frame_count,
+                        project_id: None,
+                        bytes_done: Some(bytes_done),
+                        bytes_total: Some(bytes_total),
+                    },
+                );
+            });
+            sink
+        });
         // Provider side: register the served dir (the negotiated want-subset when
         // `Some`, the full package when `None`), then advertise it to the peer. A
         // failure here (e.g. the peer is offline) is retryable, not fatal:
         // remember the announce + want and arm a retry deadline.
         let serve_announce = async {
             self.transport
-                .serve(&announce, &dir, want.as_ref())
+                .serve(&announce, &dir, want.as_ref(), import_progress)
                 .await
                 .context("serve package")?;
             match &project {
@@ -2326,17 +2359,6 @@ impl Worker {
                 self.on_serve_file_progress(package_id, file, bytes_done, bytes_total);
                 Ok(())
             }
-            // The serve import is hashing the package we are about to announce
-            // (transfer-prepare spec §4.4): surface it as the `indexing` stage so a
-            // multi-GB send is not a frozen row.
-            TransportEvent::ImportProgress {
-                package_id,
-                bytes_done,
-                bytes_total,
-            } => {
-                self.on_import_progress(package_id, bytes_done, bytes_total);
-                Ok(())
-            }
         }
     }
 
@@ -2508,29 +2530,6 @@ impl Worker {
             cumulative.min(byte_size),
             byte_size,
         );
-    }
-
-    /// Serve-import (outboard hashing) progress for a package we are preparing to
-    /// announce (transfer-prepare spec §4.4) — surfaced as the `indexing` stage.
-    ///
-    /// The slot is resolved exactly as [`on_serve_progress`](Self::on_serve_progress)
-    /// resolves it: the pending entry whose minted announce carries this
-    /// `package_id`. A tick for no live slot is dropped at debug. Unlike a serve
-    /// tick this is NOT peer contact — no bytes have left this device — so it
-    /// deliberately does not touch the ack-timeout ladder, the reachability
-    /// tracker, or `last_error`. It is a display stage and nothing more; the
-    /// figures come straight from the import, so no session-base arithmetic
-    /// applies either.
-    fn on_import_progress(&mut self, package_id: PackageId, bytes_done: u64, bytes_total: u64) {
-        let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
-            Some(a) if a.package_id == package_id => Some((*k, a.frame_count)),
-            _ => None,
-        });
-        let Some((id, frame_count)) = slot else {
-            tracing::debug!(package_id = %package_id.0, "import-progress for no pending slot; dropped");
-            return;
-        };
-        self.emit_progress_bytes(id, "indexing", frame_count, bytes_done, bytes_total);
     }
 
     /// Bytes of this package the peer has ALREADY taken, read from the durable

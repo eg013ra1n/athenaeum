@@ -58,7 +58,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
     PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{FetchSink, ProviderTelemetrySink, SharingTransport};
+use crate::sharing::{FetchSink, ImportProgressSink, ProviderTelemetrySink, SharingTransport};
 use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
@@ -493,17 +493,15 @@ impl EventDemux {
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
                 }
-                // ServeProgress / ServeComplete / ServeFileProgress / ImportProgress
-                // originate on OUR endpoint (the provider-events consumer, or the
-                // serve import itself), never arrive as a decoded inbound control
-                // message, and are routed via `route_serve_progress` /
-                // `route_serve_complete` / `route_serve_file_progress` /
-                // `route_import_progress` — not this path. Treat a stray one
-                // defensively as an orphan (no consumer, no delivery ack).
+                // ServeProgress / ServeComplete / ServeFileProgress originate on OUR
+                // endpoint (the provider-events consumer), never arrive as a decoded
+                // inbound control message, and are routed via `route_serve_progress`
+                // / `route_serve_complete` / `route_serve_file_progress` — not this
+                // path. Treat a stray one defensively as an orphan (no consumer, no
+                // delivery ack).
                 TransportEvent::ServeProgress { .. }
                 | TransportEvent::ServeComplete { .. }
-                | TransportEvent::ServeFileProgress { .. }
-                | TransportEvent::ImportProgress { .. } => None,
+                | TransportEvent::ServeFileProgress { .. } => None,
             }
         };
         match target {
@@ -635,37 +633,6 @@ impl EventDemux {
             }
         }
     }
-
-    /// Route a locally-generated
-    /// [`ImportProgress`](TransportEvent::ImportProgress) (transfer-prepare spec
-    /// §4.4) to the sender handle(s) that announced this package — the
-    /// serve-import sibling of
-    /// [`route_serve_progress`](Self::route_serve_progress), matched by
-    /// `package_id` across the live ack claims. Non-blocking (`try_send`): a full
-    /// channel drops the tick and a package with no live claim is silently
-    /// ignored — import progress is best-effort UI data.
-    ///
-    /// Same keyed-on-`package_id`-only cross-destination caveat as
-    /// [`route_serve_progress`](Self::route_serve_progress): a package fanned out
-    /// to N peers delivers this same tick to every one of them — a benign
-    /// over-report of one shared local import, never a misroute.
-    pub(crate) fn route_import_progress(
-        &self,
-        package_id: &PackageId,
-        bytes_done: u64,
-        bytes_total: u64,
-    ) {
-        let inner = self.inner.lock().expect("demux mutex poisoned");
-        for ((_, pid), (_, tx)) in inner.claims.iter() {
-            if pid == package_id {
-                let _ = tx.try_send(TransportEvent::ImportProgress {
-                    package_id: package_id.clone(),
-                    bytes_done,
-                    bytes_total,
-                });
-            }
-        }
-    }
 }
 
 /// The inbound-event variant an orphan warn names, plus the peer it came from.
@@ -680,7 +647,6 @@ fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
         TransportEvent::ServeProgress { .. } => ("serve_progress", [0u8; 32]),
         TransportEvent::ServeComplete { .. } => ("serve_complete", [0u8; 32]),
         TransportEvent::ServeFileProgress { .. } => ("serve_file_progress", [0u8; 32]),
-        TransportEvent::ImportProgress { .. } => ("import_progress", [0u8; 32]),
     }
 }
 
@@ -2503,6 +2469,7 @@ impl SharedIrohNode {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> Result<()> {
         let tag = role_package_tag(role.prefix(), &pkg.package_id);
         // The import returns the collection hash PLUS the ordered `(rel_path, size)`
@@ -2534,6 +2501,9 @@ impl SharedIrohNode {
                     root_hash = %hash,
                     "serve reuses the already-imported collection"
                 );
+                // Nothing is hashed on this path, so `progress` is never called —
+                // a re-serve emits no `indexing` ticks at all, which is honest:
+                // there is no work to show.
                 return Ok(());
             }
             tracing::warn!(
@@ -2550,16 +2520,10 @@ impl SharedIrohNode {
         let mode = self.serve_import_mode;
         // Transfer-prepare spec §4.4: the import hashes every payload before the
         // peer is even told the package exists, so a multi-GB send would otherwise
-        // sit frozen. Feed those bytes to the announcing sender engine as
-        // `ImportProgress` (its `indexing` stage). Best-effort UI data: the sink
-        // never blocks and a tick with no live claim is dropped.
-        let progress: blobs::ImportProgressSink = {
-            let demux = Arc::clone(&self.demux);
-            let package_id = pkg.package_id.clone();
-            Arc::new(move |bytes_done, bytes_total| {
-                demux.route_import_progress(&package_id, bytes_done, bytes_total)
-            })
-        };
+        // sit frozen. `progress` carries those bytes straight back to the caller
+        // (the sender engine's `indexing` stage) — synchronously, from inside this
+        // awaited call, which is the whole point: the engine does not drain its
+        // event channel while it is here.
         let (hash, entries) = match want {
             None => {
                 blobs::import_package_collection_with_mode(
@@ -2567,12 +2531,12 @@ impl SharedIrohNode {
                     src_dir,
                     &tag,
                     mode,
-                    Some(progress),
+                    progress,
                 )
                 .await?
             }
             Some(w) => {
-                blobs::import_subset_collection(&self.store, src_dir, w, &tag, mode, Some(progress))
+                blobs::import_subset_collection(&self.store, src_dir, w, &tag, mode, progress)
                     .await?
             }
         };
@@ -3027,8 +2991,11 @@ impl SharingTransport for RoleHandle {
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        progress: Option<ImportProgressSink>,
     ) -> Result<()> {
-        self.node.role_serve(self.role, pkg, src_dir, want).await
+        self.node
+            .role_serve(self.role, pkg, src_dir, want, progress)
+            .await
     }
 
     async fn ack(
@@ -3504,13 +3471,13 @@ mod tests {
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
         let handle = node.role_handle(Role::Out);
 
-        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None, None).await.unwrap();
         let first_hash = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("the first serve records a collection hash");
 
         std::fs::write(pkg_dir.join("frame.fits"), b"completely different bytes").unwrap();
-        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None, None).await.unwrap();
         let second_hash = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("the second serve keeps a collection hash");
@@ -3524,7 +3491,7 @@ mod tests {
         // Releasing forgets the collection, so a rebuilt payload — Perseus's resend
         // path — imports for real again rather than serving stale bytes.
         handle.release(&announce.package_id).await.unwrap();
-        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None, None).await.unwrap();
         let after_release = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("the post-release serve records a hash");
@@ -3551,7 +3518,7 @@ mod tests {
 
         let full = HashSet::from(["frame_a.fits".to_string(), "frame_b.fits".to_string()]);
         handle
-            .serve(&announce, &pkg_dir, Some(&full))
+            .serve(&announce, &pkg_dir, Some(&full), None)
             .await
             .unwrap();
         let full_hash = node
@@ -3560,7 +3527,7 @@ mod tests {
 
         let subset = HashSet::from(["frame_a.fits".to_string()]);
         handle
-            .serve(&announce, &pkg_dir, Some(&subset))
+            .serve(&announce, &pkg_dir, Some(&subset), None)
             .await
             .unwrap();
         let subset_hash = node
@@ -3576,7 +3543,7 @@ mod tests {
         // content, not by the HashSet's iteration order.
         let same_subset_again = HashSet::from(["frame_a.fits".to_string()]);
         handle
-            .serve(&announce, &pkg_dir, Some(&same_subset_again))
+            .serve(&announce, &pkg_dir, Some(&same_subset_again), None)
             .await
             .unwrap();
         assert_eq!(
@@ -3670,7 +3637,7 @@ mod tests {
             .unwrap();
         copy_node
             .role_handle(Role::Out)
-            .serve(&announce, &pkg_dir, None)
+            .serve(&announce, &pkg_dir, None, None)
             .await
             .unwrap();
         copy_node.shutdown().await;
@@ -4167,7 +4134,7 @@ mod tests {
 
         // Functional proof: import via Out, read the resulting tag via Recv.
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         let tag = format!("out/pkg/{}", announce.package_id.0);
         assert!(
@@ -4190,7 +4157,7 @@ mod tests {
 
         let out = node.role_handle(Role::Out);
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // The collection root hash the serve registered, read back off its tag.
         let tag = format!("out/pkg/{}", announce.package_id.0);
@@ -4241,7 +4208,7 @@ mod tests {
         // Two frames of clearly different sizes (4 KiB, 64 KiB) so a per-blob
         // (not cumulative) bug would visibly undershoot the full byte_size.
         let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Register both handles' consumers BEFORE announcing (same ordering the
         // other demux tests use): `out.events()` registers the ack-claim channel
@@ -4351,7 +4318,7 @@ mod tests {
         pair(&s, &s_info, &r, &r_info);
 
         let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Register consumers BEFORE announcing so the ack-claim channel exists for
         // route_serve_progress / route_serve_complete to target.
@@ -4493,7 +4460,7 @@ mod tests {
         pair(&s, &s_info, &r, &r_info);
 
         let (pkg_dir, announce, expected) = build_three_frame_dup_package(ds.path());
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Register consumers BEFORE announcing so the ack-claim channel exists for
         // route_serve_file_progress to target.
@@ -4583,7 +4550,7 @@ mod tests {
 
         // frame_a = 4 KiB, frame_b = 64 KiB; announced byte_size = 68 KiB.
         let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
-        out.serve(&announce, &pkg_dir, None).await.unwrap();
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
 
         // Pre-seed the receiver store with the 64 KiB frame so the fetch resumes,
         // pulling only the 4 KiB frame — far fewer bytes than the 68 KiB byte_size.

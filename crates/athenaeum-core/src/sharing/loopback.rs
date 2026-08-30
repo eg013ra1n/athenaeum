@@ -21,7 +21,7 @@ use super::types::{
     AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     RevokeReason, StartInfo, TransportEvent,
 };
-use super::{FetchSink, SharingTransport};
+use super::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::package::MANIFEST_FILENAME;
 use crate::sync::DedupResponder;
 
@@ -626,11 +626,14 @@ impl SharingTransport for LoopbackTransport {
         Ok(dest)
     }
 
+    /// The mock stores no blobs and hashes nothing, so `_progress` is accepted and
+    /// ignored: there is no import work for an `indexing` tick to describe.
     async fn serve(
         &self,
         pkg: &PackageAnnounce,
         src_dir: &Path,
         want: Option<&HashSet<String>>,
+        _progress: Option<ImportProgressSink>,
     ) -> anyhow::Result<()> {
         let mut reg = self.registry.lock().expect("registry mutex poisoned");
         let inbox = reg

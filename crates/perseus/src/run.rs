@@ -3640,10 +3640,10 @@ mod multi_target_tests {
         // (3) Both targets serve onto the node's single blob store (local, no net).
         let (pkg1, ann1) = make_announced_pkg(tmp.path(), "uuid-a", "a.fits");
         let (pkg2, ann2) = make_announced_pkg(tmp.path(), "uuid-b", "b.fits");
-        h1.serve(&ann1, &pkg1, None)
+        h1.serve(&ann1, &pkg1, None, None)
             .await
             .expect("target 1 serves onto the shared store");
-        h2.serve(&ann2, &pkg2, None)
+        h2.serve(&ann2, &pkg2, None, None)
             .await
             .expect("target 2 serves onto the SAME shared store");
 
