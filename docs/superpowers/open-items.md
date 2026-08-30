@@ -79,6 +79,13 @@ Spec `docs/superpowers/specs/2026-08-30-transfer-prepare-and-footprint-design.md
   children on every retry.
 - An `announced` row's bar sits at the 0.95 cap it inherited from the final
   indexing byte count; speed and ETA are correctly suppressed there.
+- `cleanup_finished_transfers` (Settings → Transfers → Clean up) removes terminal
+  payload dirs without a `protect_shared_before_cleanup` pass — under
+  `TryReference` a live sibling package sharing a byte-identical child can
+  transiently lose its winning external path (self-heals: the next serve's
+  readability probe Copy-re-imports it; it takes a manual click while a
+  shared-content transfer is live). Fast-follow: run the protect hook per
+  terminal package before its dir is removed.
 
 ### Sender counter subtracts the peer's duplicates (2026-08-30)
 
