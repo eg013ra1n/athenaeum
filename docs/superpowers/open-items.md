@@ -3,7 +3,7 @@
 What is finished in code but not yet confirmed by hand, and what has already been
 decided and should not be reopened. Everything here sits on `main` — the development
 trunk since 2026-08-24, when the project went open source and version branches were
-retired — and covers the ten completed cycles on top of the last tag.
+retired — and covers the eleven completed cycles on top of the last tag.
 
 Plans, specs and audits live in `plans/`, `specs/` and `research/` beside this file
 and hold the detail. This file holds only the residue: the checks nobody has run and

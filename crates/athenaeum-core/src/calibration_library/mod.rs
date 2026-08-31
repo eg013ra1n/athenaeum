@@ -20,8 +20,8 @@ pub mod light_headers;
 // `api::lights`): resolves a light frame's Dark/Flat/Bias links against the
 // catalog into `ResolvedFrameInputs`. Render-gated because it names
 // `integration::cfa::CfaGeometry`, itself render-gated — same reasoning as
-// `light_cal` above. A later export-side generator (also render-gated) will
-// consume it directly, without going through `api`.
+// `light_cal` above. The export-side generator (also render-gated) consumes it
+// directly, without going through `api`.
 #[cfg(feature = "render")]
 pub mod light_resolve;
 pub mod paths;

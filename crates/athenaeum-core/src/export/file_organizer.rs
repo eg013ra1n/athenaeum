@@ -373,11 +373,22 @@ impl GenerationBatch {
     ) -> Self {
         let mut specs = std::collections::HashMap::new();
         let mut skipped = std::collections::HashMap::new();
+        // ONE memo for the whole batch: resolving a light's flat-norm divisor
+        // can read the master flat's entire plane, and a frame set's lights
+        // share one flat. See `export::DivisorCache` — it is valid only for the
+        // single `opts` this batch resolves under, which is exactly its scope.
+        let mut divisors = crate::export::DivisorCache::new();
         for placement in compute_wbpp_placements(data) {
             let PlacementSource::CalibrateLight { frame_id, .. } = placement.source else {
                 continue;
             };
-            match crate::export::resolve_generation(conn, frame_id, &opts, &scratch_dir) {
+            match crate::export::resolve_generation_cached(
+                conn,
+                frame_id,
+                &opts,
+                &scratch_dir,
+                &mut divisors,
+            ) {
                 Ok(spec) => {
                     specs.insert(frame_id, spec);
                 }
@@ -395,6 +406,7 @@ impl GenerationBatch {
         tracing::info!(
             resolved = specs.len(),
             skipped = skipped.len(),
+            flat_divisors = divisors.len(),
             "calibrated-light generation planned"
         );
         Self {

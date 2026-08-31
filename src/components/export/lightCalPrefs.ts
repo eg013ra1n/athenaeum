@@ -35,9 +35,11 @@ export const DEFAULT_LIGHTCAL_PARAMS: LightCalParams = {
 };
 
 /** Read the persisted Advanced parameters, coercing every field into range and
- *  falling back to {@link DEFAULT_LIGHTCAL_PARAMS} when unset/corrupt. Exported so
- *  the badge/details readiness fetches in FrameSetDetail resolve staleness against
- *  the exact params the dialog would submit. */
+ *  falling back to {@link DEFAULT_LIGHTCAL_PARAMS} when unset/corrupt. Both
+ *  consumers seed from it — the Export tab's own controls (ExportTab.tsx) and
+ *  the send-to-device dialog (SendToNodeDialog.tsx), which reads the persisted
+ *  value directly so a transfer generates what an export of the same set
+ *  would. */
 export function readLightCalParamsPref(): LightCalParams {
   try {
     const raw = localStorage.getItem(LIGHTCAL_PARAMS_KEY);

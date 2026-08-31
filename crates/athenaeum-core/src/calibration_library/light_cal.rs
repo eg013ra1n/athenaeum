@@ -603,10 +603,10 @@ fn read_ath_channel_norms(flat_path: &Path, light: CfaGeometry) -> Option<[f64; 
             xoff: offset("XBAYROFF"),
             yoff: offset("YBAYROFF"),
         });
-    // Offsets compare modulo 2 ([`CfaGeometry::same_phase`], which the advisory
-    // light-vs-master check in `api::lights` shares): an `XBAYROFF` of 2 and one
-    // of 0 are the same phase, and calling that a disagreement would push a
-    // perfectly good flat onto the recompute path for nothing.
+    // Offsets compare modulo 2 ([`CfaGeometry::same_phase`], the single home of
+    // the parity rule): an `XBAYROFF` of 2 and one of 0 are the same phase, and
+    // calling that a disagreement would push a perfectly good flat onto the
+    // recompute path for nothing.
     match flat_geom {
         Some(g) if g.same_phase(light) => Some(k),
         _ => {

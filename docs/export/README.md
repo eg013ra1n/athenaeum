@@ -218,8 +218,15 @@ export's own destination tree. There is still no token-templating engine here
   linked light (e.g. dark only) does **not** block — it calibrates
   best-effort with an honest `CALSTAT`. Athenaeum never auto-builds masters
   during export; the blocker routes the user to Coverage instead.
-- **Two run-level toggles**, shown when the mode is selected and persisted the
-  same way as the mode itself (`src/components/export/lightCalPrefs.ts`):
+- **Run-level options**, shown when the mode is selected and persisted the
+  same way as the mode itself (`src/components/export/lightCalPrefs.ts`).
+  Every option the retired standalone dialog had lives here now, under the
+  same storage keys and with the same defaults, so an existing install's
+  choices carry over:
+  - **Normalize master flat** (default ON) + its **statistic** — central-third
+    mean (Athenaeum) or full-frame trimmed mean — and, nested under the
+    statistic it refines, **per-channel CFA flat scaling** (default ON,
+    unavailable in the trimmed mode, which is measured whole-frame).
   - **Hot-pixel correction** (default ON) — replaces hot pixels detected from
     the applied master dark (median + 10·1.4826·MAD threshold) with a
     neighbourhood median before debayering; honestly skipped when no dark
@@ -227,9 +234,12 @@ export's own destination tree. There is still no token-templating engine here
   - **Debayer OSC lights (VNG)** (default ON) — full-resolution VNG debayer
     for OSC lights, planar RGB output. OFF exports the CFA frame as-is
     (`c_*.fits`) for stackers that debayer themselves.
-  Flat normalization (toggle + statistic) moved here too, from the old
-  standalone dialog — same defaults as before (ON, central-third mean,
-  per-CFA-channel for colour lights).
+  - **Advanced** (collapsed by default) — the flat trim fraction (only in the
+    trimmed statistic, default 0.05), the output pedestal in DN (default 0 =
+    negatives preserved, added after the scale divide), and the no-dark-master
+    policy: subtract the linked bias best-effort (default) or skip the frame.
+  The same five values travel with a **Send to device…** of this mode, so a
+  transfer generates the bytes an export of the set would.
 - **Every export regenerates.** No cache and no skip-if-exists for generated
   files — a re-run overwrites its own previous output in place (tmp + atomic
   rename). The exists-skip described above under "Folder structure it

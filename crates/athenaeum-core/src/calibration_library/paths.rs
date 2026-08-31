@@ -85,41 +85,6 @@ pub fn master_relative_path(p: &MasterPathParams) -> PathBuf {
         .join(format!("{}.fits", parts.join("_")))
 }
 
-/// Sanitize `s`, falling back to `fallback` when that collapses to empty
-/// (all-whitespace/reserved-char input) — same "no empty path segment"
-/// guard [`master_relative_path`] applies to its camera token.
-fn sanitized_or(s: &str, fallback: &str) -> String {
-    let sanitized = sanitize_for_filename(s);
-    if sanitized.is_empty() {
-        fallback.to_string()
-    } else {
-        sanitized
-    }
-}
-
-/// Relative path inside the Calibration Library root for a calibrated LIGHT
-/// output (design spec 2026-07-05-light-calibration-design.md §3):
-/// `<OBJECT sanitized>/<INSTRUME sanitized>/<DATE-OBS date>/c_<original filename>`.
-/// Uses the same sanitizer + "Unknown…" fallback idiom as
-/// [`master_relative_path`]. `date_obs_date` (YYYY-MM-DD) and
-/// `original_filename` are taken as-is — the date is already filesystem-safe
-/// and the filename came from a real file on disk, so re-sanitizing it would
-/// only risk mangling a name that's already valid. The caller joins the
-/// library root and applies [`resolve_collision`].
-pub fn calibrated_light_relative_path(
-    object: &str,
-    instrume: &str,
-    date_obs_date: &str,
-    original_filename: &str,
-) -> PathBuf {
-    let object = sanitized_or(object, "UnknownObject");
-    let instrume = sanitized_or(instrume, "UnknownCamera");
-    PathBuf::from(object)
-        .join(instrume)
-        .join(date_obs_date)
-        .join(format!("c_{original_filename}"))
-}
-
 /// First non-existing variant of `abs`: abs, then stem_2.fits, stem_3.fits…
 pub fn resolve_collision(abs: &Path) -> PathBuf {
     if !abs.exists() {
@@ -278,26 +243,6 @@ mod tests {
             date: "2026-01-01",
         });
         assert!(p.starts_with("UnknownCamera/MasterBias/"), "{p:?}");
-    }
-
-    #[test]
-    fn relative_path_sanitizes_and_prefixes() {
-        // Assert against whatever the existing sanitizer produces for these
-        // inputs (called directly), not a hardcoded literal — the point is
-        // that calibrated_light_relative_path reuses the same sanitizer
-        // master paths use, not a second implementation of it.
-        let object = sanitize_for_filename("M 31");
-        let instrume = sanitize_for_filename("ZWO ASI2600MM Pro");
-        let p = calibrated_light_relative_path(
-            "M 31",
-            "ZWO ASI2600MM Pro",
-            "2026-06-01",
-            "L_0001.fits",
-        );
-        assert_eq!(
-            p,
-            PathBuf::from(format!("{object}/{instrume}/2026-06-01/c_L_0001.fits"))
-        );
     }
 
     #[test]

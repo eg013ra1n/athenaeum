@@ -62,8 +62,9 @@ impl CfaGeometry {
     /// (or raise a compatibility warning) for nothing.
     ///
     /// THE single home of the parity rule: the flat-card check
-    /// (`light_cal::read_ath_channel_norms`) and the advisory light-vs-master
-    /// comparison (`api::lights`) both call it, so the two can never drift.
+    /// (`light_cal::read_ath_channel_norms`) and the generator's own flat
+    /// resolution (`export::calibrated_generator`, through that check) both go
+    /// through it, so no second folding rule can drift away from this one.
     pub fn same_phase(self, other: CfaGeometry) -> bool {
         self.pattern == other.pattern
             && self.xoff.rem_euclid(2) == other.xoff.rem_euclid(2)

@@ -639,29 +639,41 @@ fn open_generation(
     })?;
     let conn = handle.conn();
     let mut specs = std::collections::HashMap::new();
+    // ONE memo for the whole package, same reason as the export batch: the
+    // flat-norm divisor can cost a full read of the master flat's plane and
+    // every light in a send shares that flat. Valid for this `opts` only, which
+    // is the loop's whole scope (see `export::DivisorCache`).
+    let mut divisors = crate::export::DivisorCache::new();
     for (src, record) in records {
         let PrepareSource::Generate { frame_id } = src else {
             continue;
         };
-        let spec = crate::export::resolve_generation(&conn, *frame_id, &opts, &scratch_dir)
-            .map_err(|e| {
-                tracing::error!(
-                    package_id = id,
-                    frame_id = *frame_id,
-                    rel_path = %record.rel_path,
-                    error = %format!("{e:#}"),
-                    "prepare: cannot calibrate this light"
-                );
-                PrepareError::Failed {
-                    reason: format!("{}: {e:#}", record.rel_path),
-                    culprit: Some((record.rel_path.clone(), format!("{e:#}"))),
-                }
-            })?;
+        let spec = crate::export::resolve_generation_cached(
+            &conn,
+            *frame_id,
+            &opts,
+            &scratch_dir,
+            &mut divisors,
+        )
+        .map_err(|e| {
+            tracing::error!(
+                package_id = id,
+                frame_id = *frame_id,
+                rel_path = %record.rel_path,
+                error = %format!("{e:#}"),
+                "prepare: cannot calibrate this light"
+            );
+            PrepareError::Failed {
+                reason: format!("{}: {e:#}", record.rel_path),
+                culprit: Some((record.rel_path.clone(), format!("{e:#}"))),
+            }
+        })?;
         specs.insert(*frame_id, spec);
     }
     tracing::info!(
         package_id = id,
         count = specs.len(),
+        flat_divisors = divisors.len(),
         "calibrated-light generation planned for a transfer"
     );
     Ok(Generation {

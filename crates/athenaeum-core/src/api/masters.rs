@@ -650,9 +650,12 @@ pub(crate) fn check_library_dir_exists(dir: &str) -> Result<(), ApiError> {
 /// and `Database::conn()` panicked (`db/mod.rs:124`). Call this ONLY with a
 /// connection the caller already owns; never acquire a fresh one inside.
 ///
-/// `pub(crate)` so the light-calibration orchestration (`api::lights`) resolves
-/// the calibrated-output root through the exact same precedence + on-disk
-/// existence check as master builds.
+/// Every caller now lives in `api::masters` itself (preview, build, rebuild,
+/// archive-of-originals), which all resolve the library root through this one
+/// precedence + on-disk existence check instead of repeating it. The
+/// `pub(crate)` is the wider visibility the removed standalone
+/// light-calibration orchestration needed; it is kept because the root is a
+/// crate-level concern, not because anything outside reaches for it today.
 pub(crate) fn library_dir_or_err(
     conn: &rusqlite::Connection,
 ) -> Result<std::path::PathBuf, ApiError> {

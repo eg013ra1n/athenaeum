@@ -1,15 +1,16 @@
 //! Per-frame master resolution for light calibration (moved out of the
-//! `api` layer in Task 5 of the 2026-08-31 calibrated-export-v2 plan so a
-//! later export-side generator can reuse it without an export→api
-//! dependency). Pure, connection-level, no pixel I/O — resolves ONE light
-//! frame's calibration links (Dark/Flat/Bias) against the current catalog
-//! into everything the light-calibration engine + header builder + tracking
-//! row need.
+//! `api` layer in Task 5 of the 2026-08-31 calibrated-export-v2 plan so the
+//! export-side generator can reuse it without an export→api dependency).
+//! Pure, connection-level, no pixel I/O — resolves ONE light frame's
+//! calibration links (Dark/Flat/Bias) against the current catalog into
+//! everything the light-calibration engine and the header builder need. There
+//! is no tracking row: a calibrated artifact is a product of an export or a
+//! transfer, never a catalogued file.
 //!
-//! Errors are `anyhow::Error` (never `api::ApiError` — this module must not
-//! depend on `crate::api`, the whole point of the move); `api::lights` wraps
-//! the single `anyhow::Error` produced here back into its own error type at
-//! its call sites.
+//! Its consumer is `export::calibrated_generator::resolve_generation`. Errors
+//! are `anyhow::Error` (never `api::ApiError` — this module must not depend on
+//! `crate::api`, the whole point of the move), which is what the generator
+//! propagates and what an export turns into one frame's skip reason.
 
 use std::path::PathBuf;
 

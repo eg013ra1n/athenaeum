@@ -32,11 +32,12 @@ pub enum ExportRunOutcome {
 
 /// Admission → plan resolution → placement, in that order.
 ///
-/// The ORDER is the point, and it mirrors `api::lights::run_batch`: the compute
-/// slot is acquired FIRST, and the catalog connection is borrowed *inside* it
-/// and dropped before any pixel work. Resolving before the slot would hold a
-/// pooled connection for the whole queue wait — which can be an entire master
-/// build or another export — for no reason at all.
+/// The ORDER is the point: the compute slot is acquired FIRST, and the catalog
+/// connection is borrowed *inside* it and dropped before any pixel work.
+/// Resolving before the slot would hold a pooled connection for the whole queue
+/// wait — which can be an entire master build or another export — for no reason
+/// at all. `api::sync_prepare::open_generation` follows the same order for a
+/// transfer's package.
 ///
 /// A slot is taken only when the mode actually generates files. A plain copy
 /// export is not CPU work and must not queue behind master builds.
@@ -77,9 +78,13 @@ pub fn run_export_organize(
         None
     };
 
-    // Catalog phase: one short borrow resolves every marked light's plan, and
-    // the guard is dropped with this block — the pixel phase below holds no
-    // database connection.
+    // Catalog phase: one borrow resolves every marked light's plan, and the
+    // guard is dropped with this block — the pixel phase below holds no
+    // database connection. Not free, and not purely a catalog cost: resolving a
+    // light's flat-norm divisor reads the master flat's plane when the constant
+    // is not on a card. `GenerationBatch::resolve` memoizes that per (flat,
+    // mosaic phase) so the batch pays it once, but the FIRST such frame still
+    // reads a whole flat while this connection is held.
     let mut generation = if generates {
         let db = db(ctx)?;
         let conn = db.conn();

@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { AlertTriangle, Folder, Loader2, Play, Send } from 'lucide-react';
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  Folder,
+  Loader2,
+  Play,
+  Send,
+  SlidersHorizontal,
+} from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
@@ -16,11 +25,19 @@ import {
   readLightCalParamsPref,
   readHotPixelPref,
   readDebayerPref,
+  writeFlatNormPref,
+  writeFlatNormModePref,
+  writeLightCalParamsPref,
   writeHotPixelPref,
   writeDebayerPref,
 } from './lightCalPrefs';
 import type { CalibrationDetail, ExportMode } from '../../types/export';
-import type { ExportFileCounts, ExportReadiness } from '../../types/models';
+import type {
+  ExportFileCounts,
+  ExportReadiness,
+  FlatNormMode,
+  LightCalParams,
+} from '../../types/models';
 
 interface ExportTabProps {
   frameSetId: number;
@@ -104,11 +121,60 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // backend reads `export_mode` from that config, not from the invoke args).
   const [exportMode, setExportMode] = useState<ExportMode>(readExportModePref);
 
-  // Generation options for the calibrated-lights mode. Held in state (rather
-  // than read at click time) so the checkboxes are controlled; each write also
-  // persists, so the choice survives a reload.
+  // Generation options for the calibrated-lights mode (spec §2). Held in state
+  // (rather than read at click time) so every control is controlled; each write
+  // also persists, so the choice survives a reload. State — not a re-read at
+  // click time — is what the export submits, so a localStorage write that fails
+  // (private mode, quota) costs the memory of the choice, never the choice.
+  const [flatNorm, setFlatNorm] = useState<boolean>(readFlatNormPref);
+  const [flatNormMode, setFlatNormMode] = useState<FlatNormMode>(readFlatNormModePref);
+  const [params, setParams] = useState<LightCalParams>(readLightCalParamsPref);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [hotPixel, setHotPixel] = useState<boolean>(readHotPixelPref);
   const [debayer, setDebayer] = useState<boolean>(readDebayerPref);
+
+  // The two numeric Advanced fields keep their own string state so a partial
+  // edit ("0.") survives until it parses; `params` stays the committed numeric
+  // source of truth that is persisted and submitted.
+  const [trimInput, setTrimInput] = useState(() => String(readLightCalParamsPref().trimFraction));
+  const [pedestalInput, setPedestalInput] = useState(() => String(readLightCalParamsPref().pedestalDn));
+
+  const handleFlatNormChange = useCallback((on: boolean) => {
+    setFlatNorm(on);
+    writeFlatNormPref(on);
+  }, []);
+  const handleFlatNormModeChange = useCallback((mode: FlatNormMode) => {
+    setFlatNormMode(mode);
+    writeFlatNormModePref(mode);
+  }, []);
+  // One writer for every Advanced field: takes the updater, persists whatever it
+  // produced. Keeps the persist from being forgotten on a new field.
+  const updateParams = useCallback((patch: (p: LightCalParams) => LightCalParams) => {
+    setParams(prev => {
+      const next = patch(prev);
+      writeLightCalParamsPref(next);
+      return next;
+    });
+  }, []);
+  const handleTrimChange = useCallback((v: string) => {
+    setTrimInput(v);
+    const n = parseFloat(v);
+    if (!Number.isNaN(n)) {
+      updateParams(p => ({ ...p, trimFraction: Math.min(0.25, Math.max(0, n)) }));
+    }
+  }, [updateParams]);
+  const handlePedestalChange = useCallback((v: string) => {
+    setPedestalInput(v);
+    const n = parseFloat(v);
+    if (!Number.isNaN(n)) {
+      updateParams(p => ({ ...p, pedestalDn: Math.max(0, n) }));
+    }
+  }, [updateParams]);
+  // The trimmed-mean option names its own trim fraction, which the Advanced
+  // block can change — so it reads the live value rather than hard-coding the
+  // default and lying to anyone who edited it.
+  const trimPercentLabel = `${+(params.trimFraction * 100).toFixed(2)}%`;
+
   const handleHotPixelChange = useCallback((on: boolean) => {
     setHotPixel(on);
     writeHotPixelPref(on);
@@ -307,10 +373,13 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
       });
     }
     try {
+      // All five options come from the live controls above, not from a re-read
+      // of localStorage: the toggles are the user's answer, the storage is only
+      // the memory of it.
       await startExport(frameSetId, outputDir, useSymlinks, {
-        flatNorm: readFlatNormPref(),
-        flatNormMode: readFlatNormModePref(),
-        params: readLightCalParamsPref(),
+        flatNorm,
+        flatNormMode,
+        params,
         hotPixel,
         debayer,
       }, exportMode);
@@ -318,7 +387,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
       console.error('Failed to start export:', err);
       setExportError(typeof err === 'string' ? err : (err as Error)?.message ?? String(err));
     }
-  }, [frameSetId, outputDir, useSymlinks, exportMode, hotPixel, debayer, wbppConfig, saveWbppConfig, startExport]);
+  }, [frameSetId, outputDir, useSymlinks, exportMode, flatNorm, flatNormMode, params, hotPixel, debayer, wbppConfig, saveWbppConfig, startExport]);
 
   const canExport = outputDir !== '' && !exporting && modeReady;
   // Sending needs no output folder — the payload is staged by the backend.
@@ -433,28 +502,196 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               })}
             </div>
 
-            {/* Generation options — only this mode calibrates anything, so the
-                toggles appear with it instead of sitting inert in every mode. */}
+            {/* Generation options (spec §2) — only this mode calibrates
+                anything, so every calibration control appears with it instead
+                of sitting inert in the other three modes. Ported from the
+                retired standalone dialog: same options, same defaults, same
+                persistence keys (`lightCalPrefs.ts`), so a user's existing
+                choices carry over unchanged. */}
             {exportMode === 'calibratedLights' && (
-              <div className="mt-3 pt-3 border-t border-border space-y-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={hotPixel}
-                    onChange={e => handleHotPixelChange(e.target.checked)}
-                    className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
-                  />
-                  <span className="text-sm text-content-secondary">Hot-pixel correction</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={debayer}
-                    onChange={e => handleDebayerChange(e.target.checked)}
-                    className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
-                  />
-                  <span className="text-sm text-content-secondary">Debayer OSC lights (VNG)</span>
-                </label>
+              <div className="mt-3 pt-3 border-t border-border space-y-3">
+                {/* Flat normalization, with its statistic nested under it: the
+                    statistic only means something while normalization runs. */}
+                <div>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={flatNorm}
+                      onChange={e => handleFlatNormChange(e.target.checked)}
+                      className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+                    />
+                    <span className="text-sm text-content-secondary">
+                      Normalize master flat (recommended)
+                    </span>
+                  </label>
+
+                  {flatNorm && (
+                    <div className="mt-2 ml-6 space-y-1.5">
+                      <div className="text-xs text-content-muted">Normalization statistic</div>
+                      <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer">
+                        <input
+                          type="radio"
+                          name="export-flatnorm-mode"
+                          checked={flatNormMode === 'centralThird'}
+                          onChange={() => handleFlatNormModeChange('centralThird')}
+                          className="w-3.5 h-3.5 text-accent border-border focus:ring-accent"
+                        />
+                        Central third mean (Athenaeum)
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer">
+                        <input
+                          type="radio"
+                          name="export-flatnorm-mode"
+                          checked={flatNormMode === 'pixinsightTrimmed'}
+                          onChange={() => handleFlatNormModeChange('pixinsightTrimmed')}
+                          className="w-3.5 h-3.5 text-accent border-border focus:ring-accent"
+                        />
+                        Full-frame trimmed mean ({trimPercentLabel} per tail)
+                      </label>
+
+                      {/* Per-channel CFA scaling refines the statistic, so it
+                          lives under the statistic it refines. Unavailable in
+                          the trimmed mode, which is measured whole-frame. */}
+                      <label
+                        className={`flex items-center gap-2 text-xs pt-1 ${
+                          flatNormMode === 'pixinsightTrimmed'
+                            ? 'text-content-muted cursor-not-allowed'
+                            : 'text-content-secondary cursor-pointer'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={params.cfaFlatScaling && flatNormMode !== 'pixinsightTrimmed'}
+                          disabled={flatNormMode === 'pixinsightTrimmed'}
+                          onChange={e =>
+                            updateParams(prev => ({ ...prev, cfaFlatScaling: e.target.checked }))
+                          }
+                          className="w-3.5 h-3.5 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+                        />
+                        Per-channel CFA flat scaling
+                      </label>
+                      <p className="text-[11px] text-content-muted ml-6">
+                        {flatNormMode === 'pixinsightTrimmed'
+                          ? 'Not available with the full-frame trimmed mean — that statistic is measured across all channels at once.'
+                          : 'Applies to color (CFA) lights; mono lights are unaffected.'}
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={hotPixel}
+                      onChange={e => handleHotPixelChange(e.target.checked)}
+                      className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+                    />
+                    <span className="text-sm text-content-secondary">Hot-pixel correction</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={debayer}
+                      onChange={e => handleDebayerChange(e.target.checked)}
+                      className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+                    />
+                    <span className="text-sm text-content-secondary">Debayer OSC lights (VNG)</span>
+                  </label>
+                </div>
+
+                {/* Advanced parameters (spec §2) — collapsed and secondary by
+                    design: the defaults are right for almost every run, and the
+                    two numeric ones change what the output pixels mean. */}
+                <div className="pt-2 border-t border-border/60">
+                  <button
+                    type="button"
+                    onClick={() => setAdvancedOpen(o => !o)}
+                    className="flex items-center gap-1.5 text-xs font-medium text-content-secondary hover:text-content transition-colors"
+                  >
+                    {advancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    <SlidersHorizontal size={12} className="text-content-muted" />
+                    Advanced
+                  </button>
+
+                  {advancedOpen && (
+                    <div className="mt-3 ml-1 space-y-3">
+                      {/* The trim fraction only exists in the trimmed statistic. */}
+                      {flatNorm && flatNormMode === 'pixinsightTrimmed' && (
+                        <div>
+                          <label className="block text-xs text-content-secondary mb-1">
+                            Flat trim fraction (per tail)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            max={0.25}
+                            step={0.01}
+                            value={trimInput}
+                            onChange={e => handleTrimChange(e.target.value)}
+                            className="w-28 px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent"
+                          />
+                          <p className="text-[11px] text-content-muted mt-1">
+                            Fraction discarded from each tail of the trimmed mean (default 0.05).
+                          </p>
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="block text-xs text-content-secondary mb-1">
+                          Output pedestal (DN)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={pedestalInput}
+                          onChange={e => handlePedestalChange(e.target.value)}
+                          className="w-28 px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent"
+                        />
+                        <p className="text-[11px] text-content-muted mt-1">
+                          Added after the scale divide, for consumers that clip negatives. 0 = negatives
+                          preserved.
+                        </p>
+                      </div>
+
+                      <div>
+                        <div className="text-xs text-content-secondary mb-1">
+                          Lights with no dark master
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-content-secondary mb-1 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="export-bias-fallback"
+                            checked={params.biasFallback === 'subtractBias'}
+                            onChange={() =>
+                              updateParams(prev => ({ ...prev, biasFallback: 'subtractBias' }))
+                            }
+                            className="w-3.5 h-3.5 text-accent border-border focus:ring-accent"
+                          />
+                          Subtract bias (calibrate best-effort)
+                        </label>
+                        <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer">
+                          <input
+                            type="radio"
+                            name="export-bias-fallback"
+                            checked={params.biasFallback === 'skipFrame'}
+                            onChange={() =>
+                              updateParams(prev => ({ ...prev, biasFallback: 'skipFrame' }))
+                            }
+                            className="w-3.5 h-3.5 text-accent border-border focus:ring-accent"
+                          />
+                          Skip the frame (never bias-only)
+                        </label>
+                        <p className="text-[11px] text-content-muted mt-1">
+                          When a light has no matched dark master, either subtract its linked bias or
+                          skip that frame — a skipped frame is reported as an export warning, never
+                          silently absent.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </section>

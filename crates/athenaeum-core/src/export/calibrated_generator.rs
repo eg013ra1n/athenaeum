@@ -178,6 +178,68 @@ fn bayer_for(geom: CfaGeometry) -> BayerPattern {
     }
 }
 
+/// Cache key for one resolved flat-normalization divisor: the master flat's
+/// path plus the LIGHT's mosaic phase, folded the way
+/// [`CfaGeometry::same_phase`] folds it — pattern plus offsets MODULO 2,
+/// because that is the only part of them the divisor depends on. Two lights
+/// declaring `XBAYROFF` 0 and 2 therefore share one entry instead of paying
+/// for the same plane read twice.
+type DivisorKey = (PathBuf, Option<(&'static str, i64, i64)>);
+
+fn divisor_key(flat_path: &str, cfa: Option<CfaGeometry>) -> DivisorKey {
+    (
+        PathBuf::from(flat_path),
+        cfa.map(|g| {
+            (
+                g.pattern.as_str(),
+                g.xoff.rem_euclid(2),
+                g.yoff.rem_euclid(2),
+            )
+        }),
+    )
+}
+
+/// One run's memo of resolved flat-normalization divisors.
+///
+/// [`resolve_flat_norm_divisor`] costs a FULL read of the master flat's plane
+/// whenever the constant cannot come off a card — an imported flat with no
+/// `ATH_FNRM`/`ATH_FNR[GB]`, or an Athenaeum flat whose stamped phase
+/// disagrees with the light's. It is resolved once per LIGHT, so a 200-frame
+/// set sharing one such flat used to read that plane 200 times. The divisor
+/// depends only on the flat, the light's mosaic phase and the run's options,
+/// so within one batch each distinct pair needs computing exactly once.
+///
+/// **A cache belongs to exactly one [`CalibratedLightOptions`].** The
+/// normalization mode, the trim fraction and the per-channel switch are part
+/// of what the divisor depends on and are deliberately NOT in the key: a batch
+/// resolves every frame under one fixed `opts`, so they are constant for the
+/// cache's whole life. Never share a cache across two option sets. A
+/// single-frame caller passes a throwaway one and pays nothing.
+#[derive(Default)]
+pub struct DivisorCache {
+    entries: HashMap<DivisorKey, FlatNormDivisor>,
+}
+
+impl DivisorCache {
+    /// An empty cache. Equivalent to [`Default::default`]; named so a call site
+    /// reads as "this batch starts its own memo".
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many distinct (flat, phase) pairs have been resolved. The memo's
+    /// observable effect — a test asserting the plane was read once asserts on
+    /// this rather than on timing.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing has been resolved yet.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Catalog phase: resolve ONE light frame's calibration links into a complete
 /// plan, including the output header.
 ///
@@ -192,11 +254,28 @@ fn bayer_for(geom: CfaGeometry) -> BayerPattern {
 /// or the run scales per CFA channel), and a decode-and-spill source needs
 /// somewhere to land. Pass the same directory later handed to
 /// [`execute_generation`].
+///
+/// This is the single-frame form: it allocates its own throwaway
+/// [`DivisorCache`], so a caller resolving a whole batch should use
+/// [`resolve_generation_cached`] instead and keep one cache across the loop.
 pub fn resolve_generation(
     conn: &Connection,
     frame_id: i64,
     opts: &CalibratedLightOptions,
     scratch_dir: &Path,
+) -> anyhow::Result<GenerationSpec> {
+    resolve_generation_cached(conn, frame_id, opts, scratch_dir, &mut DivisorCache::new())
+}
+
+/// [`resolve_generation`] with the run's flat-normalization memo threaded
+/// through — see [`DivisorCache`] for what it saves and the one invariant it
+/// asks for (one cache per `opts`).
+pub fn resolve_generation_cached(
+    conn: &Connection,
+    frame_id: i64,
+    opts: &CalibratedLightOptions,
+    scratch_dir: &Path,
+    divisors: &mut DivisorCache,
 ) -> anyhow::Result<GenerationSpec> {
     let resolved = resolve_frame_inputs(conn, frame_id, opts.flat_norm)?;
 
@@ -215,13 +294,26 @@ pub fn resolve_generation(
     let calstat = compute_calstat(dark_applied, bias_applied, flat_applied);
 
     let divisor = match (&resolved.flat, opts.flat_norm) {
-        (Some(m), true) => resolve_flat_norm_divisor(
-            Path::new(&m.path),
-            scratch_dir,
-            opts.flat_norm_mode,
-            &opts.params,
-            resolved.cfa_geometry,
-        )?,
+        (Some(m), true) => {
+            // Memoized per (flat, light phase): the miss path can read the
+            // whole flat plane, and a set's lights overwhelmingly share one
+            // flat and one phase.
+            let key = divisor_key(&m.path, resolved.cfa_geometry);
+            match divisors.entries.get(&key) {
+                Some(d) => *d,
+                None => {
+                    let d = resolve_flat_norm_divisor(
+                        Path::new(&m.path),
+                        scratch_dir,
+                        opts.flat_norm_mode,
+                        &opts.params,
+                        resolved.cfa_geometry,
+                    )?;
+                    divisors.entries.insert(key, d);
+                    d
+                }
+            }
+        }
         _ => FlatNormDivisor::Global(1.0),
     };
     let flat_norm_divisor = divisor.global_value();
@@ -951,6 +1043,65 @@ mod tests {
             "two frames sharing one dark must measure it once"
         );
         assert_eq!(hot_maps.values().next().unwrap().len(), 2);
+    }
+
+    /// Resolving a light's flat-normalization divisor reads the master flat's
+    /// ENTIRE plane whenever the constant is not on a card (an imported flat,
+    /// or a phase disagreement) — and resolution runs once per light. A batch
+    /// must therefore compute each distinct (flat, mosaic phase) pair once.
+    ///
+    /// Proven two ways, because a cache-size assertion alone would still pass
+    /// if the miss path ran twice and overwrote its own entry: the flat file is
+    /// DELETED between the two resolves, so the second frame can only succeed
+    /// by reading the memo, and the divisor it lands on must be the identical
+    /// number the first frame stamped.
+    #[test]
+    fn flat_norm_divisor_memoized_across_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let light_a = write_plane(&dir.path().join("light_a.fits"), |_, _| 1000.0);
+        let light_b = write_plane(&dir.path().join("light_b.fits"), |_, _| 1200.0);
+        // No ATH_FNRM card (write_plane writes none), so the divisor can only
+        // come from the pixels — the path the memo exists for.
+        let flat = write_plane(&dir.path().join("flat.fits"), |x, _| 800.0 + x as f32);
+        let conn = seed_db();
+        seed_light(&conn, 1, &light_a, None, None);
+        seed_light(&conn, 2, &light_b, None, None);
+        seed_master_set(&conn, 20, "Flat", &flat);
+        add_link(&conn, 1, 20, "Flat");
+        add_link(&conn, 2, 20, "Flat");
+
+        let opts = CalibratedLightOptions::default();
+        assert!(
+            opts.flat_norm,
+            "the memo only runs while normalization is on"
+        );
+        let mut divisors = DivisorCache::new();
+        assert!(divisors.is_empty());
+
+        let spec_a = resolve_generation_cached(&conn, 1, &opts, dir.path(), &mut divisors).unwrap();
+        assert_eq!(divisors.len(), 1, "the first light resolves the flat once");
+
+        // The plane is gone. A second read would fail; the memo cannot.
+        std::fs::remove_file(&flat).unwrap();
+        let spec_b = resolve_generation_cached(&conn, 2, &opts, dir.path(), &mut divisors).unwrap();
+        assert_eq!(
+            divisors.len(),
+            1,
+            "two lights sharing one flat must resolve its divisor once"
+        );
+
+        let fnm = |spec: &GenerationSpec| {
+            spec.cards
+                .iter()
+                .find(|c| c.keyword == "ATH_CFNM")
+                .map(|c| format!("{:?}", c.value))
+        };
+        assert!(fnm(&spec_a).is_some(), "a normalized flat stamps ATH_CFNM");
+        assert_eq!(
+            fnm(&spec_a),
+            fnm(&spec_b),
+            "the memoized divisor must be the same number, not a re-derived one"
+        );
     }
 
     /// The pattern handed to the debayer must describe the SAME mosaic the
