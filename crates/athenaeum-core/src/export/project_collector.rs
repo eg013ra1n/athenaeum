@@ -736,7 +736,11 @@ mod tests {
             "no own dataset while the own side is blocked; got {:?}",
             data.publishers.iter().map(|(d, _)| d).collect::<Vec<_>>()
         );
-        assert_eq!(all_frames(find(&data, "Alice")).len(), 1, "received side unaffected");
+        assert_eq!(
+            all_frames(find(&data, "Alice")).len(),
+            1,
+            "received side unaffected"
+        );
         assert_eq!(
             data.warnings.len(),
             2,
@@ -744,7 +748,9 @@ mod tests {
             data.warnings
         );
         assert!(
-            data.warnings.iter().all(|w| w.contains("no calibrated output")),
+            data.warnings
+                .iter()
+                .all(|w| w.contains("no calibrated output")),
             "each skip names the missing artifact; got {:?}",
             data.warnings
         );
@@ -851,7 +857,13 @@ mod tests {
         let me = find(&data, "Me");
         let frames = all_frames(me);
         assert_eq!(frames.len(), 1, "exactly the received copy");
-        assert_eq!(frames[0].filename, "dup.fits", "the received copy, not an own output");
-        assert_eq!(frames[0].frame_id, -1, "received frames carry no catalog id");
+        assert_eq!(
+            frames[0].filename, "dup.fits",
+            "the received copy, not an own output"
+        );
+        assert_eq!(
+            frames[0].frame_id, -1,
+            "received frames carry no catalog id"
+        );
     }
 }

@@ -13,9 +13,11 @@
 //! - **Match** — cached projects whose target radius contains a point and that
 //!   aren't already linked to a set (the Task-6 auto-link hook).
 //!
-//! Render-gated (`api/mod.rs`) because publishing consumes the render-only
-//! package/stamping surface; the `crate::collab` core module and `db::collab`
-//! stay ungated so the headless/perseus `--no-default-features` build compiles.
+//! Render-gated (`api/mod.rs`) because [`publish_collab_frames`] calls the
+//! render-gated `api::sync::unique_rel_path` (the old reason — an `api::lights`
+//! import for `frame_cal_status` — went away with spec 2026-08-31 §8a); the
+//! `crate::collab` core module and `db::collab` stay ungated so the
+//! headless/perseus `--no-default-features` build compiles.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -3081,6 +3083,64 @@ mod tests {
         assert_eq!(retained, 0, "the retained publication dir is dropped too");
 
         node.shutdown().await;
+    }
+
+    /// Decision C (spec 2026-08-31 §8a) is PINNED here, not merely documented:
+    /// a set whose frames satisfy every OTHER layer-1 precondition — on target,
+    /// known pixel scale, analyzed, not trailed, no threshold rules — is still
+    /// refused, and the calibration precondition is the ONLY reason given.
+    ///
+    /// Two assertions carry the pin:
+    ///   1. every gate row fails with EXACTLY one reason, the calibration one —
+    ///      so the block is the constant, not some other precondition quietly
+    ///      doing the work;
+    ///   2. publish fails with the gate-level `"no publishable frames"`, not the
+    ///      artifact-level `"no publishable frames — every calibrated artifact
+    ///      is missing on disk"` that a `Calibrated` constant would produce.
+    ///
+    /// Flipping the constant to `Calibrated` (or restoring a resolver that says
+    /// so) turns this red on assertion 2. No hub is wired: the gate rejects
+    /// above the announce call. No `light_calibrations` dependency, so it
+    /// survives the table drop.
+    #[tokio::test]
+    async fn decision_c_blocks_publish_of_gate_eligible_frames() {
+        let (_tmp, ctx) = test_ctx();
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-dc-1", "uuid-dc-2"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        // 1. The frames are gate-eligible in every respect but calibration.
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 2, "both LIGHT frames are candidates");
+        assert_eq!(report.publishable, 0, "decision C blocks all of them");
+        for row in &report.rows {
+            assert_eq!(
+                row.failures,
+                vec!["not calibrated (NotCalibrated)".to_string()],
+                "calibration must be the SOLE failure — otherwise this test is \
+                 pinning some other precondition; frame {} got {:?}",
+                row.frame_id,
+                row.failures
+            );
+        }
+
+        // 2. Publish refuses at the gate, above any hub call.
+        let sender = crate::sync::SyncSenderRuntime::new();
+        let err = publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .expect_err("decision C must block publishing");
+        match err {
+            ApiError::Invalid(msg) => assert_eq!(
+                msg, "no publishable frames",
+                "the GATE-level refusal, not the artifact-level one a \
+                 `Calibrated` status would reach"
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     /// An empty gate (no publishable frames) is an `Invalid`, never a panic.

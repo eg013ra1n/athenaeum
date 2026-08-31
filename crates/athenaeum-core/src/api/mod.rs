@@ -52,10 +52,14 @@ pub mod masters;
 #[cfg(feature = "render")]
 pub mod export;
 // Stage-II collaboration orchestration (slice 3, Task 4): linking, ranked
-// suggestions, per-frame gate report, portal deep-link intents. Render-gated
-// because it imports `api::lights` internals (`frame_cal_status`); the
-// `crate::collab` core module and `db::collab` stay ungated. Keeping this gated
-// preserves `cargo build -p perseus --no-default-features`.
+// suggestions, per-frame gate report, portal deep-link intents. The old
+// rationale — an `api::lights` import for `frame_cal_status` — no longer holds:
+// the gate's calibration status is a constant while collab publish is deferred
+// (spec 2026-08-31 §8a, rework pending). What still forces the gate is
+// `publish_collab_frames`'s call into the render-gated
+// `api::sync::unique_rel_path`; the `crate::collab` core module and `db::collab`
+// stay ungated. Keeping this gated preserves
+// `cargo build -p perseus --no-default-features`.
 #[cfg(feature = "render")]
 pub mod collab;
 

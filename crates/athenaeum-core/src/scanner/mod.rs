@@ -3110,8 +3110,16 @@ mod calibrated_light_scan_tests {
             .unwrap();
 
             let result = run_scan(parallel, root.path(), &conn, 1);
-            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
-            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: no files row");
+            assert!(
+                result.errors.is_empty(),
+                "parallel={parallel}: {:?}",
+                result.errors
+            );
+            assert_eq!(
+                files_count(&conn, &cal_str),
+                0,
+                "parallel={parallel}: no files row"
+            );
 
             // The catalog is exactly what it was before the scan: the seeded
             // source frame, and nothing the artifact contributed.
@@ -3121,8 +3129,14 @@ mod calibrated_light_scan_tests {
             let frames_total: i64 = conn
                 .query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(files_total, 1, "parallel={parallel}: artifact contributed no files row");
-            assert_eq!(frames_total, 1, "parallel={parallel}: artifact contributed no frames row");
+            assert_eq!(
+                files_total, 1,
+                "parallel={parallel}: artifact contributed no files row"
+            );
+            assert_eq!(
+                frames_total, 1,
+                "parallel={parallel}: artifact contributed no frames row"
+            );
 
             // Transitional — Task 11 deletes this table together with this
             // assertion. It is what actually goes red on the retired adopt
