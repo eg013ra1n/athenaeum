@@ -220,6 +220,20 @@ pub struct LightCalOutcome {
     pub floored_flat_pixels: u64,
 }
 
+/// One calibrated image plane held in RAM, handed from the compute phase to the
+/// write phase.
+///
+/// The split exists so intermediate pixel stages can run between the formula
+/// and the file write without either phase knowing about them. `data` is
+/// row-major and `width * height` long — a stage that turns one plane into
+/// several hands its own buffer straight to [`write_calibrated_output`], which
+/// takes the channel count as a parameter for exactly that reason.
+pub struct CalibratedFrame {
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<f32>,
+}
+
 /// Calibrate one LIGHT frame and write the result to `inputs.output_path`.
 ///
 /// Cancellation is cooperative: checked once per band before any pixel work,
@@ -231,6 +245,42 @@ pub fn calibrate_light(
     calibrate_light_inner(inputs, cancel, BAND_BUDGET_BYTES)
 }
 
+/// The formula pass on its own — everything [`calibrate_light`] does EXCEPT the
+/// file write and the hash, so a caller can put its own pixel stages between
+/// the two halves.
+///
+/// The returned outcome is complete but for [`LightCalOutcome::output_hash`],
+/// which stays empty until [`write_calibrated_output`] produces it. Nothing is
+/// written to `inputs.output_path` here; that path is the write phase's
+/// business, and a caller is free to write the result somewhere else entirely.
+///
+/// Cancellation is cooperative, checked once per band before any pixel work.
+pub fn calibrate_light_compute(
+    inputs: &LightCalInputs,
+    cancel: &AtomicBool,
+) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
+    calibrate_light_compute_inner(inputs, cancel, BAND_BUDGET_BYTES)
+}
+
+/// Write a calibrated plane to `path` and return the xxh3 of the written file.
+///
+/// The write is atomic — [`write_fits_f32`] stages a sibling temp file and
+/// renames it into place, so a failed write never truncates a good file already
+/// sitting at `path`. `channels` is a parameter rather than the constant `1`
+/// because a debayered frame goes out through this same door.
+pub fn write_calibrated_output(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[Card],
+) -> Result<String, IntegrationError> {
+    write_fits_f32(path, width, height, channels, data, cards)
+        .map_err(|e| io_err(format!("writing {}: {e}", path.display())))?;
+    compute_xxhash(path).map_err(|e| io_err(format!("hashing {}: {e:#}", path.display())))
+}
+
 /// [`calibrate_light`] with the band-memory budget as a parameter, so tests can
 /// force a multi-band run on a small fixture (the integration engine's
 /// `integrate_flat_inner` takes its band size the same way).
@@ -239,6 +289,38 @@ fn calibrate_light_inner(
     cancel: &AtomicBool,
     band_budget_bytes: usize,
 ) -> Result<LightCalOutcome, IntegrationError> {
+    let (frame, mut outcome) = calibrate_light_compute_inner(inputs, cancel, band_budget_bytes)?;
+    outcome.output_hash = write_calibrated_output(
+        &inputs.output_path,
+        frame.width,
+        frame.height,
+        1,
+        &frame.data,
+        &inputs.cards,
+    )?;
+
+    tracing::debug!(
+        src = %inputs.light_path.display(),
+        dest = %inputs.output_path.display(),
+        calstat = %outcome.calstat,
+        flat_norm_divisor = outcome.flat_norm_divisor,
+        cfa_scaling_applied = outcome.cfa_scaling_applied,
+        width = frame.width,
+        height = frame.height,
+        floored_flat_pixels = outcome.floored_flat_pixels,
+        "light calibrated"
+    );
+
+    Ok(outcome)
+}
+
+/// [`calibrate_light_compute`] with the band-memory budget as a parameter, for
+/// the same reason [`calibrate_light_inner`] takes one.
+fn calibrate_light_compute_inner(
+    inputs: &LightCalInputs,
+    cancel: &AtomicBool,
+    band_budget_bytes: usize,
+) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
     // Subtrahend: dark preferred, else bias (spec §2 fallback order). The
     // calstat prefix records what was actually subtracted.
     let (subtrahend, calstat_base): (Option<&PathBuf>, &str) =
@@ -370,37 +452,24 @@ fn calibrate_light_inner(
         );
     }
 
-    write_fits_f32(&inputs.output_path, w, h, 1, &out, &inputs.cards)
-        .map_err(|e| io_err(format!("writing {}: {e}", inputs.output_path.display())))?;
-    let output_hash = compute_xxhash(&inputs.output_path)
-        .map_err(|e| io_err(format!("hashing {}: {e:#}", inputs.output_path.display())))?;
-
     let calstat = if has_flat {
         format!("{calstat_base}F")
     } else {
         calstat_base.to_string()
     };
 
-    tracing::debug!(
-        src = %inputs.light_path.display(),
-        dest = %inputs.output_path.display(),
-        calstat = %calstat,
-        flat_norm_divisor,
-        cfa_scaling_applied = divisor.is_per_channel(),
-        width = w,
-        height = h,
-        floored_flat_pixels,
-        "light calibrated"
-    );
-
-    Ok(LightCalOutcome {
-        calstat,
-        flat_norm_divisor,
-        flat_channel_divisors: divisor.channel_values(),
-        cfa_scaling_applied: divisor.is_per_channel(),
-        output_hash,
-        floored_flat_pixels,
-    })
+    Ok((
+        CalibratedFrame { width: w, height: h, data: out },
+        LightCalOutcome {
+            calstat,
+            flat_norm_divisor,
+            flat_channel_divisors: divisor.channel_values(),
+            cfa_scaling_applied: divisor.is_per_channel(),
+            // Empty until the write phase hashes the file it produced.
+            output_hash: String::new(),
+            floored_flat_pixels,
+        },
+    ))
 }
 
 /// Resolve how `flat_path` normalizes: one constant for the whole frame, or one
@@ -1647,5 +1716,77 @@ mod tests {
         let r = calibrate_light(&cfg, &cancel);
         assert!(matches!(r, Err(IntegrationError::Cancelled)), "expected Cancelled, got {r:?}");
         assert!(!out.exists(), "cancelled run must leave no output file");
+    }
+
+    /// The compute/write split is a pure refactor: running the two phases by
+    /// hand must produce the SAME file bytes and the SAME outcome as the
+    /// one-shot [`calibrate_light`]. Pins the seam a later task inserts
+    /// hot-pixel correction and debayering into — if the split ever starts
+    /// dropping a step (the flat divisor, the pedestal, the floored counter,
+    /// the header cards), this diverges.
+    #[test]
+    fn compute_then_write_equals_calibrate_light() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 9usize);
+        // Full BDF path with a non-trivial flat, a real header card and a
+        // pedestal, so every field the split carries across is exercised.
+        let light = write_fill(dir.path(), "light.fits", w, h, |x, y| 1000.0 + (x + y * w) as f32, &[]);
+        let dark = write_plane(dir.path(), "dark.fits", w, h, 100.0, &[]);
+        // One dead flat pixel so the floored counter is NON-zero: comparing
+        // `0 == 0` would pass even if the split dropped the counter entirely.
+        // The `ATH_FNRM` card still fixes the divisor at 2.0 (card path, no
+        // recompute), so the dead pixel does not move `flat_norm_divisor`.
+        let flat = write_fill(
+            dir.path(),
+            "flat.fits",
+            w,
+            h,
+            |x, y| if (x, y) == (3, 4) { 0.0 } else { 2.0 },
+            &[fnrm_card(2.0)],
+        );
+        let cards = vec![Card::new("OBJECT", CardValue::Str("M42".into())).unwrap()];
+
+        let out_a = dir.path().join("out_a.fits");
+        let mut cfg_a = inputs(
+            dir.path(),
+            light.clone(),
+            Some(dark.clone()),
+            None,
+            Some(flat.clone()),
+            true,
+            out_a.clone(),
+        );
+        cfg_a.params.pedestal_dn = 50.0;
+        cfg_a.cards = cards.clone();
+        let outcome_a = calibrate_light(&cfg_a, &AtomicBool::new(false)).unwrap();
+
+        let out_b = dir.path().join("out_b.fits");
+        let mut cfg_b = inputs(dir.path(), light, Some(dark), None, Some(flat), true, out_b.clone());
+        cfg_b.params.pedestal_dn = 50.0;
+        cfg_b.cards = cards;
+        let (frame, outcome_b) = calibrate_light_compute(&cfg_b, &AtomicBool::new(false)).unwrap();
+        // The compute phase writes nothing and hashes nothing.
+        assert!(outcome_b.output_hash.is_empty(), "compute must not hash");
+        assert!(!out_b.exists(), "compute must not write");
+        assert_eq!((frame.width, frame.height), (w, h));
+        assert_eq!(frame.data.len(), w * h);
+        let hash_b = write_calibrated_output(
+            &out_b,
+            frame.width,
+            frame.height,
+            1,
+            &frame.data,
+            &cfg_b.cards,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&out_a).unwrap(), std::fs::read(&out_b).unwrap(), "file bytes differ");
+        assert_eq!(outcome_a.output_hash, hash_b, "hash differs");
+        assert_eq!(outcome_a.calstat, outcome_b.calstat);
+        assert_eq!(outcome_a.flat_norm_divisor, outcome_b.flat_norm_divisor);
+        assert_eq!(outcome_a.flat_channel_divisors, outcome_b.flat_channel_divisors);
+        assert_eq!(outcome_a.cfa_scaling_applied, outcome_b.cfa_scaling_applied);
+        assert_eq!(outcome_a.floored_flat_pixels, outcome_b.floored_flat_pixels);
+        assert!(outcome_a.floored_flat_pixels > 0, "fixture must exercise the floor");
     }
 }

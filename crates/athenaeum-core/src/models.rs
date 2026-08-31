@@ -1128,13 +1128,24 @@ pub struct CatalogMeta {
 // engine (gated behind the `render` feature) re-exports them for its callers.
 // ---------------------------------------------------------------------------
 
-/// Bump when the calibration math changes — every existing tracking row then
-/// derives as stale (see `crate::db::light_calibrations::derive_status`, which
-/// re-exports this constant). Single definition lives here.
+/// Bump when the calibration math or the engine's output surface changes — a
+/// stamped `ATH_CVER` then tells a consumer which engine produced the file, and
+/// an older stamp reads as out of date (today that is
+/// `crate::db::light_calibrations::derive_status`, which derives every existing
+/// tracking row as stale).
+///
+/// The single definition lives HERE, not next to the engine: the `ATH_CVER`
+/// stamp itself sits in `calibration_library::light_headers`, which is ungated,
+/// while the engine (`calibration_library::light_cal`) is behind the `render`
+/// feature — a definition inside the engine would not compile headless. The
+/// engine re-exports this constant so `light_cal::LIGHT_CAL_ENGINE_VERSION`
+/// stays a valid path for its render-gated callers.
 ///
 /// - `2`: flat denominator floored at `FLAT_DENOM_FLOOR`, and the output scale
 ///   divisor follows the source's BITPIX instead of a hardcoded 65535.
-pub const LIGHT_CAL_ENGINE_VERSION: i64 = 2;
+/// - `3`: the engine's output surface grew — cosmetic hot-pixel correction and
+///   the OSC debayer stage, with the cards that record them.
+pub const LIGHT_CAL_ENGINE_VERSION: i64 = 3;
 
 /// Fraction of pixels discarded from EACH tail by the PixInsight-compatible
 /// trimmed mean (`FlatNormMode::PixinsightTrimmed`). Matches PixInsight

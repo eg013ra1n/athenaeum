@@ -162,7 +162,7 @@ pub fn build_light_cal_cards(
         .custom(
             Card::new(
                 "ATH_CVER",
-                CardValue::Integer(crate::db::light_calibrations::LIGHT_CAL_ENGINE_VERSION),
+                CardValue::Integer(crate::models::LIGHT_CAL_ENGINE_VERSION),
             )?
             .with_comment("calibration engine version"),
         );
@@ -337,7 +337,7 @@ mod tests {
         let ver = find("ATH_CVER").expect("ATH_CVER card");
         assert!(matches!(
             ver.value,
-            Some(CardValue::Integer(v)) if v == crate::db::light_calibrations::LIGHT_CAL_ENGINE_VERSION
+            Some(CardValue::Integer(v)) if v == crate::models::LIGHT_CAL_ENGINE_VERSION
         ));
 
         // ATH_CPED is stamped ALWAYS (0.0 here); ATH_CTRM only in PI mode (absent).
