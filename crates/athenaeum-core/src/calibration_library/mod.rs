@@ -5,6 +5,10 @@
 //! relink, and supersede.
 
 pub mod headers;
+// Hot-pixel cosmetic correction reads a master dark through the render-gated
+// `integration` module, same as the light-calibration engine below.
+#[cfg(feature = "render")]
+pub mod cosmetic;
 // The light-calibration engine streams raw pixels via the render-gated
 // `integration` module. Its shared data types (FlatNormMode, BiasFallback,
 // LightCalParams, LIGHT_CAL_ENGINE_VERSION, PI_TRIM_FRACTION) live in `models`
