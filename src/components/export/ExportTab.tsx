@@ -14,7 +14,7 @@ import {
   readFlatNormPref,
   readFlatNormModePref,
   readLightCalParamsPref,
-} from '../calibration/CalibrateLightsDialog';
+} from './lightCalPrefs';
 import type { CalibrationDetail, ExportMode } from '../../types/export';
 import type { ExportFileCounts, ExportReadiness } from '../../types/models';
 
@@ -37,13 +37,19 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; cou
   { value: 'calibratedLights', label: 'Calibrated lights', hint: 'c_*.fits calibrated artifacts, no calibration frames — WBPP runs with calibration disabled.', count: c => c.calibratedLights },
 ];
 
-/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready`. */
+/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` — including
+ *  the calibrated mode's blocker ORDER (masters before links: a build is what
+ *  can also change where a light's links resolve to). */
 function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
+  const noMaster = `Build masters first — ${r.rawSetsWithoutMaster} set${r.rawSetsWithoutMaster === 1 ? '' : 's'} without a master`;
   if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
-    return `Build masters first — ${r.rawSetsWithoutMaster} set${r.rawSetsWithoutMaster === 1 ? '' : 's'} without a master`;
+    return noMaster;
   }
-  if (mode === 'calibratedLights' && r.stale + r.missing > 0) {
-    return `Calibrate lights first — ${r.stale} stale, ${r.missing} missing`;
+  if (mode === 'calibratedLights') {
+    if (r.rawSetsWithoutMaster > 0) return noMaster;
+    if (r.unlinkedLights > 0) {
+      return `${r.unlinkedLights} light${r.unlinkedLights === 1 ? '' : 's'} ${r.unlinkedLights === 1 ? 'has' : 'have'} no calibration links`;
+    }
   }
   return null;
 }
@@ -120,15 +126,10 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
     let cancelled = false;
     setReadinessLoading(true);
     setReadinessError(null);
-    // Resolve staleness against the exact prefs Calibrate Lights would submit,
-    // so the tally agrees with what the backend gate will compute.
+    // No calibration prefs: readiness is about the INPUTS (masters built,
+    // lights linked), which no dialog toggle can change.
     api
-      .invoke<ExportReadiness>('get_export_readiness', {
-        setId: frameSetId,
-        flatNorm: readFlatNormPref(),
-        flatNormMode: readFlatNormModePref(),
-        params: readLightCalParamsPref(),
-      })
+      .invoke<ExportReadiness>('get_export_readiness', { setId: frameSetId })
       .then(r => { if (!cancelled) setReadiness(r); })
       .catch(err => {
         if (cancelled) return;
@@ -393,8 +394,13 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                               e.stopPropagation();
                               // handleSetClick resolves the set's REAL kind from
                               // setKindMap — a flat or bias set without a master
-                              // must not land on the Dark library.
-                              const first = opt.value === 'rawWithMasters' ? readiness?.rawSetIdsWithoutMaster[0] : undefined;
+                              // must not land on the Dark library. Deep-link only
+                              // when the missing master IS the blocker: the
+                              // calibrated mode can also be blocked by unlinked
+                              // lights, which no set row explains.
+                              const first = (readiness?.rawSetsWithoutMaster ?? 0) > 0
+                                ? readiness?.rawSetIdsWithoutMaster[0]
+                                : undefined;
                               if (first !== undefined) handleSetClick(first);
                               else navigate('?tab=calibration');
                             }}

@@ -87,14 +87,20 @@ pub struct ExportToWbppArgs {
     /// command). Optional so pre-mode-UI callers keep working.
     #[serde(default)]
     pub export_mode: Option<ExportMode>,
-    /// Calibration preferences used only by the `calibratedLights` strict gate
-    /// (spec §12.2); optional so the pre-mode-UI frontend keeps working
-    /// (default: normalize ON).
+    /// Calibration preferences for the `calibratedLights` mode. They no longer
+    /// feed the readiness gate (readiness is input-shaped now — see
+    /// `api::lights`); they are the GENERATION options the export-generation
+    /// task consumes, kept on the wire so the frontend contract does not move
+    /// twice. `allow(dead_code)`: accepted-and-parked, not unused — the Tauri
+    /// mirror does the same with `allow(unused_variables)`.
     #[serde(default = "default_flat_norm")]
+    #[allow(dead_code)]
     pub flat_norm: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     pub flat_norm_mode: FlatNormMode,
     #[serde(default)]
+    #[allow(dead_code)]
     pub params: LightCalParams,
 }
 
@@ -106,12 +112,6 @@ fn default_flat_norm() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct GetExportReadinessArgs {
     pub set_id: i64,
-    #[serde(default = "default_flat_norm")]
-    pub flat_norm: bool,
-    #[serde(default)]
-    pub flat_norm_mode: FlatNormMode,
-    #[serde(default)]
-    pub params: LightCalParams,
 }
 
 #[derive(serde::Deserialize)]
@@ -235,8 +235,10 @@ pub async fn get_export_summary(
 // ── Active export handlers ────────────────────────────────────────────────────
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
-/// (spec §12.2). Read-only; run under `spawn_blocking` so the derived-status
+/// (spec §12.2, v2 §6). Read-only; run under `spawn_blocking` so the catalog
 /// queries stay off the async executor (matches the readiness precedent).
+/// Takes no calibration preferences — readiness is about the inputs (masters
+/// built, lights linked), which no dialog toggle can change.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_export_readiness(
     State(state): State<WebAppState>,
@@ -260,7 +262,7 @@ fn get_export_readiness_core(
     ctx: &athenaeum_core::services::ServiceContext,
     args: GetExportReadinessArgs,
 ) -> Result<ExportReadiness, athenaeum_core::api::ApiError> {
-    api_get_export_readiness(ctx, args.set_id, args.flat_norm, args.flat_norm_mode, args.params)
+    api_get_export_readiness(ctx, args.set_id)
 }
 
 /// Export a frame set to PixInsight WBPP folder structure.
@@ -338,14 +340,8 @@ pub async fn export_to_wbpp(
     // Strict gate (spec §12.2) + mode transform. Returns per-set omission
     // warnings to fold in, or an Err message that aborts before any file write.
     let prepare = |export_data: &mut ExportData| -> Result<Vec<String>, String> {
-        let readiness = api_get_export_readiness(
-            &state.ctx,
-            frame_set_id,
-            args.flat_norm,
-            args.flat_norm_mode,
-            args.params.clone(),
-        )
-        .map_err(|e| e.to_string())?;
+        let readiness =
+            api_get_export_readiness(&state.ctx, frame_set_id).map_err(|e| e.to_string())?;
         if let Err(msg) = athenaeum_core::api::lights::check_mode_ready(&readiness, mode) {
             tracing::warn!(frame_set_id, ?mode, error = %msg, "export refused: mode not ready");
             return Err(msg);

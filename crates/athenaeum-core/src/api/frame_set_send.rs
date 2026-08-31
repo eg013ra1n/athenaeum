@@ -14,9 +14,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[cfg(feature = "render")]
-use crate::api::lights::{check_mode_ready, get_export_readiness, FlatNormMode, LightCalParams};
+use crate::api::lights::{check_mode_ready, get_export_readiness};
 #[cfg(feature = "render")]
 use crate::api::{db, ApiError};
+#[cfg(feature = "render")]
+use crate::export::calibrated_generator::CalibratedLightOptions;
 #[cfg(feature = "render")]
 use crate::export::models::{CalibrationSetInfo, ExportData, ExportMode};
 use crate::package::PayloadKind;
@@ -41,16 +43,20 @@ pub struct PayloadEntry {
 ///
 /// Catalog-only — the entries name the files to copy; the copying is the package
 /// builder's job (`api::sync::build_selection_package`).
+///
+/// `gen_opts` belongs to the calibrated-lights mode: the transform generates
+/// those files, and their names depend on it (a debayered output is `_d`). It
+/// is accepted here already so the caller's plumbing is final; the transform
+/// starts consuming it in the export-generation task.
 #[cfg(feature = "render")]
 pub fn frame_set_entries(
     ctx: &ServiceContext,
     frame_set_id: i64,
     mode: ExportMode,
-    flat_norm: bool,
-    flat_norm_mode: FlatNormMode,
-    params: LightCalParams,
+    // Threaded into the mode transform by the export-generation task.
+    _gen_opts: &CalibratedLightOptions,
 ) -> Result<Vec<PayloadEntry>, ApiError> {
-    let readiness = get_export_readiness(ctx, frame_set_id, flat_norm, flat_norm_mode, params)?;
+    let readiness = get_export_readiness(ctx, frame_set_id)?;
     if let Err(msg) = check_mode_ready(&readiness, mode) {
         tracing::warn!(frame_set_id, ?mode, error = %msg, "frame-set send refused: mode not ready");
         return Err(ApiError::Invalid(msg));
@@ -135,7 +141,6 @@ fn master_frame_ids(data: &ExportData, master_sets: &HashSet<i64>) -> HashSet<i6
 #[cfg(all(test, feature = "render"))]
 mod tests {
     use super::*;
-    use crate::api::lights::{FlatNormMode, LightCalParams};
     use crate::db::light_calibrations::{
         upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
     };
@@ -204,8 +209,39 @@ mod tests {
         }
     }
 
-    fn prefs() -> (bool, FlatNormMode, LightCalParams) {
-        (true, FlatNormMode::CentralThird, LightCalParams::default())
+    /// Generation options — inert for every mode but `calibratedLights`, and
+    /// parked there until the export-generation task consumes them.
+    fn opts() -> CalibratedLightOptions {
+        CalibratedLightOptions::default()
+    }
+
+    /// Build a master for the raw dark 100 and repoint both lights' Dark links
+    /// onto it — what a master build does, and what the v2 calibrated-lights
+    /// gate demands before it will compose anything.
+    fn build_master_dark(conn: &Connection) {
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (300, 'MasterDark', '2026-07-05', 1)", []).unwrap();
+        conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (700, '/lib/master_dark.fits', 'master_dark.fits', 0, '2026-07-05T00:00:00Z', 'FITS')", []).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (700, 700, 'MasterDark', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (300, 700)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 300 WHERE id = 100",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE calibration_set_to_frames SET calibration_set_id = 300
+             WHERE calibration_set_id = 100",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -216,17 +252,14 @@ mod tests {
             let db = ctx.db.get().unwrap();
             seed(&db.conn());
         }
-        let (fn_, fm, p) = prefs();
-
-        let lights = frame_set_entries(&ctx, 1, ExportMode::LightsOnly, fn_, fm, p).unwrap();
+        let lights = frame_set_entries(&ctx, 1, ExportMode::LightsOnly, &opts()).unwrap();
         assert_eq!(lights.len(), 2);
         assert!(lights
             .iter()
             .all(|e| e.kind == PayloadKind::RawFrame
                 && e.rel_path.starts_with("camera_testcam/lights/")));
 
-        let raw =
-            frame_set_entries(&ctx, 1, ExportMode::RawWithCalibrationSets, fn_, fm, p).unwrap();
+        let raw = frame_set_entries(&ctx, 1, ExportMode::RawWithCalibrationSets, &opts()).unwrap();
         assert_eq!(raw.len(), 2 + 2 + 1);
         assert_eq!(
             raw.iter().filter(|e| e.kind == PayloadKind::Master).count(),
@@ -252,8 +285,7 @@ mod tests {
             let db = ctx.db.get().unwrap();
             seed(&db.conn());
         }
-        let (fn_, fm, p) = prefs();
-        let err = frame_set_entries(&ctx, 1, ExportMode::RawWithMasters, fn_, fm, p).unwrap_err();
+        let err = frame_set_entries(&ctx, 1, ExportMode::RawWithMasters, &opts()).unwrap_err();
         assert!(
             err.to_string().contains("1 calibration set has no master"),
             "{err}"
@@ -268,16 +300,24 @@ mod tests {
             let db = ctx.db.get().unwrap();
             seed(&db.conn());
         }
-        let (fn_, fm, p) = prefs();
-        let err = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, fn_, fm, p).unwrap_err();
+        // Masters-built strictness (v2 §6): the raw dark 100 the seed links
+        // blocks the mode — the export will GENERATE these files, and it can
+        // only do that from built masters.
+        let err = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("2 of 2 lights lack a fresh calibrated output"),
+                .contains("Build masters first — 1 set without a master"),
             "{err}"
         );
 
-        // Track both lights as freshly calibrated against the master flat (set 200)
-        // and the raw dark set 100 — derive_status reads the CURRENT links.
+        {
+            let db = ctx.db.get().unwrap();
+            build_master_dark(&db.conn());
+        }
+
+        // Track both lights as calibrated against the master flat (set 200)
+        // and the master dark (set 300) — the mode transform still resolves the
+        // artifact from these rows until the generation task replaces it.
         {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();
@@ -290,7 +330,7 @@ mod tests {
                         source_uuid: Some(format!("uuid-{f}")),
                         source_filename: Some(format!("L_{f}.fits")),
                         output_path: format!("/lib/M31/TestCam/2026-07-05/c_L_{f}.fits"),
-                        dark_set_id: Some(100),
+                        dark_set_id: Some(300),
                         flat_set_id: Some(200),
                         bias_set_id: None,
                         calstat: "BDF".into(),
@@ -306,7 +346,7 @@ mod tests {
                 .unwrap();
             }
         }
-        let cal = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, fn_, fm, p).unwrap();
+        let cal = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap();
         assert_eq!(cal.len(), 2);
         assert!(cal.iter().all(|e| e.kind == PayloadKind::CalibratedLight));
         assert!(
@@ -320,5 +360,41 @@ mod tests {
             cal.iter().all(|e| e.frame_id == 10 || e.frame_id == 11),
             "frame_id is the SOURCE light"
         );
+    }
+
+    /// Every master is built, but one light links nothing at all: there is
+    /// nothing to apply to it, so the send refuses rather than shipping a
+    /// "calibrated" copy of the raw frame.
+    #[test]
+    fn calibrated_lights_refused_while_a_light_has_no_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(tmp.path());
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            seed(&conn);
+            build_master_dark(&conn);
+            conn.execute(
+                "DELETE FROM calibration_set_to_frames WHERE source_id = 11",
+                [],
+            )
+            .unwrap();
+        }
+        let err = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap_err();
+        assert!(
+            err.to_string().contains("1 light has no calibration links"),
+            "{err}"
+        );
+        // Every other mode ships the raw file and does not care.
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithCalibrationSets,
+            ExportMode::RawWithMasters,
+        ] {
+            assert!(
+                frame_set_entries(&ctx, 1, mode, &opts()).is_ok(),
+                "{mode:?}"
+            );
+        }
     }
 }

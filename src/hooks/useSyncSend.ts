@@ -65,8 +65,10 @@ export interface SendOptions {
   frameSetId?: number | null;
 }
 
-/** Frame-set send (spec 2026-08-28): the export mode + the readiness prefs the
- *  Export tab used, so the backend gate agrees with what the tab showed. */
+/** Frame-set send (spec 2026-08-28): the export mode + the light-calibration
+ *  preferences. They no longer feed the readiness gate (readiness is
+ *  input-shaped now — masters built, lights linked); they are the options the
+ *  calibrated-lights mode generates its files with. */
 export interface FrameSetSendOptions {
   batchName?: string | null;
   flatNorm: boolean;
@@ -89,8 +91,7 @@ export interface UseSyncSend {
    * Enqueue a whole frame set, resolved server-side by `mode`, to EACH `deviceId`.
    * Same fan-out contract as `sendSelection` — one destination per backend call,
    * each caught independently. `opts` carries the optional batch name plus the
-   * readiness prefs (flat normalization + light-cal params) so the backend's
-   * eligibility gate agrees with the counts the Export tab displayed.
+   * light-calibration preferences the calibrated-lights mode generates with.
    */
   sendFrameSet: (
     frameSetId: number,

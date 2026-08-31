@@ -142,27 +142,21 @@ pub async fn get_calibration_route(
 }
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
-/// (spec §12.2). Read-only; run under `spawn_blocking` so the derived-status
-/// queries stay off the async executor. `params` is optional so the pre-mode-UI
-/// frontend keeps compiling — an omitted arg defaults to
-/// [`LightCalParams::default`].
+/// (spec §12.2, v2 §6). Read-only; run under `spawn_blocking` so the catalog
+/// queries stay off the async executor. Takes no calibration preferences —
+/// readiness is about the inputs (masters built, lights linked), which no
+/// dialog toggle can change.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_export_readiness(
     state: State<'_, AppState>,
     set_id: i64,
-    flat_norm: bool,
-    flat_norm_mode: FlatNormMode,
-    params: Option<LightCalParams>,
 ) -> Result<ExportReadiness, String> {
-    let params = params.unwrap_or_default();
     let ctx = state.ctx.clone();
-    tokio::task::spawn_blocking(move || {
-        api_get_export_readiness(&ctx, set_id, flat_norm, flat_norm_mode, params)
-    })
-    .await
-    .map_err(|e| format!("Export readiness task panicked: {}", e))?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || api_get_export_readiness(&ctx, set_id))
+        .await
+        .map_err(|e| format!("Export readiness task panicked: {}", e))?
+        .map_err(|e| e.to_string())
 }
 
 /// Export a frame set to PixInsight WBPP folder structure
@@ -184,9 +178,15 @@ pub async fn get_export_readiness(
 /// [`WbppExportConfig`]'s mode — the frontend loads that config asynchronously
 /// and could present it as `null`, so the mode is now passed explicitly rather
 /// than relying on a best-effort config sync. `flat_norm` / `flat_norm_mode` /
-/// `params` are the caller's calibration preferences, used by the strict mode
-/// gate; they are optional so the pre-mode-UI frontend keeps working
+/// `params` are the caller's calibration preferences; they no longer feed the
+/// readiness gate (readiness is input-shaped now — see `api::lights`) and are
+/// carried for the calibrated-lights GENERATION the export-generation task
+/// wires up. They stay optional so a caller that has no opinion keeps working
 /// (defaults: normalize ON, central-third, default advanced params).
+//
+// The three preference args are consumed by the generation path, not by this
+// wrapper — an underscore prefix is not an option, it is the IPC argument name.
+#[allow(unused_variables)]
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
@@ -248,14 +248,8 @@ pub async fn export_to_wbpp(
     // per-set omission warnings to fold into the final result, or an Err
     // message that aborts the export before any file is written.
     let prepare = |export_data: &mut ExportData| -> Result<Vec<String>, String> {
-        let readiness = api_get_export_readiness(
-            &state.ctx,
-            frame_set_id,
-            flat_norm.unwrap_or(true),
-            flat_norm_mode.unwrap_or(FlatNormMode::CentralThird),
-            params.clone().unwrap_or_default(),
-        )
-        .map_err(|e| e.to_string())?;
+        let readiness =
+            api_get_export_readiness(&state.ctx, frame_set_id).map_err(|e| e.to_string())?;
         if let Err(msg) = athenaeum_core::api::lights::check_mode_ready(&readiness, mode) {
             tracing::warn!(frame_set_id, ?mode, error = %msg, "export refused: mode not ready");
             return Err(msg);

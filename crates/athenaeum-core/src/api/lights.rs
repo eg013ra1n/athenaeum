@@ -119,20 +119,29 @@ pub struct LightCalReadiness {
 }
 
 /// Export/send readiness for one frame set, every mode at once (spec
-/// 2026-08-28 §5). Reported per frame set: `total` = in-scope LIGHT members,
-/// `calibrated` = fresh calibrated outputs, `stale` = has an output but its
-/// derived status is Stale/Partial, `missing` = no calibrated output at all —
-/// together the `calibratedLights` rule. `raw_sets_without_master` (with the
-/// ids behind it, for the Coverage link) is the `rawWithMasters` rule;
-/// `file_counts` is what each mode would place. The gate itself is
-/// [`check_mode_ready`].
+/// 2026-08-28 §5, re-cut by the calibrated-export v2 spec §6).
+///
+/// **The calibrated-lights mode no longer asks about existing artifacts.** An
+/// export GENERATES its calibrated files on the spot, so what a previous
+/// Calibrate-Lights run left on disk (fresh, stale, or absent) says nothing
+/// about whether this export can run — the old `calibrated`/`stale`/`missing`
+/// tally is gone, and with it the readiness call's dependence on the caller's
+/// flat-norm/params preferences. What matters instead is whether the inputs
+/// exist: every calibration link resolved to a BUILT master
+/// (`raw_sets_without_master`), and no light left with nothing to apply
+/// (`unlinked_lights`).
+///
+/// `total` = in-scope LIGHT members; `raw_sets_without_master` (with the ids
+/// behind it, for the Coverage link) gates BOTH strict modes; `file_counts` is
+/// what each mode would place. The gate itself is [`check_mode_ready`].
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportReadiness {
     pub total: i64,
-    pub calibrated: i64,
-    pub stale: i64,
-    pub missing: i64,
+    /// LIGHT members with ZERO calibration links of any type. Nothing could be
+    /// applied to them, so a "calibrated" output would be the source file under
+    /// a name that claims otherwise.
+    pub unlinked_lights: i64,
     pub raw_sets_without_master: i64,
     /// Ascending, so the tab's `→ Coverage` deep link (`[0]`) is stable across
     /// refetches.
@@ -746,41 +755,55 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
                 if n == 1 { "has" } else { "have" }
             ))
         }
-        ExportMode::CalibratedLights if r.stale + r.missing == 0 => Ok(()),
-        ExportMode::CalibratedLights => Err(format!(
-            "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
-            r.stale + r.missing,
-            r.total
-        )),
+        // Masters-built strictness (v2 §6): the export generates the calibrated
+        // files itself, so it needs INPUTS, not artifacts. Masters first — a
+        // build is the step that can also change what a light resolves to, so
+        // reporting the link count over it would send the operator to the wrong
+        // screen.
+        ExportMode::CalibratedLights if r.raw_sets_without_master > 0 => {
+            let n = r.raw_sets_without_master;
+            Err(format!(
+                "Build masters first — {n} set{} without a master",
+                if n == 1 { "" } else { "s" }
+            ))
+        }
+        ExportMode::CalibratedLights if r.unlinked_lights > 0 => {
+            let n = r.unlinked_lights;
+            Err(format!(
+                "{n} light{} {} no calibration links",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "has" } else { "have" }
+            ))
+        }
+        ExportMode::CalibratedLights => Ok(()),
     }
 }
 
 /// Tally everything the mode gate needs for a frame set, for every mode at
-/// once: the per-frame calibration status buckets, the raw calibration sets
-/// that still have no master, and what each mode would place. Pure DB work (no
-/// pixel I/O) — the export tree is collected once and feeds both raw-set
-/// readiness and the file counts.
-fn compute_export_readiness(
-    conn: &Connection,
-    set_id: i64,
-    flat_norm: bool,
-    flat_norm_mode: FlatNormMode,
-    params: LightCalParams,
-) -> Result<ExportReadiness, ApiError> {
+/// once: the lights with nothing linked, the raw calibration sets that still
+/// have no master, and what each mode would place. Pure DB work (no pixel I/O)
+/// — the export tree is collected once and feeds both raw-set readiness and the
+/// file counts.
+///
+/// **One source of truth for "which sets have no master".**
+/// `data_collector::raw_sets_without_master` is it, for BOTH strict modes: it
+/// walks the same export tree the pipeline will walk (so it also sees a raw
+/// SUB-calibration — a raw flat's own dark — that a light's direct links never
+/// name), and it is the very function `apply_raw_with_masters` uses as its
+/// backstop. Tallying the calibrated mode from the per-frame `classify` walk
+/// instead would let the two modes report different numbers for the same frame
+/// set, and let the calibrated gate pass a tree the backstop would refuse.
+fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportReadiness, ApiError> {
     let members = load_light_members(conn, set_id)?;
     let total = members.len() as i64;
 
-    let mut calibrated = 0i64;
-    let mut stale = 0i64;
-    let mut missing = 0i64;
+    // A light with no links of ANY type: nothing to subtract, nothing to
+    // divide by. It is the one per-frame fact the export tree cannot state,
+    // because a frame with no calibration contributes no set to walk.
+    let mut unlinked_lights = 0i64;
     for (frame_id, _filename) in members {
-        let links = get_links_for_frame(conn, frame_id)?;
-        match derive_status(conn, frame_id, &links, flat_norm, flat_norm_mode, &params)? {
-            LightCalStatus::Calibrated => calibrated += 1,
-            // Partial (new coverage available) is not a fresh full output — for
-            // an export it must be recalibrated, so it groups with Stale.
-            LightCalStatus::Stale | LightCalStatus::Partial => stale += 1,
-            LightCalStatus::NotCalibrated => missing += 1,
+        if get_links_for_frame(conn, frame_id)?.is_empty() {
+            unlinked_lights += 1;
         }
     }
 
@@ -795,38 +818,30 @@ fn compute_export_readiness(
     tracing::debug!(
         set_id,
         total,
-        calibrated,
-        stale,
-        missing,
+        unlinked_lights,
         raw_sets = raw_set_ids_without_master.len(),
         "export readiness computed"
     );
     Ok(ExportReadiness {
         total,
-        calibrated,
-        stale,
-        missing,
+        unlinked_lights,
         raw_sets_without_master: raw_set_ids_without_master.len() as i64,
         raw_set_ids_without_master,
         file_counts,
     })
 }
 
-/// Export/send readiness for every mode in one call (spec 2026-08-28 §5).
-/// `flat_norm` / `flat_norm_mode` / `params` are the caller's calibration
-/// preferences; staleness is derived against them exactly like
-/// [`get_light_calibration_readiness`], so a frame calibrated with settings the
-/// user has since changed reads as stale and blocks `calibratedLights`.
+/// Export/send readiness for every mode in one call (spec 2026-08-28 §5, v2
+/// §6). Takes no calibration preferences: the calibrated-lights mode generates
+/// its files during the export, so readiness is about the INPUTS (masters
+/// built, lights linked) and cannot change with a dialog toggle.
 pub fn get_export_readiness(
     ctx: &ServiceContext,
     set_id: i64,
-    flat_norm: bool,
-    flat_norm_mode: FlatNormMode,
-    params: LightCalParams,
 ) -> Result<ExportReadiness, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    compute_export_readiness(&conn, set_id, flat_norm, flat_norm_mode, params)
+    compute_export_readiness(&conn, set_id)
 }
 
 // ── Per-frame recipe details (spec §12.1) ────────────────────────────────────
@@ -4547,9 +4562,7 @@ mod tests {
     fn check_mode_ready_truth_table() {
         let ready = ExportReadiness {
             total: 4,
-            calibrated: 4,
-            stale: 0,
-            missing: 0,
+            unlinked_lights: 0,
             raw_sets_without_master: 0,
             raw_set_ids_without_master: vec![],
             file_counts: Default::default(),
@@ -4562,30 +4575,173 @@ mod tests {
         ] {
             assert!(check_mode_ready(&ready, mode).is_ok(), "{mode:?}");
         }
-        let uncal = ExportReadiness {
-            calibrated: 1,
-            stale: 2,
-            missing: 1,
+        // An unlinked light blocks ONLY the calibrated-lights mode: every other
+        // mode ships the raw file, which needs no calibration at all.
+        let unlinked = ExportReadiness {
+            unlinked_lights: 3,
             ..ready.clone()
         };
-        assert!(check_mode_ready(&uncal, ExportMode::LightsOnly).is_ok());
-        assert!(check_mode_ready(&uncal, ExportMode::RawWithCalibrationSets).is_ok());
-        assert!(check_mode_ready(&uncal, ExportMode::RawWithMasters).is_ok());
-        let msg = check_mode_ready(&uncal, ExportMode::CalibratedLights).unwrap_err();
-        assert_eq!(
-            msg,
-            "3 of 4 lights lack a fresh calibrated output — run Calibrate Lights first"
-        );
+        assert!(check_mode_ready(&unlinked, ExportMode::LightsOnly).is_ok());
+        assert!(check_mode_ready(&unlinked, ExportMode::RawWithCalibrationSets).is_ok());
+        assert!(check_mode_ready(&unlinked, ExportMode::RawWithMasters).is_ok());
+        let msg = check_mode_ready(&unlinked, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(msg, "3 lights have no calibration links");
+
+        // One raw set blocks BOTH strict modes, each in its own words.
         let raw = ExportReadiness {
             raw_sets_without_master: 2,
             raw_set_ids_without_master: vec![7, 9],
             ..ready.clone()
         };
-        assert!(check_mode_ready(&raw, ExportMode::CalibratedLights).is_ok());
+        assert!(check_mode_ready(&raw, ExportMode::LightsOnly).is_ok());
+        assert!(check_mode_ready(&raw, ExportMode::RawWithCalibrationSets).is_ok());
+        let msg = check_mode_ready(&raw, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(msg, "Build masters first — 2 sets without a master");
         let msg = check_mode_ready(&raw, ExportMode::RawWithMasters).unwrap_err();
         assert_eq!(
             msg,
             "2 calibration sets have no master — build masters first"
         );
+
+        // Singular forms, and: masters come first when both blockers apply —
+        // building them is the step that can also resolve the links.
+        let both = ExportReadiness {
+            unlinked_lights: 1,
+            raw_sets_without_master: 1,
+            raw_set_ids_without_master: vec![7],
+            ..ready.clone()
+        };
+        let msg = check_mode_ready(&both, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(msg, "Build masters first — 1 set without a master");
+        let one = ExportReadiness {
+            unlinked_lights: 1,
+            ..ready.clone()
+        };
+        let msg = check_mode_ready(&one, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(msg, "1 light has no calibration links");
+    }
+
+    /// A raw (non-master) calibration set with `n` member frames — the shape
+    /// `export::data_collector::raw_sets_without_master` counts.
+    fn seed_raw_set_with_frames(conn: &Connection, set_id: i64, imagetyp: &str, n: i64) -> i64 {
+        seed_set(conn, set_id, imagetyp, false);
+        for i in 0..n {
+            let file_id = set_id * 100 + i + 5_000_000;
+            let frame_id = set_id * 100 + i + 6_000_000;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+                params![
+                    file_id,
+                    format!("/raw/{imagetyp}_{set_id}_{i}.fits"),
+                    format!("{imagetyp}_{set_id}_{i}.fits")
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+                params![frame_id, file_id, imagetyp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// A light nothing is linked to cannot be calibrated by anybody: the mode
+    /// would emit a file labelled `""` — calibrated with nothing applied. The
+    /// gate refuses instead, and says how many frames are in that state.
+    #[test]
+    fn unlinked_light_blocks_calibrated_mode() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_light(&conn, 2, session);
+        seed_masters(&conn);
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+        // Frame 2 links nothing at all.
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.total, 2);
+        assert_eq!(r.unlinked_lights, 1);
+        assert_eq!(r.raw_sets_without_master, 0);
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights).unwrap_err(),
+            "1 light has no calibration links"
+        );
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithCalibrationSets,
+            ExportMode::RawWithMasters,
+        ] {
+            assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
+        }
+    }
+
+    /// Masters-built strictness: a light linked to a RAW set blocks the
+    /// calibrated mode until that set has a master, with the build-masters
+    /// sentence — the same tally that already gates `rawWithMasters`, so the
+    /// two strict modes can never disagree about which sets are missing.
+    #[test]
+    fn raw_linked_set_blocks_with_build_masters_message() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_masters(&conn);
+        let raw = seed_raw_set_with_frames(&conn, 200, "Dark", 2);
+        add_link(&conn, 1, raw, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.total, 1);
+        assert_eq!(
+            r.unlinked_lights, 0,
+            "the light IS linked — just not to a master"
+        );
+        assert_eq!(r.raw_sets_without_master, 1);
+        assert_eq!(r.raw_set_ids_without_master, vec![200]);
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights).unwrap_err(),
+            "Build masters first — 1 set without a master"
+        );
+        assert!(check_mode_ready(&r, ExportMode::RawWithMasters).is_err());
+        assert!(check_mode_ready(&r, ExportMode::LightsOnly).is_ok());
+        assert!(check_mode_ready(&r, ExportMode::RawWithCalibrationSets).is_ok());
+    }
+
+    /// PARTIAL coverage is not a blocker: a light with only a master Dark
+    /// calibrates honestly (`CALSTAT = "BD"`), so the gate must let it through.
+    /// The gate asks "is every link a built master?", never "is every type
+    /// linked?".
+    #[test]
+    fn partial_links_pass() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_light(&conn, 2, session);
+        seed_masters(&conn);
+        // Dark only — no Flat, no Bias.
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 2, 100, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.total, 2);
+        assert_eq!(r.unlinked_lights, 0);
+        assert_eq!(r.raw_sets_without_master, 0);
+        assert!(r.raw_set_ids_without_master.is_empty());
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithCalibrationSets,
+            ExportMode::RawWithMasters,
+            ExportMode::CalibratedLights,
+        ] {
+            assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
+        }
+        assert_eq!(r.file_counts.calibrated_lights, 2);
     }
 }

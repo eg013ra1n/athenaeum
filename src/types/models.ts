@@ -647,7 +647,13 @@ cfaWarnings: Array<string>, };
 
 export type ExportFileCounts = { lightsOnly: number, rawWithCalibrationSets: number, rawWithMasters: number, calibratedLights: number, };
 
-export type ExportReadiness = { total: number, calibrated: number, stale: number, missing: number, rawSetsWithoutMaster: number, 
+export type ExportReadiness = { total: number, 
+/**
+ * LIGHT members with ZERO calibration links of any type. Nothing could be
+ * applied to them, so a "calibrated" output would be the source file under
+ * a name that claims otherwise.
+ */
+unlinkedLights: number, rawSetsWithoutMaster: number, 
 /**
  * Ascending, so the tab's `→ Coverage` deep link (`[0]`) is stable across
  * refetches.

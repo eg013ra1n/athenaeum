@@ -1,76 +1,29 @@
 import { useState, useEffect, useMemo } from 'react';
 import { X, Wand2, Hammer, AlertTriangle, CheckCircle2, Info, Loader2, ChevronDown, ChevronRight, SlidersHorizontal } from 'lucide-react';
 import { api } from '../../api';
-import type { LightCalReadiness, FlatNormMode, LightCalParams, BiasFallback } from '../../types/models';
+import type { LightCalReadiness, FlatNormMode, LightCalParams } from '../../types/models';
 import { useLightCalibrationContext } from '../../contexts/LightCalibrationContext';
 
-/** localStorage key for the "Normalize master flat" preference (default ON). */
-export const LIGHTCAL_FLATNORM_KEY = 'athenaeum.lightcal.flatNorm';
-
-/** localStorage key for the flat-normalization statistic (default centralThird). */
-export const LIGHTCAL_FLATNORM_MODE_KEY = 'athenaeum.lightcal.flatNormMode';
-
-/** localStorage key for the Advanced calibration parameters (JSON). */
-export const LIGHTCAL_PARAMS_KEY = 'athenaeum.lightcal.params';
-
-/** Advanced-parameter defaults — these reproduce the engine's current behavior
- *  (see `LightCalParams::default` in `calibration_library/light_cal.rs`). */
-export const DEFAULT_LIGHTCAL_PARAMS: LightCalParams = {
-  trimFraction: 0.05,
-  pedestalDn: 0,
-  biasFallback: 'subtractBias',
-  cfaFlatScaling: true,
-};
-
-/** Read the persisted Advanced parameters, coercing every field into range and
- *  falling back to {@link DEFAULT_LIGHTCAL_PARAMS} when unset/corrupt. Exported so
- *  the badge/details readiness fetches in FrameSetDetail resolve staleness against
- *  the exact params the dialog would submit. */
-export function readLightCalParamsPref(): LightCalParams {
-  try {
-    const raw = localStorage.getItem(LIGHTCAL_PARAMS_KEY);
-    if (!raw) return { ...DEFAULT_LIGHTCAL_PARAMS };
-    const parsed = JSON.parse(raw) as Partial<LightCalParams>;
-    const trimFraction =
-      typeof parsed.trimFraction === 'number' && Number.isFinite(parsed.trimFraction)
-        ? Math.min(0.25, Math.max(0, parsed.trimFraction))
-        : DEFAULT_LIGHTCAL_PARAMS.trimFraction;
-    const pedestalDn =
-      typeof parsed.pedestalDn === 'number' && Number.isFinite(parsed.pedestalDn)
-        ? Math.max(0, parsed.pedestalDn)
-        : DEFAULT_LIGHTCAL_PARAMS.pedestalDn;
-    const biasFallback: BiasFallback =
-      parsed.biasFallback === 'skipFrame' ? 'skipFrame' : 'subtractBias';
-    // Default ON, so a preference blob written before this option existed keeps
-    // the recommended behavior instead of silently opting out of it.
-    const cfaFlatScaling = parsed.cfaFlatScaling !== false;
-    return { trimFraction, pedestalDn, biasFallback, cfaFlatScaling };
-  } catch {
-    return { ...DEFAULT_LIGHTCAL_PARAMS };
-  }
-}
-
-/** Read the persisted flat-norm preference (default ON when unset/corrupt). */
-export function readFlatNormPref(): boolean {
-  try {
-    return localStorage.getItem(LIGHTCAL_FLATNORM_KEY) !== 'false';
-  } catch {
-    return true;
-  }
-}
-
-/** Read the persisted flat-normalization statistic (default centralThird when
- *  unset/corrupt — any value other than the exact 'pixinsightTrimmed' token
- *  falls back to the default). */
-export function readFlatNormModePref(): FlatNormMode {
-  try {
-    return localStorage.getItem(LIGHTCAL_FLATNORM_MODE_KEY) === 'pixinsightTrimmed'
-      ? 'pixinsightTrimmed'
-      : 'centralThird';
-  } catch {
-    return 'centralThird';
-  }
-}
+// Preference storage moved to `../export/lightCalPrefs` (calibrated-export v2:
+// calibration is part of the export now). Re-exported here so the remaining
+// importers of this module keep working until it is removed.
+import {
+  readLightCalParamsPref,
+  readFlatNormPref,
+  readFlatNormModePref,
+  writeLightCalParamsPref,
+  writeFlatNormPref,
+  writeFlatNormModePref,
+} from '../export/lightCalPrefs';
+export {
+  LIGHTCAL_FLATNORM_KEY,
+  LIGHTCAL_FLATNORM_MODE_KEY,
+  LIGHTCAL_PARAMS_KEY,
+  DEFAULT_LIGHTCAL_PARAMS,
+  readLightCalParamsPref,
+  readFlatNormPref,
+  readFlatNormModePref,
+} from '../export/lightCalPrefs';
 
 interface CalibrateLightsDialogProps {
   setId: number;
@@ -114,17 +67,17 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
 
   // Persist the flat-norm choice whenever it changes.
   useEffect(() => {
-    try { localStorage.setItem(LIGHTCAL_FLATNORM_KEY, String(flatNorm)); } catch { /* ignore */ }
+    writeFlatNormPref(flatNorm);
   }, [flatNorm]);
 
   // Persist the normalization-statistic choice whenever it changes.
   useEffect(() => {
-    try { localStorage.setItem(LIGHTCAL_FLATNORM_MODE_KEY, flatNormMode); } catch { /* ignore */ }
+    writeFlatNormModePref(flatNormMode);
   }, [flatNormMode]);
 
   // Persist the Advanced parameters whenever they change.
   useEffect(() => {
-    try { localStorage.setItem(LIGHTCAL_PARAMS_KEY, JSON.stringify(params)); } catch { /* ignore */ }
+    writeLightCalParamsPref(params);
   }, [params]);
 
   // Re-query readiness on open and whenever the flat-norm flag, statistic, or

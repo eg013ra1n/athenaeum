@@ -33,6 +33,8 @@ use crate::api::lights::{FlatNormMode, LightCalParams};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
 #[cfg(feature = "render")]
+use crate::export::calibrated_generator::CalibratedLightOptions;
+#[cfg(feature = "render")]
 use crate::export::models::ExportMode;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
@@ -3689,14 +3691,17 @@ pub async fn enqueue_frame_set_send(
     params: LightCalParams,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
-    let entries = crate::api::frame_set_send::frame_set_entries(
-        ctx,
-        frame_set_id,
-        mode,
+    // The command's own signature is unchanged; its three calibration
+    // preferences now travel as the generator's options bundle (the two new
+    // flags default until the send dialog offers them).
+    let gen_opts = CalibratedLightOptions {
         flat_norm,
         flat_norm_mode,
         params,
-    )?;
+        ..Default::default()
+    };
+    let entries =
+        crate::api::frame_set_send::frame_set_entries(ctx, frame_set_id, mode, &gen_opts)?;
     // Nothing to send (a frame set with no lights passes every mode vacuously):
     // a benign no-op that must not start an engine for `dest`, exactly as an
     // empty frame selection does not.

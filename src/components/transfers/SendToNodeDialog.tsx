@@ -20,7 +20,7 @@ import {
   readFlatNormPref,
   readFlatNormModePref,
   readLightCalParamsPref,
-} from '../calibration/CalibrateLightsDialog';
+} from '../export/lightCalPrefs';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type { ExportMode } from '../../types/export';
 import type { AccountDevice, AccountStatus, IneligibleFrame } from '../../types/models';
@@ -154,8 +154,9 @@ export function SendToNodeDialog({
     const checkedIds = [...checked];
     if (checkedIds.length === 0 || itemCount === 0 || sending) return;
 
-    // A frame-set send passes the same readiness prefs the Export tab read, so
-    // the backend's eligibility gate agrees with the counts the tab showed.
+    // A frame-set send passes the same light-calibration preferences the Export
+    // tab reads — the options the calibrated-lights mode generates its files
+    // with (the readiness gate itself no longer takes any).
     const results =
       target.kind === 'frames'
         ? await sendSelection(target.frameIds, checkedIds, {
