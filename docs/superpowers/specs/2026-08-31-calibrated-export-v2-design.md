@@ -211,6 +211,32 @@ package instead of copying pre-built artifacts:
   no longer goes through reconcile-adopt — the file lands and the scanner
   skip (§9) keeps it out of the catalog.
 
+## 8a. Collab: deferred (owner decision C, 2026-08-31)
+
+Collab publishing is built on pre-existing artifacts: the project gate's
+layer-1 "calibrated" precondition reads `light_calibrations`
+(`collab/gate.rs::LightCalStatus`), and `publish_collab_frames` /
+`project_collector` package `light_calibrations.output_path` files. The owner
+chose to DEFER the collab rework to its own cycle rather than extend this one:
+
+- The gate's calibration status resolves to **NotCalibrated unconditionally**
+  (one caller-side constant in `api::collab`, with a comment naming this spec)
+  — no frame passes layer 1, so `publish_collab_frames` fails early with its
+  existing "no publishable frames" error. Publishing own lights is therefore
+  temporarily non-functional, honestly blocked rather than silently empty.
+- `LightCalStatus` moves into `collab/gate.rs` (the gate is DB-free by
+  design); every other `db::light_calibrations` import in collab code is
+  excised — artifact lookups become unconditional skip-with-warn naming the
+  pending rework.
+- **Receiving contributions keeps working**: the scanner's `ATH_PRJ` routing
+  and `reconcile_project_contribution` run on `db::collab_exchange` tables and
+  are untouched.
+- Collab tests that seeded `light_calibrations` rows to make frames
+  publishable are rewritten to assert the blocked behavior (or `#[ignore]`d
+  with a reason naming the follow-up) — never deleted silently.
+- The rework itself (generate-at-publish, gate = masters-built) is a named
+  follow-up cycle, recorded in `docs/open-items.md`.
+
 ## 9. Demolition of the standalone flow
 
 - **Commands removed** (both backends + registrations):
