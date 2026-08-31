@@ -572,6 +572,9 @@ pub(crate) fn current_calibration_links(
 /// vacuous by construction, while the staleness checks it cares about — link
 /// changes, master rebuilds, engine-version bumps — stay fully live. No tracking
 /// row → [`LightCalStatus::NotCalibrated`].
+// Unused since the collab gate went to a constant (decision C, spec
+// 2026-08-31 §8a); kept with the rest of this module for Task 11.
+#[allow(dead_code)]
 pub(crate) fn frame_cal_status(conn: &Connection, frame_id: i64) -> anyhow::Result<LightCalStatus> {
     let Some(row) = get_light_calibration_for_frame(conn, frame_id)? else {
         return Ok(LightCalStatus::NotCalibrated);
@@ -3534,8 +3537,13 @@ mod orchestration_tests {
         }
         assert!(checked >= 2, "checked {checked} lights");
 
-        // ── Scanner reconcile-adopt over the library root ────────────────────
-        // (a) rescan: calibrated outputs skipped, zero new frames.
+        // ── Scanner over the library root ────────────────────────────────────
+        // Calibrated outputs are never cataloged (spec 2026-08-31 §4): a rescan
+        // skips them outright — no frames row, no files row, nothing tracking
+        // them. The former (b) move-repair and (c) duplicate-report blocks
+        // covered the retired reconcile-adopt branches and are gone with it;
+        // the skip itself is pinned by the scanner's own suite
+        // (`scanner::calibrated_light_scan_tests`).
         {
             let conn = db_ref.conn();
             let frames_before = count(&conn, "SELECT COUNT(*) FROM frames");
@@ -3545,84 +3553,15 @@ mod orchestration_tests {
             let frames_after = count(&conn, "SELECT COUNT(*) FROM frames");
             let cal_after = count(&conn, "SELECT COUNT(*) FROM light_calibrations");
             eprintln!(
-                "[b5-e2e] rescan(a): frames {frames_before}->{frames_after} cal {cal_before}->{cal_after} dups={}",
-                sr.calibrated_duplicates.len()
+                "[b5-e2e] rescan: frames {frames_before}->{frames_after} cal {cal_before}->{cal_after}"
             );
             assert_eq!(frames_before, frames_after, "rescan must add no frames");
             assert_eq!(cal_before, cal_after, "rescan must add no tracking rows");
-            assert!(
-                sr.calibrated_duplicates.is_empty(),
-                "known paths are not duplicates"
-            );
             let out0 = first_output.clone().unwrap();
             assert_eq!(
                 files_count(&conn, &out0),
                 0,
                 "calibrated output never registered as a file"
-            );
-        }
-
-        // (b) move one output → rescan repairs output_path.
-        {
-            let moved_fid = light_frame_ids[0];
-            let (old_path, moved_path) = {
-                let conn = db_ref.conn();
-                let old = get_light_calibration_for_frame(&conn, moved_fid)
-                    .unwrap()
-                    .unwrap()
-                    .output_path;
-                let moved = format!("{old}.moved.fits");
-                std::fs::rename(&old, &moved).unwrap();
-                (old, moved)
-            };
-            let conn = db_ref.conn();
-            let sr = scan_directory(&library_dir, &conn, None, false, lib_root_id);
-            assert!(sr.errors.is_empty(), "move-rescan errors: {:?}", sr.errors);
-            let repaired = get_light_calibration_for_frame(&conn, moved_fid)
-                .unwrap()
-                .unwrap()
-                .output_path;
-            eprintln!("[b5-e2e] move(b): {old_path} -> {repaired}");
-            assert_eq!(
-                repaired, moved_path,
-                "output_path must be repaired to the new location"
-            );
-            assert!(
-                sr.calibrated_duplicates.is_empty(),
-                "a move is not a duplicate"
-            );
-        }
-
-        // (c) copy one output → rescan reports a duplicate; row untouched.
-        {
-            let dup_fid = light_frame_ids[1];
-            let (kept_path, dup_path) = {
-                let conn = db_ref.conn();
-                let kept = get_light_calibration_for_frame(&conn, dup_fid)
-                    .unwrap()
-                    .unwrap()
-                    .output_path;
-                let dup = format!("{kept}.copy.fits");
-                std::fs::copy(&kept, &dup).unwrap();
-                (kept, dup)
-            };
-            let conn = db_ref.conn();
-            let sr = scan_directory(&library_dir, &conn, None, false, lib_root_id);
-            assert!(sr.errors.is_empty(), "copy-rescan errors: {:?}", sr.errors);
-            eprintln!("[b5-e2e] copy(c): dups={:?}", sr.calibrated_duplicates);
-            assert!(
-                sr.calibrated_duplicates
-                    .iter()
-                    .any(|d| d.duplicate_path == dup_path),
-                "duplicate copy must be reported: {:?}",
-                sr.calibrated_duplicates
-            );
-            let row = get_light_calibration_for_frame(&conn, dup_fid)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                row.output_path, kept_path,
-                "tracking row untouched by a duplicate"
             );
         }
 

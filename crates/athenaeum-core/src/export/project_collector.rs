@@ -17,7 +17,6 @@ use rusqlite::Connection;
 
 use crate::db::collab::{get_project, linked_set_ids};
 use crate::db::collab_exchange::contributions_for_project;
-use crate::db::light_calibrations::get_light_calibration_for_frame;
 use crate::export::models::{
     CalibrationSubgroup, CalibrationSummary, CameraType, ExportData, ExportFrame, ExportGroup,
     MasterCreationPlan,
@@ -81,28 +80,23 @@ pub fn collect_project_export_data(
     // below so the skips reach `ExportResult.warnings` (the export dialog).
     let mut warnings: Vec<String> = Vec::new();
 
-    // ── Own side first (rule 3/4): the calibrated LIGHT outputs of the linked
-    // sets, each with a fresh output file on disk. ──────────────────────────
+    // ── Own side (rule 3/4): the linked sets' LIGHT frames. Decision C (spec
+    // 2026-08-31 §8a): there is no calibrated artifact to attach any more —
+    // light calibration moved into export and its tracking table is gone — so
+    // every own frame is skipped, loudly, until the collab rework lands. The
+    // received side below is unaffected. ────────────────────────────────────
+    // `own_display` names the dataset the own side lands in. It stays in the
+    // signature for the pending rework; with the own side blocked nothing is
+    // added under it, and a received publisher of the same name simply owns
+    // that bucket outright.
+    let _ = own_display;
     let set_ids = linked_set_ids(conn, project_id)?;
     for (frame_id, filename) in union_light_frames(conn, &set_ids)? {
-        let Some(cal) = get_light_calibration_for_frame(conn, frame_id)? else {
-            tracing::warn!(
-                frame_id,
-                "project export: linked light has no calibrated output — skipping"
-            );
-            warnings.push(format!("skipped {filename}: no calibrated output"));
-            continue;
-        };
-        if !Path::new(&cal.output_path).exists() {
-            tracing::warn!(frame_id, path = %cal.output_path, "project export: calibrated output missing on disk — skipping");
-            warnings.push(format!("skipped {filename}: no calibrated output on disk"));
-            continue;
-        }
-        let (ef, uuid) = own_export_frame(conn, frame_id, &cal.output_path)?;
-        if let Some(u) = uuid.filter(|s| !s.is_empty()) {
-            seen_uuids.insert(u);
-        }
-        add_frame(&mut order, &mut by_display, own_display, ef);
+        tracing::warn!(
+            frame_id,
+            "calibrated artifact unavailable — light calibration moved into export (collab rework pending)"
+        );
+        warnings.push(format!("skipped {filename}: no calibrated output"));
     }
 
     // ── Received side (rule 2): non-superseded contributions, partitioned by
@@ -292,6 +286,10 @@ fn build_dataset(display: &str, object_name: &str, frames: Vec<ExportFrame>) -> 
 /// Build one own-side [`ExportFrame`] from the `frames` row, with the calibrated
 /// output as its file path/name. Returns `(frame, frame_uuid)` — the uuid feeds
 /// the own-wins dedup.
+///
+/// Unreachable while the own side is blocked (decision C, spec 2026-08-31 §8a);
+/// kept for the pending collab rework, which restores the own-side branch.
+#[allow(dead_code)]
 fn own_export_frame(
     conn: &Connection,
     frame_id: i64,
@@ -382,9 +380,6 @@ mod tests {
     use crate::db::collab::{link_set, upsert_project, CollabProjectRow};
     use crate::db::collab_exchange::{
         insert_contribution, upsert_package, ContributionRow, PackageRow,
-    };
-    use crate::db::light_calibrations::{
-        upsert_light_calibration, FlatNormMode, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
     };
     use rusqlite::params;
 
@@ -546,31 +541,6 @@ mod tests {
         frame_id
     }
 
-    fn add_cal_row(conn: &Connection, frame_id: i64, output_path: &str) {
-        upsert_light_calibration(
-            conn,
-            &LightCalRow {
-                id: 0,
-                frame_id: Some(frame_id),
-                source_uuid: None,
-                source_filename: None,
-                output_path: output_path.into(),
-                dark_set_id: None,
-                flat_set_id: None,
-                bias_set_id: None,
-                calstat: "B".into(),
-                flat_norm_applied: false,
-                flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().into(),
-                output_hash: "h".into(),
-                engine_version: LIGHT_CAL_ENGINE_VERSION,
-                created_at: "2026-07-10T00:00:00Z".into(),
-                cal_params: "{}".into(),
-                cfa_scaling_applied: None,
-            },
-        )
-        .unwrap();
-    }
-
     fn find<'a>(data: &'a ProjectExportData, display: &str) -> &'a ExportData {
         &data
             .publishers
@@ -717,51 +687,56 @@ mod tests {
         assert_eq!(frames[0].filename, "live.fits");
     }
 
-    // (c) own calibrated frame lands in own_display dataset; a linked frame with
-    // no cal row or a missing output file is skipped.
+    // (c) Decision C (spec 2026-08-31 §8a): the own side is blocked — every
+    // linked LIGHT is skipped with a warning and no own dataset is produced.
+    // A project with ONLY own frames therefore has nothing to export.
     #[test]
-    fn own_calibrated_frame_lands_missing_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn own_side_is_blocked_until_the_collab_rework() {
         let conn = test_conn();
         seed_project(&conn, "p-1");
         let (set_id, session) = seed_own_set(&conn);
-
-        // A: cal row + real file on disk → included.
-        let fa = add_own_frame(&conn, session, "own-a", "CamA", "L");
-        let a_out = tmp.path().join("c_own-a.fits");
-        std::fs::write(&a_out, b"calibrated-a").unwrap();
-        add_cal_row(&conn, fa, &a_out.to_string_lossy());
-
-        // B: no cal row → skipped.
-        let _fb = add_own_frame(&conn, session, "own-b", "CamA", "L");
-
-        // C: cal row whose output_path does not exist → skipped.
-        let fc = add_own_frame(&conn, session, "own-c", "CamA", "L");
-        let c_out = tmp.path().join("does-not-exist").join("c_own-c.fits");
-        add_cal_row(&conn, fc, &c_out.to_string_lossy());
-
+        add_own_frame(&conn, session, "own-a", "CamA", "L");
+        add_own_frame(&conn, session, "own-b", "CamA", "L");
         link_set(&conn, "p-1", set_id).unwrap();
 
-        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        let me = find(&data, "Me");
-        let frames = all_frames(me);
-        assert_eq!(
-            frames.len(),
-            1,
-            "only the frame with a fresh output on disk survives"
+        let err = collect_project_export_data(&conn, "p-1", "Me").unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to export"),
+            "own frames alone no longer produce a dataset; got {err}"
         );
-        assert_eq!(
-            frames[0].filename, "c_own-a.fits",
-            "plain basename of the calibrated output"
-        );
-        assert_eq!(frames[0].file_path, a_out.to_string_lossy());
-        assert_eq!(
-            frames[0].frame_id, fa,
-            "own frames carry their real frame id"
-        );
-        assert_eq!(me.total_light_frames, 1);
+    }
 
-        // Both skips surface as warnings so the dialog can report the omissions.
+    // (c2) With a received contribution present the collector still succeeds —
+    // only the own frames drop out, each with its own warning so the export
+    // dialog reports the omission instead of silently shrinking.
+    #[test]
+    fn own_frames_are_skipped_with_a_warning_each() {
+        let conn = test_conn();
+        seed_project(&conn, "p-1");
+        let (set_id, session) = seed_own_set(&conn);
+        add_own_frame(&conn, session, "own-a", "CamA", "L");
+        add_own_frame(&conn, session, "own-b", "CamA", "L");
+        link_set(&conn, "p-1", set_id).unwrap();
+
+        mk_pkg(&conn, "p-1", "pkg-a", "Alice");
+        mk_contrib(
+            &conn,
+            "p-1",
+            "pkg-a",
+            "Alice",
+            "u-a",
+            "/land/Alice/L_0001.fits",
+            r#"{"instrume":"CamA","filter":"L","exptime":300.0}"#,
+            false,
+        );
+
+        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
+        assert!(
+            data.publishers.iter().all(|(d, _)| d != "Me"),
+            "no own dataset while the own side is blocked; got {:?}",
+            data.publishers.iter().map(|(d, _)| d).collect::<Vec<_>>()
+        );
+        assert_eq!(all_frames(find(&data, "Alice")).len(), 1, "received side unaffected");
         assert_eq!(
             data.warnings.len(),
             2,
@@ -769,17 +744,8 @@ mod tests {
             data.warnings
         );
         assert!(
-            data.warnings
-                .iter()
-                .any(|w| w.contains("own-b.fits") && w.contains("no calibrated output")),
-            "missing cal-row skip warned; got {:?}",
-            data.warnings
-        );
-        assert!(
-            data.warnings
-                .iter()
-                .any(|w| w.contains("own-c.fits") && w.contains("no calibrated output on disk")),
-            "missing-output-on-disk skip warned; got {:?}",
+            data.warnings.iter().all(|w| w.contains("no calibrated output")),
+            "each skip names the missing artifact; got {:?}",
             data.warnings
         );
     }
@@ -855,17 +821,17 @@ mod tests {
         );
     }
 
-    // Own + received sharing a frame_uuid: own wins, received duplicate dropped.
+    // Own + received sharing a frame_uuid. The own-wins dedup (rule 4) is
+    // dormant while the own side is blocked (decision C, spec 2026-08-31 §8a):
+    // with no own frame placed, nothing claims the uuid, so the received copy
+    // is the one that survives. Rewritten from `own_wins_over_received_duplicate_uuid`
+    // — the rework restores the own-wins assertion together with the own side.
     #[test]
-    fn own_wins_over_received_duplicate_uuid() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn received_copy_survives_while_the_own_side_is_blocked() {
         let conn = test_conn();
         seed_project(&conn, "p-1");
         let (set_id, session) = seed_own_set(&conn);
-        let fa = add_own_frame(&conn, session, "shared-uuid", "CamA", "L");
-        let a_out = tmp.path().join("c_shared.fits");
-        std::fs::write(&a_out, b"own-shared").unwrap();
-        add_cal_row(&conn, fa, &a_out.to_string_lossy());
+        add_own_frame(&conn, session, "shared-uuid", "CamA", "L");
         link_set(&conn, "p-1", set_id).unwrap();
 
         // A received contribution for the SAME uuid, under the same display "Me".
@@ -884,11 +850,8 @@ mod tests {
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
         let me = find(&data, "Me");
         let frames = all_frames(me);
-        assert_eq!(
-            frames.len(),
-            1,
-            "the received duplicate uuid is dropped; own wins"
-        );
-        assert_eq!(frames[0].filename, "c_shared.fits");
+        assert_eq!(frames.len(), 1, "exactly the received copy");
+        assert_eq!(frames[0].filename, "dup.fits", "the received copy, not an own output");
+        assert_eq!(frames[0].frame_id, -1, "received frames carry no catalog id");
     }
 }

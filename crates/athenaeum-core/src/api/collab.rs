@@ -6,15 +6,15 @@
 //! - **Suggestions** — rank every non-archived frame set by angular distance to
 //!   a project's target, flagging within-radius and already-linked sets.
 //! - **Gate report** — assemble each linked LIGHT frame's gate inputs from
-//!   `frames`/`plate_solves`/`frame_analysis`/`light_calibrations` and run the
-//!   pure [`crate::collab::gate`] engine over the union.
+//!   `frames`/`plate_solves`/`frame_analysis` and run the pure
+//!   [`crate::collab::gate`] engine over the union.
 //! - **Portal deep-link intent** — record a "publish as project" intent for a
 //!   set and build the portal `/new` URL prefilled from its target.
 //! - **Match** — cached projects whose target radius contains a point and that
 //!   aren't already linked to a set (the Task-6 auto-link hook).
 //!
-//! Render-gated (`api/mod.rs`) because [`frame_cal_status`] lives in the
-//! render-only `api::lights`; the `crate::collab` core module and `db::collab`
+//! Render-gated (`api/mod.rs`) because publishing consumes the render-only
+//! package/stamping surface; the `crate::collab` core module and `db::collab`
 //! stay ungated so the headless/perseus `--no-default-features` build compiles.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -25,10 +25,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::collab_exchange::ensure_collab_sender_engine;
-use crate::api::lights::frame_cal_status;
 use crate::api::{db, ApiError};
 use crate::collab::gate::{
-    evaluate_frame, FrameGateRow, GateFrameInput, ProjectTarget, ThresholdRuleView,
+    evaluate_frame, FrameGateRow, GateFrameInput, LightCalStatus, ProjectTarget, ThresholdRuleView,
 };
 use crate::collab::hub_client::{AnnounceRequest, CollabClient};
 use crate::collab::snapshot::{member_node_ids, own_display_name, SnapshotMember};
@@ -40,7 +39,6 @@ use crate::db::collab_exchange::{
     mark_superseded, own_active_announcement_ids_for_uuids, set_local_status, upsert_package,
     PackageRow,
 };
-use crate::db::light_calibrations::get_light_calibration_for_frame;
 use crate::events::ProgressEmitter;
 use crate::fits_writer::{stamp_extra_card, Card, CardValue};
 use crate::models::FrameAnalysis;
@@ -389,14 +387,15 @@ fn frame_gate_inputs(
                 })
             });
 
-        let cal_status = frame_cal_status(conn, *frame_id)?;
-
         out.push(GateFrameInput {
             frame_id: *frame_id,
             filename: filename.clone(),
             center,
             pixel_scale_arcsec,
-            cal_status,
+            // Decision C (spec 2026-08-31 §8a): light-cal artifacts are gone —
+            // collab publish rework is a named follow-up. Until then no frame
+            // passes layer 1.
+            cal_status: LightCalStatus::NotCalibrated,
             analysis: analyses.get(frame_id).cloned(),
         });
     }
@@ -1073,7 +1072,7 @@ pub struct PublishResult {
 /// One publishable frame carried through the stamping/manifest build.
 struct PublishFrame {
     frame_id: i64,
-    /// The calibrated-light artifact on disk (`light_calibrations.output_path`).
+    /// The calibrated-light artifact on disk.
     output_path: String,
     /// The light-calibration engine version stamped into the record's project stamp.
     engine_version: i64,
@@ -1136,8 +1135,13 @@ fn select_seed_target(
 /// announce it to the hub (anchored on the pre-minted hub uuid), record it
 /// locally with Д9 supersedes, and push-seed the first receive-capable member.
 ///
-/// Render-gated (it consumes [`evaluate_project_gate`] + `db::light_calibrations`),
+/// Render-gated (it consumes [`evaluate_project_gate`] + the stamping surface),
 /// so the headless `--no-default-features` build never compiles it.
+///
+/// Decision C (spec 2026-08-31 §8a): the gate resolves every frame to
+/// `NotCalibrated`, so this returns `Invalid("no publishable frames")` before
+/// reaching the package builder. The body below is kept intact for the pending
+/// collab rework, minus the artifact lookup that no longer has a table.
 pub async fn publish_collab_frames(
     ctx: &ServiceContext,
     collab_sender: &crate::sync::SyncSenderRuntime,
@@ -1163,61 +1167,19 @@ pub async fn publish_collab_frames(
                 ))
             })?;
 
-        let ids: Vec<i64> = publishable.iter().map(|r| r.frame_id).collect();
-        let rows =
-            crate::db::get_frames_with_files_by_ids(&conn, &ids).map_err(|e| internal(e.into()))?;
-        let frame_by_id: HashMap<i64, crate::models::Frame> = rows
-            .into_iter()
-            .map(|(_, _, fr)| (fr.id.unwrap_or_default(), fr))
-            .collect();
-        let analysis_by_id: HashMap<i64, FrameAnalysis> = get_frame_analyses_by_ids(&conn, &ids)
-            .map_err(|e| internal(e.into()))?
-            .into_iter()
-            .map(|a| (a.frame_id, a))
-            .collect();
-
-        let mut frames: Vec<PublishFrame> = Vec::with_capacity(publishable.len());
+        // Decision C (spec 2026-08-31 §8a): there is no calibrated artifact to
+        // resolve any more — light calibration moved into export and its
+        // tracking table is gone. Every frame is skipped, loudly. Unreachable
+        // in practice (the gate blocks all of them above), kept honest for the
+        // moment the pending rework loosens the gate first.
+        let frames: Vec<PublishFrame> = Vec::new();
         let mut skipped: Vec<i64> = Vec::new();
         for row in &publishable {
-            let Some(cal) =
-                get_light_calibration_for_frame(&conn, row.frame_id).map_err(internal)?
-            else {
-                tracing::warn!(
-                    frame_id = row.frame_id,
-                    "publish: no light-calibration row — skipping"
-                );
-                skipped.push(row.frame_id);
-                continue;
-            };
-            if !Path::new(&cal.output_path).exists() {
-                tracing::warn!(
-                    frame_id = row.frame_id,
-                    path = %cal.output_path,
-                    "publish: calibrated artifact missing on disk — skipping"
-                );
-                skipped.push(row.frame_id);
-                continue;
-            }
-            let Some(frame) = frame_by_id.get(&row.frame_id).cloned() else {
-                tracing::warn!(
-                    frame_id = row.frame_id,
-                    "publish: frame row vanished — skipping"
-                );
-                skipped.push(row.frame_id);
-                continue;
-            };
-            let analysis = analysis_by_id
-                .get(&row.frame_id)
-                .and_then(|a| serde_json::to_value(a).ok());
-            frames.push(PublishFrame {
-                frame_id: row.frame_id,
-                output_path: cal.output_path,
-                engine_version: cal.engine_version,
-                frame,
-                analysis,
-                fwhm_arcsec: row.fwhm_arcsec,
-                eccentricity: row.eccentricity,
-            });
+            tracing::warn!(
+                frame_id = row.frame_id,
+                "calibrated artifact unavailable — light calibration moved into export (collab rework pending)"
+            );
+            skipped.push(row.frame_id);
         }
         (frames, project, skipped)
     };
@@ -2068,7 +2030,7 @@ mod tests {
         assert_eq!(report.rows.len(), 2);
         assert_eq!(
             report.publishable, 0,
-            "no light_calibrations rows → not calibrated"
+            "decision C (spec 2026-08-31 §8a): every frame resolves NotCalibrated"
         );
 
         // Frame 0: blocked only by calibration. Frame 1: calibration + trailed.
@@ -2484,9 +2446,6 @@ mod tests {
 
     // ── Publish (Task 7) ─────────────────────────────────────────────────────
 
-    use crate::db::light_calibrations::{
-        upsert_light_calibration, FlatNormMode, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
-    };
     use wiremock::matchers::{method as wm_method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2539,9 +2498,12 @@ mod tests {
         })
     }
 
-    /// A frame set of gate-passing, calibrated LIGHT frames: on-target, known
-    /// pixel scale, not trailed, each with a real tiny calibrated FITS artifact on
-    /// disk + a `Calibrated` `light_calibrations` row. Returns the set id.
+    /// A frame set of on-target, analyzed, not-trailed LIGHT frames, each with a
+    /// real tiny calibrated FITS artifact on disk. Returns the set id.
+    ///
+    /// Gate-PASSING until decision C (spec 2026-08-31 §8a) — the calibration
+    /// precondition is now a constant `NotCalibrated`, so every consumer of this
+    /// fixture is `#[ignore]`d pending the collab publish rework.
     fn seed_publishable_set(
         conn: &rusqlite::Connection,
         out_dir: &std::path::Path,
@@ -2603,32 +2565,10 @@ mod tests {
             )
             .unwrap();
 
-            // A real single-HDU FITS the stamper can copy + a Calibrated tracking
-            // row (no set-ids, current engine, no calibration links ⇒ Calibrated).
+            // A real single-HDU FITS the stamper can copy. There is no tracking
+            // row to seed any more (spec 2026-08-31 §8a).
             let out_path = out_dir.join(format!("c_{uuid}.fits"));
             crate::fits_writer::write_fits_f32(&out_path, 4, 4, 1, &vec![0.5f32; 16], &[]).unwrap();
-            upsert_light_calibration(
-                conn,
-                &LightCalRow {
-                    id: 0,
-                    frame_id: Some(frame_id),
-                    source_uuid: Some(uuid.to_string()),
-                    source_filename: Some(format!("L_{i:04}.fits")),
-                    output_path: out_path.to_string_lossy().to_string(),
-                    dark_set_id: None,
-                    flat_set_id: None,
-                    bias_set_id: None,
-                    calstat: "B".to_string(),
-                    flat_norm_applied: false,
-                    flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
-                    output_hash: "deadbeef".to_string(),
-                    engine_version: LIGHT_CAL_ENGINE_VERSION,
-                    created_at: "2026-07-10T00:00:00Z".to_string(),
-                    cal_params: "{}".to_string(),
-                    cfa_scaling_applied: None,
-                },
-            )
-            .unwrap();
         }
         set_id
     }
@@ -2721,6 +2661,7 @@ mod tests {
     /// origin=mine row with manifest bytes, the hub saw the manifest anchor +
     /// `supersedes: []`, and the send_receive member was seeded.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn publish_announces_stamps_and_seeds_the_member() {
         const BOB: NodeId = [0x11; 32];
         let server = MockServer::start().await;
@@ -2822,6 +2763,7 @@ mod tests {
     /// the second announce body carries the first announcement id, the first
     /// package row flips `superseded=1`, and the result echoes it.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn republish_supersedes_the_prior_announcement() {
         let server = MockServer::start().await;
         // First POST → ann-1 (once), later POSTs → ann-2.
@@ -2904,6 +2846,7 @@ mod tests {
     /// (c) A `pending` announcement (require_approval) seeds the COORDINATOR, not
     /// a non-coordinator send_receive member.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn pending_publish_seeds_the_coordinator() {
         const COORD: NodeId = [0x22; 32];
         const BOB: NodeId = [0x11; 32];
@@ -2951,6 +2894,7 @@ mod tests {
     /// (d) No receive-capable member online ⇒ `seed_target` is None but the
     /// package is still announced + recorded.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn publish_with_no_eligible_target_still_announces() {
         let server = MockServer::start().await;
         mount_announce(&server, "p-1", "ann-d", "published").await;
@@ -3000,6 +2944,7 @@ mod tests {
     /// no provider's blob store ever held that value, which is exactly why a
     /// swarm fetch against it could not work.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn publish_root_hash_is_the_collection_hash() {
         let server = MockServer::start().await;
         mount_announce(&server, "p-1", "ann-e", "published").await;
@@ -3088,6 +3033,7 @@ mod tests {
     /// GET fails on: exactly the phantom holder the supersede-reclaim unseed
     /// exists to prevent.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn failed_announce_leaves_no_seed_tag() {
         use n0_future::StreamExt as _;
 
@@ -3487,6 +3433,7 @@ mod tests {
     /// — so the same step must stop seeding it. The new package is seeded, and
     /// another project's seed is untouched.
     #[tokio::test]
+    #[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
     async fn publish_supersede_unseeds_the_reclaimed_package() {
         let server = MockServer::start().await;
         Mock::given(wm_method("POST"))

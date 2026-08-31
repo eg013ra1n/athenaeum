@@ -398,13 +398,11 @@ fn frame_declares_cfa(conn: &Connection, frame_id: i64) -> Result<bool> {
 }
 
 /// Derived (never stored) calibration status for a light frame — design §5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LightCalStatus {
-    NotCalibrated,
-    Calibrated,
-    Partial,
-    Stale,
-}
+///
+/// The definition moved to [`crate::collab::gate`] (its last real consumer, and
+/// DB-free by design) when light calibration moved into export — spec
+/// 2026-08-31 §8a. Re-exported here so this module's own callers keep the path.
+pub use crate::collab::gate::LightCalStatus;
 
 /// Derive a light frame's calibration status from its tracking row (if any)
 /// against the frame's *current* calibration links.

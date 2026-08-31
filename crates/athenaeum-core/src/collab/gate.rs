@@ -16,8 +16,22 @@
 //! catalog. The caller resolves the frame's center, pixel scale, calibration
 //! status, and analysis, then hands them here as a [`GateFrameInput`].
 
-use crate::db::light_calibrations::LightCalStatus;
 use crate::models::FrameAnalysis;
+
+/// A frame's light-calibration status, as layer-1 precondition (1) reads it.
+///
+/// Lives here (not in `db::`) because the gate is DB-free by design and this is
+/// the only surface that still consumes the status: light calibration moved
+/// into export and its tracking table is gone (spec 2026-08-31 §8a). The
+/// collab-publish rework — the named follow-up that gives this enum a real
+/// resolver again — will decide what "calibrated" means for a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightCalStatus {
+    NotCalibrated,
+    Calibrated,
+    Partial,
+    Stale,
+}
 
 /// The project's target field: a center and an acceptance radius (decimal
 /// degrees). A frame whose resolved center lies farther than `radius_deg` from
@@ -186,7 +200,6 @@ pub fn evaluate_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::light_calibrations::LightCalStatus;
     use crate::models::FrameAnalysis;
 
     /// `FrameAnalysis` fields are NOT `Option` (see `models.rs`): `median_fwhm:

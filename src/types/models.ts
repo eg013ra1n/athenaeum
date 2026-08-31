@@ -130,15 +130,7 @@ export type FolderSimilarity = { folder_a: string, folder_b: string, similarity_
 
 export type ScanProgressEvent = { current: number, total: number, current_file: string | null, percent: number, root_id: number, phase: string, };
 
-export type CalibratedDuplicate = { keptPath: string, duplicatePath: string, };
-
-export type ScanCompleteEvent = { root_id: number, files_found: number, files_processed: number, files_skipped: number, errors: Array<string>, lights_count: number, darks_count: number, flats_count: number, bias_count: number, darkflats_count: number, calibration_sets_created: number, cancelled: boolean, 
-/**
- * Calibrated-LIGHT artifacts (design §4.3) whose header identity matches a
- * tracked output whose file ALSO still exists — a duplicate copy the user
- * should be told about. Never registered as frames; surfaced only here.
- */
-calibrated_duplicates: Array<CalibratedDuplicate>, };
+export type ScanCompleteEvent = { root_id: number, files_found: number, files_processed: number, files_skipped: number, errors: Array<string>, lights_count: number, darks_count: number, flats_count: number, bias_count: number, darkflats_count: number, calibration_sets_created: number, cancelled: boolean, };
 
 export type FileWithFrame = { file: File, frame: Frame | null, };
 

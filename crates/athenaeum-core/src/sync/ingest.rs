@@ -619,8 +619,10 @@ fn process_calibrated_light(
         .with_context(|| format!("land calibrated light {}", record.rel_path))?;
     let landed_str = landed.to_string_lossy().into_owned();
 
-    // Reject-and-remove: a landed artifact we refuse must never stay on disk
-    // untracked (a later scan would adopt or `_2`-duplicate it).
+    // Reject-and-remove: a landed artifact we refuse must never stay on disk.
+    // A scan would not clean it up either — calibrated artifacts are skipped,
+    // never cataloged (spec 2026-08-31 §4) — so removing it here is the only
+    // moment it can happen.
     let reject = |reason: String| -> Result<FrameVerdict> {
         if let Err(e) = std::fs::remove_file(&landed) {
             tracing::warn!(path = %landed_str, error = %e, "sync ingest: failed to remove rejected artifact");

@@ -40,9 +40,6 @@ use crate::api::collab_exchange::{
 use crate::api::db;
 use crate::db::collab::{upsert_project, CollabProjectRow};
 use crate::db::collab_exchange::{contributions_for_package, get_package};
-use crate::db::light_calibrations::{
-    upsert_light_calibration, FlatNormMode, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
-};
 use crate::services::ServiceContext;
 use crate::sharing::loopback::{LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::NodeId;
@@ -187,10 +184,13 @@ fn seed_project(conn: &Connection, project_id: &str, members_json: &str, require
     .unwrap();
 }
 
-/// A frame set of gate-passing, calibrated LIGHT frames: on-target, known pixel
-/// scale, not trailed, each with a real tiny calibrated FITS artifact on disk +
-/// a `Calibrated` `light_calibrations` row. Returns the set id. Reproduced from
+/// A frame set of on-target, analyzed, not-trailed LIGHT frames, each with a real
+/// tiny calibrated FITS artifact on disk. Returns the set id. Reproduced from
 /// `api::collab::seed_publishable_set`.
+///
+/// Gate-PASSING until decision C (spec 2026-08-31 §8a) — the calibration
+/// precondition is now a constant `NotCalibrated`, so both scenarios below are
+/// `#[ignore]`d pending the collab publish rework.
 fn seed_publishable_set(
     conn: &Connection,
     out_dir: &std::path::Path,
@@ -252,30 +252,10 @@ fn seed_publishable_set(
         )
         .unwrap();
 
+        // A real single-HDU FITS the stamper can copy. There is no tracking row
+        // to seed any more (spec 2026-08-31 §8a).
         let out_path = out_dir.join(format!("c_{uuid}.fits"));
         crate::fits_writer::write_fits_f32(&out_path, 4, 4, 1, &vec![0.5f32; 16], &[]).unwrap();
-        upsert_light_calibration(
-            conn,
-            &LightCalRow {
-                id: 0,
-                frame_id: Some(frame_id),
-                source_uuid: Some(uuid.to_string()),
-                source_filename: Some(format!("L_{i:04}.fits")),
-                output_path: out_path.to_string_lossy().to_string(),
-                dark_set_id: None,
-                flat_set_id: None,
-                bias_set_id: None,
-                calstat: "B".to_string(),
-                flat_norm_applied: false,
-                flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
-                output_hash: "deadbeef".to_string(),
-                engine_version: LIGHT_CAL_ENGINE_VERSION,
-                created_at: "2026-07-10T00:00:00Z".to_string(),
-                cal_params: "{}".to_string(),
-                cfa_scaling_applied: None,
-            },
-        )
-        .unwrap();
     }
     set_id
 }
@@ -375,6 +355,7 @@ async fn start_collab_engine(
 /// half of the scenario, validating the fixture layer before the full E2E.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
 async fn publish_seeds_pending_smoke() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -446,6 +427,7 @@ async fn publish_seeds_pending_smoke() {
 /// byte-identical to CONTRIB's payloads, with PROC's catalog untouched (§11).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "collab publish rework pending — calibrated-export-v2 spec §8a"]
 async fn three_instance_project_flow_publish_moderate_deliver_export() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
