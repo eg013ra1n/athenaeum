@@ -63,7 +63,18 @@ bayerpat: string | null,
 /**
  * Camera/instrument name
  */
-instrume: string | null, };
+instrume: string | null, 
+/**
+ * How this frame reaches the export: `None` = copy the file at
+ * `file_path` as it is (every mode but one); `Some(debayer)` = the
+ * executor CALIBRATES it into place, debayering it when `true`.
+ *
+ * Set only by the calibrated-lights mode transform
+ * ([`crate::export::apply_export_mode`]), which also renames `filename`
+ * to the matching `c_*` output name. Collectors leave it `None` — a
+ * frame is copied unless something deliberately asks for generation.
+ */
+debayerCalibrated: boolean | null, };
 
 export type CalibrationSetInfo = { 
 /**
@@ -758,7 +769,9 @@ current: number,
  */
 total: number, percent: number, currentFile: string | null, 
 /**
- * "collecting" | "copying" | "complete"
+ * "collecting" | "copying" | "calibrating" | "complete"
+ * ("calibrating" = this file is being generated from its masters rather
+ * than copied — the calibrated-lights mode.)
  */
 phase: string, };
 

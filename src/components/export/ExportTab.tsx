@@ -14,6 +14,10 @@ import {
   readFlatNormPref,
   readFlatNormModePref,
   readLightCalParamsPref,
+  readHotPixelPref,
+  readDebayerPref,
+  writeHotPixelPref,
+  writeDebayerPref,
 } from './lightCalPrefs';
 import type { CalibrationDetail, ExportMode } from '../../types/export';
 import type { ExportFileCounts, ExportReadiness } from '../../types/models';
@@ -34,7 +38,7 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; cou
   { value: 'lightsOnly', label: 'Lights only', hint: 'Raw light frames, no calibration frames.', count: c => c.lightsOnly },
   { value: 'rawWithCalibrationSets', label: 'Lights + calibration sets', hint: 'Raw light frames with their matched raw calibration frames — WBPP performs all calibration.', count: c => c.rawWithCalibrationSets },
   { value: 'rawWithMasters', label: 'Lights + masters', hint: 'Raw lights with the built master calibration files. Every linked set needs a master.', count: c => c.rawWithMasters },
-  { value: 'calibratedLights', label: 'Calibrated lights', hint: 'c_*.fits calibrated artifacts, no calibration frames — WBPP runs with calibration disabled.', count: c => c.calibratedLights },
+  { value: 'calibratedLights', label: 'Calibrated lights', hint: 'Calibrates every light from its linked masters during the export — no calibration frames land; WBPP runs with calibration disabled.', count: c => c.calibratedLights },
 ];
 
 /** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` — including
@@ -99,6 +103,20 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // memory; synced into the persisted WbppExportConfig at export time (the
   // backend reads `export_mode` from that config, not from the invoke args).
   const [exportMode, setExportMode] = useState<ExportMode>(readExportModePref);
+
+  // Generation options for the calibrated-lights mode. Held in state (rather
+  // than read at click time) so the checkboxes are controlled; each write also
+  // persists, so the choice survives a reload.
+  const [hotPixel, setHotPixel] = useState<boolean>(readHotPixelPref);
+  const [debayer, setDebayer] = useState<boolean>(readDebayerPref);
+  const handleHotPixelChange = useCallback((on: boolean) => {
+    setHotPixel(on);
+    writeHotPixelPref(on);
+  }, []);
+  const handleDebayerChange = useCallback((on: boolean) => {
+    setDebayer(on);
+    writeDebayerPref(on);
+  }, []);
 
   // Readiness for the whole set — one fetch, mode-independent: it carries every
   // mode's file count plus the two blocker tallies. The gate here is UX; the
@@ -295,12 +313,14 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
         flatNorm: readFlatNormPref(),
         flatNormMode: readFlatNormModePref(),
         params: readLightCalParamsPref(),
+        hotPixel,
+        debayer,
       }, exportMode);
     } catch (err) {
       console.error('Failed to start export:', err);
       setExportError(typeof err === 'string' ? err : (err as Error)?.message ?? String(err));
     }
-  }, [frameSetId, outputDir, useSymlinks, exportMode, wbppConfig, saveWbppConfig, startExport]);
+  }, [frameSetId, outputDir, useSymlinks, exportMode, hotPixel, debayer, wbppConfig, saveWbppConfig, startExport]);
 
   const canExport = outputDir !== '' && !exporting && modeReady;
   // Sending needs no output folder — the payload is staged by the backend.
@@ -414,6 +434,31 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                 );
               })}
             </div>
+
+            {/* Generation options — only this mode calibrates anything, so the
+                toggles appear with it instead of sitting inert in every mode. */}
+            {exportMode === 'calibratedLights' && (
+              <div className="mt-3 pt-3 border-t border-border space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={hotPixel}
+                    onChange={e => handleHotPixelChange(e.target.checked)}
+                    className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+                  />
+                  <span className="text-sm text-content-secondary">Hot-pixel correction</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={debayer}
+                    onChange={e => handleDebayerChange(e.target.checked)}
+                    className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+                  />
+                  <span className="text-sm text-content-secondary">Debayer OSC lights (VNG)</span>
+                </label>
+              </div>
+            )}
           </section>
 
           {/* Top-level warnings — was previously dead code (WarningsPanel

@@ -13,9 +13,12 @@ pub mod project_collector;
 
 #[cfg(feature = "render")]
 pub use calibrated_generator::{
-    calibrated_output_filename, execute_generation, resolve_generation, CalibratedLightOptions,
-    GeneratedLight, GenerationSpec,
+    execute_generation, resolve_generation, GeneratedLight, GenerationSpec,
 };
+// The generator's run options and its output-naming rule live in `models`, not
+// behind the `render` gate: the ungated mode transform names those files and
+// records the debayer decision (see the note beside them there).
+pub use models::{calibrated_output_filename, CalibratedLightOptions};
 pub use data_collector::*;
 pub use file_organizer::*;
 pub use project_collector::{collect_project_export_data, ProjectExportData};

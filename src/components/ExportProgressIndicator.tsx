@@ -4,6 +4,9 @@ import { useExportProgressContext } from '../contexts/ExportProgressContext';
 const phaseConfig: Record<string, { label: string }> = {
   collecting: { label: 'Collecting export data...' },
   copying: { label: 'Exporting files' },
+  // Calibrated-lights mode: this file is being generated from its masters
+  // rather than copied, which is slow enough that saying so matters.
+  calibrating: { label: 'Calibrating…' },
 };
 
 export function ExportProgressIndicator() {

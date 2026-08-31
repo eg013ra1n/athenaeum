@@ -121,6 +121,30 @@ pub struct WbppPlacement {
     /// Forward-slash directory relative to the frame-set root (frame-set name NOT
     /// included).
     pub rel_dir: String,
+    /// Where this placement's bytes come from — copied, or calibrated into
+    /// place. See [`PlacementSource`].
+    pub source: PlacementSource,
+}
+
+/// Where a placement's bytes come from.
+///
+/// `Copy` is every mode but one: the file at `file_path` is copied (or
+/// symlinked) as it is. `CalibrateLight` is the calibrated-lights mode: the
+/// file at `file_path` is the RAW light, and the executor generates the
+/// destination from it and its linked masters.
+///
+/// Derived from [`crate::export::models::ExportFrame::debayer_calibrated`],
+/// which only the calibrated-lights mode transform sets — so every other
+/// caller of [`compute_wbpp_placements`] keeps seeing `Copy` for everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementSource {
+    Copy,
+    CalibrateLight {
+        frame_id: i64,
+        /// Whether the generated output is debayered. Mirrors the `_d` marker
+        /// already in `filename` — the transform decided both from one value.
+        debayer: bool,
+    },
 }
 
 /// Compute the WBPP placement of every frame the organizer would place, in the
@@ -254,6 +278,13 @@ fn place_at(
             file_path: f.file_path.clone(),
             filename: f.filename.clone(),
             rel_dir: rel_dir.clone(),
+            source: match f.debayer_calibrated {
+                None => PlacementSource::Copy,
+                Some(debayer) => PlacementSource::CalibrateLight {
+                    frame_id: f.frame_id,
+                    debayer,
+                },
+            },
         });
     }
 }
@@ -285,6 +316,161 @@ impl DestClaims {
     }
 }
 
+/// Everything one export run needs to CALIBRATE its lights instead of copying
+/// them: one resolved plan per marked frame, the run's options, and the spill
+/// directory the pixel phase streams through.
+///
+/// Built by [`GenerationBatch::resolve`] while a catalog connection is held,
+/// then handed to [`organize_files_wbpp`] — which never touches the database.
+/// That split is the whole point: resolving is short and needs the catalog,
+/// generating is long and must not hold it.
+///
+/// No lifetime parameter: every field is owned, so the batch outlives the
+/// connection it was resolved from (a borrowed spec would pin that connection
+/// for the entire pixel phase, which is exactly what this avoids).
+#[cfg(feature = "render")]
+pub struct GenerationBatch {
+    /// frame_id → its resolved plan.
+    specs: std::collections::HashMap<i64, crate::export::GenerationSpec>,
+    /// frame_id → why it has no plan. Recorded at resolve time so the ONE
+    /// warning the operator sees for that frame carries the real reason
+    /// instead of a generic "not generated".
+    skipped: std::collections::HashMap<i64, String>,
+    opts: crate::export::CalibratedLightOptions,
+    scratch_dir: PathBuf,
+    /// One hot-pixel map per master dark, for the whole run: the map depends on
+    /// the dark alone and costs a full plane read to measure, so a set sharing
+    /// one dark pays that once. Lives here rather than in `organize_files_wbpp`
+    /// so that (ungated) function never names a `render`-only type.
+    hot_maps: std::collections::HashMap<
+        PathBuf,
+        std::sync::Arc<crate::calibration_library::cosmetic::HotPixelMap>,
+    >,
+}
+
+/// A build with no pixel pipeline can never generate anything, so the batch is
+/// uninhabited there: `organize_files_wbpp` keeps ONE signature across both
+/// configurations, and the headless build proves at compile time that its
+/// generation arm is unreachable (`match *batch {}`) instead of carrying dead
+/// runtime code.
+#[cfg(not(feature = "render"))]
+pub enum GenerationBatch {}
+
+#[cfg(feature = "render")]
+impl GenerationBatch {
+    /// Resolve a plan for every light the calibrated-lights transform marked.
+    ///
+    /// Walks the same [`compute_wbpp_placements`] the organizer will walk, so a
+    /// marked frame either gets a spec or gets its failure recorded — there is
+    /// no third outcome and no placement the executor can meet unprepared. A
+    /// per-frame resolve failure is never fatal: the rest of the export runs
+    /// and that one frame is reported.
+    pub fn resolve(
+        conn: &rusqlite::Connection,
+        data: &ExportData,
+        opts: crate::export::CalibratedLightOptions,
+        scratch_dir: PathBuf,
+    ) -> Self {
+        let mut specs = std::collections::HashMap::new();
+        let mut skipped = std::collections::HashMap::new();
+        for placement in compute_wbpp_placements(data) {
+            let PlacementSource::CalibrateLight { frame_id, .. } = placement.source else {
+                continue;
+            };
+            match crate::export::resolve_generation(conn, frame_id, &opts, &scratch_dir) {
+                Ok(spec) => {
+                    specs.insert(frame_id, spec);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        frame_id,
+                        file = %placement.filename,
+                        error = %e,
+                        "cannot calibrate this light — it will be skipped"
+                    );
+                    skipped.insert(frame_id, format!("{e:#}"));
+                }
+            }
+        }
+        tracing::info!(
+            resolved = specs.len(),
+            skipped = skipped.len(),
+            "calibrated-light generation planned"
+        );
+        Self {
+            specs,
+            skipped,
+            opts,
+            scratch_dir,
+            hot_maps: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Generate one placement: calibrate `frame_id` from its plan and write it to
+/// `dest`. The write is atomic (temp + rename), so an existing output is
+/// REPLACED — there is no exists-skip on a generated file, which would
+/// otherwise leave a stale artifact from an earlier run in the export.
+#[cfg(feature = "render")]
+fn generate_one(
+    batch: &mut GenerationBatch,
+    frame_id: i64,
+    debayer: bool,
+    dest: &Path,
+    cancel_flag: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    // Field-level destructuring: `specs` is read while `hot_maps` is written,
+    // which a whole-struct borrow would not allow.
+    let GenerationBatch {
+        specs,
+        skipped,
+        opts,
+        scratch_dir,
+        hot_maps,
+    } = batch;
+    let Some(spec) = specs.get(&frame_id) else {
+        match skipped.get(&frame_id) {
+            Some(reason) => anyhow::bail!("{reason}"),
+            None => anyhow::bail!("no calibration plan was resolved for this frame"),
+        }
+    };
+    if spec.debayer != debayer {
+        // The name is already claimed; the content is about to be written. They
+        // are decided from the same column by the same parser, so a mismatch is
+        // a bug worth a log line rather than a silent `_d` disagreement.
+        tracing::warn!(
+            frame_id,
+            named_debayer = debayer,
+            resolved_debayer = spec.debayer,
+            "debayer decision disagrees with the placed filename"
+        );
+    }
+    let generated =
+        crate::export::execute_generation(spec, dest, scratch_dir, opts, hot_maps, cancel_flag)?;
+    tracing::debug!(
+        frame_id,
+        dest = %dest.display(),
+        calstat = %generated.calstat,
+        debayered = generated.debayered,
+        hot_pixels_replaced = generated.hot_pixels_replaced,
+        "calibrated light written into the export"
+    );
+    Ok(())
+}
+
+/// Headless stub: [`GenerationBatch`] is uninhabited without the `render`
+/// feature, so reaching here is impossible and the compiler knows it.
+#[cfg(not(feature = "render"))]
+fn generate_one(
+    batch: &mut GenerationBatch,
+    _frame_id: i64,
+    _debayer: bool,
+    _dest: &Path,
+    _cancel_flag: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    match *batch {}
+}
+
 /// Organize files for PixInsight WBPP export
 ///
 /// Creates a nested folder structure where parent calibrates child,
@@ -292,6 +478,11 @@ impl DestClaims {
 /// computed by the pure [`compute_wbpp_placements`] (shared with the Transfers
 /// send path); this function only prepends the frame-set root and does the
 /// copy/symlink + progress I/O.
+///
+/// `generation` is the calibrated-lights mode's plan (see [`GenerationBatch`]).
+/// `None` — every other mode, and every caller that only copies — means a
+/// placement marked for calibration is reported as a warning instead of being
+/// silently copied raw under a `c_*` name.
 pub fn organize_files_wbpp(
     output_dir: &Path,
     data: &ExportData,
@@ -300,6 +491,7 @@ pub fn organize_files_wbpp(
     emitter: Option<&dyn ProgressEmitter>,
     frame_set_id: i64,
     cancel_flag: &std::sync::atomic::AtomicBool,
+    generation: Option<&mut GenerationBatch>,
 ) -> Result<OrganizeResult> {
     let span = tracing::info_span!("export", frame_set_id);
     let _g = span.enter();
@@ -318,8 +510,10 @@ pub fn organize_files_wbpp(
     let placements = compute_wbpp_placements(data);
     let mut last_emit = Instant::now();
 
-    // Helper closure to emit progress (throttled to every 100ms)
-    let mut emit_progress = |current: usize, filename: Option<&str>| {
+    // Helper closure to emit progress (throttled to every 100ms). `phase`
+    // distinguishes a copied placement from a generated one — same counter,
+    // same denominator, different work.
+    let mut emit_progress = |current: usize, filename: Option<&str>, phase: &str| {
         let now = Instant::now();
         if now.duration_since(last_emit).as_millis() >= 100 || current == total_files {
             if let Some(e) = emitter {
@@ -337,7 +531,7 @@ pub fn organize_files_wbpp(
                         total: total_files,
                         percent,
                         current_file: filename.map(|s| s.to_string()),
-                        phase: "copying".to_string(),
+                        phase: phase.to_string(),
                     },
                 );
             }
@@ -345,6 +539,7 @@ pub fn organize_files_wbpp(
         }
     };
 
+    let mut generation = generation;
     let mut claims = DestClaims::default();
     for placement in &placements {
         if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -358,12 +553,44 @@ pub fn organize_files_wbpp(
         fs::create_dir_all(&dest_dir)?;
         let filename = claims.claim(&placement.rel_dir, &placement.filename);
         let dest = dest_dir.join(&filename);
-        match copy_or_link(&placement.file_path, &dest, use_symlinks) {
-            Ok(_) => {
-                files_organized += 1;
-                emit_progress(files_organized as usize, Some(&filename));
+        match placement.source {
+            PlacementSource::Copy => {
+                match copy_or_link(&placement.file_path, &dest, use_symlinks) {
+                    Ok(_) => {
+                        files_organized += 1;
+                        emit_progress(files_organized as usize, Some(&filename), "copying");
+                    }
+                    Err(e) => warnings.push(format!("Failed to copy {}: {}", filename, e)),
+                }
             }
-            Err(e) => warnings.push(format!("Failed to copy {}: {}", filename, e)),
+            PlacementSource::CalibrateLight { frame_id, debayer } => {
+                // Announce the frame BEFORE the work, unlike a copy: calibrating
+                // one light takes seconds to minutes, and a bar that only moves
+                // on completion looks frozen for the whole of it. The count is
+                // still what has actually landed.
+                emit_progress(files_organized as usize, Some(&filename), "calibrating");
+                let outcome = match generation.as_deref_mut() {
+                    Some(batch) => generate_one(batch, frame_id, debayer, &dest, cancel_flag),
+                    None => Err(anyhow::anyhow!(
+                        "this export was not prepared to calibrate lights"
+                    )),
+                };
+                match outcome {
+                    Ok(()) => {
+                        files_organized += 1;
+                        emit_progress(files_organized as usize, Some(&filename), "calibrating");
+                    }
+                    Err(e) => {
+                        // A cancel surfaces here as a per-frame error; the loop
+                        // is about to end anyway, so it is not a warning the
+                        // operator needs to read.
+                        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        warnings.push(format!("Failed to calibrate {}: {:#}", filename, e));
+                    }
+                }
+            }
         }
     }
 
@@ -424,6 +651,7 @@ mod tests {
             xpixsz: None,
             bayerpat: None,
             instrume: Some(instrume.to_string()),
+            debayer_calibrated: None,
         }
     }
 
@@ -642,7 +870,7 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let config = WbppExportConfig::default();
         let result =
-            organize_files_wbpp(out.path(), &data, false, &config, None, 1, &cancel).unwrap();
+            organize_files_wbpp(out.path(), &data, false, &config, None, 1, &cancel, None).unwrap();
         assert_eq!(result.files_organized, 3);
         assert!(result.warnings.is_empty());
 
@@ -679,6 +907,150 @@ mod tests {
         assert_eq!(claims.claim("lights", "L_0001.fits"), "L_0001_3.fits");
         // Different directory — no rename.
         assert_eq!(claims.claim("FLAT_1", "L_0001.fits"), "L_0001.fits");
+    }
+
+    /// End-to-end for the generation path: a real (tiny) light + master dark on
+    /// disk, the calibrated-lights transform, a resolved batch, and the
+    /// organizer — the output must be a CALIBRATED file written under its `c_*`
+    /// name, counted like any other placement, with no calibration folder in the
+    /// tree. Debayer is off so the assertion is about generation, not mosaics.
+    #[cfg(feature = "render")]
+    #[test]
+    fn organize_generates_calibrated_lights() {
+        use crate::export::models::CalibratedLightOptions;
+        use rusqlite::params;
+
+        const W: usize = 8;
+        const H: usize = 8;
+
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let write_plane = |name: &str, value: f32| {
+            let path = src.path().join(name);
+            crate::fits_writer::write_fits_f32(&path, W, H, 1, &vec![value; W * H], &[]).unwrap();
+            path
+        };
+        let light_path = write_plane("light_10.fits", 1000.0);
+        let dark_path = write_plane("master_dark.fits", 300.0);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'My Set')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (1, '2026-07-05T20:00:00Z', '2026-07-05T23:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let night_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'TestCam')",
+            params![night_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+        // The light.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, ?1, 'light_10.fits', 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![light_path.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs, filter)
+             VALUES (10, 1, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z', 'Ha')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, 10)",
+            params![session_id],
+        )
+        .unwrap();
+        // A master dark set, linked to it.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (200, 'Dark', '2026-07-05', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (2, ?1, 'master_dark.fits', 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![dark_path.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (20, 2, 'Dark', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (200, 20)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (10, 'frame', 200, 'Dark', '2026-07-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let mut data = crate::export::collect_export_data(&conn, 1).unwrap();
+        let opts = CalibratedLightOptions {
+            debayer_osc: false,
+            ..CalibratedLightOptions::default()
+        };
+        crate::export::apply_export_mode(
+            &conn,
+            &mut data,
+            crate::export::models::ExportMode::CalibratedLights,
+            Some(&opts),
+        )
+        .unwrap();
+
+        let mut batch = GenerationBatch::resolve(&conn, &data, opts, scratch.path().to_path_buf());
+        drop(conn); // the pixel phase holds no catalog connection
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let config = WbppExportConfig::default();
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            None,
+            1,
+            &cancel,
+            Some(&mut batch),
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 1, "warnings: {:?}", result.warnings);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+
+        let written = out
+            .path()
+            .join("My Set/camera_testcam/lights/c_light_10.fits");
+        assert!(written.exists(), "calibrated output missing at {written:?}");
+        // Calibrated, not copied: 1000 − 300 (a float source is never re-scaled).
+        let header = crate::fits_parser::FitsHeader::from_path(&written).unwrap();
+        assert_eq!(header.get_str("CALSTAT").as_deref(), Some("BD"));
+        // The raw light was NOT placed, and no calibration folder exists.
+        let files: Vec<String> = walkdir(out.path())
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(out.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(files, vec!["My Set/camera_testcam/lights/c_light_10.fits"]);
     }
 
     /// Minimal recursive file walker for the layout pin (avoids a walkdir dep).

@@ -5,13 +5,18 @@ import type { ExportProgressEvent, ExportCompleteEvent, ExportResult, ExportMode
 import type { FlatNormMode, LightCalParams } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
 
-/** Calibration preferences forwarded to `export_to_wbpp`. Only consumed by the
- *  backend's `calibratedLights` strict gate (spec §12.2); harmless in the other
- *  modes. Optional so pre-mode-selector callers keep working. */
+/** Generation options forwarded to `export_to_wbpp`. In `calibratedLights` mode
+ *  the backend calibrates every light from its linked masters as it places it,
+ *  and these choose how; every other mode ignores them. Optional so
+ *  pre-mode-selector callers keep working (the backend defaults each field). */
 export interface ExportLightCalPrefs {
   flatNorm: boolean;
   flatNormMode: FlatNormMode;
   params: LightCalParams;
+  /** Replace the master dark's hot pixels with a neighbourhood median. */
+  hotPixel: boolean;
+  /** Debayer CFA lights to full-resolution RGB. */
+  debayer: boolean;
 }
 
 export interface ActiveExport {
@@ -139,13 +144,15 @@ export function useExportProgress() {
           // Explicit export mode overrides the persisted config on the backend.
           // Omitted → backend falls back to the persisted WbppExportConfig.
           ...(exportMode ? { exportMode } : {}),
-          // Forwarded only for the `calibratedLights` strict gate; ignored by
-          // the backend in the other two modes. Omitted keys → backend defaults.
+          // Generation options for `calibratedLights`; ignored by the backend in
+          // the other three modes. Omitted keys → backend defaults.
           ...(lightCalPrefs
             ? {
                 flatNorm: lightCalPrefs.flatNorm,
                 flatNormMode: lightCalPrefs.flatNormMode,
                 params: lightCalPrefs.params,
+                hotPixel: lightCalPrefs.hotPixel,
+                debayer: lightCalPrefs.debayer,
               }
             : {}),
         });

@@ -7,14 +7,16 @@ use athenaeum_core::api::lights::get_export_readiness as api_get_export_readines
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
 use athenaeum_core::events::{emit_event, ProgressEmitter};
 use athenaeum_core::export::frame_set_queries::{self, ExportableFrameSet};
+use athenaeum_core::export::file_organizer::GenerationBatch;
 use athenaeum_core::export::{
     apply_export_mode, collect_export_data, collect_export_summary, organize_files_wbpp,
     resolve_export_mode,
 };
 use athenaeum_core::export::models::{
-    CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent,
-    ExportResult, ExportSummary, WbppExportConfig,
+    CalibratedLightOptions, CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode,
+    ExportProgressEvent, ExportResult, ExportSummary, WbppExportConfig,
 };
+use athenaeum_core::services::compute_queue::ComputeJobKind;
 use athenaeum_core::services::ExportHandle;
 use axum::{extract::State, http::StatusCode, Json};
 use std::path::PathBuf;
@@ -87,24 +89,25 @@ pub struct ExportToWbppArgs {
     /// command). Optional so pre-mode-UI callers keep working.
     #[serde(default)]
     pub export_mode: Option<ExportMode>,
-    /// Calibration preferences for the `calibratedLights` mode. They no longer
-    /// feed the readiness gate (readiness is input-shaped now — see
-    /// `api::lights`); they are the GENERATION options the export-generation
-    /// task consumes, kept on the wire so the frontend contract does not move
-    /// twice. `allow(dead_code)`: accepted-and-parked, not unused — the Tauri
-    /// mirror does the same with `allow(unused_variables)`.
-    #[serde(default = "default_flat_norm")]
-    #[allow(dead_code)]
+    /// Generation options for the `calibratedLights` mode: in that mode the
+    /// export calibrates every light from its linked masters as it places it.
+    /// Each field defaults to the recommended behavior so a caller with no
+    /// opinion keeps working; every other mode ignores them.
+    #[serde(default = "default_true")]
     pub flat_norm: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     pub flat_norm_mode: FlatNormMode,
     #[serde(default)]
-    #[allow(dead_code)]
     pub params: LightCalParams,
+    /// Replace the master dark's hot pixels with a neighbourhood median.
+    #[serde(default = "default_true")]
+    pub hot_pixel: bool,
+    /// Debayer CFA lights to full-resolution planar RGB.
+    #[serde(default = "default_true")]
+    pub debayer: bool,
 }
 
-fn default_flat_norm() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -315,6 +318,16 @@ pub async fn export_to_wbpp(
     }; // DB lock released here
     // Explicit per-invocation override wins over the persisted config's mode.
     let mode = resolve_export_mode(args.export_mode, &config);
+    // Read by the calibrated-lights mode only; the transform ignores it in the
+    // others (its debayer flag decides the output NAMES, so it must be the same
+    // value the pixel phase later resolves against).
+    let gen_opts = CalibratedLightOptions {
+        flat_norm: args.flat_norm,
+        flat_norm_mode: args.flat_norm_mode,
+        params: args.params,
+        hot_pixel_correction: args.hot_pixel,
+        debayer_osc: args.debayer,
+    };
 
     let output_path = PathBuf::from(&args.output_dir);
 
@@ -348,7 +361,7 @@ pub async fn export_to_wbpp(
         }
         let db = state.ctx.db.get().ok_or_else(|| "Database not initialized".to_string())?;
         let conn = db.conn();
-        apply_export_mode(&conn, export_data, mode).map_err(|e| e.to_string())
+        apply_export_mode(&conn, export_data, mode, Some(&gen_opts)).map_err(|e| e.to_string())
     };
 
     // Run the file organizer (no DB lock held during file operations)
@@ -361,57 +374,120 @@ pub async fn export_to_wbpp(
                 tracing::error!(frame_set_id, error = %e, "export blocked before organizing");
                 make_fail(e)
             }
-            Ok(mode_warnings) => match organize_files_wbpp(
-                &output_path,
-                &export_data,
-                args.use_symlinks,
-                &config,
-                Some(&emitter as &dyn ProgressEmitter),
-                frame_set_id,
-                &cancel_flag,
-            ) {
-                Ok(org_result) => {
-                    let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-                    let mut warnings = org_result.warnings;
-                    warnings.extend(mode_warnings);
-                    if was_cancelled {
-                        ExportResult {
-                            success: false,
-                            output_dir: args.output_dir.clone(),
-                            files_organized: org_result.files_organized,
-                            scripts_generated: Vec::new(),
-                            warnings,
-                            error: Some("Export cancelled".to_string()),
-                        }
-                    } else {
-                        ExportResult {
-                            success: true,
-                            output_dir: args.output_dir.clone(),
-                            files_organized: org_result.files_organized,
-                            scripts_generated: Vec::new(),
-                            warnings,
-                            error: None,
+            Ok(mode_warnings) => {
+                // Catalog phase: one short connection borrow resolves every
+                // marked light's plan, and the guard is dropped with the block —
+                // the pixel phase below must not hold the database.
+                let mut generation = if mode == ExportMode::CalibratedLights {
+                    let db = state.ctx.db.get().ok_or_else(no_db)?;
+                    let conn = db.conn();
+                    Some(GenerationBatch::resolve(
+                        &conn,
+                        &export_data,
+                        gen_opts.clone(),
+                        std::env::temp_dir(),
+                    ))
+                } else {
+                    None
+                };
+                // Generating lights is heavy CPU work, so it rides the same
+                // admission queue as master builds and analysis — ONE slot for
+                // the whole run, held exactly around the organize call. A plain
+                // copy export takes no slot at all.
+                let permit = match generation.is_some() {
+                    false => Ok(None),
+                    true => state
+                        .ctx
+                        .compute_queue
+                        .acquire(
+                            ComputeJobKind::LightCalibration,
+                            &format!("Export — calibrate lights (set {frame_set_id})"),
+                            cancel_flag.clone(),
+                        )
+                        .map(|(permit, _job_id)| Some(permit)),
+                };
+                let Ok(_permit) = permit else {
+                    // Cancelled while queued. `acquire` fails only when THIS
+                    // flag was raised — by `cancel_export`, or by the queue's
+                    // own cancel, which sets the very flag it was handed — so
+                    // the export is already cancelled and there is nothing left
+                    // to stop.
+                    let cancelled = ExportResult {
+                        success: false,
+                        output_dir: args.output_dir.clone(),
+                        files_organized: 0,
+                        scripts_generated: Vec::new(),
+                        warnings: mode_warnings,
+                        error: Some("Export cancelled".to_string()),
+                    };
+                    finish_export(&state, &emitter, frame_set_id, cancelled.clone());
+                    return Ok(Json(cancelled));
+                };
+                match organize_files_wbpp(
+                    &output_path,
+                    &export_data,
+                    args.use_symlinks,
+                    &config,
+                    Some(&emitter as &dyn ProgressEmitter),
+                    frame_set_id,
+                    &cancel_flag,
+                    generation.as_mut(),
+                ) {
+                    Ok(org_result) => {
+                        let was_cancelled = cancel_flag.load(Ordering::Relaxed);
+                        let mut warnings = org_result.warnings;
+                        warnings.extend(mode_warnings);
+                        if was_cancelled {
+                            ExportResult {
+                                success: false,
+                                output_dir: args.output_dir.clone(),
+                                files_organized: org_result.files_organized,
+                                scripts_generated: Vec::new(),
+                                warnings,
+                                error: Some("Export cancelled".to_string()),
+                            }
+                        } else {
+                            ExportResult {
+                                success: true,
+                                output_dir: args.output_dir.clone(),
+                                files_organized: org_result.files_organized,
+                                scripts_generated: Vec::new(),
+                                warnings,
+                                error: None,
+                            }
                         }
                     }
+                    Err(e) => {
+                        let msg = format!("Failed to organize files: {}", e);
+                        tracing::error!(frame_set_id, error = %e, "export failed");
+                        make_fail(msg)
+                    }
                 }
-                Err(e) => {
-                    let msg = format!("Failed to organize files: {}", e);
-                    tracing::error!(frame_set_id, error = %e, "export failed");
-                    make_fail(msg)
-                }
-            },
+            }
         }
     };
 
-    // Unregister export
+    finish_export(&state, &emitter, frame_set_id, result.clone());
+    Ok(Json(result))
+}
+
+/// Unregister the export and broadcast its completion event. Extracted so the
+/// compute-queue cancellation can leave `export_to_wbpp` early without
+/// stranding the `active_exports` entry or skipping `export-complete` — a
+/// cancelled export must look exactly like any other finished one. Mirrors the
+/// Tauri command's `finish_export`.
+fn finish_export(
+    state: &WebAppState,
+    emitter: &SseProgressEmitter,
+    frame_set_id: i64,
+    result: ExportResult,
+) {
     {
         let mut exports = state.ctx.active_exports.lock().unwrap();
         exports.remove(&frame_set_id);
     }
-
-    // Emit completion event
     emit_event(
-        &emitter,
+        emitter,
         "export-complete",
         &ExportCompleteEvent {
             frame_set_id,
@@ -422,8 +498,6 @@ pub async fn export_to_wbpp(
             output_dir: result.output_dir.clone(),
         },
     );
-
-    Ok(Json(result))
 }
 
 /// Returns the configured export directory path, or null if not set.

@@ -3,18 +3,18 @@
 //! Collects light frames from a frame set and their linked calibrations
 //! to prepare data for export.
 
-use crate::db::light_calibrations::get_light_calibration_for_frame;
 use crate::export::models::{
-    CalibrationDetail, CalibrationSetInfo, CalibrationSubgroup, CalibrationSummary, CameraType,
-    DetailedWarning, ExportCalibrationSet, ExportData, ExportFileCounts, ExportFrame, ExportGroup,
-    ExportMode, ExportSummary, ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode,
-    FolderNodeType, FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity,
-    WarningType, WbppExportConfig,
+    calibrated_output_filename, CalibratedLightOptions, CalibrationDetail, CalibrationSetInfo,
+    CalibrationSubgroup, CalibrationSummary, CameraType, DetailedWarning, ExportCalibrationSet,
+    ExportData, ExportFileCounts, ExportFrame, ExportGroup, ExportMode, ExportSummary,
+    ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode, FolderNodeType,
+    FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity, WarningType,
+    WbppExportConfig,
 };
+use crate::fits_writer::keywords::Bayer;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 /// Collect all export data for a frame set
 ///
@@ -177,16 +177,23 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
 /// - [`ExportMode::RawWithMasters`]: lights stay raw and only master files are
 ///   placed on the calibration side. Strict (spec 2026-08-28 D2): a linked set
 ///   that still has raw frames is an error, not an omission.
-/// - [`ExportMode::CalibratedLights`]: each light's raw file is swapped for its
-///   `light_calibrations.output_path` artifact (`c_*.fits`) and ALL calibration
-///   nodes are dropped (WBPP runs with calibration disabled). Errors if any
-///   in-scope light has no tracking row — the strict readiness gate (§12.2) must
-///   run first at the API layer; this is the defensive backstop that guarantees
-///   we never write a partial silent export.
+/// - [`ExportMode::CalibratedLights`]: every calibration node is dropped (WBPP
+///   runs with calibration disabled) and each light is MARKED for generation —
+///   its `filename` becomes the `c_*` output name and `debayer_calibrated`
+///   records whether that output will be debayered. The light keeps pointing
+///   at its RAW file: the executor calibrates it into place
+///   ([`crate::export::organize_files_wbpp`]). Nothing is read from a tracking
+///   table and nothing can be "missing" — readiness is the API-layer gate's job
+///   (`api::lights::check_mode_ready`).
+///
+/// `gen_opts` are the run's calibration options. `ExportMode::CalibratedLights`
+/// REQUIRES them (the debayer toggle decides the output names, so guessing here
+/// would let a name and its content disagree); every other mode ignores them.
 pub fn apply_export_mode(
     conn: &Connection,
     data: &mut ExportData,
     mode: ExportMode,
+    gen_opts: Option<&CalibratedLightOptions>,
 ) -> Result<Vec<String>> {
     tracing::debug!(frame_set_id = data.frame_set_id, ?mode, "applying export mode");
     match mode {
@@ -196,7 +203,12 @@ pub fn apply_export_mode(
             Ok(Vec::new())
         }
         ExportMode::RawWithMasters => apply_raw_with_masters(conn, data),
-        ExportMode::CalibratedLights => apply_calibrated_lights(conn, data),
+        ExportMode::CalibratedLights => {
+            let opts = gen_opts.ok_or_else(|| {
+                anyhow::anyhow!("calibrated-lights export needs generation options")
+            })?;
+            apply_calibrated_lights(conn, data, opts)
+        }
     }
 }
 
@@ -401,44 +413,71 @@ fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Ve
     Ok(Vec::new())
 }
 
-fn apply_calibrated_lights(conn: &Connection, data: &mut ExportData) -> Result<Vec<String>> {
+/// Mark every light for calibration-at-export and rename it to its output.
+///
+/// This is a pure planning pass: it reads no artifact table, writes nothing to
+/// disk, and cannot fail on a per-frame basis. `file_path` deliberately keeps
+/// pointing at the RAW light — that is the file the generator reads — while
+/// `filename` becomes the `c_*` name the placement is written under, so the
+/// organizer's case-insensitive dedup and the WBPP tree work on the OUTPUT
+/// names for free.
+fn apply_calibrated_lights(
+    conn: &Connection,
+    data: &mut ExportData,
+    opts: &CalibratedLightOptions,
+) -> Result<Vec<String>> {
     // No calibration frames are exported — WBPP runs with calibration disabled,
     // so the BIAS/DARKS/FLAT nesting is dropped entirely and the lights land
     // directly under the camera folder.
     drop_calibration_nodes(data);
-    let mut missing: Vec<i64> = Vec::new();
     let mut total = 0usize;
+    let mut debayered = 0usize;
     for group in &mut data.groups {
         for subgroup in &mut group.subgroups {
             for frame in &mut subgroup.frames {
                 total += 1;
-                match get_light_calibration_for_frame(conn, frame.frame_id)? {
-                    Some(row) => {
-                        let filename = Path::new(&row.output_path)
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| format!("c_{}", frame.filename));
-                        frame.file_path = row.output_path;
-                        frame.filename = filename;
-                    }
-                    None => missing.push(frame.frame_id),
+                let debayer = opts.debayer_osc && declares_usable_mosaic(conn, frame.frame_id)?;
+                if debayer {
+                    debayered += 1;
                 }
+                frame.debayer_calibrated = Some(debayer);
+                frame.filename = calibrated_output_filename(&frame.filename, debayer);
             }
         }
-    }
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
-            missing.len(),
-            total
-        );
     }
     tracing::debug!(
         frame_set_id = data.frame_set_id,
         lights = total,
-        "calibrated-lights mode: substituted artifact paths"
+        debayered,
+        "calibrated-lights mode: lights marked for generation"
     );
     Ok(Vec::new())
+}
+
+/// Does this frame declare a CFA mosaic the catalog can vouch for?
+///
+/// Must answer exactly what `light_resolve::resolve_cfa_geometry` answers, and
+/// does so the same way: the same `frames.bayerpat` column read through the
+/// same [`Bayer::parse`]. That agreement is load-bearing — this decides the
+/// output NAME (`_d`) and the resolver decides the output CONTENT, so a second
+/// spelling of "is this a mosaic" would let a `c_x.fits` file hold three
+/// planes. A missing row, a NULL/blank value or a pattern we cannot parse all
+/// mean "no mosaic", which is also how the resolver reads them.
+fn declares_usable_mosaic(conn: &Connection, frame_id: i64) -> Result<bool> {
+    let bayerpat: Option<Option<String>> = conn
+        .query_row(
+            "SELECT bayerpat FROM frames WHERE id = ?1",
+            [frame_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(bayerpat
+        .flatten()
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(Bayer::parse)
+        .is_some())
 }
 
 /// Get frame set name and object name
@@ -530,6 +569,7 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
                 xpixsz: row.get(12)?,
                 bayerpat: row.get(13)?,
                 instrume: row.get(14)?,
+                debayer_calibrated: None,
             })
         },
     ).context(format!("Failed to get frame by ID: {}", frame_id))
@@ -666,6 +706,7 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
                 xpixsz: row.get(12)?,
                 bayerpat: row.get(13)?,
                 instrume: row.get(14)?,
+                debayer_calibrated: None,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2336,12 +2377,33 @@ mod export_mode_tests {
         apply_export_mode, collect_export_data, export_file_counts, raw_sets_without_master,
         resolve_export_mode,
     };
-    use crate::db::light_calibrations::{
-        upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
-    };
     use crate::db::schema::init_db;
-    use crate::export::models::{ExportMode, WbppExportConfig};
+    use crate::export::models::{
+        CalibratedLightOptions, ExportData, ExportFrame, ExportMode, WbppExportConfig,
+    };
     use rusqlite::{params, Connection};
+    use std::collections::HashMap;
+
+    /// Give an already-seeded light a BAYERPAT, the way a real OSC frame carries
+    /// one — the transform reads this column, not the collected struct.
+    fn set_bayerpat(conn: &Connection, frame_id: i64, pattern: &str) {
+        conn.execute(
+            "UPDATE frames SET bayerpat = ?2 WHERE id = ?1",
+            params![frame_id, pattern],
+        )
+        .unwrap();
+    }
+
+    /// Every light in the collected data, keyed by frame id (subgrouping is not
+    /// what these tests are about).
+    fn lights_by_id(data: &ExportData) -> HashMap<i64, &ExportFrame> {
+        data.groups
+            .iter()
+            .flat_map(|g| g.subgroups.iter())
+            .flat_map(|sg| sg.frames.iter())
+            .map(|f| (f.frame_id, f))
+            .collect()
+    }
 
     /// Regression: the export mode used to travel only via the persisted
     /// `WbppExportConfig`, so a stale/unloaded config on the frontend silently
@@ -2502,27 +2564,6 @@ mod export_mode_tests {
         .unwrap();
     }
 
-    fn track_row(frame_id: i64, output_path: &str, dark_set_id: Option<i64>) -> LightCalRow {
-        LightCalRow {
-            id: 0,
-            frame_id: Some(frame_id),
-            source_uuid: None,
-            source_filename: Some(format!("light_{frame_id}.fits")),
-            output_path: output_path.to_string(),
-            dark_set_id,
-            flat_set_id: None,
-            bias_set_id: None,
-            calstat: "BD".to_string(),
-            flat_norm_applied: false,
-            flat_norm_mode: "centralThird".to_string(),
-            output_hash: "hash".to_string(),
-            engine_version: LIGHT_CAL_ENGINE_VERSION,
-            created_at: "2026-07-05T21:00:00Z".to_string(),
-            cal_params: "{}".to_string(),
-            cfa_scaling_applied: None,
-        }
-    }
-
     /// Regression pin: the default mode never touches the collected data.
     #[test]
     fn default_mode_is_bit_for_bit_noop() {
@@ -2535,7 +2576,7 @@ mod export_mode_tests {
         let mut data = collect_export_data(&conn, 1).unwrap();
         let before = serde_json::to_value(&data).unwrap();
         let warnings =
-            apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets).unwrap();
+            apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets, None).unwrap();
         assert!(warnings.is_empty(), "default mode emits no warnings");
         assert_eq!(
             serde_json::to_value(&data).unwrap(),
@@ -2544,50 +2585,121 @@ mod export_mode_tests {
         );
     }
 
-    /// CalibratedLights swaps the raw light for its artifact and drops calibration.
+    /// The calibrated-lights transform is a MARKING pass: it renames each light
+    /// to its `c_*` output, records the debayer decision, drops every
+    /// calibration node — and leaves `file_path` on the RAW light, which is what
+    /// the executor reads to generate the output.
     #[test]
-    fn calibrated_lights_substitutes_artifact_paths() {
+    fn apply_calibrated_lights_marks_and_renames() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha")); // mono
+        seed_light(&conn, 11, session, Some("Ha"));
+        set_bayerpat(&conn, 11, "RGGB"); // OSC
+        let dark = seed_master_set(&conn, 200, "Dark");
+        add_link(&conn, 10, dark, "Dark");
+        add_link(&conn, 11, dark, "Dark");
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let opts = CalibratedLightOptions::default(); // debayer_osc ON
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights, Some(&opts)).unwrap();
+        assert!(warnings.is_empty());
+
+        for group in &data.groups {
+            for sg in &group.subgroups {
+                assert!(
+                    sg.flat.is_none() && sg.dark.is_none() && sg.bias.is_none(),
+                    "no calibration frames are exported"
+                );
+            }
+        }
+        let frames = lights_by_id(&data);
+        // Mono: nothing to debayer, plain `c_` name.
+        assert_eq!(frames[&10].debayer_calibrated, Some(false));
+        assert_eq!(frames[&10].filename, "c_light_10.fits");
+        // OSC + debayer on: the `_d` marker is part of the placed name.
+        assert_eq!(frames[&11].debayer_calibrated, Some(true));
+        assert_eq!(frames[&11].filename, "c_light_11_d.fits");
+        // The source stays the raw light — generation reads it.
+        assert_eq!(frames[&10].file_path, "/test/light_10.fits");
+        assert_eq!(frames[&11].file_path, "/test/light_11.fits");
+
+        // …and the placements carry the discriminant the executor dispatches on.
+        let placements = crate::export::file_organizer::compute_wbpp_placements(&data);
+        let sources: std::collections::HashMap<i64, _> =
+            placements.iter().map(|p| (p.frame_id, p.source)).collect();
+        assert_eq!(
+            sources[&10],
+            crate::export::file_organizer::PlacementSource::CalibrateLight {
+                frame_id: 10,
+                debayer: false
+            }
+        );
+        assert_eq!(
+            sources[&11],
+            crate::export::file_organizer::PlacementSource::CalibrateLight {
+                frame_id: 11,
+                debayer: true
+            }
+        );
+    }
+
+    /// Two things the old artifact-substituting transform got wrong and this one
+    /// must not: a light with NOTHING linked is still marked (readiness is the
+    /// API gate's job, not this pass's), and `debayer_osc = false` keeps a
+    /// mosaic light on the un-suffixed name.
+    #[test]
+    fn apply_calibrated_lights_never_bails_and_honours_debayer_off() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha")); // no calibration links at all
+        set_bayerpat(&conn, 10, "RGGB");
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let opts = CalibratedLightOptions {
+            debayer_osc: false,
+            ..CalibratedLightOptions::default()
+        };
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights, Some(&opts)).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "an unlinked light is not this pass's problem"
+        );
+
+        let frames = lights_by_id(&data);
+        assert_eq!(frames[&10].debayer_calibrated, Some(false));
+        assert_eq!(frames[&10].filename, "c_light_10.fits");
+    }
+
+    /// An unparsable BAYERPAT is not a mosaic we can vouch for — same verdict the
+    /// generator's own CFA resolution reaches, so name and content agree.
+    #[test]
+    fn unparsable_bayerpat_is_not_debayered() {
         let conn = mem();
         let session = seed_frame_set(&conn, 1);
         seed_light(&conn, 10, session, Some("Ha"));
-        let dark = seed_raw_set(&conn, 100, "Dark", 2);
-        add_link(&conn, 10, dark, "Dark");
-        upsert_light_calibration(
-            &conn,
-            &track_row(10, "/lib/M31/TestCam/2026-07-05/c_light_10.fits", Some(dark)),
-        )
-        .unwrap();
+        set_bayerpat(&conn, 10, "XYZW");
 
         let mut data = collect_export_data(&conn, 1).unwrap();
-        let warnings =
-            apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights).unwrap();
-        assert!(warnings.is_empty());
-
-        let sg = &data.groups[0].subgroups[0];
-        assert!(sg.flat.is_none() && sg.dark.is_none() && sg.bias.is_none(), "no calibration frames");
-        assert_eq!(sg.frames.len(), 1);
-        assert_eq!(
-            sg.frames[0].file_path,
-            "/lib/M31/TestCam/2026-07-05/c_light_10.fits",
-            "light source is the calibrated artifact"
-        );
-        assert_eq!(sg.frames[0].filename, "c_light_10.fits");
+        let opts = CalibratedLightOptions::default();
+        apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights, Some(&opts)).unwrap();
+        assert_eq!(lights_by_id(&data)[&10].debayer_calibrated, Some(false));
     }
 
-    /// The strict gate errors (never a partial silent export) when a light has no
-    /// calibrated output.
+    /// The mode that generates files cannot be asked to guess how: without
+    /// options the debayer decision (and with it every output NAME) would be a
+    /// guess the pixel phase might not repeat.
     #[test]
-    fn calibrated_lights_gate_errors_on_missing_output() {
+    fn calibrated_lights_requires_generation_options() {
         let conn = mem();
         let session = seed_frame_set(&conn, 1);
-        seed_light(&conn, 10, session, Some("Ha")); // no tracking row
-
+        seed_light(&conn, 10, session, Some("Ha"));
         let mut data = collect_export_data(&conn, 1).unwrap();
-        let err = apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights).unwrap_err();
-        assert!(
-            err.to_string().contains("lack a fresh calibrated output"),
-            "gate message, got: {err}"
-        );
+        let err =
+            apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights, None).unwrap_err();
+        assert!(err.to_string().contains("generation options"), "got: {err}");
     }
 
     /// LightsOnly drops every calibration node and never touches light paths.
@@ -2602,7 +2714,7 @@ mod export_mode_tests {
         add_link(&conn, 10, flat, "Flat");
 
         let mut data = collect_export_data(&conn, 1).unwrap();
-        let warnings = apply_export_mode(&conn, &mut data, ExportMode::LightsOnly).unwrap();
+        let warnings = apply_export_mode(&conn, &mut data, ExportMode::LightsOnly, None).unwrap();
         assert!(warnings.is_empty());
 
         let sg = &data.groups[0].subgroups[0];
@@ -2666,7 +2778,8 @@ mod export_mode_tests {
         let dark = seed_raw_set(&conn, 100, "Dark", 2);
         add_link(&conn, 10, dark, "Dark");
         let mut data = collect_export_data(&conn, 1).unwrap();
-        let err = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap_err();
+        let err =
+            apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters, None).unwrap_err();
         assert!(err.to_string().contains("no master"), "got: {err}");
     }
 
@@ -2680,7 +2793,8 @@ mod export_mode_tests {
         add_link(&conn, 10, flat, "Flat");
         let mut data = collect_export_data(&conn, 1).unwrap();
         let before = serde_json::to_value(&data).unwrap();
-        let warnings = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap();
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters, None).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(serde_json::to_value(&data).unwrap(), before);
     }

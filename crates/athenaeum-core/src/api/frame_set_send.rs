@@ -18,7 +18,7 @@ use crate::api::lights::{check_mode_ready, get_export_readiness};
 #[cfg(feature = "render")]
 use crate::api::{db, ApiError};
 #[cfg(feature = "render")]
-use crate::export::calibrated_generator::CalibratedLightOptions;
+use crate::export::models::CalibratedLightOptions;
 #[cfg(feature = "render")]
 use crate::export::models::{CalibrationSetInfo, ExportData, ExportMode};
 use crate::package::PayloadKind;
@@ -44,17 +44,15 @@ pub struct PayloadEntry {
 /// Catalog-only — the entries name the files to copy; the copying is the package
 /// builder's job (`api::sync::build_selection_package`).
 ///
-/// `gen_opts` belongs to the calibrated-lights mode: the transform generates
-/// those files, and their names depend on it (a debayered output is `_d`). It
-/// is accepted here already so the caller's plumbing is final; the transform
-/// starts consuming it in the export-generation task.
+/// `gen_opts` belongs to the calibrated-lights mode: the transform names the
+/// generated files from it (a debayered output is `_d`), so the entries' own
+/// `rel_path`s depend on it. Every other mode ignores it.
 #[cfg(feature = "render")]
 pub fn frame_set_entries(
     ctx: &ServiceContext,
     frame_set_id: i64,
     mode: ExportMode,
-    // Threaded into the mode transform by the export-generation task.
-    _gen_opts: &CalibratedLightOptions,
+    gen_opts: &CalibratedLightOptions,
 ) -> Result<Vec<PayloadEntry>, ApiError> {
     let readiness = get_export_readiness(ctx, frame_set_id)?;
     if let Err(msg) = check_mode_ready(&readiness, mode) {
@@ -65,7 +63,7 @@ pub fn frame_set_entries(
     let conn = db.conn();
     let mut data = crate::export::collect_export_data(&conn, frame_set_id)
         .map_err(|e| ApiError::Internal(format!("collect export data: {e:#}")))?;
-    crate::export::apply_export_mode(&conn, &mut data, mode)
+    crate::export::apply_export_mode(&conn, &mut data, mode, Some(gen_opts))
         .map_err(|e| ApiError::Invalid(format!("{e:#}")))?;
     let master_sets = crate::export::data_collector::master_set_ids(&conn, &data)
         .map_err(|e| ApiError::Internal(format!("master set ids: {e:#}")))?;
@@ -141,9 +139,6 @@ fn master_frame_ids(data: &ExportData, master_sets: &HashSet<i64>) -> HashSet<i6
 #[cfg(all(test, feature = "render"))]
 mod tests {
     use super::*;
-    use crate::db::light_calibrations::{
-        upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
-    };
     use crate::export::models::ExportMode;
     use crate::services::ServiceContext;
     use rusqlite::{params, Connection};
@@ -293,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_lights_compose_artifacts_and_refuse_when_missing() {
+    fn calibrated_lights_compose_from_marked_lights_and_refuse_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(tmp.path());
         {
@@ -315,50 +310,36 @@ mod tests {
             build_master_dark(&db.conn());
         }
 
-        // Track both lights as calibrated against the master flat (set 200)
-        // and the master dark (set 300) — the mode transform still resolves the
-        // artifact from these rows until the generation task replaces it.
-        {
-            let db = ctx.db.get().unwrap();
-            let conn = db.conn();
-            for f in [10i64, 11] {
-                upsert_light_calibration(
-                    &conn,
-                    &LightCalRow {
-                        id: 0,
-                        frame_id: Some(f),
-                        source_uuid: Some(format!("uuid-{f}")),
-                        source_filename: Some(format!("L_{f}.fits")),
-                        output_path: format!("/lib/M31/TestCam/2026-07-05/c_L_{f}.fits"),
-                        dark_set_id: Some(300),
-                        flat_set_id: Some(200),
-                        bias_set_id: None,
-                        calstat: "BDF".into(),
-                        flat_norm_applied: true,
-                        flat_norm_mode: "centralThird".into(),
-                        output_hash: "h".into(),
-                        engine_version: LIGHT_CAL_ENGINE_VERSION,
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        cal_params: "{}".into(),
-                        cfa_scaling_applied: None,
-                    },
-                )
-                .unwrap();
-            }
-        }
+        // No tracking table, no pre-generated artifact: the transform MARKS each
+        // light and names its output. `source_path` is still the raw light —
+        // generating the payload from it belongs to the send-generation task,
+        // which is what turns these entries into calibrated bytes on the wire.
         let cal = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap();
         assert_eq!(cal.len(), 2);
         assert!(cal.iter().all(|e| e.kind == PayloadKind::CalibratedLight));
         assert!(
             cal.iter()
                 .any(|e| e.rel_path == "camera_testcam/lights/c_L_10.fits"
-                    && e.source_path
-                        == std::path::Path::new("/lib/M31/TestCam/2026-07-05/c_L_10.fits")),
+                    && e.source_path == std::path::Path::new("/test/L_10.fits")),
             "{cal:?}"
         );
         assert!(
             cal.iter().all(|e| e.frame_id == 10 || e.frame_id == 11),
             "frame_id is the SOURCE light"
+        );
+
+        // The debayer option is part of the NAME, so the entries move with it.
+        let debayered = frame_set_entries(
+            &ctx,
+            1,
+            ExportMode::CalibratedLights,
+            &CalibratedLightOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            debayered.iter().all(|e| e.rel_path.ends_with("c_L_10.fits")
+                || e.rel_path.ends_with("c_L_11.fits")),
+            "mono lights are never debayered, whatever the option says: {debayered:?}"
         );
     }
 

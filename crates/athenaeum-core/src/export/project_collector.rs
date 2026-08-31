@@ -151,6 +151,7 @@ pub fn collect_project_export_data(
             xpixsz: meta_f64(&meta, "xpixsz"),
             bayerpat: meta_str(&meta, "bayerpat"),
             instrume: meta_str(&meta, "instrume"),
+            debayer_calibrated: None,
         };
         if !c.frame_uuid.is_empty() {
             seen_uuids.insert(c.frame_uuid.clone());
@@ -321,6 +322,7 @@ fn own_export_frame(
                     xpixsz: row.get(9)?,
                     bayerpat: row.get(10)?,
                     instrume: row.get(11)?,
+                    debayer_calibrated: None,
                 },
                 uuid,
             ))

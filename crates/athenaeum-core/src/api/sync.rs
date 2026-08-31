@@ -33,7 +33,7 @@ use crate::api::lights::{FlatNormMode, LightCalParams};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
 #[cfg(feature = "render")]
-use crate::export::calibrated_generator::CalibratedLightOptions;
+use crate::export::models::CalibratedLightOptions;
 #[cfg(feature = "render")]
 use crate::export::models::ExportMode;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};

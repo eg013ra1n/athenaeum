@@ -6,14 +6,16 @@ use crate::commands::{AppState, ExportHandle};
 use crate::export::{
     apply_export_mode, collect_export_data, collect_export_summary, organize_files_wbpp,
     resolve_export_mode,
+    file_organizer::GenerationBatch,
     frame_set_queries::{self, ExportableFrameSet},
     models::{
-        CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent,
-        ExportResult, ExportSummary, WbppExportConfig,
+        CalibratedLightOptions, CalibrationRoute, ExportCompleteEvent, ExportData, ExportMode,
+        ExportProgressEvent, ExportResult, ExportSummary, WbppExportConfig,
     },
 };
 use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
 use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
+use athenaeum_core::services::compute_queue::ComputeJobKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -177,16 +179,14 @@ pub async fn get_export_readiness(
 /// (what the mode selector sends), `None` falls back to the persisted
 /// [`WbppExportConfig`]'s mode — the frontend loads that config asynchronously
 /// and could present it as `null`, so the mode is now passed explicitly rather
-/// than relying on a best-effort config sync. `flat_norm` / `flat_norm_mode` /
-/// `params` are the caller's calibration preferences; they no longer feed the
-/// readiness gate (readiness is input-shaped now — see `api::lights`) and are
-/// carried for the calibrated-lights GENERATION the export-generation task
-/// wires up. They stay optional so a caller that has no opinion keeps working
-/// (defaults: normalize ON, central-third, default advanced params).
-//
-// The three preference args are consumed by the generation path, not by this
-// wrapper — an underscore prefix is not an option, it is the IPC argument name.
-#[allow(unused_variables)]
+/// than relying on a best-effort config sync.
+///
+/// `flat_norm` / `flat_norm_mode` / `params` / `hot_pixel` / `debayer` are the
+/// calibrated-lights GENERATION options: in that mode this command calibrates
+/// every light from its linked masters as it places it. Each stays optional so
+/// a caller with no opinion keeps working (defaults: normalize ON,
+/// central-third, default advanced params, hot-pixel correction ON, debayer
+/// ON); every other mode ignores them.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
@@ -199,6 +199,8 @@ pub async fn export_to_wbpp(
     flat_norm: Option<bool>,
     flat_norm_mode: Option<FlatNormMode>,
     params: Option<LightCalParams>,
+    hot_pixel: Option<bool>,
+    debayer: Option<bool>,
 ) -> Result<ExportResult, String> {
     // Create cancel flag and register export
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -232,6 +234,16 @@ pub async fn export_to_wbpp(
     };
     // Explicit per-invocation override wins over the persisted config's mode.
     let mode = resolve_export_mode(export_mode, &config);
+    // Read by the calibrated-lights mode only; the transform ignores it in the
+    // others (its debayer flag decides the output NAMES, so it must be the same
+    // value the pixel phase later resolves against).
+    let gen_opts = CalibratedLightOptions {
+        flat_norm: flat_norm.unwrap_or(true),
+        flat_norm_mode: flat_norm_mode.unwrap_or_default(),
+        params: params.unwrap_or_default(),
+        hot_pixel_correction: hot_pixel.unwrap_or(true),
+        debayer_osc: debayer.unwrap_or(true),
+    };
 
     let output_path = PathBuf::from(&output_dir);
 
@@ -256,7 +268,7 @@ pub async fn export_to_wbpp(
         }
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        apply_export_mode(&conn, export_data, mode).map_err(|e| e.to_string())
+        apply_export_mode(&conn, export_data, mode, Some(&gen_opts)).map_err(|e| e.to_string())
     };
 
     // Organize files into WBPP structure (with progress events + cancel support)
@@ -274,6 +286,55 @@ pub async fn export_to_wbpp(
                 make_fail(e)
             }
             Ok(mode_warnings) => {
+                // Catalog phase: one short connection borrow resolves every
+                // marked light's plan, and the guard is dropped with the block —
+                // the pixel phase below must not hold the database.
+                let mut generation = if mode == ExportMode::CalibratedLights {
+                    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+                    let conn = db.conn();
+                    Some(GenerationBatch::resolve(
+                        &conn,
+                        &export_data,
+                        gen_opts.clone(),
+                        std::env::temp_dir(),
+                    ))
+                } else {
+                    None
+                };
+                // Generating lights is heavy CPU work, so it rides the same
+                // admission queue as master builds and analysis — ONE slot for
+                // the whole run, held exactly around the organize call. A plain
+                // copy export takes no slot at all.
+                let _permit = match generation.is_some() {
+                    false => None,
+                    true => match state.ctx.compute_queue.acquire(
+                        ComputeJobKind::LightCalibration,
+                        &format!("Export — calibrate lights (set {frame_set_id})"),
+                        cancel_flag.clone(),
+                    ) {
+                        Ok((permit, _job_id)) => Some(permit),
+                        // Cancelled while queued. `acquire` fails only when
+                        // THIS flag was raised — by `cancel_export`, or by the
+                        // queue's own cancel, which sets the very flag it was
+                        // handed — so the export is already cancelled and there
+                        // is nothing left to stop.
+                        Err(_cancelled) => {
+                            return finish_export(
+                                &state,
+                                &app_handle,
+                                frame_set_id,
+                                ExportResult {
+                                    success: false,
+                                    output_dir: output_dir.clone(),
+                                    files_organized: 0,
+                                    scripts_generated: Vec::new(),
+                                    warnings: mode_warnings,
+                                    error: Some("Export cancelled".to_string()),
+                                },
+                            );
+                        }
+                    },
+                };
                 let export_emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
                 match organize_files_wbpp(
                     &output_path,
@@ -283,6 +344,7 @@ pub async fn export_to_wbpp(
                     Some(&export_emitter as &dyn athenaeum_core::events::ProgressEmitter),
                     frame_set_id,
                     &cancel_flag,
+                    generation.as_mut(),
                 ) {
                     Ok(org_result) => {
                         let was_cancelled = cancel_flag.load(Ordering::Relaxed);
@@ -314,13 +376,23 @@ pub async fn export_to_wbpp(
         }
     };
 
-    // Unregister export
+    finish_export(&state, &app_handle, frame_set_id, result)
+}
+
+/// Unregister the export and emit its completion event. Extracted so the
+/// compute-queue cancellation can leave `export_to_wbpp` early without
+/// stranding the `active_exports` entry or skipping `export-complete` — a
+/// cancelled export must look exactly like any other finished one.
+fn finish_export(
+    state: &State<'_, AppState>,
+    app_handle: &tauri::AppHandle,
+    frame_set_id: i64,
+    result: ExportResult,
+) -> Result<ExportResult, String> {
     {
         let mut exports = state.ctx.active_exports.lock().unwrap();
         exports.remove(&frame_set_id);
     }
-
-    // Emit completion event
     let _ = app_handle.emit(
         "export-complete",
         ExportCompleteEvent {
@@ -332,7 +404,6 @@ pub async fn export_to_wbpp(
             output_dir: result.output_dir.clone(),
         },
     );
-
     Ok(result)
 }
 

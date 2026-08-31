@@ -1,5 +1,6 @@
 //! Data models for the export module
 
+use crate::models::{FlatNormMode, LightCalParams};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -69,6 +70,16 @@ pub struct ExportFrame {
     pub bayerpat: Option<String>,
     /// Camera/instrument name
     pub instrume: Option<String>,
+    /// How this frame reaches the export: `None` = copy the file at
+    /// `file_path` as it is (every mode but one); `Some(debayer)` = the
+    /// executor CALIBRATES it into place, debayering it when `true`.
+    ///
+    /// Set only by the calibrated-lights mode transform
+    /// ([`crate::export::apply_export_mode`]), which also renames `filename`
+    /// to the matching `c_*` output name. Collectors leave it `None` — a
+    /// frame is copied unless something deliberately asks for generation.
+    #[serde(default)]
+    pub debayer_calibrated: Option<bool>,
 }
 
 /// A calibration set with its frames (legacy - kept for compatibility)
@@ -271,6 +282,97 @@ pub fn sanitize_display_folder_name(name: &str) -> String {
 }
 
 // ============================================================================
+// Calibrated-light generation: run options + output naming
+// ============================================================================
+//
+// Both live HERE, beside the folder sanitizers, rather than in
+// `export::calibrated_generator` where the generator itself lives: the mode
+// transform (`data_collector::apply_calibrated_lights`) names the output files
+// and records the debayer decision, and that transform is UNGATED — it must
+// compile in a headless build (`--no-default-features`), which has no pixel
+// pipeline. Neither item needs one: the options are plain configuration and
+// the filename rule is pure string work. The generator re-exports both, so it
+// stays the place a reader looks for them.
+
+/// serde default for the three ON-by-default toggles below — the value
+/// `#[serde(default = "…")]` needs a named function for. `LightCalParams`
+/// carries the same helper, for the same reason.
+fn default_true() -> bool {
+    true
+}
+
+/// Everything a run chooses about how its lights are calibrated. One value per
+/// run (an export, a transfer preparation), shared by every frame in it.
+///
+/// `hot_pixel_correction` and `debayer_osc` are the two stages the generator
+/// adds on top of the calibration formula; both default ON, and both degrade
+/// silently to "not applicable" rather than failing — a frame with no dark
+/// master gets no cosmetic pass, a mono frame is never debayered.
+///
+/// **Every field is optional on the wire** (`#[serde(default)]`, mirroring
+/// [`crate::models::LightCalParams`]), each defaulting to the recommended
+/// behavior. A host command that knows only some of these — or a payload
+/// written before a field existed — decodes the rest to
+/// [`CalibratedLightOptions::default`] instead of failing the whole request;
+/// `{}` is a valid, fully-defaulted payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibratedLightOptions {
+    /// Normalize the master flat by its own level before dividing (spec §2).
+    #[serde(default = "default_true")]
+    pub flat_norm: bool,
+    /// Which statistic computes that normalization constant. Plain
+    /// `#[serde(default)]` resolves through [`FlatNormMode::default`]
+    /// (`CentralThird`), so this tracks the enum's own default instead of
+    /// restating it here.
+    #[serde(default)]
+    pub flat_norm_mode: FlatNormMode,
+    /// Advanced per-run parameters (pedestal, trim fraction, bias fallback,
+    /// per-CFA-channel flat scaling). Omitting it wholesale is the same as
+    /// sending `{}` — every one of ITS fields defaults too.
+    #[serde(default)]
+    pub params: LightCalParams,
+    /// Replace the master dark's hot pixels with a neighbourhood median.
+    #[serde(default = "default_true")]
+    pub hot_pixel_correction: bool,
+    /// Debayer a CFA light to full-resolution planar RGB. Ignored for mono
+    /// frames and for a `BAYERPAT` the catalog cannot vouch for.
+    #[serde(default = "default_true")]
+    pub debayer_osc: bool,
+}
+
+impl Default for CalibratedLightOptions {
+    fn default() -> Self {
+        Self {
+            flat_norm: true,
+            flat_norm_mode: FlatNormMode::CentralThird,
+            params: LightCalParams::default(),
+            hot_pixel_correction: true,
+            debayer_osc: true,
+        }
+    }
+}
+
+/// `c_<stem>.fits`, or `c_<stem>_d.fits` for a debayered output — the ONE
+/// place that spelling is defined. The export path names files before the
+/// pixels are generated and the generator names them at write time; a second
+/// implementation of this rule would let those two drift.
+///
+/// The extension is always forced to `.fits`: an XISF source yields a FITS
+/// output.
+pub fn calibrated_output_filename(source_filename: &str, debayer: bool) -> String {
+    let stem = std::path::Path::new(source_filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(source_filename);
+    if debayer {
+        format!("c_{stem}_d.fits")
+    } else {
+        format!("c_{stem}.fits")
+    }
+}
+
+// ============================================================================
 // Calibration Route (UI Display)
 // ============================================================================
 
@@ -359,7 +461,9 @@ pub struct ExportProgressEvent {
     pub total: usize,
     pub percent: f64,
     pub current_file: Option<String>,
-    /// "collecting" | "copying" | "complete"
+    /// "collecting" | "copying" | "calibrating" | "complete"
+    /// ("calibrating" = this file is being generated from its masters rather
+    /// than copied — the calibrated-lights mode.)
     pub phase: String,
 }
 
@@ -800,5 +904,39 @@ mod tests {
         assert_eq!(sanitize_display_folder_name("M31."), "M31");
         assert_eq!(sanitize_display_folder_name("M31 Panel 1"), "M31 Panel 1");
         assert_eq!(sanitize_display_folder_name("a\u{7}b"), "ab");
+    }
+
+    /// Every field is optional on the wire: a host that knows only some of
+    /// these — or a payload written before a field existed — must decode, not
+    /// fail. `{}` is the extreme case and has to equal the documented default.
+    #[test]
+    fn options_decode_from_a_partial_payload() {
+        let empty: CalibratedLightOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, CalibratedLightOptions::default());
+
+        let partial: CalibratedLightOptions =
+            serde_json::from_str(r#"{"debayerOsc": false}"#).unwrap();
+        assert!(!partial.debayer_osc, "the sent field wins");
+        assert!(partial.flat_norm, "omitted flat_norm defaults ON");
+        assert!(
+            partial.hot_pixel_correction,
+            "omitted hot_pixel_correction defaults ON"
+        );
+        assert_eq!(partial.flat_norm_mode, FlatNormMode::CentralThird);
+        // An omitted `params` defaults wholesale, its own fields included.
+        assert_eq!(partial.params, LightCalParams::default());
+        assert_eq!(
+            partial,
+            CalibratedLightOptions {
+                debayer_osc: false,
+                ..CalibratedLightOptions::default()
+            }
+        );
+
+        // The camelCase spelling is the wire contract; round-tripping our own
+        // serialization must land back on the same value.
+        let round: CalibratedLightOptions =
+            serde_json::from_str(&serde_json::to_string(&partial).unwrap()).unwrap();
+        assert_eq!(round, partial);
     }
 }

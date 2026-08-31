@@ -2905,6 +2905,9 @@ pub async fn export_project_for_wbpp(
                 emitter.as_deref(),
                 SENTINEL,
                 &cancel_flag,
+                // Collab datasets are always copied — the contributions arrive
+                // already-calibrated or raw, never marked for generation.
+                None,
             )
             .map_err(|e| ApiError::Internal(format!("organize publisher {publisher}: {e:#}")))?;
             files_organized += result.files_organized;
