@@ -48,6 +48,13 @@ use astroimage::BayerPattern;
 /// still needs it to display the frame the right way up.
 const MOSAIC_KEYWORDS: [&str; 3] = ["BAYERPAT", "XBAYROFF", "YBAYROFF"];
 
+/// serde default for the three ON-by-default toggles below — the value
+/// `#[serde(default = "…")]` needs a named function for. `LightCalParams`
+/// carries the same helper, for the same reason.
+fn default_true() -> bool {
+    true
+}
+
 /// Everything a run chooses about how its lights are calibrated. One value per
 /// run (an export, a transfer preparation), shared by every frame in it.
 ///
@@ -55,20 +62,35 @@ const MOSAIC_KEYWORDS: [&str; 3] = ["BAYERPAT", "XBAYROFF", "YBAYROFF"];
 /// adds on top of the calibration formula; both default ON, and both degrade
 /// silently to "not applicable" rather than failing — a frame with no dark
 /// master gets no cosmetic pass, a mono frame is never debayered.
+///
+/// **Every field is optional on the wire** (`#[serde(default)]`, mirroring
+/// [`LightCalParams`]), each defaulting to the recommended behavior. A host
+/// command that knows only some of these — or a payload written before a field
+/// existed — decodes the rest to [`CalibratedLightOptions::default`] instead of
+/// failing the whole request; `{}` is a valid, fully-defaulted payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibratedLightOptions {
     /// Normalize the master flat by its own level before dividing (spec §2).
+    #[serde(default = "default_true")]
     pub flat_norm: bool,
-    /// Which statistic computes that normalization constant.
+    /// Which statistic computes that normalization constant. Plain
+    /// `#[serde(default)]` resolves through [`FlatNormMode::default`]
+    /// (`CentralThird`), so this tracks the enum's own default instead of
+    /// restating it here.
+    #[serde(default)]
     pub flat_norm_mode: FlatNormMode,
     /// Advanced per-run parameters (pedestal, trim fraction, bias fallback,
-    /// per-CFA-channel flat scaling).
+    /// per-CFA-channel flat scaling). Omitting it wholesale is the same as
+    /// sending `{}` — every one of ITS fields defaults too.
+    #[serde(default)]
     pub params: LightCalParams,
     /// Replace the master dark's hot pixels with a neighbourhood median.
+    #[serde(default = "default_true")]
     pub hot_pixel_correction: bool,
     /// Debayer a CFA light to full-resolution planar RGB. Ignored for mono
     /// frames and for a `BAYERPAT` the catalog cannot vouch for.
+    #[serde(default = "default_true")]
     pub debayer_osc: bool,
 }
 
@@ -882,5 +904,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every field is optional on the wire: a host that knows only some of
+    /// these — or a payload written before a field existed — must decode, not
+    /// fail. `{}` is the extreme case and has to equal the documented default.
+    #[test]
+    fn options_decode_from_a_partial_payload() {
+        let empty: CalibratedLightOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, CalibratedLightOptions::default());
+
+        let partial: CalibratedLightOptions =
+            serde_json::from_str(r#"{"debayerOsc": false}"#).unwrap();
+        assert!(!partial.debayer_osc, "the sent field wins");
+        assert!(partial.flat_norm, "omitted flat_norm defaults ON");
+        assert!(
+            partial.hot_pixel_correction,
+            "omitted hot_pixel_correction defaults ON"
+        );
+        assert_eq!(partial.flat_norm_mode, FlatNormMode::CentralThird);
+        // An omitted `params` defaults wholesale, its own fields included.
+        assert_eq!(partial.params, LightCalParams::default());
+        assert_eq!(
+            partial,
+            CalibratedLightOptions {
+                debayer_osc: false,
+                ..CalibratedLightOptions::default()
+            }
+        );
+
+        // The camelCase spelling is the wire contract; round-tripping our own
+        // serialization must land back on the same value.
+        let round: CalibratedLightOptions =
+            serde_json::from_str(&serde_json::to_string(&partial).unwrap()).unwrap();
+        assert_eq!(round, partial);
     }
 }
