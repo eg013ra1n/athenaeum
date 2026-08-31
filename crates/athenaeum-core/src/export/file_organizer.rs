@@ -510,12 +510,19 @@ pub fn organize_files_wbpp(
     let placements = compute_wbpp_placements(data);
     let mut last_emit = Instant::now();
 
-    // Helper closure to emit progress (throttled to every 100ms). `phase`
-    // distinguishes a copied placement from a generated one — same counter,
-    // same denominator, different work.
-    let mut emit_progress = |current: usize, filename: Option<&str>, phase: &str| {
+    // Helper closure to emit progress. `phase` distinguishes a copied placement
+    // from a generated one — same counter, same denominator, different work.
+    //
+    // Throttled to every 100ms, because a copy export can place thousands of
+    // files a second. `force` opts out for the generation path: calibrating one
+    // light takes seconds to minutes, so its events cannot flood anything, and
+    // WITHOUT the opt-out the announcement of the frame about to be calibrated
+    // would be swallowed by the window the previous frame's success emit just
+    // opened — leaving the panel showing the previous filename for the whole
+    // calibration.
+    let mut emit_progress = |current: usize, filename: Option<&str>, phase: &str, force: bool| {
         let now = Instant::now();
-        if now.duration_since(last_emit).as_millis() >= 100 || current == total_files {
+        if force || now.duration_since(last_emit).as_millis() >= 100 || current == total_files {
             if let Some(e) = emitter {
                 let percent = if total_files > 0 {
                     (current as f64 / total_files as f64) * 100.0
@@ -558,7 +565,7 @@ pub fn organize_files_wbpp(
                 match copy_or_link(&placement.file_path, &dest, use_symlinks) {
                     Ok(_) => {
                         files_organized += 1;
-                        emit_progress(files_organized as usize, Some(&filename), "copying");
+                        emit_progress(files_organized as usize, Some(&filename), "copying", false);
                     }
                     Err(e) => warnings.push(format!("Failed to copy {}: {}", filename, e)),
                 }
@@ -568,7 +575,7 @@ pub fn organize_files_wbpp(
                 // one light takes seconds to minutes, and a bar that only moves
                 // on completion looks frozen for the whole of it. The count is
                 // still what has actually landed.
-                emit_progress(files_organized as usize, Some(&filename), "calibrating");
+                emit_progress(files_organized as usize, Some(&filename), "calibrating", true);
                 let outcome = match generation.as_deref_mut() {
                     Some(batch) => generate_one(batch, frame_id, debayer, &dest, cancel_flag),
                     None => Err(anyhow::anyhow!(
@@ -578,7 +585,12 @@ pub fn organize_files_wbpp(
                 match outcome {
                     Ok(()) => {
                         files_organized += 1;
-                        emit_progress(files_organized as usize, Some(&filename), "calibrating");
+                        emit_progress(
+                            files_organized as usize,
+                            Some(&filename),
+                            "calibrating",
+                            true,
+                        );
                     }
                     Err(e) => {
                         // A cancel surfaces here as a per-frame error; the loop

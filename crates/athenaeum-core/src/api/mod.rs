@@ -44,6 +44,13 @@ pub mod compute;
 pub mod lights;
 #[cfg(feature = "render")]
 pub mod masters;
+// Shared blocking phase of a WBPP export (admission → plan resolution →
+// placement), driven by both hosts from inside `spawn_blocking`. Render-gated
+// because it calls `GenerationBatch::resolve`, which only exists under
+// `render` (`export::file_organizer` itself stays ungated so a plain copy
+// export still compiles headless).
+#[cfg(feature = "render")]
+pub mod export;
 // Stage-II collaboration orchestration (slice 3, Task 4): linking, ranked
 // suggestions, per-frame gate report, portal deep-link intents. Render-gated
 // because it imports `api::lights` internals (`frame_cal_status`); the
