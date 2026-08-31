@@ -509,7 +509,11 @@ pub(crate) fn stage_records(
     let mut generated_sizes: Vec<(String, u64)> = Vec::new();
     for ((src, record), (h, real_size)) in records.iter_mut().zip(staged_hashes.into_iter()) {
         record.xxh3 = h;
-        if matches!(src, PrepareSource::Generate { .. }) && record.byte_size != real_size {
+        // Unconditional for a generated record, even when the estimate happened
+        // to be right: one UPDATE per generated file is nothing, and a
+        // "correct only when it differs" path would be one the fixtures never
+        // exercise.
+        if matches!(src, PrepareSource::Generate { .. }) {
             record.byte_size = real_size;
             generated_sizes.push((record.rel_path.clone(), real_size));
         }
@@ -1077,21 +1081,41 @@ mod tests {
     /// The whole point of the task: a `Generate` record puts CALIBRATED bytes in
     /// the package under the `c_` name — not a copy of the raw light — and the
     /// manifest describes what actually landed (full-file hash + real size), so
-    /// the receiver's own verification accepts it.
+    /// the receiver's own verification accepts it. The transfer's own per-file
+    /// row is corrected to the same real size.
     #[test]
     fn stage_records_generates_into_package() {
+        use crate::sharing::types::{AnnounceFileEntry, PackageLayout};
+
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         let light = seed(&ctx, tmp.path());
         let estimate = std::fs::metadata(&light).unwrap().len();
 
         let rel = "camera_testcam/lights/c_L_10.fits";
-        let mut records = vec![generate_record(rel, estimate)];
         let pkg_dir = tmp.path().join("packages").join("pkg-1");
+        // A real `preparing` row with its per-file row, exactly as the enqueue
+        // writes one — the size correction has somewhere to land.
+        let store = sync_store(&ctx).unwrap();
+        let id = store
+            .enqueue_preparing(
+                &pkg_dir.to_string_lossy(),
+                [0u8; 32],
+                Some("M31 calibrated"),
+                &[AnnounceFileEntry {
+                    rel_path: rel.to_string(),
+                    byte_size: estimate,
+                    frame_uuid: "artifact-uuid".to_string(),
+                }],
+                PackageLayout::Batch,
+            )
+            .unwrap();
+
+        let mut records = vec![generate_record(rel, estimate)];
         let flag = Arc::new(AtomicBool::new(false));
         let stats = stage_records(
             &ctx,
-            0,
+            id,
             [0u8; 32],
             &pkg_dir,
             &mut records,
@@ -1116,6 +1140,14 @@ mod tests {
         assert_eq!(records[0].1.byte_size, real_size);
         assert_eq!(stats.files, 1);
         assert_eq!(stats.bytes, real_size, "stats report what landed");
+
+        // …and so does the row the Transfers list reads. That the UPDATE itself
+        // writes what it is told is pinned by
+        // `store::tests::update_outbound_file_size_corrects_one_row`; here the
+        // point is that the two halves agree after a real staging pass.
+        let rows = crate::sync::store::list_outbound_files(&store.lock_conn(), id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].byte_size, real_size, "per-file row corrected");
 
         // And the bytes are the CALIBRATED frame, not the source: (1000 − ~300)
         // per pixel, so the two files cannot hash alike.

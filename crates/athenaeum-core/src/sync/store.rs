@@ -4355,6 +4355,47 @@ mod tests {
         );
     }
 
+    /// The size correction a generated payload needs: the row was written from
+    /// the plan's ESTIMATE (a calibrated light does not exist when the row is
+    /// enqueued), and preparation rewrites it to what landed. Only the named
+    /// file moves, and only its size — a wrong column or a loose `WHERE` here
+    /// would silently mis-report every transfer's per-file picture.
+    #[test]
+    fn update_outbound_file_size_corrects_one_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let files = vec![
+            AnnounceFileEntry {
+                rel_path: "lights/c_a.fits".into(),
+                byte_size: 10,
+                frame_uuid: "ua".into(),
+            },
+            AnnounceFileEntry {
+                rel_path: "lights/c_b.fits".into(),
+                byte_size: 20,
+                frame_uuid: "ub".into(),
+            },
+        ];
+        let id = store
+            .enqueue_preparing("/pkg/x", PEER, None, &files, PackageLayout::Batch)
+            .unwrap();
+
+        store
+            .update_outbound_file_size(id, "lights/c_a.fits", 4096)
+            .unwrap();
+
+        let rows = list_outbound_files(&store.lock_conn(), id).unwrap();
+        assert_eq!(rows[0].byte_size, 4096, "the named file was corrected");
+        assert_eq!(rows[0].state, OutboundFileState::Pending, "state untouched");
+        assert_eq!(rows[1].byte_size, 20, "its sibling was not");
+
+        // An unknown rel_path is a no-op, not an error — the package-shape tests
+        // stage without a row at all.
+        store
+            .update_outbound_file_size(id, "lights/nope.fits", 1)
+            .unwrap();
+    }
+
     /// The compare-and-set the preparation worker promotes with: it moves the
     /// row only while the state it read is still the state on disk. Without it,
     /// a verdict written between the worker's ownership check and its promotion
