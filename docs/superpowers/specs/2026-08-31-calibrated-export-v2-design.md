@@ -188,11 +188,12 @@ The send path (`calibratedLights` mode) generates the same outputs into the
 package instead of copying pre-built artifacts:
 
 - `PayloadEntry` (UNGATED, shared with headless Perseus) gains
-  `generate: Option<GeneratePayload>` — v1's only variant carries the
-  `frame_id` to calibrate; `None` for every existing producer, so Perseus and
-  the selection path are untouched. `frame_set_entries` sets it for lights in
-  CalibratedLights mode and leaves `source_path` at the RAW light (the
-  existence pre-flight stats it; its size is the progress estimate).
+  `generate: bool` — the entry's own `frame_id` names what to calibrate, and
+  the generation options travel at package level; `false` for every existing
+  producer, so Perseus and the selection path are untouched.
+  `frame_set_entries` sets it for lights in CalibratedLights mode and leaves
+  `source_path` at the RAW light (the existence pre-flight stats it; its size
+  is the progress estimate).
 - `api::sync_prepare::spawn_prepare` staging loop: an entry with `generate`
   runs the §3 generator writing directly to the entry's package destination
   (tmp + rename inside the package dir), then hashes the written file for the
