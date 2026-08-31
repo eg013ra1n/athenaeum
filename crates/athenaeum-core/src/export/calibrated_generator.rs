@@ -427,6 +427,7 @@ mod tests {
     use crate::fits_parser::FitsHeader;
     use crate::fits_writer::write_fits_f32;
     use crate::integration::cfa::cfa_channel_at;
+    use crate::models::LightCalParams;
     use rusqlite::params;
 
     const W: usize = 16;
@@ -533,6 +534,40 @@ mod tests {
         .unwrap();
     }
 
+    /// A RAW (unbuilt) calibration set with a real member file on disk. The
+    /// file exists on purpose: it makes `is_master_library = 0` — and nothing
+    /// else — the reason the term is skipped.
+    fn seed_raw_set(conn: &Connection, set_id: i64, imagetyp: &str, path: &Path) {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2026-07-05', 0)",
+            params![set_id, imagetyp],
+        )
+        .unwrap();
+        let file_id = set_id + 3_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                path.to_string_lossy(),
+                path.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+        let frame_id = set_id + 4_000_000;
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+            params![frame_id, file_id, imagetyp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, frame_id],
+        )
+        .unwrap();
+    }
+
     fn add_link(conn: &Connection, frame_id: i64, set_id: i64, cal_type: &str) {
         conn.execute(
             "INSERT INTO calibration_set_to_frames
@@ -601,6 +636,136 @@ mod tests {
         add_link(&conn, 1, 10, "Dark");
         add_link(&conn, 1, 11, "Flat");
         (conn, "light_b.fits".to_string())
+    }
+
+    /// `BiasFallback::SkipFrame` is user-selectable (persisted by
+    /// `lightCalPrefs.ts` into `LightCalParams`), and it is the ONLY thing that
+    /// turns a bias-only light into a refusal instead of a `"B"` calibration.
+    /// Both arms are pinned here: the policy has no other coverage since the
+    /// standalone flow's own suite was removed with it.
+    #[test]
+    fn skip_frame_policy_refuses_a_bias_only_light() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_plane(&dir.path().join("light_c.fits"), |_, _| 1000.0);
+        let bias = write_plane(&dir.path().join("bias.fits"), |_, _| 50.0);
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 12, "Bias", &bias);
+        add_link(&conn, 1, 12, "Bias");
+
+        // skipFrame → resolution refuses, naming the missing dark.
+        let skip = CalibratedLightOptions {
+            params: LightCalParams {
+                bias_fallback: BiasFallback::SkipFrame,
+                ..LightCalParams::default()
+            },
+            ..CalibratedLightOptions::default()
+        };
+        let err = match resolve_generation(&conn, 1, &skip, dir.path()) {
+            Ok(_) => panic!("skipFrame must refuse a light with no dark master"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            format!("{err}"),
+            "no dark master (bias fallback disabled)",
+            "the refusal must name the policy that caused it"
+        );
+
+        // subtractBias (the default) → the same light resolves and calibrates
+        // to a bias-only CALSTAT.
+        let opts = CalibratedLightOptions::default();
+        assert_eq!(opts.params.bias_fallback, BiasFallback::SubtractBias);
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert!(
+            spec.dark_path.is_none(),
+            "no dark is linked, so nothing can drive a cosmetic pass"
+        );
+
+        let out = dir.path().join("wbpp/M31/lights/c_light_c.fits");
+        let generated = execute_generation(
+            &spec,
+            &out,
+            dir.path(),
+            &opts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            generated.calstat, "B",
+            "bias subtracted, no dark and no flat → a bare 'B'"
+        );
+        assert_eq!(
+            generated.hot_pixels_replaced, 0,
+            "a hot-pixel map needs a master dark"
+        );
+        assert!(out.exists());
+
+        let (_, _, _, data) = read_written(&out);
+        // Float source, no re-scale: the plain difference 1000 − 50.
+        assert!((data[0] - 950.0).abs() < 1e-3, "got {}", data[0]);
+    }
+
+    /// The built-master-wins / unbuilt-raw-skipped rule
+    /// (`light_resolve::resolve_master`: `Some` only for
+    /// `is_master_library = 1`; `resolve_type` treats `None` as "skip this
+    /// term"). Pinned through `resolve_frame_inputs`, the one function the
+    /// export generator and the transfer preparation both resolve through.
+    #[test]
+    fn resolution_prefers_a_built_master_and_skips_an_unbuilt_raw_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_plane(&dir.path().join("light_d.fits"), |_, _| 1000.0);
+        let dark = write_plane(&dir.path().join("dark.fits"), spiky_dark);
+        let bias = write_plane(&dir.path().join("bias.fits"), |_, _| 50.0);
+        // The raw flat has a member FILE, exactly like the masters — only its
+        // `is_master_library` flag differs.
+        let raw_flat = write_plane(&dir.path().join("raw_flat.fits"), |_, _| 2000.0);
+
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 10, "Dark", &dark);
+        seed_master_set(&conn, 12, "Bias", &bias);
+        seed_raw_set(&conn, 200, "Flat", &raw_flat);
+        add_link(&conn, 1, 10, "Dark");
+        add_link(&conn, 1, 12, "Bias");
+        add_link(&conn, 1, 200, "Flat");
+
+        let r = crate::calibration_library::light_resolve::resolve_frame_inputs(&conn, 1, true)
+            .unwrap();
+
+        let rd = r.dark.expect("built dark master must resolve");
+        assert_eq!(rd.set_id, 10);
+        assert_eq!(rd.path, dark.to_string_lossy());
+        assert!(
+            !rd.uuid.is_empty(),
+            "master uuid comes from the identity trigger"
+        );
+
+        let rb = r.bias.expect("built bias master must resolve");
+        assert_eq!(rb.set_id, 12);
+        assert_eq!(rb.path, bias.to_string_lossy());
+
+        assert!(
+            r.flat.is_none(),
+            "a raw, unbuilt set must not resolve even with a member file on disk"
+        );
+
+        // Identity + layout fields the caller places the output by.
+        assert_eq!(r.frame_id, 1);
+        assert_eq!(r.source_filename, "light_d.fits");
+        assert_eq!(r.object, "M31");
+        assert_eq!(r.instrume, "TestCam");
+        assert_eq!(r.date_obs_date, "2026-07-05");
+        assert!(
+            r.source_uuid.is_some(),
+            "light uuid populated by the trigger"
+        );
+
+        // And the generator agrees: the skipped flat leaves nothing to divide by.
+        let opts = CalibratedLightOptions::default();
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert!(spec.inputs.flat_path.is_none());
+        assert!(spec.dark_path.is_some());
     }
 
     #[test]
