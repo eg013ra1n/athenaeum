@@ -1871,7 +1871,6 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "render", feature = "solver"))]
             dso_catalog: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
@@ -3100,8 +3099,8 @@ mod tests {
     ///
     /// Flipping the constant to `Calibrated` (or restoring a resolver that says
     /// so) turns this red on assertion 2. No hub is wired: the gate rejects
-    /// above the announce call. No `light_calibrations` dependency, so it
-    /// survives the table drop.
+    /// above the announce call, and nothing here reads a tracking row — the
+    /// pin survived the removal of the whole standalone flow unchanged.
     #[tokio::test]
     async fn decision_c_blocks_publish_of_gate_eligible_frames() {
         let (_tmp, ctx) = test_ctx();

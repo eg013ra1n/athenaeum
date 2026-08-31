@@ -20,9 +20,10 @@ pub struct MasterRef {
     pub path: String,
 }
 
-/// The identity + provenance a calibrated LIGHT output carries in its header,
-/// enough to reconcile it against the `light_calibrations` table or adopt it
-/// into a rebuilt catalog (design §4).
+/// The identity + provenance a calibrated LIGHT output carries in its header.
+/// It is what makes the file self-describing: the scanner recognizes an
+/// artifact by these cards and skips it outright, and a human (or a future
+/// consumer) can read back which source frame and which masters produced it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalibratedIdentity {
     /// `ATH_CSRC` — uuid of the source frame. `None` when the card is absent
@@ -329,8 +330,8 @@ mod tests {
     #[test]
     fn parse_decodes_encoded_filename_and_master_path() {
         // What the producer writes for a Cyrillic Windows profile: uuid raw,
-        // path percent-encoded. The parser must hand back the ORIGINAL bytes so
-        // the `light_calibrations` rows (which store them RAW) still match.
+        // path percent-encoded. The parser must hand back the ORIGINAL bytes,
+        // so a consumer comparing them against the catalog still matches.
         let cyr_name = "Файл 1.fits";
         let cyr_path = r"C:\Users\Вилен\Athenaeum\master_dark.fits";
         let csrn = encode_ident(cyr_name);

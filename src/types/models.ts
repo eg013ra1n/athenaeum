@@ -594,49 +594,6 @@ export type BatchSkip = { setId: number, reason: string, };
 
 export type DeleteMasterResult = { masterSetId: number, restoredRawSetId: number | null, linksRepointed: number, filesDeleted: number, };
 
-export type LightFrameReadiness = { frameId: number, filename: string, 
-/**
- * `db::light_calibrations::derive_status` mapped to the frontend's
- * verbatim strings: `"notCalibrated"` | `"calibrated"` | `"partial"` |
- * `"stale"`.
- */
-status: string, 
-/**
- * Dark-link classification: `"master"` | `"rawSet"` | `"missing"`.
- */
-dark: string, 
-/**
- * Flat-link classification: `"master"` | `"rawSet"` | `"missing"`.
- */
-flat: string, 
-/**
- * Bias-link classification: `"master"` | `"rawSet"` | `"missing"`.
- */
-bias: string, 
-/**
- * Distinct raw (non-master, non-superseded) calibration-set ids this
- * frame links to — the sets a preflight would have to build masters for.
- */
-rawSetIds: Array<number>, };
-
-export type LightCalReadiness = { frames: Array<LightFrameReadiness>, readyCount: number, rawSetCount: number, missingCount: number, 
-/**
- * Distinct raw calibration-set ids across all frames that a preflight
- * must build masters for, in first-seen order. `raw_set_ids_to_build.len()`
- * is the number of master builds; `raw_set_count` is the number of
- * affected frames (a single raw set can serve many frames).
- */
-rawSetIdsToBuild: Array<number>, 
-/**
- * ADVISORY notes about CFA compatibility between the set's light frames
- * and the masters they link — a mono master flat against an OSC light, a
- * mosaic phase shift, a pattern that does not match. Empty = nothing to
- * say. Purely informational: it never blocks the run, never changes the
- * counts above, and a failure to compute it leaves the list empty rather
- * than failing readiness.
- */
-cfaWarnings: Array<string>, };
-
 export type ExportFileCounts = { lightsOnly: number, rawWithCalibrationSets: number, rawWithMasters: number, calibratedLights: number, };
 
 export type ExportReadiness = { total: number, 
@@ -651,51 +608,6 @@ unlinkedLights: number, rawSetsWithoutMaster: number,
  * refetches.
  */
 rawSetIdsWithoutMaster: Array<number>, fileCounts: ExportFileCounts, };
-
-export type LightCalDetails = { frameId: number, 
-/**
- * CALSTAT recorded on the calibrated output (`"BDF"`, `"BF"`, `"BD"`, …).
- */
-calstat: string, 
-/**
- * Master-dark filename, or `None` when unlinked/unresolvable.
- */
-darkMaster: string | null, 
-/**
- * Master-flat filename, or `None`.
- */
-flatMaster: string | null, 
-/**
- * Master-bias filename, or `None`.
- */
-biasMaster: string | null, flatNormApplied: boolean, 
-/**
- * Normalization statistic wire string (`"centralThird"` |
- * `"pixinsightTrimmed"`); meaningful only when `flat_norm_applied`.
- */
-flatNormMode: string, 
-/**
- * Canonical JSON of the advanced parameters actually applied.
- */
-calParams: string, 
-/**
- * Whether the flat was normalized per CFA channel. `None` = the row
- * predates per-channel scaling and does not say. Comes from the row's own
- * column, NOT from `cal_params` — that field records what was requested,
- * which a mono light satisfies globally.
- */
-cfaScalingApplied: boolean | null, engineVersion: number, 
-/**
- * RFC3339 timestamp the tracking row was written.
- */
-calibratedAt: string, outputPath: string, 
-/**
- * `derive_status` against the caller's wanted preferences resolved to Stale
- * or Partial — the coverage view should flag this row for re-calibration.
- */
-stale: boolean, };
-
-export type LightCalScope = { onlyStale: boolean, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

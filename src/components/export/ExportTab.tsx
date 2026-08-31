@@ -159,14 +159,12 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
     return () => { cancelled = true; };
   }, [frameSetId, readinessTick]);
 
-  // A master build or a light calibration finishing elsewhere (Coverage tab)
-  // changes what this tab may export — re-read rather than making the user
-  // leave and come back.
+  // A master build finishing elsewhere (Coverage tab, Equipment page) changes
+  // what this tab may export — re-read rather than making the user leave and
+  // come back.
   useEffect(() => {
-    window.addEventListener('light-cal-updated', loadReadiness);
     window.addEventListener('library-updated', loadReadiness);
     return () => {
-      window.removeEventListener('light-cal-updated', loadReadiness);
       window.removeEventListener('library-updated', loadReadiness);
     };
   }, [loadReadiness]);

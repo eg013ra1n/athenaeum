@@ -1123,16 +1123,16 @@ pub struct CatalogMeta {
 //
 // These plain data types + consts are used by BOTH the render-gated
 // light-calibration engine (`calibration_library::light_cal`) and ungated
-// consumers (`db::light_calibrations`, `scanner`, `export`). They live here in
+// consumers (`scanner`, `export`). They live here in
 // `models` so the ungated side compiles with `--no-default-features` while the
 // engine (gated behind the `render` feature) re-exports them for its callers.
 // ---------------------------------------------------------------------------
 
 /// Bump when the calibration math or the engine's output surface changes — a
 /// stamped `ATH_CVER` then tells a consumer which engine produced the file, and
-/// an older stamp reads as out of date (today that is
-/// `crate::db::light_calibrations::derive_status`, which derives every existing
-/// tracking row as stale).
+/// an older stamp reads as out of date. Nothing consults it automatically since
+/// calibrated-export v2 retired the tracking table — every export regenerates —
+/// so it is now provenance a human (or a future consumer) reads off the file.
 ///
 /// The single definition lives HERE, not next to the engine: the `ATH_CVER`
 /// stamp itself sits in `calibration_library::light_headers`, which is ungated,
@@ -1176,8 +1176,8 @@ pub enum FlatNormMode {
 impl FlatNormMode {
     /// The over-the-wire / stored string for this mode — identical to the serde
     /// camelCase representation and to the `flat_norm_mode` DB column values.
-    /// Kept as a `&'static str` so `db::light_calibrations` can compare a stored
-    /// row's mode against a wanted mode without a serde round-trip.
+    /// Kept as a `&'static str` so a consumer can compare a stored/stamped mode
+    /// against a wanted mode without a serde round-trip.
     pub fn as_wire_str(self) -> &'static str {
         match self {
             FlatNormMode::CentralThird => "centralThird",
@@ -1208,21 +1208,18 @@ fn default_trim_fraction() -> f64 {
 
 /// serde default for [`LightCalParams::cfa_flat_scaling`] — ON, so an omitted
 /// wire field decodes to the recommended behavior for colour sensors. NOTE the
-/// asymmetry with the other defaults: a stored `'{}'` (a row written before this
-/// field existed) also decodes to `true`, which is NOT what that row was
-/// calibrated with. That is why staleness reads the row's own
-/// `cfa_scaling_applied` column and never `cal_params` — see
-/// `db::light_calibrations::derive_status`.
+/// asymmetry with the other defaults: a stored/stamped `'{}'` written before
+/// this field existed also decodes to `true`, which is NOT what it was
+/// calibrated with. `cal_params` therefore records what was REQUESTED; what was
+/// APPLIED is reported separately (`ATH_CCFA` on the output).
 fn default_true() -> bool {
     true
 }
 
 /// Advanced per-run light-calibration parameters (spec §2 "Advanced
 /// parameters"). Every field is optional on the wire (`#[serde(default)]`) with
-/// a default equal to the current behavior, so an omitted field — or the
-/// `cal_params = '{}'` a pre-feature tracking row carries — decodes to
-/// [`LightCalParams::default`]. Recorded verbatim in the tracking row and
-/// compared for staleness (`db::light_calibrations::derive_status`).
+/// a default equal to the current behavior, so an omitted field — or a
+/// pre-feature `'{}'` — decodes to [`LightCalParams::default`].
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct LightCalParams {

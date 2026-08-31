@@ -96,9 +96,7 @@ pub(crate) fn create_calibration_set_empty_prune_trigger(conn: &Connection) -> r
 /// (`superseded_by_set_id`, `master_provenance.source_set_id`) aborts the
 /// caller's own transaction, CASCADE (`master_provenance.master_set_id`,
 /// `calibration_set_to_frames`, `calibration_set_originals`,
-/// `archive_operations`) silently takes the referring row with it, and SET NULL
-/// (`light_calibrations.{dark,flat,bias}_set_id`) silently blanks what a
-/// calibrated artifact recorded about the master it used.
+/// `archive_operations`) silently takes the referring row with it.
 pub(crate) fn prune_orphaned_calibration_sets(conn: &Connection) -> rusqlite::Result<usize> {
     let plain_orphans = conn.execute(
         "DELETE FROM calibration_set
@@ -153,12 +151,6 @@ pub(crate) fn prune_orphaned_calibration_sets(conn: &Connection) -> rusqlite::Re
            AND NOT EXISTS (
                 SELECT 1 FROM archive_operations
                  WHERE calibration_set_id = calibration_set.id
-           )
-           AND NOT EXISTS (
-                SELECT 1 FROM light_calibrations
-                 WHERE dark_set_id = calibration_set.id
-                    OR flat_set_id = calibration_set.id
-                    OR bias_set_id = calibration_set.id
            )",
         [],
     )?;
@@ -1815,189 +1807,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // B5: light_calibrations — sole tracking record for calibrated-light FITS
-    // artifacts, which live OUTSIDE the catalog and are never registered in
-    // `files`/`frames` (design spec 2026-07-05-light-calibration-design.md
-    // §5). `frame_id` is nullable + UNIQUE: NULL only for an "adopted" row
-    // whose source frame isn't cataloged yet, UNIQUE because a frame has at
-    // most one tracked calibrated output. `dark_set_id`/`flat_set_id`/
-    // `bias_set_id` are `ON DELETE SET NULL` (unlike
-    // `master_provenance.master_set_id`'s CASCADE): deleting a calibration set
-    // — including a master a calibrated light references — must NOT delete the
-    // calibrated-light history AND must NOT abort the delete with a
-    // FOREIGN KEY constraint failure (as a no-action FK would once any light is
-    // calibrated). A NULLed set id makes `derive_status` yield Partial/Stale,
-    // i.e. an honest "re-calibrate" prompt.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS light_calibrations (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
-            source_uuid       TEXT,
-            source_filename   TEXT,
-            output_path       TEXT NOT NULL UNIQUE,
-            dark_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
-            flat_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
-            bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
-            calstat           TEXT NOT NULL,
-            flat_norm_applied INTEGER NOT NULL,
-            flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
-            cal_params        TEXT NOT NULL DEFAULT '{}',
-            cfa_scaling_applied INTEGER,
-            output_hash       TEXT NOT NULL,
-            engine_version    INTEGER NOT NULL,
-            created_at        TEXT NOT NULL
-        )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_light_cal_source_uuid ON light_calibrations(source_uuid)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_light_cal_source_filename ON light_calibrations(source_filename)",
-        [],
-    )?;
-
-    // B5 (2026-07-06): selectable flat-normalization statistic. v0.2.5 is
-    // unreleased, but the owner's dev DB already carries `light_calibrations`
-    // rows, so ADD COLUMN with a DEFAULT preserves them (an existing row's
-    // statistic was central-third — today's only behavior). Must run BEFORE the
-    // FK rebuild below so that rebuild's explicit-column INSERT..SELECT finds the
-    // column on the source table.
-    if !column_exists(conn, "light_calibrations", "flat_norm_mode")? {
-        conn.execute(
-            "ALTER TABLE light_calibrations ADD COLUMN flat_norm_mode TEXT NOT NULL DEFAULT 'centralThird'",
-            [],
-        )?;
-    }
-
-    // B5 (2026-07-06): advanced per-run parameters (trim fraction / output
-    // pedestal / bias-fallback policy) as one JSON blob. Same rationale as the
-    // flat_norm_mode ADD COLUMN above — v0.2.5 is unreleased but the owner's dev
-    // DB already carries `light_calibrations` rows, so DEFAULT '{}' preserves
-    // them (an existing row predates every advanced param, so '{}' decodes to
-    // `LightCalParams::default()` = today's behavior). Must run BEFORE the FK
-    // rebuild below so that rebuild's explicit-column INSERT..SELECT finds the
-    // column on the source table.
-    if !column_exists(conn, "light_calibrations", "cal_params")? {
-        conn.execute(
-            "ALTER TABLE light_calibrations ADD COLUMN cal_params TEXT NOT NULL DEFAULT '{}'",
-            [],
-        )?;
-    }
-
-    // CFA hardening (2026-08-03): whether the flat was normalized per CFA
-    // channel. NULLABLE with no default, unlike the two ADD COLUMNs above: a
-    // pre-existing row was written by an engine that had no per-channel mode, so
-    // NULL is the honest "not recorded" — `derive_status` reads it as "global
-    // was applied", which is what those rows in fact got. It deliberately does
-    // NOT live in `cal_params`: that column stores what was REQUESTED, and a
-    // request for per-channel scaling on a mono light (or on a flat with
-    // degenerate channel constants) is satisfied globally. Must run BEFORE the
-    // FK rebuild below so that rebuild's explicit-column INSERT..SELECT finds
-    // the column on the source table.
-    if !column_exists(conn, "light_calibrations", "cfa_scaling_applied")? {
-        conn.execute(
-            "ALTER TABLE light_calibrations ADD COLUMN cfa_scaling_applied INTEGER",
-            [],
-        )?;
-    }
-
-    // Guarded migration for dev DBs created before the `ON DELETE SET NULL`
-    // fix (v0.2.5 is unreleased, so only dev DBs can carry the old no-action
-    // FK). Detect via the pragma FK list: if any of the three set-id FKs
-    // reference calibration_set WITHOUT `SET NULL`, rebuild the table in place
-    // preserving rows (SQLite can't alter an FK action). Same FK-off / 12-step
-    // recipe the archive_operations rebuild below uses.
-    let light_cal_needs_rebuild = {
-        let mut stmt = conn.prepare("PRAGMA foreign_key_list('light_calibrations')")?;
-        // columns: 0 id, 1 seq, 2 table, 3 from, 4 to, 5 on_update, 6 on_delete, 7 match
-        let fks = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(3)?, r.get::<_, String>(6)?)))?
-            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
-        fks.iter().any(|(from, on_delete)| {
-            matches!(from.as_str(), "dark_set_id" | "flat_set_id" | "bias_set_id")
-                && on_delete != "SET NULL"
-        })
-    };
-    if light_cal_needs_rebuild {
-        // FK enforcement OFF around the rebuild (a no-op inside a transaction,
-        // so it must be issued OUTSIDE the BEGIN/COMMIT batch). light_calibrations
-        // is a leaf — no other table FK-references its id — so DROP TABLE fires
-        // no cascades and id preservation via the explicit-column INSERT
-        // (SQLite re-seeds sqlite_sequence from the max copied id) is safe.
-        conn.pragma_update(None, "foreign_keys", false)?;
-        let rebuild = conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE light_calibrations_new (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
-                source_uuid       TEXT,
-                source_filename   TEXT,
-                output_path       TEXT NOT NULL UNIQUE,
-                dark_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
-                flat_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
-                bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
-                calstat           TEXT NOT NULL,
-                flat_norm_applied INTEGER NOT NULL,
-                flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
-                cal_params        TEXT NOT NULL DEFAULT '{}',
-                cfa_scaling_applied INTEGER,
-                output_hash       TEXT NOT NULL,
-                engine_version    INTEGER NOT NULL,
-                created_at        TEXT NOT NULL
-             );
-             INSERT INTO light_calibrations_new
-                (id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
-                 flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params,
-                 cfa_scaling_applied, output_hash, engine_version, created_at)
-                SELECT id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
-                       flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params,
-                       cfa_scaling_applied, output_hash, engine_version, created_at
-                FROM light_calibrations;
-             DROP TABLE light_calibrations;
-             ALTER TABLE light_calibrations_new RENAME TO light_calibrations;
-             COMMIT;",
-        );
-        // A failed statement inside the batch leaves its explicit BEGIN
-        // open; `PRAGMA foreign_keys` is a silent no-op while a transaction
-        // is pending, so roll back FIRST or the re-enable below would do
-        // nothing (audit M7).
-        if rebuild.is_err() && !conn.is_autocommit() {
-            if let Err(e) = conn.execute("ROLLBACK", []) {
-                tracing::error!(error = %e, "migration batch rollback failed");
-            }
-        }
-        // Re-enable FK enforcement whether or not the rebuild succeeded, then
-        // surface the rebuild error — never leave the connection unenforced.
-        let re_enable = conn.pragma_update(None, "foreign_keys", true);
-        rebuild?;
-        re_enable?;
-        // Step 10 of the recipe: verify the rebuild didn't orphan any row.
-        let violations: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_foreign_key_check('light_calibrations')",
-            [],
-            |r| r.get(0),
-        )?;
-        if violations > 0 {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-                Some(format!(
-                    "light_calibrations rebuild broke foreign-key integrity: \
-                     {violations} violation(s)"
-                )),
-            ));
-        }
-        // Recreate the two indexes the DROP removed.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_light_cal_source_uuid ON light_calibrations(source_uuid)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_light_cal_source_filename ON light_calibrations(source_filename)",
-            [],
-        )?;
-    }
+    // Calibrated-export v2 (2026-08-31): light calibration generates at export;
+    // the tracking table is gone. Idempotent — a fresh DB never creates it.
+    conn.execute_batch("DROP TABLE IF EXISTS light_calibrations")?;
 
     // B2: prune empty `calibration_set` rows automatically. The
     // `calibration_set_frames` junction table CASCADE-deletes rows when
@@ -2443,9 +2255,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_imaging_nights_frames_set ON imaging_nights(frames_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_imaging_night ON sessions(imaging_night_id)",
         "CREATE INDEX IF NOT EXISTS idx_calibration_set_originals_set ON calibration_set_originals(set_id)",
-        "CREATE INDEX IF NOT EXISTS idx_light_cal_dark_set ON light_calibrations(dark_set_id)",
-        "CREATE INDEX IF NOT EXISTS idx_light_cal_flat_set ON light_calibrations(flat_set_id)",
-        "CREATE INDEX IF NOT EXISTS idx_light_cal_bias_set ON light_calibrations(bias_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_master_provenance_source_set ON master_provenance(source_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_master_provenance_master_set ON master_provenance(master_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_archive_op_steps_op_file ON archive_operation_steps(operation_file_id)",
@@ -2468,6 +2277,152 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod light_calibrations_drop_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// Calibrated-export v2: the standalone Calibrate Lights flow is gone and
+    /// with it its tracking table. A catalog that still carries
+    /// `light_calibrations` (every dev/beta DB that ever calibrated a light)
+    /// must lose it on the next `init_db`, rows and all.
+    #[test]
+    fn init_db_drops_a_legacy_light_calibrations_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The shape a pre-v2 catalog carries, reduced to what the migration
+        // needs to see: the table exists and holds a row.
+        conn.execute_batch(
+            "CREATE TABLE light_calibrations (id INTEGER PRIMARY KEY);
+             INSERT INTO light_calibrations (id) VALUES (1);",
+        )
+        .unwrap();
+        assert!(table_exists(&conn, "light_calibrations"));
+
+        init_db(&conn).unwrap();
+
+        assert!(
+            !table_exists(&conn, "light_calibrations"),
+            "init_db must drop the legacy tracking table"
+        );
+    }
+
+    /// The realistic upgrade shape: the table as v0.5.4 actually created it —
+    /// foreign keys onto `frames` and `calibration_set`, and a row pointing at
+    /// live parents. `PRAGMA foreign_keys` is ON during init, so the DROP does
+    /// an implicit delete of those child rows; it must neither abort nor take
+    /// the parents with it.
+    #[test]
+    fn init_db_drops_the_real_legacy_table_with_its_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, '/a/L_0001.fits', 'L_0001.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp) VALUES (1, 1, 'Light')",
+            [],
+        )
+        .unwrap();
+        // A calibration set with a real member, so `init_db`'s own orphan sweep
+        // (which runs in the same call) has no reason to remove it — the only
+        // thing that could take it out is a cascade from the dropped table.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, frame_count)
+             VALUES (7, 'MasterDark', '2026-01-01', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (2, '/a/master_dark.fits', 'master_dark.fits', 1,
+                     '2026-01-01T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp) VALUES (2, 2, 'MasterDark')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (7, 2)",
+            [],
+        )
+        .unwrap();
+
+        // v0.5.4's DDL verbatim, plus a row that exercises every FK.
+        conn.execute_batch(
+            "CREATE TABLE light_calibrations (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
+                source_uuid       TEXT,
+                source_filename   TEXT,
+                output_path       TEXT NOT NULL UNIQUE,
+                dark_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                flat_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                calstat           TEXT NOT NULL,
+                flat_norm_applied INTEGER NOT NULL,
+                flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
+                cal_params        TEXT NOT NULL DEFAULT '{}',
+                cfa_scaling_applied INTEGER,
+                output_hash       TEXT NOT NULL,
+                engine_version    INTEGER NOT NULL,
+                created_at        TEXT NOT NULL
+             );
+             INSERT INTO light_calibrations
+                (frame_id, source_uuid, output_path, dark_set_id, calstat,
+                 flat_norm_applied, output_hash, engine_version, created_at)
+             VALUES (1, 'uuid-1', '/out/c_L_0001.fits', 7, 'BD', 1, 'hash', 2,
+                     '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        assert!(!table_exists(&conn, "light_calibrations"));
+        for (table, id) in [("frames", 1i64), ("calibration_set", 7)] {
+            let alive: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(alive, 1, "{table} row {id} must survive the drop");
+        }
+    }
+
+    /// Idempotent both ways: a fresh catalog never creates the table, and a
+    /// second `init_db` over the same connection is a no-op rather than an
+    /// error on the missing table.
+    #[test]
+    fn fresh_init_never_creates_light_calibrations_and_reinit_is_a_no_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert!(
+            !table_exists(&conn, "light_calibrations"),
+            "a fresh catalog must never materialise the tracking table"
+        );
+        init_db(&conn).unwrap();
+        assert!(!table_exists(&conn, "light_calibrations"));
+    }
 }
 
 #[cfg(test)]
@@ -3779,8 +3734,7 @@ mod archive_schema_tests {
     /// …but only when NOTHING points at it. Each reference below is a different
     /// FK action and a different way to lose data silently: NO ACTION aborts the
     /// caller's own transaction, CASCADE takes the provenance / originals /
-    /// archive-operation row with it, SET NULL blanks what a calibrated artifact
-    /// recorded about the master it used.
+    /// archive-operation row with it.
     #[test]
     fn shared_prune_spares_referenced_master_sets() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3835,21 +3789,10 @@ mod archive_schema_tests {
         )
         .unwrap();
 
-        // 546 — a calibrated light records it as the dark it used (SET NULL).
-        insert_ghost_master(&conn, 546);
-        conn.execute(
-            "INSERT INTO light_calibrations
-             (dark_set_id, output_path, calstat, flat_norm_applied, output_hash,
-              engine_version, created_at)
-             VALUES (546, '/out/c_a.fits', 'BD', 1, 'hash', 1, '2025-01-01T00:00:00Z')",
-            [],
-        )
-        .unwrap();
-
         let pruned = super::prune_orphaned_calibration_sets(&conn).unwrap();
         assert_eq!(pruned, 0, "every referenced master must be spared");
 
-        for id in [540, 541, 542, 543, 544, 545, 546] {
+        for id in [540, 541, 542, 543, 544, 545] {
             let alive: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",

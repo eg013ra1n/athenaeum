@@ -220,10 +220,10 @@ mod tests {
     /// field case) must never brick the output write AND must come back
     /// byte-identical on read. Before the reversible percent-encoding, the
     /// writer's lossy ASCII sanitizer turned every Cyrillic char into '?', so
-    /// the stamped path could never be matched to the master file again —
-    /// scanner adoption deferred forever and `resolve_master_set_id`'s path
-    /// fallback silently missed. This pin asserts the ROUND TRIP (it previously
-    /// asserted the '?' replacement).
+    /// the stamped path could never be matched to the master file again — the
+    /// card became provenance nobody could follow back to the file it names.
+    /// This pin asserts the ROUND TRIP (it previously asserted the '?'
+    /// replacement).
     #[test]
     fn cyrillic_master_path_round_trips_through_card_and_parser() {
         use crate::fits_parser::{calibrated_light_identity, FitsHeader};

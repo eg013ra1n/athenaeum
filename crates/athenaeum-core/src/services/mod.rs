@@ -14,7 +14,7 @@ use crate::db::Database;
 use crate::plate_solve::dso_lookup::DsoCatalog;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 // RwLock is used only by the solver-gated cache fields below.
 #[cfg(feature = "solver")]
@@ -62,19 +62,6 @@ pub struct MasterBuildHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
-/// Handle to track an active light-calibration batch (B5 Task 5). Keyed by the
-/// frame-set id being calibrated — only one light-cal run per frame set at a
-/// time (mirrors `MasterBuildHandle`'s duplicate-run guard). `job_id` is the
-/// compute-queue ticket, stored by the worker thread once
-/// `ComputeQueue::acquire` returns so `cancel_light_calibration` can promptly
-/// drop a still-queued job; `0` until acquired (setting `cancel_flag` alone is
-/// always sufficient — the queue's `acquire` loop polls it — so the job id is
-/// a best-effort promptness aid, not a correctness requirement).
-pub struct LightCalHandle {
-    pub cancel_flag: Arc<AtomicBool>,
-    pub job_id: Arc<AtomicI64>,
-}
-
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
 pub struct ServiceContext {
     pub db: OnceLock<Database>,
@@ -93,9 +80,6 @@ pub struct ServiceContext {
     /// Active master-build operations (Task 12), keyed by SOURCE calibration
     /// set id. Only one build per source set at a time.
     pub active_master_builds: Arc<Mutex<HashMap<i64, MasterBuildHandle>>>,
-    /// Active light-calibration batches (B5 Task 5), keyed by frame-set id.
-    /// Only one light-cal run per frame set at a time.
-    pub active_light_cal: Arc<Mutex<HashMap<i64, LightCalHandle>>>,
     /// Lazy-loaded deep-sky object catalog, used to auto-label plate-solve
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
     /// Gated to match `DsoCatalog`'s home in the render+solver plate_solve module.
@@ -165,7 +149,6 @@ impl ServiceContext {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "render", feature = "solver"))]
             dso_catalog: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]

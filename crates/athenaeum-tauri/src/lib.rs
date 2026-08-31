@@ -78,7 +78,6 @@ pub fn run() {
                     active_registrations: Arc::new(Mutex::new(HashMap::new())),
                     active_archives: Arc::new(Mutex::new(HashMap::new())),
                     active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-                    active_light_cal: Arc::new(Mutex::new(HashMap::new())),
                     dso_catalog: Arc::new(std::sync::RwLock::new(None)),
                     star_cache: Arc::new(std::sync::RwLock::new(None)),
                     bright_cache: Arc::new(std::sync::RwLock::new(None)),
@@ -389,11 +388,6 @@ pub fn run() {
             commands::archive_calibration_originals,
             commands::restore_calibration_originals,
             commands::clear_stale_archive_markers,
-            // Light calibration commands
-            commands::get_light_calibration_readiness,
-            commands::get_light_calibration_details,
-            commands::start_light_calibration,
-            commands::cancel_light_calibration,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

@@ -10,7 +10,6 @@ pub mod calibration_links;
 pub mod analysis;
 pub mod master_provenance;
 pub mod master_unregister;
-pub mod light_calibrations;
 pub mod collab;
 pub mod collab_exchange;
 

@@ -37,7 +37,6 @@ mod plate_solve;
 mod registration;
 mod archive;
 mod masters;
-mod lights;
 pub(crate) mod sync;
 mod account;
 mod collab;
@@ -254,10 +253,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
         .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
-        .route("/api/get_light_calibration_readiness", post(lights::get_light_calibration_readiness))
-        .route("/api/get_light_calibration_details", post(lights::get_light_calibration_details))
-        .route("/api/start_light_calibration", post(lights::start_light_calibration))
-        .route("/api/cancel_light_calibration", post(lights::cancel_light_calibration))
         // Personal sync (Stage I, task A7)
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))
@@ -480,7 +475,6 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),

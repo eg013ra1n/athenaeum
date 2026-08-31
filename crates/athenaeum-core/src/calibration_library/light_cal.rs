@@ -53,8 +53,8 @@ use crate::models::FileFormat;
 
 // The shared light-calibration data types + consts (LIGHT_CAL_ENGINE_VERSION,
 // PI_TRIM_FRACTION, FlatNormMode, BiasFallback, LightCalParams) live in
-// `crate::models` so ungated consumers (db::light_calibrations, scanner,
-// export) compile with `--no-default-features`. They are re-exported here so
+// `crate::models` so ungated consumers (scanner, export) compile with
+// `--no-default-features`. They are re-exported here so
 // this engine and its render-gated callers keep using the `light_cal::` paths.
 pub use crate::models::{
     BiasFallback, FlatNormMode, LightCalParams, LIGHT_CAL_ENGINE_VERSION, PI_TRIM_FRACTION,

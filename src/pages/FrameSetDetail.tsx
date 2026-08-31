@@ -2,14 +2,13 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, AlignHorizontalJustifyCenter, Users } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, LightFrameReadiness, LightCalReadiness, LightCalDetails, PortalNewProjectLink } from '../types/models';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
-import { CalibrateLightsDialog, readFlatNormPref, readFlatNormModePref, readLightCalParamsPref } from '../components/calibration/CalibrateLightsDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../components/calibration/utils';
@@ -156,14 +155,6 @@ export default function FrameSetDetail() {
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
-
-  // Light-calibration state: dialog visibility + per-frame readiness for the
-  // status badges in the frame table (fetched once per set view, not per frame).
-  const [showCalibrateDialog, setShowCalibrateDialog] = useState(false);
-  const [lightCalReadiness, setLightCalReadiness] = useState<Map<number, LightFrameReadiness>>(new Map());
-  // Per-frame calibration recipe (tracking-row truth) for the Coverage table's
-  // status-badge tooltip. Fetched once per set view alongside readiness.
-  const [lightCalDetails, setLightCalDetails] = useState<Map<number, LightCalDetails>>(new Map());
 
   // Archive state
   const [showArchiveDialog, setShowArchiveDialog] = useState(false);
@@ -424,64 +415,6 @@ export default function FrameSetDetail() {
       console.error('Failed to refresh calibration hierarchy:', err);
     }
   }, [id]);
-
-  // Light-calibration readiness for the per-frame status badges. Cheap DB-only
-  // call, fetched once per set view (and again after a calibration or master
-  // build changes the links). Uses the persisted flat-norm preference so the
-  // Stale badge matches what the dialog would report. Failures are non-fatal —
-  // the badges simply don't render.
-  const loadLightCalReadiness = useCallback(async () => {
-    if (!id) return;
-    try {
-      const readiness = await api.invoke<LightCalReadiness>('get_light_calibration_readiness', {
-        setId: parseInt(id),
-        flatNorm: readFlatNormPref(),
-        flatNormMode: readFlatNormModePref(),
-        params: readLightCalParamsPref(),
-      });
-      const map = new Map<number, LightFrameReadiness>();
-      for (const f of readiness.frames) map.set(f.frameId, f);
-      setLightCalReadiness(map);
-    } catch (err) {
-      console.error('[FrameSetDetail] get_light_calibration_readiness failed:', err);
-    }
-  }, [id]);
-
-  // Per-frame calibration recipe (CALSTAT, applied masters, normalization, cal
-  // params, calibrated-at, staleness) for the Coverage table tooltip. Same
-  // preferences as readiness so the "stale" flag agrees with the badge; cheap
-  // DB-only join, fetched once per set view. Failures are non-fatal.
-  const loadLightCalDetails = useCallback(async () => {
-    if (!id) return;
-    try {
-      const details = await api.invoke<LightCalDetails[]>('get_light_calibration_details', {
-        setId: parseInt(id),
-        flatNorm: readFlatNormPref(),
-        flatNormMode: readFlatNormModePref(),
-        params: readLightCalParamsPref(),
-      });
-      const map = new Map<number, LightCalDetails>();
-      for (const d of details) map.set(d.frameId, d);
-      setLightCalDetails(map);
-    } catch (err) {
-      console.error('[FrameSetDetail] get_light_calibration_details failed:', err);
-    }
-  }, [id]);
-
-  // Refresh readiness + recipe details on mount / id change, and when a
-  // calibration run or a master build (which repoints links) completes anywhere
-  // in the app.
-  useEffect(() => {
-    loadLightCalReadiness();
-    loadLightCalDetails();
-    const onChanged = () => { loadLightCalReadiness(); loadLightCalDetails(); };
-    window.addEventListener('light-cal-updated', onChanged);
-    window.addEventListener('library-updated', onChanged);
-    return () => {
-      window.removeEventListener('light-cal-updated', onChanged);
-      window.removeEventListener('library-updated', onChanged);
-    };
-  }, [loadLightCalReadiness, loadLightCalDetails]);
 
   const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
     setAlertDialog({ isOpen: true, title, message, variant });
@@ -959,13 +892,6 @@ export default function FrameSetDetail() {
               onCreateCustomSet={handleOpenCreateDialog}
               highlightCalSet={pendingHighlightCalSet}
               onHighlightConsumed={() => setPendingHighlightCalSet(null)}
-              onCalibrateLights={
-                !detail.frames_set?.archived_at && !detail.frames_set?.is_archived
-                  ? () => setShowCalibrateDialog(true)
-                  : undefined
-              }
-              readinessByFrameId={lightCalReadiness}
-              detailsByFrameId={lightCalDetails}
             />
           ) : (
             <LightsAnalysisView
@@ -980,8 +906,6 @@ export default function FrameSetDetail() {
               hideLocateColumn={!!detail?.frames_set?.archived_at}
               referenceFrameId={referenceFrameId ?? null}
               onReferenceChanged={(ref) => setReferenceFrameId(ref?.referenceFrameId ?? null)}
-              readinessByFrameId={lightCalReadiness}
-              detailsByFrameId={lightCalDetails}
             />
           )
         ) : (
@@ -1147,22 +1071,6 @@ export default function FrameSetDetail() {
               message: `Added ${report.added_count} frame${report.added_count === 1 ? '' : 's'}${report.skipped_count ? `, skipped ${report.skipped_count}` : ''}. See the History tab for details.`,
               variant: 'info',
             });
-          }}
-        />
-      )}
-
-      {/* Calibrate Lights Dialog */}
-      {showCalibrateDialog && (
-        <CalibrateLightsDialog
-          setId={parseInt(id!)}
-          setName={detail.frames_set?.name || 'Untitled'}
-          onClose={() => {
-            setShowCalibrateDialog(false);
-            // The flat-norm toggle or Advanced params inside the dialog may have
-            // changed; re-fetch readiness + recipe so the badges/tooltips reflect
-            // the current staleness view.
-            loadLightCalReadiness();
-            loadLightCalDetails();
           }}
         />
       )}

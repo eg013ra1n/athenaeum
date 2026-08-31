@@ -12,7 +12,7 @@ pub mod cosmetic;
 // The light-calibration engine streams raw pixels via the render-gated
 // `integration` module. Its shared data types (FlatNormMode, BiasFallback,
 // LightCalParams, LIGHT_CAL_ENGINE_VERSION, PI_TRIM_FRACTION) live in `models`
-// so ungated consumers (db::light_calibrations, scanner, export) keep working.
+// so ungated consumers (scanner, export) keep working.
 #[cfg(feature = "render")]
 pub mod light_cal;
 pub mod light_headers;

@@ -798,11 +798,6 @@ fn ingest_calibrated_light_lands_without_tracking() {
         "artifact never becomes a frame"
     );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
-    assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
-        0,
-        "the receiver tracks nothing for an artifact"
-    );
     let landed = walkdir_files(&incoming)
         .into_iter()
         .find(|p| p.file_name().unwrap() == std::ffi::OsStr::new("c_L_0001.fits"))
@@ -899,9 +894,9 @@ fn calibrated_light_recalibrated_resend_lands_beside_the_first() {
         .collect();
     assert_eq!(files.len(), 2, "both artifacts are kept: {files:?}");
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
+        count(&conn, "SELECT COUNT(*) FROM frames"),
         0,
-        "still nothing tracked"
+        "neither artifact enters the catalog"
     );
 }
 
@@ -927,11 +922,10 @@ fn calibrated_light_without_a_known_source_still_lands() {
     .unwrap();
     assert_eq!(outcome.ingested, 1, "{outcome:?}");
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
+        count(&conn, "SELECT COUNT(*) FROM frames"),
         0,
-        "an artifact is never tracked, known source or not"
+        "an artifact never enters the catalog, known source or not"
     );
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 0);
     assert_eq!(walkdir_files(&incoming).len(), 1, "file kept on disk");
 }
 

@@ -1,8 +1,8 @@
 // Light-calibration preferences, persisted per browser/profile in
-// localStorage. They used to live in CalibrateLightsDialog — the dialog that
+// localStorage. They used to live in the Calibrate Lights dialog, which
 // pre-generated calibrated artifacts. Calibration is part of the EXPORT now
-// (calibrated-export v2), so the preferences live with the export tree and the
-// dialog re-exports them until it is removed.
+// (calibrated-export v2) — the dialog is gone, and these live with the export
+// tree, read by the Export tab and the send-to-device dialog.
 //
 // Every reader is total: an unset, unparsable or out-of-range value resolves to
 // the documented default rather than throwing, because localStorage can be

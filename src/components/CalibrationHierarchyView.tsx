@@ -1,11 +1,9 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { api } from '../api';
-import { Scissors, Plus, Calendar, Camera, X, ScanSearch, Wand2 } from 'lucide-react';
+import { Scissors, Plus, Calendar, Camera, X, ScanSearch } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
-  LightFrameReadiness,
-  LightCalDetails,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
 import type { ManualPick } from './ManualCalibrationModal';
@@ -18,7 +16,6 @@ import { CalibrationFinderButton } from './CalibrationFinderButton';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { CreateMasterDialog } from './calibration/CreateMasterDialog';
 import { useMasterBuildContext } from '../contexts/MasterBuildContext';
-import { useLightCalibrationContext } from '../contexts/LightCalibrationContext';
 import { useNotifications } from '../contexts/NotificationContext';
 
 interface CalibrationHierarchyViewProps {
@@ -43,15 +40,6 @@ interface CalibrationHierarchyViewProps {
   highlightCalSet?: { setId: number; kind: 'flat' | 'dark' | 'bias' } | null;
   /** Called once the highlight has been forwarded to the table view. */
   onHighlightConsumed?: () => void;
-  /** Opens the Calibrate Lights dialog. When provided (and the set has frames),
-   *  a "Calibrate Lights" button is shown in the toolbar next to "Create all
-   *  masters" (spec §12.3). Omitted for archived sets whose sources are gone. */
-  onCalibrateLights?: () => void;
-  /** Per-frame light-calibration readiness (keyed by frame_id), fetched once per
-   *  set view by the parent. Feeds the Coverage lights table's "Calib" column. */
-  readinessByFrameId?: Map<number, LightFrameReadiness>;
-  /** Per-frame calibration recipe (keyed by frame_id) for the Calib tooltip. */
-  detailsByFrameId?: Map<number, LightCalDetails>;
 }
 
 export function CalibrationHierarchyView({
@@ -69,15 +57,9 @@ export function CalibrationHierarchyView({
   onCreateCustomSet,
   highlightCalSet,
   onHighlightConsumed,
-  onCalibrateLights,
-  readinessByFrameId,
-  detailsByFrameId,
 }: CalibrationHierarchyViewProps) {
   // Re-assign mode toggle
   const [reassignMode, setReassignMode] = useState(false);
-
-  const { isCalibrating } = useLightCalibrationContext();
-  const calibratingLights = frameSetId != null && isCalibrating(frameSetId);
 
   const { notify } = useNotifications();
 
@@ -456,17 +438,6 @@ export function CalibrationHierarchyView({
                 >
                   Create all masters ({rawCalSetIds.length})
                 </button>
-                {onCalibrateLights && data.total_frames > 0 && (
-                  <button
-                    onClick={onCalibrateLights}
-                    disabled={calibratingLights}
-                    title="Apply linked master darks & flats and write calibrated copies to the calibration library"
-                    className="h-7 inline-flex items-center gap-1.5 px-3 border border-accent/40 bg-accent/10 text-accent text-sm rounded hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  >
-                    <Wand2 size={12} />
-                    {calibratingLights ? 'Calibrating…' : 'Calibrate Lights'}
-                  </button>
-                )}
               </div>
             )}
 
@@ -482,8 +453,6 @@ export function CalibrationHierarchyView({
               onHighlightConsumed={onHighlightConsumed}
               onCreateMaster={(setId) => setBatchDialogIds([setId])}
               buildStatusBySet={buildStatusBySet}
-              readinessByFrameId={readinessByFrameId}
-              detailsByFrameId={detailsByFrameId}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 

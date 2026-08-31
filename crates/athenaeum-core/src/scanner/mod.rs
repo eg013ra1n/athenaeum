@@ -3138,13 +3138,19 @@ mod calibrated_light_scan_tests {
                 "parallel={parallel}: artifact contributed no frames row"
             );
 
-            // Transitional — Task 11 deletes this table together with this
-            // assertion. It is what actually goes red on the retired adopt
-            // branch: "not a frame" was always true, "not tracked" is new.
-            let tracked: i64 = conn
-                .query_row("SELECT COUNT(*) FROM light_calibrations", [], |r| r.get(0))
+            // Nothing about the artifact was recorded anywhere else either:
+            // the retired adopt branch used to bind a tracking row to the
+            // seeded source frame, and ingestion would have banked the
+            // artifact's header blob. Both must stay absent — `fits_header`
+            // is the one table that would carry a trace without needing a
+            // `files` row of its own to be counted here.
+            let headers_total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM fits_header", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(tracked, 0, "parallel={parallel}: no adoption, ever");
+            assert_eq!(
+                headers_total, 0,
+                "parallel={parallel}: artifact banked a header blob"
+            );
         }
     }
 

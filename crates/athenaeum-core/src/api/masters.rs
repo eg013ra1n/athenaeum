@@ -1248,12 +1248,11 @@ fn run_master_build_thread(
     let was_new_build = matches!(target, BuildTarget::New);
 
     // Wrap the fallible body so a panic inside `run_build` can never unwind past
-    // the handle removal / `master-build-complete` emission below (which would
-    // leak the `active_master_builds` handle — and, since fa6f7423, hang any
-    // light-calibration job that polls that map in `wait_for_preflight_builds`).
-    // A caught panic is folded into `BuildStepError::Other` so the SINGLE exit
-    // path (handle removal + error-outcome event) handles it identically to any
-    // other build failure. Mirrors `run_light_cal_thread`'s finally discipline.
+    // the handle removal / `master-build-complete` emission below, which would
+    // leak the `active_master_builds` handle and leave the UI showing a build
+    // that is no longer running. A caught panic is folded into
+    // `BuildStepError::Other` so the SINGLE exit path (handle removal +
+    // error-outcome event) handles it identically to any other build failure.
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_build(
             &ctx,
@@ -1813,11 +1812,10 @@ pub fn cancel_master_build(ctx: &ServiceContext, set_id: i64) -> Result<(), ApiE
 /// raw set stays superseded (invisible to the matcher) forever, so its whole
 /// lineage is locked.
 ///
-/// Known, intended side effect: `light_calibrations.{dark,flat,bias}_set_id`
-/// are `ON DELETE SET NULL`, so calibrated lights that used this master flip
-/// to stale/partial in `derive_status` — an honest "re-calibrate me" prompt
-/// rather than a lie about what produced them. The UI says so before asking
-/// for confirmation.
+/// Known, intended side effect: calibrated lights already exported with this
+/// master keep the deleted master's uuid/path in their `ATH_C*` cards. Nothing
+/// tracks them (calibrated-export v2 removed the tracking table), so they are
+/// simply stale files on disk until the next export regenerates them.
 pub fn delete_master(
     ctx: &ServiceContext,
     master_set_id: i64,
@@ -2961,7 +2959,6 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
@@ -3109,7 +3106,6 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
@@ -3421,7 +3417,6 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
@@ -3948,7 +3943,6 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),

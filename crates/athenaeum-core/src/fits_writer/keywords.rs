@@ -63,9 +63,9 @@ impl Bayer {
     /// inputs go through both).
     ///
     /// Lives here beside the enum rather than in `calibration_library`: the
-    /// light-calibration side reads it from ungated code (`db::light_calibrations`
-    /// derives CFA staleness), and `fits_writer` is the ungated module both
-    /// sides already depend on.
+    /// light-calibration side reads it from ungated code (the header/card
+    /// builders), and `fits_writer` is the ungated module both sides already
+    /// depend on.
     pub fn parse(s: &str) -> Option<Bayer> {
         match s
             .trim()
