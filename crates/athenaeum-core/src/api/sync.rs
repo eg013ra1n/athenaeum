@@ -32,7 +32,9 @@ use crate::api::frame_set_send::PayloadEntry;
 use crate::api::lights::{FlatNormMode, LightCalParams};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
-#[cfg(feature = "render")]
+// UNGATED, unlike the frame-set send that fills it in: the plan carries the
+// options through to the preparation worker, and the headless selection path
+// has to name the (always `None`) field.
 use crate::export::models::CalibratedLightOptions;
 #[cfg(feature = "render")]
 use crate::export::models::ExportMode;
@@ -2896,6 +2898,21 @@ pub async fn ensure_sender_engine(
     Ok((engine, origin_device))
 }
 
+/// Where one planned payload's bytes come from — the plan's half of the
+/// decision [`crate::export::file_organizer::PlacementSource`] makes for an
+/// export, kept separate because the two pipelines carry different baggage
+/// (a package record and a rel_path here, a WBPP placement there).
+///
+/// `Copy` is every send but one: the file at that path already exists and is
+/// staged as it is. `Generate` is the calibrated-lights frame-set send: the
+/// output does not exist anywhere yet, and the preparation worker calibrates
+/// `frame_id` straight into the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareSource {
+    Copy(PathBuf),
+    Generate { frame_id: i64 },
+}
+
 /// A built (or empty) selection package plus the eligibility split.
 /// A send resolved down to "what would travel", with nothing copied yet
 /// (transfer-prepare spec §3.2). Everything here comes from the catalog and a
@@ -2906,8 +2923,14 @@ pub(crate) struct PlannedSelection {
     /// Where the package WILL be staged, or `None` when nothing was eligible.
     pub(crate) pkg_dir: Option<PathBuf>,
     /// `(source, record)` per payload, each record's `xxh3` still empty — the
-    /// worker fills it from the read its copy already pays for.
-    pub(crate) records: Vec<(PathBuf, ManifestRecord)>,
+    /// worker fills it from the read its copy (or its generation) already pays
+    /// for.
+    pub(crate) records: Vec<(PrepareSource, ManifestRecord)>,
+    /// How the calibrated-lights mode wants its files generated. `None` for
+    /// every plan that only copies; a plan holding a
+    /// [`PrepareSource::Generate`] record must carry it, and the worker fails
+    /// such a plan rather than silently calibrating with defaults.
+    pub(crate) gen_opts: Option<CalibratedLightOptions>,
     /// Catalog rows whose `strong_hash` the worker may bank from that same read.
     pub(crate) bank: Vec<crate::api::sync_prepare::BankCandidate>,
     pub(crate) eligible: Vec<i64>,
@@ -3241,6 +3264,9 @@ fn selection_entries(
             source_path: PathBuf::from(&file.path),
             rel_path: assign_rel_path(&layout, frame_id, file, &mut used_by_dir),
             kind,
+            // A frame selection sends files that exist; only the frame-set
+            // send's calibrated-lights mode generates any.
+            generate: false,
         });
     }
 
@@ -3287,6 +3313,12 @@ fn selection_entries(
 ///   all: it carries the SOURCE light's `frame_meta` under its own fresh uuid,
 ///   with no analysis and no hash banking (the catalog row describes the source
 ///   file, not this one).
+///
+/// An entry marked [`PayloadEntry::generate`] does not exist yet, so its
+/// `source_path` — the raw light — is what gets stat'd: the existence check is
+/// the same eligibility gate (no light, nothing to calibrate) and its size is
+/// the byte ESTIMATE the row shows until the worker has written the real
+/// output. `gen_opts` is what that worker calibrates with.
 pub(crate) fn plan_selection_package(
     conn: &rusqlite::Connection,
     origin_device: &str,
@@ -3294,6 +3326,7 @@ pub(crate) fn plan_selection_package(
     input: SelectionInput,
     batch_name: Option<&str>,
     frame_set_id: Option<i64>,
+    gen_opts: Option<CalibratedLightOptions>,
 ) -> Result<PlannedSelection, ApiError> {
     // Load each referenced frame's snapshot once, indexed by frame id rather than
     // walked row-by-row: two entries may share one frame (a calibrated artifact
@@ -3320,7 +3353,7 @@ pub(crate) fn plan_selection_package(
     // the per-file failures below append to the same list.
     let mut ineligible: Vec<IneligibleFrame> = input.ineligible;
     let mut eligible: Vec<i64> = Vec::new();
-    let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::new();
+    let mut records: Vec<(PrepareSource, ManifestRecord)> = Vec::new();
     // Per-directory used-filename sets for collision suffixing (§D2). The caller
     // owns the directory; the filename is deduped within it here so no two
     // entries can overwrite each other inside the package.
@@ -3363,8 +3396,13 @@ pub(crate) fn plan_selection_package(
         };
         let byte_size = meta.len();
         // A calibrated artifact is NOT the file the catalog row describes, so
-        // neither its hash nor its analysis may be attributed to that row.
-        let is_catalog_file = entry.kind != PayloadKind::CalibratedLight;
+        // neither its hash nor its analysis may be attributed to that row. Nor
+        // is a payload that does not exist yet: the read the worker pays for is
+        // of the source, and banking that digest against a row whose file is
+        // the one being generated FROM would be a wrong `strong_hash`. Today
+        // the two conditions name the same entries; stated separately so a
+        // future generated kind cannot quietly land on the wrong side.
+        let is_catalog_file = entry.kind != PayloadKind::CalibratedLight && !entry.generate;
         let frame_meta = match serde_json::to_value(frame) {
             Ok(v) => v,
             Err(e) => {
@@ -3422,8 +3460,15 @@ pub(crate) fn plan_selection_package(
                 rel_path: rel_path.clone(),
             });
         }
+        let source = if entry.generate {
+            PrepareSource::Generate {
+                frame_id: entry.frame_id,
+            }
+        } else {
+            PrepareSource::Copy(path.to_path_buf())
+        };
         records.push((
-            path.to_path_buf(),
+            source,
             ManifestRecord {
                 v: MANIFEST_VERSION,
                 frame_uuid: frame_uuid.clone(),
@@ -3447,6 +3492,7 @@ pub(crate) fn plan_selection_package(
         return Ok(PlannedSelection {
             pkg_dir: None,
             records: Vec::new(),
+            gen_opts: None,
             bank: Vec::new(),
             eligible,
             ineligible,
@@ -3477,6 +3523,7 @@ pub(crate) fn plan_selection_package(
     Ok(PlannedSelection {
         pkg_dir: Some(packages_dir.join(uuid::Uuid::new_v4().to_string())),
         records,
+        gen_opts,
         bank,
         eligible,
         ineligible,
@@ -3517,6 +3564,9 @@ async fn build_and_enqueue_selection(
             input,
             batch_name,
             frame_set_id,
+            // A frame selection never generates, so it has nothing to
+            // calibrate with.
+            None,
         )?
     };
     let enqueued_count = planned.eligible.len() as u32;
@@ -3594,6 +3644,7 @@ async fn enqueue_planned(
             peer,
             pkg_dir,
             records: planned.records,
+            gen_opts: planned.gen_opts,
             bank: planned.bank,
             engine: Arc::clone(engine),
             emitter,
@@ -3689,16 +3740,19 @@ pub async fn enqueue_frame_set_send(
     flat_norm: bool,
     flat_norm_mode: FlatNormMode,
     params: LightCalParams,
+    hot_pixel_correction: bool,
+    debayer_osc: bool,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
-    // The command's own signature is unchanged; its three calibration
-    // preferences now travel as the generator's options bundle (the two new
-    // flags default until the send dialog offers them).
+    // The send dialog reads the same five light-calibration preferences the
+    // Export tab does, so a send and an export of one frame set produce the
+    // same files.
     let gen_opts = CalibratedLightOptions {
         flat_norm,
         flat_norm_mode,
         params,
-        ..Default::default()
+        hot_pixel_correction,
+        debayer_osc,
     };
     let entries =
         crate::api::frame_set_send::frame_set_entries(ctx, frame_set_id, mode, &gen_opts)?;
@@ -3743,6 +3797,9 @@ pub async fn enqueue_frame_set_send(
             },
             batch_name.as_deref(),
             Some(frame_set_id),
+            // Inert for every mode but calibrated-lights, which is the only one
+            // that plans a `Generate` record for the worker to use them on.
+            Some(gen_opts),
         )?
     };
     let enqueued_count = planned.eligible.len() as u32;
@@ -5784,6 +5841,7 @@ mod tests {
     /// staging pass the worker runs (`stage_records` + the same hash banking),
     /// rather than a test-local re-implementation of either.
     fn build_selection_package(
+        ctx: &ServiceContext,
         conn: &rusqlite::Connection,
         origin_device: &str,
         packages_dir: &Path,
@@ -5798,14 +5856,17 @@ mod tests {
             input,
             batch_name,
             frame_set_id,
+            None,
         )?;
         if let Some(dir) = planned.pkg_dir.clone() {
-            let flag = std::sync::atomic::AtomicBool::new(false);
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             crate::api::sync_prepare::stage_records(
+                ctx,
                 0,
                 [0u8; 32],
                 &dir,
                 &mut planned.records,
+                None,
                 None,
                 &flag,
             )
@@ -8290,6 +8351,7 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             build_selection_package(
+                &ctx,
                 &conn,
                 "origin-dev",
                 &pkg_root,
@@ -8377,6 +8439,7 @@ mod tests {
 
         let pkg_root = dir.join("packages");
         let built = build_selection_package(
+            &ctx,
             &conn,
             "origin-dev",
             &pkg_root,
@@ -8434,6 +8497,7 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             build_selection_package(
+                &ctx,
                 &conn,
                 "origin-dev",
                 &pkg_root,
@@ -8525,6 +8589,7 @@ mod tests {
         let db = db(ctx).unwrap();
         let conn = db.conn();
         build_selection_package(
+            ctx,
             &conn,
             "origin-dev",
             &pkg_root,
@@ -9044,6 +9109,7 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             build_selection_package(
+                &ctx,
                 &conn,
                 "origin-dev",
                 &pkg_root,
@@ -9167,6 +9233,7 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             build_selection_package(
+                &ctx,
                 &conn,
                 "origin-dev",
                 &pkg_root2,
@@ -9182,6 +9249,7 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             build_selection_package(
+                &ctx,
                 &conn,
                 "origin-dev",
                 &pkg_root2,
@@ -9260,6 +9328,7 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             let pkg_dir = build_selection_package(
+                &ctx,
                 &conn,
                 "origin-dev",
                 &pkg_root,
@@ -9902,12 +9971,14 @@ mod tests {
     /// (spec 2026-08-28 §3 step 5).
     #[test]
     fn build_selection_package_honours_payload_kinds() {
-        use crate::db::schema::init_db;
         use crate::fits_writer::write_fits_f32;
         use crate::package::PayloadKind;
-        let tmp = tempfile::tempdir().unwrap();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        // A file-backed catalog rather than an in-memory one: the staging pass
+        // the helper runs now takes a `ServiceContext` (it may have to calibrate
+        // a light out of the catalog it was planned from).
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
 
         // One raw light (frame 10), one master (frame 20), one calibrated
         // artifact of frame 10 that is NOT in the catalog.
@@ -9945,18 +10016,23 @@ mod tests {
                     source_path: light.clone(),
                     rel_path: "camera_X/lights/L_10.fits".into(),
                     kind: PayloadKind::RawFrame,
+                    generate: false,
                 },
                 PayloadEntry {
                     frame_id: 20,
                     source_path: master.clone(),
                     rel_path: "camera_X/DARKS_5/master_dark.fits".into(),
                     kind: PayloadKind::Master,
+                    generate: false,
                 },
+                // An artifact that already exists on disk — the pre-generated
+                // shape. The generated shape has its own test.
                 PayloadEntry {
                     frame_id: 10,
                     source_path: artifact.clone(),
                     rel_path: "camera_X/lights/c_L_10.fits".into(),
                     kind: PayloadKind::CalibratedLight,
+                    generate: false,
                 },
                 // A second raw frame: the shape a frame-set send produces for a
                 // shared calibration frame.
@@ -9965,6 +10041,7 @@ mod tests {
                     source_path: shared_dark.clone(),
                     rel_path: "camera_X/DARKS_5/D_0.fits".into(),
                     kind: PayloadKind::RawFrame,
+                    generate: false,
                 },
             ],
             ineligible: Vec::new(),
@@ -9973,6 +10050,7 @@ mod tests {
         };
         let packages = tmp.path().join("packages");
         let built = build_selection_package(
+            &ctx,
             &conn,
             "ab".repeat(32).as_str(),
             &packages,
@@ -10018,6 +10096,104 @@ mod tests {
         assert_eq!(banked, 3);
     }
 
+    /// An entry the composer marked `generate` is planned as work, not as a
+    /// copy: its record points at the FRAME to calibrate (the file does not
+    /// exist yet), it is stat'd against the raw light for eligibility and the
+    /// byte estimate, and it banks no hash — the read that will pay for it is
+    /// of the source, and its digest is not this artifact's.
+    #[test]
+    fn plan_marks_generate_records() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::package::PayloadKind;
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+
+        let light = tmp.path().join("L_10.fits");
+        let dark = tmp.path().join("D_0.fits");
+        for p in [&light, &dark] {
+            write_fits_f32(p, 4, 4, 1, &[1.0f32; 16], &[]).unwrap();
+        }
+        let insert = |file_id: i64, frame_id: i64, path: &std::path::Path, imagetyp: &str| {
+            let meta = std::fs::metadata(path).unwrap();
+            let mtime: chrono::DateTime<chrono::Utc> = meta.modified().unwrap().into();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, ?4, ?5, 'FITS')",
+                rusqlite::params![file_id, path.to_string_lossy(), path.file_name().unwrap().to_string_lossy(), meta.len() as i64, mtime.to_rfc3339()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, uuid) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![frame_id, file_id, imagetyp, format!("uuid-{frame_id}")],
+            )
+            .unwrap();
+        };
+        insert(1, 10, &light, "Light");
+        insert(2, 30, &dark, "Dark");
+
+        let input = SelectionInput {
+            entries: vec![
+                PayloadEntry {
+                    frame_id: 10,
+                    // The RAW light: the output does not exist anywhere yet.
+                    source_path: light.clone(),
+                    rel_path: "camera_X/lights/c_L_10.fits".into(),
+                    kind: PayloadKind::CalibratedLight,
+                    generate: true,
+                },
+                PayloadEntry {
+                    frame_id: 30,
+                    source_path: dark.clone(),
+                    rel_path: "camera_X/DARKS_5/D_0.fits".into(),
+                    kind: PayloadKind::RawFrame,
+                    generate: false,
+                },
+            ],
+            ineligible: Vec::new(),
+            ancestor: None,
+            total: 2,
+        };
+        let opts = CalibratedLightOptions::default();
+        let planned = plan_selection_package(
+            &conn,
+            "ab".repeat(32).as_str(),
+            &tmp.path().join("packages"),
+            input,
+            None,
+            None,
+            Some(opts.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(planned.eligible, vec![10, 30]);
+        assert!(planned.ineligible.is_empty());
+        assert_eq!(planned.gen_opts.as_ref(), Some(&opts));
+        let by_rel: HashMap<&str, &(PrepareSource, ManifestRecord)> = planned
+            .records
+            .iter()
+            .map(|r| (r.1.rel_path.as_str(), r))
+            .collect();
+        let cal = by_rel["camera_X/lights/c_L_10.fits"];
+        assert_eq!(cal.0, PrepareSource::Generate { frame_id: 10 });
+        assert_eq!(
+            cal.1.byte_size,
+            std::fs::metadata(&light).unwrap().len(),
+            "the raw light's size is the estimate until the worker writes the real one"
+        );
+        assert_eq!(
+            by_rel["camera_X/DARKS_5/D_0.fits"].0,
+            PrepareSource::Copy(dark.clone())
+        );
+        assert_eq!(
+            planned
+                .bank
+                .iter()
+                .map(|c| c.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["camera_X/DARKS_5/D_0.fits"],
+            "a generated payload banks nothing"
+        );
+    }
+
     /// `selection_entries`' kind classification — the one behavior change on the
     /// otherwise behavior-preserving selection path. The signal is the CATALOG's
     /// `frames.is_master`, which the scanner sets from
@@ -10026,12 +10202,12 @@ mod tests {
     /// `IMAGETYP = Dark` and ship it as an ordinary `RawFrame`.
     #[test]
     fn selection_entries_labels_masters_by_the_catalog_signal() {
-        use crate::db::schema::init_db;
         use crate::fits_writer::write_fits_f32;
         use crate::package::PayloadKind;
-        let tmp = tempfile::tempdir().unwrap();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        // File-backed for the same reason as the kinds test above.
+        let (tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
 
         let light = tmp.path().join("L_10.fits");
         let header_master = tmp.path().join("master_bias.fits");
@@ -10080,6 +10256,7 @@ mod tests {
         // The labels survive into the written package: all three frames are
         // eligible and the manifest carries the kind each entry was given.
         let built = build_selection_package(
+            &ctx,
             &conn,
             "ab".repeat(32).as_str(),
             &tmp.path().join("packages"),

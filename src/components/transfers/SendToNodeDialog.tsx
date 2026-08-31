@@ -20,6 +20,8 @@ import {
   readFlatNormPref,
   readFlatNormModePref,
   readLightCalParamsPref,
+  readHotPixelPref,
+  readDebayerPref,
 } from '../export/lightCalPrefs';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type { ExportMode } from '../../types/export';
@@ -154,9 +156,10 @@ export function SendToNodeDialog({
     const checkedIds = [...checked];
     if (checkedIds.length === 0 || itemCount === 0 || sending) return;
 
-    // A frame-set send passes the same light-calibration preferences the Export
+    // A frame-set send passes ALL FIVE light-calibration preferences the Export
     // tab reads — the options the calibrated-lights mode generates its files
-    // with (the readiness gate itself no longer takes any).
+    // with (the readiness gate itself no longer takes any). The transfer
+    // generates the same bytes an export of this set would.
     const results =
       target.kind === 'frames'
         ? await sendSelection(target.frameIds, checkedIds, {
@@ -168,6 +171,8 @@ export function SendToNodeDialog({
             flatNorm: readFlatNormPref(),
             flatNormMode: readFlatNormModePref(),
             params: readLightCalParamsPref(),
+            hotPixel: readHotPixelPref(),
+            debayer: readDebayerPref(),
           });
 
     // --- Aggregate the per-destination outcomes into one honest notification. ---

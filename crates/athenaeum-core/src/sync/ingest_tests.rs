@@ -747,12 +747,18 @@ fn calibrated_package_from_payload(
     (pkg_dir.to_path_buf(), announce)
 }
 
+/// Land-only (calibrated-export v2 §8): a calibrated artifact is written to
+/// disk and recorded in the receipts/history, and NOTHING else — no
+/// `files`/`frames` row, and no tracking row either. The receiver used to run
+/// the scanner's adopt path here; light calibration is an export product now,
+/// so the receiver has nothing to track it with.
 #[test]
-fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
+fn ingest_calibrated_light_lands_without_tracking() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
     let conn = catalog_conn();
-    // The receiver already holds the source light (uuid src-1).
+    // The receiver already holds the SOURCE light (uuid src-1) — the shape that
+    // used to trigger the adopt, so this pins that it no longer does.
     let (src_pkg, src_ann) = build_fixture_package(
         tmp.path(),
         "src-1",
@@ -792,28 +798,18 @@ fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
         "artifact never becomes a frame"
     );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
-    let landed: String = conn
-        .query_row(
-            "SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        landed.ends_with("camera_testcam/lights/c_L_0001.fits"),
-        "{landed}"
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
+        0,
+        "the receiver tracks nothing for an artifact"
     );
-    assert!(Path::new(&landed).exists());
-    let frame_id: Option<i64> = conn
-        .query_row(
-            "SELECT frame_id FROM light_calibrations WHERE source_uuid = 'src-1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let landed = walkdir_files(&incoming)
+        .into_iter()
+        .find(|p| p.file_name().unwrap() == std::ffi::OsStr::new("c_L_0001.fits"))
+        .expect("the artifact landed");
     assert!(
-        frame_id.is_some(),
-        "adopted against the cataloged source light"
+        landed.to_string_lossy().contains("camera_testcam"),
+        "landed under its package rel_path: {landed:?}"
     );
 
     // Re-send: duplicate by content hash, one file on disk. A fresh announce
@@ -846,46 +842,18 @@ fn calibrated_light_lands_without_catalog_rows_and_adopts_when_source_known() {
         })
         .collect();
     assert_eq!(files.len(), 1, "{files:?}");
-    assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
-        1,
-        "a duplicate never mints a second tracking row"
-    );
 }
 
-/// The already-tracked branch (spec §4.1): a SECOND artifact for a source the
-/// receiver already tracks, with different bytes and a different filename, so
-/// neither the content-hash receipt dedup nor the package replay guard fires.
-/// The receiver's existing artifact wins — the landed copy is dropped and the
-/// record reports Duplicate, mirroring the scanner's own duplicate branch
-/// (non-destructive; nothing on the receiver is overwritten).
-///
-/// This is also the v1 LIMITATION it pins: re-sending a RE-calibrated light does
-/// not replace the receiver's tracked artifact.
+/// A RE-calibrated light (same source, different bytes) now LANDS beside the
+/// first one instead of being dropped as an already-tracked duplicate. That
+/// branch existed only because the receiver kept a tracking row per source;
+/// with nothing to consult, the honest answer is to keep both files and let the
+/// two filenames tell them apart (identical bytes are still deduped by hash).
 #[test]
-fn calibrated_light_already_tracked_is_dropped_as_duplicate() {
+fn calibrated_light_recalibrated_resend_lands_beside_the_first() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
     let conn = catalog_conn();
-    // The receiver holds the source light and already tracks an artifact for it.
-    let (src_pkg, src_ann) = build_fixture_package(
-        tmp.path(),
-        "src-1",
-        "L_0001.fits",
-        "M31",
-        "2026-01-16T10:00:00.000Z",
-    );
-    ingest_package(
-        IngestConn::Borrowed(&conn),
-        &incoming,
-        &src_pkg,
-        &src_ann,
-        PEER_HEX,
-        &src_ann.package_id.0,
-        None,
-        None,
-    )
-    .unwrap();
     let (pkg, ann) = build_calibrated_package(tmp.path(), "src-1", "c_L_0001.fits", true);
     ingest_package(
         IngestConn::Borrowed(&conn),
@@ -898,18 +866,11 @@ fn calibrated_light_already_tracked_is_dropped_as_duplicate() {
         None,
     )
     .unwrap();
-    let tracked: String = conn
-        .query_row(
-            "SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
 
     // Same identity, different bytes (ATH_CVER = 2) and a different filename.
     let (pkg2, ann2) = build_calibrated_package_v(tmp.path(), "src-1", "c_L_0001_v2.fits", true, 2);
     // Guard the route: identical bytes would be swallowed by the content-hash
-    // receipt dedup above, and this test would prove nothing about adoption.
+    // receipt dedup, and this test would prove nothing about the second landing.
     assert_ne!(
         package::read_manifest(&pkg).unwrap()[0].xxh3,
         package::read_manifest(&pkg2).unwrap()[0].xxh3,
@@ -926,7 +887,7 @@ fn calibrated_light_already_tracked_is_dropped_as_duplicate() {
         None,
     )
     .unwrap();
-    assert_eq!(outcome.duplicate, 1, "{outcome:?}");
+    assert_eq!(outcome.ingested, 1, "{outcome:?}");
     let files: Vec<_> = walkdir_files(&incoming)
         .into_iter()
         .filter(|p| {
@@ -936,24 +897,19 @@ fn calibrated_light_already_tracked_is_dropped_as_duplicate() {
                 .starts_with("c_L_0001")
         })
         .collect();
-    assert_eq!(files.len(), 1, "the landed copy is dropped: {files:?}");
+    assert_eq!(files.len(), 2, "both artifacts are kept: {files:?}");
     assert_eq!(
         count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
-        1,
-        "the existing artifact wins; no second row"
+        0,
+        "still nothing tracked"
     );
-    let still: String = conn
-        .query_row(
-            "SELECT output_path FROM light_calibrations WHERE source_uuid = 'src-1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(still, tracked, "the tracking row is left untouched");
 }
 
+/// The receiver never resolves an artifact's source frame, so a source it has
+/// never heard of changes nothing: the file lands exactly as it would beside a
+/// known one.
 #[test]
-fn calibrated_light_without_source_lands_deferred() {
+fn calibrated_light_without_a_known_source_still_lands() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
     let conn = catalog_conn();
@@ -973,7 +929,7 @@ fn calibrated_light_without_source_lands_deferred() {
     assert_eq!(
         count(&conn, "SELECT COUNT(*) FROM light_calibrations"),
         0,
-        "no source → no row (deferred)"
+        "an artifact is never tracked, known source or not"
     );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 0);
     assert_eq!(walkdir_files(&incoming).len(), 1, "file kept on disk");
@@ -1022,42 +978,10 @@ fn calibrated_light_with_unreadable_header_is_rejected_with_the_cause() {
     assert!(walkdir_files(&incoming).is_empty(), "nothing left behind");
 }
 
-/// An adopt failure (spec §8) is a Rejected receipt AND the landed copy goes
-/// with it — leaving it would strand an untracked artifact that a later scan
-/// re-adopts or `_2`-duplicates. Provoked by dropping `light_calibrations` so
-/// the very first query inside `reconcile_calibrated_light` errors.
-#[test]
-fn calibrated_light_adopt_failure_removes_the_landed_copy() {
-    let tmp = TempDir::new().unwrap();
-    let incoming = tmp.path().join("incoming");
-    let conn = catalog_conn();
-    let (pkg, ann) = build_calibrated_package(tmp.path(), "src-5", "c_L_0005.fits", true);
-    conn.execute("DROP TABLE light_calibrations", []).unwrap();
-
-    let outcome = ingest_package(
-        IngestConn::Borrowed(&conn),
-        &incoming,
-        &pkg,
-        &ann,
-        PEER_HEX,
-        &ann.package_id.0,
-        None,
-        None,
-    )
-    .unwrap();
-    assert_eq!(outcome.rejected, 1, "{outcome:?}");
-    assert!(
-        matches!(&outcome.receipts[0].outcome, ReceiptOutcome::Rejected(r)
-            if r.contains("adopt calibrated light")),
-        "{:?}",
-        outcome.receipts[0].outcome
-    );
-    assert!(
-        walkdir_files(&incoming).is_empty(),
-        "the landed artifact is removed when adopt fails"
-    );
-}
-
+/// The receiver still refuses a payload that is not a calibrated light at all,
+/// even though it no longer tracks one: a mislabeled `c_*.fits` landing in the
+/// incoming tree would be a plain FITS the next scan catalogs as an ordinary
+/// frame (the scanner only skips files carrying the identity cards).
 #[test]
 fn calibrated_light_payload_without_identity_is_rejected_and_removed() {
     let tmp = TempDir::new().unwrap();

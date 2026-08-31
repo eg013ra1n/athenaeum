@@ -61,7 +61,12 @@ pub struct GeneratedLight {
     /// [`crate::calibration_library::cosmetic`] on why a degenerate dark
     /// yields an empty map instead of an error.
     pub hot_pixels_replaced: u64,
-    /// xxh3 of the written file.
+    /// The catalog's SAMPLING xxh3 of the written file
+    /// (`duplicates::compute_xxhash` — three 512 KB windows), the same digest
+    /// the scanner stores for a file. NOT the full-file digest a package
+    /// manifest carries: a caller putting this artifact on the wire has to
+    /// compute `package::xxh3_full_file` itself, or the receiver's own
+    /// verification will reject the payload.
     pub output_hash: String,
     /// Size of the written file, measured on disk after the write.
     pub byte_size: u64,

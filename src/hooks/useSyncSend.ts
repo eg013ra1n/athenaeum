@@ -74,6 +74,10 @@ export interface FrameSetSendOptions {
   flatNorm: boolean;
   flatNormMode: FlatNormMode;
   params: LightCalParams;
+  /** Cosmetic hot-pixel correction from the master dark (default ON). */
+  hotPixel: boolean;
+  /** Debayer a CFA light to planar RGB (default ON; inert for mono). */
+  debayer: boolean;
 }
 
 export interface UseSyncSend {
@@ -170,6 +174,8 @@ export function useSyncSend(): UseSyncSend {
                 flatNorm: opts.flatNorm,
                 flatNormMode: opts.flatNormMode,
                 params: opts.params,
+                hotPixel: opts.hotPixel,
+                debayer: opts.debayer,
               });
               return { deviceId, result };
             } catch (err) {

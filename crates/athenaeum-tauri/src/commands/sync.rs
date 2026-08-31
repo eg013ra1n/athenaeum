@@ -151,6 +151,8 @@ pub async fn enqueue_frame_set_send(
     flat_norm: Option<bool>,
     flat_norm_mode: Option<FlatNormMode>,
     params: Option<LightCalParams>,
+    hot_pixel: Option<bool>,
+    debayer: Option<bool>,
 ) -> Result<EnqueueSelectionResult, String> {
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
     let dest = api::resolve_dest_node(&state.ctx, &destination_device_id)
@@ -168,6 +170,10 @@ pub async fn enqueue_frame_set_send(
         flat_norm.unwrap_or(true),
         flat_norm_mode.unwrap_or(FlatNormMode::CentralThird),
         params.unwrap_or_default(),
+        // Both default ON, like every other calibration toggle: an older
+        // frontend that sends neither gets the recommended behavior.
+        hot_pixel.unwrap_or(true),
+        debayer.unwrap_or(true),
         Some(emitter),
     )
     .await

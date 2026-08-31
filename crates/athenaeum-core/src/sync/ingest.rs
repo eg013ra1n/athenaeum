@@ -458,12 +458,11 @@ fn process_frame(
         return Ok(FrameVerdict { receipt, history_outcome: "rejected", inserted: None });
     }
 
-    // 1b. A calibrated-light artifact is NOT catalog material (frame-set-send
-    // design 2026-08-28 §4.1 / D4): it lands on disk and is reconciled against
-    // `light_calibrations`, never inserted into `files`/`frames`. Branch before
-    // the snapshot deserialization below — for this kind `frame_meta` describes
-    // the SOURCE light, not the payload, so none of the frame-shaped steps
-    // (uuid dedup, catalog insert) apply.
+    // 1b. A calibrated-light artifact is NOT catalog material (calibrated-export
+    // v2 §8): it lands on disk and is never inserted into `files`/`frames`, nor
+    // tracked anywhere else. Branch before the snapshot deserialization below —
+    // for this kind `frame_meta` describes the SOURCE light, not the payload, so
+    // none of the frame-shaped steps (uuid dedup, catalog insert) apply.
     if record.payload_kind == PayloadKind::CalibratedLight {
         return process_calibrated_light(conn, landing_base, &payload, record, package_id, history_key, peer_device, started_at, batch_name);
     }
@@ -582,9 +581,16 @@ fn process_frame(
     })
 }
 
-/// A calibrated-light artifact (spec 2026-08-28 §4.1): land it, never catalog it,
-/// and run the scanner's own adopt path so the receiver's `light_calibrations`
-/// learns about it when the source light is cataloged.
+/// A calibrated-light artifact: land it, and nothing else (calibrated-export v2
+/// §8). It is a product, not a catalog file — no `files`/`frames` row, and since
+/// light calibration became an export stage there is no tracking table to adopt
+/// it into either. The receipt and the history row are the whole record of it;
+/// the scanner's own skip keeps a later scan from cataloging it.
+///
+/// The identity check below survives the adopt it used to feed: a payload
+/// without the calibrated-light cards is not what the manifest says it is, and
+/// landing it would put a plain FITS in the incoming tree for the next scan to
+/// catalog as an ordinary frame.
 #[allow(clippy::too_many_arguments)]
 fn process_calibrated_light(
     conn: &Connection,
@@ -643,49 +649,9 @@ fn process_calibrated_light(
         }
     };
     let keys = parse_stored_header_keys(FileFormat::FITS, &text);
-    let Some(identity) = calibrated_light_identity(&keys) else {
+    if calibrated_light_identity(&keys).is_none() {
         tracing::error!(frame_uuid = %record.frame_uuid, path = %landed_str, "sync ingest: CalibratedLight payload lacks identity cards; rejecting");
         return reject("payload is not a calibrated light".to_string());
-    };
-
-    // Log field only (the scanner's `root_id`): the designated incoming root's
-    // id when there is one, 0 otherwise.
-    let root_id = match crate::db::scan_root_id_of_kind(conn, "sync_incoming") {
-        Ok(Some(id)) => id,
-        Ok(None) => 0,
-        Err(e) => {
-            tracing::warn!(error = %e, "sync ingest: sync_incoming root lookup failed; root_id = 0");
-            0
-        }
-    };
-    let mut dups = Vec::new();
-    if let Err(e) = crate::scanner::reconcile_calibrated_light(conn, &landed, &landed_str, &identity, root_id, &mut dups) {
-        // Spec §8: an adopt failure is a Rejected receipt (the caller turns this
-        // Err into one) — and the landed copy goes with it, exactly as the
-        // RawFrame path removes its landing on a transaction failure. Leaving it
-        // would strand an untracked artifact that a later scan re-adopts or
-        // `_2`-duplicates.
-        tracing::error!(
-            frame_uuid = %record.frame_uuid,
-            path = %landed_str,
-            error = %format!("{e:#}"),
-            "sync ingest: calibrated light adopt failed; removing landed copy"
-        );
-        if let Err(rm) = std::fs::remove_file(&landed) {
-            tracing::warn!(path = %landed_str, error = %rm, "sync ingest: failed to remove landed artifact after adopt failure");
-        }
-        return Err(e).with_context(|| format!("adopt calibrated light {}", record.rel_path));
-    }
-    if !dups.is_empty() {
-        // The receiver already tracks this artifact at another path: keep that
-        // copy, drop the one we just landed, report Duplicate.
-        tracing::info!(frame_uuid = %record.frame_uuid, kept = %dups[0].kept_path, "sync ingest: calibrated light already tracked; dropping landed copy");
-        if let Err(e) = std::fs::remove_file(&landed) {
-            tracing::warn!(path = %landed_str, error = %e, "sync ingest: failed to remove duplicate artifact");
-        }
-        let receipt = duplicate_receipt(record);
-        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
-        return Ok(FrameVerdict { receipt, history_outcome: "duplicate", inserted: None });
     }
 
     let receipt = ingested_receipt(record);

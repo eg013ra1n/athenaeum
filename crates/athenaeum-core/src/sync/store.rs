@@ -2376,6 +2376,40 @@ pub fn cancel_outbound_row(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Correct one outbound file's `byte_size` after the fact, keyed on
+/// `(outbound_id, rel_path)`.
+///
+/// Exists for ONE producer: a calibrated light is generated during preparation,
+/// so the row written at enqueue time could only carry the raw light's size as
+/// an estimate. Everything else knows its size before the row exists and must
+/// never rewrite it — a size that moves under a transfer in flight would
+/// desync the announce from the manifest. Deliberately does NOT touch
+/// `updated_at`/`state`: this is a correction to the plan, not a transition.
+pub fn update_outbound_file_size(
+    conn: &Connection,
+    outbound_id: i64,
+    rel_path: &str,
+    byte_size: u64,
+) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE sync_outbound_files SET byte_size = ?1
+             WHERE outbound_id = ?2 AND rel_path = ?3",
+            params![byte_size as i64, outbound_id, rel_path],
+        )
+        .with_context(|| format!("update outbound file size for {outbound_id}/{rel_path}"))?;
+    if changed == 0 {
+        // The package-shape tests stage without a row at all; a real send always
+        // has one. Same treatment as `set_outbound_file_state`'s no-op.
+        tracing::debug!(
+            outbound_id,
+            rel_path,
+            "update_outbound_file_size matched 0 rows"
+        );
+    }
+    Ok(())
+}
+
 /// Settle every not-yet-`done` per-file row of an OUTBOUND batch to terminal
 /// `done` carrying `outcome` in ONE UPDATE — the outbound twin of
 /// [`settle_unsettled_inbound_files`], matching the engine's per-row terminal
@@ -3084,6 +3118,19 @@ impl CatalogSyncStore {
             layout,
             OutboundState::Preparing,
         )
+    }
+
+    /// Correct one generated payload's `byte_size` after preparation wrote it —
+    /// see [`update_outbound_file_size`] for why only that one producer may.
+    /// Inherent (not on [`SyncStore`]): only the preparation worker calls it.
+    pub fn update_outbound_file_size(
+        &self,
+        outbound_id: i64,
+        rel_path: &str,
+        byte_size: u64,
+    ) -> Result<()> {
+        let conn = self.lock_conn();
+        update_outbound_file_size(&conn, outbound_id, rel_path, byte_size)
     }
 
     /// Close every unfinished per-file row of a batch the engine never got —

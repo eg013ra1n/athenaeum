@@ -18,6 +18,8 @@ use crate::api::lights::{check_mode_ready, get_export_readiness};
 #[cfg(feature = "render")]
 use crate::api::{db, ApiError};
 #[cfg(feature = "render")]
+use crate::export::file_organizer::PlacementSource;
+#[cfg(feature = "render")]
 use crate::export::models::CalibratedLightOptions;
 #[cfg(feature = "render")]
 use crate::export::models::{CalibrationSetInfo, ExportData, ExportMode};
@@ -34,6 +36,12 @@ pub struct PayloadEntry {
     pub source_path: PathBuf,
     pub rel_path: String,
     pub kind: PayloadKind,
+    /// `true` when the package file does not exist yet and the preparation
+    /// worker must GENERATE it from `source_path` (calibrated-lights sends —
+    /// `source_path` is then the raw light, and its size is only the estimate
+    /// the plan reports until the real output has been written). Every other
+    /// producer copies, so this is `false` for them.
+    pub generate: bool,
 }
 
 /// The export pipeline's file list for one frame set under `mode`, as payload
@@ -76,6 +84,11 @@ pub fn frame_set_entries(
                 _ if masters.contains(&p.frame_id) => PayloadKind::Master,
                 _ => PayloadKind::RawFrame,
             };
+            // The transform's own verdict, read off the placement rather than
+            // re-derived from `mode`: the ONE decision that a file is
+            // calibrated into place lives in `PlacementSource`, and the export
+            // executor and the preparation worker must act on the same one.
+            let generate = matches!(p.source, PlacementSource::CalibrateLight { .. });
             PayloadEntry {
                 frame_id: p.frame_id,
                 source_path: PathBuf::from(&p.file_path),
@@ -85,6 +98,7 @@ pub fn frame_set_entries(
                     format!("{}/{}", p.rel_dir, p.filename)
                 },
                 kind,
+                generate,
             }
         })
         .collect::<Vec<_>>();
@@ -253,9 +267,14 @@ mod tests {
             .iter()
             .all(|e| e.kind == PayloadKind::RawFrame
                 && e.rel_path.starts_with("camera_testcam/lights/")));
+        assert!(
+            lights.iter().all(|e| !e.generate),
+            "every other mode copies files that already exist"
+        );
 
         let raw = frame_set_entries(&ctx, 1, ExportMode::RawWithCalibrationSets, &opts()).unwrap();
         assert_eq!(raw.len(), 2 + 2 + 1);
+        assert!(raw.iter().all(|e| !e.generate));
         assert_eq!(
             raw.iter().filter(|e| e.kind == PayloadKind::Master).count(),
             1
@@ -311,12 +330,16 @@ mod tests {
         }
 
         // No tracking table, no pre-generated artifact: the transform MARKS each
-        // light and names its output. `source_path` is still the raw light —
-        // generating the payload from it belongs to the send-generation task,
-        // which is what turns these entries into calibrated bytes on the wire.
+        // light and names its output. `source_path` is still the raw light, and
+        // `generate` is what tells the preparation worker to calibrate it into
+        // the package instead of copying those raw bytes under the `c_` name.
         let cal = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap();
         assert_eq!(cal.len(), 2);
         assert!(cal.iter().all(|e| e.kind == PayloadKind::CalibratedLight));
+        assert!(
+            cal.iter().all(|e| e.generate),
+            "a calibrated light is generated, never copied: {cal:?}"
+        );
         assert!(
             cal.iter()
                 .any(|e| e.rel_path == "camera_testcam/lights/c_L_10.fits"

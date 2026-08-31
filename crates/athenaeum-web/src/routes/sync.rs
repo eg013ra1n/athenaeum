@@ -204,6 +204,13 @@ pub struct EnqueueFrameSetSendArgs {
     pub flat_norm_mode: FlatNormMode,
     #[serde(default)]
     pub params: LightCalParams,
+    /// Cosmetic hot-pixel correction from the master dark. Default ON, like the
+    /// generator's own option.
+    #[serde(default = "default_true")]
+    pub hot_pixel: bool,
+    /// Debayer a CFA light to planar RGB. Default ON; inert for mono frames.
+    #[serde(default = "default_true")]
+    pub debayer: bool,
 }
 
 fn default_true() -> bool {
@@ -233,6 +240,8 @@ pub async fn enqueue_frame_set_send(
         args.flat_norm,
         args.flat_norm_mode,
         args.params,
+        args.hot_pixel,
+        args.debayer,
         Some(emitter),
     )
     .await
