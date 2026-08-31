@@ -16,6 +16,19 @@
 //! standard-deviation estimate of a normal distribution, so `HOT_SIGMA` reads
 //! as sigmas.
 //!
+//! **Two refusals guard that threshold, because over-flagging is destructive
+//! and skipping is not.** Every mapped pixel gets median-filtered away, so a
+//! map that is wrong in the direction of "too many" silently smooths real
+//! signal out of the frame; a map that is empty merely leaves the frame as it
+//! was. So: a MAD of exactly zero yields no map at all (it means over half the
+//! plane reads the same value — a heavily stacked integer-BITPIX master dark
+//! whose read noise quantizes to whole ADU does this routinely, and there is
+//! no spread left to measure sigmas against), and a map flagging more than
+//! [`MAX_HOT_FRACTION`] of the plane is thrown away whole. Neither case can be
+//! rescued by clamping the threshold to something small: `median + ε` on a
+//! quantized dark flags every pixel one ADU above the median, which is a large
+//! fraction of the sensor.
+//!
 //! **Replacement is a neighbourhood median, and the neighbourhood is
 //! colour-aware.** On a mono frame the eight pixels of the 3x3 window measure
 //! the same thing as the centre. On a mosaic they do not: four of them carry a
@@ -42,16 +55,14 @@ pub const HOT_SIGMA: f64 = 10.0;
 /// deviation of a normal distribution.
 const MAD_TO_SIGMA: f64 = 1.4826;
 
-/// Floor on the scaled MAD, in the dark's own units.
+/// Largest fraction of the plane a map may flag before it is refused whole.
 ///
-/// A synthetic or heavily processed dark can have a MAD of exactly zero (every
-/// pixel identical), which collapses the threshold to `value > median` — an
-/// equality comparison on floats that would flag every pixel a hair above the
-/// median, or none, on rounding alone. The floor keeps the comparison strictly
-/// above the median so a uniform plane yields an empty map. It is orders of
-/// magnitude below any real dark's noise (which is at least fractions of an
-/// ADU), so on real data it never binds.
-const SPREAD_FLOOR: f64 = 1e-6;
+/// A real sensor's hot pixels are a small defect population — a fraction of a
+/// percent. A map covering a large slice of the frame is not a hot-pixel map,
+/// it is a sign the statistics were degenerate, and applying it would median-
+/// filter that whole slice of real signal away. 5 % is far above any plausible
+/// defect count and far below the damage threshold.
+const MAX_HOT_FRACTION: f64 = 0.05;
 
 /// Which pixels of one master dark read hot, as row-major indices into a
 /// `width * height` plane, ascending.
@@ -83,6 +94,11 @@ impl HotPixelMap {
 
 /// Read a master dark's full plane and flag every pixel reading above
 /// `median + HOT_SIGMA · 1.4826 · MAD`.
+///
+/// Returns an EMPTY map — never an error — for the three degenerate cases a
+/// dark can present: a MAD of zero, a non-finite threshold, and a result over
+/// [`MAX_HOT_FRACTION`] of the plane. All three are logged; see the module docs
+/// for why refusing beats correcting on a threshold that cannot be trusted.
 ///
 /// The plane is band-streamed in (bounded working set) but the statistics need
 /// the whole distribution, so one plane plus one scratch copy is the memory
@@ -116,7 +132,27 @@ pub fn hot_pixel_map_from_dark(
     let mad = median_of_sorted(&work);
     drop(work);
 
-    let threshold = median + HOT_SIGMA * (MAD_TO_SIGMA * mad).max(SPREAD_FLOOR);
+    let empty = || HotPixelMap {
+        width,
+        height,
+        indices: Vec::new(),
+    };
+
+    if mad == 0.0 {
+        // More than half the plane reads exactly the median — the signature of
+        // a stacked integer-BITPIX master dark whose noise quantizes to whole
+        // ADU, not of a broken file. There is no spread to measure sigmas
+        // against, and any small substitute threshold would flag every pixel
+        // one ADU high, i.e. a large fraction of the sensor. No map.
+        tracing::debug!(
+            path = %dark_path.display(),
+            median,
+            "zero mad in master dark — no pixels mapped"
+        );
+        return Ok(empty());
+    }
+
+    let threshold = median + HOT_SIGMA * MAD_TO_SIGMA * mad;
     if !threshold.is_finite() {
         // Reachable only on a dark whose median is NaN or infinite (a broken
         // or mostly-NaN file). Every comparison against it would be false, so
@@ -128,11 +164,7 @@ pub fn hot_pixel_map_from_dark(
             threshold,
             "hot-pixel threshold not finite — no pixels mapped"
         );
-        return Ok(HotPixelMap {
-            width,
-            height,
-            indices: Vec::new(),
-        });
+        return Ok(empty());
     }
 
     // Ascending by construction: a row-major scan visits indices in order.
@@ -142,6 +174,21 @@ pub fn hot_pixel_map_from_dark(
         .filter(|(_, &v)| (v as f64) > threshold)
         .map(|(i, _)| i as u32)
         .collect();
+
+    let total = width * height;
+    if indices.len() as f64 > MAX_HOT_FRACTION * total as f64 {
+        // Not a defect population. Whatever produced this — a bimodal dark, a
+        // gradient, a file that is not really a dark — applying it would
+        // median-filter that share of every frame. Refusing costs the run its
+        // cosmetic correction; applying it would cost real signal.
+        tracing::warn!(
+            path = %dark_path.display(),
+            count = indices.len(),
+            total,
+            "hot-pixel map exceeds the safety cap — no pixels mapped"
+        );
+        return Ok(empty());
+    }
 
     tracing::debug!(
         path = %dark_path.display(),
@@ -315,21 +362,83 @@ mod tests {
         data
     }
 
-    /// A dark whose only outliers are two injected spikes maps exactly those
-    /// two pixels — no neighbours dragged in, no off-by-one on the index.
+    /// A dark with a real spread maps exactly the pixels above
+    /// `median + HOT_SIGMA · 1.4826 · MAD`, at the right indices.
+    ///
+    /// The fixture is built so the arithmetic is pinned from BOTH sides rather
+    /// than merely separating an obvious spike from an obvious background.
+    /// 125 pixels alternate 300.0/302.0 (63 low, 62 high), then three probes:
+    ///
+    /// - sorted, elements 63 and 64 are both 302.0 → `median = 302.0`;
+    /// - the deviations are 63 twos, 62 zeros and the three probes, whose
+    ///   elements 63 and 64 are both 2.0 → `MAD = 2.0`;
+    /// - so `threshold = 302 + 10 · 1.4826 · 2 = 331.652`.
+    ///
+    /// Probe 327.0 sits below that and must NOT be flagged — it is above
+    /// `median + 10 · MAD` (322), so dropping the 1.4826 factor flags it and
+    /// fails the test. Probe 336.0 sits just above and MUST be flagged — a
+    /// sigma of 12 would put the threshold at 337.6 and miss it. The threshold
+    /// is therefore bracketed to (327, 336].
     #[test]
     fn map_flags_exactly_the_spikes() {
+        let dir = tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let mut data: Vec<f32> = (0..125)
+            .map(|i| if i % 2 == 0 { 300.0 } else { 302.0 })
+            .collect();
+        data.push(327.0); // idx 125 — below the threshold
+        data.push(336.0); // idx 126 — above it
+        data.push(5000.0); // idx 127 — the obvious spike
+        assert_eq!(data.len(), w * h);
+        let path = write_plane(dir.path(), "dark.fits", w, h, &data);
+
+        let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
+        assert!(!map.is_empty());
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.indices, vec![126u32, 127u32]);
+    }
+
+    /// A dark whose background is a single repeated value has MAD 0 even with
+    /// obvious spikes in it — over half the plane equals the median. That is
+    /// what a stacked integer-BITPIX master dark looks like, so the answer is
+    /// no map rather than a substitute threshold that would flag every pixel
+    /// one step above the median. The spikes go uncorrected; nothing is
+    /// damaged.
+    #[test]
+    fn flat_background_with_spikes_is_refused() {
         let dir = tempdir().unwrap();
         let (w, h) = (16usize, 8usize);
         let mut data = vec![300.0f32; w * h];
         data[5] = 5000.0;
         data[100] = 5000.0;
-        let path = write_plane(dir.path(), "dark.fits", w, h, &data);
+        let path = write_plane(dir.path(), "flat_bg.fits", w, h, &data);
 
         let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
-        assert_eq!(map.len(), 2, "exactly the two spikes");
-        assert!(!map.is_empty());
-        assert_eq!(map.indices, vec![5u32, 100u32]);
+        assert!(map.is_empty(), "zero MAD must not produce a map");
+    }
+
+    /// A map covering more than 5 % of the plane is not a defect population.
+    /// Applying it would median-filter that share of every frame away, so it is
+    /// refused whole — even though the statistics here are perfectly
+    /// well-formed (median 302.0, MAD 2.0, threshold 331.652) and the 20
+    /// flagged pixels really do clear it.
+    #[test]
+    fn over_flagged_map_is_refused() {
+        let dir = tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let mut data: Vec<f32> = (0..108)
+            .map(|i| if i % 2 == 0 { 300.0 } else { 302.0 })
+            .collect();
+        data.extend(std::iter::repeat_n(5000.0f32, 20));
+        assert_eq!(data.len(), w * h);
+        assert!(
+            20.0 > MAX_HOT_FRACTION * (w * h) as f64,
+            "fixture must trip the cap"
+        );
+        let path = write_plane(dir.path(), "over_flagged.fits", w, h, &data);
+
+        let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
+        assert!(map.is_empty(), "a map over the safety cap must be refused");
     }
 
     /// Mono replacement is the median of the eight 3x3 neighbours, and it
@@ -455,9 +564,8 @@ mod tests {
         assert!(data.iter().all(|&v| v == 9.0));
     }
 
-    /// A synthetic uniform dark has MAD 0, which would make the threshold
-    /// degenerate (`value > median`) and flag nothing or everything depending
-    /// on rounding. The absolute floor keeps it honestly empty.
+    /// The simplest MAD-0 case: every pixel identical, so there is no spread
+    /// to measure sigmas against and no map to build.
     #[test]
     fn uniform_dark_flags_nothing() {
         let dir = tempdir().unwrap();
