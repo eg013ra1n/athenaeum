@@ -42,6 +42,56 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Calibrated-export v2 (2026-08-31)
+
+Spec `docs/superpowers/specs/2026-08-31-calibrated-export-v2-design.md`. The
+standalone "Calibrate Lights" op is gone; the **Calibrated lights** export mode now
+calibrates every LIGHT frame at export/send time from its linked masters, applies
+hot-pixel cosmetic correction from the master dark, and VNG-debayers OSC lights
+(`rustafits`'s `astroimage::processing::vng`), engine version bumped 2 → 3. Verified
+so far only by the unit suite and a throwaway pixel-diff harness (spec §1/§6) — no
+owner run through the shipped Export tab or Transfers yet.
+
+- Real-data export: LDN 1272 (OSC ZWO ASI2600MC Duo + mono ATR2600M,
+  `~/Pictures/LDN1272`) through the Export tab in **Calibrated lights** mode,
+  spot-compared against the external-reference calibrated/debayered outputs already
+  collected for spec §1/§6 under the same directory (the reference calibrated pair
+  and the `debayered/` folder, log `20260830105156.log`): math stays at float32
+  rounding (as the throwaway harness already found), the VNG output matches the
+  reference debayer within tolerance (no checkerboard/color-swap, small p99.9
+  residual on interior pixels — bitwise equality is not expected), and the
+  `ATH_CHPX` hot-pixel counts land near the reference's ~0.24%-of-pixels figure.
+  This is the first run through the real UI (gate sentences, the two toggles, the
+  `"calibrating"` progress phase) rather than the unit/harness path.
+- Two-instance smoke: frame-set send in **Calibrated lights** mode (Transfers) —
+  the masters-built gate blocks/unblocks the same way the Export tab does,
+  generation runs during the `preparing` phase (not a copy), the receiver lands
+  `c_*.fits`/`c_*_d.fits` with no catalog row at all, and re-sending after a
+  re-calibration lands `c_*_2.fits` beside the first copy instead of replacing it
+  (expected — see the release-note caveat below, not a bug to file).
+
+#### Follow-ups surfaced by review (not smokes)
+
+- **Collab publish rework — its own cycle.** Publishing a device's own lights is
+  currently blocked unconditionally (spec §8a, decision C: the project gate's
+  `LightCalStatus` resolves to `NotCalibrated` for every frame, so
+  `publish_collab_frames` always fails with "no publishable frames"). The rework
+  is generate-at-publish with a masters-built gate, mirroring this cycle's export
+  gate. It must also un-ignore the 9 collab tests `#[ignore]`d pending it
+  (`api/collab.rs` ×7, `api/collab_e2e_tests.rs` ×2, all tagged "collab publish
+  rework pending — calibrated-export-v2 spec §8a") — they were rewritten to assert
+  the blocked behavior, not deleted, specifically so the rework has something to
+  flip back.
+- CFA-mismatch advisories (light vs. master Bayer phase) used to surface through
+  the old standalone dialog's readiness call; that dialog is gone and nothing
+  replaced the surface — the per-frame engine-side logging still runs, but the
+  set-level warning reaches no UI. Follow-up: add a `cfa_warnings` field to
+  `ExportReadiness` (or the export summary) so Coverage/Export can show it again.
+- Old `c_*` trees left under the Calibration Library root by the retired
+  standalone flow are uncataloged leftovers on disk — this cycle deliberately does
+  not migrate or delete them (spec §2). Manual cleanup, at the owner's
+  convenience, whenever the library root gets tidied.
+
 ### Transfer preparation + single-copy footprint (2026-08-30)
 
 Spec `docs/superpowers/specs/2026-08-30-transfer-prepare-and-footprint-design.md`.
@@ -447,3 +497,17 @@ cycle, so anything from them that matters later belongs here or in a plan.
   working folder can each be pointed at any disk (with the upload limit,
   receiving limit and storage figures moved there too), and whatever the previous
   folders still hold can be cleaned up from the same page.
+- Export: the Calibrated lights mode now calibrates lights on the spot from your
+  built masters at export (or send) time instead of requiring a separate
+  Calibrate Lights run first — the standalone flow, its dialog and its per-frame
+  badge are gone.
+- Export: Calibrated lights gained two toggles — hot-pixel correction (replaces
+  known-defective pixels using the master dark) and full-resolution VNG debayer
+  for one-shot-color cameras — both on by default.
+- Collaboration: publishing your own lights to a project is temporarily disabled
+  while the calibrated-export changes above are worked into it; receiving other
+  members' contributions is unaffected.
+- Known consequence: resending a Calibrated-lights transfer after re-calibrating
+  (e.g. after rebuilding a master) now lands a second copy on the receiver
+  instead of replacing the first one — there is no tracking table left to dedup
+  against.

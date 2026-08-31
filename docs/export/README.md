@@ -84,6 +84,11 @@ logic (`file_organizer.rs:186-328` vs. `data_collector.rs:1503-1747`):
                     └── lights/      # light frames — always present
 ```
 
+This is the shape for `lightsOnly` / `rawWithCalibrationSets` / `rawWithMasters`.
+The **Calibrated lights** mode (see "Export modes" below) uses the same
+`<output_dir>/<frame set name>/camera_<x>/` root but skips the `BIAS_`/`DARKS_`/`FLAT_`
+levels entirely — calibration is already applied, not linked, so only `lights/` exists.
+
 - The frame-set folder name uses `sanitize_display_folder_name` (`models.rs:242`) —
   keeps spaces/case, replaces `: / \ * ? " < > |` with `_`, collapses repeats.
 - The `camera_` folder name uses `sanitize_folder_name` (`models.rs:229`) — lowercases
@@ -174,6 +179,90 @@ exposed through `ExportData.master_plan` (from `get_export_preview` /
 renders from it is a count (`masters_to_create` in `CalibrationRouteSummary`,
 `commands/export.rs:394`). PixInsight/WBPP creates the actual masters after the
 files are organized on disk.
+
+## Export modes
+
+`WbppExportConfig.export_mode` (`ExportMode`, `models.rs`) picks what a run puts
+on disk for the lights + calibration side; the same enum gates the frame-set
+*send* feature (Transfers), not only folder export — `check_mode_ready`
+(`api::lights`) is the single readiness gate for both. Four modes:
+
+- **`lightsOnly`** — raw lights, no calibration frames at all.
+- **`rawWithCalibrationSets`** (default) — the behavior described above:
+  raw lights plus whatever raw calibration sets are already linked.
+- **`rawWithMasters`** — raw lights, calibration side restricted to already-built
+  master files (`calibration_set.is_master_library = 1`). Strict: a linked set
+  that still has raw frames is a blocking error, not a silent omission.
+- **`calibratedLights`** — described in full below; the lights themselves are
+  generated, not copied, and there is no calibration folder at all.
+
+## Calibrated lights export mode
+
+Spec: `docs/superpowers/specs/2026-08-31-calibrated-export-v2-design.md`
+(supersedes the standalone "Calibrate Lights" flow described in
+`docs/superpowers/specs/2026-07-05-light-calibration-design.md`, which no
+longer exists — no dialog, no `light_calibrations` table, no per-frame
+calibration badge).
+
+Selecting **Calibrated lights** does not copy pre-existing artifacts — it
+**calibrates every LIGHT frame at export time** from its currently linked
+masters (and, for OSC, debayers it) and writes the result straight into this
+export's own destination tree. There is still no token-templating engine here
+— output naming is a fixed rule (below), not `{OBJECT}`-style tokens.
+
+- **Gate (masters-built strictness).** Every calibration set linked anywhere
+  in the frame set's tree must already be a built master — a raw linked set
+  blocks with "Build masters first — N sets without a master" (`→ Coverage`
+  deep-link to the first blocking set). A light with **zero** calibration
+  links blocks with "N lights have no calibration links". A *partially*
+  linked light (e.g. dark only) does **not** block — it calibrates
+  best-effort with an honest `CALSTAT`. Athenaeum never auto-builds masters
+  during export; the blocker routes the user to Coverage instead.
+- **Two run-level toggles**, shown when the mode is selected and persisted the
+  same way as the mode itself (`src/components/export/lightCalPrefs.ts`):
+  - **Hot-pixel correction** (default ON) — replaces hot pixels detected from
+    the applied master dark (median + 10·1.4826·MAD threshold) with a
+    neighbourhood median before debayering; honestly skipped when no dark
+    applies. Stamps `ATH_CHPX` (replaced-pixel count) on the output.
+  - **Debayer OSC lights (VNG)** (default ON) — full-resolution VNG debayer
+    for OSC lights, planar RGB output. OFF exports the CFA frame as-is
+    (`c_*.fits`) for stackers that debayer themselves.
+  Flat normalization (toggle + statistic) moved here too, from the old
+  standalone dialog — same defaults as before (ON, central-third mean,
+  per-CFA-channel for colour lights).
+- **Every export regenerates.** No cache and no skip-if-exists for generated
+  files — a re-run overwrites its own previous output in place (tmp + atomic
+  rename). The exists-skip described above under "Folder structure it
+  produces" applies only to *copied* files in the other three modes.
+- **Output layout**: lands in the *same* destination tree as every other
+  mode — `<output_dir>/<frame set name, sanitized>/camera_<x>/lights/` — with
+  no `BIAS_*`/`DARKS_*`/`FLAT_*` folders at all (calibration is already
+  applied, not linked). This replaces the old standalone flow's separate
+  `<CalibrationLibraryRoot>/<OBJECT>/<INSTRUME>/<date>/` artifact store, which
+  no longer exists; any `c_*` trees still sitting under the Calibration
+  Library root from that old flow are uncataloged leftovers — Athenaeum does
+  not migrate or delete them automatically.
+- **Output naming**: `c_<original stem>.fits` for a mono light, or an OSC
+  light with the VNG toggle off; `c_<original stem>_d.fits` for a debayered
+  OSC light (3-plane; the Bayer cards are stripped since the mosaic is gone,
+  `ROWORDER` stays). An XISF source always yields a `.fits` output.
+- **Progress**: `export-progress` gains phase `"calibrating"` (per-frame
+  `current`/`total`/`current_file`) alongside the existing `"copying"` phase
+  used by the other modes; `cancel_export` and the existing progress/complete
+  events are otherwise unchanged.
+- Runs inside one `ComputeQueue` admission slot (job kind `LightCalibration`),
+  so it serializes with master builds and analysis rather than running
+  concurrently with them.
+- The same generation logic runs during a frame-set **send** in this mode
+  (Transfers) instead of at folder-export time — see CLAUDE.md's
+  "Calibrated-Lights Export" section for the send-side and receiver behavior,
+  which is out of scope for this file.
+
+Engine internals (the calibration formula itself, CFA flat handling, header
+whitelist, BITPIX-aware scaling) live in
+`crates/athenaeum-core/src/calibration_library/` and are documented in
+CLAUDE.md, not repeated here — this file covers only how the *export* feature
+drives them.
 
 ## Project-scoped export (collab)
 
