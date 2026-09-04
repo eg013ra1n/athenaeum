@@ -202,6 +202,22 @@ export default function ProjectDetail() {
   const needsApproval = c.requireApproval && !c.coordinator;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   const publishable = gate?.publishable ?? 0;
+  // Decision C (spec 2026-08-31 §8a): the calibration precondition resolves to
+  // `NotCalibrated` unconditionally for every candidate frame, so as long as
+  // there IS at least one candidate frame, that is always the reason the gate
+  // is fully closed — check the rows rather than hard-coding "always show
+  // this" so a future generate-at-publish rework (which gives the status a
+  // real resolver again) doesn't leave a permanently-wrong message behind.
+  const publishBlockedByCalibration =
+    !!gate &&
+    gate.total > 0 &&
+    publishable === 0 &&
+    gate.rows.every((r) => r.failures.some((f) => f.startsWith('not calibrated')));
+  const publishTooltip = publishBlockedByCalibration
+    ? 'Publishing calibrated lights from this device is not available in this version — export or send them instead.'
+    : publishable === 0
+      ? 'No passing frames to publish yet'
+      : undefined;
   // The project's published volume, client-side from the rows already listed:
   // every announcement that survived moderation and has not been superseded.
   const publishedBytes =
@@ -314,10 +330,17 @@ export default function ProjectDetail() {
               }}
               disabled={publishable === 0}
               className="inline-flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              title={publishable === 0 ? 'No passing frames to publish yet' : undefined}
+              title={publishTooltip}
             >
               <Send size={14} /> Publish {publishable} passing frames
             </button>
+            {/* Honest line near the button (D-2, review fix) — the tooltip alone
+                is easy to miss on a dead-looking disabled button, and decision C
+                means this is not a temporary/data-dependent state a user could
+                fix by linking more objects or waiting for analysis. */}
+            {publishBlockedByCalibration && (
+              <p className="text-xs text-content-muted">{publishTooltip}</p>
+            )}
             {publishError && !publishConfirm && <p className="text-sm text-error">{publishError}</p>}
           </div>
 
