@@ -25,7 +25,7 @@ use crate::services::ServiceContext;
 use crate::sharing::types::NodeId;
 use crate::sync::engine::SyncEngineHandle;
 use crate::sync::receiver::{SyncFileProgressEvent, SyncFinishedEvent, SyncProgressEvent};
-use crate::sync::store::{outbound_file_counts, CatalogSyncStore, SyncStore};
+use crate::sync::store::{CatalogSyncStore, SyncStore};
 use crate::sync::{node_id_hex, Direction, OutboundState, SyncSenderRuntime};
 
 /// Floor between two progress events of the same kind. Staging a package reads
@@ -96,28 +96,18 @@ impl PrepareError {
     }
 }
 
-/// The row's byte total, already computed by `enqueue_preparing` into
-/// `sync_outbound_files` before this worker ever ran — read back rather than
-/// recomputed, so the "queued behind another slot" signal (C-1) shows the
-/// real total even before staging (or a generated payload's size correction)
-/// has started. A read failure emits `0` rather than blocking the signal on a
-/// store that will answer at the very next poll anyway.
-fn preparing_bytes_total(ctx: &ServiceContext, id: i64) -> u64 {
-    let store = match sync_store(ctx) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(package_id = id, error = %format!("{e:#}"), "prepare: cannot open store; bytes_total unknown for the preparing signal");
-            return 0;
-        }
-    };
-    let conn = store.lock_conn();
-    match outbound_file_counts(&conn, &[id]) {
-        Ok(map) => map.get(&id).map(|c| c.total_bytes).unwrap_or(0),
-        Err(e) => {
-            tracing::warn!(package_id = id, error = %format!("{e:#}"), "prepare: reading bytes_total for the preparing signal failed");
-            0
-        }
-    }
+/// The row's byte total for the "still queued, nothing moving yet" signal
+/// (C-1). This is the SAME number `enqueue_preparing` already wrote into
+/// `sync_outbound_files` and `stage_records` (below) sums independently on
+/// its own blocking thread — review fix #4: the original form of this helper
+/// re-derived it by opening a fresh `CatalogSyncStore` connection and taking
+/// its `std::sync::Mutex` from inside the async `tokio::spawn` body, which is
+/// blocking file and lock work on an executor thread for a number the caller
+/// already has in hand. Both call sites hold the plan's own records, so they
+/// sum this directly instead; the helper function is gone — nothing else
+/// called it.
+fn preparing_bytes_total(records: &[(PrepareSource, ManifestRecord)]) -> u64 {
+    records.iter().map(|(_, r)| r.byte_size).sum()
 }
 
 /// One `sync-progress { stage: "preparing", bytesDone: 0, bytesTotal }` event —
@@ -173,7 +163,7 @@ pub fn spawn_prepare(ctx: Arc<ServiceContext>, sender: Arc<SyncSenderRuntime>, j
         // row to say why. Say so now, with the row's own known byte total,
         // before we even try for the slot.
         if let Some(em) = emitter.as_deref() {
-            let bytes_total = preparing_bytes_total(&ctx, id);
+            let bytes_total = preparing_bytes_total(&job.records);
             emit_preparing_progress(em, id, peer, job.records.len() as u32, bytes_total);
         }
         let _permit = match slot.acquire_owned().await {
@@ -712,7 +702,7 @@ fn open_generation(
     // can make it necessary.
     tracing::info!(package_id = id, "prepare: waiting for the compute slot");
     if let Some(em) = emitter {
-        let bytes_total = preparing_bytes_total(ctx, id);
+        let bytes_total = preparing_bytes_total(records);
         emit_preparing_progress(em.as_ref(), id, peer, records.len() as u32, bytes_total);
     }
     let _permit = match ctx.compute_queue.acquire(
