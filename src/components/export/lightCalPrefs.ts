@@ -35,11 +35,13 @@ export const DEFAULT_LIGHTCAL_PARAMS: LightCalParams = {
 };
 
 /** Read the persisted Advanced parameters, coercing every field into range and
- *  falling back to {@link DEFAULT_LIGHTCAL_PARAMS} when unset/corrupt. Both
- *  consumers seed from it — the Export tab's own controls (ExportTab.tsx) and
- *  the send-to-device dialog (SendToNodeDialog.tsx), which reads the persisted
- *  value directly so a transfer generates what an export of the same set
- *  would. */
+ *  falling back to {@link DEFAULT_LIGHTCAL_PARAMS} when unset/corrupt. Seeds the
+ *  Export tab's own controls (ExportTab.tsx) — the tab then submits and sends
+ *  its live `params` state, never a re-read of this. An opener with no export
+ *  state of its own (e.g. DualPaneFileBrowser's frame-selection send) reads it
+ *  directly at its own call site instead (D-1, review fix), so the fallback to
+ *  "whatever was last persisted" is visible where it happens, not hidden
+ *  inside `SendToNodeDialog`. */
 export function readLightCalParamsPref(): LightCalParams {
   try {
     const raw = localStorage.getItem(LIGHTCAL_PARAMS_KEY);
@@ -59,7 +61,8 @@ export function readLightCalParamsPref(): LightCalParams {
     // the recommended behavior instead of silently opting out of it.
     const cfaFlatScaling = parsed.cfaFlatScaling !== false;
     return { trimFraction, pedestalDn, biasFallback, cfaFlatScaling };
-  } catch {
+  } catch (err) {
+    console.warn('[lightCalPrefs] read Advanced parameters failed:', err);
     return { ...DEFAULT_LIGHTCAL_PARAMS };
   }
 }
@@ -68,7 +71,8 @@ export function readLightCalParamsPref(): LightCalParams {
 export function readFlatNormPref(): boolean {
   try {
     return localStorage.getItem(LIGHTCAL_FLATNORM_KEY) !== 'false';
-  } catch {
+  } catch (err) {
+    console.warn('[lightCalPrefs] read flat-norm preference failed:', err);
     return true;
   }
 }
@@ -81,7 +85,8 @@ export function readFlatNormModePref(): FlatNormMode {
     return localStorage.getItem(LIGHTCAL_FLATNORM_MODE_KEY) === 'pixinsightTrimmed'
       ? 'pixinsightTrimmed'
       : 'centralThird';
-  } catch {
+  } catch (err) {
+    console.warn('[lightCalPrefs] read flat-norm mode failed:', err);
     return 'centralThird';
   }
 }
@@ -91,7 +96,8 @@ export function readFlatNormModePref(): FlatNormMode {
 export function readHotPixelPref(): boolean {
   try {
     return localStorage.getItem(LIGHTCAL_HOT_PIXEL_KEY) !== 'false';
-  } catch {
+  } catch (err) {
+    console.warn('[lightCalPrefs] read hot-pixel preference failed:', err);
     return true;
   }
 }
@@ -100,7 +106,8 @@ export function readHotPixelPref(): boolean {
 export function readDebayerPref(): boolean {
   try {
     return localStorage.getItem(LIGHTCAL_DEBAYER_KEY) !== 'false';
-  } catch {
+  } catch (err) {
+    console.warn('[lightCalPrefs] read debayer preference failed:', err);
     return true;
   }
 }
@@ -110,8 +117,8 @@ export function readDebayerPref(): boolean {
 export function writeLightCalParamsPref(params: LightCalParams): void {
   try {
     localStorage.setItem(LIGHTCAL_PARAMS_KEY, JSON.stringify(params));
-  } catch {
-    /* ignore — localStorage unavailable (private mode / quota) */
+  } catch (err) {
+    console.warn('[lightCalPrefs] write Advanced parameters failed:', err);
   }
 }
 
@@ -119,8 +126,8 @@ export function writeLightCalParamsPref(params: LightCalParams): void {
 export function writeFlatNormPref(on: boolean): void {
   try {
     localStorage.setItem(LIGHTCAL_FLATNORM_KEY, String(on));
-  } catch {
-    /* ignore */
+  } catch (err) {
+    console.warn('[lightCalPrefs] write flat-norm preference failed:', err);
   }
 }
 
@@ -128,8 +135,8 @@ export function writeFlatNormPref(on: boolean): void {
 export function writeFlatNormModePref(mode: FlatNormMode): void {
   try {
     localStorage.setItem(LIGHTCAL_FLATNORM_MODE_KEY, mode);
-  } catch {
-    /* ignore */
+  } catch (err) {
+    console.warn('[lightCalPrefs] write flat-norm mode failed:', err);
   }
 }
 
@@ -137,8 +144,8 @@ export function writeFlatNormModePref(mode: FlatNormMode): void {
 export function writeHotPixelPref(on: boolean): void {
   try {
     localStorage.setItem(LIGHTCAL_HOT_PIXEL_KEY, String(on));
-  } catch {
-    /* ignore */
+  } catch (err) {
+    console.warn('[lightCalPrefs] write hot-pixel preference failed:', err);
   }
 }
 
@@ -146,7 +153,7 @@ export function writeHotPixelPref(on: boolean): void {
 export function writeDebayerPref(on: boolean): void {
   try {
     localStorage.setItem(LIGHTCAL_DEBAYER_KEY, String(on));
-  } catch {
-    /* ignore */
+  } catch (err) {
+    console.warn('[lightCalPrefs] write debayer preference failed:', err);
   }
 }

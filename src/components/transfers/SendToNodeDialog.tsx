@@ -16,16 +16,33 @@ import { Send, Check, X, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useSyncSend, summarizeIneligible, errMsg } from '../../hooks/useSyncSend';
-import {
-  readFlatNormPref,
-  readFlatNormModePref,
-  readLightCalParamsPref,
-  readHotPixelPref,
-  readDebayerPref,
-} from '../export/lightCalPrefs';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type { ExportMode } from '../../types/export';
-import type { AccountDevice, AccountStatus, IneligibleFrame } from '../../types/models';
+import type {
+  AccountDevice,
+  AccountStatus,
+  FlatNormMode,
+  IneligibleFrame,
+  LightCalParams,
+} from '../../types/models';
+
+/**
+ * The five light-calibration options a `frameSet` send generates its files
+ * with (D-1, review fix). Previously this dialog re-read them from
+ * `lightCalPrefs.ts` at send time, which could disagree with the Export tab's
+ * live (unsaved / not-yet-persisted) state — now every opener supplies the
+ * exact values it wants used, from its own live state or, if it has none, the
+ * persisted preferences read explicitly at the call site.
+ */
+export interface LightCalOptions {
+  flatNorm: boolean;
+  flatNormMode: FlatNormMode;
+  params: LightCalParams;
+  /** Cosmetic hot-pixel correction from the master dark (default ON). */
+  hotPixel: boolean;
+  /** Debayer a CFA light to planar RGB (default ON; inert for mono). */
+  debayer: boolean;
+}
 
 /** Compact display for a hub-assigned device id (opaque, can be long). Mirrors the
  *  helper in the account settings UI — kept local so this file never imports that
@@ -60,6 +77,14 @@ interface SendToNodeDialogProps {
    * → the field starts empty and the backend auto-names.
    */
   defaultBatchName?: string;
+  /**
+   * The light-calibration options a `frameSet` send generates its files with
+   * (D-1, review fix). Always required, even for a `frames`-kind send that
+   * never reaches `sendFrameSet` — every opener names its source (live state
+   * or explicit persisted-prefs read) rather than the dialog silently
+   * re-reading localStorage behind the caller's back.
+   */
+  lightCalOptions: LightCalOptions;
 }
 
 /** Explanatory empty state — signed out, or no eligible peers on the account. */
@@ -76,6 +101,7 @@ export function SendToNodeDialog({
   open,
   onClose,
   defaultBatchName,
+  lightCalOptions,
 }: SendToNodeDialogProps) {
   const { notify } = useNotifications();
   const { sending, sendSelection, sendFrameSet } = useSyncSend();
@@ -156,10 +182,10 @@ export function SendToNodeDialog({
     const checkedIds = [...checked];
     if (checkedIds.length === 0 || itemCount === 0 || sending) return;
 
-    // A frame-set send passes ALL FIVE light-calibration preferences the Export
-    // tab reads — the options the calibrated-lights mode generates its files
-    // with (the readiness gate itself no longer takes any). The transfer
-    // generates the same bytes an export of this set would.
+    // A frame-set send passes ALL FIVE light-calibration options the opener
+    // supplied via `lightCalOptions` (D-1) — the options the calibrated-lights
+    // mode generates its files with (the readiness gate itself no longer takes
+    // any). The transfer generates the same bytes an export of this set would.
     const results =
       target.kind === 'frames'
         ? await sendSelection(target.frameIds, checkedIds, {
@@ -168,11 +194,7 @@ export function SendToNodeDialog({
           })
         : await sendFrameSet(target.frameSetId, target.mode, checkedIds, {
             batchName,
-            flatNorm: readFlatNormPref(),
-            flatNormMode: readFlatNormModePref(),
-            params: readLightCalParamsPref(),
-            hotPixel: readHotPixelPref(),
-            debayer: readDebayerPref(),
+            ...lightCalOptions,
           });
 
     // --- Aggregate the per-destination outcomes into one honest notification. ---

@@ -54,6 +54,13 @@ import type { ScanRootWithAvailability } from '../../types/helpers';
 import BlinkViewer from '../BlinkViewer';
 import { computeMissingFlags, type MissingFlags } from '../missing-metadata/MissingMetadataTable';
 import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
+import {
+  readFlatNormPref,
+  readFlatNormModePref,
+  readLightCalParamsPref,
+  readHotPixelPref,
+  readDebayerPref,
+} from '../export/lightCalPrefs';
 import CatalogSearch from './CatalogSearch';
 import MetadataPane from './MetadataPane';
 import {
@@ -1453,6 +1460,17 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         open={sendOpen}
         onClose={() => setSendOpen(false)}
         defaultBatchName={sendBatchName}
+        // This opener has no export state of its own (a `frames`-kind send
+        // never reaches `sendFrameSet`), so it reads the persisted preferences
+        // explicitly (D-1, review fix) — the fallback the dialog used to hide
+        // behind a localStorage re-read is now visible right here.
+        lightCalOptions={{
+          flatNorm: readFlatNormPref(),
+          flatNormMode: readFlatNormModePref(),
+          params: readLightCalParamsPref(),
+          hotPixel: readHotPixelPref(),
+          debayer: readDebayerPref(),
+        }}
       />
     </div>
   );

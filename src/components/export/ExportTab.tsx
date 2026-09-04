@@ -58,18 +58,30 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; cou
   { value: 'calibratedLights', label: 'Calibrated lights', hint: 'Calibrates every light from its linked masters during the export — no calibration frames land; WBPP runs with calibration disabled.', count: c => c.calibratedLights },
 ];
 
-/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` — including
- *  the calibrated mode's blocker ORDER (masters before links: a build is what
- *  can also change where a light's links resolve to). */
+/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` verbatim —
+ *  wording included: `rawWithMasters` and the calibrated mode's masters-missing
+ *  blocker read different sentences on the backend even though both gate on
+ *  `rawSetsWithoutMaster`, and the calibrated mode's blocker ORDER is
+ *  masters-missing → unlinked-lights → missing master FILES (a build is what
+ *  can also change where a light's links resolve to; a missing FILE is a
+ *  distinct failure from "not built yet"). */
 function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
-  const noMaster = `Build masters first — ${r.rawSetsWithoutMaster} set${r.rawSetsWithoutMaster === 1 ? '' : 's'} without a master`;
   if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
-    return noMaster;
+    const n = r.rawSetsWithoutMaster;
+    return `${n} calibration set${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no master — build masters first`;
   }
   if (mode === 'calibratedLights') {
-    if (r.rawSetsWithoutMaster > 0) return noMaster;
+    if (r.rawSetsWithoutMaster > 0) {
+      const n = r.rawSetsWithoutMaster;
+      return `Build masters first — ${n} set${n === 1 ? '' : 's'} without a master`;
+    }
     if (r.unlinkedLights > 0) {
-      return `${r.unlinkedLights} light${r.unlinkedLights === 1 ? '' : 's'} ${r.unlinkedLights === 1 ? 'has' : 'have'} no calibration links`;
+      const n = r.unlinkedLights;
+      return `${n} light${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no calibration links`;
+    }
+    if (r.missingMasterFiles > 0) {
+      const n = r.missingMasterFiles;
+      return `${n} master file(s) missing on disk — restore from archive first`;
     }
   }
   return null;
@@ -163,6 +175,14 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
       updateParams(p => ({ ...p, trimFraction: Math.min(0.25, Math.max(0, n)) }));
     }
   }, [updateParams]);
+  // The typed string can run past [0, 0.25] while the committed `params.trimFraction`
+  // is already clamped (above) — e.g. typing "0.9" shows "0.9" while the value that
+  // will actually export is 0.25. Snap the display back to the committed value once
+  // the user is done typing, rather than clamping every keystroke (which would fight
+  // a partial edit like "0.").
+  const handleTrimBlur = useCallback(() => {
+    setTrimInput(String(params.trimFraction));
+  }, [params.trimFraction]);
   const handlePedestalChange = useCallback((v: string) => {
     setPedestalInput(v);
     const n = parseFloat(v);
@@ -240,6 +260,10 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // will hard-error on.
   const blocker = readiness ? modeBlocker(readiness, exportMode) : null;
   const modeReady = readiness !== null && blocker === null;
+  // A failed fetch also closes both gates (readiness === null above), but a
+  // `blocker` of null then reads as "nothing wrong" — show the actual reason
+  // instead of falling through to the default enabled-looking tooltip.
+  const readinessFailedTooltip = readinessError ? 'Readiness check failed — see console' : null;
 
   // In web mode, pull the server-configured export directory once.
   useEffect(() => {
@@ -607,6 +631,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                   <button
                     type="button"
                     onClick={() => setAdvancedOpen(o => !o)}
+                    aria-expanded={advancedOpen}
                     className="flex items-center gap-1.5 text-xs font-medium text-content-secondary hover:text-content transition-colors"
                   >
                     {advancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -619,16 +644,18 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                       {/* The trim fraction only exists in the trimmed statistic. */}
                       {flatNorm && flatNormMode === 'pixinsightTrimmed' && (
                         <div>
-                          <label className="block text-xs text-content-secondary mb-1">
+                          <label htmlFor="export-trim-fraction" className="block text-xs text-content-secondary mb-1">
                             Flat trim fraction (per tail)
                           </label>
                           <input
+                            id="export-trim-fraction"
                             type="number"
                             min={0}
                             max={0.25}
                             step={0.01}
                             value={trimInput}
                             onChange={e => handleTrimChange(e.target.value)}
+                            onBlur={handleTrimBlur}
                             className="w-28 px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent"
                           />
                           <p className="text-[11px] text-content-muted mt-1">
@@ -638,10 +665,11 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                       )}
 
                       <div>
-                        <label className="block text-xs text-content-secondary mb-1">
+                        <label htmlFor="export-pedestal-dn" className="block text-xs text-content-secondary mb-1">
                           Output pedestal (DN)
                         </label>
                         <input
+                          id="export-pedestal-dn"
                           type="number"
                           min={0}
                           step={1}
@@ -818,12 +846,12 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
               the other ships it to another node. Same readiness gate. */}
           <div className="flex gap-3">
             <button onClick={() => { void handleExport(); }} disabled={!canExport}
-              title={blocker ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
+              title={readinessFailedTooltip ?? blocker ?? (outputDir ? 'Export to PixInsight WBPP folder structure' : 'Pick an output folder first')}
               className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${canExport ? 'bg-accent hover:bg-accent-hover text-white' : 'bg-surface-hover cursor-not-allowed text-content-muted'}`}>
               {exporting ? (<><Loader2 className="animate-spin" size={20} /> Exporting…</>) : (<><Play size={20} /> Export to WBPP</>)}
             </button>
             <button onClick={() => setSendOpen(true)} disabled={!canSend}
-              title={blocker ?? 'Send this frame set to another Athenaeum node'}
+              title={readinessFailedTooltip ?? blocker ?? 'Send this frame set to another Athenaeum node'}
               className={`flex-1 py-3 rounded-lg font-medium flex items-center justify-center gap-2 border ${canSend ? 'border-accent text-accent hover:bg-accent/10' : 'border-border cursor-not-allowed text-content-muted'}`}>
               <Send size={20} /> Send to node…
             </button>
@@ -856,6 +884,10 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
           open={sendOpen}
           onClose={() => setSendOpen(false)}
           defaultBatchName={frameSetName}
+          // Same live state the export submits at handleExport above (D-1,
+          // review fix) — never a localStorage re-read, so an unsaved edit in
+          // the controls can't disagree with what Send actually ships.
+          lightCalOptions={{ flatNorm, flatNormMode, params, hotPixel, debayer }}
         />
       )}
     </div>
