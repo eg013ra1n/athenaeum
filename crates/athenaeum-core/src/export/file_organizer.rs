@@ -338,13 +338,15 @@ pub struct GenerationBatch {
     skipped: std::collections::HashMap<i64, String>,
     opts: crate::export::CalibratedLightOptions,
     scratch_dir: PathBuf,
-    /// One hot-pixel map per master dark, for the whole run: the map depends on
-    /// the dark alone and costs a full plane read to measure, so a set sharing
-    /// one dark pays that once. Lives here rather than in `organize_files_wbpp`
-    /// so that (ungated) function never names a `render`-only type.
+    /// One hot-pixel outcome per master dark, for the whole run: the answer
+    /// depends on the dark alone and costs a full plane read to measure, so a
+    /// set sharing one dark pays that once — refusals included, which is what
+    /// keeps a degenerate dark to ONE warning per run instead of one per frame.
+    /// Lives here rather than in `organize_files_wbpp` so that (ungated)
+    /// function never names a `render`-only type.
     hot_maps: std::collections::HashMap<
         PathBuf,
-        std::sync::Arc<crate::calibration_library::cosmetic::HotPixelMap>,
+        std::sync::Arc<crate::calibration_library::cosmetic::HotPixelMapOutcome>,
     >,
 }
 
@@ -423,6 +425,11 @@ impl GenerationBatch {
 /// `dest`. The write is atomic (temp + rename), so an existing output is
 /// REPLACED — there is no exists-skip on a generated file, which would
 /// otherwise leave a stale artifact from an earlier run in the export.
+///
+/// Returns the frame's non-fatal notes (today: a refused hot-pixel map, once
+/// per dark for the whole batch) for the caller to fold into
+/// [`OrganizeResult::warnings`] — a successful generation can still have
+/// something the operator needs to read.
 #[cfg(feature = "render")]
 fn generate_one(
     batch: &mut GenerationBatch,
@@ -430,7 +437,7 @@ fn generate_one(
     debayer: bool,
     dest: &Path,
     cancel_flag: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // Field-level destructuring: `specs` is read while `hot_maps` is written,
     // which a whole-struct borrow would not allow.
     let GenerationBatch {
@@ -467,7 +474,7 @@ fn generate_one(
         hot_pixels_replaced = generated.hot_pixels_replaced,
         "calibrated light written into the export"
     );
-    Ok(())
+    Ok(generated.warnings)
 }
 
 /// Headless stub: [`GenerationBatch`] is uninhabited without the `render`
@@ -479,7 +486,7 @@ fn generate_one(
     _debayer: bool,
     _dest: &Path,
     _cancel_flag: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     match *batch {}
 }
 
@@ -595,8 +602,9 @@ pub fn organize_files_wbpp(
                     )),
                 };
                 match outcome {
-                    Ok(()) => {
+                    Ok(notes) => {
                         files_organized += 1;
+                        warnings.extend(notes);
                         emit_progress(
                             files_organized as usize,
                             Some(&filename),
@@ -767,7 +775,14 @@ mod tests {
             None,
             Some(Box::new(bias_of_dark)),
         );
-        let darkflat = set_info(11, "DarkFlat", vec![frame(110, "df1.fits", "ASI")], None, None, None);
+        let darkflat = set_info(
+            11,
+            "DarkFlat",
+            vec![frame(110, "df1.fits", "ASI")],
+            None,
+            None,
+            None,
+        );
         let flat = set_info(
             10,
             "Flat",
@@ -785,8 +800,10 @@ mod tests {
         let data = export_data("M31 Set", vec![sg]);
 
         let placements = compute_wbpp_placements(&data);
-        let by_id: std::collections::HashMap<i64, String> =
-            placements.iter().map(|p| (p.frame_id, p.rel_dir.clone())).collect();
+        let by_id: std::collections::HashMap<i64, String> = placements
+            .iter()
+            .map(|p| (p.frame_id, p.rel_dir.clone()))
+            .collect();
 
         // camera_asi/BIAS_30/DARKS_20/FLAT_10/lights
         assert_eq!(by_id[&1], "camera_asi/BIAS_30/DARKS_20/FLAT_10/lights");
@@ -803,13 +820,22 @@ mod tests {
     /// under `camera_.../FLAT_.../lights` — no BIAS or DARKS directory appears.
     #[test]
     fn wbpp_placements_collapse_missing_levels() {
-        let flat = set_info(10, "Flat", vec![frame(100, "flat1.fits", "ASI")], None, None, None);
+        let flat = set_info(
+            10,
+            "Flat",
+            vec![frame(100, "flat1.fits", "ASI")],
+            None,
+            None,
+            None,
+        );
         let sg = subgroup(vec![frame(1, "light1.fits", "ASI")], Some(flat), None, None);
         let data = export_data("Set", vec![sg]);
 
         let placements = compute_wbpp_placements(&data);
-        let by_id: std::collections::HashMap<i64, String> =
-            placements.iter().map(|p| (p.frame_id, p.rel_dir.clone())).collect();
+        let by_id: std::collections::HashMap<i64, String> = placements
+            .iter()
+            .map(|p| (p.frame_id, p.rel_dir.clone()))
+            .collect();
 
         assert_eq!(by_id[&1], "camera_asi/FLAT_10/lights");
         assert_eq!(by_id[&100], "camera_asi/FLAT_10");
@@ -837,16 +863,33 @@ mod tests {
     /// counts placements against that total.
     #[test]
     fn placement_count_matches_progress_total() {
-        let bias_of_dark = set_info(30, "Bias", vec![frame(300, "bias1.fits", "ASI")], None, None, None);
+        let bias_of_dark = set_info(
+            30,
+            "Bias",
+            vec![frame(300, "bias1.fits", "ASI")],
+            None,
+            None,
+            None,
+        );
         let dark = set_info(
             20,
             "Dark",
-            vec![frame(200, "dark1.fits", "ASI"), frame(201, "dark2.fits", "ASI")],
+            vec![
+                frame(200, "dark1.fits", "ASI"),
+                frame(201, "dark2.fits", "ASI"),
+            ],
             None,
             None,
             Some(Box::new(bias_of_dark)),
         );
-        let darkflat = set_info(11, "DarkFlat", vec![frame(110, "df1.fits", "ASI")], None, None, None);
+        let darkflat = set_info(
+            11,
+            "DarkFlat",
+            vec![frame(110, "df1.fits", "ASI")],
+            None,
+            None,
+            None,
+        );
         let flat = set_info(
             10,
             "Flat",
@@ -862,7 +905,10 @@ mod tests {
             None,
         );
         let data = export_data("Set", vec![sg]);
-        assert_eq!(compute_wbpp_placements(&data).len(), count_total_files(&data));
+        assert_eq!(
+            compute_wbpp_placements(&data).len(),
+            count_total_files(&data)
+        );
     }
 
     /// Byte-identical layout pin: running the real (I/O) organizer over a small
@@ -933,31 +979,37 @@ mod tests {
         assert_eq!(claims.claim("FLAT_1", "L_0001.fits"), "L_0001.fits");
     }
 
-    /// End-to-end for the generation path: a real (tiny) light + master dark on
-    /// disk, the calibrated-lights transform, a resolved batch, and the
-    /// organizer — the output must be a CALIBRATED file written under its `c_*`
-    /// name, counted like any other placement, with no calibration folder in the
-    /// tree. Debayer is off so the assertion is about generation, not mosaics.
+    /// Catalog + on-disk fixture for the generation arm: frame set "My Set",
+    /// one `TestCam` session, `lights` LIGHT frames (each a real 8x8 FITS
+    /// plane) and ONE master dark set linked to all of them — one dark means
+    /// one subgroup, so the placement order below is the order the lights are
+    /// given in.
+    ///
+    /// The dark alternates 300/302 (median 301, MAD 1.0 → threshold 315.8), so
+    /// its hot-pixel map is MEASURED and empty. A uniform dark would be REFUSED
+    /// instead, which is a warning of its own and would mask the ones these
+    /// tests are about.
+    ///
+    /// Returns the connection and the master dark's path.
     #[cfg(feature = "render")]
-    #[test]
-    fn organize_generates_calibrated_lights() {
-        use crate::export::models::CalibratedLightOptions;
+    fn seed_generation_fixture(
+        src: &Path,
+        lights: &[(i64, &str)],
+        bayerpat: Option<&str>,
+    ) -> (rusqlite::Connection, PathBuf) {
         use rusqlite::params;
 
         const W: usize = 8;
         const H: usize = 8;
-
-        let src = tempfile::tempdir().unwrap();
-        let out = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
-
-        let write_plane = |name: &str, value: f32| {
-            let path = src.path().join(name);
-            crate::fits_writer::write_fits_f32(&path, W, H, 1, &vec![value; W * H], &[]).unwrap();
-            path
+        let write_plane = |path: &Path, fill: &dyn Fn(usize, usize) -> f32| {
+            let mut data = vec![0f32; W * H];
+            for y in 0..H {
+                for x in 0..W {
+                    data[y * W + x] = fill(x, y);
+                }
+            }
+            crate::fits_writer::write_fits_f32(path, W, H, 1, &data, &[]).unwrap();
         };
-        let light_path = write_plane("light_10.fits", 1000.0);
-        let dark_path = write_plane("master_dark.fits", 300.0);
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
@@ -976,25 +1028,16 @@ mod tests {
         )
         .unwrap();
         let session_id = conn.last_insert_rowid();
-        // The light.
-        conn.execute(
-            "INSERT INTO files (id, path, filename, size, modified_at, format)
-             VALUES (1, ?1, 'light_10.fits', 0, '2026-07-05T00:00:00Z', 'FITS')",
-            params![light_path.to_string_lossy()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs, filter)
-             VALUES (10, 1, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z', 'Ha')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, 10)",
-            params![session_id],
-        )
-        .unwrap();
-        // A master dark set, linked to it.
+
+        // The master dark set, shared by every light.
+        let dark_path = src.join("master_dark.fits");
+        write_plane(&dark_path, &|x, y| {
+            if (x + y) % 2 == 0 {
+                300.0
+            } else {
+                302.0
+            }
+        });
         conn.execute(
             "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
              VALUES (200, 'Dark', '2026-07-05', 1)",
@@ -1017,28 +1060,95 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO calibration_set_to_frames
-             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
-             VALUES (10, 'frame', 200, 'Dark', '2026-07-05T00:00:00Z')",
-            [],
-        )
-        .unwrap();
 
-        let mut data = crate::export::collect_export_data(&conn, 1).unwrap();
+        for (frame_id, name) in lights {
+            let light_path = src.join(name);
+            write_plane(&light_path, &|_, _| 1000.0);
+            let file_id = frame_id + 1_000;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+                params![file_id, light_path.to_string_lossy(), name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs, filter,
+                                     bayerpat, xbayroff, ybayroff)
+                 VALUES (?1, ?2, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z', 'Ha',
+                         ?3, ?4, ?4)",
+                params![frame_id, file_id, bayerpat, bayerpat.map(|_| 0i64)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                params![session_id, frame_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                 VALUES (?1, 'frame', 200, 'Dark', '2026-07-05T00:00:00Z')",
+                params![frame_id],
+            )
+            .unwrap();
+        }
+        (conn, dark_path)
+    }
+
+    /// Collect + transform + resolve for the calibrated-lights mode, the three
+    /// steps every generation test does before it can call the organizer.
+    #[cfg(feature = "render")]
+    fn resolve_calibrated_batch(
+        conn: &rusqlite::Connection,
+        scratch: &Path,
+        debayer: bool,
+    ) -> (ExportData, GenerationBatch) {
+        use crate::export::models::CalibratedLightOptions;
+        let mut data = crate::export::collect_export_data(conn, 1).unwrap();
         let opts = CalibratedLightOptions {
-            debayer_osc: false,
+            debayer_osc: debayer,
             ..CalibratedLightOptions::default()
         };
         crate::export::apply_export_mode(
-            &conn,
+            conn,
             &mut data,
             crate::export::models::ExportMode::CalibratedLights,
             Some(&opts),
         )
         .unwrap();
+        let batch = GenerationBatch::resolve(conn, &data, opts, scratch.to_path_buf());
+        (data, batch)
+    }
 
-        let mut batch = GenerationBatch::resolve(&conn, &data, opts, scratch.path().to_path_buf());
+    /// Every regular file under `root`, forward-slashed and relative to it.
+    fn files_under(root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = walkdir(root)
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// End-to-end for the generation path: a real (tiny) light + master dark on
+    /// disk, the calibrated-lights transform, a resolved batch, and the
+    /// organizer — the output must be a CALIBRATED file written under its `c_*`
+    /// name, counted like any other placement, with no calibration folder in the
+    /// tree. Debayer is off so the assertion is about generation, not mosaics.
+    #[cfg(feature = "render")]
+    #[test]
+    fn organize_generates_calibrated_lights() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let (conn, _dark) = seed_generation_fixture(src.path(), &[(10, "light_10.fits")], None);
+        let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), false);
         drop(conn); // the pixel phase holds no catalog connection
 
         let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -1061,20 +1171,27 @@ mod tests {
             .path()
             .join("My Set/camera_testcam/lights/c_light_10.fits");
         assert!(written.exists(), "calibrated output missing at {written:?}");
-        // Calibrated, not copied: 1000 − 300 (a float source is never re-scaled).
         let header = crate::fits_parser::FitsHeader::from_path(&written).unwrap();
         assert_eq!(header.get_str("CALSTAT").as_deref(), Some("BD"));
+        // The dark's map was measured and empty — the pass ran, replacing none.
+        assert_eq!(header.get_i32("ATH_CHPX"), Some(0));
+
+        // Calibrated, not copied: the light is 1000 everywhere and the dark
+        // alternates 300/302, so the first row reads 700, 698 — a copy would
+        // read 1000, 1000.
+        let mut plane =
+            crate::integration::banded::BandSource::open(&[written.clone()], scratch.path())
+                .unwrap();
+        let mut bufs = vec![Vec::new()];
+        plane.read_band(0, 1, &mut bufs).unwrap();
+        assert!((bufs[0][0] - 700.0).abs() < 1e-3, "got {}", bufs[0][0]);
+        assert!((bufs[0][1] - 698.0).abs() < 1e-3, "got {}", bufs[0][1]);
+
         // The raw light was NOT placed, and no calibration folder exists.
-        let files: Vec<String> = walkdir(out.path())
-            .into_iter()
-            .map(|p| {
-                p.strip_prefix(out.path())
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect();
-        assert_eq!(files, vec!["My Set/camera_testcam/lights/c_light_10.fits"]);
+        assert_eq!(
+            files_under(out.path()),
+            vec!["My Set/camera_testcam/lights/c_light_10.fits"]
+        );
     }
 
     /// Minimal recursive file walker for the layout pin (avoids a walkdir dep).
@@ -1082,7 +1199,9 @@ mod tests {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {

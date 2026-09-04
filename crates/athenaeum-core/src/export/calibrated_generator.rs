@@ -24,7 +24,7 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use crate::calibration_library::cosmetic::{
-    apply_hot_pixel_correction, hot_pixel_map_from_dark, HotPixelMap,
+    apply_hot_pixel_correction, hot_pixel_map_from_dark, HotPixelMapOutcome,
 };
 use crate::calibration_library::light_cal::{
     calibrate_light_compute, resolve_flat_norm_divisor, scale_divisor_for_bitpix,
@@ -61,6 +61,12 @@ pub struct GeneratedLight {
     /// [`crate::calibration_library::cosmetic`] on why a degenerate dark
     /// yields an empty map instead of an error.
     pub hot_pixels_replaced: u64,
+    /// Non-fatal notes the run should show its operator: today, one line the
+    /// first time a master dark's hot-pixel map is refused (a degenerate dark,
+    /// or one that could not be read at all). Emitted on the MISS of the
+    /// caller's `hot_maps` cache only, so a dark shared by 200 lights produces
+    /// one line, not 200 — see [`execute_generation`].
+    pub warnings: Vec<String>,
     /// The catalog's SAMPLING xxh3 of the written file
     /// (`duplicates::compute_xxhash` — three 512 KB windows), the same digest
     /// the scanner stores for a file. NOT the full-file digest a package
@@ -395,9 +401,16 @@ pub fn resolve_generation_cached(
 /// replaced from same-colour neighbours — after interpolation the defect has
 /// already been smeared across three planes.
 ///
-/// `hot_maps` caches one map per master dark for the caller's whole batch:
-/// the map depends on the dark alone, and measuring it costs a full plane
-/// read plus two sorts, so a set sharing one dark pays that once.
+/// `hot_maps` caches one OUTCOME per master dark for the caller's whole batch:
+/// the answer depends on the dark alone, and measuring it costs a full plane
+/// read plus two sorts, so a set sharing one dark pays that once. Refusals and
+/// read failures are cached too — re-measuring a dark that already said no
+/// would cost the same read per frame and warn the operator once per frame.
+///
+/// A refused map is NOT a correction that found nothing: the output carries no
+/// `ATH_CHPX` card (the card would claim a pass that never ran) and the first
+/// frame to hit that dark returns the reason in
+/// [`GeneratedLight::warnings`] for the run to surface.
 ///
 /// The write is atomic (temp file + rename), so re-generating over an existing
 /// output replaces it in place rather than leaving a truncated file behind.
@@ -411,7 +424,7 @@ pub fn execute_generation(
     output_path: &Path,
     scratch_dir: &Path,
     opts: &CalibratedLightOptions,
-    hot_maps: &mut HashMap<PathBuf, Arc<HotPixelMap>>,
+    hot_maps: &mut HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
     cancel: &AtomicBool,
 ) -> anyhow::Result<GeneratedLight> {
     let (mut frame, outcome) = calibrate_light_compute(&spec.inputs, cancel)?;
@@ -420,27 +433,59 @@ pub fn execute_generation(
     // Only a master dark can say which pixels are defective, so a frame with
     // no dark applied is honestly skipped rather than guessed at.
     let mut hot_pixels_replaced = 0u64;
+    let mut warnings = Vec::new();
     let corrected = match (opts.hot_pixel_correction, &spec.dark_path) {
         (true, Some(dark)) => {
-            let map = match hot_maps.get(dark) {
-                Some(cached) => Arc::clone(cached),
+            // `newly_measured` is what keeps the refusal warning to ONE line
+            // per dark for the whole batch: only the frame that actually
+            // measured it reports it.
+            let (hit, newly_measured) = match hot_maps.get(dark) {
+                Some(cached) => (Arc::clone(cached), false),
                 None => {
-                    // A failure here fails the frame instead of degrading
-                    // quietly: the output would otherwise be uncorrected while
-                    // its ATH_CHPX card claimed "0 defects found".
-                    let built = Arc::new(hot_pixel_map_from_dark(dark, scratch_dir)?);
+                    // A read failure does not fail the frame: the light is
+                    // still calibrated, just without a cosmetic pass. It is
+                    // cached as a refusal for the same reason the degenerate
+                    // darks are — otherwise every frame in the batch pays the
+                    // failed read again and warns the operator again.
+                    let measured = match hot_pixel_map_from_dark(dark, scratch_dir) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %dark.display(),
+                                error = %format!("{e:#}"),
+                                "measuring the master dark failed — hot-pixel correction refused"
+                            );
+                            HotPixelMapOutcome::Refused(format!("measuring it failed: {e:#}"))
+                        }
+                    };
+                    let built = Arc::new(measured);
                     hot_maps.insert(dark.clone(), Arc::clone(&built));
-                    built
+                    (built, true)
                 }
             };
-            hot_pixels_replaced = apply_hot_pixel_correction(
-                &mut frame.data,
-                frame.width,
-                frame.height,
-                &map,
-                spec.cfa_geometry,
-            );
-            true
+            match &*hit {
+                HotPixelMapOutcome::Map(map) => {
+                    hot_pixels_replaced = apply_hot_pixel_correction(
+                        &mut frame.data,
+                        frame.width,
+                        frame.height,
+                        map,
+                        spec.cfa_geometry,
+                    );
+                    true
+                }
+                HotPixelMapOutcome::Refused(reason) => {
+                    if newly_measured {
+                        // Already logged at `warn!` where the refusal was
+                        // decided; this is the operator-facing half of it.
+                        warnings.push(format!(
+                            "Hot-pixel correction skipped for {}: {reason}",
+                            dark.display()
+                        ));
+                    }
+                    false
+                }
+            }
         }
         _ => false,
     };
@@ -509,6 +554,7 @@ pub fn execute_generation(
         hot_pixels_replaced,
         output_hash,
         byte_size,
+        warnings,
     })
 }
 
@@ -1042,7 +1088,135 @@ mod tests {
             1,
             "two frames sharing one dark must measure it once"
         );
-        assert_eq!(hot_maps.values().next().unwrap().len(), 2);
+        match &**hot_maps.values().next().unwrap() {
+            HotPixelMapOutcome::Map(m) => assert_eq!(m.len(), 2),
+            HotPixelMapOutcome::Refused(r) => panic!("the spiky dark must map: {r}"),
+        }
+    }
+
+    /// A REFUSED hot-pixel map must not be dressed up as a correction that
+    /// found nothing: no `ATH_CHPX` card at all (the card would claim a pass
+    /// that never ran), and one human-readable warning naming the dark.
+    ///
+    /// The refusal is also cached: a second light sharing the same dark neither
+    /// re-measures it nor repeats the warning, so a 200-frame set with one
+    /// degenerate dark reports ONE line.
+    #[test]
+    fn refused_hot_map_stamps_no_card_and_warns_once_per_dark() {
+        let dir = tempfile::tempdir().unwrap();
+        let light_a = write_plane(&dir.path().join("light_a.fits"), |_, _| 1000.0);
+        let light_c = write_plane(&dir.path().join("light_c.fits"), |_, _| 1200.0);
+        // Uniform: every pixel is the median, so MAD is 0 and the map is
+        // refused (the stacked integer-BITPIX master-dark signature).
+        let dark = write_plane(&dir.path().join("dark.fits"), |_, _| 300.0);
+        let conn = seed_db();
+        seed_light(&conn, 1, &light_a, None, None);
+        seed_light(&conn, 2, &light_c, None, None);
+        seed_master_set(&conn, 10, "Dark", &dark);
+        add_link(&conn, 1, 10, "Dark");
+        add_link(&conn, 2, 10, "Dark");
+
+        let opts = CalibratedLightOptions::default();
+        assert!(opts.hot_pixel_correction, "the pass is on by default");
+        let mut hot_maps = HashMap::new();
+        let mut generated = Vec::new();
+        for (frame_id, name) in [(1i64, "light_a.fits"), (2, "light_c.fits")] {
+            let spec = resolve_generation(&conn, frame_id, &opts, dir.path()).unwrap();
+            let out = dir.path().join(spec.output_filename(name));
+            let g = execute_generation(
+                &spec,
+                &out,
+                dir.path(),
+                &opts,
+                &mut hot_maps,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let header = FitsHeader::from_path(&out).unwrap();
+            assert_eq!(
+                header.get_i32("ATH_CHPX"),
+                None,
+                "{name}: a refused map must stamp no correction card"
+            );
+            assert_eq!(g.hot_pixels_replaced, 0, "{name}");
+            assert_eq!(g.calstat, "BD", "{name}: the frame is still calibrated");
+            generated.push(g);
+        }
+
+        assert_eq!(
+            generated[0].warnings.len(),
+            1,
+            "the first frame reports the refusal: {:?}",
+            generated[0].warnings
+        );
+        let warning = &generated[0].warnings[0];
+        assert!(
+            warning.contains(&dark.to_string_lossy().to_string()),
+            "the warning must name the dark: {warning}"
+        );
+        assert!(
+            warning.contains("zero MAD"),
+            "the warning must carry the reason: {warning}"
+        );
+        assert!(
+            generated[1].warnings.is_empty(),
+            "the cached refusal must not warn again: {:?}",
+            generated[1].warnings
+        );
+        assert_eq!(
+            hot_maps.len(),
+            1,
+            "a refused dark is measured once per batch, like a mapped one"
+        );
+    }
+
+    /// The other half of the distinction: a dark that WAS measured and held no
+    /// outlier stamps `ATH_CHPX = 0` — the correction ran and replaced nothing,
+    /// which is a different (and true) statement from "it was refused".
+    ///
+    /// Alternating 300/302 gives median 301 and MAD 1.0, so the threshold is
+    /// 315.8 and nothing in the plane comes near it.
+    #[test]
+    fn measured_dark_with_no_hits_still_stamps_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_plane(&dir.path().join("light_a.fits"), |_, _| 1000.0);
+        let dark = write_plane(&dir.path().join("dark.fits"), |x, y| {
+            if (x + y) % 2 == 0 {
+                300.0
+            } else {
+                302.0
+            }
+        });
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 10, "Dark", &dark);
+        add_link(&conn, 1, 10, "Dark");
+
+        let opts = CalibratedLightOptions::default();
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        let out = dir.path().join(spec.output_filename("light_a.fits"));
+        let generated = execute_generation(
+            &spec,
+            &out,
+            dir.path(),
+            &opts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(generated.hot_pixels_replaced, 0);
+        assert!(
+            generated.warnings.is_empty(),
+            "a measured dark is not a refusal: {:?}",
+            generated.warnings
+        );
+        let header = FitsHeader::from_path(&out).unwrap();
+        assert_eq!(
+            header.get_i32("ATH_CHPX"),
+            Some(0),
+            "the pass ran and replaced nothing — say so"
+        );
     }
 
     /// Resolving a light's flat-normalization divisor reads the master flat's

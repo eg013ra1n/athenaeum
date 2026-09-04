@@ -577,10 +577,14 @@ struct Generation {
     specs: std::collections::HashMap<i64, crate::export::GenerationSpec>,
     opts: CalibratedLightOptions,
     scratch_dir: PathBuf,
-    /// One hot-pixel map per master dark for the whole package — measuring one
-    /// costs a full plane read, and a frame set shares its dark.
-    hot_maps:
-        std::collections::HashMap<PathBuf, Arc<crate::calibration_library::cosmetic::HotPixelMap>>,
+    /// One hot-pixel outcome per master dark for the whole package — measuring
+    /// one costs a full plane read, and a frame set shares its dark. Refusals
+    /// are cached with the maps, so a degenerate dark is measured (and logged)
+    /// once per package rather than once per light.
+    hot_maps: std::collections::HashMap<
+        PathBuf,
+        Arc<crate::calibration_library::cosmetic::HotPixelMapOutcome>,
+    >,
 }
 
 /// A build with no pixel pipeline can never generate anything, so the type is
@@ -748,6 +752,12 @@ fn generate_payload(
         reason: format!("hash generated payload: {e:#}"),
         culprit: None,
     })?;
+    // A send has no per-file warning channel (its failure policy is
+    // all-or-nothing), so a non-fatal note — today only a refused hot-pixel map,
+    // raised once per master dark — is logged against the frame that met it.
+    for note in &generated.warnings {
+        tracing::warn!(frame_id, note = %note, "calibrated light staged with a warning");
+    }
     tracing::debug!(
         frame_id,
         dest = %dest.display(),

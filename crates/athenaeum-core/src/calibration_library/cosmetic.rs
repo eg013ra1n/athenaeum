@@ -27,7 +27,10 @@
 //! [`MAX_HOT_FRACTION`] of the plane is thrown away whole. Neither case can be
 //! rescued by clamping the threshold to something small: `median + ε` on a
 //! quantized dark flags every pixel one ADU above the median, which is a large
-//! fraction of the sensor.
+//! fraction of the sensor. A refusal is not an empty map: it comes back as
+//! [`HotPixelMapOutcome::Refused`] carrying its reason, so the caller can leave
+//! the `ATH_CHPX` card off the output (a count of zero would claim a correction
+//! that never ran) and tell the operator which dark was skipped and why.
 //!
 //! **Replacement is a neighbourhood median, and the neighbourhood is
 //! colour-aware.** On a mono frame the eight pixels of the 3x3 window measure
@@ -92,13 +95,32 @@ impl HotPixelMap {
     }
 }
 
+/// What measuring one master dark produced.
+///
+/// An empty [`Map`](HotPixelMapOutcome::Map) and a
+/// [`Refused`](HotPixelMapOutcome::Refused) are NOT the same answer, and the
+/// difference is what the output header says. An empty map means the dark was
+/// measured and held no outlier: the correction ran and replaced nothing, which
+/// is honestly `ATH_CHPX = 0`. A refusal means it was never measured — stamping
+/// a count there would claim a correction that did not happen, so the caller
+/// leaves the card off and reports the reason instead.
+#[derive(Debug, Clone)]
+pub enum HotPixelMapOutcome {
+    /// The dark's statistics held up; these are its hot pixels (possibly none).
+    Map(HotPixelMap),
+    /// No map could be trusted. Carries a short lowercase phrase naming why,
+    /// ready to compose into a user-facing line together with the dark's path.
+    Refused(String),
+}
+
 /// Read a master dark's full plane and flag every pixel reading above
 /// `median + HOT_SIGMA · 1.4826 · MAD`.
 ///
-/// Returns an EMPTY map — never an error — for the three degenerate cases a
-/// dark can present: a MAD of zero, a non-finite threshold, and a result over
-/// [`MAX_HOT_FRACTION`] of the plane. All three are logged; see the module docs
-/// for why refusing beats correcting on a threshold that cannot be trusted.
+/// Returns [`HotPixelMapOutcome::Refused`] — never an error — for the three
+/// degenerate cases a dark can present: a MAD of zero, a non-finite threshold,
+/// and a result over [`MAX_HOT_FRACTION`] of the plane. All three are logged at
+/// `warn!`; see the module docs for why refusing beats correcting on a threshold
+/// that cannot be trusted.
 ///
 /// The plane is band-streamed in (bounded working set) but the statistics need
 /// the whole distribution, so one plane plus one scratch copy is the memory
@@ -107,7 +129,7 @@ impl HotPixelMap {
 pub fn hot_pixel_map_from_dark(
     dark_path: &Path,
     scratch_dir: &Path,
-) -> Result<HotPixelMap, IntegrationError> {
+) -> Result<HotPixelMapOutcome, IntegrationError> {
     let (width, height, data) = read_full_plane(dark_path, scratch_dir)?;
     if width.saturating_mul(height) > u32::MAX as usize {
         return Err(IntegrationError::BadInput(format!(
@@ -132,24 +154,20 @@ pub fn hot_pixel_map_from_dark(
     let mad = median_of_sorted(&work);
     drop(work);
 
-    let empty = || HotPixelMap {
-        width,
-        height,
-        indices: Vec::new(),
-    };
-
     if mad == 0.0 {
         // More than half the plane reads exactly the median — the signature of
         // a stacked integer-BITPIX master dark whose noise quantizes to whole
         // ADU, not of a broken file. There is no spread to measure sigmas
         // against, and any small substitute threshold would flag every pixel
         // one ADU high, i.e. a large fraction of the sensor. No map.
-        tracing::debug!(
+        tracing::warn!(
             path = %dark_path.display(),
             median,
-            "zero mad in master dark — no pixels mapped"
+            "zero mad in master dark — hot-pixel correction refused"
         );
-        return Ok(empty());
+        return Ok(HotPixelMapOutcome::Refused(
+            "the master dark has no measurable spread (zero MAD)".to_string(),
+        ));
     }
 
     let threshold = median + HOT_SIGMA * MAD_TO_SIGMA * mad;
@@ -162,9 +180,11 @@ pub fn hot_pixel_map_from_dark(
             median,
             mad,
             threshold,
-            "hot-pixel threshold not finite — no pixels mapped"
+            "hot-pixel threshold not finite — hot-pixel correction refused"
         );
-        return Ok(empty());
+        return Ok(HotPixelMapOutcome::Refused(
+            "the hot-pixel threshold is not a finite number".to_string(),
+        ));
     }
 
     // Ascending by construction: a row-major scan visits indices in order.
@@ -185,9 +205,13 @@ pub fn hot_pixel_map_from_dark(
             path = %dark_path.display(),
             count = indices.len(),
             total,
-            "hot-pixel map exceeds the safety cap — no pixels mapped"
+            "hot-pixel map exceeds the safety cap — hot-pixel correction refused"
         );
-        return Ok(empty());
+        return Ok(HotPixelMapOutcome::Refused(format!(
+            "the map flagged {} of {total} pixels, over the {:.0}% safety cap",
+            indices.len(),
+            MAX_HOT_FRACTION * 100.0
+        )));
     }
 
     tracing::debug!(
@@ -200,11 +224,11 @@ pub fn hot_pixel_map_from_dark(
         count = indices.len(),
         "hot-pixel map built"
     );
-    Ok(HotPixelMap {
+    Ok(HotPixelMapOutcome::Map(HotPixelMap {
         width,
         height,
         indices,
-    })
+    }))
 }
 
 /// Replace every mapped pixel of `data` with the median of its neighbours,
@@ -338,6 +362,24 @@ mod tests {
         p
     }
 
+    /// The map a dark was expected to yield; panics (naming the reason) on a
+    /// refusal, so a test that meant to measure a dark cannot silently assert
+    /// against a refusal instead.
+    fn expect_map(outcome: HotPixelMapOutcome) -> HotPixelMap {
+        match outcome {
+            HotPixelMapOutcome::Map(m) => m,
+            HotPixelMapOutcome::Refused(reason) => panic!("expected a map, got refusal: {reason}"),
+        }
+    }
+
+    /// The reason a dark was expected to be refused for.
+    fn expect_refusal(outcome: HotPixelMapOutcome) -> String {
+        match outcome {
+            HotPixelMapOutcome::Refused(reason) => reason,
+            HotPixelMapOutcome::Map(m) => panic!("expected a refusal, got a map of {}", m.len()),
+        }
+    }
+
     fn rggb() -> CfaGeometry {
         CfaGeometry {
             pattern: Bayer::Rggb,
@@ -392,7 +434,7 @@ mod tests {
         assert_eq!(data.len(), w * h);
         let path = write_plane(dir.path(), "dark.fits", w, h, &data);
 
-        let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
+        let map = expect_map(hot_pixel_map_from_dark(&path, dir.path()).unwrap());
         assert!(!map.is_empty());
         assert_eq!(map.len(), 2);
         assert_eq!(map.indices, vec![126u32, 127u32]);
@@ -413,8 +455,11 @@ mod tests {
         data[100] = 5000.0;
         let path = write_plane(dir.path(), "flat_bg.fits", w, h, &data);
 
-        let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
-        assert!(map.is_empty(), "zero MAD must not produce a map");
+        let reason = expect_refusal(hot_pixel_map_from_dark(&path, dir.path()).unwrap());
+        assert!(
+            reason.contains("zero MAD"),
+            "the refusal must name what was degenerate: {reason}"
+        );
     }
 
     /// A map covering more than 5 % of the plane is not a defect population.
@@ -437,8 +482,11 @@ mod tests {
         );
         let path = write_plane(dir.path(), "over_flagged.fits", w, h, &data);
 
-        let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
-        assert!(map.is_empty(), "a map over the safety cap must be refused");
+        let reason = expect_refusal(hot_pixel_map_from_dark(&path, dir.path()).unwrap());
+        assert!(
+            reason.contains("20 of 128 pixels") && reason.contains("safety cap"),
+            "the refusal must show the count it refused: {reason}"
+        );
     }
 
     /// Mono replacement is the median of the eight 3x3 neighbours, and it
@@ -567,14 +615,36 @@ mod tests {
     /// The simplest MAD-0 case: every pixel identical, so there is no spread
     /// to measure sigmas against and no map to build.
     #[test]
-    fn uniform_dark_flags_nothing() {
+    fn uniform_dark_is_refused() {
         let dir = tempdir().unwrap();
         let (w, h) = (16usize, 8usize);
         let data = vec![300.0f32; w * h];
         let path = write_plane(dir.path(), "uniform.fits", w, h, &data);
 
-        let map = hot_pixel_map_from_dark(&path, dir.path()).unwrap();
-        assert!(map.is_empty());
+        let reason = expect_refusal(hot_pixel_map_from_dark(&path, dir.path()).unwrap());
+        assert!(reason.contains("zero MAD"), "{reason}");
+    }
+
+    /// A dark with a real spread but nothing above the threshold is NOT a
+    /// refusal: it was measured, and the honest answer is a map of zero
+    /// pixels. This is the case the caller stamps `ATH_CHPX = 0` for, and the
+    /// one a refusal must never be confused with.
+    ///
+    /// Alternating 300/302 over 128 pixels: the sorted plane's two middle
+    /// elements are 300 and 302, so `median = 301`; every deviation is 1.0, so
+    /// `MAD = 1.0` and `threshold = 301 + 10 · 1.4826 = 315.8`. No pixel comes
+    /// near it.
+    #[test]
+    fn measured_dark_with_no_outlier_is_a_map_not_a_refusal() {
+        let dir = tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let data: Vec<f32> = (0..w * h)
+            .map(|i| if i % 2 == 0 { 300.0 } else { 302.0 })
+            .collect();
+        let path = write_plane(dir.path(), "quiet.fits", w, h, &data);
+
+        let map = expect_map(hot_pixel_map_from_dark(&path, dir.path()).unwrap());
+        assert!(map.is_empty(), "nothing clears the threshold");
         assert_eq!(map.len(), 0);
     }
 }
