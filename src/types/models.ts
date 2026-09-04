@@ -609,12 +609,18 @@ unlinkedLights: number, rawSetsWithoutMaster: number,
  */
 rawSetIdsWithoutMaster: Array<number>, 
 /**
- * Distinct resolved master files (dark/flat/bias) this frame set's lights
- * would actually apply that no longer exist on disk — an archived or
- * moved master. The same stat `export::calibrated_generator::open_generation`
- * runs (via `sync_prepare`) before generating a single frame (C-2, review
- * fix), computed here too so the Export tab and the Send dialog refuse up
- * front instead of failing partway through a batch.
+ * Distinct resolved master files this frame set's lights would actually
+ * apply that no longer exist on disk — an archived or moved master. Dark
+ * and flat are always counted; the bias is counted ONLY when no dark
+ * resolved for that light — the raw-master-dark convention means the
+ * engine never reads a bias once a dark applies, so a bias file that is
+ * gone must not block a run that would never touch it (review fix #1).
+ * The same set `export::calibrated_generator::resolved_master_paths`
+ * computes is what `api::sync_prepare::open_generation` stats (C-2,
+ * review fix) before generating a single frame — computed here too so
+ * the Export tab and the Send dialog refuse up front instead of failing
+ * partway through a batch, and the two MUST keep counting the identical
+ * set.
  */
 missingMasterFiles: number, fileCounts: ExportFileCounts, };
 
