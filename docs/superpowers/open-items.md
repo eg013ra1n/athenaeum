@@ -99,6 +99,19 @@ owner run through the shipped Export tab or Transfers yet.
   for the compute slot, so the wait itself is visible). The model-level
   question — a separate generation slot, or resolving generation before the
   staging slot — is still open and is an owner call.
+- A flat deleted between readiness and preparation (the race window C-2 does
+  not close) fails inside `resolve_generation_cached`'s norm-divisor read with
+  a generic decode error rather than the C-2 "master file missing on disk"
+  sentence — the failure is still early and non-partial, and readiness
+  catches the case up front, so this is a message downgrade in a narrow race
+  window only. A per-frame stat between `resolve_frame_inputs` and the
+  divisor computation would close it.
+- `get_export_readiness` resolves masters per LIGHT with no per-set
+  memoization (`lights.rs:186-200`): a 500-light set runs `resolve_master` up
+  to ~1500 times for a handful of shared sets, on a UI path called on every
+  dialog open and mode switch. A `HashMap<i64, Option<String>>` memo would
+  cut it to one query per set. Deferred out of this wave by the minimal-scope
+  constraint.
 
 ### Transfer preparation + single-copy footprint (2026-08-30)
 

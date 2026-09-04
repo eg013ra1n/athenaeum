@@ -393,11 +393,22 @@ pub fn resolve_generation_cached(
     })
 }
 
-/// Every DISTINCT master path a resolved batch actually applies — dark, flat
-/// and bias, unioned across every spec (review fix C-2: a preflight existence
-/// check before generation starts). A frame set shares its masters (one dark
-/// covers a whole night), so a batch of specs collapses to a handful of paths
-/// worth stat-ing once each, never once per frame.
+/// Every DISTINCT master path a resolved batch RESOLVES — dark, flat and
+/// bias, unioned across every spec (review fix C-2: a preflight existence
+/// check before generation starts). This is every LINKED master, not every
+/// master the engine actually reads: a light linked to both a dark and a
+/// bias resolves both (`bias_path` comes straight from the resolved link,
+/// independent of `bias_applied`), even though the raw-master-dark
+/// convention means the engine never touches the bias plane once a dark
+/// applies (`Light − MasterDark` already removes the bias). Deliberate:
+/// readiness (`api::lights::compute_export_readiness`) unions the exact same
+/// three fields from the exact same link resolution, so this preflight and
+/// that gate must count the same set of files, or one could pass a batch the
+/// other would refuse. Honest consequence: a missing bias file blocks a send
+/// even when every one of its lights has a dark and would never read that
+/// bias. A frame set shares its masters (one dark covers a whole night), so a
+/// batch of specs collapses to a handful of paths worth stat-ing once each,
+/// never once per frame.
 pub fn resolved_master_paths(
     specs: &HashMap<i64, GenerationSpec>,
 ) -> std::collections::BTreeSet<PathBuf> {

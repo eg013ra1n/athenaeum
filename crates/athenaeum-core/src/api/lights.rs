@@ -155,9 +155,9 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
 
 /// Tally everything the mode gate needs for a frame set, for every mode at
 /// once: the lights with nothing linked, the raw calibration sets that still
-/// have no master, and what each mode would place. Pure DB work (no pixel I/O)
-/// — the export tree is collected once and feeds both raw-set readiness and the
-/// file counts.
+/// have no master, and what each mode would place. DB work plus one `stat`
+/// per distinct resolved master file (no pixel I/O) — the export tree is
+/// collected once and feeds both raw-set readiness and the file counts.
 ///
 /// **One source of truth for "which sets have no master".**
 /// `data_collector::raw_sets_without_master` is it, for BOTH strict modes: it

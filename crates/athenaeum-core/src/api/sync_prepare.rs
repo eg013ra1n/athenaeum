@@ -472,9 +472,14 @@ pub(crate) fn stage_records(
 
     // `checked_sub`, not a plain `-`: on a fresh container the monotonic clock
     // can be younger than `PROGRESS_MIN_INTERVAL`, and subtracting past its
-    // epoch panics. Falling back to `now()` just means the very first progress
-    // check treats the floor as already elapsed — the same "tick immediately"
-    // behavior a long-uptime process gets for free.
+    // epoch panics. The `now()` fallback is NOT "tick immediately" — it sets
+    // `last_tick` to right now, so the first `elapsed()` read comes back ~0
+    // and the very first progress tick is DELAYED by up to one interval
+    // instead of firing straight away. Acceptable only because the branch is
+    // near-unreachable outside that fresh-container window (the process has
+    // to be younger than `PROGRESS_MIN_INTERVAL` for this to trigger at all),
+    // and even then it costs one interval's worth of a late first tick, never
+    // a wrong one.
     let mut done_before: u64 = 0;
     let mut last_tick = Instant::now()
         .checked_sub(PROGRESS_MIN_INTERVAL)
