@@ -132,12 +132,6 @@ Spec `docs/superpowers/specs/2026-08-30-transfer-prepare-and-footprint-design.md
 
 #### Follow-ups surfaced by review (not smokes)
 
-- The sidebar Transfers mini-row keeps the `queued` chip beside a moving byte
-  fraction for the whole serve-import (`indexing`) phase, while `/transfers`
-  shows the `preparing` chip and the "indexing" subline — the panel's
-  `displayState` comes from the polled `OutboundSummary`, which has no
-  `indexing` label. Spec §7.1 asks for the same chip in both places; one-line
-  fix, held for final-review triage.
 - `set_transfer_paths` has no "keep this one" value on the wire (`Option<String>`
   means set-or-reset), so the UI resends the other folder's configured value and
   the backend re-validates it (`create_dir_all` + write probe). An unreachable
