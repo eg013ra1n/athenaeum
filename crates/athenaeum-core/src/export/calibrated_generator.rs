@@ -393,6 +393,23 @@ pub fn resolve_generation_cached(
     })
 }
 
+/// Every DISTINCT master path a resolved batch actually applies — dark, flat
+/// and bias, unioned across every spec (review fix C-2: a preflight existence
+/// check before generation starts). A frame set shares its masters (one dark
+/// covers a whole night), so a batch of specs collapses to a handful of paths
+/// worth stat-ing once each, never once per frame.
+pub fn resolved_master_paths(
+    specs: &HashMap<i64, GenerationSpec>,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    for spec in specs.values() {
+        paths.extend(spec.inputs.dark_path.clone());
+        paths.extend(spec.inputs.flat_path.clone());
+        paths.extend(spec.inputs.bias_path.clone());
+    }
+    paths
+}
+
 /// Pixel phase: calibrate, repair, optionally debayer, write. No database.
 ///
 /// Stage order is not arbitrary. The cosmetic pass runs on the CALIBRATED

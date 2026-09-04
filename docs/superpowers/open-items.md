@@ -91,6 +91,14 @@ owner run through the shipped Export tab or Transfers yet.
   standalone flow are uncataloged leftovers on disk — this cycle deliberately does
   not migrate or delete them (spec §2). Manual cleanup, at the owner's
   convenience, whenever the library root gets tidied.
+- `sync_prepare::spawn_prepare` holds the ONE staging slot for the WHOLE
+  generation phase of a calibrated-lights send (minutes, not seconds) — a
+  second send meanwhile sits in `preparing` at 0 bytes with no progress event
+  of its own (fixed in the review-fix wave: it now announces itself with the
+  row's known byte total before trying for the slot, and again before trying
+  for the compute slot, so the wait itself is visible). The model-level
+  question — a separate generation slot, or resolving generation before the
+  staging slot — is still open and is an owner call.
 
 ### Transfer preparation + single-copy footprint (2026-08-30)
 

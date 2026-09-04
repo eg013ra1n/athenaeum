@@ -13,8 +13,8 @@ pub mod project_collector;
 
 #[cfg(feature = "render")]
 pub use calibrated_generator::{
-    execute_generation, resolve_generation, resolve_generation_cached, DivisorCache, GeneratedLight,
-    GenerationSpec,
+    execute_generation, resolve_generation, resolve_generation_cached, resolved_master_paths,
+    DivisorCache, GeneratedLight, GenerationSpec,
 };
 // The generator's run options and its output-naming rule live in `models`, not
 // behind the `render` gate: the ungated mode transform names those files and

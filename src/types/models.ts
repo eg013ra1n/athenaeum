@@ -607,7 +607,16 @@ unlinkedLights: number, rawSetsWithoutMaster: number,
  * Ascending, so the tab's `→ Coverage` deep link (`[0]`) is stable across
  * refetches.
  */
-rawSetIdsWithoutMaster: Array<number>, fileCounts: ExportFileCounts, };
+rawSetIdsWithoutMaster: Array<number>, 
+/**
+ * Distinct resolved master files (dark/flat/bias) this frame set's lights
+ * would actually apply that no longer exist on disk — an archived or
+ * moved master. The same stat `export::calibrated_generator::open_generation`
+ * runs (via `sync_prepare`) before generating a single frame (C-2, review
+ * fix), computed here too so the Export tab and the Send dialog refuse up
+ * front instead of failing partway through a batch.
+ */
+missingMasterFiles: number, fileCounts: ExportFileCounts, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

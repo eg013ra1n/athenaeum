@@ -25,7 +25,7 @@ use crate::services::ServiceContext;
 use crate::sharing::types::NodeId;
 use crate::sync::engine::SyncEngineHandle;
 use crate::sync::receiver::{SyncFileProgressEvent, SyncFinishedEvent, SyncProgressEvent};
-use crate::sync::store::{CatalogSyncStore, SyncStore};
+use crate::sync::store::{outbound_file_counts, CatalogSyncStore, SyncStore};
 use crate::sync::{node_id_hex, Direction, OutboundState, SyncSenderRuntime};
 
 /// Floor between two progress events of the same kind. Staging a package reads
@@ -96,6 +96,60 @@ impl PrepareError {
     }
 }
 
+/// The row's byte total, already computed by `enqueue_preparing` into
+/// `sync_outbound_files` before this worker ever ran — read back rather than
+/// recomputed, so the "queued behind another slot" signal (C-1) shows the
+/// real total even before staging (or a generated payload's size correction)
+/// has started. A read failure emits `0` rather than blocking the signal on a
+/// store that will answer at the very next poll anyway.
+fn preparing_bytes_total(ctx: &ServiceContext, id: i64) -> u64 {
+    let store = match sync_store(ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(package_id = id, error = %format!("{e:#}"), "prepare: cannot open store; bytes_total unknown for the preparing signal");
+            return 0;
+        }
+    };
+    let conn = store.lock_conn();
+    match outbound_file_counts(&conn, &[id]) {
+        Ok(map) => map.get(&id).map(|c| c.total_bytes).unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(package_id = id, error = %format!("{e:#}"), "prepare: reading bytes_total for the preparing signal failed");
+            0
+        }
+    }
+}
+
+/// One `sync-progress { stage: "preparing", bytesDone: 0, bytesTotal }` event —
+/// the "still queued, nothing moving yet" signal shared by C-1's two call
+/// sites: once from `spawn_prepare` itself, before it tries for the shared
+/// staging slot, and again from inside `open_generation`, before it tries for
+/// the compute slot. Same shape both times, on purpose: the UI already renders
+/// this as a byte fraction, and a second, differently-shaped tick would only
+/// make the bar jump.
+fn emit_preparing_progress(
+    emitter: &dyn ProgressEmitter,
+    id: i64,
+    peer: NodeId,
+    frame_count: u32,
+    bytes_total: u64,
+) {
+    emit_event(
+        emitter,
+        "sync-progress",
+        &SyncProgressEvent {
+            package_id: id.to_string(),
+            direction: Direction::Sent,
+            stage: "preparing".to_string(),
+            peer_device: node_id_hex(&peer),
+            frame_count,
+            project_id: None,
+            bytes_done: Some(0),
+            bytes_total: Some(bytes_total),
+        },
+    );
+}
+
 /// Fire-and-forget: acquires the single preparation slot, stages on a blocking
 /// thread, then flips the row and drives it — or terminalizes it.
 ///
@@ -114,6 +168,14 @@ pub fn spawn_prepare(ctx: Arc<ServiceContext>, sender: Arc<SyncSenderRuntime>, j
     let engine = Arc::clone(&job.engine);
     let emitter = job.emitter.clone();
     tokio::spawn(async move {
+        // C-1: a preparation parked behind another one's staging slot would
+        // otherwise sit silent — no bytes moving, no event, nothing in the
+        // row to say why. Say so now, with the row's own known byte total,
+        // before we even try for the slot.
+        if let Some(em) = emitter.as_deref() {
+            let bytes_total = preparing_bytes_total(&ctx, id);
+            emit_preparing_progress(em, id, peer, job.records.len() as u32, bytes_total);
+        }
         let _permit = match slot.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
@@ -401,13 +463,22 @@ pub(crate) fn stage_records(
         .iter()
         .any(|(s, _)| matches!(s, PrepareSource::Generate { .. }))
     {
-        Some(open_generation(ctx, id, records, gen_opts, flag)?)
+        Some(open_generation(
+            ctx, id, peer, records, gen_opts, emitter, flag,
+        )?)
     } else {
         None
     };
 
+    // `checked_sub`, not a plain `-`: on a fresh container the monotonic clock
+    // can be younger than `PROGRESS_MIN_INTERVAL`, and subtracting past its
+    // epoch panics. Falling back to `now()` just means the very first progress
+    // check treats the floor as already elapsed — the same "tick immediately"
+    // behavior a long-uptime process gets for free.
     let mut done_before: u64 = 0;
-    let mut last_tick = Instant::now() - PROGRESS_MIN_INTERVAL;
+    let mut last_tick = Instant::now()
+        .checked_sub(PROGRESS_MIN_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut staged_hashes: Vec<(String, u64)> = Vec::with_capacity(records.len());
     for (src, record) in records.iter() {
         let dest = pkg_dir.join(&record.rel_path);
@@ -416,7 +487,9 @@ pub(crate) fn stage_records(
         // Copied, not borrowed: `done_before` is fixed for the duration of this
         // file and is advanced after the closure is gone.
         let base = done_before;
-        let mut file_last = Instant::now() - PROGRESS_MIN_INTERVAL;
+        let mut file_last = Instant::now()
+            .checked_sub(PROGRESS_MIN_INTERVAL)
+            .unwrap_or_else(Instant::now);
         let (xxh3, real_size) = match src {
             PrepareSource::Copy(path) => {
                 let mut on_progress = |file_done: u64| {
@@ -607,8 +680,10 @@ enum Generation {}
 fn open_generation(
     ctx: &ServiceContext,
     id: i64,
+    peer: NodeId,
     records: &[(PrepareSource, ManifestRecord)],
     gen_opts: Option<&CalibratedLightOptions>,
+    emitter: Option<&Arc<dyn ProgressEmitter>>,
     flag: &Arc<AtomicBool>,
 ) -> Result<Generation, PrepareError> {
     use crate::services::compute_queue::ComputeJobKind;
@@ -626,6 +701,15 @@ fn open_generation(
             culprit: None,
         }
     })?;
+    // C-1: waiting for the compute slot is its own kind of parked — one
+    // already-running generation can hold it for minutes — so it gets the
+    // same signal the shared staging slot does, right before the wait that
+    // can make it necessary.
+    tracing::info!(package_id = id, "prepare: waiting for the compute slot");
+    if let Some(em) = emitter {
+        let bytes_total = preparing_bytes_total(ctx, id);
+        emit_preparing_progress(em.as_ref(), id, peer, records.len() as u32, bytes_total);
+    }
     let _permit = match ctx.compute_queue.acquire(
         ComputeJobKind::LightCalibration,
         &format!("Transfer — calibrate lights (send {id})"),
@@ -680,6 +764,26 @@ fn open_generation(
         flat_divisors = divisors.len(),
         "calibrated-light generation planned for a transfer"
     );
+
+    // C-2: stat every DISTINCT resolved master (dark/flat/bias) before a
+    // single frame is generated. A batch's masters are shared across its
+    // lights, so this is a handful of stats, not one per frame — and it must
+    // happen here, before the loop in `stage_records` writes anything, so a
+    // missing/archived master fails the WHOLE preparation up front rather
+    // than partway through the package dir.
+    for path in crate::export::resolved_master_paths(&specs) {
+        if std::fs::metadata(&path).is_err() {
+            tracing::error!(path = %path.display(), "prepare: master file missing");
+            return Err(PrepareError::Failed {
+                reason: format!(
+                    "master file missing on disk: {} (archived or moved — restore it, then send again)",
+                    path.display()
+                ),
+                culprit: None,
+            });
+        }
+    }
+
     Ok(Generation {
         _permit,
         specs,
@@ -693,8 +797,10 @@ fn open_generation(
 fn open_generation(
     _ctx: &ServiceContext,
     _id: i64,
+    _peer: NodeId,
     _records: &[(PrepareSource, ManifestRecord)],
     _gen_opts: Option<&CalibratedLightOptions>,
+    _emitter: Option<&Arc<dyn ProgressEmitter>>,
     _flag: &Arc<AtomicBool>,
 ) -> Result<Generation, PrepareError> {
     // Unreachable: no headless producer mints a `Generate` record (composing
@@ -1100,6 +1206,160 @@ mod tests {
         )
     }
 
+    /// A second light (frame 11, file id 3) sharing `seed()`'s master dark —
+    /// used only by the mid-generation cancel test, which cancels BETWEEN two
+    /// lights' generations rather than during either one's own (tiny,
+    /// single-band) pixel loop.
+    fn seed_second_light(ctx: &ServiceContext, dir: &Path) -> PathBuf {
+        let light = dir.join("L_11.fits");
+        write_plane(&light, |_, _| 1000.0);
+        let handle = db(ctx).unwrap();
+        let conn: &Connection = &handle.conn();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (3, ?1, ?2, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                light.to_string_lossy(),
+                light.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs, uuid)
+             VALUES (11, 3, 'Light', 'TestCam', 'M31', '2026-07-05T20:31:00Z', 'uuid-11')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (11, 'frame', 100, 'Dark', '2026-07-05T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        light
+    }
+
+    /// [`generate_record`] with an explicit `frame_id`, for a batch of more
+    /// than one generated light.
+    fn generate_record_for(
+        frame_id: i64,
+        rel_path: &str,
+        estimate: u64,
+    ) -> (PrepareSource, ManifestRecord) {
+        (
+            PrepareSource::Generate { frame_id },
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("artifact-uuid-{frame_id}"),
+                origin_catalog_uuid: format!("artifact-uuid-{frame_id}"),
+                origin_device: "ab".repeat(32),
+                payload_kind: PayloadKind::CalibratedLight,
+                rel_path: rel_path.to_string(),
+                byte_size: estimate,
+                xxh3: String::new(),
+                frame_meta: serde_json::json!({}),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            },
+        )
+    }
+
+    /// A `Copy` record for a real on-disk file — the C-1 signal test does not
+    /// need the calibration engine at all, only a preparation with SOMETHING
+    /// to stage once the shared slot is free.
+    fn copy_record(rel_path: &str, path: &Path, byte_size: u64) -> (PrepareSource, ManifestRecord) {
+        (
+            PrepareSource::Copy(path.to_path_buf()),
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: "uuid-1".to_string(),
+                origin_catalog_uuid: "uuid-1".to_string(),
+                origin_device: "ab".repeat(32),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: rel_path.to_string(),
+                byte_size,
+                xxh3: String::new(),
+                frame_meta: serde_json::json!({}),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            },
+        )
+    }
+
+    /// A working `SyncEngineHandle` bound to `ctx`'s own sync store, over a
+    /// fresh in-process loopback transport, addressed at a NEVER-STARTED peer.
+    /// Enough for `PrepareJob.engine` to exist for a `spawn_prepare` test;
+    /// neither test that uses it drives a package to completion (both assert
+    /// on the row before that could happen), so a `drive` reaching for an
+    /// unstarted peer is harmless — logged, never awaited on.
+    fn test_engine(ctx: &ServiceContext) -> (Arc<crate::sync::engine::SyncEngineHandle>, NodeId) {
+        let store: Arc<dyn SyncStore> = Arc::new(sync_store(ctx).unwrap());
+        let net = crate::sharing::loopback::LoopbackNetwork::new();
+        let sender_transport = Arc::new(net.endpoint());
+        let dest_peer = net.endpoint().node_id();
+        (
+            Arc::new(crate::sync::engine::SyncEngine::spawn(
+                store,
+                sender_transport,
+                dest_peer,
+            )),
+            dest_peer,
+        )
+    }
+
+    /// Records every emitted `(event_name, payload)` — mirrors
+    /// `sync::engine_tests::CapturingEmitter`, private to that file.
+    #[derive(Default)]
+    struct CapturingEmitter(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
+    impl crate::events::ProgressEmitter for CapturingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((event_name.to_string(), payload));
+        }
+    }
+    impl CapturingEmitter {
+        fn named(&self, name: &str) -> Vec<serde_json::Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+    }
+
+    /// Sets the preparation's own cancel flag the moment it sees the SECOND
+    /// light's "about to generate" tick (`sync-file-progress`, `bytesDone ==
+    /// 0`) — the same reacting-emitter shape `api::sync::CancelWhenStaged`
+    /// uses for the copy path, aimed one step earlier: frame 1 finishes
+    /// generating uncancelled, and frame 2's very first (only, for this
+    /// 16x16 fixture) band-loop check inside the engine observes the flag
+    /// already raised — genuinely mid-generation, not at admission.
+    struct CancelBeforeSecondGenerate {
+        sender: Arc<SyncSenderRuntime>,
+        id: i64,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::events::ProgressEmitter for CancelBeforeSecondGenerate {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            if event_name != "sync-file-progress" {
+                return;
+            }
+            if payload.get("bytesDone").and_then(|v| v.as_u64()) != Some(0) {
+                return;
+            }
+            if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 2 {
+                self.sender.prepare().cancel(self.id);
+            }
+        }
+    }
+
     /// The whole point of the task: a `Generate` record puts CALIBRATED bytes in
     /// the package under the `c_` name — not a copy of the raw light — and the
     /// manifest describes what actually landed (full-file hash + real size), so
@@ -1210,6 +1470,50 @@ mod tests {
         assert!(!pkg_dir.join(rel).exists());
     }
 
+    /// C-2: a resolved master whose FILE was deleted (archived or moved — the
+    /// catalog row is untouched) fails the WHOLE preparation early, before a
+    /// single output file lands in the package dir. Reuses `seed()`'s fixture
+    /// and removes its master dark from disk.
+    #[test]
+    fn stage_records_fails_early_on_a_missing_master_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let light = seed(&ctx, tmp.path());
+        let estimate = std::fs::metadata(&light).unwrap().len();
+        std::fs::remove_file(tmp.path().join("master_dark.fits")).unwrap();
+
+        let rel = "camera_testcam/lights/c_L_10.fits";
+        let mut records = vec![generate_record(rel, estimate)];
+        let pkg_dir = tmp.path().join("packages").join("pkg-missing-master");
+        let flag = Arc::new(AtomicBool::new(false));
+        let err = stage_records(
+            &ctx,
+            0,
+            [0u8; 32],
+            &pkg_dir,
+            &mut records,
+            Some(&CalibratedLightOptions::default()),
+            None,
+            &flag,
+        )
+        .err()
+        .expect("a missing master must fail the whole preparation");
+        assert!(
+            matches!(err, PrepareError::Failed { .. }),
+            "{}",
+            err.describe()
+        );
+        assert!(
+            err.describe().contains("master file missing"),
+            "{}",
+            err.describe()
+        );
+        assert!(
+            !pkg_dir.join(rel).exists(),
+            "nothing partial lands when a master is missing"
+        );
+    }
+
     /// A plan that generates without options is refused rather than calibrated
     /// with defaults the user never chose. Unreachable through the API; the
     /// failure text is what a developer would see if it ever became reachable.
@@ -1240,5 +1544,162 @@ mod tests {
             "{}",
             err.describe()
         );
+    }
+
+    /// C-1 items 1 and 4: a preparation that has to wait for the shared
+    /// staging slot is not silent while it waits — it announces the row's own
+    /// known byte total before it ever tries for the slot, so a second send
+    /// queued behind another one shows a byte fraction instead of nothing at
+    /// all. The test holds the slot itself, so any event `spawn_prepare`
+    /// emits before releasing it necessarily happened before the wait.
+    #[tokio::test]
+    async fn spawn_prepare_emits_preparing_signal_before_the_slot() {
+        use crate::sharing::types::{AnnounceFileEntry, PackageLayout};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
+
+        let src = tmp.path().join("L_1.fits");
+        std::fs::write(&src, vec![7u8; 4096]).unwrap();
+        let rel = "camera_testcam/lights/L_1.fits";
+        let pkg_dir = tmp.path().join("packages").join("pkg-parked");
+
+        let (engine, dest_peer) = test_engine(&ctx);
+        let store = sync_store(&ctx).unwrap();
+        let id = store
+            .enqueue_preparing(
+                &pkg_dir.to_string_lossy(),
+                dest_peer,
+                Some("M31"),
+                &[AnnounceFileEntry {
+                    rel_path: rel.to_string(),
+                    byte_size: 4096,
+                    frame_uuid: "uuid-1".to_string(),
+                }],
+                PackageLayout::Batch,
+            )
+            .unwrap();
+
+        let emitter = Arc::new(CapturingEmitter::default());
+        let sender = Arc::new(SyncSenderRuntime::new());
+        // Hold the ONE staging slot ourselves: `spawn_prepare`'s task must
+        // wait for it, so anything it emits from THIS test happened before
+        // that wait, not after.
+        let held = sender.prepare().slot().acquire_owned().await.unwrap();
+
+        let job = PrepareJob {
+            id,
+            peer: dest_peer,
+            pkg_dir: pkg_dir.clone(),
+            records: vec![copy_record(rel, &src, 4096)],
+            gen_opts: None,
+            bank: Vec::new(),
+            engine,
+            emitter: Some(Arc::clone(&emitter) as Arc<dyn ProgressEmitter>),
+        };
+        spawn_prepare(Arc::clone(&ctx), Arc::clone(&sender), job);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tick = loop {
+            if let Some(t) = emitter
+                .named("sync-progress")
+                .into_iter()
+                .find(|e| e["stage"] == "preparing")
+            {
+                break t;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no preparing signal arrived while parked behind the slot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(tick["bytesDone"], serde_json::json!(0));
+        assert_eq!(tick["bytesTotal"], serde_json::json!(4096));
+
+        drop(held);
+    }
+
+    /// Sync Minor: a cancel raised WHILE generation is under way (between two
+    /// lights in the same batch — not before admission, which
+    /// `stage_records_generation_honours_a_cancel` already covers) maps to
+    /// `PrepareError::Cancelled`, and the ROW it belongs to settles
+    /// `cancelled` — never `failed`, which is what a mismapped
+    /// `IntegrationError::Cancelled` would produce.
+    #[tokio::test]
+    async fn mid_generation_cancel_ends_the_row_cancelled_not_failed() {
+        use crate::sharing::types::{AnnounceFileEntry, PackageLayout};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
+        let light1 = seed(&ctx, tmp.path());
+        let light2 = seed_second_light(&ctx, tmp.path());
+        let est1 = std::fs::metadata(&light1).unwrap().len();
+        let est2 = std::fs::metadata(&light2).unwrap().len();
+
+        let rel1 = "camera_testcam/lights/c_L_10.fits";
+        let rel2 = "camera_testcam/lights/c_L_11.fits";
+        let pkg_dir = tmp.path().join("packages").join("pkg-mid-cancel");
+
+        let (engine, dest_peer) = test_engine(&ctx);
+        let store = sync_store(&ctx).unwrap();
+        let id = store
+            .enqueue_preparing(
+                &pkg_dir.to_string_lossy(),
+                dest_peer,
+                Some("M31 calibrated"),
+                &[
+                    AnnounceFileEntry {
+                        rel_path: rel1.to_string(),
+                        byte_size: est1,
+                        frame_uuid: "artifact-uuid-10".to_string(),
+                    },
+                    AnnounceFileEntry {
+                        rel_path: rel2.to_string(),
+                        byte_size: est2,
+                        frame_uuid: "artifact-uuid-11".to_string(),
+                    },
+                ],
+                PackageLayout::Batch,
+            )
+            .unwrap();
+
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let emitter = Arc::new(CancelBeforeSecondGenerate {
+            sender: Arc::clone(&sender),
+            id,
+            seen: Default::default(),
+        });
+
+        let job = PrepareJob {
+            id,
+            peer: dest_peer,
+            pkg_dir: pkg_dir.clone(),
+            records: vec![
+                generate_record_for(10, rel1, est1),
+                generate_record_for(11, rel2, est2),
+            ],
+            gen_opts: Some(CalibratedLightOptions::default()),
+            bank: Vec::new(),
+            engine,
+            emitter: Some(Arc::clone(&emitter) as Arc<dyn ProgressEmitter>),
+        };
+        spawn_prepare(Arc::clone(&ctx), Arc::clone(&sender), job);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let row = loop {
+            let row = sync_store(&ctx).unwrap().get_outbound(id).unwrap().unwrap();
+            if row.state == OutboundState::Cancelled || row.state == OutboundState::Failed {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "preparation did not terminate");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            row.state,
+            OutboundState::Cancelled,
+            "a mid-generation cancel is not a failure"
+        );
+        assert!(!pkg_dir.exists(), "the partial package dir is removed");
     }
 }

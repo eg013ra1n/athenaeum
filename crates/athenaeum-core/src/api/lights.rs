@@ -23,10 +23,14 @@
 //! `api/calibration.rs` inner-fn precedent); the public handler is a thin
 //! `ctx` → `conn` wrapper.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
+use crate::calibration_library::light_resolve::{link_set_id, resolve_master};
 use crate::db::calibration_links::get_links_for_frame;
 use crate::export::models::{ExportFileCounts, ExportMode};
 use crate::services::ServiceContext;
@@ -66,6 +70,13 @@ pub struct ExportReadiness {
     /// Ascending, so the tab's `→ Coverage` deep link (`[0]`) is stable across
     /// refetches.
     pub raw_set_ids_without_master: Vec<i64>,
+    /// Distinct resolved master files (dark/flat/bias) this frame set's lights
+    /// would actually apply that no longer exist on disk — an archived or
+    /// moved master. The same stat `export::calibrated_generator::open_generation`
+    /// runs (via `sync_prepare`) before generating a single frame (C-2, review
+    /// fix), computed here too so the Export tab and the Send dialog refuse up
+    /// front instead of failing partway through a batch.
+    pub missing_master_files: i64,
     pub file_counts: ExportFileCounts,
 }
 
@@ -128,6 +139,16 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
                 if n == 1 { "has" } else { "have" }
             ))
         }
+        // C-2: a set IS a built master, but its FILE is gone (archived or
+        // moved) — a different failure mode than the two blockers above, and
+        // one `open_generation` would otherwise only discover partway through
+        // generating the batch.
+        ExportMode::CalibratedLights if r.missing_master_files > 0 => {
+            let n = r.missing_master_files;
+            Err(format!(
+                "{n} master file(s) missing on disk — restore from archive first"
+            ))
+        }
         ExportMode::CalibratedLights => Ok(()),
     }
 }
@@ -153,12 +174,34 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
     // A light with no links of ANY type: nothing to subtract, nothing to
     // divide by. It is the one per-frame fact the export tree cannot state,
     // because a frame with no calibration contributes no set to walk.
+    //
+    // The same pass resolves every LINKED light's dark/flat/bias master —
+    // `link_set_id` + `resolve_master`, exactly the two calls
+    // `light_resolve::resolve_frame_inputs` makes for each of those three
+    // types — and collects the DISTINCT paths (C-2, review fix): readiness
+    // and `open_generation`'s own preflight must count the same files.
     let mut unlinked_lights = 0i64;
+    let mut master_paths: BTreeSet<PathBuf> = BTreeSet::new();
     for (frame_id, _filename) in members {
-        if get_links_for_frame(conn, frame_id)?.is_empty() {
+        let links = get_links_for_frame(conn, frame_id)?;
+        if links.is_empty() {
             unlinked_lights += 1;
+            continue;
+        }
+        for cal_type in ["Dark", "Flat", "Bias"] {
+            if let Some(set_id) = link_set_id(&links, cal_type) {
+                if let Some(master) = resolve_master(conn, set_id)
+                    .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
+                {
+                    master_paths.insert(PathBuf::from(master.path));
+                }
+            }
         }
     }
+    let missing_master_files = master_paths
+        .iter()
+        .filter(|p| std::fs::metadata(p).is_err())
+        .count() as i64;
 
     let data = crate::export::collect_export_data(conn, set_id)
         .map_err(|e| ApiError::Internal(format!("collect export data for readiness: {e:#}")))?;
@@ -173,6 +216,7 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
         total,
         unlinked_lights,
         raw_sets = raw_set_ids_without_master.len(),
+        missing_master_files,
         "export readiness computed"
     );
     Ok(ExportReadiness {
@@ -180,6 +224,7 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
         unlinked_lights,
         raw_sets_without_master: raw_set_ids_without_master.len() as i64,
         raw_set_ids_without_master,
+        missing_master_files,
         file_counts,
     })
 }
@@ -500,6 +545,7 @@ mod tests {
             unlinked_lights: 0,
             raw_sets_without_master: 0,
             raw_set_ids_without_master: vec![],
+            missing_master_files: 0,
             file_counts: Default::default(),
         };
         for mode in [
@@ -554,6 +600,21 @@ mod tests {
         };
         let msg = check_mode_ready(&one, ExportMode::CalibratedLights).unwrap_err();
         assert_eq!(msg, "1 light has no calibration links");
+
+        // A missing master FILE blocks only the calibrated-lights mode, with
+        // the C-2 sentence — every other blocker in `ready` is clear.
+        let missing = ExportReadiness {
+            missing_master_files: 2,
+            ..ready.clone()
+        };
+        assert!(check_mode_ready(&missing, ExportMode::LightsOnly).is_ok());
+        assert!(check_mode_ready(&missing, ExportMode::RawWithCalibrationSets).is_ok());
+        assert!(check_mode_ready(&missing, ExportMode::RawWithMasters).is_ok());
+        let msg = check_mode_ready(&missing, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(
+            msg,
+            "2 master file(s) missing on disk — restore from archive first"
+        );
     }
 
     /// A raw (non-master) calibration set with `n` member frames — the shape
@@ -647,6 +708,76 @@ mod tests {
         assert!(check_mode_ready(&r, ExportMode::RawWithMasters).is_err());
         assert!(check_mode_ready(&r, ExportMode::LightsOnly).is_ok());
         assert!(check_mode_ready(&r, ExportMode::RawWithCalibrationSets).is_ok());
+    }
+
+    /// A BUILT master set (`is_master_library = 1`) with one real member frame
+    /// whose file lives at `path` — real enough for `resolve_master` to return
+    /// `Some`, so the C-2 missing-file stat has something to stat (`seed_masters`'
+    /// Dark/Flat/Bias sets have no member frame at all, so they never resolve to
+    /// a path and never exercise this stat).
+    fn seed_master_with_file(
+        conn: &Connection,
+        set_id: i64,
+        imagetyp: &str,
+        path: &std::path::Path,
+    ) {
+        seed_set(conn, set_id, imagetyp, true);
+        let file_id = set_id * 100 + 8_000_000;
+        let frame_id = set_id * 100 + 8_500_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                path.to_string_lossy(),
+                format!("{imagetyp}_{set_id}.fits")
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?2, ?3, 1)",
+            params![frame_id, file_id, imagetyp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, frame_id],
+        )
+        .unwrap();
+    }
+
+    /// C-2: a light linked to a real BUILT master whose file has since been
+    /// archived or moved (the catalog row is intact; the disk is not) blocks
+    /// the calibrated-lights mode with the "restore from archive" sentence —
+    /// before `open_generation` would ever discover it partway through a batch
+    /// — and leaves every other mode untouched.
+    #[test]
+    fn missing_master_file_blocks_calibrated_mode() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let dark_path = tmp.path().join("master_dark.fits");
+        // Never written to disk: the catalog row points at a file that isn't
+        // there — the "archived or moved" shape, not a broken fixture.
+        seed_master_with_file(&conn, 100, "MasterDark", &dark_path);
+        add_link(&conn, 1, 100, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.unlinked_lights, 0, "the light IS linked");
+        assert_eq!(r.raw_sets_without_master, 0, "the set IS a built master");
+        assert_eq!(r.missing_master_files, 1);
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights).unwrap_err(),
+            "1 master file(s) missing on disk — restore from archive first"
+        );
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithCalibrationSets,
+            ExportMode::RawWithMasters,
+        ] {
+            assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
+        }
     }
 
     /// PARTIAL coverage is not a blocker: a light with only a master Dark
