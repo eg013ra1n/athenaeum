@@ -108,7 +108,6 @@ export function useScanProgress() {
               ? 'info'
               : 'success',
         });
-
       })
       .then((fn) => { if (cancelled) fn(); else completeUnlisten = fn; })
       .catch((err) => console.error('[useScanProgress] listen failed:', err));
