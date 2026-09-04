@@ -22,8 +22,8 @@
 //! Missing calibration levels are simply omitted (collapsed).
 
 use crate::export::models::{
-    sanitize_display_folder_name, sanitize_folder_name, CalibrationSetInfo, CalibrationSubgroup,
-    ExportData, ExportProgressEvent, WbppExportConfig,
+    calibrated_output_filename, sanitize_display_folder_name, sanitize_folder_name,
+    CalibrationSetInfo, CalibrationSubgroup, ExportData, ExportProgressEvent, WbppExportConfig,
 };
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -605,6 +605,13 @@ pub fn organize_files_wbpp(
                     Ok(notes) => {
                         files_organized += 1;
                         warnings.extend(notes);
+                        remove_stale_sibling(
+                            &dest_dir,
+                            &placement.file_path,
+                            &filename,
+                            debayer,
+                            &mut warnings,
+                        );
                         emit_progress(
                             files_organized as usize,
                             Some(&filename),
@@ -619,6 +626,12 @@ pub fn organize_files_wbpp(
                         if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
+                        tracing::warn!(
+                            frame_id,
+                            dest = %dest.display(),
+                            error = %format!("{e:#}"),
+                            "calibrated light generation failed — frame skipped"
+                        );
                         warnings.push(format!("Failed to calibrate {}: {:#}", filename, e));
                     }
                 }
@@ -630,6 +643,56 @@ pub fn organize_files_wbpp(
         files_organized,
         warnings,
     })
+}
+
+/// Delete the output the OTHER debayer setting would have written for the same
+/// source light, if an earlier export into this same folder left one behind.
+///
+/// The toggle decides the NAME (`c_x.fits` vs `c_x_d.fits`), so re-exporting a
+/// frame set with it flipped used to leave both files side by side and WBPP
+/// ingested the frame twice. Only that one sibling name, only in the directory
+/// just written, and only when the placed name is exactly the one this source
+/// maps to — a collision-suffixed placement (`c_x_2.fits`) belongs to a
+/// different frame's stem and must not have anything deleted on its behalf.
+///
+/// Both names come from [`calibrated_output_filename`] over the SAME source
+/// spelling, so the pair can never describe two different frames. A failure to
+/// remove is reported, never fatal: the export's own output is already written.
+fn remove_stale_sibling(
+    dest_dir: &Path,
+    source_path: &str,
+    placed_filename: &str,
+    debayer: bool,
+    warnings: &mut Vec<String>,
+) {
+    let Some(source_name) = Path::new(source_path).file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if calibrated_output_filename(source_name, debayer) != placed_filename {
+        return;
+    }
+    let sibling = dest_dir.join(calibrated_output_filename(source_name, !debayer));
+    if !sibling.exists() {
+        return;
+    }
+    match fs::remove_file(&sibling) {
+        Ok(()) => tracing::info!(
+            path = %sibling.display(),
+            "stale calibrated sibling removed"
+        ),
+        Err(e) => {
+            tracing::warn!(
+                path = %sibling.display(),
+                error = %e,
+                "stale calibrated sibling could not be removed"
+            );
+            warnings.push(format!(
+                "Could not remove {}, left by an earlier export with the other debayer setting: {}",
+                sibling.display(),
+                e
+            ));
+        }
+    }
 }
 
 /// Copy file or create symlink
@@ -1191,6 +1254,194 @@ mod tests {
         assert_eq!(
             files_under(out.path()),
             vec!["My Set/camera_testcam/lights/c_light_10.fits"]
+        );
+    }
+
+    /// Spec §11 failure isolation: one light that cannot be generated costs the
+    /// export that ONE frame and nothing else. The middle light's source file
+    /// is deleted after the batch resolves (resolution reads the catalog and
+    /// the header; the pixel phase is what fails), so the run must place the
+    /// other two, report exactly one warning naming the casualty, and return
+    /// `Ok` — an export that dies on frame 2 of 200 would be the real defect.
+    #[cfg(feature = "render")]
+    #[test]
+    fn generation_failure_isolates_one_frame() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let lights = [
+            (10i64, "light_10.fits"),
+            (11, "light_11.fits"),
+            (12, "light_12.fits"),
+        ];
+        let (conn, _dark) = seed_generation_fixture(src.path(), &lights, None);
+        let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), false);
+        drop(conn);
+
+        // One subgroup, so the placement order is the seeding order — this is
+        // what makes "the MIDDLE one fails" a statement about this batch.
+        let placed: Vec<String> = compute_wbpp_placements(&data)
+            .into_iter()
+            .map(|p| p.filename)
+            .collect();
+        assert_eq!(
+            placed,
+            vec!["c_light_10.fits", "c_light_11.fits", "c_light_12.fits"]
+        );
+
+        std::fs::remove_file(src.path().join("light_11.fits")).unwrap();
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let config = WbppExportConfig::default();
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            None,
+            1,
+            &cancel,
+            Some(&mut batch),
+        )
+        .expect("one unusable frame must not fail the export");
+
+        assert_eq!(result.files_organized, 2);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("c_light_11.fits"),
+            "the warning must name the frame that was skipped: {}",
+            result.warnings[0]
+        );
+        assert_eq!(
+            files_under(out.path()),
+            vec![
+                "My Set/camera_testcam/lights/c_light_10.fits",
+                "My Set/camera_testcam/lights/c_light_12.fits",
+            ]
+        );
+    }
+
+    /// A cancel raised while the batch is running stops it: the frames after
+    /// the cancelled one are never generated, and the run still returns `Ok`
+    /// (a cancel is not a failure) with no warning about the frame it dropped.
+    ///
+    /// The flag is raised from the progress emitter — the organizer announces
+    /// each light BEFORE calibrating it, so raising the flag on the second
+    /// announcement lands inside frame 2's own work, deterministically, with
+    /// no test-only hook in the generator and no thread racing the loop.
+    #[cfg(feature = "render")]
+    #[test]
+    fn cancel_mid_batch_stops_the_remaining_frames() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// Raises `cancel` the first time a DIFFERENT file is announced, i.e.
+        /// when the organizer starts the second light.
+        struct CancelOnSecondFrame {
+            cancel: Arc<AtomicBool>,
+            first: Mutex<Option<String>>,
+        }
+        impl crate::events::ProgressEmitter for CancelOnSecondFrame {
+            fn emit_json(&self, _event: &str, payload: serde_json::Value) {
+                let Some(file) = payload.get("currentFile").and_then(|v| v.as_str()) else {
+                    return;
+                };
+                let mut first = self.first.lock().unwrap();
+                match first.as_deref() {
+                    None => *first = Some(file.to_string()),
+                    Some(seen) if seen != file => self.cancel.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+        }
+
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let lights = [
+            (10i64, "light_10.fits"),
+            (11, "light_11.fits"),
+            (12, "light_12.fits"),
+        ];
+        let (conn, _dark) = seed_generation_fixture(src.path(), &lights, None);
+        let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), false);
+        drop(conn);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitter = CancelOnSecondFrame {
+            cancel: Arc::clone(&cancel),
+            first: Mutex::new(None),
+        };
+        let config = WbppExportConfig::default();
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            Some(&emitter),
+            1,
+            &cancel,
+            Some(&mut batch),
+        )
+        .expect("a cancel is not an export failure");
+
+        assert!(cancel.load(Ordering::Relaxed), "the emitter never fired");
+        assert_eq!(
+            result.files_organized, 1,
+            "only the frame that finished before the cancel counts"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "a cancelled frame is not a warning the operator needs: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            files_under(out.path()),
+            vec!["My Set/camera_testcam/lights/c_light_10.fits"],
+            "the third light must never be generated"
+        );
+    }
+
+    /// Flipping the debayer toggle changes the output NAME, so a re-export into
+    /// the same folder used to leave BOTH `c_x_d.fits` and `c_x.fits` there and
+    /// WBPP ingested the frame twice. The second run must clear the sibling the
+    /// first one wrote.
+    #[cfg(feature = "render")]
+    #[test]
+    fn flipping_debayer_removes_the_stale_sibling() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        // An OSC light, so the debayer toggle actually changes the name.
+        let (conn, _dark) =
+            seed_generation_fixture(src.path(), &[(10, "light_10.fits")], Some("RGGB"));
+        let config = WbppExportConfig::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        for debayer in [true, false] {
+            let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), debayer);
+            let result = organize_files_wbpp(
+                out.path(),
+                &data,
+                false,
+                &config,
+                None,
+                1,
+                &cancel,
+                Some(&mut batch),
+            )
+            .unwrap();
+            assert_eq!(result.files_organized, 1, "{:?}", result.warnings);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        }
+
+        assert_eq!(
+            files_under(out.path()),
+            vec!["My Set/camera_testcam/lights/c_light_10.fits"],
+            "the debayered output of the first run must not survive the second"
         );
     }
 
