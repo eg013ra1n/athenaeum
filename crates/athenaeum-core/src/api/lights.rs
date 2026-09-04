@@ -854,12 +854,23 @@ mod tests {
         assert!(check_mode_ready(&r, ExportMode::CalibratedLights).is_ok());
     }
 
-    /// Same shape, but the light has NO dark link at all — the engine falls
-    /// back to the bias, so its missing file DOES block. Together with the
-    /// test above this pins the exact rule: bias inclusion keys on the
-    /// RESOLVED DARK PATH, not on whether a Dark link exists.
+    /// Same shape, but the Dark LINK exists and points at a RAW, unbuilt set
+    /// — `link_set_id` says `Some`, `resolve_master` says `None` — so the
+    /// engine falls back to the bias, whose missing file must still block.
+    ///
+    /// This is the case that actually discriminates the rule. A test that
+    /// instead seeds NO Dark link at all (the previous shape of this test)
+    /// stays green even under the WRONG condition
+    /// (`link_set_id(&links, "Dark").is_some()`), because "no link" and "a
+    /// link that fails to resolve" both make that wrong condition false —
+    /// the two rules only disagree on THIS shape, where the light IS linked
+    /// but the link is to an unbuilt set. A raw Dark link also trips the
+    /// UNRELATED `raw_sets_without_master` blocker (asserted first, its own
+    /// coverage is `raw_linked_set_blocks_with_build_masters_message`), so
+    /// this test reads `missing_master_files` directly rather than
+    /// `check_mode_ready`'s message, which the other blocker would own.
     #[test]
-    fn missing_bias_file_blocks_when_no_dark_applies() {
+    fn missing_bias_file_blocks_when_dark_link_is_unbuilt() {
         let conn = seed_db();
         let session = seed_frame_set(&conn, 1);
         seed_light(&conn, 1, session);
@@ -867,13 +878,19 @@ mod tests {
         let bias_path = tmp.path().join("master_bias.fits");
         // Never written to disk.
         seed_master_with_file(&conn, 102, "MasterBias", &bias_path);
+        let raw_dark = seed_raw_set_with_frames(&conn, 200, "Dark", 1);
+        add_link(&conn, 1, raw_dark, "Dark");
         add_link(&conn, 1, 102, "Bias");
 
         let r = compute_export_readiness(&conn, 1).unwrap();
-        assert_eq!(r.missing_master_files, 1, "no dark applies — bias IS read");
         assert_eq!(
-            check_mode_ready(&r, ExportMode::CalibratedLights).unwrap_err(),
-            "1 master file(s) missing on disk — restore from archive first"
+            r.raw_sets_without_master, 1,
+            "the Dark link IS there — just unbuilt"
+        );
+        assert_eq!(
+            r.missing_master_files, 1,
+            "resolve_master(dark) returned None, so the bias fallback \
+             applies and its missing file must still be counted"
         );
     }
 

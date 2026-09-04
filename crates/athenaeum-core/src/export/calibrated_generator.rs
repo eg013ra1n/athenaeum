@@ -56,13 +56,20 @@ pub struct GeneratedLight {
     pub calstat: String,
     /// Whether the output is planar RGB rather than the source mosaic.
     pub debayered: bool,
-    /// How many pixels the cosmetic pass replaced. `0` in two DIFFERENT
-    /// shapes that this field alone cannot tell apart: the map was measured
-    /// and genuinely found nothing (the output still carries `ATH_CHPX = 0`),
-    /// or the master dark was REFUSED (zero MAD, over the safety cap, or
-    /// unreadable — [`crate::calibration_library::cosmetic`]), in which case
-    /// no pass ran at all, the output carries no `ATH_CHPX` card, and the
-    /// refusal is reported once via `warnings` below instead.
+    /// How many pixels the cosmetic pass replaced. `0` in THREE different
+    /// shapes that this field alone cannot tell apart:
+    ///
+    /// - the map was measured and genuinely found nothing — the output still
+    ///   carries `ATH_CHPX = 0`;
+    /// - the master dark was REFUSED (zero MAD, over the safety cap, or
+    ///   unreadable — [`crate::calibration_library::cosmetic`]) — no pass ran
+    ///   at all, the output carries no `ATH_CHPX` card, and the refusal is
+    ///   reported once via `warnings` below instead;
+    /// - the pass never ran because there was nothing to run it FROM — hot-
+    ///   pixel correction is off in this run's options, or no dark applies to
+    ///   this frame at all (`execute_generation`'s `_ => false` arm) — same as
+    ///   a refusal, no `ATH_CHPX` card, but silently: there is nothing
+    ///   irregular to warn about.
     pub hot_pixels_replaced: u64,
     /// Non-fatal notes the run should show its operator: today, one line the
     /// first time a master dark's hot-pixel map is refused (a degenerate dark,
@@ -972,30 +979,52 @@ mod tests {
         );
     }
 
-    /// Same shape, but with no Dark link at all: the engine falls back to the
-    /// bias, so its file must be counted. Together with the test above this
-    /// pins the exact rule: inclusion keys on the RESOLVED DARK PATH, not on
-    /// whether a Dark link exists.
+    /// Same shape, but the Dark LINK exists and points at a RAW, unbuilt set
+    /// — `resolve_master` returns `None` for it (`is_master_library = 0`),
+    /// so the engine falls back to the bias and its file must be counted.
+    ///
+    /// `resolved_master_paths` itself only ever sees `spec.inputs.dark_path`
+    /// (already resolved by the time a `GenerationSpec` exists — the raw
+    /// link is gone), so its own condition cannot regress to a link-existence
+    /// check the way `api::lights::compute_export_readiness`'s could. The
+    /// discriminating power here is upstream, in `resolve_generation`: a test
+    /// that instead seeds NO Dark link at all (the previous shape of this
+    /// test) can never catch a regression where a merely-LINKED-but-unbuilt
+    /// Dark gets resolved into `dark_path` anyway — there being no link at
+    /// all leaves nothing for such a bug to latch onto. This shape asserts
+    /// `spec.inputs.dark_path.is_none()` for exactly the C-2 scenario the
+    /// review named: a Dark link to an unbuilt raw set, so a regression
+    /// there — not just in this function's own `if` — is what this test
+    /// actually pins.
     #[test]
-    fn resolved_master_paths_includes_bias_when_no_dark_resolves() {
+    fn resolved_master_paths_includes_bias_when_dark_link_is_unbuilt() {
         let dir = tempfile::tempdir().unwrap();
         let light = write_plane(&dir.path().join("light_f.fits"), |_, _| 1000.0);
+        let raw_dark = write_plane(&dir.path().join("raw_dark.fits"), spiky_dark);
         let bias = write_plane(&dir.path().join("bias.fits"), |_, _| 50.0);
 
         let conn = seed_db();
         seed_light(&conn, 1, &light, None, None);
+        seed_raw_set(&conn, 200, "Dark", &raw_dark);
         seed_master_set(&conn, 12, "Bias", &bias);
+        add_link(&conn, 1, 200, "Dark");
         add_link(&conn, 1, 12, "Bias");
 
         let opts = CalibratedLightOptions::default();
         let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
-        assert!(spec.inputs.dark_path.is_none());
+        assert!(
+            spec.inputs.dark_path.is_none(),
+            "a raw, unbuilt set must not resolve"
+        );
         assert_eq!(spec.inputs.bias_path, Some(bias.clone()));
 
         let mut specs = HashMap::new();
         specs.insert(1i64, spec);
         let paths = resolved_master_paths(&specs);
-        assert!(paths.contains(&bias), "no dark applies — the bias IS read");
+        assert!(
+            paths.contains(&bias),
+            "the dark link never resolved — the bias IS read"
+        );
     }
 
     #[test]
