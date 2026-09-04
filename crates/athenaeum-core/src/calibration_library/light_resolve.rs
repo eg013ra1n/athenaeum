@@ -90,9 +90,17 @@ pub fn resolve_master(conn: &Connection, set_id: i64) -> anyhow::Result<Option<R
     }))
 }
 
-/// Resolve one calibration type's link to a built master, warning (best-effort
-/// policy, spec §6) when the link points at a raw set the preflight did not or
-/// could not build.
+/// Resolve one calibration type's link to a built master. `None` means "skip
+/// this term" under the best-effort policy (light-calibration spec 2026-07-05
+/// §6), and is warned about rather than passed over silently.
+///
+/// [`resolve_master`] answers `None` for a link still pointing at a raw,
+/// unbuilt set — and for a set flagged as a master library with no member file
+/// behind it. The calibrated-export v2 §4 masters-built gate refuses an export
+/// before it reaches here, so either shape arriving at this point is a race or
+/// a caller that came in around the gate, not the expected path. The term is
+/// skipped rather than fabricated, and the frame calibrates with whatever
+/// masters did resolve under an honest CALSTAT.
 fn resolve_type(
     conn: &Connection,
     links: &[CalibrationLink],

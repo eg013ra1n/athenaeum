@@ -1205,6 +1205,7 @@ mod tests {
     }
 
     /// Every regular file under `root`, forward-slashed and relative to it.
+    #[cfg(feature = "render")]
     fn files_under(root: &Path) -> Vec<String> {
         let mut v: Vec<String> = walkdir(root)
             .into_iter()
