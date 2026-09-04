@@ -53,7 +53,7 @@ import type { FileWithFrame, Frame } from '../../types/models';
 import type { ScanRootWithAvailability } from '../../types/helpers';
 import BlinkViewer from '../BlinkViewer';
 import { computeMissingFlags, type MissingFlags } from '../missing-metadata/MissingMetadataTable';
-import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
+import { SendToNodeDialog, type LightCalOptions } from '../transfers/SendToNodeDialog';
 import {
   readFlatNormPref,
   readFlatNormModePref,
@@ -368,6 +368,19 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const [sendFrameIds, setSendFrameIds] = useState<number[]>([]);
   const [sendBatchName, setSendBatchName] = useState('');
   const [sendResolving, setSendResolving] = useState(false);
+  // This opener has no export state of its own (a `frames`-kind send never
+  // reaches `sendFrameSet`), so it reads the persisted light-cal preferences
+  // explicitly (D-1) — the fallback the dialog used to hide behind a
+  // localStorage re-read is visible at this call site instead. Captured once
+  // per open (in `openSend`, below) rather than read on every render of this
+  // large, frequently re-rendering component.
+  const [sendLightCalOptions, setSendLightCalOptions] = useState<LightCalOptions>(() => ({
+    flatNorm: readFlatNormPref(),
+    flatNormMode: readFlatNormModePref(),
+    params: readLightCalParamsPref(),
+    hotPixel: readHotPixelPref(),
+    debayer: readDebayerPref(),
+  }));
   const refreshTokenRef = useRef(0);
   /** Per-pane generation counter for in-flight directory loads. Each call to
    *  loadListing increments its pane's counter and captures the value; only
@@ -896,6 +909,16 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       // Suggest the selection's common folder name as the batch name (§D1); the
       // dialog lets the user edit it, and a blank auto-names server-side.
       setSendBatchName(commonFolderName(paths));
+      // Re-read the persisted light-cal prefs now (not on every render) so a
+      // change made elsewhere (e.g. the Export tab) since this dialog was last
+      // opened is picked up.
+      setSendLightCalOptions({
+        flatNorm: readFlatNormPref(),
+        flatNormMode: readFlatNormModePref(),
+        params: readLightCalParamsPref(),
+        hotPixel: readHotPixelPref(),
+        debayer: readDebayerPref(),
+      });
       setSendOpen(true);
     } catch (e) {
       console.error('resolve_frame_ids_for_paths failed:', e);
@@ -1460,17 +1483,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         open={sendOpen}
         onClose={() => setSendOpen(false)}
         defaultBatchName={sendBatchName}
-        // This opener has no export state of its own (a `frames`-kind send
-        // never reaches `sendFrameSet`), so it reads the persisted preferences
-        // explicitly (D-1, review fix) — the fallback the dialog used to hide
-        // behind a localStorage re-read is now visible right here.
-        lightCalOptions={{
-          flatNorm: readFlatNormPref(),
-          flatNormMode: readFlatNormModePref(),
-          params: readLightCalParamsPref(),
-          hotPixel: readHotPixelPref(),
-          debayer: readDebayerPref(),
-        }}
+        // Captured in `openSend` (D-1, review fix) — this opener has no export
+        // state of its own, so it reads the persisted preferences explicitly
+        // rather than the dialog silently re-reading localStorage, but it does
+        // so once per open, not once per render of this component.
+        lightCalOptions={sendLightCalOptions}
       />
     </div>
   );
