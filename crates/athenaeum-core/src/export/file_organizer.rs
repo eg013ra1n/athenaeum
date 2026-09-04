@@ -297,9 +297,20 @@ fn place_at(
 struct DestClaims(std::collections::HashSet<String>);
 
 impl DestClaims {
+    /// The case-insensitive key one destination is tracked under. ONE spelling,
+    /// so [`DestClaims::claim`] and [`DestClaims::is_claimed`] can never
+    /// disagree about what has been placed.
+    fn key(rel_dir: &str, filename: &str) -> String {
+        format!("{}/{}", rel_dir.to_lowercase(), filename.to_lowercase())
+    }
+
+    /// Whether this run has already placed `filename` in `rel_dir`.
+    fn is_claimed(&self, rel_dir: &str, filename: &str) -> bool {
+        self.0.contains(&Self::key(rel_dir, filename))
+    }
+
     fn claim(&mut self, rel_dir: &str, filename: &str) -> String {
-        let key = |f: &str| format!("{}/{}", rel_dir.to_lowercase(), f.to_lowercase());
-        if self.0.insert(key(filename)) {
+        if self.0.insert(Self::key(rel_dir, filename)) {
             return filename.to_string();
         }
         let mut n = 2;
@@ -308,7 +319,7 @@ impl DestClaims {
                 Some((stem, ext)) => format!("{stem}_{n}.{ext}"),
                 None => format!("{filename}_{n}"),
             };
-            if self.0.insert(key(&candidate)) {
+            if self.0.insert(Self::key(rel_dir, &candidate)) {
                 return candidate;
             }
             n += 1;
@@ -610,6 +621,7 @@ pub fn organize_files_wbpp(
                             &placement.file_path,
                             &filename,
                             debayer,
+                            |name| claims.is_claimed(&placement.rel_dir, name),
                             &mut warnings,
                         );
                         emit_progress(
@@ -658,11 +670,16 @@ pub fn organize_files_wbpp(
 /// Both names come from [`calibrated_output_filename`] over the SAME source
 /// spelling, so the pair can never describe two different frames. A failure to
 /// remove is reported, never fatal: the export's own output is already written.
+///
+/// `already_placed` is the run's own claim ledger: a source named `x_d.fits`
+/// sitting beside `x.fits` maps to the same output name as `x.fits` debayered,
+/// and this sweep must never delete a file THIS export just wrote.
 fn remove_stale_sibling(
     dest_dir: &Path,
     source_path: &str,
     placed_filename: &str,
     debayer: bool,
+    already_placed: impl Fn(&str) -> bool,
     warnings: &mut Vec<String>,
 ) {
     let Some(source_name) = Path::new(source_path).file_name().and_then(|n| n.to_str()) else {
@@ -671,7 +688,11 @@ fn remove_stale_sibling(
     if calibrated_output_filename(source_name, debayer) != placed_filename {
         return;
     }
-    let sibling = dest_dir.join(calibrated_output_filename(source_name, !debayer));
+    let sibling_name = calibrated_output_filename(source_name, !debayer);
+    if already_placed(&sibling_name) {
+        return;
+    }
+    let sibling = dest_dir.join(sibling_name);
     if !sibling.exists() {
         return;
     }
@@ -1442,6 +1463,60 @@ mod tests {
             files_under(out.path()),
             vec!["My Set/camera_testcam/lights/c_light_10.fits"],
             "the debayered output of the first run must not survive the second"
+        );
+    }
+
+    /// The sibling sweep must never delete a file THIS export placed. A source
+    /// literally named `x_d.fits` produces `c_x_d.fits` — the same name the
+    /// debayered output of `x.fits` would take — so with both in one frame set
+    /// the sweep for `c_x.fits` aims straight at the other frame's output.
+    ///
+    /// `x_d.fits` is placed FIRST, so an unguarded sweep would delete it with
+    /// nothing left in the run to write it again: one light silently missing
+    /// from the export.
+    #[cfg(feature = "render")]
+    #[test]
+    fn sibling_sweep_spares_a_file_this_run_placed() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let (conn, _dark) =
+            seed_generation_fixture(src.path(), &[(10, "x_d.fits"), (11, "x.fits")], None);
+        let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), false);
+        drop(conn);
+
+        let placed: Vec<String> = compute_wbpp_placements(&data)
+            .into_iter()
+            .map(|p| p.filename)
+            .collect();
+        assert_eq!(
+            placed,
+            vec!["c_x_d.fits", "c_x.fits"],
+            "the collision only bites when the sibling is placed first"
+        );
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let config = WbppExportConfig::default();
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            None,
+            1,
+            &cancel,
+            Some(&mut batch),
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
+        assert_eq!(
+            files_under(out.path()),
+            vec![
+                "My Set/camera_testcam/lights/c_x.fits",
+                "My Set/camera_testcam/lights/c_x_d.fits",
+            ],
+            "both lights must survive their own export"
         );
     }
 

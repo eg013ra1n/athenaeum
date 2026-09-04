@@ -439,7 +439,7 @@ pub fn execute_generation(
             // `newly_measured` is what keeps the refusal warning to ONE line
             // per dark for the whole batch: only the frame that actually
             // measured it reports it.
-            let (hit, newly_measured) = match hot_maps.get(dark) {
+            let (hot_outcome, newly_measured) = match hot_maps.get(dark) {
                 Some(cached) => (Arc::clone(cached), false),
                 None => {
                     // A read failure does not fail the frame: the light is
@@ -463,7 +463,7 @@ pub fn execute_generation(
                     (built, true)
                 }
             };
-            match &*hit {
+            match &*hot_outcome {
                 HotPixelMapOutcome::Map(map) => {
                     hot_pixels_replaced = apply_hot_pixel_correction(
                         &mut frame.data,
