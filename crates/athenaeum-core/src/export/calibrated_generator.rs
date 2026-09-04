@@ -56,10 +56,13 @@ pub struct GeneratedLight {
     pub calstat: String,
     /// Whether the output is planar RGB rather than the source mosaic.
     pub debayered: bool,
-    /// How many pixels the cosmetic pass replaced. `0` also when the pass ran
-    /// and found nothing, which is the honest answer — see
-    /// [`crate::calibration_library::cosmetic`] on why a degenerate dark
-    /// yields an empty map instead of an error.
+    /// How many pixels the cosmetic pass replaced. `0` in two DIFFERENT
+    /// shapes that this field alone cannot tell apart: the map was measured
+    /// and genuinely found nothing (the output still carries `ATH_CHPX = 0`),
+    /// or the master dark was REFUSED (zero MAD, over the safety cap, or
+    /// unreadable — [`crate::calibration_library::cosmetic`]), in which case
+    /// no pass ran at all, the output carries no `ATH_CHPX` card, and the
+    /// refusal is reported once via `warnings` below instead.
     pub hot_pixels_replaced: u64,
     /// Non-fatal notes the run should show its operator: today, one line the
     /// first time a master dark's hot-pixel map is refused (a degenerate dark,
@@ -393,22 +396,20 @@ pub fn resolve_generation_cached(
     })
 }
 
-/// Every DISTINCT master path a resolved batch RESOLVES — dark, flat and
-/// bias, unioned across every spec (review fix C-2: a preflight existence
-/// check before generation starts). This is every LINKED master, not every
-/// master the engine actually reads: a light linked to both a dark and a
-/// bias resolves both (`bias_path` comes straight from the resolved link,
-/// independent of `bias_applied`), even though the raw-master-dark
+/// Every DISTINCT master path a resolved batch actually READS — dark and
+/// flat unconditionally, plus bias ONLY for a spec whose `dark_path` is
+/// `None` (review fix #1) — unioned across every spec (review fix C-2: a
+/// preflight existence check before generation starts). The raw-master-dark
 /// convention means the engine never touches the bias plane once a dark
-/// applies (`Light − MasterDark` already removes the bias). Deliberate:
-/// readiness (`api::lights::compute_export_readiness`) unions the exact same
-/// three fields from the exact same link resolution, so this preflight and
-/// that gate must count the same set of files, or one could pass a batch the
-/// other would refuse. Honest consequence: a missing bias file blocks a send
-/// even when every one of its lights has a dark and would never read that
-/// bias. A frame set shares its masters (one dark covers a whole night), so a
-/// batch of specs collapses to a handful of paths worth stat-ing once each,
-/// never once per frame.
+/// applies (`Light − MasterDark` already removes the bias, and `ATH_CBIA` is
+/// only written when `bias_applied`), so a bias that is linked but never read
+/// must not block a run that would produce byte-identical output either way.
+/// Deliberate: readiness (`api::lights::compute_export_readiness`) applies
+/// the exact same dark-path-gated rule over the exact same link resolution,
+/// so this preflight and that gate must count the same set of files, or one
+/// could pass a batch the other would refuse. A frame set shares its masters
+/// (one dark covers a whole night), so a batch of specs collapses to a
+/// handful of paths worth stat-ing once each, never once per frame.
 pub fn resolved_master_paths(
     specs: &HashMap<i64, GenerationSpec>,
 ) -> std::collections::BTreeSet<PathBuf> {
@@ -416,7 +417,9 @@ pub fn resolved_master_paths(
     for spec in specs.values() {
         paths.extend(spec.inputs.dark_path.clone());
         paths.extend(spec.inputs.flat_path.clone());
-        paths.extend(spec.inputs.bias_path.clone());
+        if spec.inputs.dark_path.is_none() {
+            paths.extend(spec.inputs.bias_path.clone());
+        }
     }
     paths
 }
@@ -929,6 +932,70 @@ mod tests {
         let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
         assert!(spec.inputs.flat_path.is_none());
         assert!(spec.dark_path.is_some());
+    }
+
+    /// Review fix #1: a light resolved to both a master Dark and a master
+    /// Bias must NOT surface the bias in [`resolved_master_paths`] — the
+    /// raw-master-dark convention means the engine subtracts the dark and
+    /// never reads the bias plane at all, so a bias file missing from disk
+    /// must never block a run that would produce byte-identical output.
+    #[test]
+    fn resolved_master_paths_excludes_bias_when_dark_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_plane(&dir.path().join("light_e.fits"), |_, _| 1000.0);
+        let dark = write_plane(&dir.path().join("dark.fits"), spiky_dark);
+        let bias = write_plane(&dir.path().join("bias.fits"), |_, _| 50.0);
+
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 10, "Dark", &dark);
+        seed_master_set(&conn, 12, "Bias", &bias);
+        add_link(&conn, 1, 10, "Dark");
+        add_link(&conn, 1, 12, "Bias");
+
+        let opts = CalibratedLightOptions::default();
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert_eq!(spec.inputs.dark_path, Some(dark.clone()));
+        assert_eq!(
+            spec.inputs.bias_path,
+            Some(bias.clone()),
+            "the link still resolves — resolved_master_paths is what filters it"
+        );
+
+        let mut specs = HashMap::new();
+        specs.insert(1i64, spec);
+        let paths = resolved_master_paths(&specs);
+        assert!(paths.contains(&dark), "the dark IS read");
+        assert!(
+            !paths.contains(&bias),
+            "the dark applies — the engine never reads the bias plane"
+        );
+    }
+
+    /// Same shape, but with no Dark link at all: the engine falls back to the
+    /// bias, so its file must be counted. Together with the test above this
+    /// pins the exact rule: inclusion keys on the RESOLVED DARK PATH, not on
+    /// whether a Dark link exists.
+    #[test]
+    fn resolved_master_paths_includes_bias_when_no_dark_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_plane(&dir.path().join("light_f.fits"), |_, _| 1000.0);
+        let bias = write_plane(&dir.path().join("bias.fits"), |_, _| 50.0);
+
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 12, "Bias", &bias);
+        add_link(&conn, 1, 12, "Bias");
+
+        let opts = CalibratedLightOptions::default();
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert!(spec.inputs.dark_path.is_none());
+        assert_eq!(spec.inputs.bias_path, Some(bias.clone()));
+
+        let mut specs = HashMap::new();
+        specs.insert(1i64, spec);
+        let paths = resolved_master_paths(&specs);
+        assert!(paths.contains(&bias), "no dark applies — the bias IS read");
     }
 
     #[test]

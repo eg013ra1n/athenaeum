@@ -70,12 +70,18 @@ pub struct ExportReadiness {
     /// Ascending, so the tab's `→ Coverage` deep link (`[0]`) is stable across
     /// refetches.
     pub raw_set_ids_without_master: Vec<i64>,
-    /// Distinct resolved master files (dark/flat/bias) this frame set's lights
-    /// would actually apply that no longer exist on disk — an archived or
-    /// moved master. The same stat `export::calibrated_generator::open_generation`
-    /// runs (via `sync_prepare`) before generating a single frame (C-2, review
-    /// fix), computed here too so the Export tab and the Send dialog refuse up
-    /// front instead of failing partway through a batch.
+    /// Distinct resolved master files this frame set's lights would actually
+    /// apply that no longer exist on disk — an archived or moved master. Dark
+    /// and flat are always counted; the bias is counted ONLY when no dark
+    /// resolved for that light — the raw-master-dark convention means the
+    /// engine never reads a bias once a dark applies, so a bias file that is
+    /// gone must not block a run that would never touch it (review fix #1).
+    /// The same set `export::calibrated_generator::resolved_master_paths`
+    /// computes is what `api::sync_prepare::open_generation` stats (C-2,
+    /// review fix) before generating a single frame — computed here too so
+    /// the Export tab and the Send dialog refuse up front instead of failing
+    /// partway through a batch, and the two MUST keep counting the identical
+    /// set.
     pub missing_master_files: i64,
     pub file_counts: ExportFileCounts,
 }
@@ -180,6 +186,15 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
     // `light_resolve::resolve_frame_inputs` makes for each of those three
     // types — and collects the DISTINCT paths (C-2, review fix): readiness
     // and `open_generation`'s own preflight must count the same files.
+    //
+    // Bias inclusion keys on the RESOLVED DARK PATH, not on whether a Dark
+    // link exists (review fix #1): a light can carry a Dark link whose
+    // `resolve_master` yields nothing (the linked set has no built master),
+    // in which case the engine falls back to the bias and that bias file
+    // MUST still be counted. Only when a dark path actually resolved is the
+    // bias skipped — the raw-master-dark convention means the engine never
+    // reads it in that case, so a bias file gone from disk must not block a
+    // run that would never touch it.
     let mut unlinked_lights = 0i64;
     let mut master_paths: BTreeSet<PathBuf> = BTreeSet::new();
     for (frame_id, _filename) in members {
@@ -188,8 +203,27 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
             unlinked_lights += 1;
             continue;
         }
-        for cal_type in ["Dark", "Flat", "Bias"] {
-            if let Some(set_id) = link_set_id(&links, cal_type) {
+
+        let dark_path = match link_set_id(&links, "Dark") {
+            Some(set_id) => resolve_master(conn, set_id)
+                .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
+                .map(|m| PathBuf::from(m.path)),
+            None => None,
+        };
+        if let Some(p) = &dark_path {
+            master_paths.insert(p.clone());
+        }
+
+        if let Some(set_id) = link_set_id(&links, "Flat") {
+            if let Some(master) = resolve_master(conn, set_id)
+                .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
+            {
+                master_paths.insert(PathBuf::from(master.path));
+            }
+        }
+
+        if dark_path.is_none() {
+            if let Some(set_id) = link_set_id(&links, "Bias") {
                 if let Some(master) = resolve_master(conn, set_id)
                     .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
                 {
@@ -198,9 +232,20 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
             }
         }
     }
+    // Review fix #2: name which file is missing, not just how many — the send
+    // path already does this (`api::sync_prepare::open_generation`'s
+    // `error!(path = …)`); the export path was silently discarding the paths
+    // after counting them, leaving no way — UI or log — to learn which master
+    // to restore.
     let missing_master_files = master_paths
         .iter()
-        .filter(|p| std::fs::metadata(p).is_err())
+        .filter(|p| {
+            let missing = std::fs::metadata(p).is_err();
+            if missing {
+                tracing::warn!(path = %p.display(), "master file missing on disk");
+            }
+            missing
+        })
         .count() as i64;
 
     let data = crate::export::collect_export_data(conn, set_id)
@@ -778,6 +823,58 @@ mod tests {
         ] {
             assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
         }
+    }
+
+    /// Review fix #1: a light linked to a resolved master Dark AND a master
+    /// Bias whose FILE is missing must not block — the raw-master-dark
+    /// convention means the engine subtracts the dark and never reads the
+    /// bias plane at all (`ATH_CBIA` is only written when `bias_applied`), so
+    /// this run would produce byte-identical output whether or not that bias
+    /// file exists.
+    #[test]
+    fn missing_bias_file_does_not_block_when_dark_resolves() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let dark_path = tmp.path().join("master_dark.fits");
+        std::fs::write(&dark_path, b"dark").unwrap();
+        let bias_path = tmp.path().join("master_bias.fits");
+        // Never written to disk — the "archived or moved" shape.
+        seed_master_with_file(&conn, 100, "MasterDark", &dark_path);
+        seed_master_with_file(&conn, 102, "MasterBias", &bias_path);
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 102, "Bias");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.missing_master_files, 0,
+            "the bias is linked but never read once the dark resolves"
+        );
+        assert!(check_mode_ready(&r, ExportMode::CalibratedLights).is_ok());
+    }
+
+    /// Same shape, but the light has NO dark link at all — the engine falls
+    /// back to the bias, so its missing file DOES block. Together with the
+    /// test above this pins the exact rule: bias inclusion keys on the
+    /// RESOLVED DARK PATH, not on whether a Dark link exists.
+    #[test]
+    fn missing_bias_file_blocks_when_no_dark_applies() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        let bias_path = tmp.path().join("master_bias.fits");
+        // Never written to disk.
+        seed_master_with_file(&conn, 102, "MasterBias", &bias_path);
+        add_link(&conn, 1, 102, "Bias");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1, "no dark applies — bias IS read");
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights).unwrap_err(),
+            "1 master file(s) missing on disk — restore from archive first"
+        );
     }
 
     /// PARTIAL coverage is not a blocker: a light with only a master Dark
