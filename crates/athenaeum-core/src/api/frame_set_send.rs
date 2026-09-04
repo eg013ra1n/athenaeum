@@ -163,7 +163,12 @@ mod tests {
         ServiceContext::new_for_tests(tmp.join("catalog.db"))
     }
 
-    fn seed(conn: &Connection) {
+    /// `dir` backs the master files this fixture registers — C-2 (calibrated-
+    /// export-v2 review fix) stats every resolved master's path against disk
+    /// before the calibrated-lights mode is allowed to run, so a fixture
+    /// pointing at a literal path with nothing behind it (`/lib/...`) would
+    /// refuse the very mode these tests exist to exercise.
+    fn seed(conn: &Connection, dir: &std::path::Path) {
         conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", [])
             .unwrap();
         conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (1, 1, '2026-07-05T20:00:00Z', '2026-07-05T23:00:00Z')", []).unwrap();
@@ -201,7 +206,9 @@ mod tests {
             .unwrap();
         }
         conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (200, 'Flat', '2026-07-05', 1)", []).unwrap();
-        conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (600, '/lib/master_flat.fits', 'master_flat.fits', 0, '2026-07-05T00:00:00Z', 'FITS')", []).unwrap();
+        let flat_path = dir.join("master_flat.fits");
+        std::fs::write(&flat_path, [0u8; 4]).unwrap();
+        conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (600, ?1, 'master_flat.fits', 0, '2026-07-05T00:00:00Z', 'FITS')", params![flat_path.to_string_lossy()]).unwrap();
         conn.execute(
             "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (600, 600, 'MasterFlat', 1)",
             [],
@@ -227,9 +234,11 @@ mod tests {
     /// Build a master for the raw dark 100 and repoint both lights' Dark links
     /// onto it — what a master build does, and what the v2 calibrated-lights
     /// gate demands before it will compose anything.
-    fn build_master_dark(conn: &Connection) {
+    fn build_master_dark(conn: &Connection, dir: &std::path::Path) {
         conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (300, 'MasterDark', '2026-07-05', 1)", []).unwrap();
-        conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (700, '/lib/master_dark.fits', 'master_dark.fits', 0, '2026-07-05T00:00:00Z', 'FITS')", []).unwrap();
+        let dark_path = dir.join("master_dark.fits");
+        std::fs::write(&dark_path, [0u8; 4]).unwrap();
+        conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (700, ?1, 'master_dark.fits', 0, '2026-07-05T00:00:00Z', 'FITS')", params![dark_path.to_string_lossy()]).unwrap();
         conn.execute(
             "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (700, 700, 'MasterDark', 1)",
             [],
@@ -259,7 +268,7 @@ mod tests {
         let ctx = ctx_with(tmp.path());
         {
             let db = ctx.db.get().unwrap();
-            seed(&db.conn());
+            seed(&db.conn(), tmp.path());
         }
         let lights = frame_set_entries(&ctx, 1, ExportMode::LightsOnly, &opts()).unwrap();
         assert_eq!(lights.len(), 2);
@@ -297,7 +306,7 @@ mod tests {
         let ctx = ctx_with(tmp.path());
         {
             let db = ctx.db.get().unwrap();
-            seed(&db.conn());
+            seed(&db.conn(), tmp.path());
         }
         let err = frame_set_entries(&ctx, 1, ExportMode::RawWithMasters, &opts()).unwrap_err();
         assert!(
@@ -312,7 +321,7 @@ mod tests {
         let ctx = ctx_with(tmp.path());
         {
             let db = ctx.db.get().unwrap();
-            seed(&db.conn());
+            seed(&db.conn(), tmp.path());
         }
         // Masters-built strictness (v2 §4): the raw dark 100 the seed links
         // blocks the mode — the export will GENERATE these files, and it can
@@ -326,7 +335,7 @@ mod tests {
 
         {
             let db = ctx.db.get().unwrap();
-            build_master_dark(&db.conn());
+            build_master_dark(&db.conn(), tmp.path());
         }
 
         // No tracking table, no pre-generated artifact: the transform MARKS each
@@ -351,14 +360,17 @@ mod tests {
             "frame_id is the SOURCE light"
         );
 
-        // The debayer option is part of the NAME, so the entries move with it.
-        let debayered = frame_set_entries(
-            &ctx,
-            1,
-            ExportMode::CalibratedLights,
-            &CalibratedLightOptions::default(),
-        )
-        .unwrap();
+        // The debayer option is part of the NAME, so the entries move with
+        // it — but only for a light with a usable mosaic. `opts()` already
+        // asked for it (`debayer_osc` defaults ON); this run asks the
+        // OPPOSITE (off) so the two calls are genuinely different, and mono
+        // lights land on the SAME `c_L_*.fits` names either way.
+        let debayer_off = CalibratedLightOptions {
+            debayer_osc: false,
+            ..CalibratedLightOptions::default()
+        };
+        let debayered =
+            frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &debayer_off).unwrap();
         assert!(
             debayered.iter().all(|e| e.rel_path.ends_with("c_L_10.fits")
                 || e.rel_path.ends_with("c_L_11.fits")),
@@ -376,8 +388,8 @@ mod tests {
         {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();
-            seed(&conn);
-            build_master_dark(&conn);
+            seed(&conn, tmp.path());
+            build_master_dark(&conn, tmp.path());
             conn.execute(
                 "DELETE FROM calibration_set_to_frames WHERE source_id = 11",
                 [],
