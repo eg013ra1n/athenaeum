@@ -760,10 +760,11 @@ fn open_generation(
         "calibrated-light generation planned for a transfer"
     );
 
-    // C-2: stat every DISTINCT resolved master (dark/flat/bias) before a
-    // single frame is generated. A batch's masters are shared across its
-    // lights, so this is a handful of stats, not one per frame — and it must
-    // happen here, before the loop in `stage_records` writes anything, so a
+    // C-2: stat every DISTINCT resolved master (dark/flat, plus bias only
+    // when no dark applies — review fix #1) before a single frame is
+    // generated. A batch's masters are shared across its lights, so this is
+    // a handful of stats, not one per frame — and it must happen here,
+    // before the loop in `stage_records` writes anything, so a
     // missing/archived master fails the WHOLE preparation up front rather
     // than partway through the package dir.
     for path in crate::export::resolved_master_paths(&specs) {

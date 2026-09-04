@@ -112,6 +112,14 @@ owner run through the shipped Export tab or Transfers yet.
   dialog open and mode switch. A `HashMap<i64, Option<String>>` memo would
   cut it to one query per set. Deferred out of this wave by the minimal-scope
   constraint.
+- The failed-regeneration sibling sweep (`file_organizer.rs`, review fix #5)
+  only clears the OPPOSITE-toggle output (`c_x_d.fits` when this run just
+  failed to write `c_x.fits`). A previous run's SAME-name output
+  (`c_x.fits` already on disk, this run fails to regenerate `c_x.fits`) is
+  left untouched, and WBPP would ingest that stale artifact. Pre-existing
+  (not introduced by this wave), out of its scope; a fix would need the
+  failure arm to also remove `dest` itself when it already exists from an
+  earlier run.
 
 ### Transfer preparation + single-copy footprint (2026-08-30)
 

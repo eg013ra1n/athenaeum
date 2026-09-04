@@ -651,9 +651,12 @@ pub fn organize_files_wbpp(
                         // so a failed regeneration would otherwise leave the
                         // PREVIOUS run's opposite-toggle output in place, and
                         // WBPP would ingest that stale artifact for a light
-                        // this run just reported as failed. A frame that
-                        // fails to regenerate should leave no artifact
-                        // behind, not a stale one. `claims.claim` above
+                        // this run just reported as failed. This sweep only
+                        // clears the OPPOSITE-toggle name, not `dest`'s own
+                        // name — a previous run's SAME-name output surviving
+                        // a failed regeneration is a separate, pre-existing
+                        // gap (tracked in `docs/superpowers/open-items.md`,
+                        // out of this wave's scope). `claims.claim` above
                         // already reserved `filename` regardless of outcome,
                         // so `is_claimed` still refuses to delete a file this
                         // same run placed.
