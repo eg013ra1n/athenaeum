@@ -190,6 +190,14 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
       updateParams(p => ({ ...p, pedestalDn: Math.max(0, n) }));
     }
   }, [updateParams]);
+  // The typed string can run negative while the committed `params.pedestalDn`
+  // is already clamped (above) — e.g. typing "-5" shows "-5" while the value
+  // that will actually export is 0. Snap the display back to the committed
+  // value once the user is done typing, rather than clamping every keystroke
+  // (which would fight a partial edit like "-").
+  const handlePedestalBlur = useCallback(() => {
+    setPedestalInput(String(params.pedestalDn));
+  }, [params.pedestalDn]);
   // The trimmed-mean option names its own trim fraction, which the Advanced
   // block can change — so it reads the live value rather than hard-coding the
   // default and lying to anyone who edited it.
@@ -675,6 +683,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                           step={1}
                           value={pedestalInput}
                           onChange={e => handlePedestalChange(e.target.value)}
+                          onBlur={handlePedestalBlur}
                           className="w-28 px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent"
                         />
                         <p className="text-[11px] text-content-muted mt-1">
