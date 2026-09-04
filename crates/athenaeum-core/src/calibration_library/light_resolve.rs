@@ -29,8 +29,7 @@ use crate::models::{CalibrationLink, FileFormat};
 /// on-disk file, and the frame uuid stamped into the `ATH_C*` provenance card.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMaster {
-    /// The MASTER calibration_set id (post-supersede the link points here); goes
-    /// into the tracking row's `dark_set_id`/`flat_set_id`/`bias_set_id`.
+    /// The MASTER calibration_set id (post-supersede the link points here).
     pub set_id: i64,
     /// Master frame uuid → `ATH_CDRK`/`ATH_CFLT`/`ATH_CBIA` value.
     pub uuid: String,
@@ -38,19 +37,14 @@ pub struct ResolvedMaster {
     pub path: String,
 }
 
-/// Everything the engine + header builder + tracking row need for ONE light
-/// frame, resolved against the current catalog in a single pooled connection.
-/// No pixel I/O — so it is unit-testable against a seeded in-memory conn.
+/// Everything the engine and the header builder need for ONE light frame,
+/// resolved against the current catalog in a single pooled connection. No
+/// pixel I/O — so it is unit-testable against a seeded in-memory conn.
 pub struct ResolvedFrameInputs {
     pub frame_id: i64,
     pub light_path: PathBuf,
     pub source_filename: String,
     pub source_uuid: Option<String>,
-    /// OBJECT / INSTRUME / DATE-OBS date → the `<object>/<cam>/<date>/` output
-    /// folder (spec §3). Empty strings fall back to `Unknown*` in the path.
-    pub object: String,
-    pub instrume: String,
-    pub date_obs_date: String,
     /// Still-valid header cards copied from the source (WCS/optics/session);
     /// [`crate::calibration_library::light_headers::build_light_cal_cards`]
     /// filters these to its whitelist.
@@ -353,60 +347,21 @@ fn resolve_cfa_geometry(conn: &Connection, frame_id: i64) -> anyhow::Result<Opti
     }))
 }
 
-/// YYYY-MM-DD from a DATE-OBS string (`2026-07-05T20:30:00Z` → `2026-07-05`).
-/// The result becomes a path segment, so it goes through the shared
-/// sanitizer — a malformed non-ISO DATE-OBS must not nest directories ('/')
-/// or hit Windows-illegal chars (':'). Missing/empty/unsalvageable →
-/// `"UnknownDate"` so the layout never gets an empty segment.
-fn date_part(date_obs: Option<&str>) -> String {
-    let raw: String = date_obs
-        .and_then(|d| d.split('T').next())
-        .map(|d| d.chars().take(10).collect())
-        .unwrap_or_default();
-    let sanitized = crate::archive::path_layout::sanitize_for_filename(&raw);
-    if sanitized.is_empty() {
-        "UnknownDate".to_string()
-    } else {
-        sanitized
-    }
-}
-
 pub fn resolve_frame_inputs(
     conn: &Connection,
     frame_id: i64,
     _flat_norm: bool,
 ) -> anyhow::Result<ResolvedFrameInputs> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-        String,
-        String,
-        String,
-    )> = conn
+    let row: Option<(Option<String>, i64, String, String, String)> = conn
         .query_row(
-            "SELECT fr.uuid, fr.object, fr.instrume, fr.date_obs, fi.id, fi.path, fi.filename, fi.format
+            "SELECT fr.uuid, fi.id, fi.path, fi.filename, fi.format
              FROM frames fr JOIN files fi ON fi.id = fr.file_id
              WHERE fr.id = ?1",
             params![frame_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((uuid, object, instrume, date_obs, file_id, path, filename, format_str)) = row else {
+    let Some((uuid, file_id, path, filename, format_str)) = row else {
         anyhow::bail!("light frame {frame_id} not found");
     };
 
@@ -427,30 +382,10 @@ pub fn resolve_frame_inputs(
         light_path: PathBuf::from(path),
         source_filename: filename,
         source_uuid: uuid,
-        object: object.unwrap_or_default(),
-        instrume: instrume.unwrap_or_default(),
-        date_obs_date: date_part(date_obs.as_deref()),
         source_cards,
         cfa_geometry: resolve_cfa_geometry(conn, frame_id)?,
         dark,
         flat,
         bias,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Moved with [`date_part`] from `api/lights.rs` (Task 5): self-contained,
-    /// no DB fixture, so it needed no rewiring to follow the function.
-    #[test]
-    fn date_part_sanitizes_non_iso_values() {
-        assert_eq!(date_part(Some("2026-07-05T20:30:00Z")), "2026-07-05");
-        // Malformed locale date: '/' must not become directory nesting, ':' is
-        // Windows-illegal — both map to '_' (audit F6).
-        assert_eq!(date_part(Some("05/07/2026")), "05_07_2026");
-        assert_eq!(date_part(None), "UnknownDate");
-        assert_eq!(date_part(Some("")), "UnknownDate");
-    }
 }

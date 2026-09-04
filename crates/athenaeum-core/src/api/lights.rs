@@ -39,7 +39,7 @@ pub use crate::calibration_library::light_cal::{BiasFallback, FlatNormMode, Ligh
 // ── DTOs (single-sourced; both wrapper crates import these) ─────────────────
 
 /// Export/send readiness for one frame set, every mode at once (spec
-/// 2026-08-28 §5, re-cut by the calibrated-export v2 spec §6).
+/// 2026-08-28 §5, re-cut by the calibrated-export v2 spec §4).
 ///
 /// **The calibrated-lights mode no longer asks about existing artifacts.** An
 /// export GENERATES its calibrated files on the spot, so what a previous
@@ -108,7 +108,7 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
                 if n == 1 { "has" } else { "have" }
             ))
         }
-        // Masters-built strictness (v2 §6): the export generates the calibrated
+        // Masters-built strictness (v2 §4): the export generates the calibrated
         // files itself, so it needs INPUTS, not artifacts. Masters first — a
         // build is the step that can also change what a light resolves to, so
         // reporting the link count over it would send the operator to the wrong
@@ -185,7 +185,7 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
 }
 
 /// Export/send readiness for every mode in one call (spec 2026-08-28 §5, v2
-/// §6). Takes no calibration preferences: the calibrated-lights mode generates
+/// §4). Takes no calibration preferences: the calibrated-lights mode generates
 /// its files during the export, so readiness is about the INPUTS (masters
 /// built, lights linked) and cannot change with a dialog toggle.
 pub fn get_export_readiness(

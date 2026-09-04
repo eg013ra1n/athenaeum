@@ -888,12 +888,9 @@ mod tests {
             "a raw, unbuilt set must not resolve even with a member file on disk"
         );
 
-        // Identity + layout fields the caller places the output by.
+        // Identity fields the caller names the output by.
         assert_eq!(r.frame_id, 1);
         assert_eq!(r.source_filename, "light_d.fits");
-        assert_eq!(r.object, "M31");
-        assert_eq!(r.instrume, "TestCam");
-        assert_eq!(r.date_obs_date, "2026-07-05");
         assert!(
             r.source_uuid.is_some(),
             "light uuid populated by the trigger"

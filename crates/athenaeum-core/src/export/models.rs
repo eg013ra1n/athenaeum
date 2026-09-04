@@ -804,10 +804,14 @@ pub enum ExportMode {
     /// untouched. The frame-set send's "just the lights"; for a folder export
     /// the lights land under `camera_<x>/lights/`.
     LightsOnly,
-    /// Export the `c_*.fits` calibrated-light artifacts in place of the raw
-    /// lights, with NO calibration frames at all (WBPP runs with its own
-    /// calibration disabled). Strictly gated: every in-scope light must have a
-    /// fresh calibrated output first.
+    /// Calibrate every in-scope light from its linked masters as the export
+    /// places it — `c_*.fits` generated at export/send time, with NO
+    /// calibration frames at all (WBPP runs with its own calibration
+    /// disabled). Nothing is cached or reused: there is no artifact store to
+    /// be fresh or stale against. Gated instead on the INPUTS — the v2 §4
+    /// masters-built gate (`api::lights::check_mode_ready`): every linked
+    /// calibration set must already be a built master, and a light with no
+    /// calibration links at all blocks.
     CalibratedLights,
     /// Raw lights as today, with the calibration side exporting ONLY built
     /// master files (`calibration_set.is_master_library = 1`). Strict (spec

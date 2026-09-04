@@ -88,25 +88,28 @@ pub struct ExportToWbppArgs {
     #[serde(default)]
     pub export_mode: Option<ExportMode>,
     /// Generation options for the `calibratedLights` mode: in that mode the
-    /// export calibrates every light from its linked masters as it places it.
-    /// Each field defaults to the recommended behavior so a caller with no
-    /// opinion keeps working; every other mode ignores them.
-    #[serde(default = "default_true")]
-    pub flat_norm: bool,
+    /// export calibrates every light from its linked masters as it places it;
+    /// every other mode ignores them.
+    ///
+    /// Optional AND nullable, exactly like the Tauri command's `Option<…>`
+    /// parameters — an absent field and an explicit `null` both mean "no
+    /// opinion" and take that field's value from
+    /// [`CalibratedLightOptions::default`]. Restating the defaults here would
+    /// let the two backends drift from the type that owns them, and rejecting
+    /// `null` with a 422 made the web host stricter than the desktop one for
+    /// the same payload.
     #[serde(default)]
-    pub flat_norm_mode: FlatNormMode,
+    pub flat_norm: Option<bool>,
     #[serde(default)]
-    pub params: LightCalParams,
+    pub flat_norm_mode: Option<FlatNormMode>,
+    #[serde(default)]
+    pub params: Option<LightCalParams>,
     /// Replace the master dark's hot pixels with a neighbourhood median.
-    #[serde(default = "default_true")]
-    pub hot_pixel: bool,
+    #[serde(default)]
+    pub hot_pixel: Option<bool>,
     /// Debayer CFA lights to full-resolution planar RGB.
-    #[serde(default = "default_true")]
-    pub debayer: bool,
-}
-
-fn default_true() -> bool {
-    true
+    #[serde(default)]
+    pub debayer: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -235,7 +238,7 @@ pub async fn get_export_summary(
 // ── Active export handlers ────────────────────────────────────────────────────
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
-/// (spec §12.2, v2 §6). Read-only; run under `spawn_blocking` so the catalog
+/// (spec §12.2, v2 §4). Read-only; run under `spawn_blocking` so the catalog
 /// queries stay off the async executor (matches the readiness precedent).
 /// Takes no calibration preferences — readiness is about the inputs (masters
 /// built, lights linked), which no dialog toggle can change.
@@ -347,12 +350,13 @@ pub async fn export_to_wbpp(
             // Read by the calibrated-lights mode only; the transform ignores it
             // in the others (its debayer flag decides the output NAMES, so it
             // must be the same value the pixel phase later resolves against).
+            let defaults = CalibratedLightOptions::default();
             let gen_opts = CalibratedLightOptions {
-                flat_norm: args.flat_norm,
-                flat_norm_mode: args.flat_norm_mode,
-                params: args.params,
-                hot_pixel_correction: args.hot_pixel,
-                debayer_osc: args.debayer,
+                flat_norm: args.flat_norm.unwrap_or(defaults.flat_norm),
+                flat_norm_mode: args.flat_norm_mode.unwrap_or(defaults.flat_norm_mode),
+                params: args.params.unwrap_or(defaults.params),
+                hot_pixel_correction: args.hot_pixel.unwrap_or(defaults.hot_pixel_correction),
+                debayer_osc: args.debayer.unwrap_or(defaults.debayer_osc),
             };
 
             // Validate output path is within the configured export directory.
@@ -666,7 +670,6 @@ mod wbpp_export_config_tests {
 mod export_cancel_while_queued_tests {
     use super::*;
     use crate::events::SseEvent;
-    use athenaeum_core::api::lights::{FlatNormMode, LightCalParams};
     use athenaeum_core::cache::MemoryImageCache;
     use athenaeum_core::db::Database;
     use athenaeum_core::services::compute_queue::{ComputeJobKind, ComputeQueue};
@@ -824,11 +827,14 @@ mod export_cancel_while_queued_tests {
                     output_dir: tmp_export_dir(),
                     use_symlinks: false,
                     export_mode: Some(ExportMode::CalibratedLights),
-                    flat_norm: true,
-                    flat_norm_mode: FlatNormMode::default(),
-                    params: LightCalParams::default(),
-                    hot_pixel: true,
-                    debayer: true,
+                    // Every option absent: the handler must fill them from
+                    // `CalibratedLightOptions::default()`, the same values the
+                    // Tauri command derives from its own `None`s.
+                    flat_norm: None,
+                    flat_norm_mode: None,
+                    params: None,
+                    hot_pixel: None,
+                    debayer: None,
                 }),
             )
             .await

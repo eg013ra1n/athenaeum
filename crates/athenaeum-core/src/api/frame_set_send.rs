@@ -314,7 +314,7 @@ mod tests {
             let db = ctx.db.get().unwrap();
             seed(&db.conn());
         }
-        // Masters-built strictness (v2 §6): the raw dark 100 the seed links
+        // Masters-built strictness (v2 §4): the raw dark 100 the seed links
         // blocks the mode — the export will GENERATE these files, and it can
         // only do that from built masters.
         let err = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap_err();

@@ -143,7 +143,7 @@ pub async fn get_calibration_route(
 }
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
-/// (spec §12.2, v2 §6). Read-only; run under `spawn_blocking` so the catalog
+/// (spec §12.2, v2 §4). Read-only; run under `spawn_blocking` so the catalog
 /// queries stay off the async executor. Takes no calibration preferences —
 /// readiness is about the inputs (masters built, lights linked), which no
 /// dialog toggle can change.
@@ -183,9 +183,9 @@ pub async fn get_export_readiness(
 /// `flat_norm` / `flat_norm_mode` / `params` / `hot_pixel` / `debayer` are the
 /// calibrated-lights GENERATION options: in that mode this command calibrates
 /// every light from its linked masters as it places it. Each stays optional so
-/// a caller with no opinion keeps working (defaults: normalize ON,
-/// central-third, default advanced params, hot-pixel correction ON, debayer
-/// ON); every other mode ignores them.
+/// a caller with no opinion keeps working — an omitted one takes
+/// [`CalibratedLightOptions::default`]'s value for that field; every other mode
+/// ignores them.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
@@ -261,12 +261,16 @@ pub async fn export_to_wbpp(
             // Read by the calibrated-lights mode only; the transform ignores it
             // in the others (its debayer flag decides the output NAMES, so it
             // must be the same value the pixel phase later resolves against).
+            // An absent (or `null`) option takes its value from the type that
+            // owns the defaults, never from a literal restated here — the Axum
+            // mirror resolves the same five fields the same way.
+            let defaults = CalibratedLightOptions::default();
             let gen_opts = CalibratedLightOptions {
-                flat_norm: flat_norm.unwrap_or(true),
-                flat_norm_mode: flat_norm_mode.unwrap_or_default(),
-                params: params.unwrap_or_default(),
-                hot_pixel_correction: hot_pixel.unwrap_or(true),
-                debayer_osc: debayer.unwrap_or(true),
+                flat_norm: flat_norm.unwrap_or(defaults.flat_norm),
+                flat_norm_mode: flat_norm_mode.unwrap_or(defaults.flat_norm_mode),
+                params: params.unwrap_or(defaults.params),
+                hot_pixel_correction: hot_pixel.unwrap_or(defaults.hot_pixel_correction),
+                debayer_osc: debayer.unwrap_or(defaults.debayer_osc),
             };
 
             // Strict gate (spec §12.2) + mode transform. `prepare` returns the
