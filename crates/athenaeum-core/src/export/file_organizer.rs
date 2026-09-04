@@ -645,6 +645,26 @@ pub fn organize_files_wbpp(
                             "calibrated light generation failed — frame skipped"
                         );
                         warnings.push(format!("Failed to calibrate {}: {:#}", filename, e));
+                        // Review fix #5: sweep the opposite-toggle sibling on
+                        // failure too. `dest` itself is never written here —
+                        // `generate_one`'s output is atomic (temp + rename) —
+                        // so a failed regeneration would otherwise leave the
+                        // PREVIOUS run's opposite-toggle output in place, and
+                        // WBPP would ingest that stale artifact for a light
+                        // this run just reported as failed. A frame that
+                        // fails to regenerate should leave no artifact
+                        // behind, not a stale one. `claims.claim` above
+                        // already reserved `filename` regardless of outcome,
+                        // so `is_claimed` still refuses to delete a file this
+                        // same run placed.
+                        remove_stale_sibling(
+                            &dest_dir,
+                            &placement.file_path,
+                            &filename,
+                            debayer,
+                            |name| claims.is_claimed(&placement.rel_dir, name),
+                            &mut warnings,
+                        );
                     }
                 }
             }
@@ -669,11 +689,20 @@ pub fn organize_files_wbpp(
 ///
 /// Both names come from [`calibrated_output_filename`] over the SAME source
 /// spelling, so the pair can never describe two different frames. A failure to
-/// remove is reported, never fatal: the export's own output is already written.
+/// remove is reported, never fatal: whatever this frame's own generation did
+/// or did not produce is unaffected either way.
+///
+/// Called on BOTH generation outcomes (review fix #5) — a successful write
+/// (the export's own output is already written) and a failed one (`dest`
+/// itself was never written, since [`generate_one`]'s output is atomic; a
+/// failure must still leave no artifact for this frame, not a stale one from
+/// an earlier run with the toggle flipped).
 ///
 /// `already_placed` is the run's own claim ledger: a source named `x_d.fits`
 /// sitting beside `x.fits` maps to the same output name as `x.fits` debayered,
-/// and this sweep must never delete a file THIS export just wrote.
+/// and this sweep must never delete a file THIS export just wrote — the
+/// caller claims a placement's name before it knows whether generation will
+/// succeed, so the guard holds on both arms.
 fn remove_stale_sibling(
     dest_dir: &Path,
     source_path: &str,
@@ -1464,6 +1493,76 @@ mod tests {
             files_under(out.path()),
             vec!["My Set/camera_testcam/lights/c_light_10.fits"],
             "the debayered output of the first run must not survive the second"
+        );
+    }
+
+    /// Review fix #5: a failed regeneration must not leave the PREVIOUS run's
+    /// opposite-toggle output behind. First run (debayer on) writes
+    /// `c_light_10_d.fits`; the source is then removed so the second run
+    /// (debayer off) fails to generate `light_10` at all — and the stale
+    /// `_d` sibling from the first run must be swept even though this run's
+    /// own `c_light_10.fits` was never written.
+    #[cfg(feature = "render")]
+    #[test]
+    fn failed_regeneration_still_sweeps_the_stale_sibling() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        // An OSC light, so the debayer toggle actually changes the name.
+        let (conn, _dark) =
+            seed_generation_fixture(src.path(), &[(10, "light_10.fits")], Some("RGGB"));
+        let config = WbppExportConfig::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        // First run: debayer ON, succeeds, writes c_light_10_d.fits.
+        let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), true);
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            None,
+            1,
+            &cancel,
+            Some(&mut batch),
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 1, "{:?}", result.warnings);
+        assert_eq!(
+            files_under(out.path()),
+            vec!["My Set/camera_testcam/lights/c_light_10_d.fits"]
+        );
+
+        // The source vanishes (archived/moved), so the second run's pixel
+        // phase fails for this frame.
+        std::fs::remove_file(src.path().join("light_10.fits")).unwrap();
+
+        // Second run: debayer OFF, and the frame fails to regenerate.
+        let (data, mut batch) = resolve_calibrated_batch(&conn, scratch.path(), false);
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            None,
+            1,
+            &cancel,
+            Some(&mut batch),
+        )
+        .unwrap();
+        assert_eq!(result.files_organized, 0, "the only frame failed");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("Failed to calibrate"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            files_under(out.path()).is_empty(),
+            "the failed frame must leave no artifact — neither its own \
+             (never written) nor the earlier run's opposite-toggle output: {:?}",
+            files_under(out.path())
         );
     }
 
