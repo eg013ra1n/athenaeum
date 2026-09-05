@@ -76,6 +76,28 @@ pub struct FrameSetIdArgs {
     pub frame_set_id: i64,
 }
 
+/// `get_export_summary` args — mirrors the Tauri command: the mode the tab has
+/// selected (`None` falls back to the persisted config) plus the five
+/// generation options, optional AND nullable like [`ExportToWbppArgs`]'s,
+/// defaulting through `CalibratedLightOptions::resolve`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetExportSummaryArgs {
+    pub frame_set_id: i64,
+    #[serde(default)]
+    pub export_mode: Option<ExportMode>,
+    #[serde(default)]
+    pub flat_norm: Option<bool>,
+    #[serde(default)]
+    pub flat_norm_mode: Option<FlatNormMode>,
+    #[serde(default)]
+    pub params: Option<LightCalParams>,
+    #[serde(default)]
+    pub hot_pixel: Option<bool>,
+    #[serde(default)]
+    pub debayer: Option<bool>,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportToWbppArgs {
@@ -221,17 +243,29 @@ pub async fn get_calibration_route(
     Ok(Json(route))
 }
 
-/// Get enhanced export summary for the new UI.
+/// Export summary for the tab, drawn for the mode the tab has selected —
+/// the tree, file total and size estimate describe THAT export. Mirrors the
+/// Tauri command's mode fallback and option defaults.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_export_summary(
     State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
+    Json(args): Json<GetExportSummaryArgs>,
 ) -> Result<Json<ExportSummary>, (StatusCode, String)> {
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let config = load_wbpp_config(&conn).unwrap_or_default();
-    let summary = collect_export_summary(&conn, args.frame_set_id, &config).map_err(db_err)?;
+    let mode = resolve_export_mode(args.export_mode, &config);
+    let gen_opts = CalibratedLightOptions::resolve(
+        args.flat_norm,
+        args.flat_norm_mode,
+        args.params,
+        args.hot_pixel,
+        args.debayer,
+    );
+    let summary =
+        collect_export_summary(&conn, args.frame_set_id, &config, mode, Some(&gen_opts))
+            .map_err(db_err)?;
     Ok(Json(summary))
 }
 
@@ -350,14 +384,15 @@ pub async fn export_to_wbpp(
             // Read by the calibrated-lights mode only; the transform ignores it
             // in the others (its debayer flag decides the output NAMES, so it
             // must be the same value the pixel phase later resolves against).
-            let defaults = CalibratedLightOptions::default();
-            let gen_opts = CalibratedLightOptions {
-                flat_norm: args.flat_norm.unwrap_or(defaults.flat_norm),
-                flat_norm_mode: args.flat_norm_mode.unwrap_or(defaults.flat_norm_mode),
-                params: args.params.unwrap_or(defaults.params),
-                hot_pixel_correction: args.hot_pixel.unwrap_or(defaults.hot_pixel_correction),
-                debayer_osc: args.debayer.unwrap_or(defaults.debayer_osc),
-            };
+            // Defaults resolve through the type's own `resolve`, shared with
+            // the Tauri command and the summary preview.
+            let gen_opts = CalibratedLightOptions::resolve(
+                args.flat_norm,
+                args.flat_norm_mode,
+                args.params,
+                args.hot_pixel,
+                args.debayer,
+            );
 
             // Validate output path is within the configured export directory.
             // A rejection here must still finish the export (same reasoning

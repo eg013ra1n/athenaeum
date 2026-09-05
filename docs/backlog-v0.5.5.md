@@ -150,8 +150,9 @@ and counts the raw frames of every linked set. So the tree is truthful only for
 calibration folders, calibrated lights has `c_*` names under `lights/` and no
 calibration folders either.
 
-Fix shape: a persisted choice never beats readiness (blocked → first ready
-option in list order); `get_export_summary(set_id, mode)` in both backends,
+Fix shape: a persisted choice never beats readiness (blocked → the documented
+default `rawWithCalibrationSets`, then list order; the preference itself is not
+rewritten); `get_export_summary(set_id, mode)` in both backends,
 mode applied before tree/totals/size, and the tab re-fetches the summary when
 the mode changes.
 

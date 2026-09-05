@@ -353,6 +353,29 @@ impl Default for CalibratedLightOptions {
     }
 }
 
+impl CalibratedLightOptions {
+    /// Resolve the five per-field host arguments, each optional: an absent
+    /// (or `null`) one takes this type's own default, so neither backend
+    /// restates the defaults — the export commands and the summary preview on
+    /// both hosts resolve the same five fields through this one place.
+    pub fn resolve(
+        flat_norm: Option<bool>,
+        flat_norm_mode: Option<FlatNormMode>,
+        params: Option<LightCalParams>,
+        hot_pixel: Option<bool>,
+        debayer: Option<bool>,
+    ) -> Self {
+        let d = Self::default();
+        Self {
+            flat_norm: flat_norm.unwrap_or(d.flat_norm),
+            flat_norm_mode: flat_norm_mode.unwrap_or(d.flat_norm_mode),
+            params: params.unwrap_or(d.params),
+            hot_pixel_correction: hot_pixel.unwrap_or(d.hot_pixel_correction),
+            debayer_osc: debayer.unwrap_or(d.debayer_osc),
+        }
+    }
+}
+
 /// `c_<stem>.fits`, or `c_<stem>_d.fits` for a debayered output — the ONE
 /// place that spelling is defined. The export path names files before the
 /// pixels are generated and the generator names them at write time; a second

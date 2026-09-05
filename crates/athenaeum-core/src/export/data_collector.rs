@@ -1479,12 +1479,30 @@ fn get_calibration_applications(
 // Export Summary Builder (Enhanced UI)
 // ============================================================================
 
-/// Collect enhanced export summary for the new UI
-pub fn collect_export_summary(conn: &Connection, frame_set_id: i64, config: &WbppExportConfig) -> Result<ExportSummary> {
-    tracing::debug!(frame_set_id, "building export summary");
+/// Collect the export summary for the tab, drawn for `mode`.
+///
+/// The data is shaped the way that mode would export it BEFORE anything is
+/// summarized, so the folder tree, the file total and the size estimate all
+/// describe that export: no calibration folders in lights-only, `c_*` names
+/// and no calibration folders for calibrated lights, one file per master set
+/// in the masters modes. A mode the set is not ready for fails here exactly
+/// like the export itself would — a blocked mode gets a refusal, never a
+/// tree drawn for a different mode. `gen_opts` is read by
+/// `CalibratedLights` only (its debayer flag decides the output names).
+pub fn collect_export_summary(
+    conn: &Connection,
+    frame_set_id: i64,
+    config: &WbppExportConfig,
+    mode: ExportMode,
+    gen_opts: Option<&CalibratedLightOptions>,
+) -> Result<ExportSummary> {
+    tracing::debug!(frame_set_id, ?mode, "building export summary");
 
-    // Get basic export data first
-    let export_data = collect_export_data(conn, frame_set_id)?;
+    let mut export_data = collect_export_data(conn, frame_set_id)?;
+    let omitted = apply_export_mode(conn, &mut export_data, mode, gen_opts)?;
+    if !omitted.is_empty() {
+        tracing::debug!(frame_set_id, count = omitted.len(), "export mode omissions in summary");
+    }
 
     // Collect equipment info from all frames
     let (cameras, telescopes, date_range) = collect_equipment_info(conn, frame_set_id)?;
@@ -1508,7 +1526,7 @@ pub fn collect_export_summary(conn: &Connection, frame_set_id: i64, config: &Wbp
 
     // Calculate totals
     let total_files = calculate_total_files(&export_data);
-    let estimated_size_bytes = estimate_total_size(conn, &export_data)?;
+    let estimated_size_bytes = estimate_total_size(conn, &export_data, total_files)?;
 
     Ok(ExportSummary {
         frame_set_id,
@@ -2249,51 +2267,38 @@ fn build_detailed_warnings(
 }
 
 /// Calculate total file count for export
+/// Files the export would place — the organizer's own placement list, so the
+/// figure matches the tree and the export for every mode. (The calibration
+/// tallies on `ExportData` are collect-time counts that no mode transform
+/// updates; summing them here drew lights-only at the raw+sets total.)
 fn calculate_total_files(export_data: &ExportData) -> i32 {
-    let mut total = 0;
-
-    // Light frames
-    total += export_data.total_light_frames;
-
-    // Calibration frames
-    total += export_data.calibration_summary.flat_count;
-    total += export_data.calibration_summary.dark_count;
-    total += export_data.calibration_summary.bias_count;
-    total += export_data.calibration_summary.dark_flat_count;
-
-    total
+    crate::export::file_organizer::compute_wbpp_placements(export_data).len() as i32
 }
 
 /// Estimate total size of export in bytes
-fn estimate_total_size(conn: &Connection, export_data: &ExportData) -> Result<u64> {
-    let mut total_size: u64 = 0;
+fn estimate_total_size(conn: &Connection, export_data: &ExportData, total_files: i32) -> Result<u64> {
 
-    // Get average file size from light frames in this set
-    let avg_size: Option<i64> = conn
-        .query_row(
-            "SELECT AVG(fi.size)
-             FROM files fi
-             JOIN frames f ON fi.id = f.file_id
-             JOIN session_members sm ON f.id = sm.frame_id
-             JOIN sessions s ON sm.session_id = s.id
-             JOIN imaging_nights n ON s.imaging_night_id = n.id
-             WHERE n.frames_set_id = ?1 AND fi.size IS NOT NULL",
-            [export_data.frame_set_id],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
+    // Average light-frame size in this set. `AVG()` is a REAL in SQLite —
+    // reading it as an integer failed every time, and the `.ok()` that used
+    // to sit here hid that behind the 50 MB default for every set. NULL (no
+    // sized light) is the only case the default is for.
+    let avg_size: Option<f64> = conn.query_row(
+        "SELECT AVG(fi.size)
+         FROM files fi
+         JOIN frames f ON fi.id = f.file_id
+         JOIN session_members sm ON f.id = sm.frame_id
+         JOIN sessions s ON sm.session_id = s.id
+         JOIN imaging_nights n ON s.imaging_night_id = n.id
+         WHERE n.frames_set_id = ?1 AND fi.size IS NOT NULL",
+        [export_data.frame_set_id],
+        |row| row.get(0),
+    )?;
 
-    let avg_size = avg_size.unwrap_or(50_000_000) as u64; // Default 50MB
+    let avg_size = avg_size.map(|v| v.round() as u64).unwrap_or(50_000_000); // Default 50MB
 
-    // Estimate total
-    total_size += export_data.total_light_frames as u64 * avg_size;
-    total_size += export_data.calibration_summary.flat_count as u64 * avg_size;
-    total_size += export_data.calibration_summary.dark_count as u64 * avg_size;
-    total_size += export_data.calibration_summary.bias_count as u64 * avg_size;
-    total_size += export_data.calibration_summary.dark_flat_count as u64 * avg_size;
-
-    Ok(total_size)
+    // Every placed file at the set's average light size — the same file total
+    // the header shows, so the two never disagree.
+    Ok(total_files.max(0) as u64 * avg_size)
 }
 
 /// Format bytes to human-readable string
@@ -2374,12 +2379,13 @@ mod tests {
 #[cfg(test)]
 mod export_mode_tests {
     use super::{
-        apply_export_mode, collect_export_data, export_file_counts, raw_sets_without_master,
-        resolve_export_mode,
+        apply_export_mode, collect_export_data, collect_export_summary, export_file_counts,
+        raw_sets_without_master, resolve_export_mode,
     };
     use crate::db::schema::init_db;
     use crate::export::models::{
-        CalibratedLightOptions, ExportData, ExportFrame, ExportMode, WbppExportConfig,
+        CalibratedLightOptions, ExportData, ExportFrame, ExportMode, FolderNode, FolderNodeType,
+        FolderPreview, WbppExportConfig,
     };
     use rusqlite::{params, Connection};
     use std::collections::HashMap;
@@ -2797,6 +2803,115 @@ mod export_mode_tests {
             apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters, None).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(serde_json::to_value(&data).unwrap(), before);
+    }
+
+    /// Names of every node of one kind in a folder preview, depth-first.
+    fn node_names(nodes: &[FolderNode], kind: &FolderNodeType, out: &mut Vec<String>) {
+        for n in nodes {
+            if &n.node_type == kind {
+                out.push(n.name.clone());
+            }
+            node_names(&n.children, kind, out);
+        }
+    }
+
+    fn folder_names(p: &FolderPreview) -> Vec<String> {
+        let mut v = Vec::new();
+        node_names(&p.structure, &FolderNodeType::Folder, &mut v);
+        v
+    }
+
+    fn file_names(p: &FolderPreview) -> Vec<String> {
+        let mut v = Vec::new();
+        node_names(&p.structure, &FolderNodeType::File, &mut v);
+        v
+    }
+
+    fn has_calibration_folder(p: &FolderPreview) -> bool {
+        folder_names(p)
+            .iter()
+            .any(|n| n.starts_with("DARKS_") || n.starts_with("FLAT_") || n.starts_with("BIAS_"))
+    }
+
+    /// The summary is drawn for the mode the tab has selected: the tree,
+    /// `total_files` and the size estimate all describe what THAT export would
+    /// place — every frame for raw+sets, no calibration folders for
+    /// lights-only, `c_*` names and no calibration folders for calibrated
+    /// lights.
+    #[test]
+    fn export_summary_follows_the_selected_mode() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        seed_light(&conn, 11, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 3);
+        let flat = seed_master_set(&conn, 200, "Flat");
+        for f in [10, 11] {
+            add_link(&conn, f, dark, "Dark");
+            add_link(&conn, f, flat, "Flat");
+        }
+        // A real size so the estimate is a multiple of the file count.
+        conn.execute("UPDATE files SET size = 1000", []).unwrap();
+        let cfg = WbppExportConfig::default();
+
+        let raw = collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithCalibrationSets, None)
+            .unwrap();
+        assert_eq!(raw.total_files, 6, "2 lights + 3 darks + 1 master flat");
+        assert_eq!(raw.estimated_size_bytes, 6_000);
+        assert!(has_calibration_folder(&raw.folder_preview));
+
+        let lights = collect_export_summary(&conn, 1, &cfg, ExportMode::LightsOnly, None).unwrap();
+        assert_eq!(lights.total_files, 2);
+        assert_eq!(lights.folder_preview.total_files, 2);
+        assert_eq!(lights.estimated_size_bytes, 2_000);
+        assert!(
+            !has_calibration_folder(&lights.folder_preview),
+            "got {:?}",
+            folder_names(&lights.folder_preview)
+        );
+
+        let opts = CalibratedLightOptions::default();
+        let cal = collect_export_summary(&conn, 1, &cfg, ExportMode::CalibratedLights, Some(&opts))
+            .unwrap();
+        assert_eq!(cal.total_files, 2);
+        let names = file_names(&cal.folder_preview);
+        assert!(
+            !names.is_empty() && names.iter().all(|f| f.starts_with("c_light_")),
+            "got {names:?}"
+        );
+        assert!(!has_calibration_folder(&cal.folder_preview));
+    }
+
+    /// Absent host arguments take the type's own defaults; present ones win.
+    #[test]
+    fn calibrated_light_options_resolve_fills_absent_fields() {
+        assert_eq!(
+            CalibratedLightOptions::resolve(None, None, None, None, None),
+            CalibratedLightOptions::default()
+        );
+        let r = CalibratedLightOptions::resolve(Some(false), None, None, Some(false), Some(false));
+        assert!(!r.flat_norm && !r.hot_pixel_correction && !r.debayer_osc);
+        assert_eq!(r.flat_norm_mode, CalibratedLightOptions::default().flat_norm_mode);
+        assert_eq!(r.params, CalibratedLightOptions::default().params);
+    }
+
+    /// A mode the set is not ready for is refused, never drawn wrong.
+    #[test]
+    fn export_summary_refuses_a_blocked_mode() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        add_link(&conn, 10, dark, "Dark");
+        let err = collect_export_summary(
+            &conn,
+            1,
+            &WbppExportConfig::default(),
+            ExportMode::RawWithMasters,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no master"), "got: {err}");
     }
 
     /// Per-mode file counts equal the placements each mode would produce.

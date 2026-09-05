@@ -15,6 +15,7 @@ import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { useExportSummary, useWbppConfig } from '../../hooks/useExportData';
 import { useExportProgressContext } from '../../contexts/ExportProgressContext';
+import type { ExportLightCalPrefs } from '../../hooks/useExportProgress';
 import { ExportSummary } from './ExportSummary';
 import { WarningsPanel } from './WarningsPanel';
 import { FolderBrowserModal } from '../FolderBrowserModal';
@@ -57,6 +58,10 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; cou
   { value: 'rawWithMasters', label: 'Lights + masters', hint: 'Raw lights with the built master calibration files. Every linked set needs a master.', count: c => c.rawWithMasters },
   { value: 'calibratedLights', label: 'Calibrated lights', hint: 'Calibrates every light from its linked masters during the export — no calibration frames land; WBPP runs with calibration disabled.', count: c => c.calibratedLights },
 ];
+
+/** Where the tab lands when the remembered mode is blocked on the current set:
+ *  the documented default first (it has no blocker), then list order. */
+const MODE_FALLBACK_ORDER: ExportMode[] = ['rawWithCalibrationSets', ...EXPORT_MODE_OPTIONS.map(o => o.value)];
 
 /** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` verbatim —
  *  wording included: `rawWithMasters` and the calibrated mode's masters-missing
@@ -123,7 +128,6 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   const [exportError, setExportError] = useState<string | null>(null);
   const [sendOpen, setSendOpen] = useState(false);
 
-  const { summary, loading: loadingSummary, error: summaryError } = useExportSummary(frameSetId);
   const { config: wbppConfig, save: saveWbppConfig } = useWbppConfig();
   const { startExport, hasActiveExports } = useExportProgressContext();
   const exporting = hasActiveExports;
@@ -131,7 +135,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // Export mode (spec §12.2). Persisted to localStorage for cross-session
   // memory; synced into the persisted WbppExportConfig at export time (the
   // backend reads `export_mode` from that config, not from the invoke args).
-  const [exportMode, setExportMode] = useState<ExportMode>(readExportModePref);
+  const [preferredMode, setPreferredMode] = useState<ExportMode>(readExportModePref);
 
   // Generation options for the calibrated-lights mode (spec §2). Held in state
   // (rather than read at click time) so every control is controlled; each write
@@ -220,8 +224,32 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   const [readinessLoading, setReadinessLoading] = useState(false);
   const [readinessError, setReadinessError] = useState<string | null>(null);
 
+  // The remembered mode never beats readiness: when it is blocked on THIS set
+  // the tab runs on the first ready mode instead. The preference itself is
+  // left alone — it is the user's memory, and only the user's next pick
+  // rewrites it.
+  const exportMode: ExportMode = useMemo(() => {
+    if (!readiness || modeBlocker(readiness, preferredMode) === null) return preferredMode;
+    return MODE_FALLBACK_ORDER.find(m => modeBlocker(readiness, m) === null) ?? 'lightsOnly';
+  }, [readiness, preferredMode]);
+
+  // The summary is drawn for the selected mode. The generation options matter
+  // only to calibrated lights (the debayer toggle decides the `c_*` names in
+  // the tree), so the other modes don't re-fetch on a toggle.
+  const summaryLightCal = useMemo<ExportLightCalPrefs | undefined>(
+    () => (exportMode === 'calibratedLights' ? { flatNorm, flatNormMode, params, hotPixel, debayer } : undefined),
+    [exportMode, flatNorm, flatNormMode, params, hotPixel, debayer],
+  );
+  // Not before readiness has answered: only then is the mode above final, and
+  // a blocked mode's summary is a refusal, not a tree.
+  const { summary, loading: loadingSummary, error: summaryError } = useExportSummary(
+    readiness ? frameSetId : null,
+    exportMode,
+    summaryLightCal,
+  );
+
   const handleModeChange = useCallback((mode: ExportMode) => {
-    setExportMode(mode);
+    setPreferredMode(mode);
     try {
       localStorage.setItem(EXPORT_MODE_KEY, mode);
     } catch {
@@ -438,15 +466,17 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
 
   return (
     <div className="h-full overflow-y-auto">
-      {loadingSummary ? (
+      {loadingSummary || (readinessLoading && !readiness) ? (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="w-8 h-8 animate-spin text-accent" />
           <span className="ml-3 text-content-muted">Loading export summary…</span>
         </div>
-      ) : summaryError ? (
+      ) : summaryError || (readinessError && !readiness) ? (
         <div className="p-4 bg-error/10 border border-error/30 rounded-lg">
-          <h3 className="font-medium text-error mb-1">Failed to load export summary</h3>
-          <p className="text-sm text-content-muted">{summaryError}</p>
+          <h3 className="font-medium text-error mb-1">
+            {summaryError ? 'Failed to load export summary' : 'Failed to check export readiness'}
+          </h3>
+          <p className="text-sm text-content-muted">{summaryError ?? readinessError}</p>
         </div>
       ) : !summary ? (
         <div className="p-4 text-center text-content-muted">
