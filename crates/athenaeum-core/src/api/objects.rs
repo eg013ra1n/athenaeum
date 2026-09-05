@@ -33,7 +33,6 @@ pub fn resolve_object_name(ctx: &ServiceContext, name: String) -> Option<Resolve
 ///
 /// Mirrors how the plate-solve batch obtains it: parsed once (~3 MB of JSON)
 /// and shared, never per call.
-#[cfg(all(feature = "render", feature = "solver"))]
 fn load_catalog(ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCatalog>> {
     if let Some(cat) = ctx.dso_catalog.read().ok()?.as_ref() {
         return Some(cat.clone());
@@ -43,12 +42,6 @@ fn load_catalog(ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCatalog>> {
         *guard = Some(loaded.clone());
     }
     Some(loaded)
-}
-
-/// Headless builds carry no shared catalog slot; parse on demand.
-#[cfg(not(all(feature = "render", feature = "solver")))]
-fn load_catalog(_ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCatalog>> {
-    DsoCatalog::load().ok().map(std::sync::Arc::new)
 }
 
 #[cfg(test)]

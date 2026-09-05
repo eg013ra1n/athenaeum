@@ -39,6 +39,9 @@ pub mod collab_exchange;
 // master integration, light calibration) and are gated with it.
 #[cfg(feature = "render")]
 pub mod analysis;
+// Resolving an OBJECT name needs the bundled DSO catalog, which lives in
+// `plate_solve` — gated on the same two features that module is.
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod objects;
 pub mod compute;
 #[cfg(feature = "render")]
