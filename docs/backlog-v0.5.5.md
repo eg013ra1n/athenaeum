@@ -195,7 +195,7 @@ The tag goes after stage 4.
 | ---- | ---- | ---- |
 | 1 | **Quick fixes**: Analysis tab (item 2) · Export default + tree (item 7) · frame cards carry camera / telescope / timings (the tail of item 1) | bounded, one commit per slice |
 | 2 | **Nights** (item 3): re-derive on merge + Recalculate nights — DONE 2026-09-05, accepted on a copy of the real catalog (set 109: 4 rows → 3 nights, 106/65/197 frames) | bounded |
-| 3 | **Manual calibration assignment** (item 6): scoring first, then the unified modal — CORE DONE 2026-09-05 (spec `docs/superpowers/specs/2026-09-05-calibration-scoring-design.md`), the unified modal is the second pass | architectural → spec → plan |
+| 3 | **Manual calibration assignment** (item 6) — DONE 2026-09-05, both passes (spec `docs/superpowers/specs/2026-09-05-calibration-scoring-design.md`): scoring/verdicts in the core, then the two modals merged into one `CalibrationPicker` | architectural → spec → plan |
 | 4 | **Plate-solve input gate** (item 5) | bounded–medium |
 
 Inside stage 3 the scoring change goes first — it is core, testable against

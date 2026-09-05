@@ -5,8 +5,8 @@ import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
 } from '../types/models';
-import { ManualCalibrationModal } from './ManualCalibrationModal';
-import type { ManualPick } from './ManualCalibrationModal';
+import { CalibrationPicker } from './calibration/CalibrationPicker';
+import type { ManualPick } from './calibration/CalibrationPicker';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
@@ -485,19 +485,25 @@ export function CalibrationHierarchyView({
         </div>
       )}
 
-      {/* Manual Calibration Modal */}
-      <ManualCalibrationModal
-        isOpen={manualModalOpen}
-        frameIds={manualModalFrameIds}
-        filterDisplay={manualModalFilterDisplay}
-        currentFlatSetId={manualModalCurrentFlat}
-        currentDarkSetId={manualModalCurrentDark}
-        currentBiasSetId={manualModalCurrentBias}
-        useBiasForDarkOptimization={useBiasForDarkOptimization}
-        onApply={handleManualCalibrationApply}
-        onClose={() => setManualModalOpen(false)}
-        onRefresh={onRefresh}
-      />
+      {/* Choosing calibration for these lights */}
+      {manualModalOpen && (
+        <CalibrationPicker
+          subject={{
+            kind: 'lights',
+            frameIds: manualModalFrameIds,
+            label: manualModalFilterDisplay,
+            current: {
+              flat: manualModalCurrentFlat,
+              dark: manualModalCurrentDark,
+              bias: manualModalCurrentBias,
+            },
+            useBiasForDarkOptimization,
+          }}
+          onApplyLights={handleManualCalibrationApply}
+          onApplied={onRefresh}
+          onClose={() => setManualModalOpen(false)}
+        />
+      )}
 
       {/* Create Master dialog — single-set (row click) or batch (toolbar) */}
       {batchDialogIds && batchDialogIds.length > 0 && (

@@ -568,6 +568,12 @@ cycle, so anything from them that matters later belongs here or in a plan.
 - Calibration: "show only compatible" now means exactly that. It used to hide
   everything whenever no candidate was perfect, and it hid compatible-but-old
   sets as well.
+- Calibration: choosing calibration by hand is one screen now, for light
+  frames and for a calibration set's own sub-calibration alike. The camera,
+  exposure and date filters are always visible, clicking a value in the left
+  panel filters the list by it, and each card names the difference that
+  matters — "Offset 30 → 200" — instead of listing parameters you had to
+  compare yourself.
 - Master libraries: a master with no GAIN or OFFSET in its header is flagged
   in the Dark/Flat library — such a set can never be matched automatically,
   and Edit Metadata fills the values in.

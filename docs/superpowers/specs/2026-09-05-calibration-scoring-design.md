@@ -199,11 +199,36 @@ gets a badge in the Master Dark/Flat Library — *"no GAIN/OFFSET — will not b
 matched automatically"* — next to the Bulk Edit that fixes it. Without it, 133
 unusable masters stay silently unusable.
 
-## 8. Out of scope
+## 8. Second pass — done 2026-09-05
 
-- Merging `ManualCalibrationModal` and `SubCalibrationModal` into one
-  interface, the always-visible filter, camera / exposure dropdowns and
-  click-to-fill from the info panel. Second pass, its own design.
+`ManualCalibrationModal` and `SubCalibrationModal` are gone, replaced by one
+`CalibrationPicker` parameterised on its SUBJECT (`lights` — a group of light
+frames — or `set` — a calibration set's own sub-calibration). Everything else
+follows from that value: which slots exist, what the summary shows, which
+command lists candidates, and who writes the result. Lights still hand their
+picks to the calibration hierarchy, which owns that transaction; a set saves
+itself.
+
+What the merge was asked to bring, and what it does:
+
+- **The filter is always visible** — camera and exposure dropdowns (built from
+  the candidates actually present) and a date window, above the list at all
+  times rather than appearing only in "show all".
+- **Click-to-fill** — the left panel's camera, exposure and nights are buttons
+  that write themselves into that filter.
+- **The card states the difference, not the parameters.** Line one identifies
+  the set (its nights, its weight, a Master badge); line two is what it is,
+  muted; line three exists only when something differs and is the only
+  coloured thing on the card: `Offset 30 → 200`, `Gain 100 → the set declares
+  none`, `Exposure 180 → 120 limit 5`.
+- **"Only sets that fit"** narrows on the client — every candidate carries
+  `compatible`, so the toggle is instant and the counter can honestly read
+  "3 of 711". Asking the backend to filter made the total unknowable, which
+  rendered as "0 of 1" beside a list of one.
+
+Verified in the running app on a copy of the real catalog: both entry points
+(Objects → Calibration Coverage → Re-assign → Manual Cal, and Equipment →
+Flats → Sub-Cal), both toggle states, and click-to-fill.
 - Changing what "cannot compare" means to the matcher (owner decision, §2).
 - The retired `MatchDetails` shape: it is removed with the modals, not before.
 

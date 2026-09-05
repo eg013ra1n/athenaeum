@@ -4,7 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
-import { SubCalibrationModal } from "./SubCalibrationModal";
+import { CalibrationPicker } from "./calibration/CalibrationPicker";
 
 export interface LibraryStats {
   totalSets: number;
@@ -251,11 +251,9 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
 
       {/* Sub-Calibration Modal */}
       {subCalModalSetId !== null && (
-        <SubCalibrationModal
-          isOpen={true}
-          sourceSetId={subCalModalSetId}
-          sourceType={subCalModalType}
-          onApply={handleSubCalApply}
+        <CalibrationPicker
+          subject={{ kind: "set", setId: subCalModalSetId, sourceType: subCalModalType }}
+          onApplied={handleSubCalApply}
           onClose={() => setSubCalModalSetId(null)}
         />
       )}
