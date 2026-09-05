@@ -559,8 +559,9 @@ async fn iroh_resume_after_endpoint_restart() {
 
     let mut receiver_events = receiver.events().await;
 
-    // A multi-megabyte package makes it likely the first fetch is interrupted
-    // mid-download; if it happens to finish, the re-fetch below is idempotent.
+    // A multi-megabyte package, throttled below, so the first fetch is
+    // interrupted mid-download — see the cancel block for why "likely" is not
+    // good enough here.
     let (pkg_dir, announce) = build_package(
         &tmp.path().join("src"),
         "uuid-r",
@@ -590,12 +591,35 @@ async fn iroh_resume_after_endpoint_restart() {
     };
 
     let dest = tmp.path().join("dest");
-    // First attempt: cancel quickly (drops the download future mid-flight).
+
+    // The first attempt MUST be interrupted mid-download, and a wall clock
+    // alone cannot promise that: a fast runner moves 16 MiB over loopback well
+    // inside 80 ms. A first fetch that runs to completion does not merely make
+    // the test vacuous — it makes it FAIL, because the export is
+    // `ExportMode::TryReference` (transfer-prepare spec §5) and MOVES the
+    // store's data file out to `dest`. The re-fetch then finds the entry
+    // `Complete` with its file gone and takes the transfer-class
+    // `on_export_source_vanished` branch, whose designed recovery is a tag drop
+    // plus GC within fifteen minutes — not something a test can wait out. (The
+    // sink cannot arm the cancel either: `FETCH_PROGRESS_MIN_INTERVAL` throttles
+    // the first progress tick to 300 ms, later than the whole download.)
+    //
+    // So throttle the provider instead: at 4 MiB/s the payload needs about four
+    // seconds, which puts the 80 ms cancel two orders of magnitude inside the
+    // download, and lift the limit again so the resume runs at full speed.
+    provider.set_upload_limit(4 * 1024 * 1024);
     let _ = tokio::time::timeout(
         Duration::from_millis(80),
         receiver.fetch(provider_info.node_id, &wire, &dest, noop_fetch_sink()),
     )
     .await;
+    // The premise, asserted rather than assumed: export runs only after a blob
+    // is fully downloaded, so an interrupted attempt leaves no file behind.
+    assert!(
+        !dest.join("big.fits").exists(),
+        "first attempt was meant to be interrupted mid-download, but it finished"
+    );
+    provider.set_upload_limit(0);
 
     // Drop the receiving endpoint + store, releasing the fs blob dir.
     receiver.shutdown().await;
