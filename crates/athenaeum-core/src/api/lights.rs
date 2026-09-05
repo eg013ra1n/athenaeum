@@ -114,8 +114,17 @@ fn load_light_members(conn: &Connection, set_id: i64) -> Result<Vec<(i64, String
 /// The ONE gate shared by `export_to_wbpp` and `enqueue_frame_set_send`. The
 /// returned sentence is what the Export tab shows under a disabled mode.
 pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), String> {
+    // Nothing linked at all: the two raw modes would land exactly what Lights
+    // only lands, so their promise is empty and they are blocked rather than
+    // offered as a difference that does not exist. Ahead of the masters rule,
+    // which is vacuously true when there is no set to lack a master.
+    let nothing_linked = r.total > 0 && r.unlinked_lights == r.total;
     match mode {
-        ExportMode::LightsOnly | ExportMode::RawWithCalibrationSets => Ok(()),
+        ExportMode::LightsOnly => Ok(()),
+        ExportMode::RawWithCalibrationSets | ExportMode::RawWithMasters if nothing_linked => Err(
+            "No calibration is linked to this set — only the lights would land".to_string(),
+        ),
+        ExportMode::RawWithCalibrationSets => Ok(()),
         ExportMode::RawWithMasters if r.raw_sets_without_master == 0 => Ok(()),
         ExportMode::RawWithMasters => {
             let n = r.raw_sets_without_master;
@@ -645,6 +654,27 @@ mod tests {
         };
         let msg = check_mode_ready(&one, ExportMode::CalibratedLights).unwrap_err();
         assert_eq!(msg, "1 light has no calibration links");
+
+        // Nothing linked at all: the two raw modes would land exactly what
+        // Lights only lands, so their promise is empty — blocked, ahead of
+        // the masters check (which is vacuously true with no sets at all).
+        let nothing = ExportReadiness {
+            unlinked_lights: 4,
+            ..ready.clone()
+        };
+        assert!(check_mode_ready(&nothing, ExportMode::LightsOnly).is_ok());
+        let msg = check_mode_ready(&nothing, ExportMode::RawWithCalibrationSets).unwrap_err();
+        assert_eq!(msg, "No calibration is linked to this set — only the lights would land");
+        let msg = check_mode_ready(&nothing, ExportMode::RawWithMasters).unwrap_err();
+        assert_eq!(msg, "No calibration is linked to this set — only the lights would land");
+        let msg = check_mode_ready(&nothing, ExportMode::CalibratedLights).unwrap_err();
+        assert_eq!(msg, "4 lights have no calibration links");
+        // A set with no lights is empty, not "nothing linked".
+        let empty = ExportReadiness {
+            total: 0,
+            ..ready.clone()
+        };
+        assert!(check_mode_ready(&empty, ExportMode::RawWithMasters).is_ok());
 
         // A missing master FILE blocks only the calibrated-lights mode, with
         // the C-2 sentence — every other blocker in `ready` is clear.

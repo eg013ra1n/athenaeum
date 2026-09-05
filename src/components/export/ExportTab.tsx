@@ -64,13 +64,19 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; cou
 const MODE_FALLBACK_ORDER: ExportMode[] = ['rawWithCalibrationSets', ...EXPORT_MODE_OPTIONS.map(o => o.value)];
 
 /** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` verbatim —
- *  wording included: `rawWithMasters` and the calibrated mode's masters-missing
- *  blocker read different sentences on the backend even though both gate on
- *  `rawSetsWithoutMaster`, and the calibrated mode's blocker ORDER is
- *  masters-missing → unlinked-lights → missing master FILES (a build is what
+ *  wording included: with nothing linked at all the two raw modes are blocked
+ *  first (they would land exactly what Lights only lands, and the masters rule
+ *  is vacuously true with no sets); `rawWithMasters` and the calibrated mode's
+ *  masters-missing blocker read different sentences on the backend even though
+ *  both gate on `rawSetsWithoutMaster`, and the calibrated mode's blocker ORDER
+ *  is masters-missing → unlinked-lights → missing master FILES (a build is what
  *  can also change where a light's links resolve to; a missing FILE is a
  *  distinct failure from "not built yet"). */
 function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
+  const nothingLinked = r.total > 0 && r.unlinkedLights === r.total;
+  if ((mode === 'rawWithCalibrationSets' || mode === 'rawWithMasters') && nothingLinked) {
+    return 'No calibration is linked to this set — only the lights would land';
+  }
   if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
     const n = r.rawSetsWithoutMaster;
     return `${n} calibration set${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no master — build masters first`;

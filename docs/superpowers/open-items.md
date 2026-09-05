@@ -541,8 +541,11 @@ cycle, so anything from them that matters later belongs here or in a plan.
 - Export: the folder tree, file total and size estimate follow the selected
   export mode — no calibration folders in Lights only, `c_*` names for
   Calibrated lights, one file per master set — and a remembered mode that is
-  not available for the current set no longer stays selected. The size
-  estimate now uses the set's real average file size instead of a fixed
-  50 MB per file.
+  not available for the current set no longer stays selected. A set with no
+  calibration linked at all now offers only Lights only (the two raw modes
+  would have landed the same files under a different name), Lights only shows
+  no calibration warnings, and a missing-calibration warning names the camera
+  when two groups share a filter. The size estimate now uses the set's real
+  average file size instead of a fixed 50 MB per file.
 - Calendar: a day's cards show the camera, the telescope and the first–last
   exposure time of that night.

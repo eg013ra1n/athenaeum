@@ -152,7 +152,11 @@ calibration folders either.
 
 Fix shape: a persisted choice never beats readiness (blocked → the documented
 default `rawWithCalibrationSets`, then list order; the preference itself is not
-rewritten); `get_export_summary(set_id, mode)` in both backends,
+rewritten); with NOTHING linked the two raw modes are blocked too (they would
+land exactly what Lights only lands — the masters rule was vacuously true with
+no sets at all; found on C/2025 A6, 104 lights, 0 links); calibration warnings
+describe the links, not the mode, and lights-only carries none; a missing-
+calibration warning names the camera (two groups can share a filter); `get_export_summary(set_id, mode)` in both backends,
 mode applied before tree/totals/size, and the tab re-fetches the summary when
 the mode changes.
 

@@ -2161,6 +2161,12 @@ fn build_detailed_warnings(
 
     for group in filter_groups {
         let filter_name = group.filter.clone().unwrap_or_else(|| "Unfiltered".to_string());
+        // Two groups can share a filter (one per camera), so the title names
+        // the camera too — the `filter` field stays the bare filter.
+        let group_label = match &group.camera {
+            Some(camera) => format!("{filter_name} · {camera}"),
+            None => filter_name.clone(),
+        };
 
         // Check temperature mismatches
         if let Some(ref dark_info) = group.dark_info {
@@ -2197,7 +2203,7 @@ fn build_detailed_warnings(
             warnings.push(DetailedWarning {
                 warning_type: WarningType::MissingCalibration,
                 severity: WarningSeverity::Warning,
-                title: format!("Missing Flat Calibration: {}", filter_name),
+                title: format!("Missing Flat Calibration: {}", group_label),
                 description: "No flat frames are linked to this filter's light frames".to_string(),
                 set_id: None,
                 filter: Some(filter_name.clone()),
@@ -2214,7 +2220,7 @@ fn build_detailed_warnings(
             warnings.push(DetailedWarning {
                 warning_type: WarningType::MissingCalibration,
                 severity: WarningSeverity::Warning,
-                title: format!("Missing Dark Calibration: {}", filter_name),
+                title: format!("Missing Dark Calibration: {}", group_label),
                 description: "No dark frames are linked to this filter's light frames".to_string(),
                 set_id: None,
                 filter: Some(filter_name.clone()),
@@ -2959,6 +2965,39 @@ mod export_mode_tests {
             "got {:?}",
             lights.warnings.iter().map(|w| &w.title).collect::<Vec<_>>()
         );
+    }
+
+    /// Two filter groups can share a filter label (one per camera), so a
+    /// missing-calibration warning names the camera too — otherwise the panel
+    /// shows the same line twice with no way to tell which is which.
+    #[test]
+    fn missing_calibration_warnings_name_the_camera() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, None);
+        seed_light(&conn, 11, session, None);
+        conn.execute(
+            "UPDATE frames SET instrume = 'CamOSC', bayerpat = 'RGGB' WHERE id = 11",
+            [],
+        )
+        .unwrap();
+        let s = collect_export_summary(
+            &conn,
+            1,
+            &WbppExportConfig::default(),
+            ExportMode::RawWithCalibrationSets,
+            None,
+        )
+        .unwrap();
+        let flats: Vec<&str> = s
+            .warnings
+            .iter()
+            .filter(|w| w.title.starts_with("Missing Flat"))
+            .map(|w| w.title.as_str())
+            .collect();
+        assert_eq!(flats.len(), 2, "{flats:?}");
+        assert!(flats.contains(&"Missing Flat Calibration: Unfiltered · TestCam"), "{flats:?}");
+        assert!(flats.contains(&"Missing Flat Calibration: Unfiltered · CamOSC"), "{flats:?}");
     }
 
     /// A mode the set is not ready for is refused, never drawn wrong.
