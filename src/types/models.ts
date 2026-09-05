@@ -298,9 +298,33 @@ export type LightFrameWithCalibration = { frame_id: number, file_id: number, fil
  */
 plate_solved: boolean, calibration_status: FrameCalibrationStatus, };
 
-export type CalendarFrameSetSummary = { id: number, name: string | null, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, };
+export type CalendarFrameSetSummary = { id: number, name: string | null, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, 
+/**
+ * Distinct INSTRUME values of the day's frames, sorted.
+ */
+cameras: Array<string>, 
+/**
+ * Distinct TELESCOP values of the day's frames, sorted (NULLs skipped).
+ */
+telescopes: Array<string>, 
+/**
+ * Earliest / latest DATE-OBS of the day's frames.
+ */
+firstObs: string | null, lastObs: string | null, };
 
-export type CalendarUnorganizedGroup = { id: string, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, frameIds: Array<number>, };
+export type CalendarUnorganizedGroup = { id: string, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, frameIds: Array<number>, 
+/**
+ * Distinct INSTRUME values of the group's frames, sorted.
+ */
+cameras: Array<string>, 
+/**
+ * Distinct TELESCOP values of the group's frames, sorted (NULLs skipped).
+ */
+telescopes: Array<string>, 
+/**
+ * Earliest / latest DATE-OBS of the group's frames.
+ */
+firstObs: string | null, lastObs: string | null, };
 
 export type CalendarDayEvent = { date: string, frameSets: Array<CalendarFrameSetSummary>, unorganizedGroups: Array<CalendarUnorganizedGroup>, totalFrameCount: number, totalExposureSeconds: number, };
 

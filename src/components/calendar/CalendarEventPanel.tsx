@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { api } from '../../api';
-import { Map, Eye, Clock, Camera, Plus, Calendar } from 'lucide-react';
+import { Map, Eye, Clock, Camera, Plus, Calendar, Aperture, Telescope, CalendarClock } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import type { CalendarDayEvent, CalendarFrameSetSummary, CalendarUnorganizedGroup } from '../../types/models';
+import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface CalendarEventPanelProps {
   selectedDate: string | null;
@@ -21,6 +22,52 @@ function formatExposure(seconds: number): string {
   }
   const hours = minutes / 60;
   return `${hours.toFixed(1)}h`;
+}
+
+/** Second meta line of a card: what shot the frames and when the night ran.
+ *  Camera and telescope are the header values (INSTRUME / TELESCOP, every
+ *  distinct one of the day); the timings are the first and last exposure
+ *  start in local time, with the full timestamps in the tooltip. */
+function EquipmentLine({
+  cameras,
+  telescopes,
+  firstObs,
+  lastObs,
+}: {
+  cameras: string[];
+  telescopes: string[];
+  firstObs: string | null;
+  lastObs: string | null;
+}) {
+  const span = firstObs && lastObs
+    ? `${format(parseISO(firstObs), 'HH:mm')}–${format(parseISO(lastObs), 'HH:mm')}`
+    : null;
+  if (cameras.length === 0 && telescopes.length === 0 && !span) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-content-muted">
+      {cameras.length > 0 && (
+        <span className="flex items-center gap-1 min-w-0" title={`Camera: ${cameras.join(', ')}`}>
+          <Aperture size={12} className="shrink-0" />
+          <span className="truncate">{cameras.join(', ')}</span>
+        </span>
+      )}
+      {telescopes.length > 0 && (
+        <span className="flex items-center gap-1 min-w-0" title={`Telescope: ${telescopes.join(', ')}`}>
+          <Telescope size={12} className="shrink-0" />
+          <span className="truncate">{telescopes.join(', ')}</span>
+        </span>
+      )}
+      {span && firstObs && lastObs && (
+        <span
+          className="flex items-center gap-1"
+          title={`First exposure ${formatTimestamp(firstObs)} · last exposure ${formatTimestamp(lastObs)}`}
+        >
+          <CalendarClock size={12} className="shrink-0" />
+          {span}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function FrameSetCard({
@@ -55,6 +102,12 @@ function FrameSetCard({
           </span>
         )}
       </div>
+      <EquipmentLine
+        cameras={frameSet.cameras}
+        telescopes={frameSet.telescopes}
+        firstObs={frameSet.firstObs}
+        lastObs={frameSet.lastObs}
+      />
       <div className="flex items-center gap-2 pt-1">
         <button
           onClick={onDetails}
@@ -110,6 +163,12 @@ function UnorganizedCard({
           {formatExposure(group.totalExposureSeconds)}
         </span>
       </div>
+      <EquipmentLine
+        cameras={group.cameras}
+        telescopes={group.telescopes}
+        firstObs={group.firstObs}
+        lastObs={group.lastObs}
+      />
       <div className="pt-1 space-y-2">
         <button
           onClick={onCreateFrameset}

@@ -14,6 +14,24 @@ use crate::models::{
     CalendarDayEvent, CalendarFrameSetSummary, CalendarMonthData, CalendarUnorganizedGroup,
 };
 
+/// Split a `GROUP_CONCAT(DISTINCT …)` column into a sorted list of non-empty
+/// names. Sorted because SQLite's concatenation order follows the scan, which
+/// a card must not mirror.
+fn split_names(joined: Option<String>) -> Vec<String> {
+    let mut names: Vec<String> = joined
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Get calendar data for a specific month
 ///
 /// Returns all imaging activity grouped by date for calendar rendering.
@@ -46,7 +64,11 @@ pub fn get_calendar_month_data(
                 COALESCE(SUM(fr.exptime), 0) as total_exposure,
                 fs.objctra as avg_ra,
                 fs.objctdec as avg_dec,
-                GROUP_CONCAT(DISTINCT fr.filter) as filters
+                GROUP_CONCAT(DISTINCT fr.filter) as filters,
+                GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
+                GROUP_CONCAT(DISTINCT fr.telescop) as telescopes,
+                MIN(fr.date_obs) as first_obs,
+                MAX(fr.date_obs) as last_obs
             FROM frames fr
             JOIN session_members sm ON sm.frame_id = fr.id
             JOIN sessions s ON s.id = sm.session_id
@@ -71,6 +93,10 @@ pub fn get_calendar_month_data(
             let ra_str: Option<String> = row.get(6)?;
             let dec_str: Option<String> = row.get(7)?;
             let filters_str: Option<String> = row.get(8)?;
+            let cameras: Vec<String> = split_names(row.get(9)?);
+            let telescopes: Vec<String> = split_names(row.get(10)?);
+            let first_obs: Option<String> = row.get(11)?;
+            let last_obs: Option<String> = row.get(12)?;
 
             // Parse sexagesimal coordinates to decimal degrees
             let avg_ra: Option<f64> = ra_str.as_ref().and_then(|s| parse_ra_sexagesimal(s).ok());
@@ -96,6 +122,10 @@ pub fn get_calendar_month_data(
                     ra: avg_ra,
                     dec: avg_dec,
                     filters,
+                    cameras,
+                    telescopes,
+                    first_obs,
+                    last_obs,
                 },
             ))
         })
@@ -131,7 +161,11 @@ pub fn get_calendar_month_data(
                 AVG(fr.ra) as avg_ra,
                 AVG(fr.dec) as avg_dec,
                 GROUP_CONCAT(DISTINCT fr.filter) as filters,
-                GROUP_CONCAT(fr.id) as frame_ids
+                GROUP_CONCAT(fr.id) as frame_ids,
+                GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
+                GROUP_CONCAT(DISTINCT fr.telescop) as telescopes,
+                MIN(fr.date_obs) as first_obs,
+                MAX(fr.date_obs) as last_obs
             FROM frames fr
             WHERE fr.imagetyp = 'Light'
               AND DATE(fr.date_obs) >= ?1
@@ -155,6 +189,10 @@ pub fn get_calendar_month_data(
             let avg_dec: Option<f64> = row.get(5)?;
             let filters_str: Option<String> = row.get(6)?;
             let frame_ids_str: Option<String> = row.get(7)?;
+            let cameras: Vec<String> = split_names(row.get(8)?);
+            let telescopes: Vec<String> = split_names(row.get(9)?);
+            let first_obs: Option<String> = row.get(10)?;
+            let last_obs: Option<String> = row.get(11)?;
 
             let filters: Vec<String> = filters_str
                 .map(|s| {
@@ -196,6 +234,10 @@ pub fn get_calendar_month_data(
                     dec: avg_dec,
                     filters,
                     frame_ids,
+                    cameras,
+                    telescopes,
+                    first_obs,
+                    last_obs,
                 },
             ))
         })
@@ -312,5 +354,89 @@ mod tests {
         assert_eq!(data.days.len(), 1);
         assert_eq!(data.days[0].date, "2026-12-24");
         assert_eq!(data.total_frame_count, 1);
+    }
+
+    fn insert_light_with(
+        conn: &Connection,
+        id: i64,
+        object: &str,
+        date_obs: &str,
+        exptime: f64,
+        instrume: &str,
+        telescop: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 1024, '2026-01-01T00:00:00Z', 'FITS')",
+            params![id, format!("/tmp/frame_{id}.fits"), format!("frame_{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (id, file_id, object, date_obs, imagetyp, exptime, filter, ra, dec, instrume, telescop)
+             VALUES (?1, ?1, ?2, ?3, 'Light', ?4, 'L', 10.0, 41.0, ?5, ?6)",
+            params![id, object, date_obs, exptime, instrume, telescop],
+        )
+        .unwrap();
+    }
+
+    /// Put frames into one frame set through a night + one session — the
+    /// calendar's organized query joins through `session_members`.
+    fn organize(conn: &Connection, fs_id: i64, frame_ids: &[i64]) {
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (?1, ?2)",
+            params![fs_id, format!("Set {fs_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (?1, '2026-03-05T20:00:00Z', '2026-03-06T03:00:00Z')",
+            params![fs_id],
+        )
+        .unwrap();
+        let night = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'TestCam')",
+            params![night],
+        )
+        .unwrap();
+        let session = conn.last_insert_rowid();
+        for f in frame_ids {
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                params![session, f],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Calendar cards carry the equipment and the timing of the night: every
+    /// camera and telescope that shot the frames (sorted, NULLs skipped) and
+    /// the first / last exposure start — for organized sets and for
+    /// unorganized groups alike.
+    #[test]
+    fn day_entries_carry_equipment_and_timings() {
+        let conn = test_db();
+        insert_light_with(&conn, 1, "M31", "2026-03-05T22:10:00", 300.0, "CamB", Some("Scope2"));
+        insert_light_with(&conn, 2, "M31", "2026-03-05T23:40:00", 300.0, "CamA", Some("Scope1"));
+        organize(&conn, 7, &[1, 2]);
+        insert_light_with(&conn, 3, "M42", "2026-03-05T20:00:00", 60.0, "CamC", None);
+        insert_light_with(&conn, 4, "M42", "2026-03-05T21:30:00", 60.0, "CamC", None);
+
+        let data = get_calendar_month_data(&conn, 2026, 3).unwrap();
+        assert_eq!(data.days.len(), 1);
+        let day = &data.days[0];
+
+        let set = &day.frame_sets[0];
+        assert_eq!(set.cameras, vec!["CamA", "CamB"]);
+        assert_eq!(set.telescopes, vec!["Scope1", "Scope2"]);
+        assert_eq!(set.first_obs.as_deref(), Some("2026-03-05T22:10:00"));
+        assert_eq!(set.last_obs.as_deref(), Some("2026-03-05T23:40:00"));
+
+        let group = &day.unorganized_groups[0];
+        assert_eq!(group.cameras, vec!["CamC"]);
+        assert!(group.telescopes.is_empty(), "a NULL TELESCOP is not a telescope");
+        assert_eq!(group.first_obs.as_deref(), Some("2026-03-05T20:00:00"));
+        assert_eq!(group.last_obs.as_deref(), Some("2026-03-05T21:30:00"));
     }
 }

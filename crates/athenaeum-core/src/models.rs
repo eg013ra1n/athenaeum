@@ -761,6 +761,13 @@ pub struct CalendarFrameSetSummary {
     pub ra: Option<f64>,
     pub dec: Option<f64>,
     pub filters: Vec<String>,
+    /// Distinct INSTRUME values of the day's frames, sorted.
+    pub cameras: Vec<String>,
+    /// Distinct TELESCOP values of the day's frames, sorted (NULLs skipped).
+    pub telescopes: Vec<String>,
+    /// Earliest / latest DATE-OBS of the day's frames.
+    pub first_obs: Option<String>,
+    pub last_obs: Option<String>,
 }
 
 /// Group of unorganized frames for calendar display
@@ -775,6 +782,13 @@ pub struct CalendarUnorganizedGroup {
     pub dec: Option<f64>,
     pub filters: Vec<String>,
     pub frame_ids: Vec<i64>,
+    /// Distinct INSTRUME values of the group's frames, sorted.
+    pub cameras: Vec<String>,
+    /// Distinct TELESCOP values of the group's frames, sorted (NULLs skipped).
+    pub telescopes: Vec<String>,
+    /// Earliest / latest DATE-OBS of the group's frames.
+    pub first_obs: Option<String>,
+    pub last_obs: Option<String>,
 }
 
 /// Summary of imaging activity for a single calendar day
