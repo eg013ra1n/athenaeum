@@ -1214,16 +1214,30 @@ mod land_payload_tests {
         assert!(!landing.join("sub").join("x.fits.tmp").exists());
     }
 
+    /// A link refusal must never fail a landing: `land_payload` hard-links the
+    /// staged file into place and falls back to a byte copy on ANY refusal
+    /// (cross-device, SMB/NFS/exFAT, permission). This drives a REAL refusal —
+    /// `hard_link` into a dest that already exists is refused on every platform
+    /// (POSIX `EEXIST`, Windows `ERROR_ALREADY_EXISTS`) — so the `Err` arm the
+    /// fallback lives in actually runs.
+    ///
+    /// It replaces a test of the same intent that passed `force_copy = true`,
+    /// which skips the `hard_link` attempt outright: the arm under test never
+    /// ran, so making a refusal fatal stayed green through the whole suite.
+    /// `force_copy` is worth a look on its own — no production call site passes
+    /// it `true` (`land_payload` passes `false`), so that argument existed only
+    /// for the test replaced here.
     #[test]
-    fn land_payload_falls_back_to_copy_when_linking_fails() {
-        // A link target on a path whose parent is a FILE cannot be linked or created
-        // — use the copy fallback seam instead: link to a dest inside a read-only
-        // dir is platform-dependent, so exercise the fallback through the helper.
+    fn link_or_copy_falls_back_to_a_copy_when_the_link_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let staged = tmp.path().join("x.fits");
         std::fs::write(&staged, b"payload").unwrap();
-        let tmp_dest = tmp.path().join("x.fits.tmp");
-        super::link_or_copy(&staged, &tmp_dest, true).unwrap();
-        assert_eq!(std::fs::read(&tmp_dest).unwrap(), b"payload");
+        let dest = tmp.path().join("x.fits.tmp");
+        std::fs::write(&dest, b"stale").unwrap();
+
+        super::link_or_copy(&staged, &dest, false)
+            .expect("a refused link must fall back to a copy, never fail the landing");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
     }
 }
