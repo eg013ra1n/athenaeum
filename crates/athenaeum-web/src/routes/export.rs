@@ -725,10 +725,15 @@ mod export_cancel_while_queued_tests {
 
     /// One light, linked straight to a registered master dark — enough for
     /// `check_mode_ready(CalibratedLights)` (no unlinked lights, no raw set
-    /// without a master). Readiness and the mode transform are DB-only (no
-    /// filesystem probe), so no real FITS bytes are needed to reach the
-    /// blocking phase this test wants to cancel before it starts.
-    fn seed_ready_calibrated_export(conn: &Connection) {
+    /// without a master, no missing master file).
+    ///
+    /// `master_path` must be a file that EXISTS: the C-2 preflight stats every
+    /// resolved master before the run starts, so a placeholder path would trip
+    /// the `missing_master_files` blocker and the export would fail outright
+    /// instead of reaching the blocking phase this test wants to cancel. Its
+    /// CONTENTS still do not matter — the cancel lands at the compute-queue
+    /// admission, before any pixel is read.
+    fn seed_ready_calibrated_export(conn: &Connection, master_path: &std::path::Path) {
         conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'Set')", [])
             .unwrap();
         conn.execute(
@@ -770,8 +775,8 @@ mod export_cancel_while_queued_tests {
         .unwrap();
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format)
-             VALUES (100, '/lib/master_100.fits', 'master_100.fits', 0, '2026-07-05T00:00:00Z', 'FITS')",
-            [],
+             VALUES (100, ?1, 'master_100.fits', 0, '2026-07-05T00:00:00Z', 'FITS')",
+            rusqlite::params![master_path.to_string_lossy()],
         )
         .unwrap();
         conn.execute(
@@ -797,9 +802,13 @@ mod export_cancel_while_queued_tests {
     async fn export_cancelled_while_queued_still_finishes_and_notifies() {
         let tmp = TempDir::new().unwrap();
         let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        // The preflight stats this path, so it has to be a real file (see the
+        // fixture's doc comment). It lives in the same temp dir as the DB.
+        let master_path = tmp.path().join("master_100.fits");
+        std::fs::write(&master_path, b"").unwrap();
         {
             let conn = db.conn();
-            seed_ready_calibrated_export(&conn);
+            seed_ready_calibrated_export(&conn, &master_path);
         }
         let state = test_state(db);
 
