@@ -133,6 +133,9 @@ pub async fn mark_frame_set_custom(
 /// Merge source frame set into target frame set
 /// Dragged frame set (source) is merged into drop target (target)
 /// Source frame set is deleted after merge
+/// Merge `source_id` into `target_id` — nights re-derived from the union of
+/// both memberships (`api::frame_sets::merge_frame_sets`), then the merged
+/// set's detail.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn merge_frame_sets(
@@ -140,130 +143,22 @@ pub async fn merge_frame_sets(
     target_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FrameSetDetail, String> {
-    tracing::info!(source_id, target_id, "merging frame sets");
-
-    if source_id == target_id {
-        return Err("Cannot merge a frame set into itself".to_string());
-    }
-
-    // Perform all database operations in a scope so conn is dropped before we call get_frame_set_detail
-    {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-
-        // Get all nights from source frame set
-        let source_nights = db::get_imaging_nights_for_set(&conn, source_id)
-            .map_err(|e| format!("Failed to get source nights: {}", e))?;
-
-        tracing::debug!(count = source_nights.len(), "nights found in source frame set");
-
-        // Get all nights from target frame set
-        let target_nights = db::get_imaging_nights_for_set(&conn, target_id)
-            .map_err(|e| format!("Failed to get target nights: {}", e))?;
-
-        tracing::debug!(count = target_nights.len(), "nights found in target frame set");
-
-        // Process each source night
-        for source_night in source_nights {
-            let source_night_id = source_night.id.ok_or("Source night has no ID")?;
-
-            // Try to find a matching night in target
-            let matching_target_night_id = crate::frames_set_merge::find_matching_night(
-                &source_night,
-                &target_nights,
-            ).map_err(|e| format!("Failed to find matching night: {}", e))?;
-
-            if let Some(target_night_id) = matching_target_night_id {
-                tracing::debug!(source_night_id, target_night_id, "night matches target night");
-
-                // Get the target night details for time range calculation
-                let target_night = target_nights
-                    .iter()
-                    .find(|n| n.id == Some(target_night_id))
-                    .ok_or("Target night not found")?;
-
-                // Calculate union of time ranges
-                let (new_start, new_end) = crate::frames_set_merge::calculate_time_range_union(
-                    &source_night.start_time,
-                    &source_night.end_time,
-                    &target_night.start_time,
-                    &target_night.end_time,
-                ).map_err(|e| format!("Failed to calculate time range union: {}", e))?;
-
-                tracing::debug!(target_night_id, start = %new_start, end = %new_end, "updating target night time range");
-
-                // Update target night time range
-                db::update_imaging_night_time_range(&conn, target_night_id, &new_start, &new_end)
-                    .map_err(|e| format!("Failed to update time range: {}", e))?;
-
-                // Get all sessions from source night and move them to target night
-                let source_sessions = db::get_sessions_for_night(&conn, source_night_id)
-                    .map_err(|e| format!("Failed to get source sessions: {}", e))?;
-
-                let session_ids: Vec<i64> = source_sessions
-                    .iter()
-                    .filter_map(|s| s.id)
-                    .collect();
-
-                tracing::debug!(count = session_ids.len(), source_night_id, target_night_id, "moving sessions to target night");
-
-                if !session_ids.is_empty() {
-                    db::move_sessions_to_night(&conn, &session_ids, target_night_id)
-                        .map_err(|e| format!("Failed to move sessions: {}", e))?;
-                }
-
-                // Delete the now-empty source night
-                // Note: This will cascade delete via FK constraints, but sessions were already moved
-                // So we need to delete the night manually since it's now empty
-                // Actually, we moved the sessions, so the night is empty and can be deleted
-                // But the FK constraint will prevent deletion if there are still sessions
-                // Wait, we already moved sessions, so the night should be empty now
-                // Let's just leave it for now and let the frame set deletion handle it
-            } else {
-                tracing::debug!(source_night_id, "night has no match in target, reassigning to target frame set");
-
-                // No matching night found, reassign this night to target frame set
-                db::reassign_imaging_night_to_frame_set(&conn, source_night_id, target_id)
-                    .map_err(|e| format!("Failed to reassign night: {}", e))?;
-            }
-        }
-
-        // Deduplicate frames in the target frame set
-        tracing::debug!(target_id, "deduplicating frames in target frame set");
-        let duplicates_removed = db::deduplicate_session_members_in_set(&conn, target_id)
-            .map_err(|e| format!("Failed to deduplicate: {}", e))?;
-
-        tracing::debug!(count = duplicates_removed, "duplicate frame references removed");
-
-        // Recalculate metadata for target frame set and mark as custom
-        tracing::debug!(target_id, "recalculating metadata for target frame set");
-        let metadata = crate::frames_set_metadata::calculate_metadata_for_frame_set(target_id, &conn)
-            .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
-
-        db::update_frames_set_metadata(
-            &conn,
-            target_id,
-            metadata.date_obs_start.as_deref(),
-            metadata.date_obs_end.as_deref(),
-            metadata.objctra.as_deref(),
-            metadata.objctdec.as_deref(),
-            metadata.total_exp_time,
-            true, // Mark as custom after merge
-            metadata.avg_rotation,
-            metadata.min_rotation,
-            metadata.max_rotation,
-        ).map_err(|e| format!("Failed to update metadata: {}", e))?;
-
-        // Delete source frame set (cascade will handle cleanup)
-        tracing::debug!(source_id, "deleting source frame set");
-        db::delete_frames_set(&conn, source_id)
-            .map_err(|e| format!("Failed to delete source frame set: {}", e))?;
-
-        tracing::info!(source_id, target_id, "merge completed successfully");
-    } // conn is dropped here
-
-    // Return the updated target frame set detail
+    athenaeum_core::api::frame_sets::merge_frame_sets(&state.ctx, source_id, target_id)
+        .map_err(|e| e.to_string())?;
     get_frame_set_detail(target_id, state).await
+}
+
+/// Re-derive this set's nights and sessions from its member frames — the
+/// repair for a set an older merge left with one night stored as two rows.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn recalculate_frame_set_nights(
+    frames_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<FrameSetDetail, String> {
+    athenaeum_core::api::frame_sets::recalculate_frame_set_nights(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())?;
+    get_frame_set_detail(frames_set_id, state).await
 }
 
 /// Split selected items from a frame set into a new frame set

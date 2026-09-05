@@ -16,7 +16,6 @@ pub mod sessions;
 pub mod duplicates;
 pub mod relinking;
 pub mod frames_set_metadata;
-pub mod frames_set_merge;
 pub mod logging;
 pub mod events;
 pub mod scanner;

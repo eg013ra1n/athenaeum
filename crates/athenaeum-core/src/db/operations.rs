@@ -2861,6 +2861,33 @@ pub fn sessions_exist_for_frame_set(conn: &Connection, frames_set_id: i64) -> Re
 }
 
 /// Reassign an imaging night to a different frame set
+/// Every frame that is a member of any session of any night of this frame
+/// set — the set's membership, distinct.
+pub fn get_frame_ids_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT sm.frame_id
+         FROM session_members sm
+         JOIN sessions s ON s.id = sm.session_id
+         JOIN imaging_nights n ON n.id = s.imaging_night_id
+         WHERE n.frames_set_id = ?1
+         ORDER BY sm.frame_id",
+    )?;
+    let ids = stmt
+        .query_map(params![frames_set_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
+/// Delete every night of this frame set; sessions and their members cascade
+/// (`PRAGMA foreign_keys = ON` on every app connection).
+pub fn delete_imaging_nights_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM imaging_nights WHERE frames_set_id = ?1",
+        params![frames_set_id],
+    )?;
+    Ok(n)
+}
+
 pub fn reassign_imaging_night_to_frame_set(
     conn: &Connection,
     night_id: i64,

@@ -352,97 +352,35 @@ pub async fn mark_frame_set_custom(
 }
 
 /// Merge source frame set into target frame set; source is deleted afterwards.
+/// Merge `source_id` into `target_id` — nights re-derived from the union of
+/// both memberships (`api::frame_sets::merge_frame_sets`), then the merged
+/// set's detail. Mirrors the Tauri command.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn merge_frame_sets(
     State(state): State<WebAppState>,
     Json(args): Json<MergeFrameSetsArgs>,
 ) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
-    use athenaeum_core::db;
-
-    if args.source_id == args.target_id {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Cannot merge a frame set into itself".to_string(),
-        ));
-    }
-
-    {
-        let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-        let conn = db_ref.conn();
-
-        let source_nights =
-            db::get_imaging_nights_for_set(&conn, args.source_id).map_err(db_err)?;
-        let target_nights =
-            db::get_imaging_nights_for_set(&conn, args.target_id).map_err(db_err)?;
-
-        for source_night in source_nights {
-            let source_night_id = source_night.id.ok_or_else(|| db_err("Source night has no ID"))?;
-
-            let matching_target_night_id =
-                athenaeum_core::frames_set_merge::find_matching_night(&source_night, &target_nights)
-                    .map_err(|e| db_err(format!("Failed to find matching night: {}", e)))?;
-
-            if let Some(target_night_id) = matching_target_night_id {
-                let target_night = target_nights
-                    .iter()
-                    .find(|n| n.id == Some(target_night_id))
-                    .ok_or_else(|| db_err("Target night not found"))?;
-
-                let (new_start, new_end) = athenaeum_core::frames_set_merge::calculate_time_range_union(
-                    &source_night.start_time,
-                    &source_night.end_time,
-                    &target_night.start_time,
-                    &target_night.end_time,
-                )
-                .map_err(|e| db_err(format!("Failed to calculate time range union: {}", e)))?;
-
-                db::update_imaging_night_time_range(&conn, target_night_id, &new_start, &new_end)
-                    .map_err(db_err)?;
-
-                let source_sessions =
-                    db::get_sessions_for_night(&conn, source_night_id).map_err(db_err)?;
-
-                let session_ids: Vec<i64> =
-                    source_sessions.iter().filter_map(|s| s.id).collect();
-
-                if !session_ids.is_empty() {
-                    db::move_sessions_to_night(&conn, &session_ids, target_night_id)
-                        .map_err(db_err)?;
-                }
-            } else {
-                db::reassign_imaging_night_to_frame_set(&conn, source_night_id, args.target_id)
-                    .map_err(db_err)?;
-            }
-        }
-
-        db::deduplicate_session_members_in_set(&conn, args.target_id).map_err(db_err)?;
-
-        let metadata =
-            athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(args.target_id, &conn)
-                .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
-
-        db::update_frames_set_metadata(
-            &conn,
-            args.target_id,
-            metadata.date_obs_start.as_deref(),
-            metadata.date_obs_end.as_deref(),
-            metadata.objctra.as_deref(),
-            metadata.objctdec.as_deref(),
-            metadata.total_exp_time,
-            true,
-            metadata.avg_rotation,
-            metadata.min_rotation,
-            metadata.max_rotation,
-        )
+    athenaeum_core::api::frame_sets::merge_frame_sets(&state.ctx, args.source_id, args.target_id)
         .map_err(db_err)?;
-
-        db::delete_frames_set(&conn, args.source_id).map_err(db_err)?;
-    }
-
-    // Return detail
     let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
     let detail = load_frame_set_detail(&conn, args.target_id).map_err(db_err)?;
+    Ok(Json(detail))
+}
+
+/// Re-derive this set's nights and sessions from its member frames — the
+/// repair for a set an older merge left with one night stored as two rows.
+/// Mirrors the Tauri command.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn recalculate_frame_set_nights(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
+    athenaeum_core::api::frame_sets::recalculate_frame_set_nights(&state.ctx, args.frames_set_id)
+        .map_err(db_err)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+    let detail = load_frame_set_detail(&conn, args.frames_set_id).map_err(db_err)?;
     Ok(Json(detail))
 }
 

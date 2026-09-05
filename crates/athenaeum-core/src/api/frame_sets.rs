@@ -12,6 +12,95 @@ use anyhow::{anyhow, Result};
 use crate::db::{self};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
+use crate::sessions::RederiveSummary;
+use rusqlite::{Connection, OptionalExtension};
+
+/// `is_custom` of a frame set, or an error naming the id when there is no
+/// such set.
+fn frame_set_is_custom(conn: &Connection, frames_set_id: i64) -> Result<bool> {
+    let flag: Option<i64> = conn
+        .query_row(
+            "SELECT is_custom FROM frames_set WHERE id = ?1",
+            [frames_set_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    flag.map(|v| v != 0)
+        .ok_or_else(|| anyhow!("frame set {frames_set_id} not found"))
+}
+
+/// Recompute the set's aggregate metadata from its (re-derived) membership.
+fn refresh_frame_set_metadata(conn: &Connection, frames_set_id: i64, is_custom: bool) -> Result<()> {
+    let m = crate::frames_set_metadata::calculate_metadata_for_frame_set(frames_set_id, conn)?;
+    db::update_frames_set_metadata(
+        conn,
+        frames_set_id,
+        m.date_obs_start.as_deref(),
+        m.date_obs_end.as_deref(),
+        m.objctra.as_deref(),
+        m.objctdec.as_deref(),
+        m.total_exp_time,
+        is_custom,
+        m.avg_rotation,
+        m.min_rotation,
+        m.max_rotation,
+    )?;
+    Ok(())
+}
+
+/// Re-derive one frame set's nights and sessions from its member frames and
+/// refresh its aggregate metadata — the manual "Recalculate nights" action,
+/// which repairs a set an older merge left with one night stored as two rows.
+pub fn recalculate_frame_set_nights(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+) -> Result<RederiveSummary> {
+    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let mut conn = db.conn();
+    let gap_hours = ctx.settings.get_session_gap_threshold_hours(&conn).unwrap_or(6.0);
+    let tx = conn.transaction()?;
+    let is_custom = frame_set_is_custom(&tx, frames_set_id)?;
+    let summary = crate::sessions::rederive_for_frame_set(&tx, frames_set_id, &[], gap_hours)?;
+    refresh_frame_set_metadata(&tx, frames_set_id, is_custom)?;
+    tx.commit()?;
+    Ok(summary)
+}
+
+/// Merge `source_id` into `target_id`: every source night moves over, the
+/// target's nights and sessions are re-derived from the union of both
+/// memberships (a night is derived data — recomputed, never stitched by
+/// date + overlap, which stored one night as two rows), the target's
+/// metadata is refreshed and marked custom, and the source set is deleted.
+/// One transaction; the same body serves both transports.
+pub fn merge_frame_sets(ctx: &ServiceContext, source_id: i64, target_id: i64) -> Result<()> {
+    if source_id == target_id {
+        return Err(anyhow!("Cannot merge a frame set into itself"));
+    }
+    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let mut conn = db.conn();
+    let gap_hours = ctx.settings.get_session_gap_threshold_hours(&conn).unwrap_or(6.0);
+    let tx = conn.transaction()?;
+    frame_set_is_custom(&tx, source_id)?;
+    frame_set_is_custom(&tx, target_id)?;
+    tracing::info!(source_id, target_id, "merging frame sets");
+
+    for night in db::get_imaging_nights_for_set(&tx, source_id)? {
+        let night_id = night.id.ok_or_else(|| anyhow!("source night has no id"))?;
+        db::reassign_imaging_night_to_frame_set(&tx, night_id, target_id)?;
+    }
+    let summary = crate::sessions::rederive_for_frame_set(&tx, target_id, &[], gap_hours)?;
+    refresh_frame_set_metadata(&tx, target_id, true)?;
+    db::delete_frames_set(&tx, source_id)?;
+    tx.commit()?;
+    tracing::info!(
+        source_id,
+        target_id,
+        frames = summary.frames,
+        nights = summary.nights,
+        "merge completed"
+    );
+    Ok(())
+}
 
 /// Outcome of one auto-generate run.
 ///
@@ -200,6 +289,70 @@ mod tests {
     use crate::events::NullEmitter;
     use crate::services::ServiceContext;
     use rusqlite::{params, Connection};
+
+    fn seed_light_at(conn: &Connection, id: i64, date_obs: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-01-01T00:00:00Z', 'FITS')",
+            params![id, format!("/t/{id}.fits"), format!("{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, date_obs, exptime)
+             VALUES (?1, ?1, 'Light', 'CamA', ?2, 60.0)",
+            params![id, date_obs],
+        )
+        .unwrap();
+    }
+
+    fn seed_set_with_night(conn: &Connection, set_id: i64, start: &str, end: &str, ids: &[i64]) {
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (?1, ?2)",
+            params![set_id, format!("Set {set_id}")],
+        )
+        .unwrap();
+        let night_id = db::create_imaging_night(conn, set_id, start, end).unwrap();
+        let session_id = db::create_session(conn, night_id, "CamA", ids.len() as i32, None).unwrap();
+        db::insert_session_members(conn, session_id, ids).unwrap();
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// The two halves of one night (a post-flip cluster merged back) become
+    /// ONE night row on the target; the source set is gone, the target is
+    /// custom, and no member is lost.
+    #[test]
+    fn merge_frame_sets_rederives_the_nights_and_deletes_the_source() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            seed_light_at(&conn, 10, "2025-09-13T21:55:00Z");
+            seed_light_at(&conn, 11, "2025-09-13T23:30:00Z");
+            seed_light_at(&conn, 12, "2025-09-13T22:36:00Z");
+            seed_light_at(&conn, 13, "2025-09-14T01:59:00Z");
+            seed_set_with_night(&conn, 1, "2025-09-13T21:55:00Z", "2025-09-13T23:30:00Z", &[10, 11]);
+            seed_set_with_night(&conn, 2, "2025-09-13T22:36:00Z", "2025-09-14T01:59:00Z", &[12, 13]);
+        }
+
+        merge_frame_sets(&ctx, 2, 1).unwrap();
+
+        let conn = ctx.db.get().unwrap().conn();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM session_members m JOIN sessions s ON s.id = m.session_id
+                 JOIN imaging_nights n ON n.id = s.imaging_night_id WHERE n.frames_set_id = 1"
+            ),
+            4
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames_set WHERE id = 2"), 0);
+        assert_eq!(count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"), 1);
+        assert!(merge_frame_sets(&ctx, 1, 1).is_err(), "self-merge is refused");
+        assert!(merge_frame_sets(&ctx, 99, 1).is_err(), "a missing source is refused");
+    }
 
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
     /// involved anywhere). Copied verbatim from `api::collab` / `api::sync`

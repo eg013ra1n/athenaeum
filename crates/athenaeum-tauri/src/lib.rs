@@ -10,7 +10,6 @@ pub use athenaeum_core::sessions;
 pub use athenaeum_core::duplicates;
 pub use athenaeum_core::relinking;
 pub use athenaeum_core::frames_set_metadata;
-pub use athenaeum_core::frames_set_merge;
 pub use athenaeum_core::logging;
 pub use athenaeum_core::calibration;
 
@@ -288,6 +287,7 @@ pub fn run() {
             commands::archive_frame_set,
             commands::find_new_frames_for_set,
             commands::auto_merge_new_frames_for_set,
+            commands::recalculate_frame_set_nights,
             commands::get_frame_set_merge_log,
             commands::get_equipment_cameras,
             commands::get_dark_library,

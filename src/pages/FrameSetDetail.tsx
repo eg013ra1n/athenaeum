@@ -155,6 +155,7 @@ export default function FrameSetDetail() {
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
+  const [recalcNightsBusy, setRecalcNightsBusy] = useState(false);
 
   // Archive state
   const [showArchiveDialog, setShowArchiveDialog] = useState(false);
@@ -214,6 +215,39 @@ export default function FrameSetDetail() {
       });
     } finally {
       setFindNewBusy(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  // "Recalculate nights": re-derive this set's nights and sessions from its
+  // member frames — repairs a set an older merge left with one night stored
+  // as two rows. The command returns the refreshed detail; the reload keeps
+  // every tab in step with it.
+  const handleRecalculateNights = useCallback(async () => {
+    if (!id) return;
+    setRecalcNightsBusy(true);
+    try {
+      const updated = await api.invoke<FrameSetDetail>('recalculate_frame_set_nights', {
+        framesSetId: parseInt(id),
+      });
+      await loadData();
+      setHistoryRefreshKey((k) => k + 1);
+      const sessions = updated.nights.reduce((n, night) => n + night.sessions.length, 0);
+      setAlertDialog({
+        isOpen: true,
+        title: 'Nights recalculated',
+        message: `${updated.nights.length} night${updated.nights.length === 1 ? '' : 's'}, ${sessions} session${sessions === 1 ? '' : 's'}.`,
+        variant: 'info',
+      });
+    } catch (e) {
+      setAlertDialog({
+        isOpen: true,
+        title: 'Recalculate nights failed',
+        message: String(e),
+        variant: 'error',
+      });
+    } finally {
+      setRecalcNightsBusy(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -774,6 +808,16 @@ export default function FrameSetDetail() {
                 >
                   <Search size={14} />
                   {findNewBusy ? 'Merging…' : 'Find new images'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRecalculateNights}
+                  disabled={recalcNightsBusy}
+                  title="Re-derive this set's nights and sessions from its frames (repairs a night stored as two)"
+                  className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <RotateCw size={14} className={recalcNightsBusy ? 'animate-spin' : ''} />
+                  {recalcNightsBusy ? 'Recalculating…' : 'Recalculate nights'}
                 </button>
                 <button
                   type="button"

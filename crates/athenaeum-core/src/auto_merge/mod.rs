@@ -5,18 +5,19 @@
 //! of any session (i.e., not part of any frame set), and (b) lies within
 //! `threshold_deg` of the target frame set's centroid.
 //!
-//! Merging delegates to `sessions::detect_sessions` and
-//! `frames_set_merge::find_matching_night` to stitch new frames into the
-//! target set's existing nights/sessions structure, reusing well-tested
-//! logic from the manual "merge frame sets" path.
+//! Merging brings the new frames in and re-derives the target set's nights
+//! and sessions from the union through `sessions::rederive_for_frame_set` —
+//! the same step the manual "merge frame sets" path takes. A night is
+//! derived data with one definition (the gap rule); stitching a detected
+//! night onto an existing row by date + overlap used to store one night as
+//! two rows.
 
 pub mod log_ops;
 
 use crate::coordinates::{angular_distance, parse_dec_sexagesimal, parse_ra_sexagesimal};
 use crate::models::{
-    CandidateFrame, ImagingNight, MergeReport, SkipReason, SkippedFrame,
+    CandidateFrame, MergeReport, SkipReason, SkippedFrame,
 };
-use crate::sessions::detect_sessions;
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 
@@ -155,86 +156,12 @@ pub fn merge_candidates(
         return Ok(report);
     }
 
-    // Load File + Frame tuples for the mergeable candidates so we can run
-    // the same session-detection pipeline used when creating a new set.
+    // Bring the new frames in and re-derive the set's nights and sessions
+    // from the union — never stitch a detected night onto an existing row by
+    // date + overlap (that stored one night as two rows after a merge).
     let frame_ids: Vec<i64> = mergeable.iter().map(|c| c.frame_id).collect();
-    let frames_with_files = crate::db::get_frames_with_files_by_ids(conn, &frame_ids)?;
-
-    // Detect nights/sessions for the new frames.
-    let detected_nights = detect_sessions(frames_with_files, session_gap_hours)?;
-
-    // Load existing nights on the target so we can match and append.
-    let target_nights: Vec<ImagingNight> =
-        crate::db::get_imaging_nights_for_set(conn, frames_set_id)?;
-
     let tx = conn.transaction()?;
-
-    for detected in detected_nights {
-        // Build an ImagingNight view of the detected night for the matcher.
-        let detected_view = ImagingNight {
-            id: None,
-            frames_set_id,
-            start_time: detected.start_time.clone(),
-            end_time: detected.end_time.clone(),
-            created_at: None,
-        };
-
-        let matching_target =
-            crate::frames_set_merge::find_matching_night(&detected_view, &target_nights)?;
-
-        let night_id = match matching_target {
-            Some(existing_night_id) => {
-                // Extend the existing night's time range to cover the new frames.
-                let existing = target_nights
-                    .iter()
-                    .find(|n| n.id == Some(existing_night_id))
-                    .ok_or_else(|| anyhow!("matching night {} vanished", existing_night_id))?;
-                let (new_start, new_end) = crate::frames_set_merge::calculate_time_range_union(
-                    &detected.start_time,
-                    &detected.end_time,
-                    &existing.start_time,
-                    &existing.end_time,
-                )?;
-                crate::db::update_imaging_night_time_range(
-                    &tx,
-                    existing_night_id,
-                    &new_start,
-                    &new_end,
-                )?;
-                existing_night_id
-            }
-            None => crate::db::create_imaging_night(
-                &tx,
-                frames_set_id,
-                &detected.start_time,
-                &detected.end_time,
-            )?,
-        };
-
-        // For each detected session (by instrume), either append to an
-        // existing session on this night or create a new one.
-        let existing_sessions = crate::db::get_sessions_for_night(&tx, night_id)?;
-
-        for session in detected.sessions {
-            let existing_session_id = existing_sessions
-                .iter()
-                .find(|s| s.instrume == session.instrume)
-                .and_then(|s| s.id);
-
-            let session_id = match existing_session_id {
-                Some(id) => id,
-                None => crate::db::create_session(
-                    &tx,
-                    night_id,
-                    &session.instrume,
-                    0, // updated by recalculate_frame_set_metadata later
-                    None,
-                )?,
-            };
-
-            crate::db::insert_session_members(&tx, session_id, &session.frame_ids)?;
-        }
-    }
+    crate::sessions::rederive_for_frame_set(&tx, frames_set_id, &frame_ids, session_gap_hours)?;
 
     // Recalculate aggregate metadata (totals, coordinate centroid drift, rotation bounds).
     let metadata =

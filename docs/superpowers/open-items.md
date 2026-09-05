@@ -39,6 +39,15 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 ## Unverified by hand
 
+### v0.5.5 stage 2 — nights (2026-09-05)
+
+- **Recalculate nights** on the real LDN 1272 (set 109) in the desktop app →
+  three nights (13→14 Sep, 17→18 Oct, 18→19 Oct). Verified headless on a copy
+  of the dev catalog through the web backend the same day; the click and the
+  page reload are the only unverified part.
+- Merge two sets whose lights are the two halves of one night → one night on
+  the target, source gone (core-tested; not yet clicked).
+
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
@@ -549,3 +558,8 @@ cycle, so anything from them that matters later belongs here or in a plan.
   average file size instead of a fixed 50 MB per file.
 - Calendar: a day's cards show the camera, the telescope and the first–last
   exposure time of that night.
+- Objects: merging frame sets (and Find new images) now recomputes the
+  merged set's nights from all of its frames instead of stitching the two
+  sets' night rows together — a night split by a meridian-flip re-pointing no
+  longer shows up as two nights — and a new **Recalculate nights** button on
+  the object page repairs sets that were merged before this release.

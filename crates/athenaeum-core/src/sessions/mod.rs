@@ -1,8 +1,101 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc, Duration};
-use std::collections::HashMap;
+use chrono::{DateTime, Duration, Utc};
+use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
 
 use crate::models::{File, Frame};
+
+/// Outcome of [`rederive_for_frame_set`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RederiveSummary {
+    pub frames: usize,
+    pub nights: usize,
+    pub sessions: usize,
+}
+
+/// Re-derive a frame set's imaging nights and sessions from the union of its
+/// current member frames and `extra_frame_ids` (frames about to join).
+///
+/// Runs inside the caller's transaction: the set's night rows are deleted
+/// (sessions and members cascade), [`detect_sessions`] runs over the whole
+/// membership, and the rows are written back. A night is derived data with
+/// one definition — the gap rule — so it is recomputed, never stitched from
+/// the rows two sets happened to carry: stitching by date + range overlap is
+/// what stored one night as two rows after a merge (LDN 1272, 2026-09-05).
+/// A member without `DATE-OBS` cannot be placed by the gap rule and is kept
+/// on a fallback night, so a recalculation never loses a frame.
+pub fn rederive_for_frame_set(
+    conn: &Connection,
+    frames_set_id: i64,
+    extra_frame_ids: &[i64],
+    gap_threshold_hours: f64,
+) -> Result<RederiveSummary> {
+    let mut frame_ids = crate::db::get_frame_ids_for_frame_set(conn, frames_set_id)?;
+    frame_ids.extend_from_slice(extra_frame_ids);
+    frame_ids.sort_unstable();
+    frame_ids.dedup();
+
+    let frames = crate::db::get_frames_with_files_by_ids(conn, &frame_ids)?;
+    let known: Vec<i64> = frames.iter().filter_map(|(_, _, f)| f.id).collect();
+    let detected = detect_sessions(frames, gap_threshold_hours)?;
+
+    crate::db::delete_imaging_nights_for_frame_set(conn, frames_set_id)?;
+
+    let mut placed: HashSet<i64> = HashSet::new();
+    let mut nights = 0usize;
+    let mut sessions = 0usize;
+    for night in &detected {
+        let night_id = crate::db::create_imaging_night(
+            conn,
+            frames_set_id,
+            &night.start_time,
+            &night.end_time,
+        )?;
+        nights += 1;
+        for session in &night.sessions {
+            let session_id = crate::db::create_session(
+                conn,
+                night_id,
+                &session.instrume,
+                session.frame_ids.len() as i32,
+                session.total_exp_time,
+            )?;
+            crate::db::insert_session_members(conn, session_id, &session.frame_ids)?;
+            placed.extend(session.frame_ids.iter().copied());
+            sessions += 1;
+        }
+    }
+
+    // Members the gap rule could not place (no DATE-OBS) stay on a fallback
+    // night — the same shape a selection with no timestamps gets — rather
+    // than silently leaving the set.
+    let leftover: Vec<i64> = known.iter().copied().filter(|id| !placed.contains(id)).collect();
+    if !leftover.is_empty() {
+        tracing::warn!(
+            set_id = frames_set_id,
+            count = leftover.len(),
+            "frames without date_obs kept on a fallback night"
+        );
+        let now = Utc::now();
+        let start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end = (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let night_id = crate::db::create_imaging_night(conn, frames_set_id, &start, &end)?;
+        let session_id =
+            crate::db::create_session(conn, night_id, "Unknown", leftover.len() as i32, None)?;
+        crate::db::insert_session_members(conn, session_id, &leftover)?;
+        nights += 1;
+        sessions += 1;
+    }
+
+    tracing::info!(
+        set_id = frames_set_id,
+        frames = known.len(),
+        nights,
+        sessions,
+        "nights re-derived"
+    );
+    Ok(RederiveSummary { frames: known.len(), nights, sessions })
+}
 
 /// Detected imaging night structure
 pub struct DetectedNight {
@@ -305,5 +398,110 @@ mod tests {
         assert_eq!(nights.len(), 2);
         assert_eq!(nights[0].sessions[0].frame_ids.len(), 2);
         assert_eq!(nights[1].sessions[0].frame_ids.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod rederive_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::{params, Connection};
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        init_db(&c).unwrap();
+        c
+    }
+
+    fn light(conn: &Connection, id: i64, date_obs: Option<&str>, instrume: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-01-01T00:00:00Z', 'FITS')",
+            params![id, format!("/t/{id}.fits"), format!("{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, date_obs)
+             VALUES (?1, ?1, 'Light', ?2, ?3)",
+            params![id, instrume, date_obs],
+        )
+        .unwrap();
+    }
+
+    /// A night row with one session holding `frame_ids` — the rows as a
+    /// merge used to stitch them.
+    fn night(conn: &Connection, set_id: i64, start: &str, end: &str, instrume: &str, ids: &[i64]) {
+        let night_id = crate::db::create_imaging_night(conn, set_id, start, end).unwrap();
+        let session_id =
+            crate::db::create_session(conn, night_id, instrume, ids.len() as i32, None).unwrap();
+        crate::db::insert_session_members(conn, session_id, ids).unwrap();
+    }
+
+    /// `(start, end, member count)` per night row, by start.
+    fn night_rows(conn: &Connection, set_id: i64) -> Vec<(String, String, i64)> {
+        let mut st = conn
+            .prepare(
+                "SELECT n.start_time, n.end_time,
+                        (SELECT COUNT(*) FROM sessions s JOIN session_members m ON m.session_id = s.id
+                          WHERE s.imaging_night_id = n.id)
+                 FROM imaging_nights n WHERE n.frames_set_id = ?1 ORDER BY n.start_time",
+            )
+            .unwrap();
+        st.query_map([set_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Two rows for one continuous night — the shape a merge used to leave
+    /// behind — come back as one night holding every frame.
+    #[test]
+    fn rederive_folds_stitched_rows_into_one_night() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'LDN 1272')", []).unwrap();
+        light(&conn, 10, Some("2025-09-13T21:55:00Z"), "CamA");
+        light(&conn, 11, Some("2025-09-13T23:30:00Z"), "CamA");
+        light(&conn, 12, Some("2025-09-13T22:36:00Z"), "CamA");
+        light(&conn, 13, Some("2025-09-14T01:59:00Z"), "CamA");
+        night(&conn, 1, "2025-09-13T21:55:00Z", "2025-09-13T23:30:00Z", "CamA", &[10, 11]);
+        night(&conn, 1, "2025-09-13T22:36:00Z", "2025-09-14T01:59:00Z", "CamA", &[12, 13]);
+        assert_eq!(night_rows(&conn, 1).len(), 2);
+
+        let summary = rederive_for_frame_set(&conn, 1, &[], 6.0).unwrap();
+        assert_eq!((summary.frames, summary.nights, summary.sessions), (4, 1, 1));
+        let rows = night_rows(&conn, 1);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].2, 4);
+        assert!(rows[0].0.starts_with("2025-09-13T21:55"), "{rows:?}");
+        assert!(rows[0].1.starts_with("2025-09-14T01:59"), "{rows:?}");
+    }
+
+    /// A real gap still splits, and frames about to join are counted in.
+    #[test]
+    fn rederive_keeps_real_gaps_and_takes_extra_frames() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        light(&conn, 10, Some("2025-10-17T22:04:00Z"), "CamA");
+        light(&conn, 11, Some("2025-10-18T02:25:00Z"), "CamA");
+        light(&conn, 12, Some("2025-10-18T17:56:00Z"), "CamA"); // 15.5 h later
+        night(&conn, 1, "2025-10-17T22:04:00Z", "2025-10-18T02:25:00Z", "CamA", &[10, 11]);
+
+        let summary = rederive_for_frame_set(&conn, 1, &[12], 6.0).unwrap();
+        assert_eq!((summary.frames, summary.nights), (3, 2));
+        assert_eq!(night_rows(&conn, 1).iter().map(|r| r.2).sum::<i64>(), 3);
+    }
+
+    /// A member without DATE-OBS is never dropped by a recalculation.
+    #[test]
+    fn rederive_never_loses_a_frame_without_date_obs() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        light(&conn, 10, Some("2025-10-17T22:04:00Z"), "CamA");
+        light(&conn, 11, None, "CamA");
+        night(&conn, 1, "2025-10-17T22:04:00Z", "2025-10-17T23:00:00Z", "CamA", &[10, 11]);
+
+        let summary = rederive_for_frame_set(&conn, 1, &[], 6.0).unwrap();
+        assert_eq!(summary.frames, 2);
+        assert_eq!(night_rows(&conn, 1).iter().map(|r| r.2).sum::<i64>(), 2);
     }
 }
