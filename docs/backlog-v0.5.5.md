@@ -234,7 +234,9 @@ with one frame going from failure to a correct solve.
 trailed frames, so the Analysis table still rates them well and the input gate
 misses them. Its own cycle — the fix changes every stored metric.
 
-**Deferred to their own cycle after the v0.5.5 tag** (owner call, 2026-09-05):
+**Deferred to their own cycle after the v0.5.5 tag** (owner call, 2026-09-05).
+Both were carried into `docs/backlog-v0.5.6.md` on 2026-09-06 when that cycle
+opened; the research below stays here and is not repeated there.
 
 - **VNG in the blink preview** (item 4) — needs the mode decision (always-on for
   `full` vs a separate "1:1" mode) and a preview-cache key decision first.
