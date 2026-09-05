@@ -3090,11 +3090,18 @@ mod multi_target_tests {
     }
 
     async fn wait_until<F: FnMut() -> bool>(mut pred: F) {
-        // 20s, not 5s: under a full --workspace run this binary's 220 tests share
-        // the cores with paced loopback fixtures, and the fan-out test (2 engines
-        // + 2 receivers on 2 workers, flake history: audit TEST-9) occasionally
-        // needed more than 5s of wall clock. A green run is unaffected — the poll
-        // returns the moment the condition holds; only a genuine failure waits.
+        // A backstop, not a tuning knob. A green run is unaffected — the poll
+        // returns the moment the condition holds; only a genuine failure waits
+        // the full budget.
+        //
+        // This ceiling was raised 5s -> 20s twice chasing a fan-out "flake"
+        // (audit TEST-9) that was never slowness: `fan_out_delivers_to_every_target`
+        // spawned its two engines WITHOUT the shared cleanup coordinator, so the
+        // first target to confirm deleted the shared package dir and the second
+        // target's fetch failed with ENOENT. Fixed at that call site. Note the
+        // ceiling still sits BELOW `DEFAULT_ACK_TIMEOUT` (30s), so no engine-level
+        // retry can rescue a stalled row inside it — a row that stops making
+        // progress here fails the test, which is the intent.
         for _ in 0..2000 {
             if pred() {
                 return;
@@ -3108,8 +3115,10 @@ mod multi_target_tests {
     /// confirm it, so the shared store ends with one confirmed outbound row per
     /// target (proving per-target delivery).
     // multi_thread runtime: a current_thread test starves its single OS thread
-    // under host load (2 engines + 2 receivers + mutex loopback), the ~2/12 flake
-    // this test carried (audit TEST-9). Two workers give the loopback room to run.
+    // under host load (2 engines + 2 receivers + mutex loopback). Two workers give
+    // the loopback room to run. This did NOT fix the ~2/12 flake it was credited
+    // with (audit TEST-9) — that was the missing cleanup coordinator below — but
+    // the runtime choice is still the right one for four concurrent actors.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fan_out_delivers_to_every_target() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3123,15 +3132,27 @@ mod multi_target_tests {
         spawn_receiver(recv_b.clone(), tmp.path().join("rb"));
 
         let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-        let engine_a = Arc::new(SyncEngine::spawn(
+        // The SAME shared-payload coordinator both engines get in production for
+        // a >=2-target fan-out (`run_once`: `transports.len() > 1` => one
+        // `SharedPackageCleanup` handed to every engine). Without it each engine
+        // keeps its single-target in-line cleanup, so whichever target confirms
+        // FIRST deletes the one shared package dir out from under the other,
+        // whose fetch then fails with ENOENT and whose row sits in
+        // `Transferring` until an ack timeout the test never waits for. That is
+        // a property of the wiring, not of timing: the race only decides whether
+        // the confirm beats the second fetch.
+        let coord = Arc::new(SharedPackageCleanup::new());
+        let engine_a = Arc::new(SyncEngine::spawn_with_sink(
             Arc::clone(&store) as Arc<dyn SyncStore>,
             Arc::new(net.endpoint()),
             a_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
         ));
-        let engine_b = Arc::new(SyncEngine::spawn(
+        let engine_b = Arc::new(SyncEngine::spawn_with_sink(
             Arc::clone(&store) as Arc<dyn SyncStore>,
             Arc::new(net.endpoint()),
             b_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
         ));
 
         let pkg = make_pkg(tmp.path(), "uuid-1", "frame.fits");
@@ -3145,6 +3166,10 @@ mod multi_target_tests {
         .await;
         assert!(first_id.is_some(), "at least one target accepted the package");
         assert_eq!(delivered, 2, "the package reached both targets");
+        // Register after the fan-out with the delivered count, the order the
+        // production callers use (`batcher.rs`, `run_once`). A terminal that
+        // beat this call was buffered by the coordinator.
+        coord.register(&pkg, delivered);
 
         // Both per-target rows reach Confirmed (one per peer).
         wait_until(|| {
