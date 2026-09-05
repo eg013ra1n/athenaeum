@@ -488,14 +488,37 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     </div>
                   </td>
 
-                  {/* Gain */}
+                  {/* Gain — a set that declares none cannot be matched
+                      automatically: gain and offset are Exact + required for
+                      lights, and "nothing to compare" is a refusal, so such a
+                      set is silently invisible to auto-link until someone
+                      fills it in (Bulk Edit, above). Say so rather than
+                      printing a bland N/A. */}
                   <td className="px-4 py-1 text-sm text-content">
-                    {set.gain !== null ? set.gain : "N/A"}
+                    {set.gain !== null ? (
+                      set.gain
+                    ) : (
+                      <span
+                        className="text-warning"
+                        title="No GAIN in this set — it will not be matched automatically. Select it and use Edit Metadata to fill it in."
+                      >
+                        none
+                      </span>
+                    )}
                   </td>
 
                   {/* Offset - Hidden on mobile */}
                   <td className="px-4 py-1 text-sm text-content hidden md:table-cell">
-                    {set.offset !== null ? set.offset : "N/A"}
+                    {set.offset !== null ? (
+                      set.offset
+                    ) : (
+                      <span
+                        className="text-warning"
+                        title="No OFFSET in this set — it will not be matched automatically. Select it and use Edit Metadata to fill it in."
+                      >
+                        none
+                      </span>
+                    )}
                   </td>
 
                   {/* Binning - Hidden on tablet */}

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
+import { MatchVerdict } from './calibration/MatchVerdict';
 import {
   X,
   Camera,
@@ -226,7 +227,12 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
     return `${temp.toFixed(1)}°C`;
   };
 
-  const formatMatchScore = (score: number) => {
+  /** The percentage is CLOSENESS (date / temperature / exposure proximity),
+   *  which an incompatible set can score highly — so an incompatible one is
+   *  never dressed in a "good match" colour. Its own reason is spelled out by
+   *  <MatchVerdict>. */
+  const formatMatchScore = (score: number, compatible: boolean) => {
+    if (!compatible) return { label: 'Not a match', color: 'text-content-muted' };
     const percent = Math.round(score * 100);
     if (percent >= 80) return { label: 'Excellent', color: 'text-success' };
     if (percent >= 60) return { label: 'Good', color: 'text-accent' };
@@ -246,8 +252,8 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
     isCurrent: boolean;
     onSelect: () => void;
   }) => {
-    const { set, match_score, match_details } = setWithScore;
-    const scoreInfo = formatMatchScore(match_score);
+    const { set, match_score, match_details, compatible, parameters } = setWithScore;
+    const scoreInfo = formatMatchScore(match_score, compatible);
 
     return (
       <div
@@ -323,6 +329,8 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
             <span className="text-content-secondary">{set.frame_count}</span>
           </div>
         </div>
+
+        <MatchVerdict compatible={compatible} parameters={parameters} />
       </div>
     );
   };

@@ -420,6 +420,13 @@ pub fn get_light_frame_parameters(
 /// `OnlyCompatible` (config-driven hard filter) and `IncludeIncompatible`
 /// (every set returned, with `passed_hard_filter = false` flagged via the
 /// MatchDetails fields).
+/// Is this candidate rendered for the given `show_all`? Compatible ones
+/// always, incompatible ones only with `show_all`, and the currently linked
+/// set either way so the "Current" badge has somewhere to render.
+fn candidate_is_visible(show_all: bool, is_current: bool, compatible: bool) -> bool {
+    show_all || is_current || compatible
+}
+
 pub fn get_calibration_sets_for_manual_selection(
     ctx: &ServiceContext,
     frame_ids: Vec<i64>,
@@ -474,12 +481,11 @@ pub fn get_calibration_sets_for_manual_selection(
     };
 
     // Manual modal is a user override — show every candidate via the engine's
-    // IncludeIncompatible mode. With the engine's score-zero rule for
-    // hard-filter rejects, the score itself honestly reflects "your config
-    // would refuse this": camera mismatch, filter mismatch, focal length /
-    // temp / exptime exceeding matching_threshold all read 0.0 now.
-    // `show_all` toggles between hiding score < 0.1 (default) and showing
-    // everything (manual override visibility).
+    // IncludeIncompatible mode, then let `show_all` decide what is rendered.
+    // Visibility is a COMPATIBILITY question (`candidate_is_visible`), not a
+    // score threshold: the score is closeness now, and a threshold over it
+    // hid compatible-but-distant sets while showing nothing at all whenever
+    // no candidate was perfect (2026-09-05 design §6).
     let candidates = find_calibration_candidates(
         &conn,
         &frame,
@@ -496,7 +502,7 @@ pub fn get_calibration_sets_for_manual_selection(
         if is_current {
             current_seen = true;
         }
-        if !show_all && !is_current && candidate.match_score < 0.1 {
+        if !candidate_is_visible(show_all, is_current, candidate.passed_hard_filter) {
             continue;
         }
         if let Some(swc) = crate::calibration::manual::load_set_with_score(&conn, &candidate)? {
@@ -1002,7 +1008,7 @@ pub fn get_subcalibration_sets_for_manual_selection(
         if is_current {
             current_seen = true;
         }
-        if !show_all && !is_current && candidate.match_score < 0.1 {
+        if !candidate_is_visible(show_all, is_current, candidate.passed_hard_filter) {
             continue;
         }
         if let Some(swc) = crate::calibration::manual::load_set_with_score(&conn, &candidate)? {
@@ -1387,6 +1393,24 @@ pub fn get_custom_metadata_set_ids(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// What the manual modal's "show only compatible" toggle means: every
+    /// candidate the user's config accepts, however distant, and none it
+    /// refuses — plus the current link, which is shown either way so the
+    /// "Current" badge has somewhere to render. The old rule was a score
+    /// threshold, which (with rejects zeroed) hid everything the moment
+    /// nothing was perfect, and hid compatible-but-old sets besides.
+    #[test]
+    fn candidate_visibility_follows_compatibility_not_a_score_threshold() {
+        // show_all: everything is visible.
+        assert!(candidate_is_visible(true, false, false));
+        assert!(candidate_is_visible(true, false, true));
+        // Filtered: compatible in, incompatible out…
+        assert!(candidate_is_visible(false, false, true));
+        assert!(!candidate_is_visible(false, false, false));
+        // …except the current link, which always renders.
+        assert!(candidate_is_visible(false, true, false));
+    }
 
     fn seed_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

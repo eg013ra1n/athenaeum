@@ -558,6 +558,19 @@ cycle, so anything from them that matters later belongs here or in a plan.
   average file size instead of a fixed 50 MB per file.
 - Calendar: a day's cards show the camera, the telescope and the first–last
   exposure time of that night.
+- Calibration: the manual assignment list is usable again. Every candidate
+  now carries a real closeness percentage instead of a flat 0 % for anything
+  your matching rules refuse, the list is ordered by how near a miss each one
+  is — same camera first, then by what each broken rule costs the calibration
+  — and every card states why a set was refused ("Temperature: 19.4 vs -9.9 —
+  off by 29.3, limit 5.0", "Gain: this set does not declare one") instead of
+  showing an unexplained score.
+- Calibration: "show only compatible" now means exactly that. It used to hide
+  everything whenever no candidate was perfect, and it hid compatible-but-old
+  sets as well.
+- Master libraries: a master with no GAIN or OFFSET in its header is flagged
+  in the Dark/Flat library — such a set can never be matched automatically,
+  and Edit Metadata fills the values in.
 - Objects and Calendar: a night that runs past midnight is one night again.
   The night tree grouped by the frame's calendar date, so every session
   through midnight showed as two — "October 18" and "October 19" instead of

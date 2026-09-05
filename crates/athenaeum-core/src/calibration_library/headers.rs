@@ -642,6 +642,38 @@ mod tests {
         })
     }
 
+    /// GAIN and OFFSET are what make a master matchable: both default to
+    /// Exact + required for lights, and a set that declares neither is
+    /// refused by the matcher as "cannot compare" — which is why every
+    /// imported master in the owner's catalog had zero links (2026-09-05
+    /// design, Finding 3). A master this app builds must never join them,
+    /// so the two cards are pinned here.
+    #[test]
+    fn master_cards_carry_gain_and_offset_from_the_source_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = load_header_inputs(&conn, set_id).unwrap();
+        let cards = build_master_cards(&inputs, "0.5.5", "winsorized(3,3) n=2", "beef", None, None)
+            .unwrap();
+        assert_eq!(card_int(&cards, "GAIN"), Some(100), "GAIN comes from the source set");
+        assert_eq!(card_int(&cards, "OFFSET"), Some(50), "OFFSET comes from the source set");
+    }
+
+    /// A source set that declares neither must not have the cards invented
+    /// for it — a fabricated GAIN would match the wrong darks silently.
+    #[test]
+    fn master_cards_omit_gain_and_offset_when_the_source_declares_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        conn.execute("UPDATE calibration_set SET gain = NULL, offset = NULL WHERE id = ?1", [set_id])
+            .unwrap();
+        let inputs = load_header_inputs(&conn, set_id).unwrap();
+        let cards = build_master_cards(&inputs, "0.5.5", "winsorized(3,3) n=2", "beef", None, None)
+            .unwrap();
+        assert!(!has_card(&cards, "GAIN"));
+        assert!(!has_card(&cards, "OFFSET"));
+    }
+
     fn has_card(cards: &[Card], kw: &str) -> bool {
         cards.iter().any(|c| c.keyword == kw)
     }

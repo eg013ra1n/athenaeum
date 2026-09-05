@@ -12,6 +12,7 @@
 use crate::calibration::finder::{CalibrationCandidate, CandidateMatchDetails};
 use crate::models::{
     CalibrationSetDetail, CalibrationSetWithScore, Frame, ImageType, MatchDetails,
+    ParameterStatus, ParameterVerdict,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -208,6 +209,48 @@ pub fn synthesize_frame_for_set(conn: &Connection, set_id: i64) -> Result<(Frame
     Ok((frame, source_type))
 }
 
+/// One parameter's verdict, from the engine's own `ParameterMatch`.
+fn verdict(name: &str, m: &crate::calibration::finder::ParameterMatch) -> ParameterVerdict {
+    use crate::calibration::config::MatchMode;
+    let status = if m.mode == MatchMode::Ignore {
+        ParameterStatus::Match
+    } else if m.unknown {
+        ParameterStatus::Unknown
+    } else if !m.matched {
+        ParameterStatus::Mismatch
+    } else if m.warning {
+        ParameterStatus::Warning
+    } else {
+        ParameterStatus::Match
+    };
+    ParameterVerdict {
+        name: name.to_string(),
+        enforced: m.mode != MatchMode::Ignore,
+        status,
+        frame_value: m.frame_value.clone(),
+        set_value: m.set_value.clone(),
+        diff: m.diff,
+        warning_threshold: m.warning_threshold,
+        matching_threshold: m.matching_threshold,
+    }
+}
+
+/// Every parameter the engine compared, in the order a card reads them:
+/// identity first, then the numbers that usually decide a rejection.
+pub fn verdicts_from_candidate(details: &CandidateMatchDetails) -> Vec<ParameterVerdict> {
+    vec![
+        verdict("instrume", &details.instrume),
+        verdict("binning", &details.binning),
+        verdict("gain", &details.gain),
+        verdict("offset", &details.offset),
+        verdict("filter", &details.filter),
+        verdict("exptime", &details.exptime),
+        verdict("ccd_temp", &details.ccd_temp),
+        verdict("focallen", &details.focallen),
+        verdict("telescop", &details.telescop),
+    ]
+}
+
 /// Map the engine's per-parameter `CandidateMatchDetails` into the legacy
 /// `MatchDetails` shape consumed by the React modals.
 pub fn match_details_from_candidate(details: &CandidateMatchDetails) -> MatchDetails {
@@ -289,6 +332,8 @@ pub fn load_set_with_score(
     Ok(set_opt.map(|set| CalibrationSetWithScore {
         set,
         match_score: candidate.match_score,
+        compatible: candidate.passed_hard_filter,
+        parameters: verdicts_from_candidate(&candidate.details),
         match_details: match_details_from_candidate(&candidate.details),
     }))
 }

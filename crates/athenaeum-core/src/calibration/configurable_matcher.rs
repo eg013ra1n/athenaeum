@@ -73,7 +73,11 @@ impl ParameterCheckResult {
             warning: false,
             warning_message: None,
             skip_matching: true,
-            detail,
+            detail: ParameterMatch {
+                matched: false,
+                unknown: true,
+                ..detail
+            },
         }
     }
 }
@@ -520,19 +524,17 @@ pub fn find_calibration_candidates(
             continue;
         }
 
-        // Score reflects "is this a real match per the user's config" — not
-        // just date/temp/exptime closeness. A wrong-camera (or wrong-filter,
-        // wrong-binning, wrong-gain, wrong-offset) candidate is honestly a
-        // zero-confidence match even if the date / temp / exptime line up,
-        // and so are warning-mode params that exceed `matching_threshold`
-        // (focal length, exptime, temp). All of those flip
-        // `passed_hard_filter = false`, so this single override zeroes the
-        // score for every kind of hard-rejection consistently.
-        let score = if passed_hard_filter {
-            score_match(date_diff, temp_diff, exptime_diff, &config.scoring)
-        } else {
-            0.0
-        };
+        // The score is CLOSENESS — date / temperature / exposure proximity —
+        // and nothing else. Whether the candidate satisfies the user's config
+        // is a separate, binary answer that travels as `passed_hard_filter`
+        // and orders the two blocks below. Folding the second into the first
+        // (score = 0.0 for every reject) destroyed the ordering inside the
+        // incompatible block, where the manual modal needs it most: on a real
+        // catalog every one of a light's 268 candidates read 0.0 %, leaving
+        // the list sorted by set creation date, so a same-camera set with a
+        // one-second exposure difference sat interleaved with sets from other
+        // cameras (2026-09-05 design, §3).
+        let score = score_match(date_diff, temp_diff, exptime_diff, &config.scoring);
 
         let candidate = CalibrationCandidate {
             set_id,
@@ -555,14 +557,22 @@ pub fn find_calibration_candidates(
         }
     }
 
-    // Score-sort each group, descending.
+    // Score-sort each group, descending. Every candidate in `compatible`
+    // satisfies the config, so closeness is the whole question there.
     let by_score_desc = |a: &CalibrationCandidate, b: &CalibrationCandidate| {
         b.match_score
             .partial_cmp(&a.match_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     };
     compatible.sort_by(by_score_desc);
-    incompatible.sort_by(by_score_desc);
+    // The incompatible block answers a different question — "how near a miss
+    // is this?" — ranked by what each broken rule COSTS the calibration
+    // (`rule_weight`), with closeness only breaking ties.
+    incompatible.sort_by(|a, b| {
+        near_miss_penalty(a, calibration_type)
+            .cmp(&near_miss_penalty(b, calibration_type))
+            .then_with(|| by_score_desc(a, b))
+    });
 
     // Master preference applies inside the compatible group.
     let mut compatible = apply_master_preference(compatible, master_pref);
@@ -582,6 +592,96 @@ pub fn find_calibration_candidates(
             Ok(compatible)
         }
     }
+}
+
+/// Weight of one broken rule, by how much it costs the calibration (owner's
+/// ranking, 2026-09-05). The steps are wide enough that a heavier rule always
+/// outweighs every lighter one put together, so the sum orders candidates
+/// exactly as the ranking reads.
+const W_DECISIVE: u32 = 1000; // the camera: another sensor is never the answer
+const W_MAJOR: u32 = 200;
+const W_SERIOUS: u32 = 40;
+const W_NOTABLE: u32 = 10;
+const W_MINOR: u32 = 3;
+const W_SLIGHT: u32 = 1;
+
+/// What a broken rule costs, per calibration type.
+///
+/// Darks and bias are about the SIGNAL: sensor, then geometry, then the pair
+/// that sets the level (gain + offset), then exposure — dark current is
+/// linear in time and nothing here scales a dark, so a wrong exposure is
+/// unusable rather than merely worse — then temperature, which errs in
+/// percents. Bias has no exposure to speak of, so it costs nothing there.
+///
+/// Flats are about the OPTICAL PATH: sensor, then the filter (a flat through
+/// Ha is not a flat through L — different vignetting, different dust), then
+/// geometry, then the telescope and focal length that shape the vignetting.
+/// Gain and offset barely matter to a flat, which is normalized by its own
+/// level before it divides anything.
+fn rule_weight(calibration_type: &str, param: &str) -> u32 {
+    match calibration_type {
+        "flat" | "darkflat" => match param {
+            "instrume" => W_DECISIVE,
+            "filter" => W_MAJOR,
+            "binning" => W_SERIOUS,
+            "telescop" | "focallen" => W_NOTABLE,
+            "gain" | "offset" => W_MINOR,
+            _ => W_SLIGHT,
+        },
+        "bias" => match param {
+            "instrume" => W_DECISIVE,
+            "binning" => W_MAJOR,
+            "gain" | "offset" => W_SERIOUS,
+            "exptime" => 0, // a bias has no exposure to match
+            "ccd_temp" => W_MINOR,
+            _ => W_SLIGHT,
+        },
+        // "dark" and anything else the config can name
+        _ => match param {
+            "instrume" => W_DECISIVE,
+            "binning" => W_MAJOR,
+            "gain" | "offset" => W_SERIOUS,
+            "exptime" => W_NOTABLE,
+            "ccd_temp" => W_MINOR,
+            _ => W_SLIGHT,
+        },
+    }
+}
+
+/// How near a miss an incompatible candidate is: the summed weight of the
+/// rules it breaks, ascending. Closeness (date / temperature / exposure
+/// proximity) then breaks ties — it cannot outrank a broken rule, which is
+/// the bug this replaced: a dark from ANOTHER camera scored 43 % on a good
+/// night while the same-camera set, wrong only in its offset, scored 16 %
+/// and sat tenth in the list.
+///
+/// A parameter the set does not declare costs HALF of a contradicted one:
+/// an imported master with no GAIN may still be the right master, while a
+/// dark whose gain is demonstrably different is not.
+fn near_miss_penalty(c: &CalibrationCandidate, calibration_type: &str) -> u32 {
+    let d = &c.details;
+    [
+        ("instrume", &d.instrume),
+        ("binning", &d.binning),
+        ("gain", &d.gain),
+        ("offset", &d.offset),
+        ("telescop", &d.telescop),
+        ("exptime", &d.exptime),
+        ("focallen", &d.focallen),
+        ("filter", &d.filter),
+        ("ccd_temp", &d.ccd_temp),
+    ]
+    .into_iter()
+    .filter(|(_, p)| p.mode != MatchMode::Ignore && !p.matched)
+    .map(|(name, p)| {
+        let w = rule_weight(calibration_type, name);
+        if p.unknown {
+            w.div_ceil(2)
+        } else {
+            w
+        }
+    })
+    .sum()
 }
 
 /// Calculate date difference in days
@@ -1324,19 +1424,25 @@ mod tests {
         assert_eq!(manual[0].set_id, 5);
         assert!(!manual[0].passed_hard_filter);
         assert!(!manual[0].details.instrume.matched);
-        // Score must be zero for any hard-filter reject (camera mismatch here).
-        // High date/temp/exptime closeness must not produce misleading scores.
-        assert_eq!(
-            manual[0].match_score, 0.0,
-            "wrong-camera dark must score 0 even with perfect date/temp/exptime"
+        // The score is closeness, and this dark IS close — what disqualifies
+        // it is the camera, carried by `passed_hard_filter` above and by the
+        // per-parameter verdict. A zero here would have told the user nothing
+        // about how this candidate compares to the other incompatible ones
+        // (2026-09-05 design, §3).
+        assert!(
+            manual[0].match_score > 0.5,
+            "a wrong-camera dark that matches on date/temp/exptime is still CLOSE: {}",
+            manual[0].match_score
         );
     }
 
     #[test]
-    fn engine_score_zero_for_hard_filter_rejects() {
-        // Verify the score-zero rule fires for every kind of hard-filter
-        // reject: instrume / binning / gain / offset (Exact mismatch),
-        // exptime / focallen / temp (Warning mode beyond matching_threshold).
+    fn engine_hard_filter_rejects_are_flagged_not_zeroed() {
+        // Every kind of hard-filter reject — instrume / binning / gain /
+        // offset (Exact mismatch), exptime / focallen / temp (Warning mode
+        // beyond matching_threshold) — is reported through
+        // `passed_hard_filter`, while the score keeps describing closeness so
+        // the incompatible block stays sortable.
         let conn = engine_test_db();
 
         // Wrong binning, otherwise perfect.
@@ -1431,13 +1537,13 @@ mod tests {
                 .get(&id)
                 .expect("incompatible candidate must still be returned");
             assert!(!c.passed_hard_filter, "set {} should fail hard filter", id);
-            assert_eq!(
-                c.match_score, 0.0,
-                "set {} score must be 0 (hard-filter reject)",
+            assert!(
+                c.match_score > 0.0,
+                "set {} keeps a closeness score so the block can be sorted",
                 id
             );
         }
-        // Compatible match keeps a real score.
+        // The compatible one leads the list whatever the others score.
         let good = by_id.get(&5).unwrap();
         assert!(good.passed_hard_filter);
         assert!(
@@ -1445,6 +1551,172 @@ mod tests {
             "compatible match should score well, got {}",
             good.match_score
         );
+        assert_eq!(manual[0].set_id, 5, "compatible block comes first");
+    }
+
+    /// The list the manual modal renders must be USEFUL: an incompatible
+    /// candidate keeps its closeness score, so two incompatible candidates
+    /// sort by how close they actually are instead of collapsing into one
+    /// flat block of zeros ordered by set creation date. (Owner report,
+    /// 2026-09-05: 268 of 268 candidates read 0.0 % on a real light.)
+    #[test]
+    fn engine_incompatible_candidates_keep_a_useful_score() {
+        let conn = engine_test_db();
+        // Both fail on binning; one was shot the day before the light, the
+        // other three months earlier. Same camera, same gain, same exposure.
+        insert_dark_set(&conn, 1, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0,
+                        "2025-07-01T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let manual = find_calibration_candidates(&conn, &frame, "lights", "dark", &config,
+                                                 CandidateMode::IncludeIncompatible).unwrap();
+        let by_id: std::collections::HashMap<i64, &CalibrationCandidate> =
+            manual.iter().map(|c| (c.set_id, c)).collect();
+        let near = by_id[&1];
+        let far = by_id[&2];
+
+        assert!(!near.passed_hard_filter && !far.passed_hard_filter, "both are incompatible");
+        assert!(near.match_score > 0.0, "an incompatible candidate still has a closeness");
+        assert!(
+            near.match_score > far.match_score,
+            "the closer one must outrank the older one: {} vs {}",
+            near.match_score, far.match_score
+        );
+        // …and the returned order follows that.
+        let pos = |id: i64| manual.iter().position(|c| c.set_id == id).unwrap();
+        assert!(pos(1) < pos(2), "incompatible block is sorted by closeness");
+    }
+
+    /// Inside the incompatible block, "how near a miss is it" beats raw
+    /// closeness: a set from the SAME camera that fails one rule must sit
+    /// above a set from another camera that happens to have been shot on a
+    /// better night. That is the owner's sentence — *the right frames should
+    /// surface instead of being buried* — and closeness alone does not do it:
+    /// on the real catalog a wrong-camera dark scored 43 % while the
+    /// same-camera one, off only by offset, scored 16 %.
+    #[test]
+    fn engine_incompatible_block_puts_the_near_miss_first() {
+        let conn = engine_test_db();
+        // Same camera, everything right except the offset. Shot months ago.
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 999.0, 300.0, -10.0,
+                        "2025-06-01T00:00:00+00:00", 0, "Dark");
+        // Another camera entirely — but shot the night before the light, so
+        // date / temp / exposure closeness is excellent.
+        insert_dark_set(&conn, 2, "QHY268M", "1x1", 56.0, 50.0, 300.0, -10.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let manual = find_calibration_candidates(&conn, &frame, "lights", "dark", &config,
+                                                 CandidateMode::IncludeIncompatible).unwrap();
+        assert!(manual.iter().all(|c| !c.passed_hard_filter));
+        assert_eq!(
+            manual[0].set_id, 1,
+            "the same-camera near miss leads, even though the other one is closer"
+        );
+        assert!(
+            manual[1].match_score > manual[0].match_score,
+            "…and it leads despite the lower closeness score"
+        );
+    }
+
+    /// Owner's ranking for darks (2026-09-05): camera, binning, gain+offset,
+    /// EXPOSURE, temperature, date. Exposure outranks temperature because
+    /// dark current accumulates linearly with time and this app never scales
+    /// a dark — a 60 s dark under a 180 s light is unusable, while a couple
+    /// of degrees is an error of percents.
+    #[test]
+    fn engine_dark_ranking_puts_exposure_above_temperature() {
+        let conn = engine_test_db();
+        // Wrong exposure (60 s vs the light's 300 s), temperature perfect.
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+        // Right exposure, temperature far off.
+        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -30.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let manual = find_calibration_candidates(&conn, &frame, "lights", "dark", &config,
+                                                 CandidateMode::IncludeIncompatible).unwrap();
+        assert!(manual.iter().all(|c| !c.passed_hard_filter));
+        assert_eq!(manual[0].set_id, 2, "the wrong-temperature dark is the nearer miss");
+    }
+
+    /// "The set does not declare this" ranks above "the values disagree": an
+    /// imported master with no GAIN may well be the right one, while a dark
+    /// whose gain is demonstrably different is not.
+    #[test]
+    fn engine_an_undeclared_parameter_ranks_above_a_contradicted_one() {
+        let conn = engine_test_db();
+        // gain contradicted.
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 999.0, 50.0, 300.0, -10.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+        // gain simply absent (every imported master in the real catalog).
+        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+        conn.execute("UPDATE calibration_set SET gain = NULL WHERE id = 2", []).unwrap();
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let manual = find_calibration_candidates(&conn, &frame, "lights", "dark", &config,
+                                                 CandidateMode::IncludeIncompatible).unwrap();
+        assert_eq!(manual[0].set_id, 2, "unknown outranks contradicted");
+    }
+
+    /// Compatibility is the first key, closeness only the second: a distant
+    /// compatible set still outranks a near incompatible one.
+    #[test]
+    fn engine_compatible_outranks_incompatible_however_close() {
+        let conn = engine_test_db();
+        // Compatible but old.
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0,
+                        "2024-01-01T00:00:00+00:00", 0, "Dark");
+        // Incompatible (binning) but taken the same week.
+        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0,
+                        "2025-09-30T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let manual = find_calibration_candidates(&conn, &frame, "lights", "dark", &config,
+                                                 CandidateMode::IncludeIncompatible).unwrap();
+        assert_eq!(manual[0].set_id, 1, "the compatible set leads the list");
+        assert!(manual[0].passed_hard_filter);
+        assert!(!manual[1].passed_hard_filter);
+        assert!(
+            manual[1].match_score > manual[0].match_score,
+            "and it leads despite being the more distant one"
+        );
+    }
+
+    /// "The set does not declare this parameter" and "the values disagree"
+    /// are different answers, and a card has to be able to tell them apart.
+    #[test]
+    fn engine_marks_an_undeclared_parameter_unknown_not_mismatched() {
+        let conn = engine_test_db();
+        // gain disagrees.
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 999.0, 50.0, 300.0, -10.0,
+                        "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // gain is not declared at all (the shape of every imported master).
+        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0,
+                        "2025-09-25T00:00:00+00:00", 0, "Dark");
+        conn.execute("UPDATE calibration_set SET gain = NULL WHERE id = 2", []).unwrap();
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        let manual = find_calibration_candidates(&conn, &frame, "lights", "dark", &config,
+                                                 CandidateMode::IncludeIncompatible).unwrap();
+        let by_id: std::collections::HashMap<i64, &CalibrationCandidate> =
+            manual.iter().map(|c| (c.set_id, c)).collect();
+
+        let mismatch = &by_id[&1].details.gain;
+        assert!(!mismatch.matched && !mismatch.unknown, "999 vs 56 is a mismatch");
+        let unknown = &by_id[&2].details.gain;
+        assert!(!unknown.matched && unknown.unknown, "a set with no gain is unknown, not wrong");
+        assert!(unknown.set_value.is_none());
     }
 
     #[test]
@@ -1593,13 +1865,15 @@ mod tests {
             !incomparable.passed_hard_filter,
             "incomparable set must be flagged incompatible, not presented as a match"
         );
-        assert_eq!(
-            incomparable.match_score, 0.0,
-            "incomparable set must score 0 like every other hard-filter reject"
+        assert!(
+            incomparable.match_score > 0.0,
+            "it keeps a closeness score like every other incompatible candidate"
         );
-        // The un-comparable parameter is rendered honestly: frame has a value,
-        // the set does not, and it did not match.
+        // The un-comparable parameter is rendered honestly: the frame has a
+        // value, the set does not, so this is UNKNOWN rather than a mismatch —
+        // the difference a card has to be able to state.
         assert!(!incomparable.details.gain.matched);
+        assert!(incomparable.details.gain.unknown);
         assert!(incomparable.details.gain.set_value.is_none());
     }
 

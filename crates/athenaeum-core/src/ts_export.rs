@@ -117,6 +117,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::CalibrationSetWithFrameCount,
             crate::models::CalibrationSetWithScore,
             crate::models::MatchDetails,
+            crate::models::ParameterStatus,
+            crate::models::ParameterVerdict,
             crate::models::LightFrameParameters,
             crate::models::CalibrationSetParameters,
             crate::models::CalibrationFilterGroup,

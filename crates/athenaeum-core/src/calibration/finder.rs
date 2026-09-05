@@ -22,6 +22,12 @@ pub struct ParameterMatch {
     /// warning_threshold and matching_threshold). The auto-link path stores
     /// these as warnings; the modal can highlight them.
     pub warning: bool,
+    /// The comparison could not be made at all — a required parameter one side
+    /// does not declare (an imported master with no GAIN, a frame with no
+    /// CCD-TEMP). Distinct from `matched: false`, which means the two values
+    /// were compared and disagreed; a card has to say different things about
+    /// "we don't know" and "these are wrong for each other".
+    pub unknown: bool,
 }
 
 /// Per-parameter details populated by `check_calibration_match` so callers can

@@ -648,8 +648,59 @@ pub struct CalibrationSetWithFrameCount {
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetWithScore {
     pub set: CalibrationSetDetail,
-    pub match_score: f64,              // 0.0-1.0, higher is better match
+    /// CLOSENESS only — date / temperature / exposure proximity, 0.0-1.0.
+    /// Whether the user's config accepts this set is `compatible`, never this
+    /// number (2026-09-05 design §3): folding the two together left every
+    /// rejected candidate at exactly 0.0 and the list unsortable.
+    pub match_score: f64,
+    /// Passed every Exact/Warning parameter check at the configured
+    /// thresholds — what auto-link would accept.
+    pub compatible: bool,
+    /// Every parameter the engine compared, with both values, the difference
+    /// and the thresholds, so a card can say WHY a set was refused. The
+    /// blockers are the entries whose status is `Mismatch` or `Unknown` and
+    /// whose mode is not `Ignore` — derived, not carried separately.
+    pub parameters: Vec<ParameterVerdict>,
+    /// Legacy six-boolean summary the current modals render. Superseded by
+    /// `parameters`; removed with those modals, not before.
     pub match_details: MatchDetails,
+}
+
+/// How one parameter compared for one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ParameterStatus {
+    /// Compared and equal (or inside tolerance).
+    Match,
+    /// Compared, outside the warning threshold but inside the matching one —
+    /// accepted, with a warning.
+    Warning,
+    /// Compared and disagreed, or beyond the matching threshold.
+    Mismatch,
+    /// Could not be compared: one side does not declare the value. Different
+    /// from `Mismatch` — "we don't know" is not "these are wrong for each
+    /// other", and an imported master with no GAIN is the common case.
+    Unknown,
+}
+
+/// One parameter's verdict for one candidate, as the modal renders it.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterVerdict {
+    /// Canonical parameter name: `instrume`, `binning`, `gain`, `offset`,
+    /// `telescop`, `exptime`, `focallen`, `filter`, `ccd_temp`.
+    pub name: String,
+    /// The user's config takes this parameter into account (`MatchMode` is not
+    /// `Ignore`). A boolean rather than the mode itself: the mode's TS type
+    /// lives in a different generated file, and this is the only question the
+    /// cards ask of it.
+    pub enforced: bool,
+    pub status: ParameterStatus,
+    pub frame_value: Option<String>,
+    pub set_value: Option<String>,
+    pub diff: Option<f64>,
+    pub warning_threshold: Option<f64>,
+    pub matching_threshold: Option<f64>,
 }
 
 /// Details about how well a calibration set matches light frame parameters

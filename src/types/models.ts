@@ -280,9 +280,49 @@ export type CalibrationSetConsumer = { frameSetId: number, name: string | null, 
 
 export type CalibrationSetWithFrameCount = { set: CalibrationSetDetail, frame_count: number, frame_ids: Array<number>, warnings: Array<CalibrationWarning>, sub_calibration: Array<SubCalibrationDetail>, };
 
-export type CalibrationSetWithScore = { set: CalibrationSetDetail, match_score: number, match_details: MatchDetails, };
+export type CalibrationSetWithScore = { set: CalibrationSetDetail, 
+/**
+ * CLOSENESS only — date / temperature / exposure proximity, 0.0-1.0.
+ * Whether the user's config accepts this set is `compatible`, never this
+ * number (2026-09-05 design §3): folding the two together left every
+ * rejected candidate at exactly 0.0 and the list unsortable.
+ */
+match_score: number, 
+/**
+ * Passed every Exact/Warning parameter check at the configured
+ * thresholds — what auto-link would accept.
+ */
+compatible: boolean, 
+/**
+ * Every parameter the engine compared, with both values, the difference
+ * and the thresholds, so a card can say WHY a set was refused. The
+ * blockers are the entries whose status is `Mismatch` or `Unknown` and
+ * whose mode is not `Ignore` — derived, not carried separately.
+ */
+parameters: Array<ParameterVerdict>, 
+/**
+ * Legacy six-boolean summary the current modals render. Superseded by
+ * `parameters`; removed with those modals, not before.
+ */
+match_details: MatchDetails, };
 
 export type MatchDetails = { instrume_match: boolean, binning_match: boolean, gain_match: boolean, offset_match: boolean, exptime_match: boolean, filter_match: boolean, temp_diff: number | null, date_diff_days: number, };
+
+export type ParameterStatus = "match" | "warning" | "mismatch" | "unknown";
+
+export type ParameterVerdict = { 
+/**
+ * Canonical parameter name: `instrume`, `binning`, `gain`, `offset`,
+ * `telescop`, `exptime`, `focallen`, `filter`, `ccd_temp`.
+ */
+name: string, 
+/**
+ * The user's config takes this parameter into account (`MatchMode` is not
+ * `Ignore`). A boolean rather than the mode itself: the mode's TS type
+ * lives in a different generated file, and this is the only question the
+ * cards ask of it.
+ */
+enforced: boolean, status: ParameterStatus, frameValue: string | null, setValue: string | null, diff: number | null, warningThreshold: number | null, matchingThreshold: number | null, };
 
 export type LightFrameParameters = { instrume: string | null, binning: string | null, gain: number | null, offset: number | null, filter: string | null, avg_ccd_temp: number | null, avg_exptime: number | null, exptime_range: [number, number] | null, frame_count: number, date_range: [string, string] | null, current_flat_set_id: number | null, current_dark_set_id: number | null, current_bias_set_id: number | null, };
 

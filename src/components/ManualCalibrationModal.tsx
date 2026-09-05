@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
+import { MatchVerdict } from './calibration/MatchVerdict';
 import { useNotifications } from '../contexts/NotificationContext';
 import {
   X,
@@ -226,7 +227,12 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     return `${fmtDt(range[0])} – ${fmtDt(range[1])}`;
   };
 
-  const formatMatchScore = (score: number) => {
+  /** The percentage is CLOSENESS (date / temperature / exposure proximity),
+   *  which an incompatible set can score highly — so an incompatible one is
+   *  never dressed in a "good match" colour. Its own reason is spelled out by
+   *  <MatchVerdict>. */
+  const formatMatchScore = (score: number, compatible: boolean) => {
+    if (!compatible) return { label: 'Not a match', color: 'text-content-muted' };
     const percent = Math.round(score * 100);
     if (percent >= 80) return { label: 'Excellent', color: 'text-success' };
     if (percent >= 60) return { label: 'Good', color: 'text-accent' };
@@ -248,8 +254,8 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     onSelect: () => void;
     type: TabType;
   }) => {
-    const { set, match_score, match_details } = setWithScore;
-    const scoreInfo = formatMatchScore(match_score);
+    const { set, match_score, match_details, compatible, parameters } = setWithScore;
+    const scoreInfo = formatMatchScore(match_score, compatible);
 
     const fmtDateJsx = (iso: string) => {
       const d = new Date(iso);
@@ -359,6 +365,8 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
             )}
           </span>
         </div>
+
+        <MatchVerdict compatible={compatible} parameters={parameters} />
       </div>
     );
   };

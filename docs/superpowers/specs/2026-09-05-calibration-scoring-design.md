@@ -75,9 +75,48 @@ what gets fixed.**
 `score_match(date_diff, temp_diff, exptime_diff, scoring)` runs for every
 candidate, compatible or not. The `else { 0.0 }` branch is deleted.
 
-Ordering is unchanged in shape and now meaningful in both halves: compatible
-candidates first (master preference applies inside that block, as today), then
-incompatible ones, each block sorted by descending score.
+Ordering: compatible candidates first (master preference applies inside that
+block, as today), then incompatible ones.
+
+Inside the **compatible** block every candidate satisfies the config, so
+closeness is the whole question and the block sorts by descending score.
+
+Inside the **incompatible** block the question is different — *how near a miss
+is this?* — and closeness answers it badly on its own. Measured on the real
+catalog: for light 28748 a dark from ANOTHER camera scored 43 % on
+date/temperature/exposure while the same-camera set, wrong only in its offset,
+scored 16 % and sat tenth. So the block ranks by the summed WEIGHT of the
+rules a candidate breaks, ascending, with closeness only breaking ties.
+
+Weights follow the owner's ranking (2026-09-05), with the assistant's three
+amendments accepted in the same exchange — exposure added to darks above
+temperature (dark current is linear in time and nothing here scales a dark, so
+a wrong exposure is unusable, not merely worse), offset added beside gain (it
+shifts the pedestal directly; the owner's own catalog has ATR2600M lights at
+offset 30 and 200 with darks only at 200), and the filter added to flats above
+the date (a flat through Ha is not a flat through L):
+
+| rank | dark | bias | flat / darkflat |
+| ---- | ---- | ---- | ---- |
+| decisive | camera | camera | camera |
+| major | binning | binning | filter |
+| serious | gain, offset | gain, offset | binning |
+| notable | exposure | — (a bias has none) | telescope, focal length |
+| minor | temperature | temperature | gain, offset |
+| slight | everything else | everything else | everything else |
+
+The steps (1000 / 200 / 40 / 10 / 3 / 1) are wide enough that a heavier rule
+always outweighs every lighter one put together, so the sum orders candidates
+exactly as the table reads. The date is not a rule — it is continuous and
+already lives in the closeness score, where it acts as the final tie-break.
+
+A parameter the set does not DECLARE costs half of a contradicted one: an
+imported master with no GAIN may still be the right master, while a dark whose
+gain is demonstrably different is not.
+
+**This ranking is the score only.** What is compatible in the first place stays
+exactly what Settings → Calibration Matching says (owner, 2026-09-05); no
+weight here can admit or refuse a candidate.
 
 ## 4. Compatibility travels as its own field
 
@@ -107,7 +146,7 @@ pub enum ParameterStatus { Match, Warning, Mismatch, Unknown }
 #[serde(rename_all = "camelCase")]
 pub struct ParameterVerdict {
     pub name: String,               // "instrume", "gain", "ccd_temp", …
-    pub mode: MatchMode,            // exact | warning | ignore
+    pub enforced: bool,             // MatchMode is not Ignore
     pub status: ParameterStatus,
     pub frame_value: Option<String>,
     pub set_value: Option<String>,
@@ -122,7 +161,10 @@ pub struct ParameterVerdict {
 both modals read it, and they are being replaced in the second pass anyway.
 
 The blockers a card highlights are derivable, not a third list: every verdict
-whose `status` is `Mismatch` or `Unknown` and whose `mode` is not `Ignore`.
+that is `enforced` and whose `status` is `Mismatch` or `Unknown`. `enforced`
+rather than the `MatchMode` itself because that enum's TypeScript declaration
+lives in a different generated file and the generator has no cross-file
+imports; it is also the only question a card asks of the mode.
 
 ## 6. The filter says what it means
 
@@ -139,11 +181,14 @@ moment nothing is perfect.
 
 ## 7. Masters are born linkable, and the broken ones are visible
 
-**7.1 New masters.** `calibration_library::headers::build_master_cards` writes
-no GAIN/OFFSET at all, so a master built in-app inherits exactly the defect the
-imported ones have. It writes both from the source frames, under the rule the
-file already applies to Bayer geometry: a value every contributing frame agrees
-on is stamped; disagreement means the card is omitted, never invented.
+**7.1 New masters — already correct; pinned.** An earlier draft of this
+section claimed `build_master_cards` writes no GAIN/OFFSET. That was a
+misreading: it writes both (`HeaderBuilder::gain` / `::offset`, from the
+source `calibration_set` row), so a master built in-app is linkable as long
+as its source set declares them — which raw sets do (179 of 181 dark sets in
+the real catalog). Nothing to change; a test pins the two cards so a future
+header refactor cannot quietly drop them and recreate Finding 3 for
+app-built masters.
 
 **7.2 Existing masters.** The repair path already exists and is proven (§1,
 Finding 3): Master Dark/Flat Library → Bulk Edit writes `gain` / `offset` onto
@@ -183,8 +228,8 @@ Core, test-first:
   `mismatch` for one that disagrees — the two are distinguishable;
 - `show_all = false` returns every compatible candidate and no incompatible
   one, plus the current link;
-- `build_master_cards` writes GAIN/OFFSET on unanimous sources and omits them
-  on disagreement.
+- `build_master_cards` stamps GAIN and OFFSET when the source set declares
+  them (the pin described in §7.1).
 
 Acceptance on the real catalog: for light 28748 the modal's list is ordered by
 closeness with the same-camera sets on top; for light 89793 the master appears
