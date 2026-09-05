@@ -72,6 +72,18 @@ Decision (owner + assistant, 2026-09-05): both.
 Acceptance: set 109 shows three nights after Recalculate; merging the two halves
 of a night produces one row without the button.
 
+**Second cause, found by the owner's smoke 2026-09-05 — and the one the report
+was actually about.** After the re-derivation the UI still showed five nights
+for LDN 1272 (Oct 19 / Oct 18 / Oct 17 / Sep 14 / Sep 13). The tree does not
+read `imaging_nights` at all: `get_calibration_hierarchy_for_frame_set` joined
+the nights only to filter by set and grouped by `DATE(f.date_obs)` — the
+frame's UTC calendar date — so every night that runs through midnight was two
+groups. 54 + 52 = 106, 29 + 36 = 65, 142 + 55 = 197: the three real nights,
+split across five dates. Fixed by grouping on `imaging_nights.id`, keying the
+group on the night's start (UTC RFC3339, so the frontend's lexicographic sort
+stays chronological) and labelling the span (`October 18–19, 2025`). Verified
+on the real catalog: set 109 → 3 groups, 368 frames.
+
 ## 4. VNG debayer in the blink preview at full resolution
 
 **Already researched in the 2026-09-05 session — start from here, do not

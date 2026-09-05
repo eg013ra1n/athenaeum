@@ -6,7 +6,7 @@ use crate::models::{
     CalibrationSetWithFrameCount, CalibrationWarning, FrameCalibrationStatus,
     FrameSetCalibrationGroups, ImageType, LightFrameWithCalibration, SubCalibrationDetail,
 };
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{params, Connection, Result};
 use std::collections::HashMap;
 
@@ -1146,7 +1146,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.focallen,
             f.xpixsz,
             f.binning,
-            DATE(f.date_obs) as session_date,
+            n.id as night_id,
             f.ccd_temp,
             f.swcreate,
             f.gain,
@@ -1156,7 +1156,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.objctdec,
             f.ra,
             f.dec,
-            ps.frame_id IS NOT NULL AS plate_solved
+            ps.frame_id IS NOT NULL AS plate_solved,
+            n.start_time as night_start,
+            n.end_time as night_end
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          LEFT JOIN plate_solves ps ON ps.frame_id = f.id
@@ -1164,7 +1166,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
          JOIN sessions s ON s.id = sm.session_id
          JOIN imaging_nights n ON n.id = s.imaging_night_id
          WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
-         ORDER BY DATE(f.date_obs) DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs",
+         ORDER BY n.start_time DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs",
     )?;
 
     // Collect raw frame data
@@ -1181,7 +1183,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
         focallen: Option<f64>,
         xpixsz: Option<f64>,
         binning: Option<String>,
-        session_date: Option<String>,
+        night_id: i64,
         ccd_temp: Option<f64>,
         swcreate: Option<String>,
         gain: Option<f64>,
@@ -1192,6 +1194,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
         ra: Option<f64>,
         dec: Option<f64>,
         plate_solved: bool,
+        night_start: String,
+        night_end: String,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1209,7 +1213,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 focallen: row.get(9)?,
                 xpixsz: row.get(10)?,
                 binning: row.get(11)?,
-                session_date: row.get(12)?,
+                night_id: row.get(12)?,
                 ccd_temp: row.get(13)?,
                 swcreate: row.get(14)?,
                 gain: row.get(15)?,
@@ -1220,6 +1224,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 ra: row.get(20)?,
                 dec: row.get(21)?,
                 plate_solved: row.get(22)?,
+                night_start: row.get(23)?,
+                night_end: row.get(24)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1227,18 +1233,25 @@ pub fn get_calibration_hierarchy_for_frame_set(
     let total_frames = frames.len();
 
     // Step 2: Build hierarchy using nested HashMaps
-    // date -> camera -> filter -> frames
+    // night -> camera -> filter -> frames
+    //
+    // Keyed on the IMAGING NIGHT, not on the frame's UTC calendar date: a
+    // night runs through midnight, so grouping by `DATE(date_obs)` split
+    // every real night in two (LDN 1272's 18→19 Oct showed as "October 18"
+    // and "October 19" — the report that opened this).
     type FilterMap = HashMap<Option<String>, Vec<RawFrame>>;
     type CameraMap = HashMap<String, FilterMap>;
-    type DateMap = HashMap<String, CameraMap>;
+    type NightMap = HashMap<i64, CameraMap>;
 
-    let mut date_map: DateMap = HashMap::new();
+    let mut date_map: NightMap = HashMap::new();
+    // night id -> (start, end), for the group's key and label.
+    let mut night_spans: HashMap<i64, (String, String)> = HashMap::new();
 
     for frame in frames {
-        let date_key = frame
-            .session_date
-            .clone()
-            .unwrap_or_else(|| "Unknown Date".to_string());
+        let date_key = frame.night_id;
+        night_spans
+            .entry(date_key)
+            .or_insert_with(|| (frame.night_start.clone(), frame.night_end.clone()));
         let camera_key = frame
             .instrume
             .clone()
@@ -1260,9 +1273,12 @@ pub fn get_calibration_hierarchy_for_frame_set(
     let mut uncalibrated_frames = 0;
     let mut date_groups: Vec<CalibrationDateGroup> = Vec::new();
 
-    // Sort dates in descending order (most recent first)
-    let mut dates: Vec<&String> = date_map.keys().collect();
-    dates.sort_by(|a, b| b.cmp(a));
+    // Sort nights in descending order (most recent first), by when they began.
+    let mut dates: Vec<&i64> = date_map.keys().collect();
+    dates.sort_by(|a, b| {
+        let key = |id: &i64| night_spans.get(id).map(|(s, _)| s.clone()).unwrap_or_default();
+        key(b).cmp(&key(a))
+    });
 
     for date_str in dates {
         let camera_map = &date_map[date_str];
@@ -1506,11 +1522,15 @@ pub fn get_calibration_hierarchy_for_frame_set(
             });
         }
 
-        // Format date display
-        let date_display = format_date_display(date_str);
+        // The night's span drives both the key and the label.
+        let (night_start, night_end) = night_spans
+            .get(date_str)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let date_display = format_night_display(&night_start, &night_end);
 
         date_groups.push(CalibrationDateGroup {
-            date: date_str.clone(),
+            date: night_sort_key(&night_start),
             date_display,
             camera_groups,
             frame_count: date_frame_count,
@@ -1533,6 +1553,46 @@ fn format_date_display(date_str: &str) -> String {
         date.format("%B %d, %Y").to_string()
     } else {
         date_str.to_string()
+    }
+}
+
+/// A night group's stable key: its start normalized to UTC RFC3339, so the
+/// frontend's lexicographic sort over the key is chronological and two
+/// nights can never collide on one key (a calendar date could).
+fn night_sort_key(start: &str) -> String {
+    match DateTime::parse_from_rfc3339(start) {
+        Ok(dt) => dt
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        Err(_) => start.to_string(),
+    }
+}
+
+/// A night's label: `September 13–14, 2025` when it runs through midnight,
+/// `October 18, 2025` when it does not, and `October 31 – November 1, 2025`
+/// across a month boundary. Both ends are read in UTC, the same frame the
+/// night's own start/end are stored in.
+fn format_night_display(start: &str, end: &str) -> String {
+    let parse = |s: &str| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc).date_naive())
+    };
+    let (Some(a), Some(b)) = (parse(start), parse(end)) else {
+        return format_date_display(start);
+    };
+    if a == b {
+        return a.format("%B %-d, %Y").to_string();
+    }
+    if a.format("%Y-%m").to_string() == b.format("%Y-%m").to_string() {
+        format!(
+            "{}–{}, {}",
+            a.format("%B %-d"),
+            b.format("%-d"),
+            a.format("%Y")
+        )
+    } else {
+        format!("{} – {}, {}", a.format("%B %-d"), b.format("%B %-d"), b.format("%Y"))
     }
 }
 
@@ -1778,5 +1838,98 @@ mod tests {
         let deleted = clear_manual_override(&conn, &[1], None).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(get_links_for_frame(&conn, 1).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod night_grouping_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::params;
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        init_db(&c).unwrap();
+        c
+    }
+
+    /// One imaging night holding `frames` — `(frame_id, date_obs)`.
+    fn night_with_lights(conn: &Connection, set_id: i64, start: &str, end: &str, frames: &[(i64, &str)]) {
+        let night_id = crate::db::create_imaging_night(conn, set_id, start, end).unwrap();
+        let session_id =
+            crate::db::create_session(conn, night_id, "CamA", frames.len() as i32, None).unwrap();
+        for (id, date_obs) in frames {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2026-01-01T00:00:00Z', 'FITS')",
+                params![id, format!("/t/{id}.fits"), format!("{id}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, instrume, date_obs, exptime)
+                 VALUES (?1, ?1, 'Light', 'CamA', ?2, 180.0)",
+                params![id, date_obs],
+            )
+            .unwrap();
+        }
+        let ids: Vec<i64> = frames.iter().map(|(id, _)| *id).collect();
+        crate::db::insert_session_members(conn, session_id, &ids).unwrap();
+    }
+
+    /// The hierarchy groups by IMAGING NIGHT, not by the UTC calendar date of
+    /// each frame: a night that runs through midnight is one group, and its
+    /// label says so.
+    #[test]
+    fn hierarchy_groups_by_night_not_by_calendar_date() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'LDN 1272')", []).unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-09-13T21:55:00Z",
+            "2025-09-14T01:59:00Z",
+            &[(10, "2025-09-13T21:55:00Z"), (11, "2025-09-14T01:59:00Z")],
+        );
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-17T22:04:00Z",
+            "2025-10-18T02:25:00Z",
+            &[(12, "2025-10-17T22:04:00Z"), (13, "2025-10-18T02:25:00Z")],
+        );
+
+        let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
+        let groups: Vec<(&str, usize)> = view
+            .date_groups
+            .iter()
+            .map(|g| (g.date_display.as_str(), g.frame_count))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![("October 17–18, 2025", 2), ("September 13–14, 2025", 2)],
+            "one group per night, newest first"
+        );
+        assert_eq!(view.total_frames, 4);
+        // The group key is unique per night and sorts chronologically.
+        let keys: Vec<&str> = view.date_groups.iter().map(|g| g.date.as_str()).collect();
+        assert!(keys[0] > keys[1], "{keys:?}");
+    }
+
+    /// A night that starts and ends on the same calendar date keeps the plain
+    /// single-date label.
+    #[test]
+    fn a_night_inside_one_date_keeps_the_single_date_label() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-18T18:00:00Z",
+            "2025-10-18T23:30:00Z",
+            &[(10, "2025-10-18T18:00:00Z"), (11, "2025-10-18T23:30:00Z")],
+        );
+        let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
+        assert_eq!(view.date_groups.len(), 1);
+        assert_eq!(view.date_groups[0].date_display, "October 18, 2025");
     }
 }
