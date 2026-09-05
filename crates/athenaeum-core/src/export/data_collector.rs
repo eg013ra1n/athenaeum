@@ -1523,8 +1523,16 @@ pub fn collect_export_summary(
     // Build folder preview — from the data as the mode shapes it
     let folder_preview = build_folder_preview(&shaped, config)?;
 
-    // Build detailed warnings
-    let warnings = build_detailed_warnings(&export_data, &filter_groups)?;
+    // Build detailed warnings — from the links, then pruned by what the mode
+    // exports: lights only ships no calibration, so nothing about the
+    // calibration is worth attention there, and every warning this builder
+    // emits today is about the calibration (temperature, age, missing, and
+    // the matcher's fallback notes filed as General). A future light-only
+    // warning needs its own type to survive this.
+    let mut warnings = build_detailed_warnings(&export_data, &filter_groups)?;
+    if matches!(mode, ExportMode::LightsOnly) {
+        warnings.clear();
+    }
     tracing::debug!(frame_set_id, count = warnings.len(), "export warnings generated");
 
     // Calculate totals — from the shaped data, like the tree
@@ -2926,6 +2934,31 @@ mod export_mode_tests {
                 .collect();
             assert!(missing.is_empty(), "{mode:?}: {missing:?}");
         }
+    }
+
+    /// Lights only exports no calibration, so a lights-only summary carries no
+    /// calibration warnings — even for lights that have no links at all (the
+    /// raw+sets summary of the same set still reports them).
+    #[test]
+    fn lights_only_summary_has_no_calibration_warnings() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let cfg = WbppExportConfig::default();
+
+        let raw = collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithCalibrationSets, None)
+            .unwrap();
+        assert!(
+            raw.warnings.iter().any(|w| w.title.starts_with("Missing")),
+            "raw+sets still reports the missing links"
+        );
+
+        let lights = collect_export_summary(&conn, 1, &cfg, ExportMode::LightsOnly, None).unwrap();
+        assert!(
+            lights.warnings.is_empty(),
+            "got {:?}",
+            lights.warnings.iter().map(|w| &w.title).collect::<Vec<_>>()
+        );
     }
 
     /// A mode the set is not ready for is refused, never drawn wrong.
