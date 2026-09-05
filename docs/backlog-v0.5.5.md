@@ -84,6 +84,15 @@ group on the night's start (UTC RFC3339, so the frontend's lexicographic sort
 stays chronological) and labelling the span (`October 18–19, 2025`). Verified
 on the real catalog: set 109 → 3 groups, 368 frames.
 
+**Calendar, same rule (owner request, 2026-09-05).** `get_calendar_month_data`
+grouped both of its queries by `DATE(fr.date_obs)`, so one night occupied two
+day cells. A day now keys on the night that STARTED there:
+`DATE(imaging_nights.start_time, '-12 hours')` for organized frames, and the
+same noon-to-noon rule over `date_obs` for loose frames (they have no stored
+night, and the shift gives the answer the gap rule would have). Verified on
+the real catalog: LDN 1272's 106 frames sit in the 13 Sep cell (was 54 + 52),
+65 in 17 Oct, 197 in 18 Oct; the 14 Sep and 19 Oct cells are gone.
+
 ## 4. VNG debayer in the blink preview at full resolution
 
 **Already researched in the 2026-09-05 session — start from here, do not

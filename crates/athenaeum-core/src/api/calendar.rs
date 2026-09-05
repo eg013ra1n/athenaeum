@@ -34,8 +34,14 @@ fn split_names(joined: Option<String>) -> Vec<String> {
 
 /// Get calendar data for a specific month
 ///
-/// Returns all imaging activity grouped by date for calendar rendering.
-/// Includes both organized frame sets and unorganized LIGHT frames.
+/// Returns all imaging activity grouped by IMAGING NIGHT for calendar
+/// rendering — a night lands on the day it started, so frames taken after
+/// midnight share a cell with the evening they belong to instead of opening
+/// an empty next-day cell. Organized frames use their stored night's start;
+/// loose frames, which have no night, fall back to the noon-to-noon rule
+/// (`DATE(date_obs, '-12 hours')`) — the same answer for every frame the
+/// gap rule would have placed on that night. Includes both organized frame
+/// sets and unorganized LIGHT frames.
 pub fn get_calendar_month_data(
     conn: &Connection,
     year: i32,
@@ -56,7 +62,7 @@ pub fn get_calendar_month_data(
     let mut stmt = conn
         .prepare(
             "SELECT
-                DATE(fr.date_obs) as obs_date,
+                DATE(ino.start_time, '-12 hours') as obs_date,
                 fs.id as frame_set_id,
                 fs.name as set_name,
                 COALESCE(fs.name, fr.object) as object_name,
@@ -75,9 +81,9 @@ pub fn get_calendar_month_data(
             JOIN imaging_nights ino ON ino.id = s.imaging_night_id
             JOIN frames_set fs ON fs.id = ino.frames_set_id
             WHERE fr.imagetyp = 'Light'
-              AND DATE(fr.date_obs) >= ?1
-              AND DATE(fr.date_obs) < ?2
-            GROUP BY DATE(fr.date_obs), fs.id
+              AND DATE(ino.start_time, '-12 hours') >= ?1
+              AND DATE(ino.start_time, '-12 hours') < ?2
+            GROUP BY DATE(ino.start_time, '-12 hours'), fs.id
             ORDER BY obs_date, object_name",
         )
         .map_err(|e| anyhow!("Failed to prepare frame sets query: {}", e))?;
@@ -153,7 +159,7 @@ pub fn get_calendar_month_data(
     let mut stmt = conn
         .prepare(
             "SELECT
-                DATE(fr.date_obs) as obs_date,
+                DATE(fr.date_obs, '-12 hours') as obs_date,
                 CASE WHEN fr.ra IS NULL THEN 'Unlocated Frames'
                      ELSE COALESCE(fr.object, 'Unknown') END as object_name,
                 COUNT(DISTINCT fr.id) as frame_count,
@@ -168,12 +174,12 @@ pub fn get_calendar_month_data(
                 MAX(fr.date_obs) as last_obs
             FROM frames fr
             WHERE fr.imagetyp = 'Light'
-              AND DATE(fr.date_obs) >= ?1
-              AND DATE(fr.date_obs) < ?2
+              AND DATE(fr.date_obs, '-12 hours') >= ?1
+              AND DATE(fr.date_obs, '-12 hours') < ?2
               AND NOT EXISTS (
                   SELECT 1 FROM session_members sm WHERE sm.frame_id = fr.id
               )
-            GROUP BY DATE(fr.date_obs),
+            GROUP BY DATE(fr.date_obs, '-12 hours'),
                      CASE WHEN fr.ra IS NULL THEN 'unlocated' ELSE 'located' END
             ORDER BY obs_date",
         )
@@ -438,5 +444,39 @@ mod tests {
         assert!(group.telescopes.is_empty(), "a NULL TELESCOP is not a telescope");
         assert_eq!(group.first_obs.as_deref(), Some("2026-03-05T20:00:00"));
         assert_eq!(group.last_obs.as_deref(), Some("2026-03-05T21:30:00"));
+    }
+
+    /// A night belongs to the day it STARTED on: frames taken after midnight
+    /// land in the same calendar cell as the evening they belong to, both for
+    /// a frame set (whose night is stored) and for loose frames (which have
+    /// no night, so the noon-to-noon rule places them).
+    #[test]
+    fn a_night_lands_on_the_day_it_started() {
+        let conn = test_db();
+        insert_light(&conn, 1, "LDN 1272", "2025-09-13T21:55:00", 300.0);
+        insert_light(&conn, 2, "LDN 1272", "2025-09-14T01:59:00", 300.0);
+        organize(&conn, 7, &[1, 2]);
+        conn.execute(
+            "UPDATE imaging_nights SET start_time = '2025-09-13T21:55:00Z',
+                                       end_time   = '2025-09-14T01:59:00Z'
+             WHERE frames_set_id = 7",
+            [],
+        )
+        .unwrap();
+        // Loose frames of the same night, never organized into a set.
+        insert_light(&conn, 3, "M42", "2025-09-13T22:30:00", 60.0);
+        insert_light(&conn, 4, "M42", "2025-09-14T00:40:00", 60.0);
+
+        let data = get_calendar_month_data(&conn, 2025, 9).unwrap();
+        assert_eq!(
+            data.days.iter().map(|d| d.date.as_str()).collect::<Vec<_>>(),
+            vec!["2025-09-13"],
+            "one cell: the night of the 13th"
+        );
+        let day = &data.days[0];
+        assert_eq!(day.total_frame_count, 4);
+        assert_eq!(day.frame_sets.len(), 1);
+        assert_eq!(day.frame_sets[0].frame_count, 2);
+        assert_eq!(day.unorganized_groups[0].frame_count, 2);
     }
 }

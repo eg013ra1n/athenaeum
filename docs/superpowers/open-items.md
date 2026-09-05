@@ -558,6 +558,12 @@ cycle, so anything from them that matters later belongs here or in a plan.
   average file size instead of a fixed 50 MB per file.
 - Calendar: a day's cards show the camera, the telescope and the first–last
   exposure time of that night.
+- Objects and Calendar: a night that runs past midnight is one night again.
+  The night tree grouped by the frame's calendar date, so every session
+  through midnight showed as two — "October 18" and "October 19" instead of
+  "October 18–19, 2025" — and the Shoot Calendar split the same night across
+  two day cells. Both now group by the imaging night, which lands on the day
+  it started.
 - Objects: merging frame sets (and Find new images) now recomputes the
   merged set's nights from all of its frames instead of stitching the two
   sets' night rows together — a night split by a meridian-flip re-pointing no
