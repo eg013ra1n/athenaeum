@@ -54,7 +54,21 @@ export function SubjectSummary({
   onFilterChange: (patch: Partial<CandidateFilter>) => void;
 }) {
   const r = requirement;
-  const dates = r.dates ? `${isoDay(r.dates[0])} → ${isoDay(r.dates[1])}` : null;
+  // Same reasoning as the candidate cards: on a single night the date repeats
+  // and only the clock distinguishes anything.
+  const dates = (() => {
+    if (!r.dates) return null;
+    const [a, b] = r.dates.map(v => new Date(v));
+    if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) {
+      return `${isoDay(r.dates[0])} → ${isoDay(r.dates[1])}`;
+    }
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const day = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const clock = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return day(a) === day(b)
+      ? `${day(a)} ${clock(a)}–${clock(b)}`
+      : `${day(a)} ${clock(a)} → ${day(b)} ${clock(b)}`;
+  })();
 
   return (
     <div>

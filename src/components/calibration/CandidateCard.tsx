@@ -2,14 +2,33 @@ import { Check, Layers } from 'lucide-react';
 import type { CalibrationSetWithScore, ParameterVerdict } from '../../types/models';
 import { blockersOf, describeDifference } from './pickerModel';
 
-/** `2025-09-13 → 09-14`, or a single day when the set does not span one. */
+const pad = (n: number) => String(n).padStart(2, '0');
+const day = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const clock = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+/**
+ * When the set was shot, close enough to choose between two of them.
+ *
+ * The date alone is not enough: two flat sets from the same night — dusk and
+ * dawn, or before and after a filter change — are the common case, and the
+ * clock is what tells them apart. Shown in local time, like every other
+ * timestamp in the app.
+ */
 function spanLabel(start: string | null, end: string | null): string {
   if (!start) return 'Undated';
-  const from = start.slice(0, 10);
-  if (!end) return from;
-  const to = end.slice(0, 10);
-  if (from === to) return from;
-  return from.slice(0, 4) === to.slice(0, 4) ? `${from} → ${to.slice(5)}` : `${from} → ${to}`;
+  const from = new Date(start);
+  if (Number.isNaN(from.getTime())) return start.slice(0, 10);
+  const to = end ? new Date(end) : null;
+  if (!to || Number.isNaN(to.getTime())) return `${day(from)} ${clock(from)}`;
+  if (day(from) === day(to)) {
+    // One session: the date once, then the window it occupied.
+    return clock(from) === clock(to)
+      ? `${day(from)} ${clock(from)}`
+      : `${day(from)} ${clock(from)}–${clock(to)}`;
+  }
+  // Across midnight (or longer): keep both dates, and the times that place them.
+  const toDay = day(from).slice(0, 4) === day(to).slice(0, 4) ? day(to).slice(5) : day(to);
+  return `${day(from)} ${clock(from)} → ${toDay} ${clock(to)}`;
 }
 
 /** The facts that identify a set at a glance — never the ones that differ. */
