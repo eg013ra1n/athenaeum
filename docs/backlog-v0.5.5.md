@@ -1,10 +1,10 @@
 # Backlog — v0.5.5
 
-Owner findings, captured 2026-09-05. Raw intake: none of this is planned yet, and
-several items are design questions rather than bugs. Each entry keeps the owner's
-wording as the requirement and adds only what is already *known* — measured
-numbers, the code that owns the behaviour, and the question that has to be
-answered before the item can be planned.
+Owner findings, captured 2026-09-05 and staged the same day (see **Stages** at
+the end). Each entry keeps the owner's wording as the requirement and adds only
+what is already *known* — measured numbers, the code that owns the behaviour, and
+the question that has to be answered before the item can be planned. Items 4 and
+1 are **out of v0.5.5** — they go to their own cycle after the tag.
 
 ## 1. Navigation memory ("backspace browsing")
 
@@ -35,9 +35,39 @@ gap between frames in the session. The app should understand night logic rather
 than gap-only clustering.
 
 **Owner rule this touches:** frame sets are clustered by sky coordinates, but
-nights come from `imaging_nights` / `sessions`. Needs a look at what actually
-defines a night boundary today before proposing anything — and a real-data
-reproduction on the LDN 1272 set, which is on this machine.
+nights come from `imaging_nights` / `sessions`.
+
+**Spike done 2026-09-05 (dev catalog, set 109 "LDN 1272", 4 night rows).** The
+night of 13→14 Sep is stored as TWO rows — `486` 21:55–23:59 (33 frames) and
+`489` 22:36–01:59 (73 frames): overlapping ranges, and no gap over 30 min
+anywhere between 21:55 and 01:59 against the 6 h threshold. One night, two rows.
+(17→18 and 18→19 Oct are two real nights in the catalog, 15.5 h apart; if the
+UI doubles 18–19 too, the mechanism is the same — confirm at acceptance.)
+
+Cause: a merge does not re-derive nights, it stitches the rows. The set was
+assembled from merged frame sets (a post-flip pointing shift clustered the
+second half of the night separately). `frames_set_merge::nights_match` = same
+UTC calendar date AND range overlap; the post-flip cluster's night did not
+overlap the target's at merge time, so it came in as a separate row, and later
+range unions (`calculate_time_range_union`) made them overlap after the fact —
+nothing re-checks. The same rule runs in the manual merge (duplicated in
+`athenaeum-tauri/commands/frame_sets.rs::merge_frame_sets` and the web mirror —
+the logic sits in the shell crates, not in core) and in `auto_merge`.
+
+Decision (owner + assistant, 2026-09-05): both.
+- Automatic: every merge (manual and "Find new images") re-derives the set's
+  nights/sessions from the UNION of member frames via the existing
+  `sessions::detect_sessions`. A night is derived data with one definition (the
+  gap rule); derived data is recomputed, never stitched. `imaging_nights` and
+  `sessions` are referenced only by `session_members` (+ the session-stat
+  triggers), so delete + re-insert per set is safe.
+- Manual: a "Recalculate nights" action on a frame set — the same core
+  function behind one button and one command in both backends — because LDN 1272
+  is already wrong in the catalog and nothing else repairs it.
+- The merge night logic moves into `athenaeum-core` on the way.
+
+Acceptance: set 109 shows three nights after Recalculate; merging the two halves
+of a night produces one row without the button.
 
 ## 4. VNG debayer in the blink preview at full resolution
 
@@ -99,9 +129,59 @@ different axis from the existing stage gates.
 The scoring point is the substantive one — it changes what the matcher reports,
 not just the UI. `calibration/configurable_matcher.rs` owns the score.
 
+## 7. Export tab — default mode and the folder tree
+
+- **Calibrated lights** is preselected even when it is unavailable. That must
+  not happen.
+- The export tree must show exactly how the export will be performed: with no
+  calibration frames, or with masters, the tree has to be drawn correctly by
+  count.
+
+**Known:** `ExportTab.tsx::readExportModePref` restores the LAST chosen mode
+from localStorage on every set without consulting readiness, so a mode chosen
+once where it was ready stays preselected everywhere, blocked or not. The tree
+comes from `get_export_summary` → `collect_export_summary`, which builds
+`build_folder_preview` BEFORE `apply_export_mode` — the mode is never passed —
+and counts the raw frames of every linked set. So the tree is truthful only for
+`rawWithCalibrationSets`: masters should be one file per set, lights-only has no
+calibration folders, calibrated lights has `c_*` names under `lights/` and no
+calibration folders either.
+
+Fix shape: a persisted choice never beats readiness (blocked → first ready
+option in list order); `get_export_summary(set_id, mode)` in both backends,
+mode applied before tree/totals/size, and the tab re-fetches the summary when
+the mode changes.
+
 ---
 
-## Suggested order
+## Stages
+
+Decided 2026-09-05. Items are independent subsystems — the order is by risk and
+by how many unknowns have to be removed before code. v0.5.5 = the work already
+on `main` since v0.5.4 (transfer preparation, calibrated-export v2, rustafits
+1.1.0 — release-note lines in `docs/superpowers/open-items.md`) + stages 1–4.
+The tag goes after stage 4.
+
+| # | Stage | Path |
+| ---- | ---- | ---- |
+| 1 | **Quick fixes**: Analysis tab (item 2) · Export default + tree (item 7) · frame cards carry camera / telescope / timings (the tail of item 1) | bounded, one commit per slice |
+| 2 | **Nights** (item 3): re-derive on merge + Recalculate nights | bounded; acceptance on LDN 1272 |
+| 3 | **Manual calibration assignment** (item 6): scoring first, then the unified modal | architectural → spec → plan |
+| 4 | **Plate-solve input gate** (item 5) | bounded–medium |
+
+Inside stage 3 the scoring change goes first — it is core, testable against
+this catalog, and independent of the UI; polishing two modals that are about
+to become one is thrown-away work.
+
+**Deferred to their own cycle after the v0.5.5 tag** (owner call, 2026-09-05):
+
+- **VNG in the blink preview** (item 4) — needs the mode decision (always-on for
+  `full` vs a separate "1:1" mode) and a preview-cache key decision first.
+- **Navigation memory** (item 1, minus the frame-card fields) — touches every
+  page under `src/pages/`, the widest regression surface in the list; needs the
+  back-gesture and persistence decisions first.
+
+## Superseded: suggested order from intake
 
 2 (self-contained UI) → 6 (unify + scoring; largest user-visible win) → 3
 (needs a real-data reproduction) → 5 → 4 (needs a mode decision) → 1 (broadest,
