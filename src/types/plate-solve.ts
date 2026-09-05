@@ -71,6 +71,26 @@ blind_scale_sanity_min: number, blind_scale_sanity_max: number,
  */
 blind_scale_header_tol: number, 
 /**
+ * Refuse to solve a frame whose own analysis says its stars are streaks.
+ * Default: on.
+ */
+input_gate_enabled: boolean, 
+/**
+ * A frame is refused when its median star eccentricity is at least this
+ * AND its trail R² is at least [`PlateSolveConfig::input_min_trail_r2`].
+ *
+ * Both, because either alone catches frames that solve perfectly well:
+ * measured on real files (2026-09-05), frames that solve correctly sit at
+ * eccentricity 0.62–0.72 with trail R² 0.30–0.57, while hopeless ones sit
+ * at 0.90–0.96 with 0.73–0.93. Default: 0.85.
+ */
+input_max_eccentricity: number, 
+/**
+ * Trail-fit R² above which the elongation is a tracking failure rather
+ * than seeing. Default: 0.65.
+ */
+input_min_trail_r2: number, 
+/**
  * Per-camera pixel-size defaults (`INSTRUME` or `TELESCOP` → xpixsz_µm).
  * Consulted by the focallen back-fill when a frame's FITS header lacks
  * `XPIXSZ` (some surveys ship sparse headers — e.g. SkyMapper). Without

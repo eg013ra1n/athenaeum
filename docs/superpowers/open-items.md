@@ -558,6 +558,17 @@ cycle, so anything from them that matters later belongs here or in a plan.
   average file size instead of a fixed 50 MB per file.
 - Calendar: a day's cards show the camera, the telescope and the first–last
   exposure time of that night.
+- Plate solving no longer invents astrometry for frames whose stars are
+  streaks. Wind-shaken frames used to come back "solved" at 16-193x their
+  true pixel scale — a confident, entirely wrong position written into the
+  catalog. Such detections are now excluded from matching, and any solve whose
+  scale disagrees with the frame's own focal length and pixel size is refused.
+- Plate solving: a frame whose analysis shows badly trailed stars is skipped
+  with a plain reason instead of spending minutes failing, and the thresholds
+  are in Settings if you want them looser.
+- Plate solving: a frame with no coordinates in its header can be solved by
+  naming its target — set OBJECT in the metadata editor and the editor tells
+  you, as you type, whether the name is one the sky catalog knows.
 - Calibration: the manual assignment list is usable again. Every candidate
   now carries a real closeness percentage instead of a flat 0 % for anything
   your matching rules refuse, the list is ordered by how near a miss each one

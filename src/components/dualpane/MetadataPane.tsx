@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Save, Loader2, AlertTriangle, ExternalLink, RotateCcw, Crosshair, CheckCircle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../../api';
+import type { ResolvedObject } from '../../types/models';
 import type {
   CalibrationSetMembership,
   DirectoryListing,
@@ -761,6 +762,40 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   /** Field row spec — numeric, free-text, or dropdown. `originalKey` maps
    *  the field to the matching `FrameOriginalSnapshot` field for the revert
    *  button (omit for fields the snapshot doesn't carry). */
+  // Naming a target is a repair for frames the solver cannot place: with no
+  // RA/Dec in the header, a recognised OBJECT gives plate solving a position
+  // hint instead of a blind search. So the editor says, while you type,
+  // whether this particular name will actually help.
+  const objectDraft = edits.object?.enabled ? edits.object.value.trim() : '';
+  const [objectLookup, setObjectLookup] = useState<
+    { state: 'idle' | 'checking' } | { state: 'known'; object: ResolvedObject } | { state: 'unknown' }
+  >({ state: 'idle' });
+
+  useEffect(() => {
+    if (!objectDraft) {
+      setObjectLookup({ state: 'idle' });
+      return;
+    }
+    let cancelled = false;
+    setObjectLookup({ state: 'checking' });
+    const timer = setTimeout(() => {
+      api
+        .invoke<ResolvedObject | null>('resolve_object_name', { name: objectDraft })
+        .then((hit) => {
+          if (cancelled) return;
+          setObjectLookup(hit ? { state: 'known', object: hit } : { state: 'unknown' });
+        })
+        .catch((err) => {
+          console.error('[MetadataPane] resolve_object_name failed:', err);
+          if (!cancelled) setObjectLookup({ state: 'idle' });
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [objectDraft]);
+
   const fields: Array<{
     key: keyof typeof common;
     label: string;
@@ -1038,6 +1073,26 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                     </button>
                   )}
                 </div>
+                )}
+                {f.key === 'object' && objectDraft && objectLookup.state !== 'idle' && (
+                  <div className="pl-[6.5rem] mt-0.5 text-[11px]">
+                    {objectLookup.state === 'checking' ? (
+                      <span className="text-content-muted">Checking the sky catalog…</span>
+                    ) : objectLookup.state === 'known' ? (
+                      <span className="text-success">
+                        {objectLookup.object.designation} — plate solving will start here (
+                        {objectLookup.object.raDeg.toFixed(3)}°,{' '}
+                        {objectLookup.object.decDeg >= 0 ? '+' : ''}
+                        {objectLookup.object.decDeg.toFixed(3)}°)
+                      </span>
+                    ) : (
+                      <span className="text-content-muted">
+                        Not a catalog name — frames without coordinates will still be solved blind.
+                        A designation like <span className="font-mono">M 31</span> or{' '}
+                        <span className="font-mono">NGC 7000</span> gives the solver a starting point.
+                      </span>
+                    )}
+                  </div>
                 )}
               </div>
             );

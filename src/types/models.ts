@@ -308,6 +308,16 @@ match_details: MatchDetails, };
 
 export type MatchDetails = { instrume_match: boolean, binning_match: boolean, gain_match: boolean, offset_match: boolean, exptime_match: boolean, filter_match: boolean, temp_diff: number | null, date_diff_days: number, };
 
+export type ResolvedObject = { 
+/**
+ * The catalog's own spelling — "M 31" for an entered "m31".
+ */
+designation: string, raDeg: number, decDeg: number, 
+/**
+ * Angular radius in degrees, when the catalog gives a size.
+ */
+radiusDeg?: number | null, };
+
 export type ParameterStatus = "match" | "warning" | "mismatch" | "unknown";
 
 export type ParameterVerdict = { 

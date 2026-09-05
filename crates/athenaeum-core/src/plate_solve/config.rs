@@ -76,6 +76,23 @@ pub struct PlateSolveConfig {
     /// header FOCALLEN is not rejected. Default: 8.0.
     #[serde(default = "default_blind_scale_header_tol")]
     pub blind_scale_header_tol: f64,
+    /// Refuse to solve a frame whose own analysis says its stars are streaks.
+    /// Default: on.
+    #[serde(default = "default_true")]
+    pub input_gate_enabled: bool,
+    /// A frame is refused when its median star eccentricity is at least this
+    /// AND its trail R² is at least [`PlateSolveConfig::input_min_trail_r2`].
+    ///
+    /// Both, because either alone catches frames that solve perfectly well:
+    /// measured on real files (2026-09-05), frames that solve correctly sit at
+    /// eccentricity 0.62–0.72 with trail R² 0.30–0.57, while hopeless ones sit
+    /// at 0.90–0.96 with 0.73–0.93. Default: 0.85.
+    #[serde(default = "default_input_max_eccentricity")]
+    pub input_max_eccentricity: f64,
+    /// Trail-fit R² above which the elongation is a tracking failure rather
+    /// than seeing. Default: 0.65.
+    #[serde(default = "default_input_min_trail_r2")]
+    pub input_min_trail_r2: f64,
     /// Per-camera pixel-size defaults (`INSTRUME` or `TELESCOP` → xpixsz_µm).
     /// Consulted by the focallen back-fill when a frame's FITS header lacks
     /// `XPIXSZ` (some surveys ship sparse headers — e.g. SkyMapper). Without
@@ -126,6 +143,15 @@ fn default_blind_scale_sanity_min() -> f64 {
 fn default_blind_scale_sanity_max() -> f64 {
     60.0
 }
+fn default_true() -> bool {
+    true
+}
+fn default_input_max_eccentricity() -> f64 {
+    0.85
+}
+fn default_input_min_trail_r2() -> f64 {
+    0.65
+}
 fn default_blind_scale_header_tol() -> f64 {
     8.0
 }
@@ -144,6 +170,9 @@ impl Default for PlateSolveConfig {
             blind_scale_sanity_min: default_blind_scale_sanity_min(),
             blind_scale_sanity_max: default_blind_scale_sanity_max(),
             blind_scale_header_tol: default_blind_scale_header_tol(),
+            input_gate_enabled: default_true(),
+            input_max_eccentricity: default_input_max_eccentricity(),
+            input_min_trail_r2: default_input_min_trail_r2(),
             camera_defaults: HashMap::new(),
             bright_cache_path: None,
         }

@@ -410,7 +410,13 @@ pub fn store_result(
             ),
             inlier_ratio: result.inlier_ratio,
             recovered_scale_arcsec: result.pixel_scale_arcsec,
-            header_scale_arcsec: None,
+            // The frame's own optics, when it declares them. `blind_gate_ok`
+            // has always compared against this — it was simply never given
+            // the number, which left its sharpest test dead: on wind-shaken
+            // frames the solver walks its autoFOV ladder and returns a
+            // confident-looking solve at 16–193× the header's scale, and
+            // every other bar in the gate passes it (2026-09-05).
+            header_scale_arcsec: header_pixel_scale_arcsec(conn, frame_id),
         };
         if !blind_gate_ok(GateStage::ScaleCleared, &m, config) {
             let reason = format!(
@@ -568,6 +574,60 @@ pub(crate) fn blind_gate_ok(
     true
 }
 
+/// Why this frame should not be sent to the solver at all, or `None`.
+///
+/// Reads the frame's own analysis, when it has one: a frame whose stars are
+/// streaks has nothing for the solver to match, and letting it through costs
+/// minutes per frame while the autoFOV ladder is walked to its end. Both
+/// thresholds must be crossed — measured on real files (2026-09-05), frames
+/// that solve correctly sit at eccentricity 0.62–0.72 with trail R² 0.30–0.57,
+/// and hopeless ones at 0.90–0.96 with 0.73–0.93, so either test alone would
+/// refuse frames that are perfectly solvable.
+///
+/// A frame with no analysis is never refused here — the answer is unknown,
+/// and the solver's own detection cut is the backstop.
+pub fn input_gate_reason(
+    conn: &Connection,
+    frame_id: i64,
+    config: &PlateSolveConfig,
+) -> Option<String> {
+    if !config.input_gate_enabled {
+        return None;
+    }
+    let a = crate::db::analysis::get_frame_analysis(conn, frame_id).ok()??;
+    if a.median_eccentricity >= config.input_max_eccentricity
+        && a.trail_r_squared >= config.input_min_trail_r2
+    {
+        return Some(format!(
+            "Stars are trailed (eccentricity {:.2}, trail R² {:.2}) — nothing to match",
+            a.median_eccentricity, a.trail_r_squared
+        ));
+    }
+    None
+}
+
+/// The pixel scale the frame's own optics imply, or `None` when it does not
+/// declare both of them.
+///
+/// `206.265 · XPIXSZ_µm / FOCALLEN_mm`, the same convention
+/// [`crate::plate_solve::hints`] uses for the scale hint — XPIXSZ is already
+/// the effective pitch of the saved image, so binning must not be folded in
+/// a second time.
+fn header_pixel_scale_arcsec(conn: &Connection, frame_id: i64) -> Option<f64> {
+    let (focallen, xpixsz): (Option<f64>, Option<f64>) = conn
+        .query_row(
+            "SELECT focallen, xpixsz FROM frames WHERE id = ?1",
+            [frame_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    let (focallen, xpixsz) = (focallen?, xpixsz?);
+    if focallen <= 0.0 || xpixsz <= 0.0 {
+        return None;
+    }
+    Some((xpixsz / 1000.0 / focallen).atan().to_degrees() * 3600.0)
+}
+
 /// Convert an arcsecond-scale base tolerance to a per-frame pixel tolerance,
 /// clamped to [4, 20] px. Tight FOVs get smaller pixel tolerances (fewer
 /// false matches); wide-field frames get larger ones (slightly defocused
@@ -611,6 +671,154 @@ mod tests {
             sip_ap_coeffs: None,
             sip_bp_coeffs: None,
         }
+    }
+
+    /// A blind solve that lands on six matches is noise, and the app must
+    /// refuse it even though the solver returned it. Real numbers, from a
+    /// DSLR frame with no FOCALLEN/XPIXSZ in its header (so the scale check
+    /// has nothing to compare against) that "solved" at Dec −68° — a sky it
+    /// was never pointed at: 6 inliers, ratio 0.037, in a field where the
+    /// catalog expects hundreds of stars (2026-09-05).
+    #[test]
+    fn blind_gate_refuses_a_six_match_noise_alignment() {
+        let cfg = PlateSolveConfig::default();
+        let noise = BlindGateMetrics {
+            inliers: 6,
+            expected_in_fov: 480,
+            rms_px: 1.159,
+            adaptive_tol_px: adaptive_tol_px(0.2178, cfg.base_verification_tolerance_arcsec),
+            inlier_ratio: 0.0373,
+            recovered_scale_arcsec: 0.2178,
+            header_scale_arcsec: None,
+        };
+        assert!(
+            !blind_gate_ok(GateStage::ScaleCleared, &noise, &cfg),
+            "six matches at ratio 0.037 is a noise alignment, not a solve"
+        );
+        // The same field with a real solve's confidence still passes.
+        let real = BlindGateMetrics { inliers: 60, inlier_ratio: 0.125, ..noise };
+        assert!(blind_gate_ok(GateStage::ScaleCleared, &real, &cfg));
+    }
+
+    /// The input gate refuses a frame whose own analysis says its stars are
+    /// streaks — and refuses nothing else. The numbers are the measured ones:
+    /// frames that solve correctly sit at 0.62–0.72 eccentricity with trail
+    /// R² 0.30–0.57; hopeless ones at 0.90–0.96 with 0.73–0.93.
+    #[test]
+    fn input_gate_refuses_trailed_frames_and_passes_the_rest() {
+        use crate::db::schema::init_db;
+        use crate::models::FrameAnalysis;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let cfg = PlateSolveConfig::default();
+
+        let mut seed = |fid: i64, ecc: f64, trail: f64| {
+            conn.execute(
+                "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+                 VALUES (?1,?2,?3,0,'2025-01-01','FITS','2025-01-01')",
+                rusqlite::params![fid, format!("/x/{fid}.fits"), format!("{fid}.fits")],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id,file_id) VALUES (?1,?1)", [fid]).unwrap();
+            let a = FrameAnalysis {
+                id: None,
+                frame_id: fid,
+                file_id: fid,
+                stars_detected: 2000,
+                median_fwhm: 4.0,
+                median_eccentricity: ecc,
+                median_snr: 30.0,
+                median_hfr: 2.0,
+                frame_snr: 30.0,
+                snr_weight: 1.0,
+                psf_signal: 100.0,
+                background: 100.0,
+                noise: 5.0,
+                detection_threshold: 5.0,
+                width: 4144,
+                height: 2822,
+                source_channels: 1,
+                trail_r_squared: trail,
+                possibly_trailed: trail > 0.5,
+                median_beta: None,
+                quality_score: None,
+                config_hash: Some("t".into()),
+                analyzed_at: "2026-09-05T00:00:00Z".into(),
+            };
+            crate::db::analysis::upsert_frame_analysis(&conn, &a).unwrap();
+        };
+
+        seed(1, 0.96, 0.73); // wind-shaken: refused
+        seed(2, 0.72, 0.57); // trailed but solvable: passed
+        seed(3, 0.62, 0.30); // the doubled frame, solves in 0.3 s: passed
+        seed(4, 0.91, 0.40); // elongated optics, not a tracking failure: passed
+
+        assert!(input_gate_reason(&conn, 1, &cfg).is_some(), "streaks are refused");
+        assert!(input_gate_reason(&conn, 2, &cfg).is_none(), "a solvable trail passes");
+        assert!(input_gate_reason(&conn, 3, &cfg).is_none(), "the doubled frame passes");
+        assert!(
+            input_gate_reason(&conn, 4, &cfg).is_none(),
+            "elongation without a trail fit is not a tracking failure"
+        );
+        // A frame nobody analysed is never refused here.
+        conn.execute(
+            "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+             VALUES (9,'/x/9.fits','9.fits',0,'2025-01-01','FITS','2025-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames (id,file_id) VALUES (9,9)", []).unwrap();
+        assert!(input_gate_reason(&conn, 9, &cfg).is_none(), "no analysis, no verdict");
+
+        let off = PlateSolveConfig { input_gate_enabled: false, ..cfg.clone() };
+        assert!(input_gate_reason(&conn, 1, &off).is_none(), "the gate can be turned off");
+    }
+
+    /// A solve whose recovered scale contradicts the frame's own optics is a
+    /// false positive, however confident it looks. Measured on wind-shaken
+    /// frames (2026-09-05): the solver walked its autoFOV ladder and "solved"
+    /// them at 16–193× the header's pixel scale, with a small pixel RMS and
+    /// an inlier ratio that cleared every other bar — and that astrometry
+    /// would have been written into the catalog. `blind_scale_header_tol`
+    /// already existed to catch exactly this; `store_result` simply never
+    /// gave it the header's scale to compare against.
+    #[test]
+    fn store_result_refuses_a_solve_that_contradicts_the_headers_optics() {
+        use crate::db::schema::init_db;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let cfg = PlateSolveConfig::default();
+        // 414 mm focal length, 3.76 µm pixels → 1.873 "/px.
+        for fid in [1i64, 2] {
+            conn.execute(
+                "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+                 VALUES (?1,?2,?3,0,'2025-01-01','FITS','2025-01-01')",
+                rusqlite::params![fid, format!("/x/{fid}.fits"), format!("{fid}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id,file_id,focallen,xpixsz) VALUES (?1,?1,414.0,3.76)",
+                [fid],
+            )
+            .unwrap();
+        }
+
+        // 29.6 "/px against the header's 1.873 — the real shape of the false
+        // solutions, confident-looking in every other respect.
+        let out = store_result(&conn, 1, &mk_result(120, 800, 0.15, 29.6, 1.0), None, &cfg).unwrap();
+        assert!(
+            !matches!(out, StoreOutcome::Persisted),
+            "a solve 16x off the header's scale must not be stored, got {out:?}"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plate_solves WHERE frame_id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "and it must not leave a plate_solves row");
+
+        // The same confidence at the header's own scale still persists — the
+        // tolerance is deliberately generous, this is not a scale gate.
+        let ok = store_result(&conn, 2, &mk_result(120, 800, 0.15, 1.9, 1.0), None, &cfg).unwrap();
+        assert!(matches!(ok, StoreOutcome::Persisted), "a scale that agrees is stored");
     }
 
     #[test]

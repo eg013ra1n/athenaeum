@@ -187,7 +187,39 @@ pub async fn plate_solve_batch(
         for frame_id in &args.frame_ids {
             match load_frame_with_path(&conn, *frame_id) {
                 Ok(Some((frame, file_path))) => {
-                    let hints = extract_hints(&frame, Some(&conn));
+                    // Mirrors the Tauri command: a frame whose own analysis
+                    // says its stars are streaks is refused before a worker
+                    // ever picks it up.
+                    if let Some(reason) =
+                        service::input_gate_reason(&conn, *frame_id, &ps_config)
+                    {
+                        tracing::info!(
+                            frame_id = *frame_id,
+                            stage = "gate",
+                            outcome = "refused",
+                            reason = %reason,
+                            "frame refused before solving"
+                        );
+                        work_items.push(WorkItem::LoadFailed {
+                            frame_id: *frame_id,
+                            error: reason,
+                        });
+                        continue;
+                    }
+                    let mut hints = extract_hints(&frame, Some(&conn));
+                    // Mirrors the Tauri command: the frame's object name is the
+                    // last position hint before a blind search.
+                    if let Some(cat) = dso.as_deref() {
+                        if let Some(name) = athenaeum_core::plate_solve::hints::
+                            apply_object_name_fallback(&mut hints, &frame, cat)
+                        {
+                            tracing::debug!(
+                                frame_id = *frame_id,
+                                object = %name,
+                                "position hint taken from the frame's object name"
+                            );
+                        }
+                    }
                     work_items.push(WorkItem::Ready {
                         frame_id: *frame_id,
                         frame,
@@ -551,6 +583,29 @@ struct AutofindCompleteEvent {
 /// are written as `"Autofind: <designation>"`.
 ///
 /// Returns immediately; progress is streamed via SSE on event names
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveObjectNameArgs {
+    pub name: String,
+}
+
+/// POST /api/resolve_object_name
+///
+/// Mirrors the Tauri command: does this object name mean anything to the
+/// solver? Used by the metadata editor while the user types.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn resolve_object_name(
+    State(state): State<WebAppState>,
+    Json(args): Json<ResolveObjectNameArgs>,
+) -> Result<
+    Json<Option<athenaeum_core::plate_solve::dso_lookup::ResolvedObject>>,
+    (StatusCode, String),
+> {
+    Ok(Json(athenaeum_core::api::objects::resolve_object_name(
+        &state.ctx, args.name,
+    )))
+}
+
 /// `autofind-objects-progress` and `autofind-objects-complete`.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn autofind_objects_from_coordinates(

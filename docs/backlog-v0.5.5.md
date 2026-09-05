@@ -196,11 +196,43 @@ The tag goes after stage 4.
 | 1 | **Quick fixes**: Analysis tab (item 2) · Export default + tree (item 7) · frame cards carry camera / telescope / timings (the tail of item 1) | bounded, one commit per slice |
 | 2 | **Nights** (item 3): re-derive on merge + Recalculate nights — DONE 2026-09-05, accepted on a copy of the real catalog (set 109: 4 rows → 3 nights, 106/65/197 frames) | bounded |
 | 3 | **Manual calibration assignment** (item 6) — DONE 2026-09-05, both passes (spec `docs/superpowers/specs/2026-09-05-calibration-scoring-design.md`): scoring/verdicts in the core, then the two modals merged into one `CalibrationPicker` | architectural → spec → plan |
-| 4 | **Plate-solve input gate** (item 5) | bounded–medium |
+| 4 | **Plate-solve gates** (item 5) — DONE 2026-09-05, and NOT what the item said: see below | bounded–medium |
 
 Inside stage 3 the scoring change goes first — it is core, testable against
 this catalog, and independent of the UI; polishing two modals that are about
 to become one is thrown-away work.
+
+### Stage 4, what the measurements changed (2026-09-05)
+
+Item 5 asked for an input gate: do not solve a frame with no stars or strong
+trailing, and never let one fall through to a blind solve. Measured on the
+owner's own files, that framing did not survive:
+
+- **A starless frame was never the problem.** The solver refuses it on
+  detection (`too few stars detected (0, need >=4)`) in well under a second,
+  hinted or blind.
+- **A trailing gate alone would have been harmful.** Six of seven trailed
+  frames solved; the one that failed had the best metrics of the set.
+- **The real damage was false solutions.** Four of seven "solved" at 16x,
+  17x, 34x and 193x their header's pixel scale, with small pixel RMS and
+  plausible inlier ratios — astrometry that would have been written to the
+  catalog. Worse than a refusal.
+
+Root cause, three layers down: the fast detector never measured shape, so the
+solver could not tell a star from a streak. Fixed in `rustafits` (measure it,
+with a stamp that follows the star's size), `solvemyastro` (drop streaks
+before ranking) and `athenaeum-core` (feed the header scale to the acceptance
+gate that already knew how to use it, plus the analysis-based input gate the
+item originally asked for). Full reasoning in CLAUDE.md -> "Plate-solve input
+and acceptance gates".
+
+Verified: all four false solutions became refusals, both correct solutions
+kept their scale, and across a 29-frame test set 28 verdicts were unchanged
+with one frame going from failure to a correct solve.
+
+**Left open on purpose**: the full analysis path under-reports eccentricity on
+trailed frames, so the Analysis table still rates them well and the input gate
+misses them. Its own cycle — the fix changes every stored metric.
 
 **Deferred to their own cycle after the v0.5.5 tag** (owner call, 2026-09-05):
 

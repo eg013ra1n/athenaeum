@@ -335,6 +335,48 @@ Device-to-device transfers over iroh (specs: `docs/superpowers/specs/2026-07-20-
 - **One copy per transfer, both ends** (same spec, §4 + §5): the app binds its iroh node with `NodeOptions { serve_import_mode: ImportMode::TryReference }` (`api::sync::ensure_iroh_node`), threaded into `import_package_collection_with_mode` AND `import_subset_collection` (which used to `add_path`, i.e. a silent second copy on every want-subset send) — so `packages/<uuid>` is the only payload copy and the store keeps the collection, the hash-seq and the outboards (64 B per 16 KiB ≈ 0.4 %). Hashes are mode-independent, so the announced `root_hash` is identical either way. The invariant `TryReference` demands — the file never changes after import — is already ours: preparation writes the dir once and no writer ever rewrites a staged payload's content (the declined-divert renames the whole dir, `cleanup_package_payloads` removes it — neither edits a staged file in place). Confirm therefore runs **protect → cleanup → release** on one detached task (`engine.rs::spawn_protect_cleanup_release`): `SharingTransport::protect_shared_before_cleanup` (no-op default; the iroh implementation copies into the store every child another live hash-seq tag also references, so `Owned` wins the union) and cleanup is SKIPPED when it failed — the payload stays on disk rather than being deleted out from under another transfer. A later import probes each referenced child for one byte and re-imports just that file with `Copy` when the read fails (`blobs::ensure_child_readable`): iroh unions external paths and reads the first, so a stale sibling path (the declined-divert rename, a cleaned-up dir) is repaired permanently, not re-pointed. Receiver: `export_child` removes a stale target first (a retry over its own exported file made upstream `reflink_or_copy(p, p)` truncate the inode) and exports with `ExportMode::TryReference`, moving the store's data file into `staging/<wire_id>`; `ingest::land_payload` then hard-links staged → tmp → landing and falls back to a copy on ANY link refusal (cross-device, SMB/NFS/exFAT, permission — `link_or_copy`, a link refusal must never fail a landing), leaving the staged file in place until the package's own epilogue cleanup so the store's reference stays valid. An export whose referenced source vanished (a same-hash sibling cleaned before GC swept the entry) is **transfer-class, never `LocalFault`**: `on_export_source_vanished` drops the receiver's OWN collection tag — a `Waiting` park never calls `release`, and the tag would pin the dead entry against GC forever — the row parks, GC purges within one window (≤ 15 min) and the sender's retry ladder re-fetches. Perseus keeps `Copy` (its resend rebuilds payloads in place, exactly the mutation `TryReference` forbids) and the collab swarm path (`fetch_collection_multi`) keeps its store copies (D3 re-seeds from `collab_seed/<pkg>`). Serve-import progress rides an `ImportProgressSink` the engine hands to `serve` (throttled ≥ 300 ms) — NOT the spec's §4.4 demux route through the transport event channel, which could only have fired after the import it describes had finished — emitting `sync-progress { stage: "indexing" }` from the import's own task while the row is still `queued`.
 - **Transfer folders are configurable** (same spec, §6): the old `sync_paths` resolver is now `api::sync::sync_dirs` → `SyncDirs { identity_dir, packages_dir, working_dir, db_path }` and every former `sync_dir.join("packages" | "blobs" | "staging" | "incoming" | "collab_*")` call site reads the matching field. `identity_dir` = `<db dir>/sync` holds `device_key` + `device_key.lock` and **never moves** (the node loads the key from it and opens `blobs/` under the working dir); `packages_dir` = `sync.outgoing_staging_dir` or `<identity_dir>/packages`; `working_dir` = `sync.incoming_working_dir` or `identity_dir`, and owns `blobs/` (one store, every role), `staging/`, the `incoming/` fallback and the collab dirs — both keys in `settings/mod.rs`, empty/unset = the default, which is exactly today's location (an install that never opens the tab changes nothing, and old rows keep their absolute `package_ref`). `validate_transfer_dir` is the single gate for both folders and both backends: absolute + `PathPolicy::check`, no overlap with any scan root (`check_scan_root_overlap` — the scanner would ingest the copies as duplicates), create-if-missing + write probe (a folder it created is removed again when a later step rejects), and the two folders may not be the same nor may the working folder sit inside the outgoing one (outgoing inside working is fine — the default is). Commands `get_transfer_paths` / `set_transfer_paths(outgoing, working)` (`None` = reset to default) / `cleanup_transfer_leftovers` (Tauri + Axum). The outgoing folder applies to the next preparation; the working folder only at the next transport start — `PathSetting.restart_required` (`effective != bound`) drives the "Restart Athenaeum to apply" badge, with no live re-bind in v1. No migration: `get_transfer_storage` reports `packages_dir` / `working_dir` and `leftover_bytes` — `blobs/` + `staging/` of a superseded working dir plus only the **row-less** payload dirs of a superseded packages dir, so a leftover sweep can never delete a package a row still references — and `cleanup_transfer_leftovers` deletes exactly those, refusing while the transport is bound under any of them and clearing the `sync.incoming_working_dir_previous` breadcrumb once they are gone. UI: Settings → **Transfers** tab (`components/settings/TransfersSection.tsx`) — the two folder cards plus the Bandwidth, Receiving and Storage cards moved out of Sync.
 
+## Plate-solve input and acceptance gates
+
+Three defences, added 2026-09-05 after wind-shaken frames were found being
+"solved" at 16-193x their true pixel scale and written into the catalog
+(measured on the owner's real files; spec-less, the reasoning lives in the
+commits and in `docs/backlog-v0.5.5.md` item 5).
+
+- **Shape reaches the fast path** (`rustafits`): `detect_fast` used to build
+  every `FastStar` with `eccentricity: 0.0` — shape was computed only by the
+  full analysis. It is now measured for every detection, over a stamp that
+  follows the star's own size (2 x HFD): a window narrower than the object
+  reports it round, which is what happens on frames whose stars are 13 px
+  across. **`sx`/`sy` are NOT a substitute** — the PSF fit declines almost
+  everything on exactly those frames, leaving them zero.
+- **Streaks are not quad material** (`solvemyastro::select`): detections with
+  eccentricity > `MAX_ECCENTRICITY` (0.8) are dropped before SNR ranking, in
+  all three selectors (their equal-length-and-order contract). Healthy frames
+  and trailed-but-solvable ones carry 8-10 % above that line, hopeless ones
+  98-99 %.
+- **Two gates in the app** (`athenaeum-core/src/plate_solve/service.rs`): the
+  input gate refuses a frame whose own analysis shows `median_eccentricity >=
+  input_max_eccentricity` AND `trail_r_squared >= input_min_trail_r2` (0.85 /
+  0.65, both required — either alone refuses frames that solve fine); the
+  acceptance gate finally receives the header's pixel scale, which
+  `blind_gate_ok` has always compared against via `blind_scale_header_tol`
+  but was given `None`. Both configurable in Settings.
+
+**Known gap, deliberately not fixed here**: the FULL analysis path
+under-reports eccentricity on trailed frames (0.56 where the fast path sees
+0.88) because its stamp is `1.5 x field FWHM` and the FWHM of a streak's
+bright head is small — a self-reinforcing measurement. The Analysis table
+therefore still shows such frames as good, and the input gate above misses
+them. Fixing it changes every stored metric, so it is its own cycle.
+
+**Object-name fallback** (`plate_solve::hints::apply_object_name_fallback`):
+when a header carries no usable RA/Dec, the frame's OBJECT name is resolved
+against the bundled DSO catalog (`dso_lookup`, name index + `Messier`/
+`Caldwell`/`Barnard` synonyms) and used as the position hint. A recorded
+position always wins. The metadata editor confirms a typed name live via
+`resolve_object_name` (both backends), so naming a target is a usable repair
+for coordinate-less frames.
+
 ## Reference
 
 - [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · [XISF 1.0](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html) · [xxHash](https://xxhash.com/)

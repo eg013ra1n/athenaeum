@@ -23,6 +23,7 @@
 //! 3. Return `None` otherwise.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Bundled DSO catalog JSON. Parsed lazily on first use.
 const DSO_JSON: &str = include_str!("../../resources/dsos.json");
@@ -46,6 +47,49 @@ pub struct Dso {
 /// In-memory catalog loaded from the bundled JSON.
 pub struct DsoCatalog {
     entries: Vec<Dso>,
+    /// Normalised designation → index into `entries`, for looking an object up
+    /// by the name a frame's OBJECT keyword carries.
+    by_designation: HashMap<String, usize>,
+}
+
+/// Spelled-out catalogue names people type, mapped to the prefixes this
+/// catalog actually uses.
+const CATALOGUE_SYNONYMS: &[(&str, &str)] = &[
+    ("MESSIER", "M"),
+    ("CALDWELL", "C"),
+    ("BARNARD", "B"),
+    ("COLLINDER", "CR"),
+    ("MELOTTE", "MEL"),
+    ("SHARPLESS", "SH"),
+];
+
+/// One spelling for a designation, so `M31`, `m 31` and `Messier 31` all reach
+/// the same entry.
+///
+/// Only `<letters><number>` shapes are rewritten. Everything else — a popular
+/// name like "Ghost Nebula", a comet like "C/2025 A6" — is upper-cased and
+/// otherwise left alone: it has to miss the index rather than be bent into a
+/// wrong hit, because a confident position for the wrong object is worse than
+/// no position at all.
+pub fn normalize_designation(raw: &str) -> String {
+    let squashed = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    let (letters, rest) = squashed.split_at(
+        squashed
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(squashed.len()),
+    );
+    let digits = rest.trim_start();
+    if letters.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return squashed;
+    }
+    let prefix = CATALOGUE_SYNONYMS
+        .iter()
+        .find(|(long, _)| *long == letters)
+        .map(|(_, short)| *short)
+        .unwrap_or(letters);
+    let number = digits.trim_start_matches('0');
+    let number = if number.is_empty() { "0" } else { number };
+    format!("{prefix} {number}")
 }
 
 /// The best match returned for a given query point.
@@ -64,6 +108,21 @@ pub enum DsoMatchReason {
     Contains,
     /// Query point is outside any DSO's radius but close to this one.
     Nearest,
+}
+
+/// What a name in a frame's OBJECT keyword resolves to, for the metadata
+/// editor: naming a target is what makes a coordinate-less frame solvable, so
+/// the editor has to be able to say whether the name will actually work.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedObject {
+    /// The catalog's own spelling — "M 31" for an entered "m31".
+    pub designation: String,
+    pub ra_deg: f64,
+    pub dec_deg: f64,
+    /// Angular radius in degrees, when the catalog gives a size.
+    #[ts(optional = nullable)]
+    pub radius_deg: Option<f64>,
 }
 
 impl DsoCatalog {
@@ -110,7 +169,29 @@ impl DsoCatalog {
             });
         }
 
-        Ok(DsoCatalog { entries })
+        // Index by name for the OBJECT-keyword lookup. First spelling wins:
+        // the file is ordered brightest/most-canonical first, and a later
+        // duplicate designation must not displace it.
+        let mut by_designation = HashMap::with_capacity(entries.len());
+        for (i, dso) in entries.iter().enumerate() {
+            by_designation
+                .entry(normalize_designation(&dso.designation))
+                .or_insert(i);
+        }
+        Ok(DsoCatalog { entries, by_designation })
+    }
+
+    /// The object a frame's OBJECT keyword names, if this catalog carries it.
+    ///
+    /// Used as the last source of a position hint before a blind solve: a
+    /// frame whose header has no RA/Dec at all can still say what it was
+    /// pointed at.
+    pub fn find_by_designation(&self, name: &str) -> Option<&Dso> {
+        let key = normalize_designation(name);
+        if key.is_empty() {
+            return None;
+        }
+        self.by_designation.get(&key).map(|&i| &self.entries[i])
     }
 
     pub fn len(&self) -> usize {
@@ -417,6 +498,46 @@ fn designation_priority(desig: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame's OBJECT keyword is written by a person or a capture program,
+    /// so it arrives in every spelling: "M31", "m 31", "M  031", "Messier 31".
+    /// All of them name the same object.
+    #[test]
+    fn designation_normalisation_accepts_how_people_write_names() {
+        assert_eq!(normalize_designation("M 31"), "M 31");
+        assert_eq!(normalize_designation("M31"), "M 31");
+        assert_eq!(normalize_designation("m31"), "M 31");
+        assert_eq!(normalize_designation("  M  031 "), "M 31");
+        assert_eq!(normalize_designation("ngc2903"), "NGC 2903");
+        assert_eq!(normalize_designation("IC5146"), "IC 5146");
+        // Catalogue names people spell out; the file uses the short prefix.
+        assert_eq!(normalize_designation("Messier 42"), "M 42");
+        assert_eq!(normalize_designation("Caldwell 7"), "C 7");
+        assert_eq!(normalize_designation("Barnard 150"), "B 150");
+        // Anything that is not "<catalogue> <number>" is left alone — a
+        // popular name has to miss rather than be mangled into a wrong hit.
+        assert_eq!(normalize_designation("Ghost Nebula"), "GHOST NEBULA");
+        assert_eq!(normalize_designation("C/2025 A6 (Lemmon)"), "C/2025 A6 (LEMMON)");
+    }
+
+    /// The point of the index: turn a name in a header into a position.
+    #[test]
+    fn finds_objects_by_designation() {
+        let cat = DsoCatalog::load().expect("catalog should parse");
+        let m31 = cat.find_by_designation("M31").expect("M31 is in the catalog");
+        assert!((m31.ra_deg - 10.685).abs() < 0.05, "ra {}", m31.ra_deg);
+        assert!((m31.dec_deg - 41.269).abs() < 0.05, "dec {}", m31.dec_deg);
+        // Same object, other spellings.
+        for spelling in ["M 31", "m 31", "Messier 31"] {
+            let hit = cat.find_by_designation(spelling).expect(spelling);
+            assert_eq!(hit.designation, m31.designation);
+        }
+        assert!(cat.find_by_designation("LDN 1272").is_some(), "LDN designations resolve");
+        // A popular name the catalog does not carry resolves to nothing —
+        // better a blind solve than a confident wrong position.
+        assert!(cat.find_by_designation("Tadpoles").is_none());
+        assert!(cat.find_by_designation("").is_none());
+    }
 
     #[test]
     fn catalog_loads() {

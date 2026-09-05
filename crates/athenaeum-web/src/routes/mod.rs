@@ -213,6 +213,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/cancel_plate_solve", post(plate_solve::cancel_plate_solve))
         .route("/api/autofind_objects_from_coordinates", post(plate_solve::autofind_objects_from_coordinates))
         .route("/api/cancel_autofind_objects", post(plate_solve::cancel_autofind_objects))
+        .route("/api/resolve_object_name", post(plate_solve::resolve_object_name))
         .route("/api/get_plate_solve_result", post(plate_solve::get_plate_solve_result))
         .route("/api/delete_plate_solve_for_frame", post(plate_solve::delete_plate_solve_for_frame))
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))

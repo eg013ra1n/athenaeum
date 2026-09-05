@@ -26,6 +26,9 @@ const DEFAULT_CONFIG: PlateSolveConfig = {
   blind_scale_sanity_min: 0.05,
   blind_scale_sanity_max: 60.0,
   blind_scale_header_tol: 8.0,
+  input_gate_enabled: true,
+  input_max_eccentricity: 0.85,
+  input_min_trail_r2: 0.65,
   camera_defaults: {},
   bright_cache_path: null,
 };

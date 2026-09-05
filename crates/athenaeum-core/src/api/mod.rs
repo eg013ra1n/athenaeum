@@ -39,6 +39,7 @@ pub mod collab_exchange;
 // master integration, light calibration) and are gated with it.
 #[cfg(feature = "render")]
 pub mod analysis;
+pub mod objects;
 pub mod compute;
 #[cfg(feature = "render")]
 pub mod lights;

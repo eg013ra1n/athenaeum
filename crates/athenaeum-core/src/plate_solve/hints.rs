@@ -6,6 +6,7 @@ use astroimage::platesolving::SolveHints;
 
 use crate::coordinates::{parse_dec_sexagesimal, parse_ra_sexagesimal};
 use crate::models::Frame;
+use crate::plate_solve::dso_lookup::DsoCatalog;
 
 /// Field of view (degrees) from optics. `XPIXSZ` is the effective saved-pixel
 /// pitch (binning already folded in), so it is used directly — never multiplied
@@ -181,6 +182,37 @@ pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
     hints
 }
 
+/// Fill a missing position from the frame's OBJECT name.
+///
+/// The last source of a hint before a blind solve: a frame whose header
+/// carries no usable RA/Dec can still say what it was pointed at, and a blind
+/// solve of a wide field costs tens of seconds where a hinted one costs
+/// tenths. Applied ONLY when the header gave nothing — a position the mount
+/// or the user actually recorded always wins over a catalogue centre, which
+/// is the middle of the object rather than the middle of the frame.
+///
+/// The object's centre is not the frame's centre — framing is a choice, and a
+/// mosaic panel can sit degrees away — but the solver already searches a 10°
+/// radius around a position hint by default, which covers that comfortably.
+/// Returns the designation that resolved, for logging.
+pub fn apply_object_name_fallback(
+    hints: &mut SolveHints,
+    frame: &Frame,
+    catalog: &DsoCatalog,
+) -> Option<String> {
+    if hints.ra.is_some() && hints.dec.is_some() {
+        return None;
+    }
+    let name = frame.object.as_deref()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let dso = catalog.find_by_designation(name)?;
+    hints.ra = Some(dso.ra_deg);
+    hints.dec = Some(dso.dec_deg);
+    Some(dso.designation.clone())
+}
+
 /// `(0, 0)` is the FITS-pipeline placeholder for "RA/Dec not actually set"
 /// — nobody legitimately images at the celestial-equator vernal-point. Any
 /// hint that lands within 1e-6° of (0, 0) is treated as a sentinel and
@@ -227,6 +259,59 @@ pub fn observation_epoch(frame: &Frame) -> f64 {
             year + day_of_year / days_in_year
         }
         None => 2025.0,
+    }
+}
+
+#[cfg(test)]
+mod object_name_tests {
+    use super::*;
+    use crate::plate_solve::dso_lookup::DsoCatalog;
+
+    fn frame_named(object: Option<&str>, ra: Option<f64>, dec: Option<f64>) -> Frame {
+        let mut f = Frame::default();
+        f.object = object.map(|s| s.to_string());
+        f.ra = ra;
+        f.dec = dec;
+        f
+    }
+
+    /// A frame with no coordinates but a name the catalog knows gets a
+    /// position — the difference between a 0.3 s hinted solve and a blind
+    /// search of tens of seconds.
+    #[test]
+    fn a_named_frame_without_coordinates_gets_a_position() {
+        let cat = DsoCatalog::load().unwrap();
+        let frame = frame_named(Some("M31"), None, None);
+        let mut hints = SolveHints::default();
+        let resolved = apply_object_name_fallback(&mut hints, &frame, &cat);
+        assert_eq!(resolved.as_deref(), Some("M 31"));
+        assert!((hints.ra.unwrap() - 10.685).abs() < 0.05);
+        assert!((hints.dec.unwrap() - 41.269).abs() < 0.05);
+    }
+
+    /// A position the header actually recorded always wins: the catalogue
+    /// centre is the middle of the OBJECT, not the middle of the frame.
+    #[test]
+    fn a_recorded_position_is_never_overwritten() {
+        let cat = DsoCatalog::load().unwrap();
+        let frame = frame_named(Some("M31"), Some(200.0), Some(-30.0));
+        let mut hints = SolveHints { ra: Some(200.0), dec: Some(-30.0), ..Default::default() };
+        assert!(apply_object_name_fallback(&mut hints, &frame, &cat).is_none());
+        assert_eq!(hints.ra, Some(200.0));
+        assert_eq!(hints.dec, Some(-30.0));
+    }
+
+    /// A name the catalog does not carry leaves the hints untouched — a blind
+    /// solve is better than a confident wrong position.
+    #[test]
+    fn an_unknown_name_changes_nothing() {
+        let cat = DsoCatalog::load().unwrap();
+        for name in [Some("Tadpoles"), Some("C/2025 A6 (Lemmon)"), Some("   "), None] {
+            let frame = frame_named(name, None, None);
+            let mut hints = SolveHints::default();
+            assert!(apply_object_name_fallback(&mut hints, &frame, &cat).is_none(), "{name:?}");
+            assert!(hints.ra.is_none() && hints.dec.is_none());
+        }
     }
 }
 

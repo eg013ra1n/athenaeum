@@ -6,7 +6,7 @@ use tauri::{Emitter, State};
 
 use athenaeum_core::db::load_frame_with_path;
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
-use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
+use athenaeum_core::plate_solve::dso_lookup::{DsoCatalog, ResolvedObject};
 use athenaeum_core::plate_solve::hints::extract_hints;
 use athenaeum_core::plate_solve::service::{self, SolveResult};
 use athenaeum_core::plate_solve::{describe_solve_failure, storage, SolveHints, StoreOutcome};
@@ -243,7 +243,41 @@ pub async fn plate_solve_batch(
         for frame_id in &frame_ids {
             match load_frame_with_path(&conn, *frame_id) {
                 Ok(Some((frame, file_path))) => {
-                    let hints = extract_hints(&frame, Some(&conn));
+                    // A frame whose own analysis says its stars are streaks has
+                    // nothing for the solver to match, and letting it through
+                    // costs minutes while the autoFOV ladder is walked to its
+                    // end. Refused here, with the reason the UI shows.
+                    if let Some(reason) =
+                        service::input_gate_reason(&conn, *frame_id, &ps_config)
+                    {
+                        tracing::info!(
+                            frame_id = *frame_id,
+                            stage = "gate",
+                            outcome = "refused",
+                            reason = %reason,
+                            "frame refused before solving"
+                        );
+                        work_items.push(WorkItem::LoadFailed {
+                            frame_id: *frame_id,
+                            error: reason,
+                        });
+                        continue;
+                    }
+                    let mut hints = extract_hints(&frame, Some(&conn));
+                    // Last source of a position before a blind search: what the
+                    // frame says it was pointed at. Only fires when the header
+                    // carried no usable RA/Dec at all.
+                    if let Some(cat) = dso.as_deref() {
+                        if let Some(name) = athenaeum_core::plate_solve::hints::
+                            apply_object_name_fallback(&mut hints, &frame, cat)
+                        {
+                            tracing::debug!(
+                                frame_id = *frame_id,
+                                object = %name,
+                                "position hint taken from the frame's object name"
+                            );
+                        }
+                    }
                     work_items.push(WorkItem::Ready {
                         frame_id: *frame_id,
                         frame,
@@ -714,6 +748,20 @@ pub async fn cancel_autofind_objects(state: State<'_, AppState>) -> Result<(), S
         handle.cancel_flag.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Does this object name mean anything to the solver?
+///
+/// The metadata editor asks while the user types: naming a target is what
+/// makes a coordinate-less frame solvable, and a name the catalog does not
+/// carry will not help.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn resolve_object_name(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<Option<ResolvedObject>, String> {
+    Ok(athenaeum_core::api::objects::resolve_object_name(&state.ctx, name))
 }
 
 #[tauri::command]
