@@ -1481,13 +1481,15 @@ fn get_calibration_applications(
 
 /// Collect the export summary for the tab, drawn for `mode`.
 ///
-/// The data is shaped the way that mode would export it BEFORE anything is
-/// summarized, so the folder tree, the file total and the size estimate all
-/// describe that export: no calibration folders in lights-only, `c_*` names
-/// and no calibration folders for calibrated lights, one file per master set
-/// in the masters modes. A mode the set is not ready for fails here exactly
-/// like the export itself would — a blocked mode gets a refusal, never a
-/// tree drawn for a different mode. `gen_opts` is read by
+/// The links are a property of the set; the mode only decides what lands.
+/// So the equipment, the per-filter breakdown and the warnings read the data
+/// AS LINKED — a lights-only summary never claims the calibration is
+/// missing — while the folder tree, the file total and the size estimate
+/// read it AS SHAPED by the mode: no calibration folders in lights-only,
+/// `c_*` names and no calibration folders for calibrated lights, one file
+/// per master set in the masters modes. A mode the set is not ready for
+/// fails here exactly like the export itself would — a blocked mode gets a
+/// refusal, never a tree drawn for a different mode. `gen_opts` is read by
 /// `CalibratedLights` only (its debayer flag decides the output names).
 pub fn collect_export_summary(
     conn: &Connection,
@@ -1498,8 +1500,9 @@ pub fn collect_export_summary(
 ) -> Result<ExportSummary> {
     tracing::debug!(frame_set_id, ?mode, "building export summary");
 
-    let mut export_data = collect_export_data(conn, frame_set_id)?;
-    let omitted = apply_export_mode(conn, &mut export_data, mode, gen_opts)?;
+    let export_data = collect_export_data(conn, frame_set_id)?;
+    let mut shaped = export_data.clone();
+    let omitted = apply_export_mode(conn, &mut shaped, mode, gen_opts)?;
     if !omitted.is_empty() {
         tracing::debug!(frame_set_id, count = omitted.len(), "export mode omissions in summary");
     }
@@ -1517,16 +1520,16 @@ pub fn collect_export_summary(
     let filter_groups = build_filter_group_summaries(conn, &export_data)?;
     tracing::debug!(frame_set_id, count = filter_groups.len(), "filter groups built");
 
-    // Build folder preview
-    let folder_preview = build_folder_preview(&export_data, config)?;
+    // Build folder preview — from the data as the mode shapes it
+    let folder_preview = build_folder_preview(&shaped, config)?;
 
     // Build detailed warnings
     let warnings = build_detailed_warnings(&export_data, &filter_groups)?;
     tracing::debug!(frame_set_id, count = warnings.len(), "export warnings generated");
 
-    // Calculate totals
-    let total_files = calculate_total_files(&export_data);
-    let estimated_size_bytes = estimate_total_size(conn, &export_data, total_files)?;
+    // Calculate totals — from the shaped data, like the tree
+    let total_files = calculate_total_files(&shaped);
+    let estimated_size_bytes = estimate_total_size(conn, &shaped, total_files)?;
 
     Ok(ExportSummary {
         frame_set_id,
@@ -2893,6 +2896,36 @@ mod export_mode_tests {
         assert!(!r.flat_norm && !r.hot_pixel_correction && !r.debayer_osc);
         assert_eq!(r.flat_norm_mode, CalibratedLightOptions::default().flat_norm_mode);
         assert_eq!(r.params, CalibratedLightOptions::default().params);
+    }
+
+    /// Calibration warnings and the per-filter breakdown describe the set's
+    /// LINKS, not the mode: a lights-only (or calibrated-lights) summary of
+    /// fully linked lights must not claim the calibration is missing — the
+    /// mode only shapes the tree.
+    #[test]
+    fn export_summary_warnings_follow_the_links_not_the_mode() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 3);
+        let flat = seed_master_set(&conn, 200, "Flat");
+        add_link(&conn, 10, dark, "Dark");
+        add_link(&conn, 10, flat, "Flat");
+        let cfg = WbppExportConfig::default();
+        let cal_opts = CalibratedLightOptions::default();
+        for (mode, opts) in [
+            (ExportMode::LightsOnly, None),
+            (ExportMode::CalibratedLights, Some(&cal_opts)),
+        ] {
+            let s = collect_export_summary(&conn, 1, &cfg, mode, opts).unwrap();
+            let missing: Vec<&str> = s
+                .warnings
+                .iter()
+                .map(|w| w.title.as_str())
+                .filter(|t| t.starts_with("Missing"))
+                .collect();
+            assert!(missing.is_empty(), "{mode:?}: {missing:?}");
+        }
     }
 
     /// A mode the set is not ready for is refused, never drawn wrong.
