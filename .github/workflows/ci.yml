@@ -5,8 +5,14 @@ on:
   # over twenty minutes of runner time.
   pull_request:
     paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
+  # Tags too: the GitLab tag pipeline builds and publishes the release without
+  # running a single test (it has no test stage at all), and the release commit's
+  # own main run is a different ref, so nothing otherwise gates a tag on green
+  # tests. This run is concurrent with the release build rather than upstream of
+  # it — it cannot block a bad publish, but it names one within ten minutes.
   push:
     branches: [main]
+    tags: ['v*']
     paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
 
 concurrency:
