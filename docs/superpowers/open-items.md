@@ -565,7 +565,9 @@ cycle, so anything from them that matters later belongs here or in a plan.
   scale disagrees with the frame's own focal length and pixel size is refused.
 - Plate solving: a frame whose analysis shows badly trailed stars is skipped
   with a plain reason instead of spending minutes failing, and the thresholds
-  are in Settings if you want them looser.
+  are in Settings if you want them looser. A frame that turns out to be
+  nothing but streaks is refused within a second — naming how many of its
+  detections were streaks — rather than searching for minutes.
 - Plate solving: a frame with no coordinates in its header can be solved by
   naming its target — set OBJECT in the metadata editor and the editor tells
   you, as you type, whether the name is one the sky catalog knows.

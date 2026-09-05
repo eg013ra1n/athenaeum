@@ -1075,21 +1075,27 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                 </div>
                 )}
                 {f.key === 'object' && objectDraft && objectLookup.state !== 'idle' && (
-                  <div className="pl-[6.5rem] mt-0.5 text-[11px]">
+                  // Sits in the input's own column, one line, never wrapping —
+                  // it answers a yes/no question while the user types and must
+                  // not push the form around while doing it.
+                  <div className="col-start-3 -mt-1 truncate text-[11px] font-mono">
                     {objectLookup.state === 'checking' ? (
-                      <span className="text-content-muted">Checking the sky catalog…</span>
+                      <span className="text-content-muted">checking…</span>
                     ) : objectLookup.state === 'known' ? (
-                      <span className="text-success">
-                        {objectLookup.object.designation} — plate solving will start here (
-                        {objectLookup.object.raDeg.toFixed(3)}°,{' '}
-                        {objectLookup.object.decDeg >= 0 ? '+' : ''}
-                        {objectLookup.object.decDeg.toFixed(3)}°)
+                      <span
+                        className="text-success"
+                        title={`Plate solving will start from ${objectLookup.object.designation} (${objectLookup.object.raDeg.toFixed(3)}°, ${objectLookup.object.decDeg.toFixed(3)}°)`}
+                      >
+                        ✓ {objectLookup.object.designation} · {objectLookup.object.raDeg.toFixed(2)}°
+                        {objectLookup.object.decDeg >= 0 ? ' +' : ' '}
+                        {objectLookup.object.decDeg.toFixed(2)}°
                       </span>
                     ) : (
-                      <span className="text-content-muted">
-                        Not a catalog name — frames without coordinates will still be solved blind.
-                        A designation like <span className="font-mono">M 31</span> or{' '}
-                        <span className="font-mono">NGC 7000</span> gives the solver a starting point.
+                      <span
+                        className="text-content-muted"
+                        title="Not a name the sky catalog knows, so frames without coordinates will still be plate-solved blind. Designations like M 31, NGC 7000 or IC 1805 give the solver a starting point."
+                      >
+                        not in the sky catalog
                       </span>
                     )}
                   </div>

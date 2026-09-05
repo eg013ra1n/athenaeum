@@ -354,6 +354,12 @@ commits and in `docs/backlog-v0.5.5.md` item 5).
   all three selectors (their equal-length-and-order contract). Healthy frames
   and trailed-but-solvable ones carry 8-10 % above that line, hopeless ones
   98-99 %.
+- **And a frame the cut emptied is refused at once** (`orchestrate`):
+  `looks_trailed` — 90 % or more of at least 100 detections removed — bails
+  before the FOV ladder. Without it such a frame still cleared the four-star
+  minimum (14 survivors of 600 on a real one) and spent minutes walking the
+  ladder twice, counting the density-balanced retry, to reach the same
+  refusal.
 - **Two gates in the app** (`athenaeum-core/src/plate_solve/service.rs`): the
   input gate refuses a frame whose own analysis shows `median_eccentricity >=
   input_max_eccentricity` AND `trail_r_squared >= input_min_trail_r2` (0.85 /
