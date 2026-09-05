@@ -22,7 +22,10 @@ shared hook or per-page work.
 ## 2. Analysis tab
 
 - Sorting on **all** columns (today only some sort).
-- Rename the `Calib` column to **Calibrated** and show the status as an icon.
+- ~~Rename the `Calib` column to **Calibrated** and show the status as an icon.~~
+  Dropped (owner, 2026-09-05): the column belonged to the retired standalone
+  Calibrate Lights flow and is already gone on `main` — v2 has no per-frame
+  "calibrated" state to show. Not coming back.
 - `WCS` column shows **Header** or **ATH**, without an icon.
 - `Reference` column shows only the star, without the set.
 

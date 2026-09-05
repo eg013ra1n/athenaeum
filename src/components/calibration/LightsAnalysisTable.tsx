@@ -1,9 +1,9 @@
 import { useState, useMemo, useCallback, useRef } from 'react';
-import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair, Star } from 'lucide-react';
+import { FolderOpen, AlertTriangle, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
-type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
+type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'wcs' | 'reference';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -57,6 +57,12 @@ function formatTotalExposure(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.round((seconds % 3600) / 60);
   return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+/** Sort rank for the WCS column: no coordinates < header WCS < solved by Athenaeum. */
+function wcsRank(frame: EnrichedLightFrame): number {
+  if (frame.ra == null || frame.dec == null) return 0;
+  return frame.plate_solved ? 2 : 1;
 }
 
 function SortableHeader({
@@ -250,11 +256,18 @@ export function LightsAnalysisTable({
         case 'beta':
           comparison = (aAnalysis?.median_beta ?? -1) - (bAnalysis?.median_beta ?? -1);
           break;
+        case 'wcs':
+          comparison = wcsRank(a) - wcsRank(b);
+          break;
+        case 'reference':
+          // Ascending puts the chosen reference frame first.
+          comparison = (a.frame_id === referenceFrameId ? 0 : 1) - (b.frame_id === referenceFrameId ? 0 : 1);
+          break;
       }
 
       return sortDirection === 'asc' ? comparison : -comparison;
     });
-  }, [frames, sortField, sortDirection, getAnalysis]);
+  }, [frames, sortField, sortDirection, getAnalysis, referenceFrameId]);
 
   // Plain click toggles one row; Shift+click selects (or clears) every row
   // between the anchor and the clicked row in the displayed order, the way the
@@ -346,12 +359,12 @@ export function LightsAnalysisTable({
                 <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
               </th>
             )}
-            <th scope="col" className="w-16 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
-              WCS
+            <th scope="col" className="w-16 px-1.5 py-1.5 text-center">
+              <SortableHeader field="wcs" label="WCS" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             {onSetReference && (
-              <th scope="col" className="w-24 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
-                Reference
+              <th scope="col" className="w-16 px-1.5 py-1.5 text-center">
+                <SortableHeader field="reference" label="Reference" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
               </th>
             )}
             {!hideLocateColumn && (
@@ -449,50 +462,42 @@ export function LightsAnalysisTable({
                 )}
                 <td className="w-16 px-1.5 py-1 text-center">
                   {frame.ra == null || frame.dec == null ? (
-                    <span
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-warning/15 text-warning border border-warning/40"
-                      title="No WCS coordinates"
-                    >
-                      <MapPin size={11} />
-                      No WCS
+                    <span className="text-xs text-content-muted" title="No WCS coordinates">
+                      —
                     </span>
                   ) : frame.plate_solved ? (
                     <span
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/40"
+                      className="inline-block px-1.5 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/40"
                       title={`Plate-solved by Athenaeum — RA ${frame.ra.toFixed(4)}, Dec ${frame.dec.toFixed(4)}`}
                     >
-                      <Crosshair size={11} />
-                      Athenaeum
+                      ATH
                     </span>
                   ) : (
                     <span
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-success/15 text-success border border-success/40"
+                      className="inline-block px-1.5 py-0.5 rounded text-xs font-medium bg-success/15 text-success border border-success/40"
                       title={`WCS from FITS header — RA ${frame.ra.toFixed(4)}, Dec ${frame.dec.toFixed(4)}`}
                     >
-                      <CheckCircle size={11} />
-                      Original
+                      Header
                     </span>
                   )}
                 </td>
                 {onSetReference && (
-                  <td className="w-24 px-1.5 py-1 text-center">
+                  <td className="w-16 px-1.5 py-1 text-center">
                     {frame.frame_id === referenceFrameId ? (
                       <span
-                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/40"
+                        className="inline-flex items-center justify-center text-accent"
                         title="This is the chosen reference frame"
                       >
-                        <Star size={11} />
-                        Reference
+                        <Star size={13} className="fill-current" />
                       </span>
                     ) : (
                       <button
                         onClick={e => { e.stopPropagation(); onSetReference(frame.frame_id); }}
                         disabled={settingReference}
-                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs text-content-muted hover:text-accent hover:bg-accent/10 border border-transparent hover:border-accent/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="inline-flex items-center justify-center p-0.5 rounded text-content-muted hover:text-accent hover:bg-accent/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         title="Set as reference frame for registration"
                       >
-                        <Star size={11} />
-                        Set
+                        <Star size={13} />
                       </button>
                     )}
                   </td>
