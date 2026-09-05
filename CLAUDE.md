@@ -366,7 +366,13 @@ commits and in `docs/backlog-v0.5.5.md` item 5).
   0.65, both required — either alone refuses frames that solve fine); the
   acceptance gate finally receives the header's pixel scale, which
   `blind_gate_ok` has always compared against via `blind_scale_header_tol`
-  but was given `None`. Both configurable in Settings.
+  but was given `None`. **Neither gate has a Settings UI**: both live in the
+  stored `plate_solve.config` JSON, and `PlateSolveSettingsPanel.tsx` renders
+  only `base_verification_tolerance_arcsec`, `sip_order` and
+  `autofind_tolerance_deg` — its `DEFAULT_CONFIG` is a hand-written mirror of
+  the whole struct, which is why the other fields round-trip without controls.
+  The v0.5.5 release notes claimed they were configurable; that was wrong and
+  has been corrected in the notes and on the docs site.
 
 **Known gap, deliberately not fixed here**: the FULL analysis path
 under-reports eccentricity on trailed frames (0.56 where the fast path sees

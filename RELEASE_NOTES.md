@@ -77,10 +77,9 @@
   whose scale disagrees with the frame's own focal length and pixel size is
   refused.
 - A frame whose analysis shows badly trailed stars is skipped with a plain
-  reason instead of spending minutes failing, and the thresholds are in
-  Settings if you want them looser. A frame that turns out to be nothing but
-  streaks is refused within a second — naming how many of its detections
-  were streaks — rather than searching for minutes.
+  reason instead of spending minutes failing. A frame that turns out to be
+  nothing but streaks is refused within a second — naming how many of its
+  detections were streaks — rather than searching for minutes.
 - **A night that runs past midnight is one night again.** The night tree
   grouped by the frame's calendar date, so every session through midnight
   showed as two — *"October 18"* and *"October 19"* instead of *"October
