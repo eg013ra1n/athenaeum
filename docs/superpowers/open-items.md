@@ -534,3 +534,15 @@ cycle, so anything from them that matters later belongs here or in a plan.
   (e.g. after rebuilding a master) now lands a second copy on the receiver
   instead of replacing the first one — there is no tracking table left to dedup
   against.
+- Analysis tab: every column with data now sorts — WCS and Reference included.
+  The WCS column reads Header / ATH / — instead of icon badges, and the
+  Reference column is just the star: filled on the chosen frame, a star
+  button on the rest.
+- Export: the folder tree, file total and size estimate follow the selected
+  export mode — no calibration folders in Lights only, `c_*` names for
+  Calibrated lights, one file per master set — and a remembered mode that is
+  not available for the current set no longer stays selected. The size
+  estimate now uses the set's real average file size instead of a fixed
+  50 MB per file.
+- Calendar: a day's cards show the camera, the telescope and the first–last
+  exposure time of that night.
