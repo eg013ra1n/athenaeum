@@ -862,6 +862,27 @@ fn log_build_finished(set_id: i64, duration: std::time::Duration, bytes_read: u6
     );
 }
 
+/// Fix round 3, Important 2: whether a `master-build-progress` tick should
+/// actually be emitted, given the last time one was. Pure and separately
+/// testable — same reasoning as `log_build_started`/`log_build_finished`
+/// above, extracted so the throttle behavior doesn't need a live
+/// multi-frame build to verify. `last_emitted` is updated to `now` on every
+/// `true` return (both the throttled-window and the terminal-bypass path),
+/// so the next call's window is measured from whichever tick actually went
+/// out, not from when the timer was first armed.
+fn progress_tick_is_due(
+    is_terminal: bool,
+    last_emitted: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    throttle: std::time::Duration,
+) -> bool {
+    let due = is_terminal || last_emitted.is_none_or(|t| now.duration_since(t) >= throttle);
+    if due {
+        *last_emitted = Some(now);
+    }
+    due
+}
+
 /// Owns the zero-byte placeholder [`claim_collision_free`] mints for a `New`
 /// build's output name (audit I7), from the moment the name is claimed until
 /// the real bytes replace it. Every exit in that window releases the claim —
@@ -998,6 +1019,19 @@ fn run_build(
 
     let pool = ctx.image_pool.as_ref();
     let scratch = std::env::temp_dir();
+    // Fix round 3, Important 2: the engine's contract is "tick per frame"
+    // (`EngineProgress::on_band`'s doc) — throttling what to do with that is
+    // this closure's job, not the engine's, matching the existing
+    // `sync-progress`/`export-progress` convention (both throttled at
+    // >= 300ms). Unthrottled, events scale as frames x bands: a 200-frame
+    // set at the budget floor (~42 bands) is ~8400 events over ~100s, each
+    // one a full `setBuildStates` re-render cascading into all three
+    // calibration tables on the frontend. 300ms still clears the "movement
+    // every ~2s" acceptance bar by 6x. `last_emitted` needs no `move` — the
+    // closure only ever takes `&last_emitted` via `Mutex::lock(&self)`,
+    // same capture shape as `emitter`/`set_id` below.
+    let last_emitted: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(300);
     let on_band = |current: usize, total: usize, bytes_read_so_far: u64, bytes_total: u64| {
         // Bytes, not bands (fix round 2, I2): Task 6 cut a set's band count
         // to as few as 2, so a band-fraction percent could sit frozen at
@@ -1015,6 +1049,20 @@ fn run_build(
         } else {
             100.0
         };
+
+        // The terminal tick (100% read) always bypasses the throttle — a
+        // window that happened to close right as the last frame finished
+        // must never swallow the one event saying reading is actually done,
+        // which would otherwise leave the operator staring at a stale <100%
+        // number through the whole silent combine phase that follows.
+        let is_terminal = bytes_total > 0 && bytes_read_so_far >= bytes_total;
+        let now = std::time::Instant::now();
+        let mut last = last_emitted.lock().unwrap();
+        if !progress_tick_is_due(is_terminal, &mut last, now, PROGRESS_THROTTLE) {
+            return;
+        }
+        drop(last);
+
         emit_event(
             emitter,
             "master-build-progress",
@@ -4302,5 +4350,45 @@ mod tests {
             events.iter().any(|(lvl, m)| lvl == "INFO" && m == "master build finished"),
             "no finish line; got {events:?}"
         );
+    }
+
+    /// Fix round 3, Important 2: unthrottled, `master-build-progress` scales
+    /// as frames x bands (~8400 events over ~100s at the budget floor on a
+    /// 200-frame set) — this pins the throttle window AND the one exception
+    /// to it, using synthetic `Instant`s so it needs no real sleeping and no
+    /// live multi-frame build.
+    #[test]
+    fn progress_tick_is_due_throttles_but_never_swallows_the_terminal_tick() {
+        let throttle = std::time::Duration::from_millis(300);
+        let mut last = None;
+
+        let t0 = std::time::Instant::now();
+        assert!(
+            progress_tick_is_due(false, &mut last, t0, throttle),
+            "the very first tick must always fire — there is nothing to throttle against yet"
+        );
+        assert_eq!(last, Some(t0));
+
+        let t1 = t0 + std::time::Duration::from_millis(50);
+        assert!(
+            !progress_tick_is_due(false, &mut last, t1, throttle),
+            "a non-terminal tick inside the 300ms window must be suppressed"
+        );
+        assert_eq!(last, Some(t0), "a suppressed tick must not move the window");
+
+        let t2 = t0 + std::time::Duration::from_millis(350);
+        assert!(
+            progress_tick_is_due(false, &mut last, t2, throttle),
+            "a tick past the window must fire"
+        );
+        assert_eq!(last, Some(t2));
+
+        let t3 = t2 + std::time::Duration::from_millis(10);
+        assert!(
+            progress_tick_is_due(true, &mut last, t3, throttle),
+            "the terminal (100%) tick must bypass the throttle even mid-window, \
+             or a 100% read can be swallowed right before the silent combine phase"
+        );
+        assert_eq!(last, Some(t3), "the terminal tick still advances the window");
     }
 }

@@ -9,7 +9,7 @@ use super::combine::{combine_pixel, IntegrationRecipe};
 use super::io_policy::IoPolicy;
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct IntegrationOutput {
     pub width: usize,
@@ -150,11 +150,29 @@ fn run_banded(
         // since the outer variable itself isn't updated until the read
         // returns; `within_band` is a fresh atomic per band, accumulating
         // this band's own bytes across however many worker threads read it.
+        //
+        // Fix round 3, Important 1: an `AtomicU64::fetch_max` high-water-mark
+        // guard here (the reviewer's first-suggested shape: `fetch_add`,
+        // then check-and-maybe-emit) is NOT enough on its own — verified by
+        // writing it, then RE-FAILING the concurrency test below against it:
+        // two workers can both pass the "am I a new maximum" check (each
+        // correctly, against the state at the moment they checked) and then
+        // still race each other into the actual `on_band` call afterward,
+        // since updating the atomic and invoking the callback are two
+        // separate, unsynchronized steps — the exact TOCTOU shape the
+        // reviewer's snippet was trying to close, just moved one line later.
+        // A `Mutex` makes "add my bytes, then emit" ONE critical section:
+        // whichever thread holds the lock is the only one that can advance
+        // `band_bytes_so_far` and call `on_band`, so emissions are ordered
+        // by lock-acquisition order, which is the same order the bytes were
+        // added in — monotonic by construction, not by discarding stale
+        // values after the fact.
         let bytes_before_this_band = bytes_read;
-        let within_band = AtomicU64::new(0);
+        let band_bytes_so_far = std::sync::Mutex::new(0u64);
         let on_bytes = |just_read: u64| {
-            let so_far_in_band = within_band.fetch_add(just_read, Ordering::Relaxed) + just_read;
-            (progress.on_band)(band_idx + 1, bands_total, bytes_before_this_band + so_far_in_band, bytes_total);
+            let mut so_far_in_band = band_bytes_so_far.lock().unwrap();
+            *so_far_in_band += just_read;
+            (progress.on_band)(band_idx + 1, bands_total, bytes_before_this_band + *so_far_in_band, bytes_total);
         };
         src.read_band_with_progress(y0, rows, &mut planes, io.read_concurrency, &on_bytes)?;
         read_duration += t_read.elapsed();
@@ -341,11 +359,21 @@ fn integrate_flat_inner(
         // pass 2's own calls use once it starts (see `wrapped_on_band`
         // below), so a caller sees ONE continuously climbing bytes fraction
         // across both passes rather than a blackout followed by a jump.
+        //
+        // Fix round 3, Important 1: same `Mutex`-as-one-critical-section fix
+        // as `run_banded`'s tick (see its comment) — an `AtomicU64::fetch_max`
+        // high-water mark is NOT enough on its own: two workers can both
+        // pass the "am I a new maximum" check and then still race each
+        // other into the actual `on_band` call afterward. The `Mutex` makes
+        // "add my bytes, then emit" one critical section, so emissions are
+        // ordered by lock-acquisition order — the same order the bytes were
+        // added in.
         let bytes_before_this_chunk = pass1_bytes_read;
-        let within_chunk = AtomicU64::new(0);
+        let chunk_bytes_so_far = std::sync::Mutex::new(0u64);
         let on_bytes = |just_read: u64| {
-            let so_far = within_chunk.fetch_add(just_read, Ordering::Relaxed) + just_read;
-            (progress.on_band)(0, bands_total_forecast, bytes_before_this_chunk + so_far, two_pass_total_bytes);
+            let mut so_far = chunk_bytes_so_far.lock().unwrap();
+            *so_far += just_read;
+            (progress.on_band)(0, bands_total_forecast, bytes_before_this_chunk + *so_far, two_pass_total_bytes);
         };
         src.read_band_with_progress(y, rows, &mut planes, io.read_concurrency, &on_bytes)?;
         pass1_read += t_read.elapsed();
@@ -796,6 +824,58 @@ mod tests {
             ((48 + 16) * 32 * 4 * 3) as u64,
             "pass 1 (16 central rows) + pass 2 (48 full rows), 3 frames, 4 bytes/sample"
         );
+    }
+
+    /// Fix round 3, Important 1: `fetch_add` is atomic, but the EMISSION
+    /// that follows it is not ordered against it — two workers can both
+    /// complete their add and then race into `on_band` in the opposite
+    /// order, so a caller sees `bytes_done` go backwards. `read_concurrency
+    /// > 1` is every real build (`io.read_concurrency` never comes back as 1
+    /// outside a 1-3-frame precal/light-cal read with no `IoPolicy` in
+    /// scope); the module's shared `io()` helper hardcodes
+    /// `read_concurrency: 1` precisely so every OTHER test in this module
+    /// stays on the deterministic single-thread fast path — which is
+    /// exactly why this bug shipped with no test noticing it. This test
+    /// deliberately builds its own `IoPolicy` instead of using `io()`.
+    #[test]
+    fn on_band_bytes_done_never_regresses_under_real_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (4, 4);
+        let n = 64;
+        let paths: Vec<_> = (0..n)
+            .map(|i| write(dir.path(), &format!("f{i}.fits"), w, h, |_, _| 1000.0))
+            .collect();
+        let calls: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let on_band = |_cur: usize, _total: usize, done: u64, _all: u64| {
+            calls.lock().unwrap().push(done);
+        };
+        let concurrent_io = IoPolicy {
+            // One band for this tiny image — every tick below belongs to
+            // it, isolating the concurrency race from any band-boundary
+            // effect.
+            band_budget_bytes: MIN_BUDGET_BYTES,
+            read_concurrency: 16,
+            storage: StorageClass::Local,
+        };
+        integrate_bias_like_inner(
+            &paths,
+            IntegrationRecipe::median(Rejection::None),
+            &pool(),
+            dir.path(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            concurrent_io,
+        )
+        .unwrap();
+        let calls = calls.into_inner().unwrap();
+        assert!(calls.len() >= 2, "expected multiple ticks, got {calls:?}");
+        for pair in calls.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "bytes_done regressed under concurrency: {} then {} in the sequence {calls:?}",
+                pair[0], pair[1]
+            );
+        }
     }
 
     /// Fix round 2, I2: Task 6 cut a set's band count to as few as 2, and
