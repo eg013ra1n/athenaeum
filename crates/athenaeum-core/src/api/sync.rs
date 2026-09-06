@@ -7152,11 +7152,29 @@ mod tests {
     }
 
     /// Test helper: force `path`'s OWN mtime (no recursion) to `age` in the past.
-    /// Works on a directory via `File::open` + the stable `set_modified` (no extra
-    /// crate needed).
+    ///
+    /// Windows cannot open a directory through the ordinary path — that needs
+    /// `FILE_FLAG_BACKUP_SEMANTICS` — and `set_modified` calls `SetFileTime`,
+    /// which needs `FILE_WRITE_ATTRIBUTES`; `File::open`'s `GENERIC_READ` grants
+    /// neither. On unix `File::open` is enough, because `futimens` keys on
+    /// ownership rather than on the open mode.
     fn set_mtime_ago(path: &Path, age: Duration) {
+        #[cfg(windows)]
+        let f = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap_or_else(|e| panic!("open {} for mtime set: {e}", path.display()))
+        };
+        #[cfg(not(windows))]
         let f = std::fs::File::open(path)
             .unwrap_or_else(|e| panic!("open {} for mtime set: {e}", path.display()));
+
         f.set_modified(SystemTime::now() - age)
             .expect("set_modified");
     }
