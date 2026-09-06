@@ -144,6 +144,18 @@ export default function Settings() {
   };
 
   const handleSaveIntegrationBudget = async () => {
+    // The invariant belongs here, not at each caller: the Save button's
+    // `disabled` prop also checks `budgetInfo === null`, but Enter-to-save
+    // on the input calls this function directly and has no guard of its
+    // own — a disabled-prop-only check is bypassed by any trigger that
+    // doesn't go through that specific button. Re-check at the point of
+    // action so every current and future entry point (keyboard, a future
+    // form submit, …) is covered by one place instead of by each one
+    // remembering.
+    if (budgetInfo === null) {
+      setBudgetError('Could not read the current memory budget — try reloading this page.');
+      return;
+    }
     const raw = integrationBudgetMb.trim();
     const mb = Number(raw);
     if (raw === '' || !Number.isFinite(mb) || !Number.isInteger(mb) || mb < 0) {
