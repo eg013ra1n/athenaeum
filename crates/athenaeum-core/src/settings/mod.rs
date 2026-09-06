@@ -42,6 +42,10 @@ pub mod defaults {
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "1";
 
+    // Banded integration working-memory budget, MB. 0 = auto (a quarter of
+    // physical RAM, clamped) — see integration::band_budget.
+    pub const INTEGRATION_BAND_BUDGET_MB: &str = "0";
+
     // Personal sync (Stage I). Dev-only ticket pairing gate — the primary-side
     // receiver + iroh transport only start when this is explicitly enabled.
     pub const SYNC_DEV_TICKET_PAIRING: &str = "false";
@@ -120,6 +124,10 @@ pub mod keys {
 
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "compute.max_concurrent";
+
+    /// Banded-integration working-memory budget, MB. `0` = auto (a quarter of
+    /// physical RAM, clamped by `integration::band_budget`).
+    pub const INTEGRATION_BAND_BUDGET_MB: &str = "integration.band_budget_mb";
 
     /// Dev-only gate for personal-sync ticket pairing (task A7). When `"true"`,
     /// `get_sync_pairing_ticket` lazily starts the receiver + iroh transport.
@@ -354,6 +362,21 @@ impl SettingsManager {
         )?;
         let n: usize = value.parse()?;
         Ok(n.clamp(1, 8))
+    }
+
+    /// Configured banded-integration memory budget in MB. `0` is the auto
+    /// sentinel and passes through untouched; any other value is clamped by
+    /// `band_budget::clamp_configured_mb`. An unparseable value degrades to
+    /// auto rather than failing a build — same defense-in-depth stance as
+    /// `get_compute_max_concurrent`, against a value that reached the row by a
+    /// direct DB edit, a settings import or a botched migration.
+    pub fn get_integration_band_budget_mb(&self, conn: &Connection) -> Result<usize> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::INTEGRATION_BAND_BUDGET_MB,
+            defaults::INTEGRATION_BAND_BUDGET_MB,
+        )?;
+        Ok(value.parse().unwrap_or(0))
     }
 
     /// Get the device-wide sync UPLOAD limit in bytes/sec. `0` means

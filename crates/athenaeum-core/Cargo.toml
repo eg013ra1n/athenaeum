@@ -137,6 +137,12 @@ libc = "0.2"
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 keyring = { version = "4", default-features = false, features = ["v1"] }
 
+# Windows RAM probe for the banded-integration budget policy
+# (`integration::band_budget`). Already in `Cargo.lock` transitively, so this
+# costs no new build time.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
 [features]
 # `render` pulls the rustafits image pipeline; `solver` pulls the plate-solver.
 # Default keeps today's full behavior for the desktop/web builds. Headless

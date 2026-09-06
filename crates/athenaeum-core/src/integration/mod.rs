@@ -2,6 +2,7 @@
 //! per-pixel robust combination, recipe orchestration. Never holds
 //! N full frames in RAM — the working set is N × one band.
 
+pub mod band_budget;
 pub mod banded;
 pub mod cfa;
 pub mod combine;

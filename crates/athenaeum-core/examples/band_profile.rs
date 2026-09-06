@@ -41,8 +41,7 @@ fn main() {
     assert!(!paths.is_empty(), "no frames matched");
 
     let budget = if budget_mb == 0 {
-        // Task 2 replaces this with band_budget::auto_budget_bytes()
-        256 * 1024 * 1024
+        athenaeum_core::integration::band_budget::auto_budget_bytes()
     } else {
         budget_mb * 1024 * 1024
     };

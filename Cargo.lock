@@ -413,6 +413,7 @@ dependencies = [
  "ts-rs",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
  "wiremock",
  "xxhash-rust",
  "zip",

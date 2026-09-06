@@ -1,0 +1,196 @@
+//! Resolves the working-memory budget for banded integration.
+//!
+//! Until 2026-09-06 this was a compile-time `256 * 1024 * 1024`. Profiling
+//! (`docs/superpowers/research/2026-09-06-master-integration-io-profiling.md`)
+//! measured that constant costing 5.3x on a 100-frame set: it yields 105-row
+//! bands, so the reader crosses all 100 files forty times and gets 22 MB/s off
+//! a drive that sustains 243 MB/s. The budget is a property of the machine,
+//! so it is resolved from the machine.
+
+use anyhow::Result;
+use rusqlite::Connection;
+
+use crate::settings::SettingsManager;
+
+/// The pre-2026-09-06 constant. The policy is floored here so it can never
+/// make any machine slower than it already is.
+pub const MIN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// 100 frames of 26 Mpx as `u16` is 5.2 GB; 8 GiB is where a large machine
+/// reaches a single band and therefore whole-file sequential reads. Above
+/// that the budget buys nothing an integration can spend.
+pub const MAX_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+/// Used when the RAM probe fails. Measured at 101.2 s against the old
+/// constant's 241.6 s on the profiled set, and safe on any machine with the
+/// 8 GB a 26 Mpx pipeline already needs.
+pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Bounds for an explicitly configured `integration.band_budget_mb`.
+const CONFIGURED_MIN_MB: usize = 64;
+const CONFIGURED_MAX_MB: usize = 16384;
+
+/// Physical RAM this process may actually use, in bytes.
+///
+/// On Linux this is `min(MemTotal, container limit)` — **load-bearing for the
+/// Docker/web build**: `/proc/meminfo` reports the HOST's RAM inside a
+/// container, so without the cgroup read a 2 GB container would size an 8 GiB
+/// budget and be OOM-killed.
+pub fn total_ram_bytes() -> Option<u64> {
+    platform_total_ram()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_total_ram() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total = None;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            total = Some(kb.saturating_mul(1024));
+            break;
+        }
+    }
+    let total = total?;
+    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|s| parse_cgroup_limit(&s))
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|s| parse_cgroup_limit(&s))
+        });
+    Some(match limit {
+        Some(l) => total.min(l),
+        None => total,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn platform_total_ram() -> Option<u64> {
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let name = b"hw.memsize\0";
+    // SAFETY: `name` is NUL-terminated, `size`/`len` are correctly sized and
+    // owned by this frame, and the new-value pointer is null (a pure read).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            &mut size as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && size > 0 { Some(size) } else { None }
+}
+
+#[cfg(windows)]
+fn platform_total_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: MEMORYSTATUSEX is a plain POD struct; zeroing it and stamping
+    // dwLength is exactly the documented calling convention.
+    let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 && st.ullTotalPhys > 0 {
+        Some(st.ullTotalPhys)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
+fn platform_total_ram() -> Option<u64> {
+    None
+}
+
+/// Parse one cgroup memory-limit file. `None` means "no limit here": cgroup v2
+/// writes the literal `max`, and v1 writes a sentinel near `u64::MAX` — a
+/// number that large is not a container limit, it is the absence of one.
+///
+/// Only `platform_total_ram`'s Linux arm calls this in production; it stays a
+/// plain (non-`#[cfg]`) function so its own unit tests run on every dev
+/// machine, including this one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_cgroup_limit(text: &str) -> Option<u64> {
+    const UNLIMITED_FLOOR: u64 = 1 << 62;
+    let v: u64 = text.trim().parse().ok()?;
+    if v == 0 || v >= UNLIMITED_FLOOR { None } else { Some(v) }
+}
+
+/// A quarter of physical RAM, clamped. A quarter and not a half because the
+/// same process also holds the catalog, the render pipeline and the transfer
+/// store — and because the OS needs page cache for the very files being read.
+pub fn auto_budget_bytes() -> usize {
+    match total_ram_bytes() {
+        Some(ram) => (ram / 4).clamp(MIN_BUDGET_BYTES as u64, MAX_BUDGET_BYTES as u64) as usize,
+        None => FALLBACK_BUDGET_BYTES,
+    }
+}
+
+/// `0` is the auto sentinel; anything else is clamped to a sane window.
+pub(crate) fn clamp_configured_mb(mb: usize) -> Option<usize> {
+    if mb == 0 { None } else { Some(mb.clamp(CONFIGURED_MIN_MB, CONFIGURED_MAX_MB)) }
+}
+
+/// Split the machine-wide budget across the builds the compute queue may admit
+/// at once, never below the old constant.
+pub(crate) fn per_job_budget(total: usize, max_concurrent: usize) -> usize {
+    (total / max_concurrent.max(1)).max(MIN_BUDGET_BYTES)
+}
+
+/// The budget one integration job may use, right now, on this machine.
+pub fn resolve_budget_bytes(conn: &Connection, settings: &SettingsManager) -> Result<usize> {
+    let configured = settings.get_integration_band_budget_mb(conn)?;
+    let total = match clamp_configured_mb(configured) {
+        Some(mb) => mb * 1024 * 1024,
+        None => auto_budget_bytes(),
+    };
+    Ok(per_job_budget(total, settings.get_compute_max_concurrent(conn)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_budget_is_a_quarter_of_ram_within_bounds() {
+        let b = auto_budget_bytes();
+        assert!(b >= MIN_BUDGET_BYTES, "auto {b} below the floor — would be slower than the old constant");
+        assert!(b <= MAX_BUDGET_BYTES, "auto {b} above the cap");
+        if let Some(ram) = total_ram_bytes() {
+            let want = (ram / 4).clamp(MIN_BUDGET_BYTES as u64, MAX_BUDGET_BYTES as u64) as usize;
+            assert_eq!(b, want, "auto must be a quarter of {ram} bytes, clamped");
+        }
+    }
+
+    #[test]
+    fn cgroup_v2_limit_parses_and_max_means_unlimited() {
+        assert_eq!(parse_cgroup_limit("2147483648\n"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_limit("max\n"), None, "'max' means no limit, not a limit of zero");
+        assert_eq!(parse_cgroup_limit(""), None);
+        assert_eq!(parse_cgroup_limit("not a number"), None);
+        // cgroup v1 writes a sentinel near u64::MAX for "unlimited"; anything
+        // that large is not a real container limit.
+        assert_eq!(parse_cgroup_limit("9223372036854771712"), None);
+    }
+
+    #[test]
+    fn configured_value_is_clamped_and_zero_means_auto() {
+        assert_eq!(clamp_configured_mb(0), None, "0 is the auto sentinel, not a size");
+        assert_eq!(clamp_configured_mb(1), Some(64), "clamps UP to the 64 MB floor");
+        assert_eq!(clamp_configured_mb(512), Some(512));
+        assert_eq!(clamp_configured_mb(999_999), Some(16384), "clamps DOWN to the 16 GB cap");
+    }
+
+    #[test]
+    fn concurrency_divides_the_budget_but_never_below_the_floor() {
+        assert_eq!(per_job_budget(4 * 1024 * 1024 * 1024, 1), 4 * 1024 * 1024 * 1024);
+        assert_eq!(per_job_budget(4 * 1024 * 1024 * 1024, 4), 1024 * 1024 * 1024);
+        assert_eq!(
+            per_job_budget(512 * 1024 * 1024, 8),
+            MIN_BUDGET_BYTES,
+            "two admitted builds must not each claim a quarter of RAM, but neither may drop below the old constant"
+        );
+    }
+}
