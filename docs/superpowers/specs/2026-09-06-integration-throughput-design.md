@@ -363,12 +363,41 @@ it stays out until a measurement demands it.
 Measured with the checked-in `examples/band_profile.rs` harness and the
 eviction protocol from research §2, on the profiling machine.
 
-| Gate | Before | After |
-| ---- | ---- | ---- |
-| 100-frame bias, cold, end to end | 241.6 s | **≤ 40 s** |
-| 100-frame bias, read throughput | 22 MB/s | **≥ 150 MB/s** |
-| 30-frame dark, cold, end to end | 11.8 s | ≤ 8 s — **NOT YET MEASURED** |
-| LDN 1272 batch (11 sets, ~23 GB) | 13.5 min | **≤ 5 min** — **NOT YET MEASURED** |
+| Gate | Before | Target | Measured |
+| ---- | ---- | ---- | ---- |
+| 100-frame bias, cold, end to end | 233.1 s | ≤ 40 s | **37.7 s** pre-fix-wave; **40.4 / 40.8 s** on the final build — see note |
+| 100-frame bias, read throughput | 23 MB/s | ≥ 150 MB/s | **175-178 MB/s**, stable across eight runs |
+| 30-frame dark, cold, end to end | 11.8 s | ≤ 8 s | **11.7 s — the target was impossible, see below** |
+| LDN 1272 batch (11 sets, ~23 GB) | 13.5 min | ≤ 5 min | **not measured** — needs a desktop rebuild and deleting real masters; owner territory |
+
+**The 30-frame dark target was wrong when it was written, and no implementation
+could have met it.** 1.57 GB against the drive's measured 243 MB/s whole-file
+ceiling is a 6.46 s read floor; plus the measured 2.75 s combine, the absolute
+best possible total on this hardware is **9.21 s** — 1.21 s above the 8 s the
+table demanded. The error was assuming the 5.3x from §3.1 generalised. It does
+not: it applies where the band count was pathological, and this set's was not.
+At 30 frames the old 256 MiB budget already bought 335-row bands, i.e. 4.2 MB
+per read, enough to amortise seeks — the set was **already reading at 71 % of
+the drive ceiling before the cycle began**. The cycle moved it 11.8 s -> 11.7 s,
+under one percent, because there was nothing there to win. The pathology was
+specific to high frame counts, where the same budget divided 100 ways gave
+1.31 MB reads.
+
+**On the 100-frame row.** The build measured at 37.66 s is the one before the
+final fix wave. The final build measures 40.4 s and 40.8 s, i.e. 1-2 % over the
+target. The whole difference sits in the combine phase, which the fix wave
+touched by adding a per-row progress tick: it read 7.67 / 7.74 s before and
+10.54 / 10.56 s after. That looks decisive and is not, for two reasons worth
+recording rather than resolving by assertion. The combine's own spread across
+the ten measurements taken earlier in this cycle was 6.08-10.05 s with no tick
+present at all, so the post-wave pair sits barely above a range the phase
+already occupied. And the tick's arithmetic cost is one relaxed `fetch_add` per
+row — 8352 per run, against ~1257 us of real work per row, i.e. about 0.1 %
+even at a microsecond per atomic, three orders of magnitude short of the 2.8 s
+it would need to explain. Both post-wave samples are consecutive and share
+machine state. **The honest statement is that the cause is not isolated**; the
+numbers are recorded so a later reader can settle it with more samples rather
+than inherit a guess.
 | Master pixels | — | **byte-identical** to the pre-change build for the same inputs |
 | SSD-backed scan root | not measured | open item — the class D3 expects to benefit most from concurrency |
 | Network mount (SMB/NFS) | not measured | open item — the one class whose policy is reasoned, not measured |
