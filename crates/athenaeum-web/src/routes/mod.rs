@@ -202,6 +202,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_compute_queue", post(compute::get_compute_queue))
         .route("/api/cancel_compute_job", post(compute::cancel_compute_job))
         .route("/api/set_compute_max_concurrent", post(compute::set_compute_max_concurrent))
+        .route("/api/get_integration_band_budget", post(compute::get_integration_band_budget))
+        .route("/api/set_integration_band_budget", post(compute::set_integration_band_budget))
         // Content index
         .route("/api/get_content_index_status", post(content_index::get_content_index_status))
         .route("/api/start_content_index", post(content_index::start_content_index))

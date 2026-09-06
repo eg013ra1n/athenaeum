@@ -546,6 +546,25 @@ export type ComputeJobState = "queued" | "running";
 
 export type ComputeQueueEntry = { jobId: number, kind: ComputeJobKind, label: string, state: ComputeJobState, queuedAt: string, };
 
+export type IntegrationBudgetInfo = { 
+/**
+ * The stored `integration.band_budget_mb`. `0` means auto.
+ */
+configuredMb: number, 
+/**
+ * What one integration job gets right now, after the auto formula and
+ * the division by `compute.max_concurrent`.
+ */
+effectiveMb: number, 
+/**
+ * What auto alone would resolve to on this machine.
+ */
+autoMb: number, 
+/**
+ * Physical RAM the probe found; `0` when the platform probe failed.
+ */
+totalRamMb: number, };
+
 export type ContentIndexProgress = { done: number, total: number, updated: number, skipped: number, };
 
 export type VerifyMethod = "bytes" | "storedHash";

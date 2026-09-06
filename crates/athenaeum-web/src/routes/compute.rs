@@ -25,6 +25,12 @@ pub struct SetComputeMaxConcurrentArgs {
     pub n: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetIntegrationBandBudgetArgs {
+    pub mb: usize,
+}
+
 // ── Routes ───────────────────────────────────────────────────────────────────
 
 /// POST /api/get_compute_queue
@@ -52,4 +58,22 @@ pub async fn set_compute_max_concurrent(
     Json(args): Json<SetComputeMaxConcurrentArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::set_compute_max_concurrent(&state.ctx, args.n).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_integration_band_budget
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_integration_band_budget(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<api::IntegrationBudgetInfo>, (StatusCode, String)> {
+    api::get_integration_band_budget(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/set_integration_band_budget
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_integration_band_budget(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetIntegrationBandBudgetArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::set_integration_band_budget(&state.ctx, args.mb).map(Json).map_err(api_err)
 }

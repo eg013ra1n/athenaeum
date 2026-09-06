@@ -16,6 +16,7 @@ import { getArchiveSettings, setArchiveCompression as apiSetArchiveCompression }
 import type { ArchiveCompression } from '../types/archive';
 import type { AnnotationSettings } from '../types/analysis-config';
 import { DEFAULT_ANNOTATION_SETTINGS } from '../types/helpers';
+import type { IntegrationBudgetInfo } from '../types/models';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -41,6 +42,15 @@ export default function Settings() {
   const [monitoringEnabledGlobal, setMonitoringEnabledGlobal] = useState(true);
   const [autoMergeOnButtonClick, setAutoMergeOnButtonClick] = useState(false);
   const [autoMergeOnMonitorDetect, setAutoMergeOnMonitorDetect] = useState(false);
+
+  // Master-build (banded integration) memory budget — Calibration tab.
+  // `integrationBudgetMb` is the editable input (string, "0" = auto);
+  // `budgetInfo` is the last snapshot loaded from/after saving to the
+  // backend, used to show the resolved effective/auto/RAM figures.
+  const [integrationBudgetMb, setIntegrationBudgetMb] = useState('0');
+  const [budgetInfo, setBudgetInfo] = useState<IntegrationBudgetInfo | null>(null);
+  const [budgetSaving, setBudgetSaving] = useState(false);
+  const [budgetError, setBudgetError] = useState<string | null>(null);
 
   // Flat Contour Plot defaults — drive the per-frame contour rendering in
   // Blink. Values match PixInsight FlatContourPlot v1.3.1 defaults.
@@ -109,7 +119,38 @@ export default function Settings() {
       api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
       api.invoke<string>('get_log_path').then(setLogDir).catch(console.error);
     }
+    loadIntegrationBudget();
   }, []);
+
+  const loadIntegrationBudget = async () => {
+    try {
+      const info = await api.invoke<IntegrationBudgetInfo>('get_integration_band_budget');
+      setBudgetInfo(info);
+      setIntegrationBudgetMb(String(info.configuredMb));
+    } catch (err) {
+      console.error('Failed to load integration memory budget:', err);
+    }
+  };
+
+  const handleSaveIntegrationBudget = async () => {
+    const raw = integrationBudgetMb.trim();
+    const mb = Number(raw);
+    if (raw === '' || !Number.isFinite(mb) || !Number.isInteger(mb) || mb < 0) {
+      setBudgetError('Enter 0 for automatic, or a whole number of megabytes.');
+      return;
+    }
+    setBudgetError(null);
+    setBudgetSaving(true);
+    try {
+      await api.invoke('set_integration_band_budget', { mb });
+      await loadIntegrationBudget();
+    } catch (err) {
+      console.error('Failed to save integration memory budget:', err);
+      setBudgetError(err as string);
+    } finally {
+      setBudgetSaving(false);
+    }
+  };
 
   const handleArchiveCompressionChange = async (next: ArchiveCompression) => {
     try {
@@ -460,6 +501,29 @@ export default function Settings() {
     }
   };
 
+  // Explains a gap between what the operator typed for the master-build
+  // memory budget and what is actually applied — either the 256-16384 MB
+  // configured range clamped it, more than one heavy job is admitted at
+  // once and splits it, or both. `null` means the applied value matches
+  // what was configured (or auto matches what auto alone would give).
+  let budgetNote: string | null = null;
+  if (budgetInfo && budgetInfo.configuredMb === 0) {
+    if (budgetInfo.effectiveMb < budgetInfo.autoMb) {
+      budgetNote = `Applying ${budgetInfo.effectiveMb} MB, below the automatic ${budgetInfo.autoMb} MB, because more than one heavy job (master build, analysis, …) may run at once and this budget is split between them.`;
+    }
+  } else if (budgetInfo && budgetInfo.effectiveMb !== budgetInfo.configuredMb) {
+    const clamped = Math.min(16384, Math.max(256, budgetInfo.configuredMb));
+    const wasClamped = clamped !== budgetInfo.configuredMb;
+    const alsoSplitByConcurrency = budgetInfo.effectiveMb < clamped;
+    if (wasClamped && alsoSplitByConcurrency) {
+      budgetNote = `Applying ${budgetInfo.effectiveMb} MB: the value was clamped to ${clamped} MB (allowed range 256-16384 MB) and then split further because more than one heavy job may run at once.`;
+    } else if (wasClamped) {
+      budgetNote = `Clamped to ${clamped} MB — configured values are limited to the 256-16384 MB range.`;
+    } else if (alsoSplitByConcurrency) {
+      budgetNote = `Applying ${budgetInfo.effectiveMb} MB, not the ${budgetInfo.configuredMb} MB entered, because more than one heavy job may run at once and this budget is split between them.`;
+    }
+  }
+
   if (loading) {
     return (
       <div className="p-6">
@@ -562,6 +626,44 @@ export default function Settings() {
             Define which parameters must match exactly, warn on threshold, or be ignored.
           </p>
           <CalibrationMatchingConfig />
+
+          <div className="mt-6 pt-6 border-t border-border">
+            <h3 className="text-xl font-semibold mb-4">Master Build Memory</h3>
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Integration memory budget ({integrationBudgetMb === '0' ? 'automatic' : `${integrationBudgetMb} MB`})
+              </label>
+              <input
+                type="number"
+                value={integrationBudgetMb}
+                onChange={(e) => setIntegrationBudgetMb(e.target.value)}
+                min="0"
+                max="16384"
+                step="64"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                Working memory one master build may use for reading frames. 0 = automatic
+                ({budgetInfo ? budgetInfo.autoMb : '…'} MB on this machine, from{' '}
+                {budgetInfo ? budgetInfo.totalRamMb : '…'} MB of RAM). Larger values read the disk in
+                fewer, longer sweeps; smaller values use less memory and take longer.
+              </p>
+              {budgetNote && (
+                <p className="text-xs text-content-muted mt-1">{budgetNote}</p>
+              )}
+              {budgetError && (
+                <p className="text-xs text-error mt-1">{budgetError}</p>
+              )}
+              <button
+                onClick={handleSaveIntegrationBudget}
+                disabled={budgetSaving}
+                className="mt-3 flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-surface rounded-lg transition-colors"
+              >
+                <Save size={16} />
+                {budgetSaving ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

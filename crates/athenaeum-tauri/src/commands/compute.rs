@@ -34,3 +34,19 @@ pub async fn cancel_compute_job(state: State<'_, AppState>, job_id: i64) -> Resu
 pub async fn set_compute_max_concurrent(state: State<'_, AppState>, n: usize) -> Result<(), String> {
     api::set_compute_max_concurrent(&state.ctx, n).map_err(|e| e.to_string())
 }
+
+/// Read the resolved banded-integration memory budget.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_integration_band_budget(
+    state: State<'_, AppState>,
+) -> Result<api::IntegrationBudgetInfo, String> {
+    api::get_integration_band_budget(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Persist the banded-integration memory budget. 0 = auto.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_integration_band_budget(state: State<'_, AppState>, mb: usize) -> Result<(), String> {
+    api::set_integration_band_budget(&state.ctx, mb).map_err(|e| e.to_string())
+}
