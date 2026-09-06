@@ -76,6 +76,13 @@ freezing at 100%).
   never be cited as evidence for it. `masters.rs` and `light_cal.rs` are render-gated
   the same way. The only headless-relevant gate for this cycle is that `--workspace`
   still builds and tests green with the feature on (the default).
+- After the 2026-09-06 review fixes: start a 100-frame build, press Cancel
+  mid-read, and confirm the row stops within a couple of seconds (it used to
+  wait for the whole band, ~6 s on the owner's 30-frame dark, ~25 s on a
+  100-frame set) and that the log shows only "master build cancelled" for
+  that set, no "finished". Watch the percent on a two-band build (any
+  100-frame set on the 16 GB machine): it must climb without ever stepping
+  back across the `integrating` → `combining` boundary.
 
 ### Blink full-resolution VNG (2026-09-06)
 
@@ -111,6 +118,10 @@ What no one has run is the app itself.
 - Settings -> Blink Viewer: the new **Memory Cache Limit (MB)** field saves,
   reloads, and rejects values outside 64-16384; the amber warning under Image
   Resolution appears only for Full.
+- After the 2026-09-06 review fixes: with Image Resolution at **Full** and an
+  OSC set buffering in Blink, open the file browser and hover thumbnails —
+  they must render while the VNG prefetch is still running (the gate no
+  longer sits inside the shared image semaphore).
 
 ### Calibrated-export v2 (2026-08-31)
 

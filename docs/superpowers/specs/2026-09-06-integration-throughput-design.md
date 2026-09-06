@@ -272,6 +272,20 @@ Three changes, all small, closing the gap the research recorded in §8.
   The sidebar `ComputeQueueIndicator` is untouched — its entries carry no
   calibration-set id, so joining progress to them is a separate change.
 
+**Amended 2026-09-06 (review F1–F3).** `percent` on `master-build-progress`
+is ONE monotonic number for the whole pixel phase — bytes read weighted 0.7,
+rows combined 0.3 (`api::masters::build_percent`, running maxima of both
+counters) — because a bytes percent during `integrating` and a rows percent
+during `combining` in the same cell went backwards at every band boundary.
+The engine's end-of-band `on_band` call, which repeats the last per-frame
+byte count, is filtered at the emitter so the stage word never flips back.
+The read workers and the probe stage now check the caller's cancel flag
+between frames (`BandSource::open_with_cancel`,
+`read_band_with_progress(.., cancel)`), so a Cancel takes effect within one
+frame's read rather than one band's; a worker's read error aborts its
+siblings. "master build finished" is logged only after the post-engine
+cancel re-check.
+
 ## 8. Out of scope, recorded so it is not lost
 
 - **`light_cal.rs` / `cosmetic.rs` keep a fixed 256 MiB budget.** They run with
