@@ -44,9 +44,9 @@
 
 use std::path::Path;
 
+use crate::integration::band_budget::MIN_BUDGET_BYTES;
 use crate::integration::banded::{band_rows_for_budget, BandSource};
 use crate::integration::cfa::{cfa_channel_at, CfaGeometry};
-use crate::integration::engine::BAND_BUDGET_BYTES;
 use crate::integration::IntegrationError;
 
 /// How many robust sigmas above the dark's median a pixel must read to count
@@ -335,7 +335,9 @@ fn read_full_plane(
 ) -> Result<(usize, usize, Vec<f32>), IntegrationError> {
     let mut src = BandSource::open(&[path.to_path_buf()], scratch_dir)?;
     let (w, h) = (src.width(), src.height());
-    let band_rows = band_rows_for_budget(w, 1, BAND_BUDGET_BYTES).min(h);
+    // One dark plane, one frame — already 1-2 bands at the floor, so the
+    // machine-resolved budget would not change the band count here (spec §8).
+    let band_rows = band_rows_for_budget(w, 1, MIN_BUDGET_BYTES).min(h);
     let mut data = vec![0f32; w * h];
     let mut bufs = vec![Vec::new()];
     let mut y = 0;

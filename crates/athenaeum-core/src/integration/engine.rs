@@ -1,17 +1,14 @@
 //! Recipe orchestration (spec §4, §9): banded streaming + per-pixel combine.
-//! Memory: N × band (default 256 MiB budget). Parallelism: rayon over the
-//! pixels of the current band via the shared image pool.
+//! Memory: N × band, sized per build by `integration::band_budget` from the
+//! machine and the compute-queue ceiling (see that module) rather than a
+//! compile-time constant. Parallelism: rayon over the pixels of the current
+//! band via the shared image pool.
 
 use super::banded::{band_rows_for_budget, BandSource};
 use super::combine::{combine_pixel, IntegrationRecipe};
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-// Shared band-memory budget (§4). `pub(crate)` so the light-calibration engine
-// (`calibration_library::light_cal`) sizes its bands with the same policy
-// instead of redefining the constant.
-pub(crate) const BAND_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct IntegrationOutput {
     pub width: usize,
@@ -75,7 +72,8 @@ pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
 /// Shared banded-combine core. `scale[i]`/`precal` transform frame i's
 /// samples before combining: v' = (v - precal(i, pixel)) * scale[i].
 /// `band_budget_bytes` is injectable (module-internal) so tests can force
-/// multi-band runs on tiny images; production passes `BAND_BUDGET_BYTES`.
+/// multi-band runs on tiny images; production passes the machine-resolved
+/// value from `integration::band_budget::resolve_budget_bytes`.
 #[allow(clippy::too_many_arguments)]
 fn run_banded(
     src: &mut BandSource,
@@ -345,6 +343,7 @@ fn integrate_flat_inner(
 mod tests {
     use super::*;
     use crate::fits_writer::write_fits_f32;
+    use crate::integration::band_budget::MIN_BUDGET_BYTES;
     use crate::integration::combine::{IntegrationRecipe, Rejection};
     use std::sync::atomic::AtomicBool;
 
@@ -376,7 +375,7 @@ mod tests {
             IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert_eq!((out.width, out.height), (w, h));
         let hot = out.data[5 * w + 5];
@@ -401,7 +400,7 @@ mod tests {
             &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         // After per-frame normalization all three frames agree, so the master
         // must reproduce the SHAPE: ratio of two positions equals shape ratio.
@@ -428,7 +427,7 @@ mod tests {
             &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 0.01),
             "1500 - 500 precal = 1000 everywhere");
@@ -448,7 +447,7 @@ mod tests {
             &paths, &FlatPrecal::SyntheticBias(100.0), IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 0.01));
     }
@@ -462,7 +461,7 @@ mod tests {
         let r = integrate_bias_like(
             &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &cancel,
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         );
         assert!(matches!(r, Err(IntegrationError::Cancelled)));
     }
@@ -480,7 +479,7 @@ mod tests {
         let out = integrate_bias_like(
             &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|&v| v == -5.0), "no clipping policy");
     }
@@ -542,7 +541,7 @@ mod tests {
             &paths, &FlatPrecal::SyntheticBias(500.0), IntegrationRecipe::average(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert!(
             out.data.iter().all(|&v| (v - 1500.0).abs() < 1e-3),
@@ -575,7 +574,7 @@ mod tests {
             IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|v| v.is_finite()), "master must never contain non-finite pixels");
         assert!((out.data[5] - 100.0).abs() < 1e-3, "pixel 5 combines the 15 good samples");
@@ -604,7 +603,7 @@ mod tests {
             &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|v| v.is_finite()));
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 1e-3),
@@ -634,7 +633,7 @@ mod tests {
             dir.path(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         )
         .unwrap();
         assert!(out.read_duration > std::time::Duration::ZERO, "read time not recorded");
@@ -706,7 +705,7 @@ mod tests {
             dir.path(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            BAND_BUDGET_BYTES,
+            MIN_BUDGET_BYTES,
         )
         .unwrap();
         assert_eq!(

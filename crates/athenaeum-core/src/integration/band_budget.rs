@@ -175,6 +175,35 @@ pub fn resolve_budget_bytes(conn: &Connection, settings: &SettingsManager) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::keys;
+    use rusqlite::Connection;
+
+    /// The build must read the operator's setting, not a constant. Pinned at
+    /// the resolver because the build itself needs a real 5 GB frame set to
+    /// exercise end to end.
+    #[test]
+    fn resolver_honours_an_explicit_setting_over_auto() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let settings = SettingsManager::new();
+
+        let auto = resolve_budget_bytes(&conn, &settings).unwrap();
+        assert_eq!(auto, per_job_budget(auto_budget_bytes(), 1), "default 0 means auto");
+
+        settings
+            .persist_setting(&conn, keys::INTEGRATION_BAND_BUDGET_MB, "512")
+            .unwrap();
+        assert_eq!(resolve_budget_bytes(&conn, &settings).unwrap(), 512 * 1024 * 1024);
+
+        settings
+            .persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "2")
+            .unwrap();
+        assert_eq!(
+            resolve_budget_bytes(&conn, &settings).unwrap(),
+            MIN_BUDGET_BYTES,
+            "512 MB split across 2 admitted jobs is 256 MB — the floor, not below it"
+        );
+    }
 
     #[test]
     fn auto_budget_is_a_quarter_of_ram_within_bounds() {

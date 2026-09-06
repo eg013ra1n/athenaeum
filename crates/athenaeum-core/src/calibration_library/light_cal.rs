@@ -47,7 +47,8 @@ use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{write_fits_f32, Card};
 use crate::integration::banded::{band_rows_for_budget, BandSource};
 use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
-use crate::integration::engine::{central_third_mean, BAND_BUDGET_BYTES};
+use crate::integration::band_budget::MIN_BUDGET_BYTES;
+use crate::integration::engine::central_third_mean;
 use crate::integration::IntegrationError;
 use crate::models::FileFormat;
 
@@ -242,7 +243,10 @@ pub fn calibrate_light(
     inputs: &LightCalInputs,
     cancel: &AtomicBool,
 ) -> Result<LightCalOutcome, IntegrationError> {
-    calibrate_light_inner(inputs, cancel, BAND_BUDGET_BYTES)
+    // A single light is one frame — already 1-2 bands at the floor budget, so
+    // the machine-resolved budget (`integration::band_budget`) buys nothing
+    // here; kept at the floor deliberately (spec §8).
+    calibrate_light_inner(inputs, cancel, MIN_BUDGET_BYTES)
 }
 
 /// The formula pass on its own — everything [`calibrate_light`] does EXCEPT the
@@ -259,7 +263,9 @@ pub fn calibrate_light_compute(
     inputs: &LightCalInputs,
     cancel: &AtomicBool,
 ) -> Result<(CalibratedFrame, LightCalOutcome), IntegrationError> {
-    calibrate_light_compute_inner(inputs, cancel, BAND_BUDGET_BYTES)
+    // Same reasoning as `calibrate_light`: one frame, 1-2 bands regardless of
+    // budget, so the floor is not the bottleneck here (spec §8).
+    calibrate_light_compute_inner(inputs, cancel, MIN_BUDGET_BYTES)
 }
 
 /// Write a calibrated plane to `path` and return the xxh3 of the written file.
@@ -698,7 +704,9 @@ fn read_full_flat_plane(
 ) -> Result<(usize, usize, Vec<f32>), IntegrationError> {
     let mut src = BandSource::open(&[flat_path.to_path_buf()], scratch_dir)?;
     let (w, h) = (src.width(), src.height());
-    let band_rows = band_rows_for_budget(w, 1, BAND_BUDGET_BYTES).min(h);
+    // One flat plane, one frame — already 1-2 bands at the floor, so the
+    // machine-resolved budget would not change the band count here (spec §8).
+    let band_rows = band_rows_for_budget(w, 1, MIN_BUDGET_BYTES).min(h);
     let mut data = vec![0f32; w * h];
     let mut bufs = vec![Vec::new()];
     let mut y = 0;

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use athenaeum_core::api::masters::resolve_recipe;
+use athenaeum_core::integration::band_budget::MIN_BUDGET_BYTES;
 use athenaeum_core::integration::combine::{IntegrationRecipe, Rejection};
 use athenaeum_core::calibration_library::headers::{build_master_cards, load_header_inputs};
 use athenaeum_core::calibration_library::paths::{master_relative_path, resolve_collision, MasterPathParams};
@@ -103,13 +104,13 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     let combine = resolve_recipe(None, "Dark", 3);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
     let on_band = |_current: usize, _total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {};
-    // `engine::BAND_BUDGET_BYTES` is `pub(crate)` — not visible from this
-    // external integration-test crate — so this mirrors its value (256 MiB)
-    // directly, same as the app's default.
+    // This test bypasses `api::masters::run_build`'s own budget resolution
+    // (it exercises the orchestration steps directly, not the build thread),
+    // so it passes the floor rather than a real machine-resolved value.
     let out = integrate_bias_like(
         &paths, combine, &pool, scratch.path(), &AtomicBool::new(false),
         EngineProgress { on_band: &on_band },
-        256 * 1024 * 1024,
+        MIN_BUDGET_BYTES,
     ).unwrap();
 
     // Write: consolidated header + fixed v1 naming into the temp library dir.
@@ -216,7 +217,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
             IntegrationRecipe::average(Rejection::None),
             &pool, scratch.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            256 * 1024 * 1024,
+            MIN_BUDGET_BYTES,
         ).unwrap()
     };
 
