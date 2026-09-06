@@ -70,7 +70,10 @@ operator raises the compute queue's ceiling: two admitted builds must not each
 believe they own a quarter of RAM.
 
 **Setting:** `integration.band_budget_mb`, default `"0"`. On read, `0` passes
-through as the auto sentinel; any other value is clamped to `64..=16384` MB —
+through as the auto sentinel; any other value is clamped to `256..=16384` MB —
+the lower bound equals `MIN_BUDGET_BYTES` deliberately: `per_job_budget` floors
+every resolved budget there anyway, so advertising a smaller minimum would be
+promising a setting the backend refuses to honour —
 the same defense-in-depth clamp `get_compute_max_concurrent` and
 `get_sync_max_concurrent_receives` apply, so a value that reached the row by a
 direct DB edit or a botched import degrades instead of OOM-ing the app.

@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn configured_value_is_clamped_and_zero_means_auto() {
         assert_eq!(clamp_configured_mb(0), None, "0 is the auto sentinel, not a size");
-        assert_eq!(clamp_configured_mb(1), Some(64), "clamps UP to the 64 MB floor");
+        assert_eq!(clamp_configured_mb(1), Some(256), "clamps UP to the 256 MB floor");
         assert_eq!(clamp_configured_mb(512), Some(512));
         assert_eq!(clamp_configured_mb(999_999), Some(16384), "clamps DOWN to the 16 GB cap");
     }
@@ -2048,7 +2048,7 @@ pub fn get_integration_band_budget(ctx: &ServiceContext) -> Result<IntegrationBu
 }
 
 /// Persist the budget. `0` restores auto; anything else is clamped to
-/// 64..=16384 MB by the resolver, so a wild value degrades instead of
+/// 256..=16384 MB by the resolver, so a wild value degrades instead of
 /// OOM-ing the next build.
 pub fn set_integration_band_budget(ctx: &ServiceContext, mb: usize) -> Result<(), ApiError> { /* .. */ }
 ```
