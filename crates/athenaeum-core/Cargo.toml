@@ -138,10 +138,11 @@ libc = "0.2"
 keyring = { version = "4", default-features = false, features = ["v1"] }
 
 # Windows RAM probe for the banded-integration budget policy
-# (`integration::band_budget`). Already in `Cargo.lock` transitively, so this
-# costs no new build time.
+# (`integration::band_budget`) plus the drive-type probe for storage-class
+# detection (`integration::storage_class`). Already in `Cargo.lock`
+# transitively, so this costs no new build time.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
 
 [features]
 # `render` pulls the rustafits image pipeline; `solver` pulls the plate-solver.

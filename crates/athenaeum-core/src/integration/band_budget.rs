@@ -190,6 +190,12 @@ mod tests {
         let auto = resolve_budget_bytes(&conn, &settings).unwrap();
         assert_eq!(auto, per_job_budget(auto_budget_bytes(), 1), "default 0 means auto");
 
+        assert_ne!(
+            auto,
+            512 * 1024 * 1024,
+            "fixture value must differ from this host's auto budget or the assertions below stop discriminating"
+        );
+
         settings
             .persist_setting(&conn, keys::INTEGRATION_BAND_BUDGET_MB, "512")
             .unwrap();

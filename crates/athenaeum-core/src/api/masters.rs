@@ -913,10 +913,10 @@ fn run_build(
     };
     let precal_desc = precal_choice.describe();
 
-    // Working-memory budget for the banded reader. Resolved per build from the
-    // machine and the compute-queue ceiling rather than a compile-time
-    // constant — the constant was measured costing 5.3x on a 100-frame set.
-    let band_budget = crate::integration::band_budget::resolve_budget_bytes(&conn, &ctx.settings)?;
+    // Both I/O knobs, resolved from the machine AND from the storage the
+    // frames actually live on — the same set may sit on a local disk today
+    // and a NAS tomorrow.
+    let io = crate::integration::io_policy::resolve(&conn, &ctx.settings, &paths, ctx.image_pool.current_num_threads())?;
 
     // Release the pooled connection before the (potentially long) pixel
     // work below — precal load + banded integration do no DB work, and the
@@ -958,7 +958,7 @@ fn run_build(
             &scratch,
             cancel_flag.as_ref(),
             progress,
-            band_budget,
+            io,
         )?
     } else {
         integrate_bias_like(
@@ -968,7 +968,7 @@ fn run_build(
             &scratch,
             cancel_flag.as_ref(),
             progress,
-            band_budget,
+            io,
         )?
     };
 

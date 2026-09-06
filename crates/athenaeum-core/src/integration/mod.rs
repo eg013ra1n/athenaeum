@@ -7,6 +7,8 @@ pub mod banded;
 pub mod cfa;
 pub mod combine;
 pub mod engine;
+pub mod io_policy;
+pub mod storage_class;
 
 #[derive(Debug)]
 pub enum IntegrationError {

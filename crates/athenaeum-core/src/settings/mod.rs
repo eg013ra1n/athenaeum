@@ -46,6 +46,11 @@ pub mod defaults {
     // physical RAM, clamped) — see integration::band_budget.
     pub const INTEGRATION_BAND_BUDGET_MB: &str = "0";
 
+    // Reads kept in flight per integration. 0 = auto (from the storage class:
+    // the CPU pool size locally, more on a network mount, which is
+    // latency-bound). See integration::storage_class.
+    pub const INTEGRATION_READ_CONCURRENCY: &str = "0";
+
     // Personal sync (Stage I). Dev-only ticket pairing gate — the primary-side
     // receiver + iroh transport only start when this is explicitly enabled.
     pub const SYNC_DEV_TICKET_PAIRING: &str = "false";
@@ -128,6 +133,10 @@ pub mod keys {
     /// Banded-integration working-memory budget, MB. `0` = auto (a quarter of
     /// physical RAM, clamped by `integration::band_budget`).
     pub const INTEGRATION_BAND_BUDGET_MB: &str = "integration.band_budget_mb";
+
+    /// Reads kept in flight per integration. `0` = auto (from the storage
+    /// class — see `integration::storage_class`).
+    pub const INTEGRATION_READ_CONCURRENCY: &str = "integration.read_concurrency";
 
     /// Dev-only gate for personal-sync ticket pairing (task A7). When `"true"`,
     /// `get_sync_pairing_ticket` lazily starts the receiver + iroh transport.
@@ -387,6 +396,19 @@ impl SettingsManager {
             );
             0
         }))
+    }
+
+    /// Configured reads-in-flight per integration. `0` is the auto sentinel;
+    /// `storage_class::read_concurrency` applies the bounds. An unparseable
+    /// value degrades to auto rather than failing a build — same stance as
+    /// `get_compute_max_concurrent`.
+    pub fn get_integration_read_concurrency(&self, conn: &Connection) -> Result<usize> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::INTEGRATION_READ_CONCURRENCY,
+            defaults::INTEGRATION_READ_CONCURRENCY,
+        )?;
+        Ok(value.parse().unwrap_or(0))
     }
 
     /// Get the device-wide sync UPLOAD limit in bytes/sec. `0` means

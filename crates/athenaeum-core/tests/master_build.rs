@@ -25,7 +25,18 @@ use athenaeum_core::fits_parser::FitsHeader;
 use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::integration::engine::{integrate_bias_like, EngineProgress};
+use athenaeum_core::integration::io_policy::IoPolicy;
+use athenaeum_core::integration::storage_class::StorageClass;
 use rusqlite::Connection;
+
+/// This test bypasses `api::masters::run_build`'s own I/O-policy resolution
+/// (it exercises the orchestration steps directly, not the build thread), so
+/// it forces the floor budget with a fixed policy rather than a real
+/// machine/storage-resolved one — concurrency and storage class are not
+/// under test here.
+fn fixed_io_policy() -> IoPolicy {
+    IoPolicy { band_budget_bytes: MIN_BUDGET_BYTES, read_concurrency: 1, storage: StorageClass::Local }
+}
 
 /// Seeds a 3-frame raw Dark calibration set with real 8x8 FITS files on
 /// disk and their DB rows (files/frames/calibration_set_frames). Mirrors
@@ -104,13 +115,10 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     let combine = resolve_recipe(None, "Dark", 3);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
     let on_band = |_current: usize, _total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {};
-    // This test bypasses `api::masters::run_build`'s own budget resolution
-    // (it exercises the orchestration steps directly, not the build thread),
-    // so it passes the floor rather than a real machine-resolved value.
     let out = integrate_bias_like(
         &paths, combine, &pool, scratch.path(), &AtomicBool::new(false),
         EngineProgress { on_band: &on_band },
-        MIN_BUDGET_BYTES,
+        fixed_io_policy(),
     ).unwrap();
 
     // Write: consolidated header + fixed v1 naming into the temp library dir.
@@ -217,7 +225,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
             IntegrationRecipe::average(Rejection::None),
             &pool, scratch.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            MIN_BUDGET_BYTES,
+            fixed_io_policy(),
         ).unwrap()
     };
 

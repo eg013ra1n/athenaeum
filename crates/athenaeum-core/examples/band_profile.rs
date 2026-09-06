@@ -2,10 +2,12 @@
 //! for `docs/superpowers/plans/2026-09-06-integration-throughput.md`.
 //!
 //! Usage:
-//!     cargo run --release -p athenaeum-core --example band_profile -- <dir> [name-substring] [budget_mb] [threads]
+//!     cargo run --release -p athenaeum-core --example band_profile -- <dir> [name-substring] [budget_mb] [threads] [readers]
 //!
 //! `budget_mb` defaults to 0, meaning "resolve the budget the way the app
-//! does"; pass a number to force one. `threads` 0 means "all cores".
+//! does"; pass a number to force one. `threads` 0 means "all cores". `readers`
+//! defaults to 0, meaning "decide from the detected storage class" — pass a
+//! number to force a read-concurrency override.
 //!
 //! COLD RUNS ONLY MEAN ANYTHING. `purge(8)` is refused to non-root users and
 //! `F_NOCACHE` is unreliable on APFS (it reported 103 MB/s and 252 MB/s for
@@ -48,6 +50,17 @@ fn main() {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
     let bytes_on_disk: u64 = paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
 
+    let storage = athenaeum_core::integration::storage_class::classify_all(&paths);
+    let readers: usize = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+    let io = athenaeum_core::integration::io_policy::IoPolicy {
+        band_budget_bytes: budget,
+        read_concurrency: athenaeum_core::integration::storage_class::read_concurrency(
+            storage, readers, pool.current_num_threads(),
+        ),
+        storage,
+    };
+    println!("storage {:?}, {} readers", io.storage, io.read_concurrency);
+
     println!(
         "{} frames, {:.2} GB on disk, budget {} MiB, {} threads",
         paths.len(),
@@ -67,7 +80,7 @@ fn main() {
         &std::env::temp_dir(),
         &AtomicBool::new(false),
         EngineProgress { on_band: &on_band },
-        budget,
+        io,
     )
     .expect("integration failed");
     let all = t.elapsed();
