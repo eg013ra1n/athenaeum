@@ -139,10 +139,12 @@ keyring = { version = "4", default-features = false, features = ["v1"] }
 
 # Windows RAM probe for the banded-integration budget policy
 # (`integration::band_budget`) plus the drive-type probe for storage-class
-# detection (`integration::storage_class`). Already in `Cargo.lock`
-# transitively, so this costs no new build time.
+# detection (`integration::storage_class` — `GetDriveTypeW` lives under
+# `Win32_Storage_FileSystem`, but the `DRIVE_REMOTE` constant it compares
+# against lives under `Win32_System_WindowsProgramming`, a different feature).
+# Already in `Cargo.lock` transitively, so this costs no new build time.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
 
 [features]
 # `render` pulls the rustafits image pipeline; `solver` pulls the plate-solver.

@@ -401,14 +401,24 @@ impl SettingsManager {
     /// Configured reads-in-flight per integration. `0` is the auto sentinel;
     /// `storage_class::read_concurrency` applies the bounds. An unparseable
     /// value degrades to auto rather than failing a build — same stance as
-    /// `get_compute_max_concurrent`.
+    /// `get_integration_band_budget_mb` above (NOT `get_compute_max_concurrent`,
+    /// which does `value.parse()?` and propagates instead of degrading). This
+    /// setting has no Settings UI, so a hand-edited or imported typo is the
+    /// only way it goes bad — logged before degrading, same as the sibling.
     pub fn get_integration_read_concurrency(&self, conn: &Connection) -> Result<usize> {
         let value = self.get_with_precedence(
             conn,
             keys::INTEGRATION_READ_CONCURRENCY,
             defaults::INTEGRATION_READ_CONCURRENCY,
         )?;
-        Ok(value.parse().unwrap_or(0))
+        Ok(value.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                key = keys::INTEGRATION_READ_CONCURRENCY,
+                value = %value,
+                "unparseable setting value — falling back to auto"
+            );
+            0
+        }))
     }
 
     /// Get the device-wide sync UPLOAD limit in bytes/sec. `0` means

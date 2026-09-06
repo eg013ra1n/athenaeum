@@ -131,7 +131,13 @@ fn classify_existing(path: &Path) -> StorageClass {
     if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
         return StorageClass::Local;
     }
-    if is_network_magic(buf.f_type as i64) { StorageClass::Network } else { StorageClass::Local }
+    // `f_type` is `__fsword_t`, which is `i32` on 32-bit Linux — sign-extending
+    // it straight to `i64` would turn CIFS (0xFF534D42) and SMB2 (0xFE534D42)
+    // negative and miss the table below, silently classifying every SMB mount
+    // as Local. Masking to the low 32 bits first is a no-op on the 64-bit
+    // (`i64`-native) targets this project actually ships.
+    let f_type = (buf.f_type as i64) & 0xFFFF_FFFF;
+    if is_network_magic(f_type) { StorageClass::Network } else { StorageClass::Local }
 }
 
 /// Only the Windows `classify_existing` arm calls this in production; it
@@ -147,7 +153,9 @@ pub(crate) fn is_unc(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn classify_existing(path: &Path) -> StorageClass {
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, DRIVE_REMOTE};
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
     if is_unc(path) {
         return StorageClass::Network;
     }
