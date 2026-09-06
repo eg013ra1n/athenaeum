@@ -28,10 +28,28 @@ pub struct IntegrationOutput {
     /// Output pixels whose ENTIRE stack was non-finite — nothing left to
     /// combine, so 0.0 was written.
     pub all_bad_pixels: usize,
+    /// Wall time spent inside `BandSource::read_band` across every band,
+    /// including a flat's pass-1 reads. Separated from `combine_duration`
+    /// because the two phases have completely different bottlenecks and only
+    /// the engine can tell them apart.
+    pub read_duration: std::time::Duration,
+    /// Wall time spent in the parallel per-pixel combine across every band.
+    pub combine_duration: std::time::Duration,
+    /// Rows per band and how many bands the run used — the two numbers the
+    /// band budget actually decides, reported so the build's log line does not
+    /// have to re-derive them.
+    pub band_rows: usize,
+    pub bands: usize,
+    /// Pixel bytes actually read (sum of `rows * width * bytes_per_sample`
+    /// over every band and frame). Not the files' size on disk: headers and
+    /// padding are never read, and a flat's pass 1 reads only its central
+    /// third.
+    pub bytes_read: u64,
 }
 
 pub struct EngineProgress<'a> {
-    pub on_band: &'a dyn Fn(usize, usize),
+    /// `(band_index_1based, bands_total, bytes_read_so_far, bytes_total)`.
+    pub on_band: &'a dyn Fn(usize, usize, u64, u64),
 }
 
 pub enum FlatPrecal {
@@ -73,6 +91,12 @@ fn run_banded(
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
     let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(h);
     let bands_total = h.div_ceil(band_rows);
+    // Computed once, next to `band_rows`, and referenced from every band's
+    // progress call below — this run's own share of the work (a flat's pass 1
+    // has already happened by the time `run_banded` is called for pass 2, and
+    // `integrate_flat_inner` adds its bytes on top via a wrapped `on_band`).
+    let per_row_bytes = src.bytes_per_row();
+    let bytes_total = (h * per_row_bytes) as u64;
     let mut out = vec![0f32; w * h];
     let rejected = AtomicUsize::new(0);
     // Non-finite accounting (audit C2). Plain counters shared across the rayon
@@ -81,19 +105,26 @@ fn run_banded(
     let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
     let all_bad = AtomicUsize::new(0);
     let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
+    let mut read_duration = std::time::Duration::ZERO;
+    let mut combine_duration = std::time::Duration::ZERO;
+    let mut bytes_read: u64 = 0;
 
     for (band_idx, y0) in (0..h).step_by(band_rows).enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(IntegrationError::Cancelled);
         }
         let rows = band_rows.min(h - y0);
+        let t_read = std::time::Instant::now();
         src.read_band(y0, rows, &mut band_bufs)?;
+        read_duration += t_read.elapsed();
+        bytes_read += (rows * per_row_bytes) as u64;
 
         // `y0` (the band's first global row) is captured by the closure below
         // for the precal MasterFrame row index (`gy = y0 + row_in_band`). It
         // must stay in scope for the closure's lifetime — do not hoist the
         // closure out of this `for` loop or split it into a free function
         // without threading `y0` through explicitly.
+        let t_combine = std::time::Instant::now();
         let out_band = &mut out[y0 * w..(y0 + rows) * w];
         pool.install(|| {
             out_band
@@ -140,7 +171,8 @@ fn run_banded(
                     }
                 });
         });
-        (progress.on_band)(band_idx + 1, bands_total);
+        combine_duration += t_combine.elapsed();
+        (progress.on_band)(band_idx + 1, bands_total, bytes_read, bytes_total);
     }
 
     // Every input sample was finiteness-checked above, so a non-finite OUTPUT
@@ -162,9 +194,15 @@ fn run_banded(
         flat_norm: None,
         bad_samples_per_frame: bad_samples.into_iter().map(|a| a.into_inner()).collect(),
         all_bad_pixels: all_bad.into_inner(),
+        read_duration,
+        combine_duration,
+        band_rows,
+        bands: bands_total,
+        bytes_read,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn integrate_bias_like(
     paths: &[PathBuf],
     recipe: IntegrationRecipe,
@@ -172,8 +210,9 @@ pub fn integrate_bias_like(
     scratch_dir: &Path,
     cancel: &AtomicBool,
     progress: EngineProgress<'_>,
+    band_budget_bytes: usize,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    integrate_bias_like_inner(paths, recipe, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
+    integrate_bias_like_inner(paths, recipe, pool, scratch_dir, cancel, progress, band_budget_bytes)
 }
 
 fn integrate_bias_like_inner(
@@ -190,6 +229,7 @@ fn integrate_bias_like_inner(
     run_banded(&mut src, &scales, None, recipe, pool, cancel, &progress, band_budget_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn integrate_flat(
     paths: &[PathBuf],
     precal: &FlatPrecal,
@@ -198,8 +238,9 @@ pub fn integrate_flat(
     scratch_dir: &Path,
     cancel: &AtomicBool,
     progress: EngineProgress<'_>,
+    band_budget_bytes: usize,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    integrate_flat_inner(paths, precal, recipe, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
+    integrate_flat_inner(paths, precal, recipe, pool, scratch_dir, cancel, progress, band_budget_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,11 +271,21 @@ fn integrate_flat_inner(
     let mut counts = vec![0usize; n];
     let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(cy1 - cy0);
     let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
+    // Computed once, next to `band_rows` — pass 1 only ever reads the
+    // central-third rows, so its share of the total is that row count, not
+    // the full height `run_banded` (pass 2, below) will report on its own.
+    let per_row_bytes = src.bytes_per_row();
+    let pass1_total_bytes = ((cy1 - cy0) * per_row_bytes) as u64;
+    let mut pass1_read = std::time::Duration::ZERO;
+    let mut pass1_bytes_read: u64 = 0;
     let mut y = cy0;
     while y < cy1 {
         if cancel.load(Ordering::Relaxed) { return Err(IntegrationError::Cancelled); }
         let rows = band_rows.min(cy1 - y);
+        let t_read = std::time::Instant::now();
         src.read_band(y, rows, &mut band_bufs)?;
+        pass1_read += t_read.elapsed();
+        pass1_bytes_read += (rows * per_row_bytes) as u64;
         for (i, frame) in band_bufs.iter().enumerate() {
             for r in 0..rows {
                 let gy = y + r;
@@ -275,8 +326,18 @@ fn integrate_flat_inner(
     // Pass 2: full combine with precal + scale applied. `BandSource::read_band`
     // takes `&mut self`, so pass 1 (above) and pass 2 reuse the SAME `src` —
     // readers just seek back to the start and stream again; no need to reopen.
-    let mut out = run_banded(&mut src, &scales, Some(precal), recipe, pool, cancel, &progress, band_budget_bytes)?;
+    //
+    // `run_banded` only knows its own (pass 2) height, not pass 1's
+    // central-third read that already happened above it — wrap the caller's
+    // `on_band` so the byte pair it sees spans both passes.
+    let wrapped_on_band = |cur: usize, total: usize, bytes_done: u64, bytes_total: u64| {
+        (progress.on_band)(cur, total, pass1_bytes_read + bytes_done, pass1_total_bytes + bytes_total);
+    };
+    let wrapped_progress = EngineProgress { on_band: &wrapped_on_band };
+    let mut out = run_banded(&mut src, &scales, Some(precal), recipe, pool, cancel, &wrapped_progress, band_budget_bytes)?;
     out.flat_norm = Some(central_third_mean(&out.data, w, h));
+    out.read_duration += pass1_read;
+    out.bytes_read += pass1_bytes_read;
     Ok(out)
 }
 
@@ -290,7 +351,7 @@ mod tests {
     fn pool() -> rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap()
     }
-    fn nop() -> impl Fn(usize, usize) { |_, _| {} }
+    fn nop() -> impl Fn(usize, usize, u64, u64) { |_, _, _, _| {} }
 
     fn write(dir: &std::path::Path, name: &str, w: usize, h: usize, f: impl Fn(usize, usize) -> f32) -> std::path::PathBuf {
         let mut d = vec![0f32; w * h];
@@ -315,6 +376,7 @@ mod tests {
             IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         assert_eq!((out.width, out.height), (w, h));
         let hot = out.data[5 * w + 5];
@@ -339,6 +401,7 @@ mod tests {
             &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         // After per-frame normalization all three frames agree, so the master
         // must reproduce the SHAPE: ratio of two positions equals shape ratio.
@@ -365,6 +428,7 @@ mod tests {
             &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 0.01),
             "1500 - 500 precal = 1000 everywhere");
@@ -384,6 +448,7 @@ mod tests {
             &paths, &FlatPrecal::SyntheticBias(100.0), IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 0.01));
     }
@@ -397,6 +462,7 @@ mod tests {
         let r = integrate_bias_like(
             &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &cancel,
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         );
         assert!(matches!(r, Err(IntegrationError::Cancelled)));
     }
@@ -414,6 +480,7 @@ mod tests {
         let out = integrate_bias_like(
             &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|&v| v == -5.0), "no clipping policy");
     }
@@ -508,6 +575,7 @@ mod tests {
             IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|v| v.is_finite()), "master must never contain non-finite pixels");
         assert!((out.data[5] - 100.0).abs() < 1e-3, "pixel 5 combines the 15 good samples");
@@ -536,6 +604,7 @@ mod tests {
             &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
         ).unwrap();
         assert!(out.data.iter().all(|v| v.is_finite()));
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 1e-3),
@@ -543,5 +612,33 @@ mod tests {
         assert_eq!(out.bad_samples_per_frame, vec![0, 1, 0]);
         assert_eq!(out.all_bad_pixels, 0, "the pixel still has 2 valid samples");
         assert!(out.flat_norm.is_some_and(|n| (n - 1000.0).abs() < 1e-3));
+    }
+
+    /// The harness and, from Task 7, the build's completion log line report
+    /// where the time went. Both numbers come out of the engine because only
+    /// it can separate the two phases.
+    #[test]
+    fn integration_output_reports_read_and_combine_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (32, 48);
+        let paths = vec![
+            write(dir.path(), "t1.fits", w, h, |_, _| 10.0),
+            write(dir.path(), "t2.fits", w, h, |_, _| 20.0),
+            write(dir.path(), "t3.fits", w, h, |_, _| 30.0),
+        ];
+        let on_band = nop();
+        let out = integrate_bias_like(
+            &paths,
+            IntegrationRecipe::median(Rejection::None),
+            &pool(),
+            dir.path(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
+        )
+        .unwrap();
+        assert!(out.read_duration > std::time::Duration::ZERO, "read time not recorded");
+        assert!(out.combine_duration > std::time::Duration::ZERO, "combine time not recorded");
+        assert!(out.data.iter().all(|&v| v == 20.0), "median unchanged by instrumentation");
     }
 }

@@ -168,6 +168,26 @@ impl BandSource {
     pub fn height(&self) -> usize { self.height }
     pub fn frame_count(&self) -> usize { self.readers.len() }
 
+    /// Source bytes `read_band` actually pulls off disk for one row, summed
+    /// over every frame in this source: `width * bytes_per_sample` per
+    /// frame, where `bytes_per_sample` is `bitpix.unsigned_abs() / 8` for a
+    /// direct FITS reader and 4 (f32) for the decode-and-spill scratch
+    /// fallback. This counts SOURCE bytes, not the widened f32 the engine
+    /// holds per sample in RAM — a BITPIX=16 frame counts 2 bytes/pixel here
+    /// even though `read_band` hands back f32.
+    pub fn bytes_per_row(&self) -> usize {
+        self.readers
+            .iter()
+            .map(|r| {
+                let bytes_per_sample = match r {
+                    FrameReader::Fits { bitpix, .. } => (bitpix.unsigned_abs() as usize) / 8,
+                    FrameReader::Scratch { .. } => 4,
+                };
+                self.width * bytes_per_sample
+            })
+            .sum()
+    }
+
     /// Reads rows [y0, y0+rows) of every frame into out[i] (len = rows*width),
     /// BZERO/BSCALE applied, native f32, no stretch, CFA untouched.
     pub fn read_band(&mut self, y0: usize, rows: usize, out: &mut [Vec<f32>]) -> Result<(), IntegrationError> {
@@ -369,6 +389,18 @@ mod tests {
         let rows = band_rows_for_budget(6248, 100, 256 * 1024 * 1024);
         assert!(rows >= 16 && rows <= 256, "{rows}");
         assert_eq!(band_rows_for_budget(10, 1, usize::MAX), usize::MAX.min(band_rows_for_budget(10, 1, usize::MAX))); // no panic on huge budgets
+    }
+
+    #[test]
+    fn bytes_per_row_counts_source_bytes_not_widened_f32() {
+        let dir = tempfile::tempdir().unwrap();
+        // f32 (BITPIX=-32): 4 bytes/sample, source == widened width.
+        let f32_file = f32_fixture(dir.path(), "float.fits", 10, 4, |_, _| 1.0);
+        // u16 (BITPIX=16): 2 bytes/sample on disk, even though read_band
+        // hands back f32 for it.
+        let u16_file = u16_fixture(dir.path(), "u16.fits", 10, 4, 1000);
+        let src = BandSource::open(&[f32_file, u16_file], dir.path()).unwrap();
+        assert_eq!(src.bytes_per_row(), 10 * 4 + 10 * 2);
     }
 
     #[test]

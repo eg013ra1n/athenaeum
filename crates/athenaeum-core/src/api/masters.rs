@@ -923,7 +923,7 @@ fn run_build(
 
     let pool = ctx.image_pool.as_ref();
     let scratch = std::env::temp_dir();
-    let on_band = |current: usize, total: usize| {
+    let on_band = |current: usize, total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {
         let percent = if total > 0 {
             (current as f64 / total as f64) * 100.0
         } else {
@@ -955,6 +955,7 @@ fn run_build(
             &scratch,
             cancel_flag.as_ref(),
             progress,
+            crate::integration::engine::BAND_BUDGET_BYTES,
         )?
     } else {
         integrate_bias_like(
@@ -964,6 +965,7 @@ fn run_build(
             &scratch,
             cancel_flag.as_ref(),
             progress,
+            crate::integration::engine::BAND_BUDGET_BYTES,
         )?
     };
 

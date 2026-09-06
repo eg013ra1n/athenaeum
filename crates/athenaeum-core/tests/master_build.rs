@@ -102,10 +102,14 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     // Resolve -> integrate (n=3 < 15 => plain Median for a non-flat type).
     let combine = resolve_recipe(None, "Dark", 3);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
-    let on_band = |_current: usize, _total: usize| {};
+    let on_band = |_current: usize, _total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {};
+    // `engine::BAND_BUDGET_BYTES` is `pub(crate)` — not visible from this
+    // external integration-test crate — so this mirrors its value (256 MiB)
+    // directly, same as the app's default.
     let out = integrate_bias_like(
         &paths, combine, &pool, scratch.path(), &AtomicBool::new(false),
         EngineProgress { on_band: &on_band },
+        256 * 1024 * 1024,
     ).unwrap();
 
     // Write: consolidated header + fixed v1 naming into the temp library dir.
@@ -206,12 +210,13 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     // mean is what actually shifts, which is what "the rebuild re-read the
     // changed source" needs to observe.
     let integrate = |paths: &[PathBuf]| {
-        let on_band = |_c: usize, _t: usize| {};
+        let on_band = |_c: usize, _t: usize, _bytes_read_so_far: u64, _bytes_total: u64| {};
         integrate_bias_like(
             paths,
             IntegrationRecipe::average(Rejection::None),
             &pool, scratch.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
+            256 * 1024 * 1024,
         ).unwrap()
     };
 
