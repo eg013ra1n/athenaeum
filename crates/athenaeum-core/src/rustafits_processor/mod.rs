@@ -47,7 +47,7 @@ pub fn needs_vng_gate(path: &Path, resolution: Resolution) -> bool {
     match bayerpat {
         Ok(pat) => pat.is_some_and(|p| !p.trim().is_empty()),
         Err(error) => {
-            tracing::debug!(path = %path.display(), error = %error, "header probe failed — taking the VNG gate defensively");
+            tracing::warn!(path = %path.display(), error = %error, "header probe failed — taking the VNG gate defensively");
             true
         }
     }

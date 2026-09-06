@@ -121,7 +121,11 @@ pub async fn get_frame_preview(
 
     // Gate BEFORE permit, never the reverse (see `VNG_GATE`'s doc in core):
     // a full-resolution colour render waits here holding nothing, so the
-    // image semaphore keeps serving thumbnails and previews meanwhile.
+    // image semaphore keeps serving thumbnails and previews meanwhile. The
+    // guard travels into the `spawn_blocking` closure below with the permit —
+    // a handler-local would drop (and release the gate under a still-running
+    // render) if the client disconnects and axum drops this future at an
+    // `.await`.
     let res = Resolution::from_string(&resolution_str);
     let path_buf = PathBuf::from(&file_path);
     let _vng_gate = if rustafits_processor::needs_vng_gate(&path_buf, res) {
@@ -140,6 +144,7 @@ pub async fn get_frame_preview(
 
     let jpeg_data = tokio::task::spawn_blocking(move || {
         let _permit = _permit; // hold permit until processing completes
+        let _vng_gate = _vng_gate; // and the VNG gate — a cancelled request must not release it under a running render
         rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &pool)
     })
     .await
