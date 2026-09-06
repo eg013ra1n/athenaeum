@@ -324,6 +324,19 @@ impl BandSource {
     /// `decode_row_into` / `decode_frame_into` on read.
     pub fn read_band(&mut self, y0: usize, rows: usize, out: &mut BandPlanes) -> Result<(), IntegrationError> {
         assert_eq!(out.bufs.len(), self.readers.len());
+        // `out`'s `width`/`kinds` are snapshotted once at `BandPlanes::new` and
+        // never re-derived here, so a `BandPlanes` built from a DIFFERENT
+        // `BandSource` with the same frame count would otherwise decode with
+        // the wrong row stride and the wrong kinds — silently, no panic. The
+        // frame-count check above cannot catch that; this one can, at debug
+        // cost only (production never pays for it, same as any other
+        // debug_assert invariant check in this crate).
+        debug_assert_eq!(
+            out.width, self.width,
+            "read_band: BandPlanes width {} does not match this BandSource's width {} — \
+             was `out` built from a different BandSource?",
+            out.width, self.width
+        );
         let w = self.width;
         if y0 + rows > self.height {
             return Err(IntegrationError::BadInput(format!("band {y0}+{rows} beyond height {}", self.height)));
@@ -570,5 +583,124 @@ mod tests {
         let u16_file = u16_fixture(dir.path(), "u16.fits", 10, 4, 1000);
         let src = BandSource::open(&[f32_file, u16_file], dir.path()).unwrap();
         assert_eq!(src.bytes_per_row(), 10 * 4 + 10 * 2);
+    }
+
+    // ── Task 4 fix-round-1 M4: table-driven pin for every `PlaneKind` arm ──
+    //
+    // The multi-band measurement gate is a BITPIX 16 corpus, so it only ever
+    // exercises `I16Be`. `planes_decode_identically_to_the_old_f32_path`
+    // above only exercises `F32Be`/`I16Be` too, and
+    // `concurrent_spills_at_same_idx_never_cross_contaminate` pins the spill
+    // *writer*'s little-endian encoding, not the `F32Le` *reader* arm. That
+    // left `U8`, `I32Be`, `F64Be` and `F32Le` with inspection only behind a
+    // byte-identical-pixels constraint. These tests hand-build byte arrays
+    // (no FITS fixtures) and check both `decode` and `decode_run` for all six
+    // variants.
+
+    /// `decode` and `decode_run` must agree, sample by sample, over every
+    /// sample in `bytes` — `decode_run` is the bulk path every production
+    /// caller reaches through (`decode_frame_into`/`decode_row_into`), so it
+    /// must never diverge from the scalar path `sample()` uses.
+    fn assert_decode_and_run_agree(kind: PlaneKind, bytes: &[u8], n: usize) {
+        let mut run = vec![0f32; n];
+        kind.decode_run(bytes, 0, &mut run);
+        for i in 0..n {
+            assert_eq!(kind.decode(bytes, i), run[i], "decode/decode_run disagree at sample {i}");
+        }
+    }
+
+    #[test]
+    fn u8_applies_bscale_and_bzero() {
+        // Non-unity scale AND non-zero offset: dropping either one changes
+        // the result, so a lost `bscale` or a lost `bzero` both fail this.
+        let kind = PlaneKind::U8 { bzero: 1.0, bscale: 2.5 };
+        let bytes = [10u8, 20, 30];
+        assert_eq!(kind.decode(&bytes, 0), 10.0 * 2.5 + 1.0);
+        assert_eq!(kind.decode(&bytes, 1), 20.0 * 2.5 + 1.0);
+        assert_eq!(kind.decode(&bytes, 2), 30.0 * 2.5 + 1.0);
+        assert_decode_and_run_agree(kind, &bytes, 3);
+    }
+
+    #[test]
+    fn i16be_negative_stored_value_with_unsigned_convention() {
+        // The real unsigned-16 FITS convention: BZERO=32768, BSCALE=1, and
+        // the on-disk value is SIGNED, with the negative half of the range
+        // representing the upper half of the unsigned range. -500 stored
+        // means physical 32268 — a wrong-endian read or a dropped BZERO both
+        // fail this.
+        let kind = PlaneKind::I16Be { bzero: 32768.0, bscale: 1.0 };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(-500i16).to_be_bytes());
+        bytes.extend_from_slice(&(1000i16).to_be_bytes());
+        assert_eq!(kind.decode(&bytes, 0), 32268.0);
+        assert_eq!(kind.decode(&bytes, 1), 33768.0);
+        assert_decode_and_run_agree(kind, &bytes, 2);
+    }
+
+    #[test]
+    fn i32be_negative_stored_value() {
+        let kind = PlaneKind::I32Be { bzero: 7.0, bscale: 3.0 };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(-123456i32).to_be_bytes());
+        bytes.extend_from_slice(&(654321i32).to_be_bytes());
+        assert_eq!(kind.decode(&bytes, 0), -123456.0 * 3.0 + 7.0);
+        assert_eq!(kind.decode(&bytes, 1), 654321.0 * 3.0 + 7.0);
+        assert_decode_and_run_agree(kind, &bytes, 2);
+    }
+
+    #[test]
+    fn f32be_byte_order_matters() {
+        // A value whose big-endian and little-endian byte patterns differ, so
+        // a byte-order slip in the decode arm is caught rather than passing
+        // by coincidence (a byte-palindromic bit pattern would not catch it).
+        let kind = PlaneKind::F32Be { bzero: 0.0, bscale: 1.0 };
+        let v: f32 = 12345.625;
+        let be = v.to_be_bytes();
+        let le = v.to_le_bytes();
+        assert_ne!(be, le, "test value's BE/LE byte patterns must differ to be a real test");
+        assert_eq!(kind.decode(&be, 0), v);
+        assert_decode_and_run_agree(kind, &be, 1);
+    }
+
+    #[test]
+    fn f64be_casts_only_at_the_end() {
+        // Catastrophic cancellation: `raw` and `-bzero` are equal to within a
+        // residual f32 cannot resolve at this magnitude (f32's spacing at 1e8
+        // is 8), so casting each operand to f32 BEFORE adding throws the
+        // residual away entirely and gives exactly 0.0. Doing the same
+        // subtraction in f64 first keeps the residual, and only THEN casting
+        // to f32 preserves it. This is the textbook case for needing the
+        // wider type — exactly what BITPIX -64 arithmetic depends on.
+        // Verified below rather than hand-computed, so the test cannot be
+        // fooled by an arithmetic slip of its own.
+        let raw: f64 = 100_000_000.0;
+        let bscale: f64 = 1.0;
+        let bzero: f64 = -raw + 1e-7;
+        let correct = (raw * bscale + bzero) as f32;
+        let wrong_early_cast = (raw as f32) * (bscale as f32) + (bzero as f32);
+        assert_ne!(
+            correct, wrong_early_cast,
+            "test input does not discriminate early-cast from late-cast — pick different numbers"
+        );
+        assert_ne!(correct, 0.0, "the whole point is that the f64 path keeps a nonzero residual");
+
+        let kind = PlaneKind::F64Be { bzero, bscale };
+        let bytes = raw.to_be_bytes();
+        assert_eq!(kind.decode(&bytes, 0), correct);
+        assert_decode_and_run_agree(kind, &bytes, 1);
+    }
+
+    #[test]
+    fn f32le_applies_no_scaling() {
+        // Decode-and-spill scratch path (XISF / RGB FITS / nonstandard
+        // headers): the spilled data is already physical, little-endian, no
+        // BZERO/BSCALE. Confirm the raw value comes back completely
+        // unscaled — there is no bzero/bscale field on this variant to drop,
+        // so the only way to get this wrong is to apply some anyway.
+        let kind = PlaneKind::F32Le;
+        let v: f32 = -42.5;
+        let bytes = v.to_le_bytes();
+        assert_eq!(kind.decode(&bytes, 0), v, "F32Le must not apply any scale/offset");
+        assert_decode_and_run_agree(kind, &bytes, 1);
     }
 }
