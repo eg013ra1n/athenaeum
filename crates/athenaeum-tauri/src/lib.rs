@@ -170,11 +170,12 @@ pub fn run() {
                         .flatten()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(200);
-                    let cache_max_mb: usize = db::get_setting(&conn, settings::keys::BLINK_MEMORY_CACHE_MAX_MB)
-                        .ok()
-                        .flatten()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(512);
+                    let cache_max_mb = settings::resolve_blink_memory_cache_max_mb(
+                        db::get_setting(&conn, settings::keys::BLINK_MEMORY_CACHE_MAX_MB)
+                            .ok()
+                            .flatten()
+                            .as_deref(),
+                    );
                     let retention_minutes: u64 = db::get_setting(&conn, settings::keys::BLINK_MEMORY_RETENTION_MINUTES)
                         .ok()
                         .flatten()

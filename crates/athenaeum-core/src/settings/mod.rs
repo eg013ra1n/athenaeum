@@ -219,6 +219,38 @@ pub mod keys {
     pub const SYNC_PEER_CAPABILITIES: &str = "sync.peer_capabilities";
 }
 
+/// Bounds for `blink.memory_cache_max_mb`. The Settings page validates the
+/// same 64..=16384 window; this is the backend's own copy, so a value that
+/// reached the row another way (a script, an older client, a hand edit)
+/// degrades instead of turning the preview cache into a single entry (`0`)
+/// or an unbounded one.
+pub const BLINK_MEMORY_CACHE_MAX_MB_MIN: usize = 64;
+pub const BLINK_MEMORY_CACHE_MAX_MB_MAX: usize = 16384;
+
+/// Resolve `blink.memory_cache_max_mb` from its raw stored text: absent or
+/// unparseable falls back to the default (logged when a value was present),
+/// then clamps. One function for the four sites that apply it — the two
+/// startup readers and the two `set_setting` handlers — so they cannot drift
+/// (review 2026-09-06 F5).
+pub fn resolve_blink_memory_cache_max_mb(raw: Option<&str>) -> usize {
+    let mb = match raw.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(v) => v,
+        None => {
+            if let Some(raw) = raw {
+                tracing::warn!(
+                    key = keys::BLINK_MEMORY_CACHE_MAX_MB,
+                    value = %raw,
+                    "unparseable setting value — using the default"
+                );
+            }
+            defaults::BLINK_MEMORY_CACHE_MAX_MB
+                .parse()
+                .expect("BLINK_MEMORY_CACHE_MAX_MB default is numeric")
+        }
+    };
+    mb.clamp(BLINK_MEMORY_CACHE_MAX_MB_MIN, BLINK_MEMORY_CACHE_MAX_MB_MAX)
+}
+
 /// Runtime overrides for settings (session-specific)
 pub struct SettingsManager {
     runtime_overrides: Mutex<HashMap<String, String>>,
@@ -714,5 +746,17 @@ mod tests {
             manager.get_sync_max_upload_bytes_per_sec(&conn).unwrap(),
             100_000
         );
+    }
+
+    /// Review 2026-09-06 F5: the byte budget had no backend clamp — a `0`
+    /// from a script or a hand edit turned the cache into a single entry with
+    /// no error and no log. One resolver, used at all four apply sites.
+    #[test]
+    fn blink_cache_max_mb_resolves_default_and_clamps() {
+        assert_eq!(resolve_blink_memory_cache_max_mb(None), 512, "absent → default");
+        assert_eq!(resolve_blink_memory_cache_max_mb(Some("abc")), 512, "unparseable → default");
+        assert_eq!(resolve_blink_memory_cache_max_mb(Some("0")), BLINK_MEMORY_CACHE_MAX_MB_MIN, "0 must not mean one entry");
+        assert_eq!(resolve_blink_memory_cache_max_mb(Some("999999")), BLINK_MEMORY_CACHE_MAX_MB_MAX);
+        assert_eq!(resolve_blink_memory_cache_max_mb(Some(" 1024 ")), 1024, "whitespace tolerated");
     }
 }

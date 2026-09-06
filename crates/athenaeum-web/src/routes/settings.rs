@@ -77,7 +77,7 @@ pub async fn set_setting(
         let size: usize = args.value.parse().unwrap_or(200);
         state.ctx.memory_cache.lock().unwrap().set_max_entries(size);
     } else if args.key == settings::keys::BLINK_MEMORY_CACHE_MAX_MB {
-        let mb: usize = args.value.parse().unwrap_or(512);
+        let mb = settings::resolve_blink_memory_cache_max_mb(Some(&args.value));
         state.ctx.memory_cache.lock().unwrap().set_max_bytes(mb * 1024 * 1024);
     } else if args.key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
         let minutes: u64 = args.value.parse().unwrap_or(30);
