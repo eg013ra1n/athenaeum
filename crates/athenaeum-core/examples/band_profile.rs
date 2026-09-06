@@ -83,7 +83,19 @@ fn main() {
         100.0 * read_s / all.as_secs_f64(),
         100.0 * out.combine_duration.as_secs_f64() / all.as_secs_f64()
     );
-    // Fingerprint so later tasks can prove the pixels did not move.
+    // Human-readable sanity check — NOT the fingerprint later tasks must
+    // reproduce: a scalar sum lets equal-and-opposite drift cancel exactly,
+    // and at seven significant digits on a real 6248x4176 bias set (sum
+    // ~2.6e10) a whole 105-row band can drift 0.01 ADU without moving a
+    // printed digit.
     let sum: f64 = out.data.iter().map(|&v| v as f64).sum();
-    println!("checksum  {:.6e}  ({}x{})", sum, out.width, out.height);
+    println!("sum       {:.6e}  ({}x{})", sum, out.width, out.height);
+    // The actual fingerprint: bytewise hash of every f32, so any pixel
+    // drift at all — not just drift that survives summation — changes it.
+    // Tasks 3, 4 and 5 must reproduce this exactly.
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for &v in &out.data {
+        hasher.update(&v.to_le_bytes());
+    }
+    println!("fingerprint {:016x}  ({}x{})", hasher.digest(), out.width, out.height);
 }

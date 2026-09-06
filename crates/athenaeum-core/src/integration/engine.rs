@@ -641,4 +641,132 @@ mod tests {
         assert!(out.combine_duration > std::time::Duration::ZERO, "combine time not recorded");
         assert!(out.data.iter().all(|&v| v == 20.0), "median unchanged by instrumentation");
     }
+
+    /// Review fix-round-1 finding I1: `band_rows`/`bands`/`bytes_read` were
+    /// never asserted against a real number, only `read_duration` and
+    /// `combine_duration` were. h=48 is deliberately NOT a multiple of the
+    /// forced 20-row band size, so the run is 20+20+8 rows — a naive
+    /// `bytes_read` accumulator that used the nominal `band_rows` for every
+    /// band (instead of the band's actual, possibly-short, row count) would
+    /// overcount by exactly the shortfall on the last band and this test
+    /// would catch it.
+    #[test]
+    fn bias_like_reports_exact_band_geometry_and_bytes_across_a_short_last_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (32, 48);
+        let paths = vec![
+            write(dir.path(), "b1.fits", w, h, |_, _| 10.0),
+            write(dir.path(), "b2.fits", w, h, |_, _| 20.0),
+            write(dir.path(), "b3.fits", w, h, |_, _| 30.0),
+        ];
+        let on_band = nop();
+        // band_rows_for_budget's per-row cost is (frames+2)*width*4 =
+        // (3+2)*32*4 = 640; budget 12_800 -> band_rows = 12_800/640 = 20
+        // exactly, so the 48-row image runs as 20/20/8-row bands.
+        let out = integrate_bias_like(
+            &paths,
+            IntegrationRecipe::median(Rejection::None),
+            &pool(),
+            dir.path(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            12_800,
+        )
+        .unwrap();
+        assert_eq!(out.band_rows, 20, "budget math must give exactly 20-row bands here");
+        assert_eq!(out.bands, 48usize.div_ceil(out.band_rows), "3 bands: 20 + 20 + 8");
+        assert_eq!(
+            out.bytes_read,
+            (48 * 32 * 4 * 3) as u64,
+            "the short last band (8 rows) must be counted at its real length, not the nominal 20 \
+             (3 frames, f32 source, 4 bytes/sample)"
+        );
+    }
+
+    /// Review fix-round-1 finding I1 (judgment call #1): `bytes_read` for a
+    /// flat must fold in pass 1's central-third read on top of pass 2's full
+    /// height — pinned numerically, not just by field presence. cy0 = h/3 =
+    /// 16, cy1 = ((2*h)/3).max(h/3+1).min(h) = 32, so pass 1 reads exactly
+    /// 16 rows; pass 2 (`run_banded`) reads the full 48.
+    #[test]
+    fn flat_bytes_read_includes_pass_one_central_third_plus_pass_two_full_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (32, 48);
+        let paths = vec![
+            write(dir.path(), "f1.fits", w, h, |_, _| 1000.0),
+            write(dir.path(), "f2.fits", w, h, |_, _| 1000.0),
+            write(dir.path(), "f3.fits", w, h, |_, _| 1000.0),
+        ];
+        let on_band = nop();
+        let out = integrate_flat_inner(
+            &paths,
+            &FlatPrecal::None,
+            IntegrationRecipe::median(Rejection::None),
+            &pool(),
+            dir.path(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            out.bytes_read,
+            ((48 + 16) * 32 * 4 * 3) as u64,
+            "pass 1 (16 central rows) + pass 2 (48 full rows), 3 frames, 4 bytes/sample"
+        );
+    }
+
+    /// Review fix-round-1 finding I1 (judgment call #2): the `on_band`
+    /// wrapper in `integrate_flat_inner` must report a byte pair that spans
+    /// BOTH passes, not just pass 2's own share — `run_banded` has no way to
+    /// see pass 1's read on its own. Forces a multi-band pass 2
+    /// (`band_budget_bytes = 1` clamps to 1-row bands, so `on_band` fires 48
+    /// times) so the wrapping is exercised across more than a single call.
+    #[test]
+    fn flat_progress_bytes_span_both_passes_via_the_wrapped_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (32, 48);
+        let paths = vec![
+            write(dir.path(), "f1.fits", w, h, |_, _| 1000.0),
+            write(dir.path(), "f2.fits", w, h, |_, _| 1000.0),
+            write(dir.path(), "f3.fits", w, h, |_, _| 1000.0),
+        ];
+        let calls: std::cell::RefCell<Vec<(usize, usize, u64, u64)>> = std::cell::RefCell::new(Vec::new());
+        let on_band = |cur: usize, total: usize, done: u64, all: u64| {
+            calls.borrow_mut().push((cur, total, done, all));
+        };
+        integrate_flat_inner(
+            &paths,
+            &FlatPrecal::None,
+            IntegrationRecipe::median(Rejection::None),
+            &pool(),
+            dir.path(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            1,
+        )
+        .unwrap();
+        let calls = calls.into_inner();
+        assert!(!calls.is_empty(), "on_band must fire at least once");
+        // Pass 1 (16 rows) + pass 2 (48 rows), 3 frames, 4 bytes/sample —
+        // same total the previous test pins on the returned field.
+        let expected_total = ((48 + 16) * 32 * 4 * 3) as u64;
+        for &(_, _, _done, all) in &calls {
+            assert_eq!(all, expected_total, "bytes_total reported to on_band must span both passes");
+        }
+        let (_, _, last_done, _) = *calls.last().unwrap();
+        assert_eq!(
+            last_done, expected_total,
+            "after the final band, bytes_read_so_far must equal the full two-pass total"
+        );
+        // The very first pass-2 band call must already carry pass 1's bytes
+        // as a baseline — otherwise the wrapping would just be re-reporting
+        // pass 2 alone against a bigger denominator.
+        let pass1_bytes = 16u64 * 32 * 4 * 3;
+        let (_, _, first_done, _) = calls[0];
+        assert!(
+            first_done > pass1_bytes,
+            "first band's bytes_done ({first_done}) must include pass 1's {pass1_bytes} bytes as a baseline"
+        );
+    }
 }
