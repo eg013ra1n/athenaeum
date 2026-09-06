@@ -25,6 +25,20 @@ pub enum StorageClass {
     Network,
 }
 
+impl StorageClass {
+    /// Short lowercase form for structured logging (the `storage` field on
+    /// the build-lifecycle log lines) — so a later measurement on a NAS or an
+    /// SSD can be filtered/read against the class the policy actually saw,
+    /// without a `{:?}` case mismatch against the rest of the snake_case
+    /// field values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageClass::Local => "local",
+            StorageClass::Network => "network",
+        }
+    }
+}
+
 /// Hard ceiling on an explicitly configured reader count. Past this the only
 /// thing that grows is the number of requests a server has to fan out.
 pub const READ_CONCURRENCY_MAX: usize = 64;

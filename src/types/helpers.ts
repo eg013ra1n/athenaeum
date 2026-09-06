@@ -223,6 +223,10 @@ export interface MasterBuildProgressEvent {
   current: number;
   total: number;
   percent: number;
+  /** Bytes of source read so far / in total. `current`/`total` count bands,
+   *  which say nothing about size once bands are machine-sized. */
+  bytes_done: number;
+  bytes_total: number;
 }
 
 /** Completion event for a master build (`master-build-complete`). ALWAYS

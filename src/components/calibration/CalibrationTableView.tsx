@@ -11,6 +11,7 @@ import type {
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
 import { ReassignFramePanel } from './ReassignFramePanel';
+import type { BuildState } from '../../hooks/useMasterBuilds';
 
 type CalSetKind = 'Flat' | 'Dark' | 'Bias';
 
@@ -33,8 +34,9 @@ interface CalibrationTableViewProps {
   onHighlightConsumed?: () => void;
   /** Invoked with a raw (non-master) set id when the row-level "Create master" hammer button is clicked. */
   onCreateMaster?: (setId: number) => void;
-  /** Live build phase per source set id, from `useMasterBuildContext().buildStates`. */
-  buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+  /** Live build state (phase, plus stage/percent while building) per source
+   *  set id, from `useMasterBuildContext().buildStates`. */
+  buildStatusBySet?: Record<number, BuildState>;
 }
 
 // ── Section colors (per spec) ──────────────────────────────────────────────
@@ -692,7 +694,9 @@ function MatchCells({ row, order = 'gbo' }: { row: MatchParams; order?: 'gbo' | 
     : <>{gainCell}{binningCell}{offsetCell}</>;
 }
 
-/** Trailing cell: the create-master hammer button, or the live "building…" pulse. */
+/** Trailing cell: the create-master hammer button, or the live build state —
+ *  the stage word and rounded percent once the engine's progress event has
+ *  arrived (a "starting…" placeholder is all there is before it does). */
 function CreateMasterCell({
   setId,
   isMaster,
@@ -702,15 +706,24 @@ function CreateMasterCell({
   setId: number;
   isMaster: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+  buildStatusBySet?: Record<number, BuildState>;
 }) {
-  const phase = buildStatusBySet?.[setId];
-  const building = phase != null && phase !== 'done';
+  const state = buildStatusBySet?.[setId];
+  const building = state != null && state.phase !== 'done';
   return (
     <td className="px-2 py-1 text-center">
       {!isMaster && onCreateMaster && (
         building ? (
-          <span className="text-[10px] text-accent animate-pulse">building…</span>
+          <span className="text-[10px] whitespace-nowrap animate-pulse">
+            {state.phase === 'building' ? (
+              <>
+                <span className="text-content-muted">{state.progress.stage}</span>{' '}
+                <span className="text-accent tabular-nums">{Math.round(state.progress.percent)}%</span>
+              </>
+            ) : (
+              <span className="text-content-muted">starting…</span>
+            )}
+          </span>
         ) : (
           <button
             onClick={(e) => { e.stopPropagation(); onCreateMaster(setId); }}
@@ -891,7 +904,7 @@ function FlatsTable({
   onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+  buildStatusBySet?: Record<number, BuildState>;
 }) {
   const { sortField, sortDir, thProps } = useTableSort<FlatSortField>('sortDate');
 
@@ -1022,7 +1035,7 @@ function DarksTable({
   onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+  buildStatusBySet?: Record<number, BuildState>;
 }) {
   const { sortField, sortDir, thProps } = useTableSort<DarkSortField>('sortDate');
 
@@ -1145,7 +1158,7 @@ function BiasTable({
   onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+  buildStatusBySet?: Record<number, BuildState>;
 }) {
   const { sortField, sortDir, thProps } = useTableSort<BiasSortField>('sortDate');
 

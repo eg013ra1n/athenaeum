@@ -35,7 +35,11 @@ pub struct IntegrationOutput {
     pub combine_duration: std::time::Duration,
     /// Rows per band and how many bands the run used — the two numbers the
     /// band budget actually decides, reported so the build's log line does not
-    /// have to re-derive them.
+    /// have to re-derive them. For a FLAT these describe pass 2 (the full
+    /// combine) only — pass 1's central-third read has no band count of its
+    /// own — whereas `read_duration`/`bytes_read` above span BOTH passes. See
+    /// [`EngineProgress::on_band`] for what that asymmetry does to a flat's
+    /// live progress numbers.
     pub band_rows: usize,
     pub bands: usize,
     /// Pixel bytes actually read (sum of `rows * width * bytes_per_sample`
@@ -47,6 +51,18 @@ pub struct IntegrationOutput {
 
 pub struct EngineProgress<'a> {
     /// `(band_index_1based, bands_total, bytes_read_so_far, bytes_total)`.
+    ///
+    /// For a FLAT, `band_index_1based`/`bands_total` count pass 2 (the full
+    /// combine) only, while `bytes_read_so_far`/`bytes_total` span BOTH
+    /// passes — `integrate_flat_inner` wraps the pass-2-only callback
+    /// `run_banded` calls so the byte pair carries pass 1's central-third
+    /// read as a baseline (pass 1 has no band count of its own to report).
+    /// The two numbers on one call can therefore disagree sharply: the very
+    /// first pass-2 band reports band 1/N (~2%) while bytes_done/bytes_total
+    /// already sit at ~25% of the two-pass total — a real ~23-point gap
+    /// between the two progress numbers on the SAME event, not a bug. A
+    /// bias-like build (one pass) never sees this — its two numbers always
+    /// agree.
     pub on_band: &'a dyn Fn(usize, usize, u64, u64),
 }
 
@@ -91,9 +107,9 @@ fn run_banded(
     let band_rows = src.band_rows_for_budget(io.band_budget_bytes).min(h);
     let bands_total = h.div_ceil(band_rows);
     // Computed once, next to `band_rows`, and referenced from every band's
-    // progress call below — this run's own share of the work (a flat's pass 1
-    // has already happened by the time `run_banded` is called for pass 2, and
-    // `integrate_flat_inner` adds its bytes on top via a wrapped `on_band`).
+    // progress call below — this run's own (pass 2) share of the work. See
+    // `EngineProgress::on_band`'s doc for why a flat's caller sees a bigger
+    // total than this once `integrate_flat_inner` wraps it with pass 1.
     let per_row_bytes = src.bytes_per_row();
     let bytes_total = (h * per_row_bytes) as u64;
     let mut out = vec![0f32; w * h];
@@ -329,7 +345,9 @@ fn integrate_flat_inner(
     //
     // `run_banded` only knows its own (pass 2) height, not pass 1's
     // central-third read that already happened above it — wrap the caller's
-    // `on_band` so the byte pair it sees spans both passes.
+    // `on_band` so the byte pair it sees spans both passes (this is the
+    // mechanism `EngineProgress::on_band`'s doc describes: band count stays
+    // pass-2-only while the byte pair jumps ahead by pass 1's share).
     let wrapped_on_band = |cur: usize, total: usize, bytes_done: u64, bytes_total: u64| {
         (progress.on_band)(cur, total, pass1_bytes_read + bytes_done, pass1_total_bytes + bytes_total);
     };

@@ -51,7 +51,10 @@ use crate::calibration_library::register::{member_hash, register_master};
 use crate::events::{emit_event, ProgressEmitter};
 use crate::fits_writer::write_fits_f32;
 use crate::integration::combine::{IntegrationRecipe, Rejection};
-use crate::integration::engine::{integrate_bias_like, integrate_flat, EngineProgress, FlatPrecal};
+use crate::integration::engine::{
+    integrate_bias_like, integrate_flat, EngineProgress, FlatPrecal, IntegrationOutput,
+};
+use crate::integration::storage_class::StorageClass;
 use crate::integration::IntegrationError;
 use crate::services::compute_queue::ComputeJobKind;
 use crate::services::{MasterBuildHandle, ServiceContext};
@@ -193,6 +196,10 @@ struct MasterBuildProgressEvent {
     current: usize,
     total: usize,
     percent: f64,
+    /// Bytes of source read so far / in total. `current`/`total` count bands,
+    /// which say nothing about size once bands are machine-sized.
+    bytes_done: u64,
+    bytes_total: u64,
 }
 
 /// `master-build-complete` event payload. ALWAYS emitted exactly once per
@@ -806,6 +813,51 @@ enum BuildTarget {
     },
 }
 
+/// Build-lifecycle log lines. Named functions rather than inline macros so a
+/// test can pin their message text without a multi-gigabyte build fixture —
+/// a multi-minute operation that logged nothing is why a running build was
+/// indistinguishable from a hung one (spec §8). The message strings are the
+/// contract: `docs/logging/README.md` recipes and the log-mcp queries match
+/// on them.
+fn log_build_started(
+    set_id: i64,
+    imagetyp: &str,
+    count: i64,
+    recipe: &str,
+    budget_bytes: usize,
+    read_threads: usize,
+    storage: StorageClass,
+) {
+    tracing::info!(
+        set_id,
+        imagetyp,
+        count,
+        recipe,
+        budget_mb = budget_bytes / (1024 * 1024),
+        // Read concurrency is `image_pool`'s size, i.e. derived from core
+        // count — a CPU number applied to an I/O problem (spec §8). Logged
+        // alongside `storage` so the pending SSD/NAS measurement can be read
+        // against the policy that actually produced it, instead of guessing.
+        read_threads,
+        storage = storage.as_str(),
+        "master build started"
+    );
+}
+
+fn log_build_finished(set_id: i64, duration: std::time::Duration, bytes_read: u64, out: &IntegrationOutput) {
+    let read_s = out.read_duration.as_secs_f64();
+    tracing::info!(
+        set_id,
+        duration_ms = duration.as_millis() as u64,
+        read_ms = out.read_duration.as_millis() as u64,
+        combine_ms = out.combine_duration.as_millis() as u64,
+        read_mb_s = if read_s > 0.0 { (bytes_read as f64 / read_s / 1e6).round() as u64 } else { 0 },
+        band_rows = out.band_rows,
+        bands = out.bands,
+        "master build finished"
+    );
+}
+
 /// Owns the zero-byte placeholder [`claim_collision_free`] mints for a `New`
 /// build's output name (audit I7), from the moment the name is claimed until
 /// the real bytes replace it. Every exit in that window releases the claim —
@@ -920,6 +972,20 @@ fn run_build(
     // and a NAS tomorrow.
     let io = crate::integration::io_policy::resolve(&conn, &ctx.settings, &paths, ctx.image_pool.current_num_threads())?;
 
+    // A multi-minute build that logs nothing is indistinguishable from a
+    // hung one (spec §8) — this is the one line an operator has to go on
+    // until the first progress event arrives.
+    let build_started_at = std::time::Instant::now();
+    log_build_started(
+        set_id,
+        &set.imagetyp,
+        set.frame_count,
+        &resolved_combine.describe(),
+        io.band_budget_bytes,
+        io.read_concurrency,
+        io.storage,
+    );
+
     // Release the pooled connection before the (potentially long) pixel
     // work below — precal load + banded integration do no DB work, and the
     // pool only has a handful of slots shared with every other in-flight
@@ -928,7 +994,7 @@ fn run_build(
 
     let pool = ctx.image_pool.as_ref();
     let scratch = std::env::temp_dir();
-    let on_band = |current: usize, total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {
+    let on_band = |current: usize, total: usize, bytes_read_so_far: u64, bytes_total: u64| {
         let percent = if total > 0 {
             (current as f64 / total as f64) * 100.0
         } else {
@@ -943,6 +1009,8 @@ fn run_build(
                 current,
                 total,
                 percent,
+                bytes_done: bytes_read_so_far,
+                bytes_total,
             },
         );
     };
@@ -973,6 +1041,7 @@ fn run_build(
             io,
         )?
     };
+    log_build_finished(set_id, build_started_at.elapsed(), out.bytes_read, &out);
 
     // Audit C2: the engine drops non-finite samples ("undefined pixels") from
     // the per-pixel stack instead of panicking or baking NaN into the master.
@@ -1019,6 +1088,11 @@ fn run_build(
             current: 0,
             total: 0,
             percent: 0.0,
+            // Reading is over by this stage — report it fully done rather
+            // than reset to 0/0, which would read as a regression in a UI
+            // that renders bytes_done/bytes_total as a fraction.
+            bytes_done: out.bytes_read,
+            bytes_total: out.bytes_read,
         },
     );
 
@@ -1105,6 +1179,8 @@ fn run_build(
             current: 0,
             total: 0,
             percent: 0.0,
+            bytes_done: out.bytes_read,
+            bytes_total: out.bytes_read,
         },
     );
 
@@ -4152,5 +4228,56 @@ mod tests {
         // central-third mean — so a consumer that knows only ATH_FNRM is
         // unaffected by the three above.
         near("ATH_FNRM", 2750.0);
+    }
+
+    /// An `IntegrationOutput` with zeroed pixel data and plausible timing/size
+    /// fields — enough for `log_build_finished` to compute `read_mb_s` without
+    /// a real multi-frame FITS fixture on disk.
+    fn nop_output() -> IntegrationOutput {
+        IntegrationOutput {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+            rejected_fraction: 0.0,
+            flat_norm: None,
+            bad_samples_per_frame: Vec::new(),
+            all_bad_pixels: 0,
+            read_duration: std::time::Duration::from_millis(30_000),
+            combine_duration: std::time::Duration::from_millis(14_400),
+            band_rows: 20,
+            bands: 3,
+            bytes_read: 5_200_000_000,
+        }
+    }
+
+    /// A multi-minute operation that logs nothing is why a running build was
+    /// indistinguishable from a hung one (research §8). The message strings
+    /// are the contract — `docs/logging/README.md` recipes and the log-mcp
+    /// queries match on them.
+    #[test]
+    fn build_lifecycle_lines_are_emitted_at_info() {
+        let (_, events) = capture_events(|| {
+            log_build_started(
+                42,
+                "Dark",
+                30,
+                "average+winsorized-3.0/3.0",
+                4 * 1024 * 1024 * 1024,
+                10,
+                StorageClass::Local,
+            );
+        });
+        assert!(
+            events.iter().any(|(lvl, m)| lvl == "INFO" && m == "master build started"),
+            "no start line; got {events:?}"
+        );
+
+        let (_, events) = capture_events(|| {
+            log_build_finished(42, std::time::Duration::from_millis(44_400), 5_200_000_000, &nop_output());
+        });
+        assert!(
+            events.iter().any(|(lvl, m)| lvl == "INFO" && m == "master build finished"),
+            "no finish line; got {events:?}"
+        );
     }
 }

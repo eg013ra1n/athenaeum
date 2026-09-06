@@ -16,6 +16,7 @@ import { CalibrationFinderButton } from './CalibrationFinderButton';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { CreateMasterDialog } from './calibration/CreateMasterDialog';
 import { useMasterBuildContext } from '../contexts/MasterBuildContext';
+import type { BuildState } from '../hooks/useMasterBuilds';
 import { useNotifications } from '../contexts/NotificationContext';
 
 interface CalibrationHierarchyViewProps {
@@ -126,9 +127,11 @@ export function CalibrationHierarchyView({
   }, [data]);
 
   const { buildStates } = useMasterBuildContext();
-  const buildStatusBySet = useMemo(() => {
-    const m: Record<number, 'starting' | 'building' | 'done'> = {};
-    for (const [id, s] of buildStates) m[id] = s.phase;
+  // The event carries stage + percent; reducing it to a phase is what made a
+  // running build indistinguishable from a hung one (research §8).
+  const buildStateBySet = useMemo(() => {
+    const m: Record<number, BuildState> = {};
+    for (const [id, s] of buildStates) m[id] = s;
     return m;
   }, [buildStates]);
 
@@ -452,7 +455,7 @@ export function CalibrationHierarchyView({
               highlightCalSet={highlightCalSet}
               onHighlightConsumed={onHighlightConsumed}
               onCreateMaster={(setId) => setBatchDialogIds([setId])}
-              buildStatusBySet={buildStatusBySet}
+              buildStatusBySet={buildStateBySet}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 
