@@ -226,7 +226,7 @@ fn run_banded(
             *so_far_in_band += just_read;
             (progress.on_band)(band_idx + 1, bands_total, bytes_before_this_band + *so_far_in_band, bytes_total);
         };
-        src.read_band_with_progress(y0, rows, &mut planes, io.read_concurrency, &on_bytes)?;
+        src.read_band_with_progress(y0, rows, &mut planes, io.read_concurrency, &on_bytes, cancel)?;
         read_duration += t_read.elapsed();
         bytes_read += (rows * per_row_bytes) as u64;
 
@@ -371,7 +371,7 @@ fn integrate_bias_like_inner(
     progress: EngineProgress<'_>,
     io: IoPolicy,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    let src = BandSource::open(paths, scratch_dir, io.read_concurrency)?;
+    let src = BandSource::open_with_cancel(paths, scratch_dir, io.read_concurrency, cancel)?;
     let scales = vec![1.0f32; src.frame_count()];
     run_banded(&src, &scales, None, recipe, pool, cancel, &progress, io)
 }
@@ -401,7 +401,7 @@ fn integrate_flat_inner(
     progress: EngineProgress<'_>,
     io: IoPolicy,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    let src = BandSource::open(paths, scratch_dir, io.read_concurrency)?;
+    let src = BandSource::open_with_cancel(paths, scratch_dir, io.read_concurrency, cancel)?;
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
     if let FlatPrecal::MasterFrame { width, height, .. } = precal {
         if (*width, *height) != (w, h) {
@@ -463,7 +463,7 @@ fn integrate_flat_inner(
             *so_far += just_read;
             (progress.on_band)(0, bands_total_forecast, bytes_before_this_chunk + *so_far, two_pass_total_bytes);
         };
-        src.read_band_with_progress(y, rows, &mut planes, io.read_concurrency, &on_bytes)?;
+        src.read_band_with_progress(y, rows, &mut planes, io.read_concurrency, &on_bytes, cancel)?;
         pass1_read += t_read.elapsed();
         pass1_bytes_read += (rows * per_row_bytes) as u64;
         // Fix wave item 1: mirrors `run_banded`'s post-read check — pass 1

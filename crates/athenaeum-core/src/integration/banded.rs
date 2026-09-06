@@ -11,12 +11,18 @@ use super::IntegrationError;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
 const BLOCK: u64 = 2880;
+
+/// For callers with no cancellation source (single-frame precal / light-cal /
+/// cosmetic reads, tests): the flag `open` and `read_band` pass on their
+/// callers' behalf. Never raised.
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// How one frame's raw band bytes decode to physical samples. Carried per
 /// frame because a set may legally mix bit depths, and because the
@@ -172,20 +178,20 @@ impl FrameReader {
             // `seek_read` also moves the file's cursor, unlike a true `pread`
             // — safe here ONLY because nothing that reads through a
             // `FrameReader`'s handle goes through a cursor any more (fix
-            // round 1, M5): every such read is positional. That invariant is
-            // narrower than "every read in this file" — `probe_fits`, a few
-            // lines up, opens its OWN short-lived `File` and reads its header
-            // with a plain cursor-based `read_exact`, which is fine because
-            // that handle is never shared, never wrapped in a `FrameReader`,
-            // and is dropped before this method could ever run against it.
-            // Concurrent calls on one `FrameReader`'s handle are still safe
-            // because each `seek_read` carries its own offset rather than
-            // relying on the moved cursor. Do NOT reintroduce a seek-based
-            // (`Seek`/`SeekFrom`) read on a `FrameReader`'s file anywhere in
-            // this module — it would silently race this cursor against
-            // concurrent `read_exact_at` calls on the same `File`, on
-            // Windows only, invisibly to every CI job (the Windows build
-            // only runs on a tag, never a branch push).
+            // round 1, M5): every such read is positional. That invariant
+            // covers the one cursor-based read a `FrameReader`'s handle ever
+            // sees: `probe_fits` reads the header with a plain `read_exact`
+            // BEFORE the handle becomes a `FrameReader` (review 2026-09-06 F6
+            // reuses that handle instead of reopening the path). From then on
+            // every read is positional, so where the cursor came to rest is
+            // irrelevant. Concurrent calls on one handle are still safe
+            // because each `seek_read` carries its own offset. Do NOT
+            // reintroduce a seek-based (`Seek`/`SeekFrom`) read on a
+            // `FrameReader`'s file anywhere in this module — it would
+            // silently race this cursor against concurrent `read_exact_at`
+            // calls on the same `File`, on Windows only, invisibly to every
+            // CI job (the Windows build only runs on a tag, never a branch
+            // push).
             let mut done = 0usize;
             while done < buf.len() {
                 let n = file.seek_read(&mut buf[done..], base + offset + done as u64)?;
@@ -211,9 +217,14 @@ pub struct BandSource {
 struct FitsInfo { data_offset: u64, bitpix: i32, naxis: i32, w: usize, h: usize, naxis3: usize, bzero: f64, bscale: f64 }
 
 /// Scan primary-header blocks for END; harvest the handful of numeric cards
-/// the direct reader needs. Returns None for anything that should take the
-/// decode-and-spill fallback (never errors on odd files — fallback covers them).
-fn probe_fits(path: &Path) -> Option<FitsInfo> {
+/// the direct reader needs. Returns the open handle alongside the info so the
+/// caller can build its reader on it instead of opening the path a second
+/// time (review 2026-09-06 F6: one open per frame is exactly the per-file
+/// latency the parallel probe exists to amortize on a network mount). The
+/// header read leaves the cursor past the header; every read a `FrameReader`
+/// makes is positional, so that never matters. Returns None for anything that
+/// should take the decode-and-spill fallback (never errors on odd files).
+fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     let mut f = File::open(path).ok()?;
     let mut info = FitsInfo { data_offset: 0, bitpix: 0, naxis: 0, w: 0, h: 0, naxis3: 1, bzero: 0.0, bscale: 1.0 };
     let mut block = [0u8; BLOCK as usize];
@@ -245,7 +256,7 @@ fn probe_fits(path: &Path) -> Option<FitsInfo> {
     info.data_offset = blocks * BLOCK;
     let ok_bitpix = matches!(info.bitpix, 8 | 16 | 32 | -32 | -64);
     if info.naxis == 2 && info.naxis3 == 1 && ok_bitpix && info.w > 0 && info.h > 0 {
-        Some(info)
+        Some((f, info))
     } else {
         None
     }
@@ -256,7 +267,7 @@ fn probe_fits(path: &Path) -> Option<FitsInfo> {
 /// exactly the files the decode-and-spill fallback covers, whose original bit
 /// depth this probe cannot speak for).
 pub fn probe_bitpix(path: &Path) -> Option<i32> {
-    probe_fits(path).map(|i| i.bitpix)
+    probe_fits(path).map(|(_, i)| i.bitpix)
 }
 
 /// Test-only observation hook (fix round 1, I1 regression pin): records
@@ -371,9 +382,9 @@ fn round_robin_groups<T>(items: impl IntoIterator<Item = T>, workers: usize) -> 
 /// why the spill lives outside this function.
 fn probe_one(p: &Path) -> Result<ProbeOutcome, IntegrationError> {
     match probe_fits(p) {
-        Some(info) => Ok(ProbeOutcome::Fits(
+        Some((file, info)) => Ok(ProbeOutcome::Fits(
             FrameReader::Fits {
-                file: File::open(p)?,
+                file,
                 data_offset: info.data_offset,
                 kind: plane_kind_for_bitpix(info.bitpix, info.bzero, info.bscale),
             },
@@ -407,6 +418,20 @@ impl BandSource {
     /// exists for. Round-robin always produces `min(n, workers)` non-empty
     /// groups.
     pub fn open(paths: &[PathBuf], scratch_dir: &Path, concurrency: usize) -> Result<BandSource, IntegrationError> {
+        Self::open_with_cancel(paths, scratch_dir, concurrency, &NEVER_CANCELLED)
+    }
+
+    /// `open` with the caller's cancel flag (review 2026-09-06 F2): each probe
+    /// worker checks it between files, the assembly loop checks it before
+    /// every decode-and-spill (a spill decodes a whole frame, ~100 MB, on
+    /// this thread), and a raised flag comes back as `Cancelled` — never as
+    /// a half-built source.
+    pub fn open_with_cancel(
+        paths: &[PathBuf],
+        scratch_dir: &Path,
+        concurrency: usize,
+        cancel: &AtomicBool,
+    ) -> Result<BandSource, IntegrationError> {
         if paths.is_empty() {
             return Err(IntegrationError::BadInput("empty frame list".into()));
         }
@@ -428,6 +453,7 @@ impl BandSource {
         // only one of the two identical situations.
         if workers == 1 {
             for (p, slot) in paths.iter().zip(slots.iter_mut()) {
+                if cancel.load(Ordering::Relaxed) { break; }
                 *slot = Some(probe_one(p));
             }
         } else {
@@ -439,6 +465,7 @@ impl BandSource {
                     for group in groups {
                         handles.push(scope.spawn(move || {
                             for (p, slot) in group {
+                                if cancel.load(Ordering::Relaxed) { break; }
                                 *slot = Some(probe_one(p));
                             }
                         }));
@@ -458,6 +485,12 @@ impl BandSource {
             }
         }
 
+        // A raised flag leaves probed-but-unassembled slots (and unprobed
+        // `None`s) behind; report the cancel, not "never probed".
+        if cancel.load(Ordering::Relaxed) {
+            return Err(IntegrationError::Cancelled);
+        }
+
         let mut readers = Vec::with_capacity(n);
         let mut dims: Option<(usize, usize)> = None;
         for (idx, (p, slot)) in paths.iter().zip(slots.into_iter()).enumerate() {
@@ -467,6 +500,9 @@ impl BandSource {
             let (reader, w, h) = match outcome {
                 ProbeOutcome::Fits(reader, w, h) => (reader, w, h),
                 ProbeOutcome::NeedsSpill => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(IntegrationError::Cancelled);
+                    }
                     // Serial, on THIS (the calling) thread — see
                     // `ProbeOutcome`'s doc comment. `idx` is this path's
                     // position in `paths`, matching the pre-parallel loop's
@@ -546,7 +582,7 @@ impl BandSource {
         out: &mut BandPlanes,
         concurrency: usize,
     ) -> Result<(), IntegrationError> {
-        self.read_band_with_progress(y0, rows, out, concurrency, &|_| {})
+        self.read_band_with_progress(y0, rows, out, concurrency, &|_| {}, &NEVER_CANCELLED)
     }
 
     /// Reads rows `[y0, y0+rows)` of every frame straight into `out`'s own
@@ -581,6 +617,14 @@ impl BandSource {
     /// band takes. Never called from the per-pixel combine — only from this
     /// read loop, one call per (frame, band). `on_bytes` must be `Sync`
     /// because of that concurrent-worker use.
+    ///
+    /// `cancel` (review 2026-09-06 F2) is checked by every worker between
+    /// frames, so a Cancel takes effect within one frame's read rather than
+    /// one band's (a band can be gigabytes). A worker that hits a read error
+    /// raises a shared abort so its siblings stop within one frame too — the
+    /// caller is about to discard the band either way. A raised cancel comes
+    /// back as `Cancelled` unless a real error happened first; the error wins,
+    /// because it is the one the operator has to act on.
     pub fn read_band_with_progress(
         &self,
         y0: usize,
@@ -588,6 +632,7 @@ impl BandSource {
         out: &mut BandPlanes,
         concurrency: usize,
         on_bytes: &(dyn Fn(u64) + Sync),
+        cancel: &AtomicBool,
     ) -> Result<(), IntegrationError> {
         assert_eq!(out.bufs.len(), self.readers.len());
         // `out`'s `width`/`kinds` are snapshotted once at `BandPlanes::new` and
@@ -631,6 +676,9 @@ impl BandSource {
         // new panic path for zero parallelism gained.
         if workers == 1 {
             for (reader, buf) in self.readers.iter().zip(out.bufs.iter_mut()) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(IntegrationError::Cancelled);
+                }
                 let bpp = reader.kind().bytes_per_sample();
                 buf.resize(rows * w * bpp, 0u8);
                 reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
@@ -645,15 +693,23 @@ impl BandSource {
         // fast path above, and `workers` never exceeds `n`).
         let groups = round_robin_groups(self.readers.iter().zip(out.bufs.iter_mut()), workers);
 
+        let abort = AtomicBool::new(false);
+        let abort = &abort;
         let mut errors: Vec<IntegrationError> = Vec::new();
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
             for group in groups {
                 handles.push(scope.spawn(move || -> Result<(), IntegrationError> {
                     for (reader, buf) in group {
+                        if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         let bpp = reader.kind().bytes_per_sample();
                         buf.resize(rows * w * bpp, 0u8);
-                        reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
+                        if let Err(e) = reader.read_exact_at(buf, (y0 * w * bpp) as u64) {
+                            abort.store(true, Ordering::Relaxed);
+                            return Err(e.into());
+                        }
                         on_bytes((rows * w * bpp) as u64);
                     }
                     Ok(())
@@ -682,6 +738,9 @@ impl BandSource {
                 tracing::warn!(error = %e, "read_band: reader-thread failure discarded in favor of an earlier one");
             }
             return Err(first);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(IntegrationError::Cancelled);
         }
         Ok(())
     }
@@ -1219,5 +1278,74 @@ mod tests {
         assert_eq!(kind.decode(&bytes, 0), v1, "F32Le must not apply any scale/offset");
         assert_eq!(kind.decode(&bytes, 1), v2, "F32Le must not apply any scale/offset");
         assert_decode_and_run_agree(kind, &bytes, 2);
+    }
+
+    /// Review 2026-09-06 F2: the read workers never looked at the caller's
+    /// cancel flag, so a Cancel waited for the whole band — ~25 s on a 4 GiB
+    /// band at 175 MB/s, and seen live (cancel 19:04:07, stop 19:04:13).
+    #[test]
+    fn read_band_stops_within_one_frame_of_a_cancel() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..6)
+            .map(|i| f32_fixture(dir.path(), &format!("c{i}.fits"), 8, 8, move |_, _| i as f32))
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let mut planes = BandPlanes::new(&src);
+        let cancel = AtomicBool::new(false);
+        let frames_read = AtomicUsize::new(0);
+        // Raise the flag from inside the first frame's tick: frame 2 must not be read.
+        let on_bytes = |_: u64| {
+            frames_read.fetch_add(1, Ordering::Relaxed);
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let r = src.read_band_with_progress(0, 8, &mut planes, 1, &on_bytes, &cancel);
+        assert!(matches!(r, Err(IntegrationError::Cancelled)), "got {r:?}");
+        assert_eq!(frames_read.load(Ordering::Relaxed), 1, "a cancel raised after frame 1 must stop before frame 2");
+    }
+
+    #[test]
+    fn read_band_honours_a_cancel_under_concurrency() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..32)
+            .map(|i| f32_fixture(dir.path(), &format!("p{i}.fits"), 8, 8, move |_, _| i as f32))
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 4).unwrap();
+        let mut planes = BandPlanes::new(&src);
+        let cancel = AtomicBool::new(true); // raised before the read starts
+        let frames_read = AtomicUsize::new(0);
+        let on_bytes = |_: u64| { frames_read.fetch_add(1, Ordering::Relaxed); };
+        let r = src.read_band_with_progress(0, 8, &mut planes, 4, &on_bytes, &cancel);
+        assert!(matches!(r, Err(IntegrationError::Cancelled)), "got {r:?}");
+        assert_eq!(frames_read.load(Ordering::Relaxed), 0, "no worker may read a frame past a raised flag");
+    }
+
+    #[test]
+    fn open_returns_cancelled_when_the_flag_is_already_raised() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..8)
+            .map(|i| f32_fixture(dir.path(), &format!("o{i}.fits"), 8, 8, move |_, _| i as f32))
+            .collect();
+        let cancel = AtomicBool::new(true);
+        let r = BandSource::open_with_cancel(&paths, dir.path(), 4, &cancel);
+        assert!(matches!(r, Err(IntegrationError::Cancelled)), "got {:?}", r.err());
+    }
+
+    /// Review 2026-09-06 F6: `probe_fits` opened the file for its header and
+    /// `probe_one` opened it AGAIN for the reader. The handle is reused now;
+    /// this pins that a reader built from the probe's own handle still reads
+    /// the right bytes at the right offset (the header read left the cursor
+    /// past the header, which must not matter to a positional reader).
+    #[test]
+    fn a_reader_built_from_the_probe_handle_reads_the_data_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = f32_fixture(dir.path(), "h.fits", 16, 4, |x, y| (y * 16 + x) as f32);
+        let src = BandSource::open(&[p], dir.path(), 1).unwrap();
+        let mut planes = BandPlanes::new(&src);
+        src.read_band(2, 2, &mut planes, 1).unwrap();
+        assert_eq!(planes.sample(0, 0), (2 * 16) as f32, "row 2 col 0");
+        assert_eq!(planes.sample(0, 2 * 16 - 1), (3 * 16 + 15) as f32, "row 3 col 15");
     }
 }
