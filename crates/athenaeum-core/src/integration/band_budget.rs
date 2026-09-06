@@ -26,8 +26,13 @@ pub const MAX_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// 8 GB a 26 Mpx pipeline already needs.
 pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
-/// Bounds for an explicitly configured `integration.band_budget_mb`.
-const CONFIGURED_MIN_MB: usize = 64;
+/// Bounds for an explicitly configured `integration.band_budget_mb`. The
+/// floor is the same number as `MIN_BUDGET_BYTES` (256 MB = 256 MiB here) on
+/// purpose: `per_job_budget`'s own `.max(MIN_BUDGET_BYTES)` floors every
+/// resolved budget unconditionally, so a lower configured floor would be
+/// silently overridden with no explanation — an honest configured window
+/// must not advertise a minimum the backend refuses to honour.
+const CONFIGURED_MIN_MB: usize = 256;
 const CONFIGURED_MAX_MB: usize = 16384;
 
 /// Physical RAM this process may actually use, in bytes.
@@ -43,6 +48,25 @@ pub fn total_ram_bytes() -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn platform_total_ram() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
+    let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
+    linux_total_ram_from(&meminfo, v2.as_deref(), v1.as_deref())
+}
+
+/// Pure computation over `/proc/meminfo`'s content plus the two possible
+/// cgroup limit-file contents. Split out of `platform_total_ram`'s Linux arm
+/// (which does nothing else but read those three files) so the container-
+/// clamping logic itself — not just `parse_cgroup_limit`'s number parsing —
+/// has a test that can run on every dev machine, same treatment as
+/// `parse_cgroup_limit` below.
+///
+/// `v2`/`v1` are `Some(contents)` when that file could be read, `None` when
+/// it doesn't exist (no cgroup there, or a v1-only / non-container host for
+/// `v2`). cgroup v2 wins when it names a real limit; `v2` holding the literal
+/// `max` (or being absent) falls through to v1; neither present is `total`
+/// unmodified.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_total_ram_from(meminfo: &str, v2: Option<&str>, v1: Option<&str>) -> Option<u64> {
     let mut total = None;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
@@ -52,14 +76,7 @@ fn platform_total_ram() -> Option<u64> {
         }
     }
     let total = total?;
-    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        .ok()
-        .and_then(|s| parse_cgroup_limit(&s))
-        .or_else(|| {
-            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-                .ok()
-                .and_then(|s| parse_cgroup_limit(&s))
-        });
+    let limit = v2.and_then(parse_cgroup_limit).or_else(|| v1.and_then(parse_cgroup_limit));
     Some(match limit {
         Some(l) => total.min(l),
         None => total,
@@ -124,7 +141,13 @@ pub(crate) fn parse_cgroup_limit(text: &str) -> Option<u64> {
 pub fn auto_budget_bytes() -> usize {
     match total_ram_bytes() {
         Some(ram) => (ram / 4).clamp(MIN_BUDGET_BYTES as u64, MAX_BUDGET_BYTES as u64) as usize,
-        None => FALLBACK_BUDGET_BYTES,
+        None => {
+            tracing::warn!(
+                fallback_mb = FALLBACK_BUDGET_BYTES / (1024 * 1024),
+                "physical RAM probe failed — using the fallback band budget"
+            );
+            FALLBACK_BUDGET_BYTES
+        }
     }
 }
 
@@ -158,10 +181,46 @@ mod tests {
         let b = auto_budget_bytes();
         assert!(b >= MIN_BUDGET_BYTES, "auto {b} below the floor — would be slower than the old constant");
         assert!(b <= MAX_BUDGET_BYTES, "auto {b} above the cap");
+        // Without this, a probe failure (wrong sysctl name, a failing
+        // GlobalMemoryStatusEx, an unreadable /proc/meminfo) falls through to
+        // the `if let` below and the test would pass vacuously — asserting a
+        // tautology over three constants instead of exercising the probe.
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(total_ram_bytes().is_some(), "the RAM probe must work on a supported platform");
         if let Some(ram) = total_ram_bytes() {
             let want = (ram / 4).clamp(MIN_BUDGET_BYTES as u64, MAX_BUDGET_BYTES as u64) as usize;
             assert_eq!(b, want, "auto must be a quarter of {ram} bytes, clamped");
         }
+    }
+
+    #[test]
+    fn linux_ram_uses_the_smaller_of_meminfo_and_the_container_limit() {
+        let meminfo = "MemTotal:       16316196 kB\nMemFree:         1234567 kB\n";
+        // Container limit (2 GiB) is well below MemTotal (~15.6 GiB) — min wins.
+        let v2 = Some("2147483648\n");
+        assert_eq!(linux_total_ram_from(meminfo, v2, None), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn linux_ram_prefers_cgroup_v2_over_v1_when_both_present() {
+        let meminfo = "MemTotal:       16316196 kB\nMemFree:         1234567 kB\n";
+        let v2 = Some("2147483648\n"); // 2 GiB
+        let v1 = Some("1073741824\n"); // 1 GiB — must be ignored while v2 names a real limit
+        assert_eq!(linux_total_ram_from(meminfo, v2, v1), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn linux_ram_falls_through_to_v1_when_v2_is_unlimited() {
+        let meminfo = "MemTotal:       16316196 kB\nMemFree:         1234567 kB\n";
+        let v2 = Some("max\n"); // cgroup v2 "no limit"
+        let v1 = Some("1073741824\n"); // 1 GiB
+        assert_eq!(linux_total_ram_from(meminfo, v2, v1), Some(1_073_741_824));
+    }
+
+    #[test]
+    fn linux_ram_is_meminfo_total_with_no_cgroup_limit_at_all() {
+        let meminfo = "MemTotal:       16316196 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(linux_total_ram_from(meminfo, None, None), Some(16_316_196 * 1024));
     }
 
     #[test]
@@ -178,7 +237,7 @@ mod tests {
     #[test]
     fn configured_value_is_clamped_and_zero_means_auto() {
         assert_eq!(clamp_configured_mb(0), None, "0 is the auto sentinel, not a size");
-        assert_eq!(clamp_configured_mb(1), Some(64), "clamps UP to the 64 MB floor");
+        assert_eq!(clamp_configured_mb(1), Some(256), "clamps UP to the 256 MB floor");
         assert_eq!(clamp_configured_mb(512), Some(512));
         assert_eq!(clamp_configured_mb(999_999), Some(16384), "clamps DOWN to the 16 GB cap");
     }
@@ -191,6 +250,11 @@ mod tests {
             per_job_budget(512 * 1024 * 1024, 8),
             MIN_BUDGET_BYTES,
             "two admitted builds must not each claim a quarter of RAM, but neither may drop below the old constant"
+        );
+        assert_eq!(
+            per_job_budget(4 * 1024 * 1024 * 1024, 0),
+            4 * 1024 * 1024 * 1024,
+            "a reported concurrency of 0 must not divide by zero — the .max(1) guard"
         );
     }
 }

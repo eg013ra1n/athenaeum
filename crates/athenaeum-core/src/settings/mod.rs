@@ -366,17 +366,27 @@ impl SettingsManager {
 
     /// Configured banded-integration memory budget in MB. `0` is the auto
     /// sentinel and passes through untouched; any other value is clamped by
-    /// `band_budget::clamp_configured_mb`. An unparseable value degrades to
-    /// auto rather than failing a build — same defense-in-depth stance as
-    /// `get_compute_max_concurrent`, against a value that reached the row by a
-    /// direct DB edit, a settings import or a botched migration.
+    /// `band_budget::clamp_configured_mb`. Defense-in-depth against a value
+    /// that reached the row by a direct DB edit, a settings import or a
+    /// botched migration — but unlike `get_compute_max_concurrent` (which
+    /// does `value.parse()?` and propagates a parse error, degrading only
+    /// the out-of-range case), an unparseable value here degrades straight
+    /// to the auto sentinel rather than failing the whole integration job.
+    /// The unparseable case is logged before degrading.
     pub fn get_integration_band_budget_mb(&self, conn: &Connection) -> Result<usize> {
         let value = self.get_with_precedence(
             conn,
             keys::INTEGRATION_BAND_BUDGET_MB,
             defaults::INTEGRATION_BAND_BUDGET_MB,
         )?;
-        Ok(value.parse().unwrap_or(0))
+        Ok(value.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                key = keys::INTEGRATION_BAND_BUDGET_MB,
+                value = %value,
+                "unparseable setting value — falling back to auto"
+            );
+            0
+        }))
     }
 
     /// Get the device-wide sync UPLOAD limit in bytes/sec. `0` means
