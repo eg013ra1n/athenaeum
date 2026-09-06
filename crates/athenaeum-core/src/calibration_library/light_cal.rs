@@ -384,7 +384,11 @@ fn calibrate_light_compute_inner(
         paths.len() - 1
     });
 
-    let mut src = BandSource::open(&paths, &inputs.scratch_dir)?;
+    // No `IoPolicy` at this call site (spec §8 keeps light calibration on the
+    // floor budget) and at most 3 frames (light + subtrahend + flat) — there
+    // is nothing to parallelize here, and inventing a policy for a 1-3 frame
+    // read would widen this cycle into the calibrated-export path.
+    let src = BandSource::open(&paths, &inputs.scratch_dir, 1)?;
     let (w, h) = (src.width(), src.height());
     let band_rows = src.band_rows_for_budget(band_budget_bytes).min(h);
     let mut planes = BandPlanes::new(&src);
@@ -400,7 +404,7 @@ fn calibrate_light_compute_inner(
             return Err(IntegrationError::Cancelled);
         }
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut planes)?;
+        src.read_band(y, rows, &mut planes, 1)?;
         let out_band = &mut out[y * w..(y + rows) * w];
         for (idx, out_px) in out_band.iter_mut().enumerate() {
             // f64 throughout, cast once at the end — negatives and division are
@@ -702,7 +706,8 @@ fn read_full_flat_plane(
     flat_path: &Path,
     scratch_dir: &Path,
 ) -> Result<(usize, usize, Vec<f32>), IntegrationError> {
-    let mut src = BandSource::open(&[flat_path.to_path_buf()], scratch_dir)?;
+    // One frame, no `IoPolicy` at this call site — nothing to parallelize.
+    let src = BandSource::open(&[flat_path.to_path_buf()], scratch_dir, 1)?;
     let (w, h) = (src.width(), src.height());
     // One flat plane, one frame — already 1-2 bands at the floor, so the
     // machine-resolved budget would not change the band count here (spec §8).
@@ -712,7 +717,7 @@ fn read_full_flat_plane(
     let mut y = 0;
     while y < h {
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut planes)?;
+        src.read_band(y, rows, &mut planes, 1)?;
         planes.decode_frame_into(0, &mut data[y * w..(y + rows) * w]);
         y += rows;
     }
@@ -797,10 +802,10 @@ mod tests {
 
     /// Read a whole f32 FITS back into RAM (one band) for exact assertions.
     fn read_all(path: &Path, scratch: &Path) -> (usize, usize, Vec<f32>) {
-        let mut src = BandSource::open(&[path.to_path_buf()], scratch).unwrap();
+        let src = BandSource::open(&[path.to_path_buf()], scratch, 1).unwrap();
         let (w, h) = (src.width(), src.height());
         let mut planes = BandPlanes::new(&src);
-        src.read_band(0, h, &mut planes).unwrap();
+        src.read_band(0, h, &mut planes, 1).unwrap();
         let mut data = vec![0f32; w * h];
         planes.decode_frame_into(0, &mut data);
         (w, h, data)
@@ -1694,7 +1699,7 @@ mod tests {
         // bytes here, so 300 bytes buys exactly 3 rows — this fixture happens to
         // land on the same number the old (n+2)*w*4 formula gave, since both
         // frames here are f32.
-        let probe = BandSource::open(&[light.clone(), flat.clone()], dir.path()).unwrap();
+        let probe = BandSource::open(&[light.clone(), flat.clone()], dir.path(), 1).unwrap();
         assert_eq!(probe.band_rows_for_budget(300), 3, "fixture must produce 3-row bands");
 
         let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());

@@ -1296,12 +1296,12 @@ mod tests {
         // Calibrated, not copied: the light is 1000 everywhere and the dark
         // alternates 300/302, so the first row reads 700, 698 — a copy would
         // read 1000, 1000.
-        let mut src =
-            crate::integration::banded::BandSource::open(&[written.clone()], scratch.path())
+        let src =
+            crate::integration::banded::BandSource::open(&[written.clone()], scratch.path(), 1)
                 .unwrap();
         let w = src.width();
         let mut planes = crate::integration::banded::BandPlanes::new(&src);
-        src.read_band(0, 1, &mut planes).unwrap();
+        src.read_band(0, 1, &mut planes, 1).unwrap();
         let mut row = vec![0f32; w];
         planes.decode_frame_into(0, &mut row);
         assert!((row[0] - 700.0).abs() < 1e-3, "got {}", row[0]);

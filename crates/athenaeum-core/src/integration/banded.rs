@@ -9,8 +9,12 @@
 
 use super::IntegrationError;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 const BLOCK: u64 = 2880;
 
@@ -136,6 +140,37 @@ impl FrameReader {
             FrameReader::Fits { kind, .. } | FrameReader::Scratch { kind, .. } => *kind,
         }
     }
+
+    /// Fill `buf` from `offset`. Positional — no seek, no cursor — so several
+    /// bands (and several frames of one band) can be read from a shared
+    /// `&BandSource` at once.
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        let (file, base) = match self {
+            FrameReader::Fits { file, data_offset, .. } => (file, *data_offset),
+            FrameReader::Scratch { file, .. } => (file, 0),
+        };
+        #[cfg(unix)]
+        {
+            file.read_exact_at(buf, base + offset)
+        }
+        #[cfg(windows)]
+        {
+            // `seek_read` may return a short read; loop until the buffer is
+            // full or the file ends. There is no `read_exact_at` on Windows.
+            let mut done = 0usize;
+            while done < buf.len() {
+                let n = file.seek_read(&mut buf[done..], base + offset + done as u64)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short read while filling a band",
+                    ));
+                }
+                done += n;
+            }
+            Ok(())
+        }
+    }
 }
 
 pub struct BandSource {
@@ -241,28 +276,82 @@ fn spill_via_read_raw(path: &Path, scratch_dir: &Path, idx: usize)
     Ok((file, w, h))
 }
 
+/// Probe one path into a ready reader. `idx` is this path's position in the
+/// caller's list — only used to keep decode-and-spill scratch filenames
+/// distinct within one `open` call (a process-wide sequence in
+/// `spill_via_read_raw` already covers cross-call uniqueness).
+fn open_one(p: &Path, scratch_dir: &Path, idx: usize) -> Result<(FrameReader, usize, usize), IntegrationError> {
+    match probe_fits(p) {
+        Some(info) => Ok((
+            FrameReader::Fits {
+                file: File::open(p)?,
+                data_offset: info.data_offset,
+                kind: plane_kind_for_bitpix(info.bitpix, info.bzero, info.bscale),
+            },
+            info.w, info.h,
+        )),
+        None => {
+            let (file, w, h) = spill_via_read_raw(p, scratch_dir, idx)?;
+            Ok((FrameReader::Scratch { file, kind: PlaneKind::F32Le }, w, h))
+        }
+    }
+}
+
 impl BandSource {
-    pub fn open(paths: &[PathBuf], scratch_dir: &Path) -> Result<BandSource, IntegrationError> {
+    /// Opens every path's reader. `probe_fits` is an `open` plus a couple of
+    /// small reads PER FILE, so on a network mount a 100-frame set pays 100
+    /// serial round trips before a single pixel is read — measured at 0.55s
+    /// even locally. Probing across `concurrency` scoped threads amortizes
+    /// that latency the same way `read_band` amortizes the per-band reads.
+    ///
+    /// Readers are assembled back in the caller's `paths` order regardless of
+    /// which worker finished first or last: each worker owns a fixed,
+    /// contiguous slice of `slots` (one per input path) and writes only into
+    /// its own slice, so completion order never leaks into reader order. That
+    /// order is load-bearing — `bad_samples_per_frame` is indexed by it, and
+    /// so is the per-pixel combine's column.
+    pub fn open(paths: &[PathBuf], scratch_dir: &Path, concurrency: usize) -> Result<BandSource, IntegrationError> {
         if paths.is_empty() {
             return Err(IntegrationError::BadInput("empty frame list".into()));
         }
-        let mut readers = Vec::with_capacity(paths.len());
-        let mut dims: Option<(usize, usize)> = None;
-        for (i, p) in paths.iter().enumerate() {
-            let (reader, w, h) = match probe_fits(p) {
-                Some(info) => (
-                    FrameReader::Fits {
-                        file: File::open(p)?,
-                        data_offset: info.data_offset,
-                        kind: plane_kind_for_bitpix(info.bitpix, info.bzero, info.bscale),
-                    },
-                    info.w, info.h,
-                ),
-                None => {
-                    let (file, w, h) = spill_via_read_raw(p, scratch_dir, i)?;
-                    (FrameReader::Scratch { file, kind: PlaneKind::F32Le }, w, h)
+        let n = paths.len();
+        let workers = concurrency.max(1).min(n);
+        let per = n.div_ceil(workers);
+
+        let mut slots: Vec<Option<Result<(FrameReader, usize, usize), IntegrationError>>> =
+            (0..n).map(|_| None).collect();
+        let mut panicked = false;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for (chunk_idx, (paths_chunk, slot_chunk)) in
+                paths.chunks(per).zip(slots.chunks_mut(per)).enumerate()
+            {
+                let base = chunk_idx * per;
+                handles.push(scope.spawn(move || {
+                    for (offset, (p, slot)) in paths_chunk.iter().zip(slot_chunk.iter_mut()).enumerate() {
+                        *slot = Some(open_one(p, scratch_dir, base + offset));
+                    }
+                }));
+            }
+            for h in handles {
+                // A panicked probe thread must surface as an error, never as
+                // a silently missing reader — its slots stay `None` below,
+                // which the assembly loop turns into a hard error.
+                if h.join().is_err() {
+                    panicked = true;
                 }
-            };
+            }
+        });
+        if panicked {
+            return Err(IntegrationError::BadInput("a frame probe thread panicked".into()));
+        }
+
+        let mut readers = Vec::with_capacity(n);
+        let mut dims: Option<(usize, usize)> = None;
+        for (p, slot) in paths.iter().zip(slots.into_iter()) {
+            let (reader, w, h) = slot.ok_or_else(|| {
+                IntegrationError::BadInput(format!("{}: never probed (owning thread panicked)", p.display()))
+            })??;
             match dims {
                 None => dims = Some((w, h)),
                 Some(d) if d != (w, h) => {
@@ -299,10 +388,12 @@ impl BandSource {
 
     /// Rows per band whose band buffers (one per frame, held in the SOURCE's
     /// own byte width — see [`BandPlanes`]) fit `budget_bytes`. Counts every
-    /// frame's OWN bytes-per-row, so a BITPIX 16 set gets twice the rows an
-    /// f32 set does for the same budget, plus two f32 rows of headroom — the
-    /// margin the old `frame_count + 2` formula carried as two phantom
-    /// frames.
+    /// frame's OWN bytes-per-row, so a BITPIX 16 set gets MORE rows than an
+    /// f32 set for the same budget, on top of a fixed `width * 8` bytes of
+    /// headroom (replacing the old `frame_count + 2` phantom-frame margin).
+    /// That headroom is a bigger share of a small set's per-row cost, so the
+    /// ratio is `(4n+8)/(2n+8)` for n frames, not a flat 2x: 1.5x at n=4,
+    /// 1.93x at n=50 — asymptotically twice the rows, but only in the limit.
     ///
     /// Floor of 1: the floor must never override the budget (2026-08-02 audit
     /// I5) — at very large frame counts a 16-row floor grew band memory
@@ -322,7 +413,26 @@ impl BandSource {
     /// per-frame byte buffers — no decode here any more (Task 4): BZERO/BSCALE
     /// and endianness are applied lazily by [`BandPlanes::sample`] /
     /// `decode_row_into` / `decode_frame_into` on read.
-    pub fn read_band(&mut self, y0: usize, rows: usize, out: &mut BandPlanes) -> Result<(), IntegrationError> {
+    ///
+    /// `concurrency` comes from `IoPolicy` (Task 5) and is deliberately NOT
+    /// the rayon pool's width. A rayon pool caps parallelism at its own
+    /// thread count, which is derived from CPU cores — and a network mount is
+    /// latency-bound, so it needs MORE outstanding reads than the machine has
+    /// cores to fill the link at all. Scoped OS threads give an exact,
+    /// pool-independent count, cost ~10-20 us to spawn against a band read
+    /// measured in seconds, and are safe to use from inside a
+    /// `pool.install(..)` (they are not rayon workers, so they cannot
+    /// deadlock against the pool that called in). Taking `&self` (not
+    /// `&mut self`) is what makes that safe: several bands, or several
+    /// frames of one band, can be read from the same shared `BandSource` at
+    /// once because there is no cursor to race — every read is positional.
+    pub fn read_band(
+        &self,
+        y0: usize,
+        rows: usize,
+        out: &mut BandPlanes,
+        concurrency: usize,
+    ) -> Result<(), IntegrationError> {
         assert_eq!(out.bufs.len(), self.readers.len());
         // `out`'s `width`/`kinds` are snapshotted once at `BandPlanes::new` and
         // never re-derived here, so a `BandPlanes` built from a DIFFERENT
@@ -341,17 +451,39 @@ impl BandSource {
         if y0 + rows > self.height {
             return Err(IntegrationError::BadInput(format!("band {y0}+{rows} beyond height {}", self.height)));
         }
-        for (reader, buf) in self.readers.iter_mut().zip(out.bufs.iter_mut()) {
-            let (file, base_offset, bpp) = match reader {
-                FrameReader::Fits { file, data_offset, kind } => (file, *data_offset, kind.bytes_per_sample()),
-                FrameReader::Scratch { file, kind } => (file, 0u64, kind.bytes_per_sample()),
-            };
-            let need = rows * w * bpp;
-            buf.resize(need, 0u8);
-            file.seek(SeekFrom::Start(base_offset + (y0 * w * bpp) as u64))?;
-            file.read_exact(buf)?;
-        }
         out.rows = rows;
+
+        let n = self.readers.len();
+        let workers = concurrency.max(1).min(n.max(1));
+        let per = n.div_ceil(workers);
+        let mut errors: Vec<IntegrationError> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for (readers, bufs) in self.readers.chunks(per).zip(out.bufs.chunks_mut(per)) {
+                handles.push(scope.spawn(move || -> Result<(), IntegrationError> {
+                    for (reader, buf) in readers.iter().zip(bufs.iter_mut()) {
+                        let bpp = reader.kind().bytes_per_sample();
+                        buf.resize(rows * w * bpp, 0u8);
+                        reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(Err(e)) => errors.push(e),
+                    // A panicked reader must surface as an error, never as a
+                    // silently short band.
+                    Err(_) => errors.push(IntegrationError::BadInput(
+                        "a band reader thread panicked".into(),
+                    )),
+                    Ok(Ok(())) => {}
+                }
+            }
+        });
+        if let Some(e) = errors.into_iter().next() {
+            return Err(e);
+        }
         Ok(())
     }
 }
@@ -448,13 +580,47 @@ mod tests {
     }
 
     #[test]
+    fn bands_are_read_positionally_from_a_shared_source() {
+        // Reads must be positional: `pread` per frame, no shared cursor, so
+        // the frames can be filled in parallel. Pinned by reading the SAME
+        // source twice from a shared reference — which does not compile
+        // against a `&mut self` reader, and would interleave cursors against
+        // a seeking one.
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..8)
+            .map(|i| f32_fixture(dir.path(), &format!("p{i}.fits"), 64, 40, move |x, y| (i * 10_000 + y * 64 + x) as f32))
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 4).unwrap();
+
+        let read = |y0: usize, rows: usize| {
+            let mut planes = BandPlanes::new(&src);
+            src.read_band(y0, rows, &mut planes, 4).unwrap();
+            (0..planes.frame_count())
+                .map(|f| (0..rows * 64).map(|i| planes.sample(f, i)).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+
+        let a = read(8, 4);
+        let b = read(8, 4);
+        assert_eq!(a, b, "the same band must read identically — a shared cursor would drift");
+        for (f, plane) in a.iter().enumerate() {
+            assert_eq!(plane[0], (f * 10_000 + 8 * 64) as f32, "frame {f} row 8 col 0");
+        }
+
+        // Two bands read concurrently off the same &BandSource.
+        let (c, d) = rayon::join(|| read(0, 4), || read(20, 4));
+        assert_eq!(c[3][0], (3 * 10_000) as f32);
+        assert_eq!(d[3][0], (3 * 10_000 + 20 * 64) as f32);
+    }
+
+    #[test]
     fn planes_decode_identically_to_the_old_f32_path() {
         let dir = tempfile::tempdir().unwrap();
         let p1 = f32_fixture(dir.path(), "a.fits", 32, 24, |x, y| (y * 32 + x) as f32);
         let p2 = u16_fixture(dir.path(), "b.fits", 32, 24, 1000);
-        let mut src = BandSource::open(&[p1, p2], dir.path()).unwrap();
+        let src = BandSource::open(&[p1, p2], dir.path(), 1).unwrap();
         let mut planes = BandPlanes::new(&src);
-        src.read_band(10, 4, &mut planes).unwrap();
+        src.read_band(10, 4, &mut planes, 1).unwrap();
 
         assert_eq!(planes.frame_count(), 2);
         assert_eq!(planes.rows(), 4);
@@ -481,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn u16_sources_get_twice_the_rows_of_f32_sources() {
+    fn u16_sources_get_more_rows_than_f32_sources() {
         let dir = tempfile::tempdir().unwrap();
         let u16s: Vec<_> = (0..4)
             .map(|i| u16_fixture(dir.path(), &format!("u{i}.fits"), 100, 200, 500))
@@ -490,8 +656,8 @@ mod tests {
             .map(|i| f32_fixture(dir.path(), &format!("f{i}.fits"), 100, 200, |_, _| 1.0))
             .collect();
         let budget = 1024 * 1024;
-        let u_rows = BandSource::open(&u16s, dir.path()).unwrap().band_rows_for_budget(budget);
-        let f_rows = BandSource::open(&f32s, dir.path()).unwrap().band_rows_for_budget(budget);
+        let u_rows = BandSource::open(&u16s, dir.path(), 1).unwrap().band_rows_for_budget(budget);
+        let f_rows = BandSource::open(&f32s, dir.path(), 1).unwrap().band_rows_for_budget(budget);
         assert!(
             u_rows > f_rows,
             "BITPIX 16 bands are half the bytes of f32 bands, so the same budget must buy more rows: {u_rows} vs {f_rows}"
@@ -500,13 +666,16 @@ mod tests {
 
     #[test]
     fn band_rows_floor_never_overrides_budget() {
-        // 3000 frames of width 9576 (2026-08-02 audit I5): one row per band is
-        // slow but bounded; the floor must yield to the budget.
+        // Width 9576 matches the real corpus that surfaced the bug (2026-08-02
+        // audit I5); this fixture uses a small frame count (4), not that
+        // corpus's actual ~3000, since only the per-row width drives the
+        // formula under test. One row per band is slow but bounded; the floor
+        // must yield to the budget regardless of frame count.
         let dir = tempfile::tempdir().unwrap();
         let paths: Vec<_> = (0..4)
             .map(|i| u16_fixture(dir.path(), &format!("t{i}.fits"), 9576, 8, 1))
             .collect();
-        let src = BandSource::open(&paths, dir.path()).unwrap();
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
         assert_eq!(src.band_rows_for_budget(1), 1, "budget of 1 byte still yields exactly one row");
     }
 
@@ -515,7 +684,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p1 = f32_fixture(dir.path(), "a.fits", 32, 24, |_, _| 0.0);
         let p2 = f32_fixture(dir.path(), "b.fits", 16, 24, |_, _| 0.0);
-        assert!(matches!(BandSource::open(&[p1, p2], dir.path()), Err(IntegrationError::BadInput(_))));
+        assert!(matches!(BandSource::open(&[p1, p2], dir.path(), 1), Err(IntegrationError::BadInput(_))));
     }
 
     #[test]
@@ -581,7 +750,7 @@ mod tests {
         // u16 (BITPIX=16): 2 bytes/sample on disk, even though the decoded
         // sample is f32.
         let u16_file = u16_fixture(dir.path(), "u16.fits", 10, 4, 1000);
-        let src = BandSource::open(&[f32_file, u16_file], dir.path()).unwrap();
+        let src = BandSource::open(&[f32_file, u16_file], dir.path(), 1).unwrap();
         assert_eq!(src.bytes_per_row(), 10 * 4 + 10 * 2);
     }
 
@@ -653,13 +822,20 @@ mod tests {
         // A value whose big-endian and little-endian byte patterns differ, so
         // a byte-order slip in the decode arm is caught rather than passing
         // by coincidence (a byte-palindromic bit pattern would not catch it).
+        // Two distinct samples so `decode_run` is checked over an actual run,
+        // not just a single-sample slice.
         let kind = PlaneKind::F32Be { bzero: 0.0, bscale: 1.0 };
-        let v: f32 = 12345.625;
-        let be = v.to_be_bytes();
-        let le = v.to_le_bytes();
-        assert_ne!(be, le, "test value's BE/LE byte patterns must differ to be a real test");
-        assert_eq!(kind.decode(&be, 0), v);
-        assert_decode_and_run_agree(kind, &be, 1);
+        let v1: f32 = 12345.625;
+        let v2: f32 = -876.5;
+        let be1 = v1.to_be_bytes();
+        let le1 = v1.to_le_bytes();
+        assert_ne!(be1, le1, "test value's BE/LE byte patterns must differ to be a real test");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&be1);
+        bytes.extend_from_slice(&v2.to_be_bytes());
+        assert_eq!(kind.decode(&bytes, 0), v1);
+        assert_eq!(kind.decode(&bytes, 1), v2);
+        assert_decode_and_run_agree(kind, &bytes, 2);
     }
 
     #[test]
@@ -684,10 +860,18 @@ mod tests {
         );
         assert_ne!(correct, 0.0, "the whole point is that the f64 path keeps a nonzero residual");
 
+        // A second, unrelated sample so `decode_run` is checked over an
+        // actual multi-sample run, not just a single-sample slice.
+        let raw2: f64 = 42.0;
+        let expected2 = (raw2 * bscale + bzero) as f32;
+
         let kind = PlaneKind::F64Be { bzero, bscale };
-        let bytes = raw.to_be_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&raw.to_be_bytes());
+        bytes.extend_from_slice(&raw2.to_be_bytes());
         assert_eq!(kind.decode(&bytes, 0), correct);
-        assert_decode_and_run_agree(kind, &bytes, 1);
+        assert_eq!(kind.decode(&bytes, 1), expected2);
+        assert_decode_and_run_agree(kind, &bytes, 2);
     }
 
     #[test]
@@ -697,10 +881,16 @@ mod tests {
         // BZERO/BSCALE. Confirm the raw value comes back completely
         // unscaled — there is no bzero/bscale field on this variant to drop,
         // so the only way to get this wrong is to apply some anyway.
+        // Two samples so `decode_run` is checked over an actual multi-sample
+        // run, not just a single-sample slice.
         let kind = PlaneKind::F32Le;
-        let v: f32 = -42.5;
-        let bytes = v.to_le_bytes();
-        assert_eq!(kind.decode(&bytes, 0), v, "F32Le must not apply any scale/offset");
-        assert_decode_and_run_agree(kind, &bytes, 1);
+        let v1: f32 = -42.5;
+        let v2: f32 = 1234.75;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&v1.to_le_bytes());
+        bytes.extend_from_slice(&v2.to_le_bytes());
+        assert_eq!(kind.decode(&bytes, 0), v1, "F32Le must not apply any scale/offset");
+        assert_eq!(kind.decode(&bytes, 1), v2, "F32Le must not apply any scale/offset");
+        assert_decode_and_run_agree(kind, &bytes, 2);
     }
 }

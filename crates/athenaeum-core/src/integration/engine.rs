@@ -77,7 +77,7 @@ pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
 /// storage-resolved policy from `integration::io_policy::resolve`.
 #[allow(clippy::too_many_arguments)]
 fn run_banded(
-    src: &mut BandSource,
+    src: &BandSource,
     scales: &[f32],
     precal: Option<&FlatPrecal>,
     recipe: IntegrationRecipe,
@@ -114,7 +114,7 @@ fn run_banded(
         }
         let rows = band_rows.min(h - y0);
         let t_read = std::time::Instant::now();
-        src.read_band(y0, rows, &mut planes)?;
+        src.read_band(y0, rows, &mut planes, io.read_concurrency)?;
         read_duration += t_read.elapsed();
         bytes_read += (rows * per_row_bytes) as u64;
 
@@ -223,9 +223,9 @@ fn integrate_bias_like_inner(
     progress: EngineProgress<'_>,
     io: IoPolicy,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    let mut src = BandSource::open(paths, scratch_dir)?;
+    let src = BandSource::open(paths, scratch_dir, io.read_concurrency)?;
     let scales = vec![1.0f32; src.frame_count()];
-    run_banded(&mut src, &scales, None, recipe, pool, cancel, &progress, io)
+    run_banded(&src, &scales, None, recipe, pool, cancel, &progress, io)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,7 +253,7 @@ fn integrate_flat_inner(
     progress: EngineProgress<'_>,
     io: IoPolicy,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    let mut src = BandSource::open(paths, scratch_dir)?;
+    let src = BandSource::open(paths, scratch_dir, io.read_concurrency)?;
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
     if let FlatPrecal::MasterFrame { width, height, .. } = precal {
         if (*width, *height) != (w, h) {
@@ -282,7 +282,7 @@ fn integrate_flat_inner(
         if cancel.load(Ordering::Relaxed) { return Err(IntegrationError::Cancelled); }
         let rows = band_rows.min(cy1 - y);
         let t_read = std::time::Instant::now();
-        src.read_band(y, rows, &mut planes)?;
+        src.read_band(y, rows, &mut planes, io.read_concurrency)?;
         pass1_read += t_read.elapsed();
         pass1_bytes_read += (rows * per_row_bytes) as u64;
         for i in 0..n {
@@ -323,8 +323,9 @@ fn integrate_flat_inner(
     let scales: Vec<f32> = means.iter().map(|m| (target / m) as f32).collect();
 
     // Pass 2: full combine with precal + scale applied. `BandSource::read_band`
-    // takes `&mut self`, so pass 1 (above) and pass 2 reuse the SAME `src` —
-    // readers just seek back to the start and stream again; no need to reopen.
+    // is positional (`&self`, `pread`-style — no cursor), so pass 1 (above)
+    // and pass 2 just reuse the SAME `src`; there is nothing to seek back and
+    // no need to reopen.
     //
     // `run_banded` only knows its own (pass 2) height, not pass 1's
     // central-third read that already happened above it — wrap the caller's
@@ -333,7 +334,7 @@ fn integrate_flat_inner(
         (progress.on_band)(cur, total, pass1_bytes_read + bytes_done, pass1_total_bytes + bytes_total);
     };
     let wrapped_progress = EngineProgress { on_band: &wrapped_on_band };
-    let mut out = run_banded(&mut src, &scales, Some(precal), recipe, pool, cancel, &wrapped_progress, io)?;
+    let mut out = run_banded(&src, &scales, Some(precal), recipe, pool, cancel, &wrapped_progress, io)?;
     out.flat_norm = Some(central_third_mean(&out.data, w, h));
     out.read_duration += pass1_read;
     out.bytes_read += pass1_bytes_read;
@@ -673,9 +674,10 @@ mod tests {
             write(dir.path(), "b3.fits", w, h, |_, _| 30.0),
         ];
         let on_band = nop();
-        // band_rows_for_budget's per-row cost is (frames+2)*width*4 =
-        // (3+2)*32*4 = 640; budget 12_800 -> band_rows = 12_800/640 = 20
-        // exactly, so the 48-row image runs as 20/20/8-row bands.
+        // band_rows_for_budget's per-row cost is sum(width * bytes_per_sample
+        // over every frame) + width*8 headroom = 3*32*4 + 32*8 = 384 + 256 =
+        // 640; budget 12_800 -> band_rows = 12_800/640 = 20 exactly, so the
+        // 48-row image runs as 20/20/8-row bands.
         let out = integrate_bias_like(
             &paths,
             IntegrationRecipe::median(Rejection::None),

@@ -327,12 +327,12 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     assert_eq!(prov.source_set_id, Some(set_id), "rebuild must not relink to a different source");
 
     // ── The file on disk actually changed (same path, new pixels). ──
-    let mut src = athenaeum_core::integration::banded::BandSource::open(
-        std::slice::from_ref(&target_abs), scratch.path(),
+    let src = athenaeum_core::integration::banded::BandSource::open(
+        std::slice::from_ref(&target_abs), scratch.path(), 1,
     ).unwrap();
     let (w, h) = (src.width(), src.height());
     let mut planes = athenaeum_core::integration::banded::BandPlanes::new(&src);
-    src.read_band(0, h, &mut planes).unwrap();
+    src.read_band(0, h, &mut planes, 1).unwrap();
     let mut data = vec![0f32; w * h];
     planes.decode_frame_into(0, &mut data);
     let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;

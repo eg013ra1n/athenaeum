@@ -430,12 +430,14 @@ fn select_flat_precal(
 fn load_precal_pixels(choice: &PrecalChoice, scratch: &Path) -> Result<FlatPrecal, ApiError> {
     match choice {
         PrecalChoice::Master { path, .. } => {
-            let mut src =
-                crate::integration::banded::BandSource::open(&[PathBuf::from(path)], scratch)
+            // One frame, no `IoPolicy` at this call site — nothing to
+            // parallelize.
+            let src =
+                crate::integration::banded::BandSource::open(&[PathBuf::from(path)], scratch, 1)
                     .map_err(|e| ApiError::Internal(format!("pre-cal master unreadable: {e}")))?;
             let (w, h) = (src.width(), src.height());
             let mut planes = crate::integration::banded::BandPlanes::new(&src);
-            src.read_band(0, h, &mut planes)
+            src.read_band(0, h, &mut planes, 1)
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             let mut data = vec![0f32; w * h];
             planes.decode_frame_into(0, &mut data);

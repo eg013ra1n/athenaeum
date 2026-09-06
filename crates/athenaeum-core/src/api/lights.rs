@@ -1058,10 +1058,10 @@ mod real_data_e2e {
 
         // ── Read a full f32 plane (one band) for exact pixel assertions ──────
         fn read_plane(path: &Path, scratch: &Path) -> (usize, usize, Vec<f32>) {
-            let mut src = BandSource::open(&[path.to_path_buf()], scratch).unwrap();
+            let src = BandSource::open(&[path.to_path_buf()], scratch, 1).unwrap();
             let (w, h) = (src.width(), src.height());
             let mut planes = BandPlanes::new(&src);
-            src.read_band(0, h, &mut planes).unwrap();
+            src.read_band(0, h, &mut planes, 1).unwrap();
             let mut data = vec![0f32; w * h];
             planes.decode_frame_into(0, &mut data);
             (w, h, data)

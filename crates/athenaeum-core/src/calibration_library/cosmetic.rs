@@ -333,7 +333,8 @@ fn read_full_plane(
     path: &Path,
     scratch_dir: &Path,
 ) -> Result<(usize, usize, Vec<f32>), IntegrationError> {
-    let mut src = BandSource::open(&[path.to_path_buf()], scratch_dir)?;
+    // One frame, no `IoPolicy` at this call site — nothing to parallelize.
+    let src = BandSource::open(&[path.to_path_buf()], scratch_dir, 1)?;
     let (w, h) = (src.width(), src.height());
     // One dark plane, one frame — already 1-2 bands at the floor, so the
     // machine-resolved budget would not change the band count here (spec §8).
@@ -343,7 +344,7 @@ fn read_full_plane(
     let mut y = 0;
     while y < h {
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut planes)?;
+        src.read_band(y, rows, &mut planes, 1)?;
         planes.decode_frame_into(0, &mut data[y * w..(y + rows) * w]);
         y += rows;
     }
