@@ -199,6 +199,10 @@ struct MasterBuildProgressEvent {
     stage: &'static str,
     current: usize,
     total: usize,
+    /// One monotonic 0-100 across the whole pixel phase: reading (bytes) is
+    /// weighted `READ_SHARE` = 0.7, combining (rows) 0.3 — see
+    /// `build_percent`. Never goes backwards between "integrating" and
+    /// "combining"; "writing"/"registering" report 0.
     percent: f64,
     /// Bytes of source read so far / in total. `current`/`total` count
     /// bands, which say nothing about size once bands are machine-sized —
@@ -856,6 +860,10 @@ fn log_build_started(
     );
 }
 
+/// Review 2026-09-06 F3/Important 1: called exactly once, at the tail of
+/// `run_build`'s success path, once the master file is written AND
+/// registered in the catalog — never on a cancel or a write/register
+/// failure, both of which return before reaching this call.
 fn log_build_finished(set_id: i64, duration: std::time::Duration, bytes_read: u64, out: &IntegrationOutput) {
     let read_s = out.read_duration.as_secs_f64();
     tracing::info!(
@@ -885,9 +893,11 @@ const READ_SHARE: f64 = 0.7;
 /// bytes percent for one stage and a rows percent for the other, rendered in
 /// the same UI cell — went backwards at every band boundary. The caller feeds
 /// this RUNNING MAXIMA of both counters, so the output is monotonic by
-/// construction. Each fraction is capped at 1 (a flat's two-pass wrapper can
-/// report a byte pair past its own total for one tick) and an unknown total
-/// (0, before the first tick of that phase) contributes nothing.
+/// construction. Each fraction is capped at 1 — defensive against any future
+/// caller reporting a value past its own total; verified today that neither
+/// of a flat's two integration passes can (both report the same total) — and
+/// an unknown total (0, before the first tick of that phase) contributes
+/// nothing.
 fn build_percent(bytes_done: u64, bytes_total: u64, rows_done: usize, rows_total: usize) -> f64 {
     let read = if bytes_total > 0 { (bytes_done as f64 / bytes_total as f64).min(1.0) } else { 0.0 };
     let combine = if rows_total > 0 { (rows_done as f64 / rows_total as f64).min(1.0) } else { 0.0 };
@@ -1093,7 +1103,9 @@ fn run_build(
         // window that happened to close right as the last frame finished
         // must never swallow the one event saying reading is actually done,
         // which would otherwise leave the operator staring at a stale <100%
-        // number through the whole silent combine phase that follows.
+        // number through the whole silent combine phase that follows. (The
+        // percent itself reads `READ_SHARE * 100` = 70 here, not 100 — the
+        // read is fully done, but combining still owns the remaining 30.)
         let is_terminal = bytes_total > 0 && bytes_read_so_far >= bytes_total;
         let now = std::time::Instant::now();
         let mut last = last_emitted.lock().unwrap();
@@ -1216,7 +1228,6 @@ fn run_build(
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BuildStepError::Cancelled);
     }
-    log_build_finished(set_id, build_started_at.elapsed(), out.bytes_read, &out);
 
     // Audit C2: the engine drops non-finite samples ("undefined pixels") from
     // the per-pixel stack instead of panicking or baking NaN into the master.
@@ -1340,17 +1351,18 @@ fn run_build(
         }
     };
 
-    // Fix wave item 1 follow-up: the first check (right after
-    // `log_build_finished`, above) closes the CRITICAL's real window — the
-    // multi-second-to-multi-minute pixel phase — but leaves a much smaller
-    // one open between it and here (a DB connection, `load_header_inputs`,
-    // `member_hash`, card building, directory creation and the collision
-    // claim). Re-check right at the boundary of the irreversible action:
-    // once `write_fits_f32` returns, real bytes are on disk under a name
-    // `register_master` is about to make load-bearing. `claim` (a
-    // `ClaimGuard`) is still armed here, so this early return deletes the
-    // just-created placeholder via the same RAII path every other exit in
-    // this function already uses — no special-case cleanup needed.
+    // Fix wave item 1 follow-up: the first check (the post-engine check just
+    // above, right after integration finishes) closes the CRITICAL's real
+    // window — the multi-second-to-multi-minute pixel phase — but leaves a
+    // much smaller one open between it and here (a DB connection,
+    // `load_header_inputs`, `member_hash`, card building, directory creation
+    // and the collision claim). Re-check right at the boundary of the
+    // irreversible action: once `write_fits_f32` returns, real bytes are on
+    // disk under a name `register_master` is about to make load-bearing.
+    // `claim` (a `ClaimGuard`) is still armed here, so this early return
+    // deletes the just-created placeholder via the same RAII path every
+    // other exit in this function already uses — no special-case cleanup
+    // needed.
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BuildStepError::Cancelled);
     }
@@ -1384,9 +1396,16 @@ fn run_build(
     })
     .to_string();
 
-    match target {
+    // Review 2026-09-06 F3/Important 1: `master_set_id` is bound here rather
+    // than returned directly from each arm so `log_build_finished` can run
+    // ONCE, at the very end of the success path — after `register_master`
+    // (New) or `finalize_rebuild` (Rebuild) has actually succeeded. Every
+    // failure arm below still returns `Err` immediately, same as before;
+    // only the success arms changed shape, from yielding `Ok((id, warning))`
+    // to yielding `id` for a single `Ok((...))` built after the match.
+    let master_set_id: i64 = match target {
         BuildTarget::New => match register_master(&conn, set_id, &target_abs, &recipe_json) {
-            Ok(reg) => Ok((reg.master_set_id, build_warning)),
+            Ok(reg) => reg.master_set_id,
             Err(e) => {
                 // Keep the written master on disk: deleting it on a catalog
                 // conflict re-created the exact divergence that caused the
@@ -1395,10 +1414,10 @@ fn run_build(
                 // lost. The path in the error makes user reports actionable.
                 // The filename claim was disarmed right after the write, so
                 // nothing on this path can remove the file either.
-                Err(BuildStepError::Other(format!(
+                return Err(BuildStepError::Other(format!(
                     "register master at {}: {e:#}",
                     target_abs.display()
-                )))
+                )));
             }
         },
         BuildTarget::Rebuild {
@@ -1456,9 +1475,17 @@ fn run_build(
             // above: new pixels on disk, stale provenance/files rows in the
             // DB until a later rebuild succeeds. That trade (stale metadata
             // over destroyed data) is intentional.
-            Ok((master_set_id, build_warning))
+            master_set_id
         }
-    }
+    };
+    // Review 2026-09-06 F1/F3 (Important 1): the ONE place this line runs —
+    // after both write and catalog registration have succeeded, right
+    // before the function's only remaining `Ok` return. `duration_ms` now
+    // includes the write + register tail, not just the pixel phase — the
+    // pixel-phase numbers (`read_ms`/`combine_ms`) come straight from `out`
+    // and are unaffected.
+    log_build_finished(set_id, build_started_at.elapsed(), out.bytes_read, &out);
+    Ok((master_set_id, build_warning))
 }
 
 /// Everything a rebuild does AFTER `write_fits_f32`'s atomic rename, in ONE
