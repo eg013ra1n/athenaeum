@@ -9,6 +9,19 @@ Plans, specs and audits live in `plans/`, `specs/` and `research/` beside this f
 and hold the detail. This file holds only the residue: the checks nobody has run and
 the calls that have already been made.
 
+## Windows: 39 pre-existing test failures, and no CI that would catch them
+
+The Rust suite has only ever run on Linux — `.gitlab-ci.yml` contains `cargo test`
+zero times (its Windows job builds the bundle and never tests), and the GitHub
+workflow is `ubuntu-latest`. A Windows run on 2026-09-06 found 39 failures in
+`athenaeum-core`, all pre-existing on `main` and proven so by a baseline diff.
+Root-cause families, file:line attribution and a suggested order are in
+`research/2026-09-06-windows-test-failures.md`. Two are worth pulling forward: a
+five-test family fixed by one `FILE_FLAG_BACKUP_SEMANTICS` flag, and a drift
+guard that cannot run on any Windows checkout because it splits on a hardcoded
+`\n` while `core.autocrlf` gives it CRLF — the repo has no `.gitattributes`.
+One red test in the list is the escape-the-root security guard.
+
 **Keeping it current.** A cycle that lands adds its unverified checks here. A check
 that passes is deleted, not ticked — with the date and the measurement, if there was
 one, moved into the cycle's own doc. A decision that gets ratified moves from
