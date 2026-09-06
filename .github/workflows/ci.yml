@@ -97,3 +97,43 @@ jobs:
 
       - name: Typecheck frontend
         run: npx tsc --noEmit
+
+  # The Rust suite has only ever run on Linux: this workflow was ubuntu-only and
+  # .gitlab-ci.yml contains `cargo test` zero times (its build:windows job is
+  # `only: tags` and builds the bundle without testing). A Windows run on
+  # 2026-09-06 found 39 pre-existing failures behind that gap. This job is the
+  # measurement that keeps them closed.
+  #
+  # `continue-on-error` is deliberate and TEMPORARY: the job is red on the day it
+  # lands and turns green over the course of the cycle in
+  # docs/superpowers/plans/2026-09-07-windows-test-failures.md, whose last task
+  # removes this line and makes Windows a gate.
+  build-and-test-windows:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # No system-dependency step: the MSVC toolchain and the WebView2 runtime
+      # Tauri needs are already on the windows-latest image. rustafits has needed
+      # no nasm/cmake since it moved to a pure-Rust JPEG encoder (2026-07-29).
+      - name: Resolve the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The command MUST stay identical to the Linux job's. Two jobs running
+      # different commands drift, and the whole point of this one is that it
+      # measures the same thing on another platform.
+      - name: Compile workspace and tests
+        run: cargo test --workspace --no-run
+
+      - name: Test workspace
+        run: cargo test --workspace -- --skip unclean_shutdown_mid_transfer_resumes_on_restart
