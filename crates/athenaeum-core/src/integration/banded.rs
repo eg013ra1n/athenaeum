@@ -242,9 +242,29 @@ pub fn probe_bitpix(path: &Path) -> Option<i32> {
     probe_fits(path).map(|i| i.bitpix)
 }
 
+/// Test-only observation hook (fix round 1, I1 regression pin): records
+/// which thread called `spill_via_read_raw`, keyed by path so a test can
+/// look up its OWN call even if some other test is spilling concurrently in
+/// the same process (cargo runs tests in parallel by default, and this is a
+/// process-wide `static` — keying by path, unique per test's own `tempdir`,
+/// is what keeps two tests' recordings from clobbering each other rather
+/// than trusting "the last one" globally). Compiled only under `#[cfg(test)]`
+/// — this is pure test instrumentation, never a release-build concern.
+#[cfg(test)]
+static SPILL_THREAD_LOG: std::sync::Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn spill_thread_for(path: &Path) -> Option<std::thread::ThreadId> {
+    SPILL_THREAD_LOG.lock().unwrap().iter().rev().find(|(p, _)| p == path).map(|(_, t)| *t)
+}
+
 fn spill_via_read_raw(path: &Path, scratch_dir: &Path, idx: usize)
     -> Result<(File, usize, usize), IntegrationError>
 {
+    #[cfg(test)]
+    SPILL_THREAD_LOG.lock().unwrap().push((path.to_path_buf(), std::thread::current().id()));
+
     let (meta, pixels) = astroimage::ImageConverter::read_raw(path)
         .map_err(|e| IntegrationError::Decode(format!("{}: {e:#}", path.display())))?;
     // Every consumer of this reader (master build AND light calibration) works
@@ -717,6 +737,107 @@ mod tests {
         data.extend(std::iter::repeat(0u8).take(pad));
         f.write_all(&data).unwrap();
         p
+    }
+
+    /// A FITS file `probe_fits` rejects — bogus `NAXIS3` on an otherwise
+    /// ordinary 2D f32 image — but `astroimage::ImageConverter::read_raw`
+    /// (the decode-and-spill fallback's decoder) reads without complaint,
+    /// since `NAXIS < 3` makes it ignore NAXIS3 entirely. The cheapest of
+    /// `probe_fits`'s four rejection routes (a >64-block header, `NAXIS !=
+    /// 2`, `NAXIS3 != 1`, or an out-of-set `BITPIX` all take the same
+    /// fallback) — no XISF, no >64-block header padding, no RGB (which
+    /// would trip `spill_via_read_raw`'s own channels-must-be-1 check).
+    fn f32_needs_spill_fixture(dir: &std::path::Path, name: &str, w: usize, h: usize, fill: impl Fn(usize, usize) -> f32) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut header = Vec::new();
+        for line in [
+            format!("{:<80}", "SIMPLE  =                    T"),
+            format!("{:<80}", format!("BITPIX  = {:>20}", -32)),
+            format!("{:<80}", format!("NAXIS   = {:>20}", 2)),
+            format!("{:<80}", format!("NAXIS1  = {:>20}", w)),
+            format!("{:<80}", format!("NAXIS2  = {:>20}", h)),
+            // The bogus card: `probe_fits` requires `naxis3 == 1` (its
+            // default when the card is absent) whenever `naxis == 2`.
+            // `NAXIS < 3` means `astroimage`'s reader ignores this entirely.
+            format!("{:<80}", format!("NAXIS3  = {:>20}", 2)),
+            format!("{:<80}", "END"),
+        ] { header.extend_from_slice(line.as_bytes()); }
+        header.resize(2880, b' ');
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&header).unwrap();
+        let mut data = Vec::with_capacity(w * h * 4);
+        for y in 0..h { for x in 0..w { data.extend_from_slice(&fill(x, y).to_be_bytes()); } }
+        let pad = (2880 - data.len() % 2880) % 2880;
+        data.extend(std::iter::repeat(0u8).take(pad));
+        f.write_all(&data).unwrap();
+        p
+    }
+
+    /// Fix round 1, I1 (round 2): pins the two-phase probe/spill shape
+    /// end-to-end through the PUBLIC `open`/`read_band` API. The only
+    /// existing spill test, `concurrent_spills_at_same_idx_never_cross_contaminate`,
+    /// calls the private `spill_via_read_raw` directly and so proves nothing
+    /// about `ProbeOutcome::NeedsSpill`/`probe_one` or about which thread
+    /// ends up running the spill.
+    ///
+    /// Two things are pinned, at `concurrency = 4` so the real multi-worker
+    /// probe path runs:
+    /// - FUNCTIONAL: the spilled frame's pixels come back correct AT ITS
+    ///   ORIGINAL INDEX (placed non-edge — index 2 of 5 — so a reordering
+    ///   bug would not hide at a first/last boundary), alongside its
+    ///   ordinary neighbours.
+    /// - STRUCTURAL, the one that actually protects I1: a functional-only
+    ///   test would still pass if someone moved the spill back onto a probe
+    ///   worker — it only checks pixels, and the spill produces byte-identical
+    ///   output regardless of which thread runs it. `spill_thread_for`
+    ///   (backed by the `#[cfg(test)]`-only `SPILL_THREAD_LOG` hook in
+    ///   `spill_via_read_raw`) asserts the spill ran on THIS test's own
+    ///   thread — `open`'s single-threaded post-join assembly loop — never
+    ///   on a probe worker.
+    #[test]
+    fn decode_and_spill_runs_on_the_caller_not_a_probe_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16, 12);
+        let spilled_path = dir.path().join("spilled.fits");
+        let bases = [0.0f32, 1000.0, 5000.0, 2000.0, 3000.0];
+        let paths = vec![
+            f32_fixture(dir.path(), "a.fits", w, h, move |x, y| bases[0] + (y * w + x) as f32),
+            f32_fixture(dir.path(), "b.fits", w, h, move |x, y| bases[1] + (y * w + x) as f32),
+            // Non-edge position — index 2 of 5 — where a probe/spill
+            // ordering bug would not hide the way it might at index 0 or 4.
+            f32_needs_spill_fixture(dir.path(), "spilled.fits", w, h, move |x, y| bases[2] + (y * w + x) as f32),
+            f32_fixture(dir.path(), "c.fits", w, h, move |x, y| bases[3] + (y * w + x) as f32),
+            f32_fixture(dir.path(), "d.fits", w, h, move |x, y| bases[4] + (y * w + x) as f32),
+        ];
+        assert_eq!(paths[2], spilled_path);
+
+        let src = BandSource::open(&paths, dir.path(), 4).unwrap();
+        let mut planes = BandPlanes::new(&src);
+        src.read_band(0, h, &mut planes, 4).unwrap();
+
+        // Functional: every frame's pixels are correct at its ORIGINAL index.
+        for (i, &base) in bases.iter().enumerate() {
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(
+                        planes.sample(i, y * w + x),
+                        base + (y * w + x) as f32,
+                        "frame {i} ({x},{y}): pixel mismatch — a probe/spill ordering bug would show up here"
+                    );
+                }
+            }
+        }
+
+        // Structural: the spill ran on THIS test's own thread, never a probe
+        // worker — the assertion a functional-only pixel check cannot make.
+        let spill_thread = spill_thread_for(&spilled_path)
+            .expect("spill_via_read_raw must have run exactly once for this fixture");
+        assert_eq!(
+            spill_thread,
+            std::thread::current().id(),
+            "the decode-and-spill fallback must run on open()'s single-threaded assembly loop, \
+             never on a probe worker thread (fix round 1, I1)"
+        );
     }
 
     #[test]
