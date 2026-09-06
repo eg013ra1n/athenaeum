@@ -1536,7 +1536,7 @@ git commit -m "feat(integration): classify the storage the frames live on and de
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/integration/banded.rs` (`read_band`)
-- Modify: `crates/athenaeum-core/src/integration/engine.rs` (wrap the call in `pool.install`)
+- Modify: `crates/athenaeum-core/src/integration/engine.rs` (pass `io.read_concurrency`; the read must NOT be wrapped in `pool.install` — see Step 4)
 
 **Interfaces:**
 - Consumes: `IoPolicy::read_concurrency` (Task 5).
