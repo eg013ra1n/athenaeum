@@ -1296,13 +1296,16 @@ mod tests {
         // Calibrated, not copied: the light is 1000 everywhere and the dark
         // alternates 300/302, so the first row reads 700, 698 — a copy would
         // read 1000, 1000.
-        let mut plane =
+        let mut src =
             crate::integration::banded::BandSource::open(&[written.clone()], scratch.path())
                 .unwrap();
-        let mut bufs = vec![Vec::new()];
-        plane.read_band(0, 1, &mut bufs).unwrap();
-        assert!((bufs[0][0] - 700.0).abs() < 1e-3, "got {}", bufs[0][0]);
-        assert!((bufs[0][1] - 698.0).abs() < 1e-3, "got {}", bufs[0][1]);
+        let w = src.width();
+        let mut planes = crate::integration::banded::BandPlanes::new(&src);
+        src.read_band(0, 1, &mut planes).unwrap();
+        let mut row = vec![0f32; w];
+        planes.decode_frame_into(0, &mut row);
+        assert!((row[0] - 700.0).abs() < 1e-3, "got {}", row[0]);
+        assert!((row[1] - 698.0).abs() < 1e-3, "got {}", row[1]);
 
         // The raw light was NOT placed, and no calibration folder exists.
         assert_eq!(

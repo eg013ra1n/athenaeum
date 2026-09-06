@@ -434,14 +434,12 @@ fn load_precal_pixels(choice: &PrecalChoice, scratch: &Path) -> Result<FlatPreca
                 crate::integration::banded::BandSource::open(&[PathBuf::from(path)], scratch)
                     .map_err(|e| ApiError::Internal(format!("pre-cal master unreadable: {e}")))?;
             let (w, h) = (src.width(), src.height());
-            let mut bufs = vec![Vec::new()];
-            src.read_band(0, h, &mut bufs)
+            let mut planes = crate::integration::banded::BandPlanes::new(&src);
+            src.read_band(0, h, &mut planes)
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
-            Ok(FlatPrecal::MasterFrame {
-                data: std::mem::take(&mut bufs[0]),
-                width: w,
-                height: h,
-            })
+            let mut data = vec![0f32; w * h];
+            planes.decode_frame_into(0, &mut data);
+            Ok(FlatPrecal::MasterFrame { data, width: w, height: h })
         }
         PrecalChoice::Synthetic(b) => Ok(FlatPrecal::SyntheticBias(*b as f32)),
         PrecalChoice::None => Ok(FlatPrecal::None),

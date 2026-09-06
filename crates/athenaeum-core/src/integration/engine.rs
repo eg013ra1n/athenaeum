@@ -4,7 +4,7 @@
 //! compile-time constant. Parallelism: rayon over the pixels of the current
 //! band via the shared image pool.
 
-use super::banded::{band_rows_for_budget, BandSource};
+use super::banded::{BandPlanes, BandSource};
 use super::combine::{combine_pixel, IntegrationRecipe};
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
@@ -87,7 +87,7 @@ fn run_banded(
 ) -> Result<IntegrationOutput, IntegrationError> {
     use rayon::prelude::*;
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
-    let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(h);
+    let band_rows = src.band_rows_for_budget(band_budget_bytes).min(h);
     let bands_total = h.div_ceil(band_rows);
     // Computed once, next to `band_rows`, and referenced from every band's
     // progress call below — this run's own share of the work (a flat's pass 1
@@ -102,7 +102,7 @@ fn run_banded(
     // the reads below happen after every worker has joined.
     let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
     let all_bad = AtomicUsize::new(0);
-    let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
+    let mut planes = BandPlanes::new(src);
     let mut read_duration = std::time::Duration::ZERO;
     let mut combine_duration = std::time::Duration::ZERO;
     let mut bytes_read: u64 = 0;
@@ -113,7 +113,7 @@ fn run_banded(
         }
         let rows = band_rows.min(h - y0);
         let t_read = std::time::Instant::now();
-        src.read_band(y0, rows, &mut band_bufs)?;
+        src.read_band(y0, rows, &mut planes)?;
         read_duration += t_read.elapsed();
         bytes_read += (rows * per_row_bytes) as u64;
 
@@ -133,8 +133,8 @@ fn run_banded(
                     for (x, out_px) in out_row.iter_mut().enumerate() {
                         column.clear();
                         let idx = row_in_band * w + x;
-                        for (i, frame) in band_bufs.iter().enumerate() {
-                            let mut v = frame[idx];
+                        for i in 0..n {
+                            let mut v = planes.sample(i, idx);
                             if let Some(p) = precal {
                                 match p {
                                     FlatPrecal::MasterFrame { data, width, .. } => {
@@ -267,8 +267,8 @@ fn integrate_flat_inner(
     let (cx0, cx1) = (w / 3, ((2 * w) / 3).max(w / 3 + 1).min(w));
     let mut sums = vec![0f64; n];
     let mut counts = vec![0usize; n];
-    let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(cy1 - cy0);
-    let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
+    let band_rows = src.band_rows_for_budget(band_budget_bytes).min(cy1 - cy0);
+    let mut planes = BandPlanes::new(&src);
     // Computed once, next to `band_rows` — pass 1 only ever reads the
     // central-third rows, so its share of the total is that row count, not
     // the full height `run_banded` (pass 2, below) will report on its own.
@@ -281,14 +281,14 @@ fn integrate_flat_inner(
         if cancel.load(Ordering::Relaxed) { return Err(IntegrationError::Cancelled); }
         let rows = band_rows.min(cy1 - y);
         let t_read = std::time::Instant::now();
-        src.read_band(y, rows, &mut band_bufs)?;
+        src.read_band(y, rows, &mut planes)?;
         pass1_read += t_read.elapsed();
         pass1_bytes_read += (rows * per_row_bytes) as u64;
-        for (i, frame) in band_bufs.iter().enumerate() {
+        for i in 0..n {
             for r in 0..rows {
                 let gy = y + r;
                 for x in cx0..cx1 {
-                    let mut v = frame[r * w + x] as f64;
+                    let mut v = planes.sample(i, r * w + x) as f64;
                     match precal {
                         FlatPrecal::MasterFrame { data, width, .. } => v -= data[gy * *width + x] as f64,
                         FlatPrecal::SyntheticBias(b) => v -= *b as f64,
@@ -485,12 +485,17 @@ mod tests {
     }
 
     /// Multi-band precal row indexing: with band_budget_bytes=1 the budget
-    /// clamps to 16-row bands, so h=48 runs as 3 bands. The master is a row
-    /// gradient (master[y] = y), the flats are 1000 + y, so after subtraction
-    /// every sample is exactly 1000.0 — but ONLY if the MasterFrame index uses
-    /// the GLOBAL row (`gy = y0 + row_in_band`). A regression that drops `y0`
-    /// reuses master rows 0..16 in bands 2 and 3 (output rows 16.. become
-    /// 1000 + 16k) and fails here while all single-band tests still pass.
+    /// floors to 1-row bands (the 2026-08-02 audit deleted the old 16-row
+    /// floor), so h=48 really runs as 48 bands — every band but the first has
+    /// `row_in_band` pinned at 0, which is a stronger check than a 3-band run
+    /// gives. The master is a row gradient (master[y] = y), the flats are
+    /// 1000 + y, so after subtraction every sample is exactly 1000.0 — but
+    /// ONLY if the MasterFrame index uses the GLOBAL row
+    /// (`gy = y0 + row_in_band`). A regression that drops `y0` reads
+    /// `master[row_in_band]` instead, which is `master[0] = 0` for every
+    /// band past the first — every output row but row 0 comes out as
+    /// `1000 + y` instead of `1000`, and this test catches it while every
+    /// single-band test still passes.
     #[test]
     fn multi_band_precal_uses_global_row_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,7 +513,7 @@ mod tests {
             &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
-            1, // band_rows_for_budget(..).max(16) => 16-row bands => 3 bands
+            1, // band_rows_for_budget(1) floors to 1 row/band => 48 bands
         ).unwrap();
         for (i, &v) in out.data.iter().enumerate() {
             assert!(

@@ -45,7 +45,7 @@
 use std::path::Path;
 
 use crate::integration::band_budget::MIN_BUDGET_BYTES;
-use crate::integration::banded::{band_rows_for_budget, BandSource};
+use crate::integration::banded::{BandPlanes, BandSource};
 use crate::integration::cfa::{cfa_channel_at, CfaGeometry};
 use crate::integration::IntegrationError;
 
@@ -337,14 +337,14 @@ fn read_full_plane(
     let (w, h) = (src.width(), src.height());
     // One dark plane, one frame — already 1-2 bands at the floor, so the
     // machine-resolved budget would not change the band count here (spec §8).
-    let band_rows = band_rows_for_budget(w, 1, MIN_BUDGET_BYTES).min(h);
+    let band_rows = src.band_rows_for_budget(MIN_BUDGET_BYTES).min(h);
     let mut data = vec![0f32; w * h];
-    let mut bufs = vec![Vec::new()];
+    let mut planes = BandPlanes::new(&src);
     let mut y = 0;
     while y < h {
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut bufs)?;
-        data[y * w..(y + rows) * w].copy_from_slice(&bufs[0]);
+        src.read_band(y, rows, &mut planes)?;
+        planes.decode_frame_into(0, &mut data[y * w..(y + rows) * w]);
         y += rows;
     }
     Ok((w, h, data))

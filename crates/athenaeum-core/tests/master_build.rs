@@ -322,10 +322,12 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     let mut src = athenaeum_core::integration::banded::BandSource::open(
         std::slice::from_ref(&target_abs), scratch.path(),
     ).unwrap();
-    let h = src.height();
-    let mut bufs = vec![Vec::new()];
-    src.read_band(0, h, &mut bufs).unwrap();
-    let mean: f32 = bufs[0].iter().sum::<f32>() / bufs[0].len() as f32;
+    let (w, h) = (src.width(), src.height());
+    let mut planes = athenaeum_core::integration::banded::BandPlanes::new(&src);
+    src.read_band(0, h, &mut planes).unwrap();
+    let mut data = vec![0f32; w * h];
+    planes.decode_frame_into(0, &mut data);
+    let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
     assert!(
         (mean - 100.0).abs() > 1.0,
         "rebuilt master pixel data must reflect the changed source frame, mean={mean}"

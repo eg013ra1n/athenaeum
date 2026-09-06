@@ -45,9 +45,9 @@ use crate::fits_parser::parse_fits_with_header;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{write_fits_f32, Card};
-use crate::integration::banded::{band_rows_for_budget, BandSource};
-use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
 use crate::integration::band_budget::MIN_BUDGET_BYTES;
+use crate::integration::banded::{BandPlanes, BandSource};
+use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
 use crate::integration::engine::central_third_mean;
 use crate::integration::IntegrationError;
 use crate::models::FileFormat;
@@ -385,9 +385,9 @@ fn calibrate_light_compute_inner(
     });
 
     let mut src = BandSource::open(&paths, &inputs.scratch_dir)?;
-    let (w, h, n) = (src.width(), src.height(), src.frame_count());
-    let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(h);
-    let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
+    let (w, h) = (src.width(), src.height());
+    let band_rows = src.band_rows_for_budget(band_budget_bytes).min(h);
+    let mut planes = BandPlanes::new(&src);
     let mut out = vec![0f32; w * h];
 
     // Dead/negative flat pixels that hit FLAT_DENOM_FLOOR. The band loop is
@@ -400,14 +400,14 @@ fn calibrate_light_compute_inner(
             return Err(IntegrationError::Cancelled);
         }
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut band_bufs)?;
+        src.read_band(y, rows, &mut planes)?;
         let out_band = &mut out[y * w..(y + rows) * w];
         for (idx, out_px) in out_band.iter_mut().enumerate() {
             // f64 throughout, cast once at the end — negatives and division are
             // preserved with no clamping or pedestal (spec §2).
-            let mut v = band_bufs[0][idx] as f64;
+            let mut v = planes.sample(0, idx) as f64;
             if let Some(si) = sub_idx {
-                v -= band_bufs[si][idx] as f64;
+                v -= planes.sample(si, idx) as f64;
             }
             if let Some(fi) = flat_idx {
                 // The constant this pixel divides by. In per-channel mode it is
@@ -429,7 +429,7 @@ fn calibrate_light_compute_inner(
                 // usable and the count is warned about below. A master flat
                 // built here writes an all-undefined pixel as exactly 0.0, so
                 // the zero case is reachable, not hypothetical.
-                let denom = band_bufs[fi][idx] as f64 / k;
+                let denom = planes.sample(fi, idx) as f64 / k;
                 if denom.is_finite() && denom >= FLAT_DENOM_FLOOR {
                     v /= denom;
                 } else {
@@ -706,22 +706,22 @@ fn read_full_flat_plane(
     let (w, h) = (src.width(), src.height());
     // One flat plane, one frame — already 1-2 bands at the floor, so the
     // machine-resolved budget would not change the band count here (spec §8).
-    let band_rows = band_rows_for_budget(w, 1, MIN_BUDGET_BYTES).min(h);
+    let band_rows = src.band_rows_for_budget(MIN_BUDGET_BYTES).min(h);
     let mut data = vec![0f32; w * h];
-    let mut bufs = vec![Vec::new()];
+    let mut planes = BandPlanes::new(&src);
     let mut y = 0;
     while y < h {
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut bufs)?;
-        data[y * w..(y + rows) * w].copy_from_slice(&bufs[0]);
+        src.read_band(y, rows, &mut planes)?;
+        planes.decode_frame_into(0, &mut data[y * w..(y + rows) * w]);
         y += rows;
     }
     Ok((w, h, data))
 }
 
 /// Two-sided trimmed mean over the whole plane, discarding exactly
-/// `trim_fraction` of the pixels from EACH tail (PixInsight's
-/// `flatScaleClippingFactor` semantics, spec §2; `trim_fraction` defaults to
+/// `trim_fraction` of the pixels from EACH tail (a common two-sided clipping
+/// convention for flat normalization, spec §2; `trim_fraction` defaults to
 /// [`PI_TRIM_FRACTION`], the advanced param exposes it). Sorts a copy (total
 /// order, NaN-tolerant) and averages the surviving middle in f64:
 /// `lo = floor(n·f)`, `hi = n − floor(n·f)`, mean over `sorted[lo..hi]`.
@@ -799,9 +799,11 @@ mod tests {
     fn read_all(path: &Path, scratch: &Path) -> (usize, usize, Vec<f32>) {
         let mut src = BandSource::open(&[path.to_path_buf()], scratch).unwrap();
         let (w, h) = (src.width(), src.height());
-        let mut bufs = vec![Vec::new()];
-        src.read_band(0, h, &mut bufs).unwrap();
-        (w, h, bufs.remove(0))
+        let mut planes = BandPlanes::new(&src);
+        src.read_band(0, h, &mut planes).unwrap();
+        let mut data = vec![0f32; w * h];
+        planes.decode_frame_into(0, &mut data);
+        (w, h, data)
     }
 
     fn fnrm_card(v: f64) -> Card {
@@ -1684,14 +1686,20 @@ mod tests {
         let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
         let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &[]);
         let out = dir.path().join("out.fits");
-        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
-        cfg.cfa_geometry = Some(rggb_geom());
 
         // 3 rows per band → 4 bands, and an ODD band height so a band-local row
         // index lands on the wrong phase from band 2 onward. Driven through the
-        // budget the same way `integrate_flat_inner` is: per_row = (n+2)*w*4 =
-        // 96 bytes here, so 300 bytes buys exactly 3 rows.
-        assert_eq!(band_rows_for_budget(w, 2, 300), 3, "fixture must produce 3-row bands");
+        // budget the same way `calibrate_light_compute_inner` is: per_row =
+        // width*4 (light, f32) + width*4 (flat, f32) + width*8 headroom = 96
+        // bytes here, so 300 bytes buys exactly 3 rows — this fixture happens to
+        // land on the same number the old (n+2)*w*4 formula gave, since both
+        // frames here are f32.
+        let probe = BandSource::open(&[light.clone(), flat.clone()], dir.path()).unwrap();
+        assert_eq!(probe.band_rows_for_budget(300), 3, "fixture must produce 3-row bands");
+
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(rggb_geom());
+
         let outcome = calibrate_light_inner(&cfg, &AtomicBool::new(false), 300).unwrap();
         assert!(outcome.cfa_scaling_applied);
         let (_, _, data) = read_all(&out, dir.path());

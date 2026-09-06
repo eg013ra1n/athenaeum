@@ -14,11 +14,128 @@ use std::path::{Path, PathBuf};
 
 const BLOCK: u64 = 2880;
 
+/// How one frame's raw band bytes decode to physical samples. Carried per
+/// frame because a set may legally mix bit depths, and because the
+/// decode-and-spill fallback produces little-endian f32 while FITS is big.
+#[derive(Clone, Copy)]
+pub(crate) enum PlaneKind {
+    U8 { bzero: f32, bscale: f32 },
+    I16Be { bzero: f32, bscale: f32 },
+    I32Be { bzero: f32, bscale: f32 },
+    F32Be { bzero: f32, bscale: f32 },
+    F64Be { bzero: f64, bscale: f64 },
+    /// Decode-and-spill scratch: little-endian f32, already physical.
+    F32Le,
+}
+
+impl PlaneKind {
+    #[inline]
+    pub(crate) fn bytes_per_sample(self) -> usize {
+        match self {
+            PlaneKind::U8 { .. } => 1,
+            PlaneKind::I16Be { .. } => 2,
+            PlaneKind::I32Be { .. } | PlaneKind::F32Be { .. } | PlaneKind::F32Le => 4,
+            PlaneKind::F64Be { .. } => 8,
+        }
+    }
+
+    #[inline]
+    fn decode(self, b: &[u8], idx: usize) -> f32 {
+        match self {
+            PlaneKind::U8 { bzero, bscale } => b[idx] as f32 * bscale + bzero,
+            PlaneKind::I16Be { bzero, bscale } => {
+                let o = idx * 2;
+                i16::from_be_bytes([b[o], b[o + 1]]) as f32 * bscale + bzero
+            }
+            PlaneKind::I32Be { bzero, bscale } => {
+                let o = idx * 4;
+                i32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as f32 * bscale + bzero
+            }
+            PlaneKind::F32Be { bzero, bscale } => {
+                let o = idx * 4;
+                f32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) * bscale + bzero
+            }
+            PlaneKind::F64Be { bzero, bscale } => {
+                let o = idx * 8;
+                let v = f64::from_be_bytes([
+                    b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+                ]);
+                (v * bscale + bzero) as f32
+            }
+            PlaneKind::F32Le => {
+                let o = idx * 4;
+                f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+            }
+        }
+    }
+
+    /// Bulk decode of `dst.len()` consecutive samples starting at `start` —
+    /// a tight typed loop per arm so the optimizer can vectorize it.
+    fn decode_run(self, b: &[u8], start: usize, dst: &mut [f32]) {
+        let bpp = self.bytes_per_sample();
+        let src = &b[start * bpp..(start + dst.len()) * bpp];
+        match self {
+            PlaneKind::U8 { bzero, bscale } => {
+                for (s, d) in src.iter().zip(dst.iter_mut()) { *d = *s as f32 * bscale + bzero; }
+            }
+            PlaneKind::I16Be { bzero, bscale } => {
+                for (c, d) in src.chunks_exact(2).zip(dst.iter_mut()) {
+                    *d = i16::from_be_bytes([c[0], c[1]]) as f32 * bscale + bzero;
+                }
+            }
+            PlaneKind::I32Be { bzero, bscale } => {
+                for (c, d) in src.chunks_exact(4).zip(dst.iter_mut()) {
+                    *d = i32::from_be_bytes([c[0], c[1], c[2], c[3]]) as f32 * bscale + bzero;
+                }
+            }
+            PlaneKind::F32Be { bzero, bscale } => {
+                for (c, d) in src.chunks_exact(4).zip(dst.iter_mut()) {
+                    *d = f32::from_be_bytes([c[0], c[1], c[2], c[3]]) * bscale + bzero;
+                }
+            }
+            PlaneKind::F64Be { bzero, bscale } => {
+                for (c, d) in src.chunks_exact(8).zip(dst.iter_mut()) {
+                    let v = f64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+                    *d = (v * bscale + bzero) as f32;
+                }
+            }
+            PlaneKind::F32Le => {
+                for (c, d) in src.chunks_exact(4).zip(dst.iter_mut()) {
+                    *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+            }
+        }
+    }
+}
+
+/// Build the decode kind for a probed FITS primary HDU. `bitpix` is always
+/// one of `8 | 16 | 32 | -32 | -64` here — `probe_fits` validates that before
+/// ever constructing a `FrameReader::Fits`, so no other value can reach this.
+fn plane_kind_for_bitpix(bitpix: i32, bzero: f64, bscale: f64) -> PlaneKind {
+    match bitpix {
+        8 => PlaneKind::U8 { bzero: bzero as f32, bscale: bscale as f32 },
+        16 => PlaneKind::I16Be { bzero: bzero as f32, bscale: bscale as f32 },
+        32 => PlaneKind::I32Be { bzero: bzero as f32, bscale: bscale as f32 },
+        -32 => PlaneKind::F32Be { bzero: bzero as f32, bscale: bscale as f32 },
+        -64 => PlaneKind::F64Be { bzero, bscale },
+        other => unreachable!("probe_fits only returns bitpix in {{8,16,32,-32,-64}}, got {other}"),
+    }
+}
+
 enum FrameReader {
     /// Direct seek-read of an uncompressed single-HDU FITS.
-    Fits { file: File, data_offset: u64, bitpix: i32, bzero: f64, bscale: f64 },
+    Fits { file: File, data_offset: u64, kind: PlaneKind },
     /// Raw little-endian f32 scratch spill (one full frame, row-major).
-    Scratch { file: File },
+    Scratch { file: File, kind: PlaneKind },
+}
+
+impl FrameReader {
+    #[inline]
+    fn kind(&self) -> PlaneKind {
+        match self {
+            FrameReader::Fits { kind, .. } | FrameReader::Scratch { kind, .. } => *kind,
+        }
+    }
 }
 
 pub struct BandSource {
@@ -137,15 +254,13 @@ impl BandSource {
                     FrameReader::Fits {
                         file: File::open(p)?,
                         data_offset: info.data_offset,
-                        bitpix: info.bitpix,
-                        bzero: info.bzero,
-                        bscale: info.bscale,
+                        kind: plane_kind_for_bitpix(info.bitpix, info.bzero, info.bscale),
                     },
                     info.w, info.h,
                 ),
                 None => {
                     let (file, w, h) = spill_via_read_raw(p, scratch_dir, i)?;
-                    (FrameReader::Scratch { file }, w, h)
+                    (FrameReader::Scratch { file, kind: PlaneKind::F32Le }, w, h)
                 }
             };
             match dims {
@@ -168,89 +283,114 @@ impl BandSource {
     pub fn height(&self) -> usize { self.height }
     pub fn frame_count(&self) -> usize { self.readers.len() }
 
+    pub(crate) fn plane_kinds(&self) -> Vec<PlaneKind> {
+        self.readers.iter().map(|r| r.kind()).collect()
+    }
+
     /// Source bytes `read_band` actually pulls off disk for one row, summed
     /// over every frame in this source: `width * bytes_per_sample` per
     /// frame, where `bytes_per_sample` is `bitpix.unsigned_abs() / 8` for a
     /// direct FITS reader and 4 (f32) for the decode-and-spill scratch
-    /// fallback. This counts SOURCE bytes, not the widened f32 the engine
-    /// holds per sample in RAM — a BITPIX=16 frame counts 2 bytes/pixel here
-    /// even though `read_band` hands back f32.
+    /// fallback. This counts SOURCE bytes — the same bytes a `BandPlanes`
+    /// buffer now holds, since Task 4 stopped widening on read.
     pub fn bytes_per_row(&self) -> usize {
-        self.readers
-            .iter()
-            .map(|r| {
-                let bytes_per_sample = match r {
-                    FrameReader::Fits { bitpix, .. } => (bitpix.unsigned_abs() as usize) / 8,
-                    FrameReader::Scratch { .. } => 4,
-                };
-                self.width * bytes_per_sample
-            })
-            .sum()
+        self.readers.iter().map(|r| self.width * r.kind().bytes_per_sample()).sum()
     }
 
-    /// Reads rows [y0, y0+rows) of every frame into out[i] (len = rows*width),
-    /// BZERO/BSCALE applied, native f32, no stretch, CFA untouched.
-    pub fn read_band(&mut self, y0: usize, rows: usize, out: &mut [Vec<f32>]) -> Result<(), IntegrationError> {
-        assert_eq!(out.len(), self.readers.len());
+    /// Rows per band whose band buffers (one per frame, held in the SOURCE's
+    /// own byte width — see [`BandPlanes`]) fit `budget_bytes`. Counts every
+    /// frame's OWN bytes-per-row, so a BITPIX 16 set gets twice the rows an
+    /// f32 set does for the same budget, plus two f32 rows of headroom — the
+    /// margin the old `frame_count + 2` formula carried as two phantom
+    /// frames.
+    ///
+    /// Floor of 1: the floor must never override the budget (2026-08-02 audit
+    /// I5) — at very large frame counts a 16-row floor grew band memory
+    /// unbounded. One row per band is slow but bounded.
+    pub fn band_rows_for_budget(&self, budget_bytes: usize) -> usize {
+        let per_row: usize = self
+            .readers
+            .iter()
+            .map(|r| self.width.saturating_mul(r.kind().bytes_per_sample()))
+            .sum::<usize>()
+            .saturating_add(self.width.saturating_mul(8))
+            .max(1);
+        (budget_bytes / per_row).max(1)
+    }
+
+    /// Reads rows `[y0, y0+rows)` of every frame straight into `out`'s own
+    /// per-frame byte buffers — no decode here any more (Task 4): BZERO/BSCALE
+    /// and endianness are applied lazily by [`BandPlanes::sample`] /
+    /// `decode_row_into` / `decode_frame_into` on read.
+    pub fn read_band(&mut self, y0: usize, rows: usize, out: &mut BandPlanes) -> Result<(), IntegrationError> {
+        assert_eq!(out.bufs.len(), self.readers.len());
         let w = self.width;
         if y0 + rows > self.height {
             return Err(IntegrationError::BadInput(format!("band {y0}+{rows} beyond height {}", self.height)));
         }
-        for (reader, dst) in self.readers.iter_mut().zip(out.iter_mut()) {
-            dst.clear();
-            dst.reserve(rows * w);
-            match reader {
-                FrameReader::Fits { file, data_offset, bitpix, bzero, bscale } => {
-                    let bpp = (bitpix.unsigned_abs() as usize) / 8;
-                    let mut buf = vec![0u8; rows * w * bpp];
-                    file.seek(SeekFrom::Start(*data_offset + (y0 * w * bpp) as u64))?;
-                    file.read_exact(&mut buf)?;
-                    let (bz, bs) = (*bzero as f32, *bscale as f32);
-                    match *bitpix {
-                        16 => for c in buf.chunks_exact(2) {
-                            let raw = i16::from_be_bytes([c[0], c[1]]) as f32;
-                            dst.push(raw * bs + bz);
-                        },
-                        -32 => for c in buf.chunks_exact(4) {
-                            let raw = f32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-                            dst.push(raw * bs + bz);
-                        },
-                        32 => for c in buf.chunks_exact(4) {
-                            let raw = i32::from_be_bytes([c[0], c[1], c[2], c[3]]) as f32;
-                            dst.push(raw * bs + bz);
-                        },
-                        -64 => for c in buf.chunks_exact(8) {
-                            let raw = f64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
-                            dst.push((raw * *bscale + *bzero) as f32);
-                        },
-                        8 => for &b in buf.iter() {
-                            dst.push(b as f32 * bs + bz);
-                        },
-                        other => return Err(IntegrationError::BadInput(format!("BITPIX {other}"))),
-                    }
-                }
-                FrameReader::Scratch { file } => {
-                    let mut buf = vec![0u8; rows * w * 4];
-                    file.seek(SeekFrom::Start((y0 * w * 4) as u64))?;
-                    file.read_exact(&mut buf)?;
-                    for c in buf.chunks_exact(4) {
-                        dst.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-                    }
-                }
-            }
+        for (reader, buf) in self.readers.iter_mut().zip(out.bufs.iter_mut()) {
+            let (file, base_offset, bpp) = match reader {
+                FrameReader::Fits { file, data_offset, kind } => (file, *data_offset, kind.bytes_per_sample()),
+                FrameReader::Scratch { file, kind } => (file, 0u64, kind.bytes_per_sample()),
+            };
+            let need = rows * w * bpp;
+            buf.resize(need, 0u8);
+            file.seek(SeekFrom::Start(base_offset + (y0 * w * bpp) as u64))?;
+            file.read_exact(buf)?;
         }
+        out.rows = rows;
         Ok(())
     }
 }
 
-/// Band height so that (frame_count+2) * band_rows * width * 4 bytes stays
-/// under budget_bytes (default caller passes 256 MiB).
-pub fn band_rows_for_budget(width: usize, frame_count: usize, budget_bytes: usize) -> usize {
-    let per_row = (frame_count + 2).saturating_mul(width).saturating_mul(4).max(1);
-    // Floor of 1 (not 16): the floor must never override the budget — at very
-    // large frame counts a 16-row floor grows band memory unbounded
-    // (2026-08-02 audit I5). One row per band is slow but bounded.
-    (budget_bytes / per_row).max(1)
+/// One band of every frame, held in the SOURCE's own sample format.
+///
+/// Before 2026-09-06 the band was `Vec<Vec<f32>>`, so a BITPIX 16 camera file
+/// was widened on the way in and every band cost twice what the data does.
+/// Holding raw bytes halves band memory for the common case, which buys twice
+/// the rows for the same budget — i.e. half the seek rounds. The widening
+/// happens per sample inside the parallel combine, where it is nearly free.
+pub struct BandPlanes {
+    bufs: Vec<Vec<u8>>,
+    kinds: Vec<PlaneKind>,
+    width: usize,
+    rows: usize,
+}
+
+impl BandPlanes {
+    pub fn new(src: &BandSource) -> BandPlanes {
+        BandPlanes {
+            bufs: vec![Vec::new(); src.frame_count()],
+            kinds: src.plane_kinds(),
+            width: src.width(),
+            rows: 0,
+        }
+    }
+
+    pub fn frame_count(&self) -> usize { self.kinds.len() }
+    pub fn rows(&self) -> usize { self.rows }
+
+    /// One decoded sample. `idx` is `row_in_band * width + x`.
+    #[inline]
+    pub fn sample(&self, frame: usize, idx: usize) -> f32 {
+        self.kinds[frame].decode(&self.bufs[frame], idx)
+    }
+
+    /// Every frame's samples for one row of the band, frame-major:
+    /// `dst[frame * width + x]`. `dst.len()` must be `frame_count * width`.
+    pub fn decode_row_into(&self, row_in_band: usize, dst: &mut [f32]) {
+        let w = self.width;
+        assert_eq!(dst.len(), self.frame_count() * w, "decode_row_into: dst must be frame_count * width");
+        for (i, kind) in self.kinds.iter().enumerate() {
+            kind.decode_run(&self.bufs[i], row_in_band * w, &mut dst[i * w..(i + 1) * w]);
+        }
+    }
+
+    /// One frame's whole band. `dst.len()` must be `rows * width`.
+    pub fn decode_frame_into(&self, frame: usize, dst: &mut [f32]) {
+        assert_eq!(dst.len(), self.rows * self.width, "decode_frame_into: dst must be rows * width");
+        self.kinds[frame].decode_run(&self.bufs[frame], 0, dst);
+    }
 }
 
 #[cfg(test)]
@@ -295,28 +435,66 @@ mod tests {
     }
 
     #[test]
-    fn reads_f32_fits_bands_exactly() {
+    fn planes_decode_identically_to_the_old_f32_path() {
         let dir = tempfile::tempdir().unwrap();
         let p1 = f32_fixture(dir.path(), "a.fits", 32, 24, |x, y| (y * 32 + x) as f32);
-        let p2 = f32_fixture(dir.path(), "b.fits", 32, 24, |_, _| 7.0);
+        let p2 = u16_fixture(dir.path(), "b.fits", 32, 24, 1000);
         let mut src = BandSource::open(&[p1, p2], dir.path()).unwrap();
-        assert_eq!((src.width(), src.height(), src.frame_count()), (32, 24, 2));
-        let mut out = vec![Vec::new(), Vec::new()];
-        src.read_band(10, 4, &mut out).unwrap();
-        assert_eq!(out[0].len(), 4 * 32);
-        assert_eq!(out[0][0], (10 * 32) as f32);        // row 10, col 0
-        assert_eq!(out[0][4 * 32 - 1], (13 * 32 + 31) as f32);
-        assert!(out[1].iter().all(|&v| v == 7.0));
+        let mut planes = BandPlanes::new(&src);
+        src.read_band(10, 4, &mut planes).unwrap();
+
+        assert_eq!(planes.frame_count(), 2);
+        assert_eq!(planes.rows(), 4);
+        // frame 0: f32 gradient; row 10 col 0 is 10*32
+        assert_eq!(planes.sample(0, 0), (10 * 32) as f32);
+        assert_eq!(planes.sample(0, 4 * 32 - 1), (13 * 32 + 31) as f32);
+        // frame 1: BITPIX 16 with BZERO 32768 — physical value, not stored
+        assert_eq!(planes.sample(1, 0), 1000.0);
+
+        // decode_row_into agrees with sample(), frame-major
+        let mut row = vec![0f32; 2 * 32];
+        planes.decode_row_into(2, &mut row);
+        for x in 0..32 {
+            assert_eq!(row[x], planes.sample(0, 2 * 32 + x), "frame 0 col {x}");
+            assert_eq!(row[32 + x], planes.sample(1, 2 * 32 + x), "frame 1 col {x}");
+        }
+
+        // decode_frame_into agrees too
+        let mut whole = vec![0f32; 4 * 32];
+        planes.decode_frame_into(0, &mut whole);
+        for i in 0..4 * 32 {
+            assert_eq!(whole[i], planes.sample(0, i), "sample {i}");
+        }
     }
 
     #[test]
-    fn u16_bzero_applied() {
+    fn u16_sources_get_twice_the_rows_of_f32_sources() {
         let dir = tempfile::tempdir().unwrap();
-        let p = u16_fixture(dir.path(), "d.fits", 16, 8, 1000);
-        let mut src = BandSource::open(&[p], dir.path()).unwrap();
-        let mut out = vec![Vec::new()];
-        src.read_band(0, 8, &mut out).unwrap();
-        assert!(out[0].iter().all(|&v| v == 1000.0), "physical = stored*BSCALE + BZERO");
+        let u16s: Vec<_> = (0..4)
+            .map(|i| u16_fixture(dir.path(), &format!("u{i}.fits"), 100, 200, 500))
+            .collect();
+        let f32s: Vec<_> = (0..4)
+            .map(|i| f32_fixture(dir.path(), &format!("f{i}.fits"), 100, 200, |_, _| 1.0))
+            .collect();
+        let budget = 1024 * 1024;
+        let u_rows = BandSource::open(&u16s, dir.path()).unwrap().band_rows_for_budget(budget);
+        let f_rows = BandSource::open(&f32s, dir.path()).unwrap().band_rows_for_budget(budget);
+        assert!(
+            u_rows > f_rows,
+            "BITPIX 16 bands are half the bytes of f32 bands, so the same budget must buy more rows: {u_rows} vs {f_rows}"
+        );
+    }
+
+    #[test]
+    fn band_rows_floor_never_overrides_budget() {
+        // 3000 frames of width 9576 (2026-08-02 audit I5): one row per band is
+        // slow but bounded; the floor must yield to the budget.
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..4)
+            .map(|i| u16_fixture(dir.path(), &format!("t{i}.fits"), 9576, 8, 1))
+            .collect();
+        let src = BandSource::open(&paths, dir.path()).unwrap();
+        assert_eq!(src.band_rows_for_budget(1), 1, "budget of 1 byte still yields exactly one row");
     }
 
     #[test]
@@ -383,33 +561,14 @@ mod tests {
     }
 
     #[test]
-    fn band_rows_budget_math() {
-        // 100 frames of width 6248, budget 256 MiB:
-        // rows = 256MiB / ((100+2) * 6248 * 4) ≈ 105 — must be >= 16 and <= height cap by caller.
-        let rows = band_rows_for_budget(6248, 100, 256 * 1024 * 1024);
-        assert!(rows >= 16 && rows <= 256, "{rows}");
-        assert_eq!(band_rows_for_budget(10, 1, usize::MAX), usize::MAX.min(band_rows_for_budget(10, 1, usize::MAX))); // no panic on huge budgets
-    }
-
-    #[test]
     fn bytes_per_row_counts_source_bytes_not_widened_f32() {
         let dir = tempfile::tempdir().unwrap();
         // f32 (BITPIX=-32): 4 bytes/sample, source == widened width.
         let f32_file = f32_fixture(dir.path(), "float.fits", 10, 4, |_, _| 1.0);
-        // u16 (BITPIX=16): 2 bytes/sample on disk, even though read_band
-        // hands back f32 for it.
+        // u16 (BITPIX=16): 2 bytes/sample on disk, even though the decoded
+        // sample is f32.
         let u16_file = u16_fixture(dir.path(), "u16.fits", 10, 4, 1000);
         let src = BandSource::open(&[f32_file, u16_file], dir.path()).unwrap();
         assert_eq!(src.bytes_per_row(), 10 * 4 + 10 * 2);
-    }
-
-    #[test]
-    fn band_rows_floor_never_overrides_budget() {
-        // 3000 frames of width 9576, budget 256 MiB: a hardcoded 16-row floor
-        // blows past the budget by ~7x (2026-08-02 audit I5) — the floor must
-        // yield once a single row already exceeds it.
-        let rows = band_rows_for_budget(9576, 3000, 256 * 1024 * 1024);
-        let bytes = (rows as u64) * (3000 + 2) * 9576 * 4;
-        assert!(bytes <= 256 * 1024 * 1024 || rows == 1, "{rows} rows -> {bytes} bytes");
     }
 }

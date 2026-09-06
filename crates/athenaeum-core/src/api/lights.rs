@@ -1051,7 +1051,7 @@ mod real_data_e2e {
     fn real_data_e2e_calibrated_export() {
         use crate::api::calibration::find_calibration_for_frame_set;
         use crate::fits_parser::stored_header::parse_stored_header_keys;
-        use crate::integration::banded::BandSource;
+        use crate::integration::banded::{BandPlanes, BandSource};
         use crate::models::FileFormat;
         use crate::scanner::scan_directory;
         use rusqlite::OpenFlags;
@@ -1060,9 +1060,11 @@ mod real_data_e2e {
         fn read_plane(path: &Path, scratch: &Path) -> (usize, usize, Vec<f32>) {
             let mut src = BandSource::open(&[path.to_path_buf()], scratch).unwrap();
             let (w, h) = (src.width(), src.height());
-            let mut bufs = vec![Vec::new()];
-            src.read_band(0, h, &mut bufs).unwrap();
-            (w, h, bufs.remove(0))
+            let mut planes = BandPlanes::new(&src);
+            src.read_band(0, h, &mut planes).unwrap();
+            let mut data = vec![0f32; w * h];
+            planes.decode_frame_into(0, &mut data);
+            (w, h, data)
         }
         fn header_keys(path: &Path) -> std::collections::HashMap<String, String> {
             let (_f, text) = crate::fits_parser::parse_fits_with_header(path, 0).unwrap();
