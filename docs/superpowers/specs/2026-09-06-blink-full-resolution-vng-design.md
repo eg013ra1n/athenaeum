@@ -161,6 +161,17 @@ poisoning is recovered with `into_inner` so one panicking render cannot disable
 previews for the rest of the session. Waiters hold only the raw pixel buffer
 (2 B/px ≈ 52 MB for the reference sensor), not the 12 B/px VNG output.
 
+**Amended 2026-09-06 (review F4).** The gate moved out of `process_fits_to_jpeg`
+and in front of the hosts' `image_semaphore`: taken inside the render, after
+the permit, it parked N−1 permits during a full-resolution colour prefetch and
+starved every thumbnail/preview request that shares the semaphore. It is now
+`pub static VNG_GATE: tokio::sync::Mutex<()>`, and `needs_vng_gate(path,
+resolution)` — a header-only probe through the scanner's own FITS/XISF readers
+— tells the host whether to take it. Lock order is gate → permit everywhere,
+so no cycle. A mono frame at `Full` still never takes it. Waiters now hold
+nothing at all (not even the raw pixel buffer), which also retires the
+"waiters hold only the raw buffer" caveat above.
+
 **Test** (`crates/athenaeum-core/src/rustafits_processor/mod.rs`): write a small
 f32 CFA FITS with `write_fits_f32` and a `BAYERPAT = 'RGGB'` card, then assert
 `process_fits_to_jpeg(.., Resolution::Full, ..)` returns native dimensions while

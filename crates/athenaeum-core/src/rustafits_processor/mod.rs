@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use astroimage::{BayerPattern, ImageConverter};
+use astroimage::ImageConverter;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Serializes full-resolution gradient debayers.
 ///
@@ -11,17 +11,47 @@ use std::sync::{Arc, Mutex};
 /// the machine on its own (5.84 s of CPU inside 0.79 s of wall time). Running
 /// several at once therefore multiplies the memory peak without buying
 /// throughput: on that frame, five in parallel took 3.40 s against 3.99 s one
-/// after another, for five times the peak. The blink prefetch does exactly that
-/// — it asks for every frame of a set at the configured resolution, up to
-/// `blink.threads` at a time — so this gate is what keeps a full-resolution set
-/// from needing gigabytes.
+/// after another, for five times the peak.
 ///
-/// A plain std mutex is the right primitive here: both hosts call
-/// `process_fits_to_jpeg` from a blocking context (`block_in_place` on desktop,
-/// `spawn_blocking` on web), so blocking on it is sanctioned. Poisoning is
-/// recovered rather than propagated, so one panicking render cannot disable
-/// previews for the rest of the session.
-static VNG_GATE: Mutex<()> = Mutex::new(());
+/// Held by the HOST, before its image semaphore, never inside the render
+/// (review 2026-09-06 F4): both hosts bound concurrent renders with one
+/// `image_semaphore` shared by every thumbnail, preview and full request. A
+/// gate taken after the permit parked N-1 permits here during a
+/// full-resolution colour prefetch and starved every unrelated request behind
+/// the whole VNG backlog. Lock order is gate → permit everywhere; a permit
+/// holder never waits for the gate, so there is no cycle. Async so a waiting
+/// request parks its task, not a runtime thread. [`needs_vng_gate`] says
+/// whether a given request must take it.
+pub static VNG_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether rendering `path` at `resolution` is a full-resolution gradient
+/// debayer and must hold [`VNG_GATE`]. Header-only — a FITS primary header
+/// or an XISF XML header, never the pixels — through the same readers the
+/// scanner uses, so the answer is what the catalog would say. Errs towards
+/// `true` when the header cannot be read: the render will fail loudly on its
+/// own, and taking the gate for a broken file costs one serialization, not
+/// gigabytes.
+pub fn needs_vng_gate(path: &Path, resolution: Resolution) -> bool {
+    if resolution != Resolution::Full {
+        return false;
+    }
+    let is_xisf = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xisf"));
+    let bayerpat = if is_xisf {
+        crate::fits_parser::parse_xisf(path, 0).map(|f| f.bayerpat)
+    } else {
+        crate::fits_parser::parse_fits(path, 0).map(|f| f.bayerpat)
+    };
+    match bayerpat {
+        Ok(pat) => pat.is_some_and(|p| !p.trim().is_empty()),
+        Err(error) => {
+            tracing::debug!(path = %path.display(), error = %error, "header probe failed — taking the VNG gate defensively");
+            true
+        }
+    }
+}
 
 /// Resolution variants for blink viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +128,9 @@ pub struct ProcessedImage {
 ///
 /// At [`Resolution::Full`] a CFA frame is debayered at its native resolution
 /// with the gradient method instead of the super-pixel one, so "full
-/// resolution" means what it says for one-shot-colour data. That render is the
-/// one serialized by [`VNG_GATE`].
+/// resolution" means what it says for one-shot-colour data. The host
+/// serializes that render by holding [`VNG_GATE`] around this call when
+/// [`needs_vng_gate`] says so; this function takes no lock itself.
 ///
 /// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
 pub fn process_fits_to_jpeg<P: AsRef<Path>>(
@@ -145,13 +176,6 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     let (meta, pixels) = pool
         .install(|| ImageConverter::read_raw(input_path))
         .with_context(|| format!("Failed to read image: {}", input_path.display()))?;
-
-    // Deliberately a superset of the pipeline's own CFA conditions (which also
-    // look at the channel count on the f32 side): erring towards taking the
-    // gate costs an impossible file a little serialization, while erring the
-    // other way would let two gigabyte-scale renders run at once.
-    let vng_render = resolution == Resolution::Full && meta.bayer_pattern != BayerPattern::None;
-    let _gate = vng_render.then(|| VNG_GATE.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Process FITS/XISF to raw RGB pixels in memory
     let processed = converter
@@ -302,5 +326,26 @@ mod tests {
         let out = process_fits_to_jpeg(&path, Resolution::Full, None, &image_pool()).unwrap();
         assert_eq!((out.width as usize, out.height as usize), (w, h));
         assert!(!out.is_color);
+    }
+
+    /// Review 2026-09-06 F4: the gate moved out of the render and in front of
+    /// the host's semaphore; the host decides from the header alone. Only a
+    /// full-resolution render of a CFA frame needs it.
+    #[test]
+    fn needs_vng_gate_only_for_cfa_at_full() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfa = dir.path().join("cfa.fits");
+        write_cfa_fits(&cfa, 16, 16);
+        let mono = dir.path().join("mono.fits");
+        write_fits_f32(&mono, 16, 16, 1, &vec![1.0f32; 256], &[]).unwrap();
+
+        assert!(needs_vng_gate(&cfa, Resolution::Full), "CFA at Full is the VNG render");
+        assert!(!needs_vng_gate(&cfa, Resolution::Preview), "preview keeps the super-pixel path");
+        assert!(!needs_vng_gate(&cfa, Resolution::Thumbnail));
+        assert!(!needs_vng_gate(&mono, Resolution::Full), "mono must never queue behind a colour render");
+        assert!(
+            needs_vng_gate(&dir.path().join("missing.fits"), Resolution::Full),
+            "an unreadable header errs towards taking the gate"
+        );
     }
 }

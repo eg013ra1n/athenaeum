@@ -119,14 +119,23 @@ pub async fn get_frame_preview(
     // the async executor using spawn_blocking to avoid blocking tokio threads.
     // Acquire a semaphore permit first to limit concurrent image processing.
 
+    // Gate BEFORE permit, never the reverse (see `VNG_GATE`'s doc in core):
+    // a full-resolution colour render waits here holding nothing, so the
+    // image semaphore keeps serving thumbnails and previews meanwhile.
+    let res = Resolution::from_string(&resolution_str);
+    let path_buf = PathBuf::from(&file_path);
+    let _vng_gate = if rustafits_processor::needs_vng_gate(&path_buf, res) {
+        Some(rustafits_processor::VNG_GATE.lock().await)
+    } else {
+        None
+    };
+
     let sem = state.image_semaphore.read().unwrap().clone();
     let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| db_err(format!("Semaphore closed: {}", e)))?;
 
-    let path_buf = PathBuf::from(&file_path);
-    let res = Resolution::from_string(&resolution_str);
     let pool: Arc<rayon::ThreadPool> = Arc::clone(&state.ctx.image_pool);
 
     let jpeg_data = tokio::task::spawn_blocking(move || {
