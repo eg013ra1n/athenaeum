@@ -870,6 +870,30 @@ fn log_build_finished(set_id: i64, duration: std::time::Duration, bytes_read: u6
     );
 }
 
+/// Share of a build's unified progress that reading accounts for. From the
+/// 2026-09-06 in-app run: read 29.5 s / combine 12.7 s and 22.9 s / 14.0 s on
+/// two 100-frame bias sets, 6.7 s / 3.2 s on a 30-frame dark — reading is
+/// 65-70 % of the pixel phase on that hardware, so 0.7 keeps the bar moving
+/// at roughly wall-clock speed. A page-cache-hot read (0.3 s / 3.4 s on the
+/// dark that re-ran after a cancel) jumps the bar to 70 % early and then
+/// crawls, which is honest about the work left if not about the time left.
+const READ_SHARE: f64 = 0.7;
+
+/// One 0..=100 for the whole pixel phase, from the two counters the engine
+/// reports: bytes read (climbs during `integrating`) and rows combined
+/// (climbs during `combining`). Review 2026-09-06 F1: the previous shape — a
+/// bytes percent for one stage and a rows percent for the other, rendered in
+/// the same UI cell — went backwards at every band boundary. The caller feeds
+/// this RUNNING MAXIMA of both counters, so the output is monotonic by
+/// construction. Each fraction is capped at 1 (a flat's two-pass wrapper can
+/// report a byte pair past its own total for one tick) and an unknown total
+/// (0, before the first tick of that phase) contributes nothing.
+fn build_percent(bytes_done: u64, bytes_total: u64, rows_done: usize, rows_total: usize) -> f64 {
+    let read = if bytes_total > 0 { (bytes_done as f64 / bytes_total as f64).min(1.0) } else { 0.0 };
+    let combine = if rows_total > 0 { (rows_done as f64 / rows_total as f64).min(1.0) } else { 0.0 };
+    (read * READ_SHARE + combine * (1.0 - READ_SHARE)) * 100.0
+}
+
 /// Fix round 3, Important 2: whether a `master-build-progress` tick should
 /// actually be emitted, given the last time one was. Pure and separately
 /// testable — same reasoning as `log_build_started`/`log_build_finished`
@@ -1040,23 +1064,30 @@ fn run_build(
     // same capture shape as `emitter`/`set_id` below.
     let last_emitted: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(300);
+    // Running maxima behind `build_percent` (review 2026-09-06 F1): each
+    // callback advances its own counter and reads the other's, so whichever
+    // stage emits, the percent is computed from the furthest point BOTH
+    // phases have reached — one bar, never two scales in one cell.
+    let max_bytes_done = std::sync::atomic::AtomicU64::new(0);
+    let max_rows_done = std::sync::atomic::AtomicUsize::new(0);
+    let rows_total_seen = std::sync::atomic::AtomicUsize::new(0);
     let on_band = |current: usize, total: usize, bytes_read_so_far: u64, bytes_total: u64| {
-        // Bytes, not bands (fix round 2, I2): Task 6 cut a set's band count
-        // to as few as 2, so a band-fraction percent could sit frozen at
-        // 0%/50%/100% for however long one band takes — exactly the
-        // multi-minute silence this whole task exists to remove. The engine
-        // now ticks `bytes_read_so_far` once per frame read (see
-        // `EngineProgress::on_band`'s doc), so deriving `percent` from bytes
-        // instead makes the number the operator sees move continuously.
-        // `total`/`current` (band index/count) are untouched — CreateMasterCell
-        // still gates whether it renders a percent at all on `total > 0`.
-        let percent = if bytes_total > 0 {
-            (bytes_read_so_far as f64 / bytes_total as f64) * 100.0
-        } else if total > 0 {
-            (current as f64 / total as f64) * 100.0
-        } else {
-            100.0
-        };
+        // Running max, and the duplicate filter (review 2026-09-06 F1): the
+        // engine calls `on_band` once more at the END of every band, after
+        // that band's combine, with the byte count its last per-frame tick
+        // already carried. Emitting that would flip the stage word back to
+        // "integrating" behind a "combining" tick that reported MORE
+        // progress. No new bytes means there is nothing new to say.
+        let prev = max_bytes_done.fetch_max(bytes_read_so_far, Ordering::Relaxed);
+        if bytes_read_so_far <= prev {
+            return;
+        }
+        let percent = build_percent(
+            bytes_read_so_far,
+            bytes_total,
+            max_rows_done.load(Ordering::Relaxed),
+            rows_total_seen.load(Ordering::Relaxed),
+        );
 
         // The terminal tick (100% read) always bypasses the throttle — a
         // window that happened to close right as the last frame finished
@@ -1095,14 +1126,19 @@ fn run_build(
     // `last_emitted`/`PROGRESS_THROTTLE` with `on_band` — one throttle
     // clock per build, not two independent ones.
     let on_combine = |current: usize, total: usize, bytes_done: u64, bytes_total: u64| {
-        // Rows, not bytes: `bytes_done`/`bytes_total` are frozen for the
-        // whole combine phase (see `EngineProgress::on_combine`'s doc) —
-        // deriving a percent from them here would just repeat whatever
-        // "integrating" last showed. `current`/`total` are genuinely moving
-        // (rows combined so far / total rows), so they carry the percent
-        // instead — the opposite of `on_band`'s bytes-first, bands-fallback
-        // order just above.
-        let percent = if total > 0 { (current as f64 / total as f64) * 100.0 } else { 0.0 };
+        // Rows advance here; bytes are frozen for the whole combine (see
+        // `EngineProgress::on_combine`'s doc), so the read share of the bar
+        // holds and only the combine share moves. `current` can arrive
+        // slightly out of order across rayon workers — the running max is
+        // what feeds the percent, the event still carries the value as given.
+        rows_total_seen.store(total, Ordering::Relaxed);
+        max_rows_done.fetch_max(current, Ordering::Relaxed);
+        let percent = build_percent(
+            max_bytes_done.load(Ordering::Relaxed).max(bytes_done),
+            bytes_total,
+            max_rows_done.load(Ordering::Relaxed),
+            total,
+        );
 
         // Terminal bypass keyed on ROWS (current >= total), not bytes — the
         // bytes pair is pinned at the same value for every tick of a band's
@@ -1158,8 +1194,6 @@ fn run_build(
             io,
         )?
     };
-    log_build_finished(set_id, build_started_at.elapsed(), out.bytes_read, &out);
-
     // Fix wave item 1 (whole-branch review, CRITICAL): the engine's own
     // cancellation checks (`run_banded`'s top-of-loop, post-read and
     // post-combine checks, and pass 1's per-chunk check for a flat) all sit
@@ -1174,9 +1208,15 @@ fn run_build(
     // `run_master_build_thread`'s existing cancelled-vs-failed handling
     // (the "master build cancelled" log line, `cancelled: true` on
     // `master-build-complete`) needs no changes to keep working here.
+    //
+    // Review 2026-09-06 F3: this check sits ABOVE `log_build_finished` on
+    // purpose — a build that is about to return `Cancelled` must not first
+    // log "master build finished"; `run_master_build_thread` logs the
+    // "master build cancelled" line for it instead.
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BuildStepError::Cancelled);
     }
+    log_build_finished(set_id, build_started_at.elapsed(), out.bytes_read, &out);
 
     // Audit C2: the engine drops non-finite samples ("undefined pixels") from
     // the per-pixel stack instead of panicking or baking NaN into the master.
@@ -4477,5 +4517,40 @@ mod tests {
              or a 100% read can be swallowed right before the silent combine phase"
         );
         assert_eq!(last, Some(t3), "the terminal tick still advances the window");
+    }
+
+    /// Review 2026-09-06 F1: the calibration row showed a bytes percent for
+    /// `integrating` and a rows percent for `combining` in the same cell, so
+    /// the number went backwards at every band boundary. One percent, built
+    /// from BOTH running maxima, cannot.
+    #[test]
+    fn build_percent_is_monotonic_across_a_two_band_build() {
+        // Two bands: read half → combine half → read the rest → combine the rest.
+        let (bt, rt) = (1000u64, 100usize);
+        let seq: [(u64, usize); 8] = [
+            (0, 0), (250, 0), (500, 0),      // band 1 read
+            (500, 25), (500, 50),            // band 1 combine
+            (750, 50), (1000, 50),           // band 2 read
+            (1000, 100),                     // band 2 combine
+        ];
+        let mut last = -1.0f64;
+        for (b, r) in seq {
+            let p = build_percent(b, bt, r, rt);
+            assert!(p >= last, "percent went backwards: {last} -> {p} at bytes={b} rows={r}");
+            last = p;
+        }
+        assert!((last - 100.0).abs() < 1e-9, "a finished build reads exactly 100, got {last}");
+        // Reading carries READ_SHARE of the bar: fully read, nothing combined.
+        let read_only = build_percent(bt, bt, 0, rt);
+        assert!((read_only - READ_SHARE * 100.0).abs() < 1e-9, "got {read_only}");
+    }
+
+    #[test]
+    fn build_percent_tolerates_unknown_totals_and_overshoot() {
+        assert_eq!(build_percent(0, 0, 0, 0), 0.0, "nothing known yet is 0, not NaN");
+        // rows_total is unknown (0) until the first combine tick: only the read share counts.
+        assert!((build_percent(500, 1000, 0, 0) - 35.0).abs() < 1e-9);
+        // A tick that overshoots its total (a flat's two-pass wrapper can) is capped at 100.
+        assert!((build_percent(2000, 1000, 200, 100) - 100.0).abs() < 1e-9);
     }
 }

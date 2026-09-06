@@ -227,6 +227,10 @@ export interface MasterBuildProgressEvent {
   stage: 'reading' | 'integrating' | 'combining' | 'writing' | 'registering';
   current: number;
   total: number;
+  /** One monotonic 0-100 across the whole pixel phase: reading (bytes) is
+   *  weighted 0.7, combining (rows) 0.3 — see `build_percent` in
+   *  `athenaeum-core/src/api/masters.rs`. Never goes backwards between
+   *  `'integrating'` and `'combining'`; `'writing'`/`'registering'` report 0. */
   percent: number;
   /** Bytes of source read so far / in total. `current`/`total` count bands,
    *  which say nothing about size once bands are machine-sized — EXCEPT
