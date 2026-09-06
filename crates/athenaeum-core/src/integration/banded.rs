@@ -157,6 +157,18 @@ impl FrameReader {
         {
             // `seek_read` may return a short read; loop until the buffer is
             // full or the file ends. There is no `read_exact_at` on Windows.
+            //
+            // `seek_read` also moves the file's cursor, unlike a true `pread`
+            // — safe here ONLY because nothing in this module reads through
+            // a cursor any more (fix round 1, M5): every read in this file is
+            // positional, so a moved cursor is never observed. Concurrent
+            // calls on one handle are still safe because each `seek_read`
+            // carries its own offset rather than relying on the moved
+            // cursor. Do NOT reintroduce a seek-based (`Seek`/`SeekFrom`)
+            // read anywhere in this module — it would silently race this
+            // cursor against concurrent `read_exact_at` calls on the same
+            // `File`, on Windows only, invisibly to every CI job (the
+            // Windows build only runs on a tag, never a branch push).
             let mut done = 0usize;
             while done < buf.len() {
                 let n = file.seek_read(&mut buf[done..], base + offset + done as u64)?;
@@ -276,13 +288,53 @@ fn spill_via_read_raw(path: &Path, scratch_dir: &Path, idx: usize)
     Ok((file, w, h))
 }
 
-/// Probe one path into a ready reader. `idx` is this path's position in the
-/// caller's list — only used to keep decode-and-spill scratch filenames
-/// distinct within one `open` call (a process-wide sequence in
-/// `spill_via_read_raw` already covers cross-call uniqueness).
-fn open_one(p: &Path, scratch_dir: &Path, idx: usize) -> Result<(FrameReader, usize, usize), IntegrationError> {
+/// What a probe worker found for one path — the header-probe part only.
+///
+/// Fix round 1 (I1): the decode-and-spill fallback used to run INSIDE the
+/// probed worker (the old `open_one`'s `None` arm called `spill_via_read_raw`
+/// directly), so it ran on all `concurrency` workers at once.
+/// `spill_via_read_raw` decodes an entire frame into RAM via
+/// `ImageConverter::read_raw` — ~104 MB per frame per the throughput spec —
+/// so that was up to `concurrency` decoded frames alive simultaneously
+/// (~1.7 GB locally, ~7.8 GB under the network policy), none of which the
+/// band budget this whole cycle exists to bound would ever see, for a
+/// fallback that used to cost one frame at a time before this task. The
+/// concurrency `open` adds is for `probe_fits`'s round trips (an `open` plus
+/// a couple of small reads), never for the spill — so a `NeedsSpill` verdict
+/// carries no reader yet, and `open` (below) performs the actual spill
+/// serially, on the calling thread, after every probe worker has joined. Do
+/// not fold the spill back into a worker.
+enum ProbeOutcome {
+    Fits(FrameReader, usize, usize),
+    NeedsSpill,
+}
+
+/// Splits `n` items round-robin into `workers` groups (item `i` goes to
+/// group `i % workers`), used by both `BandSource::open` and
+/// `BandSource::read_band` to hand disjoint work to their scoped-thread
+/// workers.
+///
+/// Fix round 1, I2: this replaces a contiguous `n.div_ceil(workers)`-sized
+/// chunk split, which silently produced FEWER than `workers` non-empty
+/// chunks whenever `workers` did not divide `n` evenly — 100 items at
+/// `workers=32` gave chunks of `ceil(100/32) = 4`, hence only
+/// `ceil(100/4) = 25` non-empty chunks, a 22% shortfall on exactly the
+/// network read-concurrency case this exists for. Round-robin always
+/// produces exactly `min(n, workers)` non-empty groups (pinned by
+/// `round_robin_groups_never_under_fills_a_non_divisor_pair` below).
+fn round_robin_groups<T>(items: impl IntoIterator<Item = T>, workers: usize) -> Vec<Vec<T>> {
+    let mut groups: Vec<Vec<T>> = (0..workers).map(|_| Vec::new()).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        groups[i % workers].push(item);
+    }
+    groups
+}
+
+/// Header-probe only — never spills. See [`ProbeOutcome`]'s doc comment for
+/// why the spill lives outside this function.
+fn probe_one(p: &Path) -> Result<ProbeOutcome, IntegrationError> {
     match probe_fits(p) {
-        Some(info) => Ok((
+        Some(info) => Ok(ProbeOutcome::Fits(
             FrameReader::Fits {
                 file: File::open(p)?,
                 data_offset: info.data_offset,
@@ -290,10 +342,7 @@ fn open_one(p: &Path, scratch_dir: &Path, idx: usize) -> Result<(FrameReader, us
             },
             info.w, info.h,
         )),
-        None => {
-            let (file, w, h) = spill_via_read_raw(p, scratch_dir, idx)?;
-            Ok((FrameReader::Scratch { file, kind: PlaneKind::F32Le }, w, h))
-        }
+        None => Ok(ProbeOutcome::NeedsSpill),
     }
 }
 
@@ -303,55 +352,75 @@ impl BandSource {
     /// serial round trips before a single pixel is read — measured at 0.55s
     /// even locally. Probing across `concurrency` scoped threads amortizes
     /// that latency the same way `read_band` amortizes the per-band reads.
+    /// The decode-and-spill fallback is deliberately NOT part of that
+    /// parallel work — see [`ProbeOutcome`]'s doc comment.
     ///
     /// Readers are assembled back in the caller's `paths` order regardless of
-    /// which worker finished first or last: each worker owns a fixed,
-    /// contiguous slice of `slots` (one per input path) and writes only into
-    /// its own slice, so completion order never leaks into reader order. That
-    /// order is load-bearing — `bad_samples_per_frame` is indexed by it, and
-    /// so is the per-pixel combine's column.
+    /// which worker finished first or last: every path has a fixed slot
+    /// (indexed by its position in `paths`) that only its own round-robin
+    /// owner ever writes, so completion order never leaks into reader order.
+    /// That order is load-bearing — `bad_samples_per_frame` is indexed by it,
+    /// and so is the per-pixel combine's column.
+    ///
+    /// Workers are assigned round-robin (`i % workers`), fix round 1 (I2),
+    /// not contiguous chunks: a contiguous `n.div_ceil(workers)`-sized split
+    /// silently under-fills whenever `workers` doesn't divide `n` evenly —
+    /// 100 paths at `workers=32` gives chunk size 4, hence only 25 non-empty
+    /// chunks, a 22% shortfall on exactly the network case this concurrency
+    /// exists for. Round-robin always produces `min(n, workers)` non-empty
+    /// groups.
     pub fn open(paths: &[PathBuf], scratch_dir: &Path, concurrency: usize) -> Result<BandSource, IntegrationError> {
         if paths.is_empty() {
             return Err(IntegrationError::BadInput("empty frame list".into()));
         }
         let n = paths.len();
         let workers = concurrency.max(1).min(n);
-        let per = n.div_ceil(workers);
 
-        let mut slots: Vec<Option<Result<(FrameReader, usize, usize), IntegrationError>>> =
-            (0..n).map(|_| None).collect();
+        let mut slots: Vec<Option<Result<ProbeOutcome, IntegrationError>>> = (0..n).map(|_| None).collect();
         let mut panicked = false;
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for (chunk_idx, (paths_chunk, slot_chunk)) in
-                paths.chunks(per).zip(slots.chunks_mut(per)).enumerate()
-            {
-                let base = chunk_idx * per;
-                handles.push(scope.spawn(move || {
-                    for (offset, (p, slot)) in paths_chunk.iter().zip(slot_chunk.iter_mut()).enumerate() {
-                        *slot = Some(open_one(p, scratch_dir, base + offset));
-                    }
-                }));
-            }
-            for h in handles {
-                // A panicked probe thread must surface as an error, never as
-                // a silently missing reader — its slots stay `None` below,
-                // which the assembly loop turns into a hard error.
-                if h.join().is_err() {
-                    panicked = true;
+        {
+            let groups = round_robin_groups(paths.iter().zip(slots.iter_mut()), workers);
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                for group in groups {
+                    handles.push(scope.spawn(move || {
+                        for (p, slot) in group {
+                            *slot = Some(probe_one(p));
+                        }
+                    }));
                 }
-            }
-        });
+                for h in handles {
+                    // A panicked probe thread must surface as an error, never
+                    // as a silently missing reader — its slots stay `None`
+                    // below, which the assembly loop turns into a hard error.
+                    if h.join().is_err() {
+                        panicked = true;
+                    }
+                }
+            });
+        }
         if panicked {
             return Err(IntegrationError::BadInput("a frame probe thread panicked".into()));
         }
 
         let mut readers = Vec::with_capacity(n);
         let mut dims: Option<(usize, usize)> = None;
-        for (p, slot) in paths.iter().zip(slots.into_iter()) {
-            let (reader, w, h) = slot.ok_or_else(|| {
+        for (idx, (p, slot)) in paths.iter().zip(slots.into_iter()).enumerate() {
+            let outcome = slot.ok_or_else(|| {
                 IntegrationError::BadInput(format!("{}: never probed (owning thread panicked)", p.display()))
             })??;
+            let (reader, w, h) = match outcome {
+                ProbeOutcome::Fits(reader, w, h) => (reader, w, h),
+                ProbeOutcome::NeedsSpill => {
+                    // Serial, on THIS (the calling) thread — see
+                    // `ProbeOutcome`'s doc comment. `idx` is this path's
+                    // position in `paths`, matching the pre-parallel loop's
+                    // per-`open`-call frame index exactly; path order is
+                    // unaffected by which worker probed it.
+                    let (file, w, h) = spill_via_read_raw(p, scratch_dir, idx)?;
+                    (FrameReader::Scratch { file, kind: PlaneKind::F32Le }, w, h)
+                }
+            };
             match dims {
                 None => dims = Some((w, h)),
                 Some(d) if d != (w, h) => {
@@ -418,14 +487,17 @@ impl BandSource {
     /// the rayon pool's width. A rayon pool caps parallelism at its own
     /// thread count, which is derived from CPU cores — and a network mount is
     /// latency-bound, so it needs MORE outstanding reads than the machine has
-    /// cores to fill the link at all. Scoped OS threads give an exact,
-    /// pool-independent count, cost ~10-20 us to spawn against a band read
-    /// measured in seconds, and are safe to use from inside a
-    /// `pool.install(..)` (they are not rayon workers, so they cannot
-    /// deadlock against the pool that called in). Taking `&self` (not
-    /// `&mut self`) is what makes that safe: several bands, or several
-    /// frames of one band, can be read from the same shared `BandSource` at
-    /// once because there is no cursor to race — every read is positional.
+    /// cores to fill the link at all. Scoped OS threads give a pool-independent
+    /// count — `min(frame_count, concurrency)` in flight, exactly, via
+    /// round-robin assignment (fix round 1, I2; a contiguous chunk split
+    /// under-fills whenever `concurrency` doesn't divide the frame count) —
+    /// cost ~10-20 us to spawn against a band read measured in seconds, and
+    /// are safe to use from inside a `pool.install(..)` (they are not rayon
+    /// workers, so they cannot deadlock against the pool that called in).
+    /// Taking `&self` (not `&mut self`) is what makes that safe: several
+    /// bands, or several frames of one band, can be read from the same
+    /// shared `BandSource` at once because there is no cursor to race —
+    /// every read is positional.
     pub fn read_band(
         &self,
         y0: usize,
@@ -454,14 +526,46 @@ impl BandSource {
         out.rows = rows;
 
         let n = self.readers.len();
-        let workers = concurrency.max(1).min(n.max(1));
-        let per = n.div_ceil(workers);
+        // Fix round 1, M4: `n == 0` cannot happen through `BandSource::open`
+        // (it rejects an empty path list before a `BandSource` ever exists),
+        // but the guard used to be a `.max(1)` dressed up as protection while
+        // still handing `per = n.div_ceil(workers) == 0` to a chunking call
+        // that panics on it. An explicit early return says plainly what is
+        // and isn't guaranteed, and costs nothing on the real path.
+        if n == 0 {
+            return Ok(());
+        }
+        let workers = concurrency.max(1).min(n);
+
+        // Fix round 1, M3: every calibration/precal call site (light_cal.rs,
+        // cosmetic.rs, `masters::load_precal_pixels`) and every test passes
+        // `concurrency == 1` — 1-3 frame reads with no `IoPolicy` in scope
+        // (spec §8). Skip `thread::scope` entirely for that case: it is a
+        // straight loop identical to what this method did before this task,
+        // and `scope.spawn` panics if the OS refuses a new thread, which
+        // would otherwise turn a bare single-frame read into a new panic
+        // path for zero parallelism gained.
+        if workers == 1 {
+            for (reader, buf) in self.readers.iter().zip(out.bufs.iter_mut()) {
+                let bpp = reader.kind().bytes_per_sample();
+                buf.resize(rows * w * bpp, 0u8);
+                reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
+            }
+            return Ok(());
+        }
+
+        // Round-robin, not contiguous chunks (fix round 1, I2) — see
+        // `round_robin_groups`'s doc comment. Always produces exactly
+        // `workers` non-empty groups here (having passed the `workers == 1`
+        // fast path above, and `workers` never exceeds `n`).
+        let groups = round_robin_groups(self.readers.iter().zip(out.bufs.iter_mut()), workers);
+
         let mut errors: Vec<IntegrationError> = Vec::new();
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            for (readers, bufs) in self.readers.chunks(per).zip(out.bufs.chunks_mut(per)) {
+            for group in groups {
                 handles.push(scope.spawn(move || -> Result<(), IntegrationError> {
-                    for (reader, buf) in readers.iter().zip(bufs.iter_mut()) {
+                    for (reader, buf) in group {
                         let bpp = reader.kind().bytes_per_sample();
                         buf.resize(rows * w * bpp, 0u8);
                         reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
@@ -481,8 +585,17 @@ impl BandSource {
                 }
             }
         });
-        if let Some(e) = errors.into_iter().next() {
-            return Err(e);
+        // Fix round 1, M2: report every discarded error, not just the one
+        // returned below — losing three frames mid-read used to surface only
+        // one of them, the other two leaving no trace, against the repo's
+        // never-swallow-an-error rule.
+        if !errors.is_empty() {
+            let mut errors = errors.into_iter();
+            let first = errors.next().unwrap();
+            for e in errors {
+                tracing::warn!(error = %e, "read_band: reader-thread failure discarded in favor of an earlier one");
+            }
+            return Err(first);
         }
         Ok(())
     }
@@ -492,9 +605,11 @@ impl BandSource {
 ///
 /// Before 2026-09-06 the band was `Vec<Vec<f32>>`, so a BITPIX 16 camera file
 /// was widened on the way in and every band cost twice what the data does.
-/// Holding raw bytes halves band memory for the common case, which buys twice
-/// the rows for the same budget — i.e. half the seek rounds. The widening
-/// happens per sample inside the parallel combine, where it is nearly free.
+/// Holding raw bytes halves band memory for the common case, which buys MORE
+/// rows for the same budget — not a flat 2x (see [`BandSource::band_rows_for_budget`]
+/// for the real, headroom-adjusted ratio), i.e. fewer read rounds. The
+/// widening happens per sample inside the parallel combine, where it is
+/// nearly free.
 pub struct BandPlanes {
     bufs: Vec<Vec<u8>>,
     kinds: Vec<PlaneKind>,
@@ -543,6 +658,31 @@ mod tests {
     use super::*;
     use crate::fits_writer::write_fits_f32;
     use std::io::Write;
+
+    /// Fix round 1, I2: a contiguous `n.div_ceil(workers)`-sized chunk split
+    /// gives FEWER than `workers` non-empty chunks whenever `workers` does
+    /// not divide `n` evenly. The reviewer's exact example: 100 items at 32
+    /// workers used to give chunks of `ceil(100/32) = 4`, hence only
+    /// `ceil(100/4) = 25` non-empty chunks — a 22% shortfall on exactly the
+    /// network read-concurrency case this exists for (`n=100, c=32` do not
+    /// divide evenly, unlike the 1/4/10/20-reader timing sweep, which can't
+    /// show this because every one of those divides 100 evenly). This is a
+    /// direct assertion on the grouping itself, not a timing measurement.
+    #[test]
+    fn round_robin_groups_never_under_fills_a_non_divisor_pair() {
+        let groups = round_robin_groups(0..100usize, 32);
+        assert_eq!(groups.len(), 32, "one Vec per worker, always");
+        assert_eq!(
+            groups.iter().filter(|g| !g.is_empty()).count(),
+            32,
+            "every one of the 32 workers must get at least one item — the old contiguous \
+             chunk split only ever populated 25 of them for this exact (n, workers) pair"
+        );
+        // Every item lands in exactly one group: none dropped, none duplicated.
+        let mut seen: Vec<usize> = groups.into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..100).collect::<Vec<_>>());
+    }
 
     fn f32_fixture(dir: &std::path::Path, name: &str, w: usize, h: usize, fill: impl Fn(usize, usize) -> f32) -> std::path::PathBuf {
         let mut data = vec![0f32; w * h];
