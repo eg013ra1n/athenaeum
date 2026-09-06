@@ -63,18 +63,13 @@ refused attempt a solve again; the three fields already on the tab still save.
 
 ## 2. VNG debayer in the blink preview at full resolution
 
-Carried over from `docs/backlog-v0.5.5.md` item 4 — **the research there is
-done, start from it, do not re-measure.** Summary: the render path uses
-`super_pixel_debayer_f32`, which halves both axes, so Blink's "Full Resolution"
-gives an OSC frame half its native size with no warning anywhere. VNG is wired
-only into the export generator. Measured on a real 26 MP OSC frame: super-pixel
-3.6 ms for 6 MP out, VNG 683 ms for 26 MP out (~191× the wall clock for 4× the
-pixels, ~313 MB for one planar f32 RGB frame). The stretch is size-agnostic and
-not a blocker.
-
-**Open, unchanged:** always-on for `full`, or a separate "1:1 / high quality"
-mode? The preview cache is keyed per resolution, so a new mode needs a cache-key
-decision too.
+**Shipped 2026-09-06** (`b11cb0a9`, spec
+`docs/superpowers/specs/2026-09-06-blink-full-resolution-vng-design.md`):
+`Resolution::Full` now debayers CFA frames at native resolution with the
+gradient method, one such render at a time, and the preview cache gained a byte
+budget (`blink.memory_cache_max_mb`). The question that was open here was
+settled as "always-on for `full`" (spec D1). What remains is the owner smoke
+list in `docs/superpowers/open-items.md`.
 
 ## 3. Navigation memory ("backspace browsing")
 
@@ -109,3 +104,33 @@ frame is refused rather than mis-solved.
 for every frame already in the catalog, so either every library needs a
 re-analysis pass or the two measurements have to coexist for a while. That
 decision, not the maths, is what makes this its own cycle.
+
+## 5. One place to watch what the app is doing
+
+Raised by the owner after the first in-app run of the integration-throughput
+cycle (2026-09-06): the builds were clearly faster, but "progress is not
+visible". Recorded so the idea is not lost; the owner's own verdict was that
+the current state is acceptable for now.
+
+What exists today is scattered per feature. The sidebar `ComputeQueueIndicator`
+lists compute-queue jobs with a label and `running` / `queued` only — no stage,
+no percent — because `ComputeQueueEntry` carries no subject id to join the
+`master-build-progress` stream to (throughput spec §8). The only place a master
+build's stage and percent render is the trailing cell of the calibration-table
+row on the Coverage tab (`CreateMasterCell`, 10 px text), which is easy to miss
+and absent from the Equipment page. Analysis has `AnalysisQueueIndicator`,
+transfers have their own page, scan / export / archive / plate-solve each own a
+widget. Nothing shows every running operation together.
+
+Shape of the idea: one window or slide-over listing every in-flight operation —
+master builds, analysis, plate-solve queue, exports, archive, transfers, content
+index — each with stage, percent, bytes / ETA where its event stream carries
+them, and a cancel. Master builds already emit `bytes_done` / `bytes_total` and
+a `combining` stage; that per-set percent is also what the 2026-09-06 review
+found non-monotonic (bytes scale for reading, rows scale for combining), which a
+single panel would have to resolve rather than inherit.
+
+**Open:** where it lives (a sidebar slide-over like the notification panel, or
+a page); whether the smallest version — `ComputeQueueEntry` growing a subject
+id so the existing sidebar card can show a percent — is enough on its own; and
+whether the per-feature widgets fold into it or stay.

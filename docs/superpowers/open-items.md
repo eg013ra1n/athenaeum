@@ -68,10 +68,6 @@ measured `I16Be` one. Final whole-branch review's fix wave applied (cancel-mid-b
 now actually stops the write/register, combine-phase progress ticks instead of
 freezing at 100%).
 
-- The two §9 acceptance rows nobody has re-run against the fixed code: the 30-frame
-  dark (≤ 8 s) and the LDN 1272 batch (11 sets, ~23 GB, ≤ 5 min) — both are marked
-  NOT YET MEASURED in the spec table pending an owner run with
-  `examples/band_profile.rs` and the research §2 eviction protocol.
 - An SSD-backed scan root has no measurement at all yet (spec §9 lists it as an open
   item) — the storage class D3 expects to benefit most from read concurrency.
 - **`cargo check -p athenaeum-core --no-default-features` does NOT compile

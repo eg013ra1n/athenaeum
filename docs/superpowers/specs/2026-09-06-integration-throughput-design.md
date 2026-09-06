@@ -367,8 +367,8 @@ eviction protocol from research §2, on the profiling machine.
 | ---- | ---- | ---- | ---- |
 | 100-frame bias, cold, end to end | 233.1 s | ≤ 40 s | **37.7 s** pre-fix-wave; **40.4 / 40.8 s** on the final build — see note |
 | 100-frame bias, read throughput | 23 MB/s | ≥ 150 MB/s | **175-178 MB/s**, stable across eight runs |
-| 30-frame dark, cold, end to end | 11.8 s | ≤ 8 s | **11.7 s — the target was impossible, see below** |
-| LDN 1272 batch (11 sets, ~23 GB) | 13.5 min | ≤ 5 min | **not measured** — needs a desktop rebuild and deleting real masters; owner territory |
+| 30-frame dark, cold, end to end | 11.8 s | ≤ 8 s | **11.7 s — the target was impossible, see below**; in the dev app 2026-09-06: 10.0 s (set 1682, read 6.7 s at 232 MB/s, combine 3.2 s) |
+| LDN 1272 batch (11 sets, ~23 GB) | 13.5 min | ≤ 5 min | **≈ 3 min wall** in the dev app 2026-09-06 (19:02:43 → 19:05:39 by the `master build started/finished` log lines, including a ~12 s cancel-and-restart pause; the two 100-frame bias sets 42.7 s and 37.3 s at 177 / 227 MB/s; one 30-frame dark re-ran page-cache-hot after the cancel, so a fully cold batch is a few seconds longer) |
 
 **The 30-frame dark target was wrong when it was written, and no implementation
 could have met it.** 1.57 GB against the drive's measured 243 MB/s whole-file
