@@ -1350,7 +1350,15 @@ pub(crate) fn is_unc(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn classify_existing(path: &Path) -> StorageClass {
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, DRIVE_REMOTE};
+    // Three separate imports, and every one of them was got wrong in the first
+    // draft of this plan. `encode_wide` is a trait method, so `OsStrExt` must be
+    // in scope; `GetDriveTypeW` really does live in `Storage::FileSystem`, but
+    // `DRIVE_REMOTE` does NOT — it is in `System::WindowsProgramming`, behind its
+    // own feature. Verified by compiling for x86_64-pc-windows-msvc, because the
+    // repo's Windows CI job is `only: tags` and a branch push never builds it.
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
     if is_unc(path) {
         return StorageClass::Network;
     }
@@ -1384,7 +1392,7 @@ Add the feature in `crates/athenaeum-core/Cargo.toml`, extending the section Tas
 
 ```toml
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
 ```
 
 - [ ] **Step 4: Add the setting and the combined policy**
