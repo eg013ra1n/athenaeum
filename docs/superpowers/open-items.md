@@ -42,6 +42,41 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Blink full-resolution VNG (2026-09-06)
+
+Spec `docs/superpowers/specs/2026-09-06-blink-full-resolution-vng-design.md`.
+`Resolution::Full` now debayers a CFA frame at native resolution with the gradient
+method instead of halving it with the super-pixel one; one such render at a time
+(`VNG_GATE`); the preview cache gained a byte budget
+(`blink.memory_cache_max_mb`, default 512 MB); the desktop command returns
+`tauri::ipc::Response` so a 17 MB JPEG no longer crosses IPC as a JSON array.
+Measured on a real ASI2600MC frame through the shipped converter path: 6248x4176
+out, 752 ms, 17.2 MB JPEG, 555 MB peak RSS (super-pixel: 3124x2088, 45 ms, 4.5 MB,
+228 MB). Crops of both were eyeballed — same star colours, no demosaic artifacts.
+What no one has run is the app itself.
+
+- Press ScanEye on an OSC light in Blink and confirm the canvas is genuinely
+  native resolution (zoom to 1:1 and compare against the same frame in an external
+  viewer), that the load feels bounded by the ~0.8 s render rather than by IPC, and
+  that pressing it again returns to preview.
+- **Measure the IPC leg** while doing it. The change from a JSON array to an
+  `ArrayBuffer` is verified in the pinned tauri sources, not in the running app. If
+  the transfer still dominates the ~0.8 s render, that is a finding for its own
+  cycle — do not patch it blind (spec 4.4).
+- Star annotations (`A`) on a full-resolution OSC frame: the overlay scales by the
+  render/analysis ratio, so a resolution change should be transparent. Confirm the
+  ellipses still land on stars.
+- Set Settings -> Blink Viewer -> Image Resolution to **Full**, open a 200+ frame
+  OSC set, and watch RSS. The expectation is a plateau near the 512 MB cache budget
+  plus one ~0.55 GB render, not unbounded growth. Note that the webview holds one
+  blob per cached frame on its own side — the Rust budget does not bound that
+  (spec 7); if the renderer process is what grows, that is the known gap.
+- Mono at Full is meant to be untouched and must not queue behind a colour render:
+  blink a mono set at Full and confirm it is as fast as before.
+- Settings -> Blink Viewer: the new **Memory Cache Limit (MB)** field saves,
+  reloads, and rejects values outside 64-16384; the amber warning under Image
+  Resolution appears only for Full.
+
 ### Calibrated-export v2 (2026-08-31)
 
 Spec `docs/superpowers/specs/2026-08-31-calibrated-export-v2-design.md`. The
@@ -503,4 +538,8 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 (The v0.5.1–v0.5.5 lines were paid at their own tags.)
 
-Nothing owed — v0.5.5 paid every line drafted for it.
+- Full resolution in the Blink viewer now debayers one-shot-colour frames at their
+  native resolution with gradient interpolation, instead of halving them. Colour
+  frames finally show every pixel the sensor recorded.
+- The Blink image cache is now bounded in megabytes as well as in frame count, so a
+  full-resolution session cannot quietly grow to gigabytes.

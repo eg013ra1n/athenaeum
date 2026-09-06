@@ -6,13 +6,34 @@ use crate::rustafits_processor::{self, Resolution};
 use std::path::PathBuf;
 use tauri::State;
 
+/// Read FITS image and return the JPEG as raw bytes.
+///
+/// Returns [`tauri::ipc::Response`] rather than a bare `Vec<u8>` on purpose. A
+/// command returning `Vec<u8>` goes through the blanket `impl<T: Serialize>
+/// IpcResponse`, i.e. `serde_json` — a full-resolution one-shot-colour frame is
+/// a 17 MB JPEG, which would cross the IPC boundary as a JSON array of
+/// seventeen million numbers. `Response` sends `application/octet-stream`
+/// instead, which the webview reads as an `ArrayBuffer`.
+///
+/// Callers inside the Rust side want the bytes, not the wrapper — they use
+/// [`read_fits_image_bytes`].
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn read_fits_image_rustafits(
+    path: String,
+    resolution: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    read_fits_image_bytes(path, resolution, state)
+        .await
+        .map(tauri::ipc::Response::new)
+}
+
 /// Read FITS image and return JPEG bytes via in-memory cache.
 ///
 /// Cache hits bypass the semaphore entirely (<1ms).
 /// The semaphore is only acquired for cache misses (actual image processing).
-#[tauri::command]
-#[tracing::instrument(skip_all, err, level = "debug")]
-pub async fn read_fits_image_rustafits(
+pub async fn read_fits_image_bytes(
     path: String,
     resolution: Option<String>,
     state: State<'_, AppState>,

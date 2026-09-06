@@ -22,6 +22,10 @@ pub mod defaults {
     // Blink viewer
     pub const BLINK_THREADS: &str = "0"; // 0 = auto (half of available cores)
     pub const BLINK_MEMORY_CACHE_SIZE: &str = "200";
+    /// Megabytes of rendered JPEG the preview cache may hold. Entry count alone
+    /// is not a memory bound — a preview JPEG is ~300 KB and a full-resolution
+    /// one-shot-colour JPEG ~17 MB.
+    pub const BLINK_MEMORY_CACHE_MAX_MB: &str = "512";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "30";
 
     // Background scan monitoring
@@ -90,6 +94,7 @@ pub mod keys {
     // Blink viewer
     pub const BLINK_THREADS: &str = "blink.threads";
     pub const BLINK_MEMORY_CACHE_SIZE: &str = "blink.memory_cache_size";
+    pub const BLINK_MEMORY_CACHE_MAX_MB: &str = "blink.memory_cache_max_mb";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "blink.memory_retention_minutes";
 
     // Background scan monitoring (see docs spec 2026-04-23 auto-scanning)

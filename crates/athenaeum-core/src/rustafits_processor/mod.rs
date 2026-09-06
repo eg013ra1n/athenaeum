@@ -1,8 +1,27 @@
 use anyhow::{Context, Result};
-use astroimage::ImageConverter;
+use astroimage::{BayerPattern, ImageConverter};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Serializes full-resolution gradient debayers.
+///
+/// One such render allocates twelve bytes per pixel of planar RGB — measured at
+/// 547 MB peak RSS on a 6248x4176 one-shot-colour frame — and already saturates
+/// the machine on its own (5.84 s of CPU inside 0.79 s of wall time). Running
+/// several at once therefore multiplies the memory peak without buying
+/// throughput: on that frame, five in parallel took 3.40 s against 3.99 s one
+/// after another, for five times the peak. The blink prefetch does exactly that
+/// — it asks for every frame of a set at the configured resolution, up to
+/// `blink.threads` at a time — so this gate is what keeps a full-resolution set
+/// from needing gigabytes.
+///
+/// A plain std mutex is the right primitive here: both hosts call
+/// `process_fits_to_jpeg` from a blocking context (`block_in_place` on desktop,
+/// `spawn_blocking` on web), so blocking on it is sanctioned. Poisoning is
+/// recovered rather than propagated, so one panicking render cannot disable
+/// previews for the rest of the session.
+static VNG_GATE: Mutex<()> = Mutex::new(());
 
 /// Resolution variants for blink viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +96,11 @@ pub struct ProcessedImage {
 /// in-process via rustafits's own `encode_jpeg` (pure-Rust libjpeg-turbo-rs),
 /// returning a `Vec<u8>`.
 ///
+/// At [`Resolution::Full`] a CFA frame is debayered at its native resolution
+/// with the gradient method instead of the super-pixel one, so "full
+/// resolution" means what it says for one-shot-colour data. That render is the
+/// one serialized by [`VNG_GATE`].
+///
 /// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
 pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     input_path: P,
@@ -104,9 +128,34 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         converter = converter.with_preview_mode();
     }
 
+    // Full resolution means native resolution, including for CFA data. Without
+    // this the super-pixel debayer folds every 2x2 Bayer tile into one pixel
+    // and hands back half of each axis under the name "full".
+    if resolution == Resolution::Full {
+        converter = converter.with_vng_debayer();
+    }
+
+    // Read and process are split so the gate below can be taken *only* for the
+    // renders that need it — a mono full-resolution render is cheap and must
+    // not queue behind one. `ImageConverter::read_raw` is an associated
+    // function and, unlike `process`/`process_data`, does not install the
+    // converter's thread pool, while the FITS reader parallelises its byte swap
+    // with rayon. Installing the pool around it by hand is what keeps that work
+    // on the app's bounded image pool instead of leaking onto the global one.
+    let (meta, pixels) = pool
+        .install(|| ImageConverter::read_raw(input_path))
+        .with_context(|| format!("Failed to read image: {}", input_path.display()))?;
+
+    // Deliberately a superset of the pipeline's own CFA conditions (which also
+    // look at the channel count on the f32 side): erring towards taking the
+    // gate costs an impossible file a little serialization, while erring the
+    // other way would let two gigabyte-scale renders run at once.
+    let vng_render = resolution == Resolution::Full && meta.bayer_pattern != BayerPattern::None;
+    let _gate = vng_render.then(|| VNG_GATE.lock().unwrap_or_else(|e| e.into_inner()));
+
     // Process FITS/XISF to raw RGB pixels in memory
     let processed = converter
-        .process(input_path)
+        .process_data(meta, pixels)
         .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
 
     let width = processed.width as u32;
@@ -184,5 +233,74 @@ impl Default for AnnotationSettings {
             fwhm_good: 1.3,
             fwhm_warn: 2.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fits_writer::{write_fits_f32, Card, CardValue};
+
+    fn image_pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap())
+    }
+
+    /// A small CFA frame with a real Bayer pattern in the header, written
+    /// through the app's own FITS writer so the reader sees exactly the shape
+    /// it sees in production.
+    fn write_cfa_fits(path: &std::path::Path, w: usize, h: usize) {
+        let data: Vec<f32> = (0..w * h).map(|i| ((i * 37) % 4096) as f32).collect();
+        let cards = vec![
+            Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
+        ];
+        write_fits_f32(path, w, h, 1, &data, &cards).unwrap();
+    }
+
+    /// The whole point of the feature: "full resolution" has to mean native
+    /// resolution for one-shot-colour data too, while preview keeps the cheap
+    /// half-size super-pixel debayer.
+    #[test]
+    fn full_resolution_debayers_cfa_at_native_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cfa.fits");
+        let (w, h) = (32, 32);
+        write_cfa_fits(&path, w, h);
+        let pool = image_pool();
+
+        let full = process_fits_to_jpeg(&path, Resolution::Full, None, &pool).unwrap();
+        assert_eq!((full.width as usize, full.height as usize), (w, h));
+        assert!(full.is_color);
+
+        let preview = process_fits_to_jpeg(&path, Resolution::Preview, None, &pool).unwrap();
+        assert_eq!(
+            (preview.width as usize, preview.height as usize),
+            (w / 2, h / 2),
+            "preview must keep the cheap super-pixel debayer"
+        );
+    }
+
+    /// A mono frame is unaffected by the change and, being cheap, must not be
+    /// serialized behind a colour render — this pins that `Full` on mono still
+    /// produces a native-size grayscale image.
+    #[test]
+    fn full_resolution_leaves_mono_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mono.fits");
+        let (w, h) = (32, 32);
+        let data: Vec<f32> = (0..w * h).map(|i| ((i * 11) % 4096) as f32).collect();
+        write_fits_f32(
+            &path,
+            w,
+            h,
+            1,
+            &data,
+            &[Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap()],
+        )
+        .unwrap();
+
+        let out = process_fits_to_jpeg(&path, Resolution::Full, None, &image_pool()).unwrap();
+        assert_eq!((out.width as usize, out.height as usize), (w, h));
+        assert!(!out.is_color);
     }
 }

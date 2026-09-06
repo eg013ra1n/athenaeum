@@ -170,6 +170,11 @@ pub fn run() {
                         .flatten()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(200);
+                    let cache_max_mb: usize = db::get_setting(&conn, settings::keys::BLINK_MEMORY_CACHE_MAX_MB)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(512);
                     let retention_minutes: u64 = db::get_setting(&conn, settings::keys::BLINK_MEMORY_RETENTION_MINUTES)
                         .ok()
                         .flatten()
@@ -177,8 +182,9 @@ pub fn run() {
                         .unwrap_or(30);
                     let mut cache = state.ctx.memory_cache.lock().unwrap();
                     cache.set_max_entries(cache_size);
+                    cache.set_max_bytes(cache_max_mb * 1024 * 1024);
                     cache.set_retention(retention_minutes);
-                    tracing::info!(cache_size, retention_minutes, "memory cache initialized");
+                    tracing::info!(cache_size, cache_max_mb, retention_minutes, "memory cache initialized");
                 }
             }
 

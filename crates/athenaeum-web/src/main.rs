@@ -165,12 +165,17 @@ async fn main() {
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
+    let cache_max_mb: usize = db::get_setting(&db.conn(), settings::keys::BLINK_MEMORY_CACHE_MAX_MB)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
     let retention_minutes: u64 = db::get_setting(&db.conn(), settings::keys::BLINK_MEMORY_RETENTION_MINUTES)
         .ok()
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    tracing::info!(cache_size, retention_minutes, "memory cache initialized");
+    tracing::info!(cache_size, cache_max_mb, retention_minutes, "memory cache initialized");
 
     // Build ServiceContext
     let settings_mgr = Arc::new(SettingsManager::new());
@@ -179,7 +184,10 @@ async fn main() {
     let ctx = Arc::new(ServiceContext {
         db: db_cell,
         settings: settings_mgr,
-        memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(cache_size, retention_minutes))),
+        memory_cache: Arc::new(Mutex::new(
+            MemoryImageCache::new(cache_size, retention_minutes)
+                .with_max_bytes(cache_max_mb * 1024 * 1024),
+        )),
         active_scans: Arc::new(Mutex::new(HashMap::new())),
         active_exports: Arc::new(Mutex::new(HashMap::new())),
         active_analyses: Arc::new(Mutex::new(HashMap::new())),

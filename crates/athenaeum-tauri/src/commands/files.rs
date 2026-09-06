@@ -143,8 +143,10 @@ pub async fn get_frame_preview(
     // doc comment for why it can't move to `athenaeum-core`.
     let file_path = api::get_frame_preview_path(&state.ctx, frame_id).map_err(|e| e.to_string())?;
 
-    // Use the existing rustafits command to get preview
-    let jpeg_data = crate::commands_rustafits::read_fits_image_rustafits(
+    // Use the existing rustafits renderer to get preview bytes (the command
+    // itself wraps these in an ipc::Response, which this handler cannot
+    // base64-encode).
+    let jpeg_data = crate::commands_rustafits::read_fits_image_bytes(
         file_path,
         resolution.or(Some("thumbnail".to_string())),
         state,

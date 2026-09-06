@@ -31,6 +31,7 @@ export default function Settings() {
   const [blinkThreads, setBlinkThreads] = useState('4');
   const [blinkThreadsMax, setBlinkThreadsMax] = useState(4);
   const [blinkCacheSize, setBlinkCacheSize] = useState('200');
+  const [blinkCacheMaxMb, setBlinkCacheMaxMb] = useState('512');
   const [blinkRetentionMinutes, setBlinkRetentionMinutes] = useState('30');
   const [useContentHash, setUseContentHash] = useState(false);
   const [checkBeta, setCheckBeta] = useState(false);
@@ -129,7 +130,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, checkBetaVal, autoCheckVal
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, cacheMaxMbVal, retentionMin, contentHash, checkBetaVal, autoCheckVal
       ] = await Promise.all([
         api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -166,6 +167,10 @@ export default function Settings() {
         api.invoke<string>('get_setting', {
           key: 'blink.memory_cache_size',
           defaultValue: '200',
+        }),
+        api.invoke<string>('get_setting', {
+          key: 'blink.memory_cache_max_mb',
+          defaultValue: '512',
         }),
         api.invoke<string>('get_setting', {
           key: 'blink.memory_retention_minutes',
@@ -216,6 +221,7 @@ export default function Settings() {
       setBlinkResolution(resolution);
       setBlinkThreads(blinkThreadsVal);
       setBlinkCacheSize(cacheSizeVal);
+      setBlinkCacheMaxMb(cacheMaxMbVal);
       setBlinkRetentionMinutes(retentionMin);
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setCheckBeta(checkBetaVal.toLowerCase() === 'true');
@@ -323,6 +329,13 @@ export default function Settings() {
         return;
       }
 
+      // Validate memory cache byte budget
+      const cacheMaxMbNum = parseInt(blinkCacheMaxMb);
+      if (isNaN(cacheMaxMbNum) || cacheMaxMbNum < 64 || cacheMaxMbNum > 16384) {
+        setError('Memory cache limit must be between 64 and 16384 MB');
+        return;
+      }
+
       // Validate memory cache retention
       const retentionNum = parseInt(blinkRetentionMinutes);
       if (isNaN(retentionNum) || retentionNum < 1 || retentionNum > 1440) {
@@ -362,6 +375,10 @@ export default function Settings() {
         api.invoke('set_setting', {
           key: 'blink.memory_cache_size',
           value: blinkCacheSize,
+        }),
+        api.invoke('set_setting', {
+          key: 'blink.memory_cache_max_mb',
+          value: blinkCacheMaxMb,
         }),
         api.invoke('set_setting', {
           key: 'blink.memory_retention_minutes',
@@ -926,6 +943,13 @@ export default function Settings() {
               <p className="text-xs text-content-muted mt-2">
                 Resolution for blink viewer images. Thumbnail is fastest, Preview balances speed and quality, Full shows maximum detail. Note: Changing this will cache images separately for each resolution.
               </p>
+              {blinkResolution === 'full' && (
+                <p className="text-xs text-warning mt-2">
+                  Full resolution debayers one-shot-colour frames at their native resolution with
+                  gradient interpolation — around ten times slower per frame than Preview, and four
+                  times the pixels. Buffering a whole set will take noticeably longer.
+                </p>
+              )}
             </div>
 
             {/* JPEG Quality - shows only the slider matching the selected resolution */}
@@ -1035,7 +1059,26 @@ export default function Settings() {
                 className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
               />
               <p className="text-xs text-content-muted mt-2">
-                Maximum number of images kept in the memory cache. Default: 200. For large frame sets, increase this to avoid cache thrashing. Each image uses ~1-2 MB of RAM.
+                Maximum number of images kept in the memory cache. Default: 200. For large frame sets, increase this to avoid cache thrashing. A preview image is well under a megabyte; a full-resolution colour one is much larger, which is what the limit below is for.
+              </p>
+            </div>
+
+            {/* Memory Cache Limit (MB) */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Memory Cache Limit (MB)
+              </label>
+              <input
+                type="number"
+                value={blinkCacheMaxMb}
+                onChange={(e) => setBlinkCacheMaxMb(e.target.value)}
+                min="64"
+                max="16384"
+                step="64"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                Total memory the image cache may use, whichever limit is reached first. Default: 512 MB. Image size varies enormously with resolution, so the image count alone is not a memory limit.
               </p>
             </div>
 

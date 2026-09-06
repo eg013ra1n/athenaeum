@@ -18,6 +18,22 @@ import { drawStarOverlay } from "./blink/StarOverlay";
 
 import type { BlinkViewerProps, SortField, SortDirection } from "./blink/types";
 
+/** Normalize a JPEG payload from either backend.
+ *
+ * Desktop returns an `ArrayBuffer` — `read_fits_image_rustafits` answers with a
+ * `tauri::ipc::Response`, which crosses the IPC boundary as
+ * `application/octet-stream` rather than as a JSON array of numbers (a
+ * full-resolution colour frame is ~17 MB). Web returns a `Uint8Array`. The
+ * `number[]` arm is what a JSON-serialized `Vec<u8>` used to look like and is
+ * kept so an older backend still renders. */
+function toJpegBytes(
+  payload: Uint8Array<ArrayBuffer> | ArrayBuffer | number[],
+): Uint8Array<ArrayBuffer> {
+  if (payload instanceof Uint8Array) return payload;
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  return new Uint8Array(payload);
+}
+
 const BlinkViewer: React.FC<BlinkViewerProps> = ({
   frames,
   initialIndex = 0,
@@ -197,16 +213,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
     try {
       const imageData = isTauri
-        ? await api.invoke<Uint8Array<ArrayBuffer>>("read_fits_image_rustafits", {
+        ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
             path: frame.file.path,
           })
-        : await api.invoke<Uint8Array<ArrayBuffer>>("get_frame_preview", {
+        : await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("get_frame_preview", {
             frameId: frame.file.id,
           });
 
-      const binaryData = imageData instanceof Uint8Array
-        ? imageData
-        : new Uint8Array(imageData as number[]);
+      const binaryData = toJpegBytes(imageData);
 
       // Both modes now return JPEG — create blob URL
       const blob = new Blob([binaryData], { type: "image/jpeg" });
@@ -521,18 +535,16 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setLoadingFullRes(true);
     try {
       const imageData = isTauri
-        ? await api.invoke<Uint8Array<ArrayBuffer>>("read_fits_image_rustafits", {
+        ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
             path: frame.file.path,
             resolution: "full",
           })
-        : await api.invoke<Uint8Array<ArrayBuffer>>("get_frame_preview", {
+        : await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("get_frame_preview", {
             frameId: frame.file.id,
             resolution: "full",
           });
 
-      const binaryData = imageData instanceof Uint8Array
-        ? imageData
-        : new Uint8Array(imageData as number[]);
+      const binaryData = toJpegBytes(imageData);
 
       // Revoke previous full-res blob if any
       if (fullResBlobRef.current) URL.revokeObjectURL(fullResBlobRef.current);

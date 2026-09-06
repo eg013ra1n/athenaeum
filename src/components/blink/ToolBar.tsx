@@ -113,7 +113,11 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
               ? "bg-accent text-surface"
               : "bg-surface-elevated text-content hover:bg-surface-hover"
           } disabled:opacity-50 disabled:cursor-not-allowed`}
-          title={fullResMode ? "Switch to preview resolution" : "Switch to full resolution"}
+          title={
+            fullResMode
+              ? "Switch to preview resolution"
+              : "Switch to full resolution — colour frames are debayered at native resolution (slower)"
+          }
         >
           {loadingFullRes ? <Loader2 size={20} className="animate-spin" /> : <ScanEye size={20} />}
         </button>

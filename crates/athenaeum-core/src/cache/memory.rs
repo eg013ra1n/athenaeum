@@ -8,9 +8,20 @@ pub struct CachedImage {
     pub last_accessed: Instant,
 }
 
+/// Default byte budget: 512 MB.
+///
+/// Entry count alone is not a memory bound, because entry size varies by three
+/// orders of magnitude with the render resolution. A preview JPEG is ~300 KB,
+/// so the entry limit is what binds there — 200 entries ≈ 60 MB, as before. A
+/// full-resolution one-shot-colour JPEG is ~17 MB, so the same 200 entries
+/// would be 3.4 GB; against this budget they are ~30 frames instead.
+pub const DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024;
+
 /// In-memory LRU cache for processed JPEG image data.
-/// Keeps up to `max_entries` recently accessed images in RAM.
-/// At ~300KB per JPEG, 200 entries ≈ 60MB — much lighter than raw pixels.
+///
+/// Bounded two ways, whichever binds first: `max_entries` recently accessed
+/// images, and `max_bytes` of JPEG payload. See [`DEFAULT_MAX_BYTES`] for why
+/// the byte bound has to exist.
 ///
 /// Entries older than `retention` are evicted by the background sweeper
 /// (`evict_stale`), so memory is freed even when no new requests arrive.
@@ -18,6 +29,8 @@ pub struct MemoryImageCache {
     entries: HashMap<String, CachedImage>,
     order: VecDeque<String>, // front = oldest, back = most recent
     max_entries: usize,
+    max_bytes: usize,
+    current_bytes: usize,
     retention: Duration,
 }
 
@@ -27,7 +40,54 @@ impl MemoryImageCache {
             entries: HashMap::with_capacity(max_entries),
             order: VecDeque::with_capacity(max_entries),
             max_entries,
+            max_bytes: DEFAULT_MAX_BYTES,
+            current_bytes: 0,
             retention: Duration::from_secs(retention_minutes * 60),
+        }
+    }
+
+    /// Builder form of [`Self::set_max_bytes`], for the construction sites that
+    /// already know the configured budget.
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self.enforce_limits();
+        self
+    }
+
+    /// Update the byte budget (called when the user saves settings).
+    /// A smaller budget evicts immediately.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.enforce_limits();
+    }
+
+    /// Bytes of JPEG payload currently held.
+    pub fn bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    /// Evict from the least-recently-used end until both bounds are satisfied.
+    ///
+    /// Stops at one entry on purpose: a single frame larger than the whole
+    /// budget must still be served. Evicting it would make every request for it
+    /// a miss and re-render it each time — worse for both memory and latency
+    /// than simply holding it.
+    fn enforce_limits(&mut self) {
+        while self.entries.len() > 1
+            && (self.entries.len() > self.max_entries || self.current_bytes > self.max_bytes)
+        {
+            match self.order.pop_front() {
+                Some(oldest) => self.forget(&oldest),
+                None => break,
+            }
+        }
+    }
+
+    /// Drop one entry from the map, keeping the byte total honest. The caller
+    /// owns removing the key from `order`.
+    fn forget(&mut self, key: &str) {
+        if let Some(removed) = self.entries.remove(key) {
+            self.current_bytes = self.current_bytes.saturating_sub(removed.data.len());
         }
     }
 
@@ -40,13 +100,7 @@ impl MemoryImageCache {
     /// If the new limit is smaller, excess LRU entries are evicted immediately.
     pub fn set_max_entries(&mut self, max_entries: usize) {
         self.max_entries = max_entries;
-        while self.entries.len() > self.max_entries {
-            if let Some(oldest_key) = self.order.pop_front() {
-                self.entries.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
+        self.enforce_limits();
     }
 
     /// Remove entries whose `last_accessed` is older than `self.retention`.
@@ -61,7 +115,7 @@ impl MemoryImageCache {
             .collect();
 
         for key in &stale_keys {
-            self.entries.remove(key);
+            self.forget(key);
         }
         if !stale_keys.is_empty() {
             self.order.retain(|k| !stale_keys.contains(k));
@@ -84,20 +138,21 @@ impl MemoryImageCache {
         }
     }
 
-    /// Insert an image into the cache. Evicts the oldest entry if at capacity.
+    /// Insert an image into the cache, evicting from the LRU end until both the
+    /// entry limit and the byte budget are satisfied.
     pub fn insert(&mut self, key: String, image: CachedImage) {
-        // If key already exists, remove old entry from order
+        // Replacing a key: drop the old payload's bytes and its order slot
+        // before the new ones are counted.
         if self.entries.contains_key(&key) {
             self.order.retain(|k| k != &key);
-        } else if self.entries.len() >= self.max_entries {
-            // Evict oldest
-            if let Some(oldest_key) = self.order.pop_front() {
-                self.entries.remove(&oldest_key);
-            }
+            self.forget(&key);
         }
 
+        self.current_bytes += image.data.len();
         self.entries.insert(key.clone(), image);
         self.order.push_back(key);
+
+        self.enforce_limits();
     }
 
     /// Number of entries currently in the cache.
@@ -110,6 +165,7 @@ impl MemoryImageCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.current_bytes = 0;
     }
 }
 
@@ -273,5 +329,82 @@ mod tests {
         // Evict stale: since we just accessed it, it should survive
         cache.evict_stale();
         assert!(cache.get("a").is_some(), "recently accessed entry should survive eviction");
+    }
+
+    // ── Byte budget ──────────────────────────────────────────────────────────
+
+    /// The entry limit is not a memory bound: entry size varies by three orders
+    /// of magnitude with the render resolution, so the byte budget has to be
+    /// able to evict long before the entry count is reached.
+    #[test]
+    fn byte_budget_evicts_before_the_entry_limit() {
+        let mut cache = MemoryImageCache::new(100, 30).with_max_bytes(250);
+        cache.insert("a".into(), img(vec![0; 100]));
+        cache.insert("b".into(), img(vec![0; 100]));
+        cache.insert("c".into(), img(vec![0; 100]));
+
+        assert!(cache.get("a").is_none(), "oldest must go once over budget");
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("c").is_some());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.bytes(), 200);
+    }
+
+    /// Evicting a frame bigger than the whole budget would make every request
+    /// for it a miss and re-render it each time — worse for both memory and
+    /// latency than holding it.
+    #[test]
+    fn an_entry_larger_than_the_budget_is_still_kept() {
+        let mut cache = MemoryImageCache::new(100, 30).with_max_bytes(50);
+        cache.insert("huge".into(), img(vec![0; 5_000]));
+
+        assert!(cache.get("huge").is_some());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_key_updates_the_byte_total() {
+        let mut cache = MemoryImageCache::new(100, 30).with_max_bytes(10_000);
+        cache.insert("a".into(), img(vec![0; 500]));
+        cache.insert("a".into(), img(vec![0; 30]));
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 30, "the replaced payload must not be counted");
+    }
+
+    #[test]
+    fn evict_stale_updates_the_byte_total() {
+        let mut cache = MemoryImageCache::new(100, 0);
+        cache.insert("a".into(), img(vec![0; 400]));
+        assert_eq!(cache.bytes(), 400);
+
+        std::thread::sleep(Duration::from_millis(10));
+        cache.evict_stale();
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn set_max_bytes_evicts_immediately() {
+        let mut cache = MemoryImageCache::new(100, 30).with_max_bytes(10_000);
+        cache.insert("a".into(), img(vec![0; 400]));
+        cache.insert("b".into(), img(vec![0; 400]));
+        cache.insert("c".into(), img(vec![0; 400]));
+        assert_eq!(cache.len(), 3);
+
+        cache.set_max_bytes(900);
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.bytes(), 800);
+        assert!(cache.get("a").is_none());
+    }
+
+    #[test]
+    fn clear_resets_the_byte_total() {
+        let mut cache = MemoryImageCache::new(100, 30);
+        cache.insert("a".into(), img(vec![0; 400]));
+        cache.clear();
+        assert_eq!(cache.bytes(), 0);
     }
 }
