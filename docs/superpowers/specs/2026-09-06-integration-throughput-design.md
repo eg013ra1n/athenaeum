@@ -283,8 +283,10 @@ The read workers and the probe stage now check the caller's cancel flag
 between frames (`BandSource::open_with_cancel`,
 `read_band_with_progress(.., cancel)`), so a Cancel takes effect within one
 frame's read rather than one band's; a worker's read error aborts its
-siblings. "master build finished" is logged only after the post-engine
-cancel re-check.
+siblings. "master build finished" is logged once, at the end of the success
+path — after the master is written AND registered — so a cancel or a
+write/register failure never logs it; `duration_ms` consequently spans the
+write+register tail, while `read_ms`/`combine_ms` remain the pixel phase.
 
 ## 8. Out of scope, recorded so it is not lost
 

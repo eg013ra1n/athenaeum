@@ -624,7 +624,9 @@ impl BandSource {
     /// raises a shared abort so its siblings stop within one frame too — the
     /// caller is about to discard the band either way. A raised cancel comes
     /// back as `Cancelled` unless a real error happened first; the error wins,
-    /// because it is the one the operator has to act on.
+    /// because it is the one the operator has to act on. A worker that
+    /// skipped frames because of a cancel is always reported as `Cancelled`,
+    /// never as `Ok` — the band is never left half-filled behind an `Ok`.
     pub fn read_band_with_progress(
         &self,
         y0: usize,
@@ -695,13 +697,26 @@ impl BandSource {
 
         let abort = AtomicBool::new(false);
         let abort = &abort;
+        // Fix wave (whole-branch review F2/R6): a worker that bails because
+        // `cancel` is raised must be reported as `Cancelled`, never as `Ok` —
+        // relying on the post-join re-check below to catch a flag that could,
+        // in principle, have been lowered again left the guarantee resting on
+        // an unwritten assumption. `saw_cancel` makes it structural: any
+        // worker that actually saw the cancel stamps it before returning, and
+        // the final check ORs that in alongside its own fresh read of `cancel`.
+        let saw_cancel = AtomicBool::new(false);
+        let saw_cancel = &saw_cancel;
         let mut errors: Vec<IntegrationError> = Vec::new();
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
             for group in groups {
                 handles.push(scope.spawn(move || -> Result<(), IntegrationError> {
                     for (reader, buf) in group {
-                        if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed) {
+                            saw_cancel.store(true, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        if abort.load(Ordering::Relaxed) {
                             return Ok(());
                         }
                         let bpp = reader.kind().bytes_per_sample();
@@ -739,7 +754,7 @@ impl BandSource {
             }
             return Err(first);
         }
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || saw_cancel.load(Ordering::Relaxed) {
             return Err(IntegrationError::Cancelled);
         }
         Ok(())

@@ -25,12 +25,19 @@ use std::sync::Arc;
 pub static VNG_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Whether rendering `path` at `resolution` is a full-resolution gradient
-/// debayer and must hold [`VNG_GATE`]. Header-only — a FITS primary header
-/// or an XISF XML header, never the pixels — through the same readers the
-/// scanner uses, so the answer is what the catalog would say. Errs towards
-/// `true` when the header cannot be read: the render will fail loudly on its
-/// own, and taking the gate for a broken file costs one serialization, not
-/// gigabytes.
+/// debayer and must hold [`VNG_GATE`]. Header-only — a FITS primary header,
+/// never the pixels — through the same readers the scanner uses, so the FITS
+/// answer is what the catalog would say. Errs towards `true` when the header
+/// cannot be read: the render will fail loudly on its own, and taking the
+/// gate for a broken file costs one serialization, not gigabytes.
+///
+/// XISF (review 2026-09-06 F3, ruled R7) is gated unconditionally at `Full`,
+/// without parsing: the renderer decides XISF CFA-ness by scanning the whole
+/// XML for a pattern substring, which is broader than our structured
+/// `BAYERPAT` keyword / `ColorFilterArray` element lookup — a mono-looking
+/// XISF by our narrower probe could still render as CFA there. Over-gating a
+/// mono XISF is this function's documented bias, and it costs one
+/// serialization, never gigabytes.
 pub fn needs_vng_gate(path: &Path, resolution: Resolution) -> bool {
     if resolution != Resolution::Full {
         return false;
@@ -39,12 +46,10 @@ pub fn needs_vng_gate(path: &Path, resolution: Resolution) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("xisf"));
-    let bayerpat = if is_xisf {
-        crate::fits_parser::parse_xisf(path, 0).map(|f| f.bayerpat)
-    } else {
-        crate::fits_parser::parse_fits(path, 0).map(|f| f.bayerpat)
-    };
-    match bayerpat {
+    if is_xisf {
+        return true;
+    }
+    match crate::fits_parser::parse_fits(path, 0).map(|f| f.bayerpat) {
         Ok(pat) => pat.is_some_and(|p| !p.trim().is_empty()),
         Err(error) => {
             tracing::warn!(path = %path.display(), error = %error, "header probe failed — taking the VNG gate defensively");
@@ -347,5 +352,11 @@ mod tests {
             needs_vng_gate(&dir.path().join("missing.fits"), Resolution::Full),
             "an unreadable header errs towards taking the gate"
         );
+
+        // Review F3/R7: XISF is gated unconditionally at Full — no header is
+        // parsed, so even a nonexistent path reports `true` there.
+        let missing_xisf = dir.path().join("any.xisf");
+        assert!(needs_vng_gate(&missing_xisf, Resolution::Full), "XISF at Full is gated unconditionally");
+        assert!(!needs_vng_gate(&missing_xisf, Resolution::Preview));
     }
 }

@@ -229,6 +229,13 @@ DB-driven update alongside `set_max_entries`/`set_retention`),
 **Acceptance:** blinking a 300-frame OSC set at `Full` holds ≤ 512 MB of JPEG in
 the cache instead of growing to 3.4 GB.
 
+**Amended 2026-09-06 (review F5).** The backend now clamps the setting to the
+same 64…16384 MB window through `settings::resolve_blink_memory_cache_max_mb`
+at all four apply sites (both startup readers, both `set_setting` handlers);
+an unparseable stored value is logged and the 512 MB default applied, so a `0`
+written by a script or hand edit can no longer collapse the cache to one
+entry.
+
 ### 4.4 desktop — the JPEG travels as bytes, not as a JSON array
 
 **Files:** `crates/athenaeum-tauri/src/commands_rustafits.rs`,

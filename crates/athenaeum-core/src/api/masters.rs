@@ -1104,8 +1104,10 @@ fn run_build(
         // must never swallow the one event saying reading is actually done,
         // which would otherwise leave the operator staring at a stale <100%
         // number through the whole silent combine phase that follows. (The
-        // percent itself reads `READ_SHARE * 100` = 70 here, not 100 — the
-        // read is fully done, but combining still owns the remaining 30.)
+        // percent itself reads at least 70 here, not 100 — exactly 70 on a
+        // single-band build; higher when earlier bands have already
+        // combined — the read is fully done, but combining still owns the
+        // remaining share.)
         let is_terminal = bytes_total > 0 && bytes_read_so_far >= bytes_total;
         let now = std::time::Instant::now();
         let mut last = last_emitted.lock().unwrap();
@@ -1221,10 +1223,12 @@ fn run_build(
     // (the "master build cancelled" log line, `cancelled: true` on
     // `master-build-complete`) needs no changes to keep working here.
     //
-    // Review 2026-09-06 F3: this check sits ABOVE `log_build_finished` on
-    // purpose — a build that is about to return `Cancelled` must not first
-    // log "master build finished"; `run_master_build_thread` logs the
-    // "master build cancelled" line for it instead.
+    // Review 2026-09-06 F3: this check exists so a cancel that landed during
+    // integration returns before any write happens, rather than writing the
+    // master file and superseding the raw calibration set anyway. The
+    // "master build finished" line itself now runs at the end of the success
+    // path (see there) — a build that returns `Cancelled` here never reaches
+    // it; `run_master_build_thread` logs "master build cancelled" instead.
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BuildStepError::Cancelled);
     }
@@ -4577,7 +4581,8 @@ mod tests {
         assert_eq!(build_percent(0, 0, 0, 0), 0.0, "nothing known yet is 0, not NaN");
         // rows_total is unknown (0) until the first combine tick: only the read share counts.
         assert!((build_percent(500, 1000, 0, 0) - 35.0).abs() < 1e-9);
-        // A tick that overshoots its total (a flat's two-pass wrapper can) is capped at 100.
+        // A tick that overshoots its total is capped at 100 — defensive against
+        // any future caller; no current caller can overshoot.
         assert!((build_percent(2000, 1000, 200, 100) - 100.0).abs() < 1e-9);
     }
 }

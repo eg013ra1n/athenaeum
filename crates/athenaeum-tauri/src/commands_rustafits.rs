@@ -108,7 +108,13 @@ pub async fn read_fits_image_bytes(
     // Gate BEFORE permit, never the reverse (see `VNG_GATE`'s doc): a
     // full-resolution colour render waits here holding nothing, so the image
     // semaphore keeps serving thumbnails and previews meanwhile. Cache hits
-    // above never reach this line, so they never probe a header either.
+    // above never reach this line, so they never probe a header either. Unlike
+    // the web host, the guard does not need to travel into the blocking
+    // section here: `block_in_place` below runs the render synchronously on
+    // this same task, with no `.await` inside it — once the task starts
+    // rendering it cannot be suspended and dropped again until the render
+    // returns, so a plain local guard already covers the whole render, the
+    // way the web host's moved-in guard has to be arranged to do.
     let _vng_gate = if rustafits_processor::needs_vng_gate(&path_buf, res) {
         Some(rustafits_processor::VNG_GATE.lock().await)
     } else {
