@@ -197,24 +197,43 @@ mod tests {
         let auto = resolve_budget_bytes(&conn, &settings).unwrap();
         assert_eq!(auto, per_job_budget(auto_budget_bytes(), 1), "default 0 means auto");
 
+        // Fix wave (whole-branch review): a HARDCODED fixture here used to
+        // turn a vacuous-pass guard into a hard test failure on any host
+        // whose visible RAM is exactly 2 GiB — a quarter of that is exactly
+        // 512 MB, which is what this fixture used to be, and that is
+        // precisely the "2 GB container" case the guard exists to reason
+        // about. Derive the fixture from the host's own `auto` instead, so
+        // the two can never collide: 512 unless the host's auto budget IS
+        // 512, in which case 1024. Every expectation below is then derived
+        // from `fixture_mb`/`fixture_bytes` too (never re-hardcoded), so
+        // either choice stays correct.
+        let fixture_mb: usize = if auto == 512 * 1024 * 1024 { 1024 } else { 512 };
+        let fixture_bytes = (fixture_mb * 1024 * 1024) as u64;
         assert_ne!(
-            auto,
-            512 * 1024 * 1024,
+            auto as u64,
+            fixture_bytes,
             "fixture value must differ from this host's auto budget or the assertions below stop discriminating"
         );
 
         settings
-            .persist_setting(&conn, keys::INTEGRATION_BAND_BUDGET_MB, "512")
+            .persist_setting(&conn, keys::INTEGRATION_BAND_BUDGET_MB, &fixture_mb.to_string())
             .unwrap();
-        assert_eq!(resolve_budget_bytes(&conn, &settings).unwrap(), 512 * 1024 * 1024);
+        assert_eq!(resolve_budget_bytes(&conn, &settings).unwrap() as u64, fixture_bytes);
 
         settings
             .persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "2")
             .unwrap();
+        // Computed via `per_job_budget` — the same function
+        // `resolve_budget_bytes` calls internally — rather than re-hardcoding
+        // "256 MB, the floor": with `fixture_mb` now variable (512 or 1024),
+        // a literal floor expectation would silently stop meaning what its
+        // message says the moment the host picked the 1024 branch above
+        // (1024 MB / 2 = 512 MB, well above the 256 MB floor).
+        let want_at_concurrency_2 = per_job_budget(fixture_bytes as usize, 2);
         assert_eq!(
             resolve_budget_bytes(&conn, &settings).unwrap(),
-            MIN_BUDGET_BYTES,
-            "512 MB split across 2 admitted jobs is 256 MB — the floor, not below it"
+            want_at_concurrency_2,
+            "the configured budget split across 2 admitted jobs must not drop below the floor"
         );
     }
 

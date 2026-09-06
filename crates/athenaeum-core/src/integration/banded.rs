@@ -348,8 +348,8 @@ enum ProbeOutcome {
 
 /// Splits `n` items round-robin into `workers` groups (item `i` goes to
 /// group `i % workers`), used by both `BandSource::open` and
-/// `BandSource::read_band` to hand disjoint work to their scoped-thread
-/// workers.
+/// `BandSource::read_band_with_progress` to hand disjoint work to their
+/// scoped-thread workers.
 ///
 /// Fix round 1, I2: this replaces a contiguous `n.div_ceil(workers)`-sized
 /// chunk split, which silently produced FEWER than `workers` non-empty
@@ -414,30 +414,48 @@ impl BandSource {
         let workers = concurrency.max(1).min(n);
 
         let mut slots: Vec<Option<Result<ProbeOutcome, IntegrationError>>> = (0..n).map(|_| None).collect();
-        let mut panicked = false;
-        {
-            let groups = round_robin_groups(paths.iter().zip(slots.iter_mut()), workers);
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(workers);
-                for group in groups {
-                    handles.push(scope.spawn(move || {
-                        for (p, slot) in group {
-                            *slot = Some(probe_one(p));
-                        }
-                    }));
-                }
-                for h in handles {
-                    // A panicked probe thread must surface as an error, never
-                    // as a silently missing reader — its slots stay `None`
-                    // below, which the assembly loop turns into a hard error.
-                    if h.join().is_err() {
-                        panicked = true;
+        // Fix wave item 4 (whole-branch review): `read_band_with_progress`
+        // short-circuits `workers == 1` out of `thread::scope` with an
+        // explicit justification — a single-frame read is a straight loop
+        // identical to pre-Task-5 behavior, and `scope.spawn` panics if the
+        // OS refuses a new thread, which would otherwise turn a bare
+        // single-frame call into a new panic path for zero parallelism
+        // gained. Every `open` call with 1-3 frames and no `IoPolicy` in
+        // scope (every precal/light-cal/cosmetic single-few-frame read, and
+        // every test that opens one flat) used to pay that same
+        // `thread::scope` cost anyway to probe ONE header — this branch
+        // makes the same reasoning apply here too, instead of applying to
+        // only one of the two identical situations.
+        if workers == 1 {
+            for (p, slot) in paths.iter().zip(slots.iter_mut()) {
+                *slot = Some(probe_one(p));
+            }
+        } else {
+            let mut panicked = false;
+            {
+                let groups = round_robin_groups(paths.iter().zip(slots.iter_mut()), workers);
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for group in groups {
+                        handles.push(scope.spawn(move || {
+                            for (p, slot) in group {
+                                *slot = Some(probe_one(p));
+                            }
+                        }));
                     }
-                }
-            });
-        }
-        if panicked {
-            return Err(IntegrationError::BadInput("a frame probe thread panicked".into()));
+                    for h in handles {
+                        // A panicked probe thread must surface as an error, never
+                        // as a silently missing reader — its slots stay `None`
+                        // below, which the assembly loop turns into a hard error.
+                        if h.join().is_err() {
+                            panicked = true;
+                        }
+                    }
+                });
+            }
+            if panicked {
+                return Err(IntegrationError::BadInput("a frame probe thread panicked".into()));
+            }
         }
 
         let mut readers = Vec::with_capacity(n);

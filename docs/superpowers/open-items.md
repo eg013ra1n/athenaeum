@@ -55,6 +55,32 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Integration throughput (2026-09-06)
+
+Spec `docs/superpowers/specs/2026-09-06-integration-throughput-design.md`, branch
+`perf/integration-throughput`. Master-frame integration 6.2x faster (233 s → 37.7 s
+on a 100-frame set) by resolving the band-memory budget from RAM instead of a
+hardcoded 256 MiB, holding band buffers in the source's own sample format, and
+making reads positional and parallel. Master pixels verified byte-identical
+(fingerprint `a4f6bb5158714175`, reproduced across six cold runs) — see the design's
+§1 principle 4 for why that is by-construction on every path, not just the
+measured `I16Be` one. Final whole-branch review's fix wave applied (cancel-mid-build
+now actually stops the write/register, combine-phase progress ticks instead of
+freezing at 100%).
+
+- The two §9 acceptance rows nobody has re-run against the fixed code: the 30-frame
+  dark (≤ 8 s) and the LDN 1272 batch (11 sets, ~23 GB, ≤ 5 min) — both are marked
+  NOT YET MEASURED in the spec table pending an owner run with
+  `examples/band_profile.rs` and the research §2 eviction protocol.
+- An SSD-backed scan root has no measurement at all yet (spec §9 lists it as an open
+  item) — the storage class D3 expects to benefit most from read concurrency.
+- **`cargo check -p athenaeum-core --no-default-features` does NOT compile
+  `integration/`** — the whole module is `#[cfg(feature = "render")]`-gated at
+  `lib.rs`, so a green headless check exercises none of this cycle's code and must
+  never be cited as evidence for it. `masters.rs` and `light_cal.rs` are render-gated
+  the same way. The only headless-relevant gate for this cycle is that `--workspace`
+  still builds and tests green with the feature on (the default).
+
 ### Blink full-resolution VNG (2026-09-06)
 
 Spec `docs/superpowers/specs/2026-09-06-blink-full-resolution-vng-design.md`.

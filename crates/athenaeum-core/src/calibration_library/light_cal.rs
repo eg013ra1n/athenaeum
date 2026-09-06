@@ -636,8 +636,8 @@ fn read_ath_channel_norms(flat_path: &Path, light: CfaGeometry) -> Option<[f64; 
 /// - [`FlatNormMode::CentralThird`] (default, Athenaeum convention): read the
 ///   `ATH_FNRM` card an Athenaeum-built master stamps, or — for a flat imported
 ///   without it — recompute the central-third mean on the fly.
-/// - [`FlatNormMode::PixinsightTrimmed`] (PixInsight-compatible): a two-sided
-///   trimmed mean over the WHOLE frame (`trim_fraction` per tail, default
+/// - [`FlatNormMode::PixinsightTrimmed`] (whole-frame parity statistic): a
+///   two-sided trimmed mean over the WHOLE frame (`trim_fraction` per tail, default
 ///   [`PI_TRIM_FRACTION`]). ALWAYS computed from the flat file; the `ATH_FNRM`
 ///   card is ignored.
 ///
@@ -673,11 +673,11 @@ pub fn flat_norm_constant(
             }
         }
         FlatNormMode::PixinsightTrimmed => {
-            // PixInsight parity: the card's meaning (central-third) does not
+            // Whole-frame parity: the card's meaning (central-third) does not
             // match this statistic, so it is deliberately ignored — always
             // computed from the flat's pixels.
             let (_w, _h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
-            let mean = pixinsight_trimmed_mean(&data, trim_fraction);
+            let mean = two_sided_trimmed_mean(&data, trim_fraction);
             tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, trim_fraction, "flat normalization from full-frame trimmed mean (pixinsightTrimmed)");
             mean
         }
@@ -734,7 +734,7 @@ fn read_full_flat_plane(
 /// Degenerate guards: an empty plane returns `1.0` (a harmless divide-by later),
 /// and a frame so small that `lo >= hi` falls back to the full-frame mean rather
 /// than averaging an empty slice.
-fn pixinsight_trimmed_mean(data: &[f32], trim_fraction: f64) -> f64 {
+fn two_sided_trimmed_mean(data: &[f32], trim_fraction: f64) -> f64 {
     let n = data.len();
     if n == 0 {
         return 1.0;
@@ -1033,18 +1033,18 @@ mod tests {
     }
 
     #[test]
-    fn pixinsight_trimmed_mean_exact() {
+    fn two_sided_trimmed_mean_exact() {
         // 1000 distinct values 0..=999 → trim floor(1000*0.05)=50 from each
         // tail → mean of sorted[50..950] = mean(50..=949) = (50+949)/2 = 499.5.
         let vals: Vec<f32> = (0..1000).map(|i| i as f32).collect();
-        let m = pixinsight_trimmed_mean(&vals, PI_TRIM_FRACTION);
+        let m = two_sided_trimmed_mean(&vals, PI_TRIM_FRACTION);
         assert!((m - 499.5).abs() < 1e-9, "trimmed mean {m}, want 499.5");
 
         // Order-independent: shuffling the input must not change the statistic
         // (the fn sorts internally).
         let mut rev: Vec<f32> = vals.clone();
         rev.reverse();
-        assert!((pixinsight_trimmed_mean(&rev, PI_TRIM_FRACTION) - 499.5).abs() < 1e-9);
+        assert!((two_sided_trimmed_mean(&rev, PI_TRIM_FRACTION) - 499.5).abs() < 1e-9);
     }
 
     #[test]
@@ -1053,8 +1053,8 @@ mod tests {
         // changes the two-sided trimmed mean — a symmetric set would give the
         // same statistic at any fraction.
         let data: Vec<f32> = (0..1000).map(|i| (i * i) as f32).collect();
-        let m05 = pixinsight_trimmed_mean(&data, 0.05);
-        let m10 = pixinsight_trimmed_mean(&data, 0.10);
+        let m05 = two_sided_trimmed_mean(&data, 0.05);
+        let m10 = two_sided_trimmed_mean(&data, 0.10);
         assert!(
             (m05 - m10).abs() > 1.0,
             "a wider trim must change the skewed statistic: {m05} vs {m10}"
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn pixinsight_trimmed_mean_real_shape_matches_formula() {
+    fn two_sided_trimmed_mean_real_shape_matches_formula() {
         // A realistic (NaN-free) radial-vignetting flat: bright center, dimmer
         // corners. The engine's band-read path must produce exactly the same
         // trimmed mean as computing the formula directly over the pixel values.
@@ -1145,7 +1145,7 @@ mod tests {
             }
         }
         assert!(data.iter().all(|v| v.is_finite()), "fixture must be NaN-free");
-        let expected = pixinsight_trimmed_mean(&data, PI_TRIM_FRACTION);
+        let expected = two_sided_trimmed_mean(&data, PI_TRIM_FRACTION);
         // Sanity: the trimmed mean sits strictly inside the value range.
         let (mn, mx) = data.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!((mn as f64) < expected && expected < (mx as f64), "trimmed mean {expected} outside ({mn},{mx})");

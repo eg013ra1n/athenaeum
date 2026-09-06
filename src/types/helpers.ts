@@ -216,15 +216,23 @@ export interface AnalysisCompleteEvent {
  *  (reserved for future use — member-path enumeration is cheap enough today
  *  not to need its own tick, so the backend never actually emits it; see
  *  `athenaeum-core/src/api/masters.rs`'s `MasterBuildProgressEvent` doc
- *  comment). Consumers must not assume every listed stage will arrive. */
+ *  comment) and `'combining'` (fix wave item 2: ticks during the per-pixel
+ *  combine phase that follows a band's read, so a build the memory budget
+ *  resolves to a single band does not freeze the UI at 100% for however
+ *  long that band's combine takes — see
+ *  `athenaeum-core/src/integration/engine.rs`'s `EngineProgress::on_combine`
+ *  doc). Consumers must not assume every listed stage will arrive. */
 export interface MasterBuildProgressEvent {
   set_id: number;
-  stage: 'reading' | 'integrating' | 'writing' | 'registering';
+  stage: 'reading' | 'integrating' | 'combining' | 'writing' | 'registering';
   current: number;
   total: number;
   percent: number;
   /** Bytes of source read so far / in total. `current`/`total` count bands,
-   *  which say nothing about size once bands are machine-sized. */
+   *  which say nothing about size once bands are machine-sized — EXCEPT
+   *  during the `'combining'` stage, where `current`/`total` count rows
+   *  instead and `bytes_done`/`bytes_total` are frozen at whatever
+   *  `'integrating'` last reported (combine reads nothing new). */
   bytes_done: number;
   bytes_total: number;
 }

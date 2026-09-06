@@ -154,6 +154,10 @@ default = ["render", "solver"]
 render = ["dep:rustafits"]
 solver = ["dep:solvemyastro"]
 
+[[example]]
+name = "band_profile"
+required-features = ["render"]
+
 [dev-dependencies]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }

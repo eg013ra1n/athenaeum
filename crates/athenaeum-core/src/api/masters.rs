@@ -184,11 +184,15 @@ pub struct DeleteMasterResult {
 // ── Progress / completion event payloads (snake_case, analysis precedent) ───
 
 /// `master-build-progress` event payload. `stage` is one of "reading" |
-/// "integrating" | "writing" | "registering" — "reading" is reserved for
-/// future use (member-path enumeration is cheap enough today not to need
-/// its own progress tick); the build thread currently emits "integrating"
-/// (driven by the engine's per-band callback), "writing", and
-/// "registering".
+/// "integrating" | "combining" | "writing" | "registering" — "reading" is
+/// reserved for future use (member-path enumeration is cheap enough today
+/// not to need its own progress tick); the build thread currently emits
+/// "integrating" (driven by the engine's per-band `on_band` callback),
+/// "combining" (fix wave item 2: the engine's `on_combine` callback,
+/// ticking during the per-pixel combine phase that follows a band's read —
+/// see `integration::engine::EngineProgress::on_combine`'s doc; unlike
+/// every other stage, `current`/`total` here count ROWS combined, not
+/// bands), "writing", and "registering".
 #[derive(Clone, serde::Serialize)]
 struct MasterBuildProgressEvent {
     set_id: i64,
@@ -196,8 +200,12 @@ struct MasterBuildProgressEvent {
     current: usize,
     total: usize,
     percent: f64,
-    /// Bytes of source read so far / in total. `current`/`total` count bands,
-    /// which say nothing about size once bands are machine-sized.
+    /// Bytes of source read so far / in total. `current`/`total` count
+    /// bands, which say nothing about size once bands are machine-sized —
+    /// except during the "combining" stage, where `current`/`total` count
+    /// rows instead and `bytes_done`/`bytes_total` are frozen at whatever
+    /// "integrating" last reported (combine reads nothing new — see
+    /// `EngineProgress::on_combine`'s doc).
     bytes_done: u64,
     bytes_total: u64,
 }
@@ -1077,7 +1085,53 @@ fn run_build(
             },
         );
     };
-    let progress = EngineProgress { on_band: &on_band };
+
+    // Fix wave item 2: `on_band` above goes silent once a band's bytes are
+    // all in — the parallel per-pixel combine that follows can then run for
+    // seconds with nothing to move the UI (worse: on a build the budget
+    // resolves to a single band, routine at >=32 GB visible RAM per Task 6,
+    // that silence is the ENTIRE combine, and a progress indicator frozen at
+    // 100% reads as "finished and stuck", not merely "in progress"). Shares
+    // `last_emitted`/`PROGRESS_THROTTLE` with `on_band` — one throttle
+    // clock per build, not two independent ones.
+    let on_combine = |current: usize, total: usize, bytes_done: u64, bytes_total: u64| {
+        // Rows, not bytes: `bytes_done`/`bytes_total` are frozen for the
+        // whole combine phase (see `EngineProgress::on_combine`'s doc) —
+        // deriving a percent from them here would just repeat whatever
+        // "integrating" last showed. `current`/`total` are genuinely moving
+        // (rows combined so far / total rows), so they carry the percent
+        // instead — the opposite of `on_band`'s bytes-first, bands-fallback
+        // order just above.
+        let percent = if total > 0 { (current as f64 / total as f64) * 100.0 } else { 0.0 };
+
+        // Terminal bypass keyed on ROWS (current >= total), not bytes — the
+        // bytes pair is pinned at the same value for every tick of a band's
+        // combine, so `on_band`'s bytes-based `is_terminal` would be true
+        // for every single one of those ticks on the run's LAST band and
+        // defeat the throttle entirely (never mind clearing it once).
+        let is_terminal = total > 0 && current >= total;
+        let now = std::time::Instant::now();
+        let mut last = last_emitted.lock().unwrap();
+        if !progress_tick_is_due(is_terminal, &mut last, now, PROGRESS_THROTTLE) {
+            return;
+        }
+        drop(last);
+
+        emit_event(
+            emitter,
+            "master-build-progress",
+            &MasterBuildProgressEvent {
+                set_id,
+                stage: "combining",
+                current,
+                total,
+                percent,
+                bytes_done,
+                bytes_total,
+            },
+        );
+    };
+    let progress = EngineProgress { on_band: &on_band, on_combine: &on_combine };
 
     let out = if is_flat {
         // Pixel materialization of the selected precal happens HERE, on the
@@ -1105,6 +1159,24 @@ fn run_build(
         )?
     };
     log_build_finished(set_id, build_started_at.elapsed(), out.bytes_read, &out);
+
+    // Fix wave item 1 (whole-branch review, CRITICAL): the engine's own
+    // cancellation checks (`run_banded`'s top-of-loop, post-read and
+    // post-combine checks, and pass 1's per-chunk check for a flat) all sit
+    // BEFORE this point — once `run_build` reaches here the engine has
+    // already returned `Ok`, and nothing downstream (the warning scan,
+    // `"writing"`, `load_header_inputs`, `write_fits_f32`, `register_master`)
+    // ever looked at `cancel_flag` again. At the band counts Task 6
+    // resolves to (as few as 1 on a >=32 GB machine), a cancel landing in
+    // this exact window used to write the master file and supersede the
+    // raw calibration set anyway — "Cancel" did nothing on 50-100% of
+    // builds. Same error variant the engine's own checks return, so
+    // `run_master_build_thread`'s existing cancelled-vs-failed handling
+    // (the "master build cancelled" log line, `cancelled: true` on
+    // `master-build-complete`) needs no changes to keep working here.
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(BuildStepError::Cancelled);
+    }
 
     // Audit C2: the engine drops non-finite samples ("undefined pixels") from
     // the per-pixel stack instead of panicking or baking NaN into the master.
@@ -1227,6 +1299,21 @@ fn run_build(
             (target_path.clone(), ClaimGuard(None))
         }
     };
+
+    // Fix wave item 1 follow-up: the first check (right after
+    // `log_build_finished`, above) closes the CRITICAL's real window — the
+    // multi-second-to-multi-minute pixel phase — but leaves a much smaller
+    // one open between it and here (a DB connection, `load_header_inputs`,
+    // `member_hash`, card building, directory creation and the collision
+    // claim). Re-check right at the boundary of the irreversible action:
+    // once `write_fits_f32` returns, real bytes are on disk under a name
+    // `register_master` is about to make load-bearing. `claim` (a
+    // `ClaimGuard`) is still armed here, so this early return deletes the
+    // just-created placeholder via the same RAII path every other exit in
+    // this function already uses — no special-case cleanup needed.
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(BuildStepError::Cancelled);
+    }
     write_fits_f32(&target_abs, out.width, out.height, 1, &out.data, &cards)?;
     // The master's real bytes are on disk now (atomic rename inside
     // `write_fits_f32` replaced the placeholder), so the name belongs to the

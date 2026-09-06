@@ -117,7 +117,7 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     let on_band = |_current: usize, _total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {};
     let out = integrate_bias_like(
         &paths, combine, &pool, scratch.path(), &AtomicBool::new(false),
-        EngineProgress { on_band: &on_band },
+        EngineProgress { on_band: &on_band, on_combine: &on_band },
         fixed_io_policy(),
     ).unwrap();
 
@@ -224,7 +224,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
             paths,
             IntegrationRecipe::average(Rejection::None),
             &pool, scratch.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &on_band },
             fixed_io_policy(),
         ).unwrap()
     };

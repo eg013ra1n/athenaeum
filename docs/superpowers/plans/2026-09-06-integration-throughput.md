@@ -473,7 +473,7 @@ pub const MAX_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Bounds for an explicitly configured `integration.band_budget_mb`.
-const CONFIGURED_MIN_MB: usize = 64;
+const CONFIGURED_MIN_MB: usize = 256;
 const CONFIGURED_MAX_MB: usize = 16384;
 
 /// Physical RAM this process may actually use, in bytes.

@@ -30,7 +30,22 @@ Target on the profiling machine (16 GB, 7200 rpm SATA): the LDN 1272 batch
 4. **Nothing about the pixel maths changes.** `combine_pixel`, the rejection
    recipes, the non-finite accounting (`bad_samples_per_frame`,
    `all_bad_pixels`), the flat normalization and every stamped header card are
-   untouched. Byte-identical masters are an acceptance criterion, not a hope.
+   untouched. The stronger, true claim: identity is safe **by construction**
+   on every path, not merely hoped for and then spot-checked — the flat
+   two-pass f64 sum order is fixed by the row walk (pass 1 always visits
+   frames-then-rows-then-columns in the same order regardless of band count),
+   each `PlaneKind` decode arm carries its own discriminating test (all six
+   variants pinned individually), `PlaneKind::F32Le` (the decode-and-spill
+   scratch format) carries no BZERO/BSCALE fields at all, so a scale/offset
+   mismatch from a spill is unrepresentable in the type rather than merely
+   untested, and the storage-class-derived read concurrency (D3/D3b) changes
+   only which worker thread fills which frame's band buffer, never the
+   buffer's contents or the order combine walks them in. Of the input
+   formats this reasoning covers, only the `I16Be` path — by far the common
+   camera case — carries an end-to-end MEASURED fingerprint
+   (`a4f6bb5158714175`, reproduced across six cold runs); the others are
+   covered by construction and by their own unit tests, not by a matching
+   before/after fingerprint run.
 
 ## 2. D1 — the band budget becomes a resolved policy
 
@@ -238,11 +253,15 @@ sets (10 frames each) as a rounding error next to the 100-frame bias.
 Three changes, all small, closing the gap the research recorded in §8.
 
 - **Log the lifecycle.** `info!` at build start with `set_id`, `imagetyp`,
-  `frames`, `recipe`, `band_rows`, `bands`, `budget_mb`; `info!` at finish with
-  `duration_ms`, `read_ms`, `combine_ms`, `read_mb_s`. Canonical field names
-  only (`duration_ms`, `count`, `outcome` per the logging spec's dictionary);
-  the new ones — `band_rows`, `bands`, `budget_mb`, `read_ms`, `combine_ms`,
-  `read_mb_s` — are added to that dictionary in the same change.
+  `count`, `recipe`, `budget_mb`; `info!` at finish with `duration_ms`,
+  `read_ms`, `combine_ms`, `read_mb_s`, `band_rows`, `bands` — the last two
+  move to the FINISH line, not the start one, because neither is knowable
+  until the engine has actually resolved and run the band geometry. Canonical
+  field names only (`duration_ms`, `count`, `outcome` per the logging spec's
+  dictionary — `frames` is not in that dictionary, hence `count` at the start
+  line, not `frames`); the new ones — `band_rows`, `bands`, `budget_mb`,
+  `read_ms`, `combine_ms`, `read_mb_s` — are added to that dictionary in the
+  same change.
 - **Carry bytes in the progress event.** `MasterBuildProgressEvent` gains
   `bytes_done` / `bytes_total` alongside the existing `current`/`total`/
   `percent`, mirrored in `src/types/helpers.ts`. Same snake_case on both sides
@@ -348,8 +367,8 @@ eviction protocol from research §2, on the profiling machine.
 | ---- | ---- | ---- |
 | 100-frame bias, cold, end to end | 241.6 s | **≤ 40 s** |
 | 100-frame bias, read throughput | 22 MB/s | **≥ 150 MB/s** |
-| 30-frame dark, cold, end to end | 11.8 s | ≤ 8 s |
-| LDN 1272 batch (11 sets, ~23 GB) | 13.5 min | **≤ 5 min** |
+| 30-frame dark, cold, end to end | 11.8 s | ≤ 8 s — **NOT YET MEASURED** |
+| LDN 1272 batch (11 sets, ~23 GB) | 13.5 min | **≤ 5 min** — **NOT YET MEASURED** |
 | Master pixels | — | **byte-identical** to the pre-change build for the same inputs |
 | SSD-backed scan root | not measured | open item — the class D3 expects to benefit most from concurrency |
 | Network mount (SMB/NFS) | not measured | open item — the one class whose policy is reasoned, not measured |

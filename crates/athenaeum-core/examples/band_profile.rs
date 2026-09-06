@@ -25,7 +25,7 @@ use std::time::Instant;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: band_profile <dir> [name-substring] [budget_mb] [threads]");
+        eprintln!("usage: band_profile <dir> [name-substring] [budget_mb] [threads] [readers]");
         std::process::exit(2);
     }
     let dir = PathBuf::from(&args[1]);
@@ -72,6 +72,11 @@ fn main() {
     let on_band = |cur: usize, total: usize, _done: u64, _all: u64| {
         if cur == 1 { println!("bands: {total}"); }
     };
+    // Combine-phase ticks (fix wave item 2) carry no information this
+    // harness reports — `read_duration`/`combine_duration` already come
+    // back on `IntegrationOutput` at full run granularity — so this stays a
+    // no-op.
+    let on_combine = |_current: usize, _total: usize, _bytes_done: u64, _bytes_total: u64| {};
     let t = Instant::now();
     let out = integrate_bias_like(
         &paths,
@@ -79,7 +84,7 @@ fn main() {
         &pool,
         &std::env::temp_dir(),
         &AtomicBool::new(false),
-        EngineProgress { on_band: &on_band },
+        EngineProgress { on_band: &on_band, on_combine: &on_combine },
         io,
     )
     .expect("integration failed");

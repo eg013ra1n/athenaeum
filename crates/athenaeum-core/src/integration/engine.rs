@@ -77,6 +77,44 @@ pub struct EngineProgress<'a> {
     /// everywhere else, so pass 1 is no longer a silent 25% of the run: a
     /// caller only needs `bytes_read_so_far`/`bytes_total` to see it move.
     pub on_band: &'a (dyn Fn(usize, usize, u64, u64) + Sync),
+
+    /// Combine-phase tick (fix wave item 2, whole-branch review). `on_band`
+    /// above has nothing left to say once a band's bytes are all in — its
+    /// last call for a band already sits at that band's ceiling — but the
+    /// parallel per-pixel combine that follows can then run for seconds
+    /// (single digits on the profiling machine at 100 frames; scales as
+    /// frames x pixels / cores) with no read events left to hang a percent
+    /// off. Task 6 can resolve a build to exactly ONE band (routine at
+    /// >=32 GB visible RAM), which turns that silence into the WHOLE
+    /// combine: a progress indicator frozen at 100% reads as "finished and
+    /// stuck", worse than one frozen partway.
+    ///
+    /// Fired from inside `run_banded`'s `par_chunks_mut` row loop via an
+    /// `AtomicUsize` row counter, periodically (a row stride, not every
+    /// row — see the counter's call site) rather than on every row, as
+    /// `(rows_combined_so_far, total_rows, bytes_done, bytes_total)`:
+    ///
+    /// - `rows_combined_so_far`/`total_rows` are GLOBAL across the whole
+    ///   run — every band's rows feed the same counter, in whatever order
+    ///   rayon happens to finish them, not restarted per band — so a
+    ///   single-band run still climbs smoothly through 0-100% instead of
+    ///   jumping straight from the read's 100% to "writing" with nothing
+    ///   between. This is a DIFFERENT meaning for `current`/`total` than
+    ///   `on_band` gives them (band index / band count there, rows here);
+    ///   that mismatch is exactly why this is a separate callback rather
+    ///   than an overloaded call to `on_band` — one field cannot honestly
+    ///   carry two incompatible meanings of its own parameters.
+    /// - `bytes_done`/`bytes_total` are NOT a new measurement — they are
+    ///   the exact `on_band` pair most recently established for this point
+    ///   in the run (the band currently combining has already finished
+    ///   reading), held constant for as long as this band's combine runs.
+    ///   Combine reads nothing, so there is nothing honest to add to
+    ///   "bytes of source read" here; they ride along only so a caller
+    ///   building one event shape out of both callbacks has a byte pair to
+    ///   put in it, not because either number moves during this callback's
+    ///   lifetime. Trivially monotonic as a result — every combine tick of
+    ///   a given band repeats the same values.
+    pub on_combine: &'a (dyn Fn(usize, usize, u64, u64) + Sync),
 }
 
 pub enum FlatPrecal {
@@ -136,6 +174,18 @@ fn run_banded(
     let mut read_duration = std::time::Duration::ZERO;
     let mut combine_duration = std::time::Duration::ZERO;
     let mut bytes_read: u64 = 0;
+    // Fix wave item 2: rows combined ACROSS THE WHOLE RUN, not per band —
+    // see `EngineProgress::on_combine`'s doc for why a single global counter
+    // (rather than one reset per band) is what makes a single-band run
+    // report anything at all during combine.
+    let rows_combined = AtomicUsize::new(0);
+    // A stride, not every row: `on_combine` is wall-clock-throttled by the
+    // caller (`masters.rs`, same as `on_band`) behind a `Mutex`, so calling
+    // it on literally every row of a multi-thousand-row image would still
+    // mean thousands of lock acquisitions this loop has no reason to pay
+    // for. `done == h` below always fires regardless of the stride, so the
+    // final tick is never skipped.
+    const COMBINE_TICK_ROWS: usize = 64;
 
     for (band_idx, y0) in (0..h).step_by(band_rows).enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -148,8 +198,10 @@ fn run_banded(
         // `bytes_before_this_band` is a snapshot of `bytes_read` (the total
         // from EARLIER bands only) taken before this band's read starts,
         // since the outer variable itself isn't updated until the read
-        // returns; `within_band` is a fresh atomic per band, accumulating
-        // this band's own bytes across however many worker threads read it.
+        // returns; `band_bytes_so_far` (below) is a fresh `Mutex<u64>` per
+        // band — NOT an atomic — accumulating this band's own bytes across
+        // however many worker threads read it. See the Fix round 3 comment
+        // just below for why a `Mutex` and not an atomic is the point.
         //
         // Fix round 3, Important 1: an `AtomicU64::fetch_max` high-water-mark
         // guard here (the reviewer's first-suggested shape: `fetch_add`,
@@ -177,6 +229,17 @@ fn run_banded(
         src.read_band_with_progress(y0, rows, &mut planes, io.read_concurrency, &on_bytes)?;
         read_duration += t_read.elapsed();
         bytes_read += (rows * per_row_bytes) as u64;
+
+        // Fix wave item 1 (whole-branch review, CRITICAL): a cancel raised
+        // while this band's read was in flight must not fall through into
+        // the combine below. Task 6 can resolve a build to exactly ONE band
+        // (routine at >=32 GB visible RAM for a typical image), in which
+        // case the top-of-loop check above fires exactly once, before any
+        // work has happened — there is no "next band" iteration left to
+        // catch a cancel that lands here.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(IntegrationError::Cancelled);
+        }
 
         // `y0` (the band's first global row) is captured by the closure below
         // for the precal MasterFrame row index (`gy = y0 + row_in_band`). It
@@ -228,9 +291,34 @@ fn run_banded(
                             if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
                         }
                     }
+                    // Fix wave item 2: one relaxed increment per ROW — this
+                    // closure runs once per row (the outer `par_chunks_mut(w)`
+                    // already chunks by row, not per pixel), so this is the
+                    // only per-pixel-adjacent cost paid here, matching the
+                    // review's "one relaxed increment and nothing else"
+                    // requirement. `done` can arrive at the tick below
+                    // slightly out of order under concurrency (two threads'
+                    // `fetch_add`s can interleave with their two `on_combine`
+                    // calls) — harmless here because bytes_done/bytes_total
+                    // are frozen for this whole band's combine regardless
+                    // (see `EngineProgress::on_combine`'s doc), so the one
+                    // hard monotonicity requirement (bytes, not rows) still
+                    // holds by construction, not by luck.
+                    let done = rows_combined.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % COMBINE_TICK_ROWS == 0 || done == h {
+                        (progress.on_combine)(done, h, bytes_read, bytes_total);
+                    }
                 });
         });
         combine_duration += t_combine.elapsed();
+        // Fix wave item 1: same reasoning as the post-read check above, for
+        // the OTHER half of a band's work — the combine is the actually
+        // slow phase once a band is a meaningful fraction of the image, and
+        // on a single-band run there is no future loop iteration to catch a
+        // cancel raised during it.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(IntegrationError::Cancelled);
+        }
         (progress.on_band)(band_idx + 1, bands_total, bytes_read, bytes_total);
     }
 
@@ -378,6 +466,12 @@ fn integrate_flat_inner(
         src.read_band_with_progress(y, rows, &mut planes, io.read_concurrency, &on_bytes)?;
         pass1_read += t_read.elapsed();
         pass1_bytes_read += (rows * per_row_bytes) as u64;
+        // Fix wave item 1: mirrors `run_banded`'s post-read check — pass 1
+        // has no combine phase of its own to guard a second time, but its
+        // last chunk has no future loop iteration either, so the same
+        // "don't wait for a top-of-loop check that may never come" reasoning
+        // applies to the read it just finished.
+        if cancel.load(Ordering::Relaxed) { return Err(IntegrationError::Cancelled); }
         for i in 0..n {
             for r in 0..rows {
                 let gy = y + r;
@@ -428,7 +522,16 @@ fn integrate_flat_inner(
     let wrapped_on_band = |cur: usize, total: usize, bytes_done: u64, bytes_total: u64| {
         (progress.on_band)(cur, total, pass1_bytes_read + bytes_done, pass1_total_bytes + bytes_total);
     };
-    let wrapped_progress = EngineProgress { on_band: &wrapped_on_band };
+    // Same wrapping for the combine-phase callback (fix wave item 2) — pass
+    // 2's `run_banded` only knows its own bytes, so the byte pair it hands
+    // `on_combine` needs pass 1's share folded in too, exactly like
+    // `wrapped_on_band` above. The row pair (`cur`/`total`) needs no such
+    // adjustment: `on_combine`'s rows are pass-2-only already (pass 1 has no
+    // combine phase of its own to count rows for).
+    let wrapped_on_combine = |cur: usize, total: usize, bytes_done: u64, bytes_total: u64| {
+        (progress.on_combine)(cur, total, pass1_bytes_read + bytes_done, pass1_total_bytes + bytes_total);
+    };
+    let wrapped_progress = EngineProgress { on_band: &wrapped_on_band, on_combine: &wrapped_on_combine };
     let mut out = run_banded(&src, &scales, Some(precal), recipe, pool, cancel, &wrapped_progress, io)?;
     out.flat_norm = Some(central_third_mean(&out.data, w, h));
     out.read_duration += pass1_read;
@@ -479,7 +582,7 @@ mod tests {
             &paths,
             IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert_eq!((out.width, out.height), (w, h));
@@ -504,7 +607,7 @@ mod tests {
         let out = integrate_flat(
             &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         // After per-frame normalization all three frames agree, so the master
@@ -531,7 +634,7 @@ mod tests {
         let out = integrate_flat(
             &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 0.01),
@@ -551,7 +654,7 @@ mod tests {
         let out = integrate_flat(
             &paths, &FlatPrecal::SyntheticBias(100.0), IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 0.01));
@@ -565,7 +668,7 @@ mod tests {
         let on_band = nop();
         let r = integrate_bias_like(
             &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &cancel,
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         );
         assert!(matches!(r, Err(IntegrationError::Cancelled)));
@@ -583,7 +686,7 @@ mod tests {
         let on_band = nop();
         let out = integrate_bias_like(
             &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert!(out.data.iter().all(|&v| v == -5.0), "no clipping policy");
@@ -617,7 +720,7 @@ mod tests {
         let out = integrate_flat_inner(
             &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(1), // band_rows_for_budget(1) floors to 1 row/band => 48 bands
         ).unwrap();
         for (i, &v) in out.data.iter().enumerate() {
@@ -650,7 +753,7 @@ mod tests {
         let out = integrate_flat_inner(
             &paths, &FlatPrecal::SyntheticBias(500.0), IntegrationRecipe::average(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert!(
@@ -683,7 +786,7 @@ mod tests {
             &paths,
             IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert!(out.data.iter().all(|v| v.is_finite()), "master must never contain non-finite pixels");
@@ -712,7 +815,7 @@ mod tests {
         let out = integrate_flat(
             &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         ).unwrap();
         assert!(out.data.iter().all(|v| v.is_finite()));
@@ -742,7 +845,7 @@ mod tests {
             &pool(),
             dir.path(),
             &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         )
         .unwrap();
@@ -779,7 +882,7 @@ mod tests {
             &pool(),
             dir.path(),
             &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(12_800),
         )
         .unwrap();
@@ -815,7 +918,7 @@ mod tests {
             &pool(),
             dir.path(),
             &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(MIN_BUDGET_BYTES),
         )
         .unwrap();
@@ -863,7 +966,7 @@ mod tests {
             &pool(),
             dir.path(),
             &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             concurrent_io,
         )
         .unwrap();
@@ -900,7 +1003,7 @@ mod tests {
             &pool(),
             dir.path(),
             &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             // Budget far exceeds this tiny image: exactly one band results,
             // so every call below belongs to band 1 of 1 — isolating the
             // per-frame ticks from any band-boundary effect.
@@ -967,7 +1070,7 @@ mod tests {
             &pool(),
             dir.path(),
             &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band },
+            EngineProgress { on_band: &on_band, on_combine: &nop() },
             io(1),
         )
         .unwrap();
