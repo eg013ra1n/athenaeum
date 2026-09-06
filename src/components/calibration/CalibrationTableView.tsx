@@ -36,7 +36,7 @@ interface CalibrationTableViewProps {
   onCreateMaster?: (setId: number) => void;
   /** Live build state (phase, plus stage/percent while building) per source
    *  set id, from `useMasterBuildContext().buildStates`. */
-  buildStatusBySet?: Record<number, BuildState>;
+  buildStateBySet?: Record<number, BuildState>;
 }
 
 // ── Section colors (per spec) ──────────────────────────────────────────────
@@ -701,14 +701,14 @@ function CreateMasterCell({
   setId,
   isMaster,
   onCreateMaster,
-  buildStatusBySet,
+  buildStateBySet,
 }: {
   setId: number;
   isMaster: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, BuildState>;
+  buildStateBySet?: Record<number, BuildState>;
 }) {
-  const state = buildStatusBySet?.[setId];
+  const state = buildStateBySet?.[setId];
   const building = state != null && state.phase !== 'done';
   return (
     <td className="px-2 py-1 text-center">
@@ -716,10 +716,19 @@ function CreateMasterCell({
         building ? (
           <span className="text-[10px] whitespace-nowrap animate-pulse">
             {state.phase === 'building' ? (
-              <>
-                <span className="text-content-muted">{state.progress.stage}</span>{' '}
-                <span className="text-accent tabular-nums">{Math.round(state.progress.percent)}%</span>
-              </>
+              // Fix round 2, I1: `writing`/`registering` report `total: 0`
+              // (no band count applies to those stages) — rendering percent
+              // off that would show a false "0%" right after `integrating`
+              // hit 100%. Gate on `total > 0` instead of always showing a
+              // number: those two stages get the stage word alone.
+              state.progress.total > 0 ? (
+                <>
+                  <span className="text-content-muted">{state.progress.stage}</span>{' '}
+                  <span className="text-accent tabular-nums">{Math.round(state.progress.percent)}%</span>
+                </>
+              ) : (
+                <span className="text-content-muted">{state.progress.stage}…</span>
+              )
             ) : (
               <span className="text-content-muted">starting…</span>
             )}
@@ -894,7 +903,7 @@ function FlatsTable({
   onJumpToEquipment,
   compact,
   onCreateMaster,
-  buildStatusBySet,
+  buildStateBySet,
 }: {
   rows: FlatRow[];
   highlightedSetIds: Set<number>;
@@ -904,7 +913,7 @@ function FlatsTable({
   onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, BuildState>;
+  buildStateBySet?: Record<number, BuildState>;
 }) {
   const { sortField, sortDir, thProps } = useTableSort<FlatSortField>('sortDate');
 
@@ -1001,7 +1010,7 @@ function FlatsTable({
                   setId={row.setId}
                   isMaster={row.isMaster}
                   onCreateMaster={onCreateMaster}
-                  buildStatusBySet={buildStatusBySet}
+                  buildStateBySet={buildStateBySet}
                 />
               </tr>
             );
@@ -1025,7 +1034,7 @@ function DarksTable({
   onJumpToEquipment,
   compact,
   onCreateMaster,
-  buildStatusBySet,
+  buildStateBySet,
 }: {
   rows: DarkRow[];
   highlightedSetIds: Set<number>;
@@ -1035,7 +1044,7 @@ function DarksTable({
   onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, BuildState>;
+  buildStateBySet?: Record<number, BuildState>;
 }) {
   const { sortField, sortDir, thProps } = useTableSort<DarkSortField>('sortDate');
 
@@ -1126,7 +1135,7 @@ function DarksTable({
                   setId={row.setId}
                   isMaster={row.isMaster}
                   onCreateMaster={onCreateMaster}
-                  buildStatusBySet={buildStatusBySet}
+                  buildStateBySet={buildStateBySet}
                 />
               </tr>
             );
@@ -1149,7 +1158,7 @@ function BiasTable({
   onJumpToEquipment,
   compact,
   onCreateMaster,
-  buildStatusBySet,
+  buildStateBySet,
 }: {
   rows: BiasRow[];
   highlightedSetIds: Set<number>;
@@ -1158,7 +1167,7 @@ function BiasTable({
   onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
   onCreateMaster?: (setId: number) => void;
-  buildStatusBySet?: Record<number, BuildState>;
+  buildStateBySet?: Record<number, BuildState>;
 }) {
   const { sortField, sortDir, thProps } = useTableSort<BiasSortField>('sortDate');
 
@@ -1235,7 +1244,7 @@ function BiasTable({
                   setId={row.setId}
                   isMaster={row.isMaster}
                   onCreateMaster={onCreateMaster}
-                  buildStatusBySet={buildStatusBySet}
+                  buildStateBySet={buildStateBySet}
                 />
               </tr>
             );
@@ -1259,7 +1268,7 @@ export function CalibrationTableView({
   highlightCalSet,
   onHighlightConsumed,
   onCreateMaster,
-  buildStatusBySet,
+  buildStateBySet,
 }: CalibrationTableViewProps) {
   const navigate = useNavigate();
 
@@ -1568,19 +1577,19 @@ export function CalibrationTableView({
             {flatRows.length > 0 && (
               <div ref={flatsSectionRef}>
                 <SectionHeader title="Flats" count={flatRows.length} color={SECTION_COLORS.flats} />
-                <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStatusBySet={buildStatusBySet} />
+                <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStateBySet={buildStateBySet} />
               </div>
             )}
             {darkRows.length > 0 && (
               <div ref={darksSectionRef} className="border-t border-border/30">
                 <SectionHeader title="Darks" count={darkRows.length} color={SECTION_COLORS.darks} />
-                <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStatusBySet={buildStatusBySet} />
+                <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStateBySet={buildStateBySet} />
               </div>
             )}
             {biasRows.length > 0 && (
               <div ref={biasSectionRef} className="border-t border-border/30">
                 <SectionHeader title="Bias" count={biasRows.length} color={SECTION_COLORS.bias} />
-                <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStatusBySet={buildStatusBySet} />
+                <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStateBySet={buildStateBySet} />
               </div>
             )}
           </div>
@@ -1603,9 +1612,9 @@ export function CalibrationTableView({
               ))}
             </div>
             <div className="flex-1 overflow-y-auto" ref={bottomTab === 'flats' ? flatsSectionRef : bottomTab === 'darks' ? darksSectionRef : biasSectionRef}>
-              {bottomTab === 'flats' && <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStatusBySet={buildStatusBySet} />}
-              {bottomTab === 'darks' && <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStatusBySet={buildStatusBySet} />}
-              {bottomTab === 'bias' && <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStatusBySet={buildStatusBySet} />}
+              {bottomTab === 'flats' && <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStateBySet={buildStateBySet} />}
+              {bottomTab === 'darks' && <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStateBySet={buildStateBySet} />}
+              {bottomTab === 'bias' && <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} onCreateMaster={onCreateMaster} buildStateBySet={buildStateBySet} />}
             </div>
           </>
         )}

@@ -455,7 +455,7 @@ export function CalibrationHierarchyView({
               highlightCalSet={highlightCalSet}
               onHighlightConsumed={onHighlightConsumed}
               onCreateMaster={(setId) => setBatchDialogIds([setId])}
-              buildStatusBySet={buildStateBySet}
+              buildStateBySet={buildStateBySet}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 

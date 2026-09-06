@@ -816,9 +816,9 @@ enum BuildTarget {
 /// Build-lifecycle log lines. Named functions rather than inline macros so a
 /// test can pin their message text without a multi-gigabyte build fixture —
 /// a multi-minute operation that logged nothing is why a running build was
-/// indistinguishable from a hung one (spec §8). The message strings are the
-/// contract: `docs/logging/README.md` recipes and the log-mcp queries match
-/// on them.
+/// indistinguishable from a hung one (research §8). The message strings are
+/// the contract: `docs/logging/README.md` recipes and the log-mcp queries
+/// match on them.
 fn log_build_started(
     set_id: i64,
     imagetyp: &str,
@@ -830,14 +830,18 @@ fn log_build_started(
 ) {
     tracing::info!(
         set_id,
-        imagetyp,
+        // Lowercased to match the pre-existing informal `imagetyp` emitters
+        // in `calibration::scan_integration` (fix round 2, minor) — a log
+        // filter must find both, not just the one formalized here.
+        imagetyp = %imagetyp.to_lowercase(),
         count,
         recipe,
         budget_mb = budget_bytes / (1024 * 1024),
-        // Read concurrency is `image_pool`'s size, i.e. derived from core
-        // count — a CPU number applied to an I/O problem (spec §8). Logged
-        // alongside `storage` so the pending SSD/NAS measurement can be read
-        // against the policy that actually produced it, instead of guessing.
+        // Read concurrency no longer rides the CPU thread pool (spec §7,
+        // D3) — it's derived from `StorageClass` instead (`storage_class.rs`),
+        // MORE than core count on a network mount. Logged alongside
+        // `storage` so the pending SSD/NAS measurement can be read against
+        // the policy that actually produced it, instead of guessing.
         read_threads,
         storage = storage.as_str(),
         "master build started"
@@ -973,7 +977,7 @@ fn run_build(
     let io = crate::integration::io_policy::resolve(&conn, &ctx.settings, &paths, ctx.image_pool.current_num_threads())?;
 
     // A multi-minute build that logs nothing is indistinguishable from a
-    // hung one (spec §8) — this is the one line an operator has to go on
+    // hung one (research §8) — this is the one line an operator has to go on
     // until the first progress event arrives.
     let build_started_at = std::time::Instant::now();
     log_build_started(
@@ -995,7 +999,18 @@ fn run_build(
     let pool = ctx.image_pool.as_ref();
     let scratch = std::env::temp_dir();
     let on_band = |current: usize, total: usize, bytes_read_so_far: u64, bytes_total: u64| {
-        let percent = if total > 0 {
+        // Bytes, not bands (fix round 2, I2): Task 6 cut a set's band count
+        // to as few as 2, so a band-fraction percent could sit frozen at
+        // 0%/50%/100% for however long one band takes — exactly the
+        // multi-minute silence this whole task exists to remove. The engine
+        // now ticks `bytes_read_so_far` once per frame read (see
+        // `EngineProgress::on_band`'s doc), so deriving `percent` from bytes
+        // instead makes the number the operator sees move continuously.
+        // `total`/`current` (band index/count) are untouched — CreateMasterCell
+        // still gates whether it renders a percent at all on `total > 0`.
+        let percent = if bytes_total > 0 {
+            (bytes_read_so_far as f64 / bytes_total as f64) * 100.0
+        } else if total > 0 {
             (current as f64 / total as f64) * 100.0
         } else {
             100.0
@@ -1407,7 +1422,15 @@ fn run_master_build_thread(
 
     let (master_set_id, success, cancelled, error, warning) = match result {
         Ok((id, warning)) => (Some(id), true, false, None, warning),
-        Err(BuildStepError::Cancelled) => (None, false, true, None, None),
+        Err(BuildStepError::Cancelled) => {
+            // Fix round 2, minor: a cancelled build used to log nothing at
+            // all here, leaving "master build started" dangling with no
+            // terminal line — precisely the unpaired-operation shape this
+            // task exists to remove (never-swallow-an-error's cousin for a
+            // deliberate non-error outcome).
+            tracing::info!(set_id, "master build cancelled");
+            (None, false, true, None, None)
+        }
         Err(BuildStepError::Other(msg)) => {
             tracing::error!(set_id, error = %msg, "master build failed");
             (None, false, false, Some(msg), None)

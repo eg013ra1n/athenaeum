@@ -9,7 +9,7 @@ use super::combine::{combine_pixel, IntegrationRecipe};
 use super::io_policy::IoPolicy;
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub struct IntegrationOutput {
     pub width: usize,
@@ -57,13 +57,26 @@ pub struct EngineProgress<'a> {
     /// passes — `integrate_flat_inner` wraps the pass-2-only callback
     /// `run_banded` calls so the byte pair carries pass 1's central-third
     /// read as a baseline (pass 1 has no band count of its own to report).
-    /// The two numbers on one call can therefore disagree sharply: the very
-    /// first pass-2 band reports band 1/N (~2%) while bytes_done/bytes_total
-    /// already sit at ~25% of the two-pass total — a real ~23-point gap
-    /// between the two progress numbers on the SAME event, not a bug. A
-    /// bias-like build (one pass) never sees this — its two numbers always
-    /// agree.
-    pub on_band: &'a dyn Fn(usize, usize, u64, u64),
+    /// The two numbers on one call can therefore disagree sharply: at the
+    /// moment `band_index_1based` first becomes 1 (pass 2's first band
+    /// finishing), it reads as 1/N (~2%) while bytes_done/bytes_total are
+    /// already at ~25% of the two-pass total — a real ~23-point gap between
+    /// the two progress numbers on the SAME event, not a bug. A bias-like
+    /// build (one pass) never sees this — its two numbers always agree.
+    ///
+    /// Fires MORE than once per band (fix round 2, I2): in addition to the
+    /// existing call at band END, `BandSource::read_band_with_progress`
+    /// calls this once per FRAME as its read completes, with `band_index_1based`/
+    /// `bands_total` held at the band currently in flight and
+    /// `bytes_read_so_far` climbing within it — Task 6 cut `bands_total` to
+    /// as few as 2, so waiting for a whole band to end can mean minutes of
+    /// silence otherwise. For a FLAT this callback also fires DURING pass 1
+    /// (`integrate_flat_inner`'s own read loop, before pass 2 has started at
+    /// all) with `band_index_1based` pinned at `0` — "no pass-2 band
+    /// reached yet" — against the same two-pass `bytes_total` used
+    /// everywhere else, so pass 1 is no longer a silent 25% of the run: a
+    /// caller only needs `bytes_read_so_far`/`bytes_total` to see it move.
+    pub on_band: &'a (dyn Fn(usize, usize, u64, u64) + Sync),
 }
 
 pub enum FlatPrecal {
@@ -130,7 +143,20 @@ fn run_banded(
         }
         let rows = band_rows.min(h - y0);
         let t_read = std::time::Instant::now();
-        src.read_band(y0, rows, &mut planes, io.read_concurrency)?;
+        // Fix round 2, I2: a per-frame tick during the read itself, not just
+        // the end-of-band call below — see `EngineProgress::on_band`'s doc.
+        // `bytes_before_this_band` is a snapshot of `bytes_read` (the total
+        // from EARLIER bands only) taken before this band's read starts,
+        // since the outer variable itself isn't updated until the read
+        // returns; `within_band` is a fresh atomic per band, accumulating
+        // this band's own bytes across however many worker threads read it.
+        let bytes_before_this_band = bytes_read;
+        let within_band = AtomicU64::new(0);
+        let on_bytes = |just_read: u64| {
+            let so_far_in_band = within_band.fetch_add(just_read, Ordering::Relaxed) + just_read;
+            (progress.on_band)(band_idx + 1, bands_total, bytes_before_this_band + so_far_in_band, bytes_total);
+        };
+        src.read_band_with_progress(y0, rows, &mut planes, io.read_concurrency, &on_bytes)?;
         read_duration += t_read.elapsed();
         bytes_read += (rows * per_row_bytes) as u64;
 
@@ -291,6 +317,18 @@ fn integrate_flat_inner(
     // the full height `run_banded` (pass 2, below) will report on its own.
     let per_row_bytes = src.bytes_per_row();
     let pass1_total_bytes = ((cy1 - cy0) * per_row_bytes) as u64;
+    // Fix round 2, I2: pass 1 used to report NOTHING to `progress.on_band`
+    // (its only contribution was the baseline folded into pass 2's FIRST
+    // call, via `wrapped_on_band` below) — a silent 25% of a flat's bytes,
+    // per the observed asymmetry in `EngineProgress::on_band`'s doc. Forecast
+    // pass 2's own band count/total up front purely so pass 1's ticks below
+    // have a real two-pass total to report against; `band_rows_for_budget`
+    // is a pure function of `src`/`io.band_budget_bytes`, so computing it
+    // here and again inside `run_banded` gives identical results — this
+    // reads the same policy earlier, it does not touch decode or offsets.
+    let pass2_band_rows_forecast = src.band_rows_for_budget(io.band_budget_bytes).min(h);
+    let bands_total_forecast = h.div_ceil(pass2_band_rows_forecast);
+    let two_pass_total_bytes = pass1_total_bytes + (h * per_row_bytes) as u64;
     let mut pass1_read = std::time::Duration::ZERO;
     let mut pass1_bytes_read: u64 = 0;
     let mut y = cy0;
@@ -298,7 +336,18 @@ fn integrate_flat_inner(
         if cancel.load(Ordering::Relaxed) { return Err(IntegrationError::Cancelled); }
         let rows = band_rows.min(cy1 - y);
         let t_read = std::time::Instant::now();
-        src.read_band(y, rows, &mut planes, io.read_concurrency)?;
+        // `band_index_1based` pinned at 0 — "no pass-2 band reached yet" —
+        // against the same `bands_total_forecast`/`two_pass_total_bytes`
+        // pass 2's own calls use once it starts (see `wrapped_on_band`
+        // below), so a caller sees ONE continuously climbing bytes fraction
+        // across both passes rather than a blackout followed by a jump.
+        let bytes_before_this_chunk = pass1_bytes_read;
+        let within_chunk = AtomicU64::new(0);
+        let on_bytes = |just_read: u64| {
+            let so_far = within_chunk.fetch_add(just_read, Ordering::Relaxed) + just_read;
+            (progress.on_band)(0, bands_total_forecast, bytes_before_this_chunk + so_far, two_pass_total_bytes);
+        };
+        src.read_band_with_progress(y, rows, &mut planes, io.read_concurrency, &on_bytes)?;
         pass1_read += t_read.elapsed();
         pass1_bytes_read += (rows * per_row_bytes) as u64;
         for i in 0..n {
@@ -749,14 +798,77 @@ mod tests {
         );
     }
 
+    /// Fix round 2, I2: Task 6 cut a set's band count to as few as 2, and
+    /// `on_band` used to fire only once per band END — a caller watching for
+    /// progress during a single, possibly multi-minute band saw nothing at
+    /// all until it finished. `read_band_with_progress` now ticks once per
+    /// FRAME as it is read, in addition to that existing end-of-band call.
+    #[test]
+    fn on_band_ticks_once_per_frame_not_just_once_per_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8, 8);
+        let paths: Vec<_> = (0..5)
+            .map(|i| write(dir.path(), &format!("f{i}.fits"), w, h, |_, _| 1000.0))
+            .collect();
+        let calls: std::sync::Mutex<Vec<(usize, usize, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+        let on_band = |cur: usize, total: usize, done: u64, all: u64| {
+            calls.lock().unwrap().push((cur, total, done, all));
+        };
+        integrate_bias_like_inner(
+            &paths,
+            IntegrationRecipe::median(Rejection::None),
+            &pool(),
+            dir.path(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            // Budget far exceeds this tiny image: exactly one band results,
+            // so every call below belongs to band 1 of 1 — isolating the
+            // per-frame ticks from any band-boundary effect.
+            io(MIN_BUDGET_BYTES),
+        )
+        .unwrap();
+        let calls = calls.into_inner().unwrap();
+        // 5 per-frame ticks (during the read) + 1 end-of-band call.
+        assert_eq!(
+            calls.len(), 6,
+            "expected one tick per frame plus the end-of-band call, got {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|&(cur, total, _, _)| cur == 1 && total == 1),
+            "this image fits one band — every call must report band 1 of 1: {calls:?}"
+        );
+        let bytes_total = calls[0].3;
+        assert!(bytes_total > 0);
+        for pair in calls.windows(2) {
+            assert!(
+                pair[1].2 >= pair[0].2,
+                "bytes_done must never regress: {:?} then {:?}", pair[0], pair[1]
+            );
+        }
+        assert_eq!(
+            calls.last().unwrap().2, bytes_total,
+            "the final call (end of band) must reach the full total"
+        );
+    }
+
     /// Review fix-round-1 finding I1 (judgment call #2): the `on_band`
     /// wrapper in `integrate_flat_inner` must report a byte pair that spans
     /// BOTH passes, not just pass 2's own share — `run_banded` has no way to
     /// see pass 1's read on its own. Forces a multi-band pass 2
-    /// (`band_budget_bytes = 1` clamps to 1-row bands, so `on_band` fires 48
-    /// times) so the wrapping is exercised across more than a single call.
+    /// (`band_budget_bytes = 1` clamps to 1-row bands, so `on_band` fires
+    /// many times) so the wrapping is exercised across more than a single
+    /// call.
+    ///
+    /// Fix round 2, I2: pass 1 now ALSO calls `on_band` directly — bypassing
+    /// the wrapper entirely, since it computes the two-pass total itself and
+    /// needs no baseline added — so `calls[0]` is no longer guaranteed to be
+    /// pass 2's first band. The old "first call already carries pass 1's
+    /// bytes as a baseline" assertion is replaced with the properties that
+    /// actually matter now: every call agrees on the two-pass total, bytes
+    /// never regress, at least one call lands DURING pass 1 (proving it is
+    /// no longer silent), and the run ends at the full total.
     #[test]
-    fn flat_progress_bytes_span_both_passes_via_the_wrapped_callback() {
+    fn flat_progress_ticks_span_both_passes_with_one_shared_total() {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (32, 48);
         let paths = vec![
@@ -764,9 +876,9 @@ mod tests {
             write(dir.path(), "f2.fits", w, h, |_, _| 1000.0),
             write(dir.path(), "f3.fits", w, h, |_, _| 1000.0),
         ];
-        let calls: std::cell::RefCell<Vec<(usize, usize, u64, u64)>> = std::cell::RefCell::new(Vec::new());
+        let calls: std::sync::Mutex<Vec<(usize, usize, u64, u64)>> = std::sync::Mutex::new(Vec::new());
         let on_band = |cur: usize, total: usize, done: u64, all: u64| {
-            calls.borrow_mut().push((cur, total, done, all));
+            calls.lock().unwrap().push((cur, total, done, all));
         };
         integrate_flat_inner(
             &paths,
@@ -779,27 +891,35 @@ mod tests {
             io(1),
         )
         .unwrap();
-        let calls = calls.into_inner();
+        let calls = calls.into_inner().unwrap();
         assert!(!calls.is_empty(), "on_band must fire at least once");
         // Pass 1 (16 rows) + pass 2 (48 rows), 3 frames, 4 bytes/sample —
         // same total the previous test pins on the returned field.
         let expected_total = ((48 + 16) * 32 * 4 * 3) as u64;
         for &(_, _, _done, all) in &calls {
-            assert_eq!(all, expected_total, "bytes_total reported to on_band must span both passes");
+            assert_eq!(all, expected_total, "bytes_total reported to on_band must span both passes, every call");
         }
         let (_, _, last_done, _) = *calls.last().unwrap();
         assert_eq!(
             last_done, expected_total,
             "after the final band, bytes_read_so_far must equal the full two-pass total"
         );
-        // The very first pass-2 band call must already carry pass 1's bytes
-        // as a baseline — otherwise the wrapping would just be re-reporting
-        // pass 2 alone against a bigger denominator.
+        // Pass 1 is no longer silent (fix round 2, I2): at least one call
+        // must land strictly before pass 1's own share is fully read,
+        // pinned at band_index 0 ("no pass-2 band reached yet").
         let pass1_bytes = 16u64 * 32 * 4 * 3;
-        let (_, _, first_done, _) = calls[0];
         assert!(
-            first_done > pass1_bytes,
-            "first band's bytes_done ({first_done}) must include pass 1's {pass1_bytes} bytes as a baseline"
+            calls.iter().any(|&(cur, _, done, _)| cur == 0 && done < pass1_bytes),
+            "expected at least one pass-1 tick (band_index 0) reporting partial \
+             progress before pass 1's {pass1_bytes} bytes are fully read; got {calls:?}"
         );
+        // `io(1)` clamps concurrency to 1, so this whole run is one
+        // sequential thread — bytes_done must never regress tick to tick.
+        for pair in calls.windows(2) {
+            assert!(
+                pair[1].2 >= pair[0].2,
+                "bytes_done must never regress across ticks: {:?} then {:?}", pair[0], pair[1]
+            );
+        }
     }
 }

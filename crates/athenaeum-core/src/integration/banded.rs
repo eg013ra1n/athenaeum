@@ -151,6 +151,11 @@ impl FrameReader {
         };
         #[cfg(unix)]
         {
+            // `read_exact_at` retries internally on `ErrorKind::Interrupted`
+            // (same policy as `Read::read_exact`) — a signal-interrupted
+            // syscall resumes rather than surfacing a spurious error. The
+            // Windows arm below has no equivalent retry loop for that kind;
+            // see its comment for why that's not a gap.
             file.read_exact_at(buf, base + offset)
         }
         #[cfg(windows)]
@@ -158,17 +163,29 @@ impl FrameReader {
             // `seek_read` may return a short read; loop until the buffer is
             // full or the file ends. There is no `read_exact_at` on Windows.
             //
+            // No `ErrorKind::Interrupted` retry here, unlike the unix arm
+            // above — deliberately: `Interrupted` models a POSIX signal
+            // arriving mid-syscall, and `ReadFile` (what `seek_read` wraps)
+            // has no equivalent concept to interrupt it with, so this arm
+            // can never actually observe that error kind.
+            //
             // `seek_read` also moves the file's cursor, unlike a true `pread`
-            // — safe here ONLY because nothing in this module reads through
-            // a cursor any more (fix round 1, M5): every read in this file is
-            // positional, so a moved cursor is never observed. Concurrent
-            // calls on one handle are still safe because each `seek_read`
-            // carries its own offset rather than relying on the moved
-            // cursor. Do NOT reintroduce a seek-based (`Seek`/`SeekFrom`)
-            // read anywhere in this module — it would silently race this
-            // cursor against concurrent `read_exact_at` calls on the same
-            // `File`, on Windows only, invisibly to every CI job (the
-            // Windows build only runs on a tag, never a branch push).
+            // — safe here ONLY because nothing that reads through a
+            // `FrameReader`'s handle goes through a cursor any more (fix
+            // round 1, M5): every such read is positional. That invariant is
+            // narrower than "every read in this file" — `probe_fits`, a few
+            // lines up, opens its OWN short-lived `File` and reads its header
+            // with a plain cursor-based `read_exact`, which is fine because
+            // that handle is never shared, never wrapped in a `FrameReader`,
+            // and is dropped before this method could ever run against it.
+            // Concurrent calls on one `FrameReader`'s handle are still safe
+            // because each `seek_read` carries its own offset rather than
+            // relying on the moved cursor. Do NOT reintroduce a seek-based
+            // (`Seek`/`SeekFrom`) read on a `FrameReader`'s file anywhere in
+            // this module — it would silently race this cursor against
+            // concurrent `read_exact_at` calls on the same `File`, on
+            // Windows only, invisibly to every CI job (the Windows build
+            // only runs on a tag, never a branch push).
             let mut done = 0usize;
             while done < buf.len() {
                 let n = file.seek_read(&mut buf[done..], base + offset + done as u64)?;
@@ -498,6 +515,22 @@ impl BandSource {
         (budget_bytes / per_row).max(1)
     }
 
+    /// Reads rows `[y0, y0+rows)` of every frame straight into `out`. See
+    /// [`Self::read_band_with_progress`] for the full contract (positional,
+    /// concurrent, `&self`-safe reads) — this is that method with progress
+    /// ticking as a no-op, for the many callers (precal loads, cosmetic/
+    /// light-cal single-few-frame reads, tests) that don't drive a progress
+    /// bar and have no `EngineProgress` in scope.
+    pub fn read_band(
+        &self,
+        y0: usize,
+        rows: usize,
+        out: &mut BandPlanes,
+        concurrency: usize,
+    ) -> Result<(), IntegrationError> {
+        self.read_band_with_progress(y0, rows, out, concurrency, &|_| {})
+    }
+
     /// Reads rows `[y0, y0+rows)` of every frame straight into `out`'s own
     /// per-frame byte buffers — no decode here any more (Task 4): BZERO/BSCALE
     /// and endianness are applied lazily by [`BandPlanes::sample`] /
@@ -517,13 +550,26 @@ impl BandSource {
     /// Taking `&self` (not `&mut self`) is what makes that safe: several
     /// bands, or several frames of one band, can be read from the same
     /// shared `BandSource` at once because there is no cursor to race —
-    /// every read is positional.
-    pub fn read_band(
+    /// every read through a `FrameReader`'s handle is positional.
+    ///
+    /// `on_bytes` (fix round 2, I2) is called with the byte count just read,
+    /// once per frame, the instant that frame's positional read completes —
+    /// including from inside the parallel workers below when `concurrency >
+    /// 1`, each holding its own copy of the same `&on_bytes` reference. This
+    /// is the only granularity below "one call per band" a reader has to
+    /// give: once a set's bands are counted in single digits (Task 6 cut
+    /// them from 40 to as few as 2), a caller that only hears from this
+    /// method at band END has nothing to report for however long that one
+    /// band takes. Never called from the per-pixel combine — only from this
+    /// read loop, one call per (frame, band). `on_bytes` must be `Sync`
+    /// because of that concurrent-worker use.
+    pub fn read_band_with_progress(
         &self,
         y0: usize,
         rows: usize,
         out: &mut BandPlanes,
         concurrency: usize,
+        on_bytes: &(dyn Fn(u64) + Sync),
     ) -> Result<(), IntegrationError> {
         assert_eq!(out.bufs.len(), self.readers.len());
         // `out`'s `width`/`kinds` are snapshotted once at `BandPlanes::new` and
@@ -560,16 +606,17 @@ impl BandSource {
         // Fix round 1, M3: every calibration/precal call site (light_cal.rs,
         // cosmetic.rs, `masters::load_precal_pixels`) and every test passes
         // `concurrency == 1` — 1-3 frame reads with no `IoPolicy` in scope
-        // (spec §8). Skip `thread::scope` entirely for that case: it is a
-        // straight loop identical to what this method did before this task,
-        // and `scope.spawn` panics if the OS refuses a new thread, which
-        // would otherwise turn a bare single-frame read into a new panic
-        // path for zero parallelism gained.
+        // (spec §8, out of scope). Skip `thread::scope` entirely for that
+        // case: it is a straight loop identical to what this method did
+        // before this task, and `scope.spawn` panics if the OS refuses a new
+        // thread, which would otherwise turn a bare single-frame read into a
+        // new panic path for zero parallelism gained.
         if workers == 1 {
             for (reader, buf) in self.readers.iter().zip(out.bufs.iter_mut()) {
                 let bpp = reader.kind().bytes_per_sample();
                 buf.resize(rows * w * bpp, 0u8);
                 reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
+                on_bytes((rows * w * bpp) as u64);
             }
             return Ok(());
         }
@@ -589,6 +636,7 @@ impl BandSource {
                         let bpp = reader.kind().bytes_per_sample();
                         buf.resize(rows * w * bpp, 0u8);
                         reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
+                        on_bytes((rows * w * bpp) as u64);
                     }
                     Ok(())
                 }));
