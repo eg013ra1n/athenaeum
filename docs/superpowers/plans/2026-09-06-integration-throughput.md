@@ -325,9 +325,16 @@ fn main() {
         100.0 * read_s / all.as_secs_f64(),
         100.0 * out.combine_duration.as_secs_f64() / all.as_secs_f64()
     );
-    // Fingerprint so later tasks can prove the pixels did not move.
+    // Fingerprint so later tasks can prove the pixels did not move. The
+    // scalar sum is a human-readable sanity line ONLY: it cancels
+    // equal-and-opposite drift exactly, and at ~2.6e10 for a real bias set its
+    // printed precision hides a whole band drifting 0.01 ADU. The xxh3 digest
+    // over the output bytes is the anchor Tasks 3-5 reproduce.
     let sum: f64 = out.data.iter().map(|&v| v as f64).sum();
-    println!("checksum  {:.6e}  ({}x{})", sum, out.width, out.height);
+    println!("sum         {:.6e}", sum);
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for &v in &out.data { h.update(&v.to_le_bytes()); }
+    println!("fingerprint {:016x}  ({}x{})", h.digest(), out.width, out.height);
 }
 ```
 
@@ -342,7 +349,7 @@ BIAS="/Volumes/bigbase2/Astrobase/Calibration/ASI2600MC DUO/ASI2600MC DUO/2024/2
 cargo run --release -p athenaeum-core --example band_profile -- "$BIAS" "" 256
 ```
 
-Expected: ~240 s total, read ~22 MB/s, 40 bands. **Write the printed `checksum` line into the task's commit message** — Tasks 3, 4 and 5 must reproduce it exactly.
+Expected: ~240 s total, read ~22 MB/s, 40 bands. **Write the printed `fingerprint` line into the task's commit message** — Tasks 3, 4 and 5 must reproduce it exactly. (It is an xxh3 digest over every output f32's bytes; the `sum` line printed beside it is a human-readable sanity check only and must never be used as the pixel-identity anchor — a scalar sum cancels equal-and-opposite drift.)
 
 - [ ] **Step 8: Commit**
 
@@ -751,9 +758,9 @@ BIAS="/Volumes/bigbase2/Astrobase/Calibration/ASI2600MC DUO/ASI2600MC DUO/2024/2
 cargo run --release -p athenaeum-core --example band_profile -- "$BIAS" "" 0
 ```
 
-Expected on the 16 GB profiling machine: auto resolves to 4 GiB, **3 bands, total ≤ 60 s** (from 241.6 s), read ≥ 100 MB/s. The `checksum` line must equal the one recorded in Task 1.
+Expected on the 16 GB profiling machine: auto resolves to 4 GiB, **3 bands, total ≤ 60 s** (from 241.6 s), read ≥ 100 MB/s. The `fingerprint` line must equal the one recorded in Task 1.
 
-If the checksum moved, stop: the budget must not change any pixel.
+If the fingerprint moved, stop: the budget must not change any pixel.
 
 - [ ] **Step 7: Commit**
 
@@ -1071,7 +1078,7 @@ Expected: PASS. `multi_band_precal_uses_global_row_index` and `non_finite_sample
 - [ ] **Step 6: Measure — the gate**
 
 Evict, then run the harness at auto budget.
-Expected: **≤ 45 s**, bands halved relative to Task 3 (3 → 2 on the profiling machine), read ≥ 130 MB/s. **The `checksum` line must still equal Task 1's** — this task moves where decoding happens, never what it produces.
+Expected: **≤ 45 s**, bands halved relative to Task 3 (3 → 2 on the profiling machine), read ≥ 130 MB/s. **The `fingerprint` line must still equal Task 1's** — this task moves where decoding happens, never what it produces.
 
 - [ ] **Step 7: Commit**
 
@@ -1728,7 +1735,7 @@ Evict, run the harness at auto budget.
 Expected: **≤ 40 s** and read **≥ 150 MB/s** — the spec's headline gate. On this
 7200 rpm drive the parallelism itself is worth only ~8 %; it is in the plan
 because queue depth 1 is the whole bottleneck on an SSD and because a network
-mount cannot be filled at all without exceeding the core count. Checksum
+mount cannot be filled at all without exceeding the core count. Fingerprint
 unchanged from Task 1.
 
 Also run the 30-frame dark set (`"$DARK" "1.00s" 0`), expecting **≤ 8 s**
