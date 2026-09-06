@@ -276,6 +276,62 @@ Three changes, all small, closing the gap the research recorded in §8.
 - **The master is written to the calibration library root, which may itself be
   a network mount.** That is one ~104 MB sequential write per build against
   gigabytes of reading, so it is not touched here.
+
+## 8a. Recorded for later: staging a network source to local scratch
+
+Not in this cycle, and deliberately conditional — but written down with its
+trigger, because if the owner's calibration ever moves onto the NAS this is the
+right answer and re-deriving it would be waste.
+
+**What it is.** When `StorageClass::Network` (D3b), read each source file ONCE,
+sequentially, into a local scratch file, then band-read the scratch. One long
+transfer per file instead of one round trip per file per band.
+
+**Why it is not the answer today, and may not be even on a NAS.** Two reasons,
+in order of how much they matter:
+
+1. **Nothing is re-read.** The bands partition the frame height without
+   overlap, so every byte of every source is read exactly once per integration.
+   A cache accelerates *repeat* reads; this workload has none. What was lost on
+   the profiled drive was seek locality within a single pass, and only the band
+   size fixes that (§3.1: 40 bands to 3 is 241.6 s to 44.4 s, with no copy).
+   Staging does not reduce the number of returns to a file — it reproduces them
+   over the copy. The one genuine exception is a flat, whose pass 1 re-reads its
+   central third; at ten frames a set that is noise.
+2. **D1 and D2 have already taken most of what staging would have bought.** At
+   the post-D1/D2 band count a network mount pays 2-3 round trips per file, not
+   40. Staging only still pays if, at 2-3 bands, per-request latency STILL
+   dominates one full sequential transfer plus a local write plus local band
+   reads. That is an empirical question with a specific shape:
+
+   ```
+   stage when   S/L_seq + S/W_local + S/local_banded  <  S/L_banded(2-3 bands)
+   ```
+
+   No number exists for `L_banded` yet — three attempts to measure the owner's
+   SMB share on 2026-09-06 all failed for different reasons (research §7b), so
+   this stays a condition, not a decision.
+
+**The shape it must take, if it is ever built.** Do NOT reuse the existing
+decode-and-spill fallback (`banded.rs::spill_via_read_raw`) as the staging
+mechanism, even though it superficially looks like one — it decodes the whole
+frame into RAM via `ImageConverter::read_raw` and writes `f32`, so a BITPIX 16
+source becomes a scratch file **twice the size** of the original (5.2 GB of bias
+becomes 10.4 GB) and each frame transits a 104 MB heap allocation. Staging wants
+the opposite: stream the data section's raw bytes to a local file verbatim,
+keep the source's `BITPIX`/`BZERO`/`BSCALE`, and let the existing
+`FrameReader::Fits` arm read the copy exactly as it reads the original. That is
+a new, small `FrameReader` construction path, not a reuse.
+
+**What it needs beyond the copy**, none of which the current engine has:
+a scratch location that is not `std::env::temp_dir()` (the transfer folders
+already set the precedent — `validate_transfer_dir` in `api::sync`); a
+free-space check before starting, since a batch can stage 23 GB; removal on
+cancel, on error and on a crashed previous run; and a staleness rule if a
+staged copy is ever kept across builds rather than deleted at the end (the
+catalog already has one in `db::disk_matches_row`). Every one of those is a
+failure surface the current design does not carry, which is the second reason
+it stays out until a measurement demands it.
 - **Raising `compute.max_concurrent`** stays out: more builds on one spindle
   multiply seeks, and above 1 the batch's bias/darkflat → dark → flat ordering
   is already documented as best-effort.
