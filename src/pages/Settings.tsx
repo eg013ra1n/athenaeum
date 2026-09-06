@@ -45,9 +45,15 @@ export default function Settings() {
 
   // Master-build (banded integration) memory budget — Calibration tab.
   // `integrationBudgetMb` is the editable input (string, "0" = auto);
-  // `budgetInfo` is the last snapshot loaded from/after saving to the
-  // backend, used to show the resolved effective/auto/RAM figures.
+  // `savedIntegrationBudgetMb` is the last loaded/saved value, for the dirty
+  // check (same pattern as TransfersSection's `savedReceives`); `budgetInfo`
+  // is the last snapshot loaded from/after saving to the backend, used to
+  // show the resolved configured/effective/auto/RAM figures. `budgetInfo`
+  // staying `null` means the read never succeeded — the control must not
+  // let Save fire in that state (it would silently overwrite the real
+  // setting with whatever the untouched input default is).
   const [integrationBudgetMb, setIntegrationBudgetMb] = useState('0');
+  const [savedIntegrationBudgetMb, setSavedIntegrationBudgetMb] = useState('0');
   const [budgetInfo, setBudgetInfo] = useState<IntegrationBudgetInfo | null>(null);
   const [budgetSaving, setBudgetSaving] = useState(false);
   const [budgetError, setBudgetError] = useState<string | null>(null);
@@ -127,8 +133,13 @@ export default function Settings() {
       const info = await api.invoke<IntegrationBudgetInfo>('get_integration_band_budget');
       setBudgetInfo(info);
       setIntegrationBudgetMb(String(info.configuredMb));
+      setSavedIntegrationBudgetMb(String(info.configuredMb));
     } catch (err) {
+      // `budgetInfo` stays null on failure — the control's Save button is
+      // disabled whenever that's true, specifically so a failed read can
+      // never be mistaken for "automatic" and silently written back as 0.
       console.error('Failed to load integration memory budget:', err);
+      setBudgetError('Could not read the current memory budget — try reloading this page.');
     }
   };
 
@@ -506,21 +517,31 @@ export default function Settings() {
   // configured range clamped it, more than one heavy job is admitted at
   // once and splits it, or both. `null` means the applied value matches
   // what was configured (or auto matches what auto alone would give).
+  //
+  // KEEP IN SYNC with `CONFIGURED_MIN_MB`/`CONFIGURED_MAX_MB` in
+  // `crates/athenaeum-core/src/integration/band_budget.rs` — those are
+  // private (not referenceable from TS), so this window is duplicated here
+  // by hand. A change on one side without the other means the UI confidently
+  // states the wrong range.
+  const CONFIGURED_MIN_MB = 256;
+  const CONFIGURED_MAX_MB = 16384;
+  const CONCURRENCY_NOTE =
+    'because the compute.max_concurrent setting allows more than one heavy job (master build, analysis, …) to run at once';
   let budgetNote: string | null = null;
   if (budgetInfo && budgetInfo.configuredMb === 0) {
     if (budgetInfo.effectiveMb < budgetInfo.autoMb) {
-      budgetNote = `Applying ${budgetInfo.effectiveMb} MB, below the automatic ${budgetInfo.autoMb} MB, because more than one heavy job (master build, analysis, …) may run at once and this budget is split between them.`;
+      budgetNote = `Applying ${budgetInfo.effectiveMb} MB, below the automatic ${budgetInfo.autoMb} MB, ${CONCURRENCY_NOTE} and this budget is split between them.`;
     }
   } else if (budgetInfo && budgetInfo.effectiveMb !== budgetInfo.configuredMb) {
-    const clamped = Math.min(16384, Math.max(256, budgetInfo.configuredMb));
+    const clamped = Math.min(CONFIGURED_MAX_MB, Math.max(CONFIGURED_MIN_MB, budgetInfo.configuredMb));
     const wasClamped = clamped !== budgetInfo.configuredMb;
     const alsoSplitByConcurrency = budgetInfo.effectiveMb < clamped;
     if (wasClamped && alsoSplitByConcurrency) {
-      budgetNote = `Applying ${budgetInfo.effectiveMb} MB: the value was clamped to ${clamped} MB (allowed range 256-16384 MB) and then split further because more than one heavy job may run at once.`;
+      budgetNote = `Applying ${budgetInfo.effectiveMb} MB: the value was clamped to ${clamped} MB (allowed range ${CONFIGURED_MIN_MB}-${CONFIGURED_MAX_MB} MB) and then split further ${CONCURRENCY_NOTE}.`;
     } else if (wasClamped) {
-      budgetNote = `Clamped to ${clamped} MB — configured values are limited to the 256-16384 MB range.`;
+      budgetNote = `Clamped to ${clamped} MB — configured values are limited to the ${CONFIGURED_MIN_MB}-${CONFIGURED_MAX_MB} MB range.`;
     } else if (alsoSplitByConcurrency) {
-      budgetNote = `Applying ${budgetInfo.effectiveMb} MB, not the ${budgetInfo.configuredMb} MB entered, because more than one heavy job may run at once and this budget is split between them.`;
+      budgetNote = `Applying ${budgetInfo.effectiveMb} MB, not the ${budgetInfo.configuredMb} MB entered, ${CONCURRENCY_NOTE} and this budget is split between them.`;
     }
   }
 
@@ -631,23 +652,41 @@ export default function Settings() {
             <h3 className="text-xl font-semibold mb-4">Master Build Memory</h3>
             <div>
               <label className="block text-sm font-medium text-content-secondary mb-2">
-                Integration memory budget ({integrationBudgetMb === '0' ? 'automatic' : `${integrationBudgetMb} MB`})
+                Integration memory budget (
+                {budgetInfo
+                  ? budgetInfo.configuredMb === 0
+                    ? 'automatic'
+                    : `${budgetInfo.configuredMb} MB`
+                  : '…'}
+                )
               </label>
               <input
                 type="number"
                 value={integrationBudgetMb}
-                onChange={(e) => setIntegrationBudgetMb(e.target.value)}
+                onChange={(e) => {
+                  setIntegrationBudgetMb(e.target.value);
+                  setBudgetError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleSaveIntegrationBudget();
+                }}
                 min="0"
                 max="16384"
-                step="64"
+                step="1"
                 className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
               />
               <p className="text-xs text-content-muted mt-2">
                 Working memory one master build may use for reading frames. 0 = automatic
-                ({budgetInfo ? budgetInfo.autoMb : '…'} MB on this machine, from{' '}
-                {budgetInfo ? budgetInfo.totalRamMb : '…'} MB of RAM). Larger values read the disk in
-                fewer, longer sweeps; smaller values use less memory and take longer.
+                ({budgetInfo ? budgetInfo.autoMb : '…'} MB on this machine
+                {budgetInfo && budgetInfo.totalRamMb > 0 ? `, from ${budgetInfo.totalRamMb} MB of RAM` : ''}
+                ). Larger values read the disk in fewer, longer sweeps; smaller values use less
+                memory and take longer.
               </p>
+              {budgetInfo && (
+                <p className="text-xs text-content-muted mt-1">
+                  Applied: {budgetInfo.effectiveMb} MB
+                </p>
+              )}
               {budgetNote && (
                 <p className="text-xs text-content-muted mt-1">{budgetNote}</p>
               )}
@@ -656,11 +695,15 @@ export default function Settings() {
               )}
               <button
                 onClick={handleSaveIntegrationBudget}
-                disabled={budgetSaving}
+                disabled={
+                  budgetSaving ||
+                  budgetInfo === null ||
+                  integrationBudgetMb.trim() === savedIntegrationBudgetMb
+                }
                 className="mt-3 flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-surface rounded-lg transition-colors"
               >
                 <Save size={16} />
-                {budgetSaving ? 'Saving...' : 'Save'}
+                {budgetSaving ? 'Saving...' : 'Save Memory Budget'}
               </button>
             </div>
           </div>

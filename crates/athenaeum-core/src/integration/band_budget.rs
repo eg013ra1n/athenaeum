@@ -32,6 +32,13 @@ pub const FALLBACK_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// resolved budget unconditionally, so a lower configured floor would be
 /// silently overridden with no explanation — an honest configured window
 /// must not advertise a minimum the backend refuses to honour.
+///
+/// KEEP IN SYNC with the `budgetNote` clamp window duplicated in
+/// `src/pages/Settings.tsx` (the Calibration tab's "Integration memory
+/// budget" control) — these constants are private and ts-rs has no way to
+/// hand a plain `usize` across the boundary, so the frontend re-derives its
+/// own copy to explain a clamp without a round trip. A change here with no
+/// matching change there means the UI confidently states the wrong range.
 const CONFIGURED_MIN_MB: usize = 256;
 const CONFIGURED_MAX_MB: usize = 16384;
 
