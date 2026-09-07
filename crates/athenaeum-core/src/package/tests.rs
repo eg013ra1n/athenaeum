@@ -187,6 +187,12 @@ fn validate_rel_path_rejects_backslash_and_drive_letters_cross_platform() {
         "C:\\Windows\\System32\\x",
         "\\\\host\\share\\x",
         "a\\b",
+        // A drive letter mid-path, not just at the head of the string: parses
+        // as an ordinary Normal component (a Windows prefix is only
+        // recognized at position 0), and a component-by-component
+        // `PathBuf::push` treats it as a fresh root, discarding everything
+        // joined before it.
+        "a/C:/x.fits",
     ] {
         assert!(
             validate_rel_path(bad).is_err(),

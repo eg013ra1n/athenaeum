@@ -76,8 +76,17 @@ pub fn validate_rel_path(rel_path: &str) -> Result<()> {
     if rel_path.contains('\\') {
         bail!("rel_path must not contain a backslash separator: {}", rel_path);
     }
-    let bytes = rel_path.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+    // Check every '/'-separated segment, not just the head of the string: a
+    // mid-path segment like the "C:" in "a/C:/x.fits" parses as an ordinary
+    // `Component::Normal` (a Windows prefix is only recognized at position 0),
+    // so it passes the component check below too — and a component-by-component
+    // `PathBuf::push` (as `sync::ingest::native_rel_path` does) replaces
+    // everything accumulated so far the moment it reaches that segment,
+    // escaping the base it was joined onto.
+    if rel_path.split('/').any(|seg| {
+        let b = seg.as_bytes();
+        b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
+    }) {
         bail!("rel_path must not carry a drive-letter prefix: {}", rel_path);
     }
 

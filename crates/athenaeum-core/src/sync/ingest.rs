@@ -774,16 +774,29 @@ fn link_or_copy(src: &Path, dest: &Path, force_copy: bool) -> Result<()> {
 /// Convert a wire `rel_path` into a native relative path.
 ///
 /// The wire contract is forward-slash — `package::validate_rel_path` rejects a
-/// backslash, a drive letter and any non-`Normal` component, and `filename_of`
-/// splits on '/' — so splitting on '/' is the whole conversion.
+/// backslash and a drive letter (in any segment, not just the head) and allows
+/// only `Normal`/`CurDir` components — and `filename_of` splits on '/' — so
+/// splitting on '/' is nearly the whole conversion.
 ///
 /// Joining the raw string instead is wrong on Windows in a way that is easy to
 /// miss: every filesystem call accepts the mixed-separator result, so the file
 /// lands correctly and a directory walk looks normal. What breaks is the string
 /// stored in `files.path`, which then never matches the native spelling the
 /// scanner writes for the same file — one file, two catalog rows.
+///
+/// Two segments are dropped rather than pushed: an empty one (a leading,
+/// trailing, or doubled '/' — no test exercises this today, but a silent
+/// no-op is the only safe behavior for it either way) and a literal `.`
+/// (`Component::CurDir`, which `validate_rel_path` permits). Neither changes
+/// where the file lands — both are filesystem no-ops — but pushing either
+/// verbatim would leave it in the stored string while a disk walk never
+/// produces one, the same stored-string-vs-disk mismatch this helper exists
+/// to close.
 fn native_rel_path(rel_path: &str) -> PathBuf {
-    rel_path.split('/').filter(|s| !s.is_empty()).collect()
+    rel_path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect()
 }
 
 /// Land an accepted payload mirroring the sender's tree under `<landing_base>/<rel_path>`,
