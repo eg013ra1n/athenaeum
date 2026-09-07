@@ -49,7 +49,7 @@ use crate::db::collab_exchange::ContributionRow;
 use crate::package::{self, ManifestRecord};
 use crate::sharing::types::{FrameReceipt, ReceiptOutcome};
 
-use super::ingest::{sanitize_slug, unique_path, IngestConn};
+use super::ingest::{native_rel_path, sanitize_slug, unique_path, IngestConn};
 use super::models::{Direction, HistoryRow};
 use super::now_iso;
 use super::store::insert_history_row;
@@ -293,7 +293,7 @@ fn process_project_frame(
     }
 
     // Verify integrity: the payload must exist and its full-content xxh3 match.
-    let payload = staging_dir.join(&record.rel_path);
+    let payload = staging_dir.join(native_rel_path(&record.rel_path));
     let actual = match package::xxh3_full_file(&payload) {
         Ok(h) => h,
         Err(e) => return Ok(rejected_receipt(record, format!("payload unreadable: {e}"))),
@@ -322,10 +322,13 @@ fn process_project_frame(
     }
 
     // Land tmp-copy + atomic rename under <root>/<project-slug>/<publisher-slug>/<rel_path>.
+    // Use the platform's own separator (see native_rel_path's doc): landed_path
+    // below is looked up by exact string match, so a mixed-separator join here
+    // would make that lookup miss forever on Windows.
     let dest_base = landing_root
         .join(sanitize_slug(project_slug))
         .join(sanitize_slug(publisher))
-        .join(Path::new(&record.rel_path));
+        .join(native_rel_path(&record.rel_path));
     let landed = land_project_payload(&dest_base, &payload)
         .with_context(|| format!("land project payload {}", record.rel_path))?;
 

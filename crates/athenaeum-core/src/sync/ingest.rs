@@ -792,7 +792,7 @@ fn link_or_copy(src: &Path, dest: &Path, force_copy: bool) -> Result<()> {
 /// verbatim would leave it in the stored string while a disk walk never
 /// produces one, the same stored-string-vs-disk mismatch this helper exists
 /// to close.
-fn native_rel_path(rel_path: &str) -> PathBuf {
+pub(crate) fn native_rel_path(rel_path: &str) -> PathBuf {
     rel_path
         .split('/')
         .filter(|s| !s.is_empty() && *s != ".")
