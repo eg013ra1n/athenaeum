@@ -50,8 +50,10 @@ fn fixtures_never_seed_a_raw_canonicalized_path() {
             continue;
         }
         // This file defines the sanctioned helper, so it necessarily contains
-        // the call the guard forbids everywhere else.
-        if path.file_name().and_then(|n| n.to_str()) == Some("test_support.rs") {
+        // the call the guard forbids everywhere else. Exact-path compare (not
+        // a bare filename match) so a future src/**/test_support.rs elsewhere
+        // in the tree is not silently exempt too.
+        if path == src.join("test_support.rs") {
             continue;
         }
         let text = std::fs::read_to_string(path).expect("read source");
@@ -81,6 +83,9 @@ fn fixtures_never_seed_a_raw_canonicalized_path() {
          On Windows that is a `\\\\?\\` verbatim path. It never compares equal to \
          the normalised spelling production stores, and it takes a forward slash \
          as a filename character rather than a separator (error 123, \
-         InvalidFilename). Use `crate::test_support::canonical_tempdir()`."
+         InvalidFilename). Use `crate::test_support::canonical_tempdir()` when the \
+         test needs a new temporary directory, or `crate::test_support::canonical_path(path)` \
+         when it already holds one (from `test_ctx()`, say) — don't create a second \
+         `TempDir` just to canonicalize a path you already have."
     );
 }

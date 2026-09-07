@@ -1021,7 +1021,14 @@ mod mkdir_target_tests {
         let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
         let target = root.join("new-subdir");
         let r = resolve_mkdir_target(&target.to_string_lossy(), &policy).unwrap();
-        assert_eq!(r, root.join("new-subdir"));
+        // `resolve_mkdir_target` builds its return from a raw `canonicalize()`
+        // of the parent (see its doc comment) — never normalized. On Windows
+        // that is a `\\?\` verbatim path, so normalize before comparing
+        // against `root`, which IS normalized (`canonical_tempdir()`).
+        assert_eq!(
+            crate::api::scan_roots::normalize_path(&r),
+            root.join("new-subdir")
+        );
     }
 
     #[test]
