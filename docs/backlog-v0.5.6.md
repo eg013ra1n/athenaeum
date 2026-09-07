@@ -82,18 +82,21 @@ budget (`blink.memory_cache_max_mb`). The question that was open here was
 settled as "always-on for `full`" (spec D1). What remains is the owner smoke
 list in `docs/superpowers/open-items.md`.
 
-## 3. Navigation memory ("backspace browsing")
+## 3. Navigation memory ("backspace browsing") — SHIPPED
+
+**Shipped 2026-09-07** (`eecb0b38`). Both open questions were answered by
+building it: "back" is **both** an in-app affordance and a keyboard gesture (a
+back/forward pair in every page header, plus Backspace, Alt+←/→ and ⌘←/→ on
+macOS), and the state is **session-only** — a reload starts a fresh stack.
+`NavHistoryContext` tracks the location keys it has seen rather than reading the
+router's own index, which is what lets Back be disabled on the session's first
+entry and never leave the app in the web build. `useSessionState` keeps
+page-local UI state across unmounts (File Manager, Objects, Project Detail
+tabs) and `useScrollRestoration` restores the scroll offset per history entry.
 
 Carried over from `docs/backlog-v0.5.5.md` item 1, minus the frame-card fields,
-which shipped in v0.5.5. Every main screen should remember its last browsing
-state; explicitly **not** pop-up modals and **not** blink. The calendar screen
-resets entirely today.
-
-**Open, unchanged:** is "back" the browser/history gesture, an in-app
-affordance, or both? Does the state survive a full restart or only navigation
-within a session? Scope is every page under `src/pages/`, so the answer decides
-whether this is one shared hook or per-page work — the widest regression surface
-of anything on this list.
+which shipped in v0.5.5. Modals and blink were out of scope by the original
+framing and stayed out.
 
 ## 4. The full analysis path under-reports eccentricity on trailed frames
 

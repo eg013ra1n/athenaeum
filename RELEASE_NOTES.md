@@ -1,104 +1,76 @@
-*Calibration is a stage of export now, choosing it by hand is one screen, a night that runs past midnight is one night again — and plate solving no longer invents a position for a frame full of streaks.*
+*Master builds finish in a fraction of the time, Full Resolution finally means it for colour cameras, and every page remembers where you were.*
 
 ## What's New
 
-- **Calibrated lights are made at export time.** The **Calibrated lights**
-  export mode now calibrates every light on the spot from your built masters
-  — at export and at send — instead of requiring a separate *Calibrate
-  Lights* run first. The standalone flow, its dialog and its per-frame badge
-  are gone. Two new toggles ride along, both on by default: **hot-pixel
-  correction**, which replaces known-defective pixels using the master dark,
-  and a **full-resolution VNG debayer** for one-shot-color cameras.
-- **Choosing calibration by hand is one screen.** Light frames and a
-  calibration set's own sub-calibration used to open two different dialogs;
-  they are now the same picker. The camera, exposure and date filters are
-  always visible, clicking a value in the left panel filters the list by it,
-  and each card names the difference that matters — *"Offset 30 → 200"* —
-  instead of listing parameters you had to compare yourself. Cards carry the
-  shooting window, not just the date, so two sets shot the same evening are
-  finally distinguishable.
-- **A frame with no coordinates can be solved by naming its target.** Set
-  OBJECT in the metadata editor and the editor tells you, as you type,
-  whether the name is one the sky catalog knows; plate solving then starts
-  from that position instead of searching blind.
-- **Sending returns instantly.** A transfer appears right away as a
-  *preparing* row with a live byte count, speed and a Cancel button while
-  the files are staged in the background, instead of the dialog hanging
-  until every file has been copied.
-- **A transfer costs one copy of its files on each machine instead of two.**
-  The sender serves the prepared package where it lies and the receiver
-  links the downloaded files into place, so a 20 GB send no longer needs
-  40 GB of free space at either end.
-- **Settings has a Transfers tab.** The outgoing staging folder and the
-  incoming working folder can each be pointed at any disk — with the upload
-  limit, receiving limit and storage figures moved there too — and whatever
-  the previous folders still hold can be cleaned up from the same page.
+- **Master builds are about six times faster.** A 100-frame bias set that
+  took 233 seconds now takes 40, measured cold on a spinning disk with the
+  page cache cleared. The integration engine sizes its working band from the
+  machine's actual memory instead of a fixed constant, keeps that band in
+  the frames' own pixel format rather than widening everything to float on
+  the way in, and reads the frames of a band in parallel by position. Nothing
+  about the result changes: the same masters, pixel for pixel.
+- **A build now tells you what it is doing.** The calibration tree shows the
+  running build's stage and percentage, and each build writes a line to the
+  log when it starts and when it finishes, with its duration, read and
+  combine times, and throughput. A thirteen-minute build used to be
+  indistinguishable from a hung one.
+- **Full Resolution means native resolution for colour frames.** In Blink,
+  every one-shot-colour frame was rendered at half size even with the
+  full-resolution button pressed, because the fast debayer folds each 2×2
+  sensor tile into a single pixel. A 6248×4176 frame arrived as 3124×2088,
+  which made 1:1 star inspection — the reason that button exists —
+  impossible. Full Resolution now debayers at the native grid.
+- **Back and forward, everywhere.** Every page header carries a back/forward
+  pair, and Backspace, Alt+← / Alt+→ and, on macOS, ⌘← / ⌘→ step through
+  them. Returning to a page returns you to it: the File Manager, Objects and
+  Project Detail tabs come back as you left them, and the scroll position is
+  restored per history entry. History is per session, so a restart starts
+  fresh.
+- **The plate-solve input gate is in Settings.** The v0.5.5 notes said the
+  thresholds were there; they were not, and the sentence was retracted. They
+  are now: an **Input Gate** section with its toggle and both thresholds,
+  plus **Batch Concurrency** in Solver Parameters. The copy states the part
+  the numbers are useless without — that both conditions must hold at once,
+  and what the values are on frames that do and do not solve.
 
 ## Changes
 
-- **Analysis tab:** every column with data now sorts, WCS and Reference
-  included. The WCS column reads *Header* / *ATH* / *—* instead of icon
-  badges, and the Reference column is just the star: filled on the chosen
-  frame, a star button on the rest.
-- **Export tab:** the folder tree, file total and size estimate follow the
-  selected mode — no calibration folders in *Lights only*, `c_*` names for
-  *Calibrated lights*, one file per master set — and a remembered mode that
-  is not available for the current set no longer stays selected. A set with
-  no calibration linked at all now offers only *Lights only*, since the two
-  raw modes would have landed the same files under a different name. *Lights
-  only* shows no calibration warnings, and a missing-calibration warning
-  names the camera when two groups share a filter.
-- **Objects:** a new **Recalculate nights** button repairs sets whose nights
-  were stitched together by a merge before this release.
-- **Calendar:** a day's cards show the camera, the telescope and the
-  first–last exposure time of that night.
-- **Transfers:** the sender's progress line counts only the files that
-  actually travel and says how many the receiver already had — *"84 of 300
-  files · 262 already on peer"* instead of *"346 of 562"* — so both sides
-  show the same total and the bar no longer stalls at half when most of a
-  set is already there.
-- **Master libraries:** a master with no GAIN or OFFSET in its header is
-  flagged in the Dark/Flat library. Such a set can never be matched
-  automatically, and *Edit Metadata* fills the values in.
-- **Collaboration:** publishing your own lights to a project is temporarily
-  disabled while the calibrated-export changes above are worked into it.
-  Receiving other members' contributions is unaffected.
-- Known consequence: resending a *Calibrated lights* transfer after
-  re-calibrating (for example after rebuilding a master) now lands a second
-  copy on the receiver instead of replacing the first one — there is no
-  tracking table left to deduplicate against.
+- **Folders:** an offline folder's banner has a **Check again** button, so a
+  drive you have just remounted is re-detected on the spot instead of
+  needing you to scan some other folder and let it re-check everything as a
+  side effect. A file that failed to parse during a scan gets a reveal
+  button next to its error, which opens the file manager at that file.
+- **Settings → Calibration → Master Build Memory:** a memory budget for the
+  integration engine. It explains rather than merely displays: if what you
+  typed is not what is applied — clamped to the supported range, divided
+  across concurrent jobs, or both — it says so and shows the figure actually
+  in force.
+- **Settings → Blink Viewer:** a memory limit for the preview cache, which
+  matters now that a full-resolution colour render is four times the size it
+  used to be.
+- **Windows is measured, not assumed.** The whole test suite now runs on
+  Windows in continuous integration and blocks a broken build. Getting there
+  fixed one real defect that shipped: a received file's path was stored with
+  a mixed path separator, which is corrected below.
 
 ## Bug Fixes
 
-- **Plate solving no longer invents astrometry for frames whose stars are
-  streaks.** Wind-shaken frames used to come back *solved* at 16–193× their
-  true pixel scale — a confident, entirely wrong position written into the
-  catalog. Such detections are now excluded from matching, and any solve
-  whose scale disagrees with the frame's own focal length and pixel size is
-  refused.
-- A frame whose analysis shows badly trailed stars is skipped with a plain
-  reason instead of spending minutes failing. A frame that turns out to be
-  nothing but streaks is refused within a second — naming how many of its
-  detections were streaks — rather than searching for minutes.
-- **A night that runs past midnight is one night again.** The night tree
-  grouped by the frame's calendar date, so every session through midnight
-  showed as two — *"October 18"* and *"October 19"* instead of *"October
-  18–19, 2025"* — and the Shoot Calendar split the same night across two day
-  cells. Both now group by the imaging night, which lands on the day it
-  started.
-- Merging frame sets (and *Find new images*) now recomputes the merged set's
-  nights from all of its frames instead of stitching the two sets' night
-  rows together, so a night split by a meridian-flip re-pointing no longer
-  shows up as two.
-- **The manual calibration list is usable again.** Every candidate carries a
-  real closeness percentage instead of a flat 0 % for anything your matching
-  rules refuse, the list is ordered by how near a miss each one is — same
-  camera first, then by what each broken rule costs the calibration — and
-  every card states why a set was refused (*"Temperature: 19.4 vs −9.9 — off
-  by 29.3, limit 5.0"*, *"Gain: this set does not declare one"*) instead of
-  showing an unexplained score.
-- *Show only compatible* now means exactly that. It used to hide everything
-  whenever no candidate was perfect, and it hid compatible-but-old sets as
-  well.
-- The export size estimate now uses the set's real average file size instead
-  of a fixed 50 MB per file.
+- **Deleting a missing master's file no longer strands its raw frames.**
+  Removing a master's file from the Missing Files panel deleted the row
+  directly, which left the master's empty shell behind and left the raw
+  calibration set still marked as superseded by it. Those raw frames became
+  invisible to calibration matching permanently, superseded by a master that
+  existed neither on disk nor in the catalog, with nothing in the interface
+  left to undo it. That route now goes through the same un-supersede path
+  every other way of deleting a master already used.
+- **Windows: a received file's path was stored with a mixed separator.**
+  Transfers landed catalog rows whose paths mixed both separators, so later
+  lookups against the same file could miss. Project contributions had the
+  same shape and are fixed with it.
+- **Windows: a relative path carrying a drive letter is refused.** The guard
+  only checked the front of the path, so a drive-letter segment further in
+  was accepted.
+- A full-resolution colour render in the web build now holds its slot for
+  the whole render rather than releasing it early, and the preview cache
+  limit is clamped on the backend, so a value typed into Settings cannot put
+  the render path into a state the interface would not allow.
