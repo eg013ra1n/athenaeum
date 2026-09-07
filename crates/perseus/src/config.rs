@@ -8,6 +8,10 @@
 //! ```toml
 //! capture_dir = "/data/capture"
 //! data_dir = "/var/lib/perseus"
+//! # On Windows, quote paths with SINGLE quotes — in a double-quoted TOML
+//! # string every backslash is an escape sequence and the file will not parse:
+//! #   capture_dir = 'C:\Users\me\Astro'
+//! #   data_dir    = 'C:\ProgramData\perseus'
 //! mode = "auto"                             # "auto" | "manual" | "scheduled"
 //! auto_quiet_secs = 60                       # auto: flush after N idle seconds
 //! schedule_times = ["06:00", "14:30"]        # scheduled: local wall-clock send times
@@ -450,6 +454,28 @@ pub struct Config {
     pub max_upload_mbps: u32,
 }
 
+/// A Windows path in a double-quoted TOML value is the most likely reason a
+/// hand-written `perseus.toml` will not parse, and the parser's own complaint
+/// ("too few unicode value digits") gives the user nothing to act on. Perseus
+/// ships a Windows installer, so this is a first-run experience, not a
+/// theoretical one.
+///
+/// TOML basic strings treat a backslash as an escape introducer, so a Windows
+/// path is read as a truncated unicode escape. Single-quoted *literal* strings
+/// do no escape processing at all, which is the fix worth naming.
+///
+/// Returns a space-prefixed sentence, or an empty string when the input has no
+/// backslash in it and the hint would only be noise.
+fn windows_path_hint(text: &str) -> String {
+    if !text.contains('\\') {
+        return String::new();
+    }
+    " A backslash in a double-quoted value is read as an escape sequence, so a \
+     Windows path must be written in single quotes, e.g. capture_dir = \
+     'C:\\Users\\me\\Astro' (or with every backslash doubled)."
+        .to_string()
+}
+
 impl Config {
     /// Parse + strictly validate a config from a TOML file on disk.
     pub fn load(path: &Path) -> Result<Self> {
@@ -527,11 +553,12 @@ impl Config {
     fn parse_toml(text: &str) -> Result<Self> {
         toml::from_str(text).map_err(|e| {
             anyhow::anyhow!(
-                "could not parse config TOML: {e}. Expected keys: capture_dir, \
+                "could not parse config TOML: {e}.{} Expected keys: capture_dir, \
                  data_dir, mode = \"auto\", a send route (either an [account] table \
                  with targets = [..], or pairing_ticket), and a [retention] table \
                  with policy = keep_everything|on_confirm|keep_days|disk_pct and \
-                 dry_run = true"
+                 dry_run = true",
+                windows_path_hint(text)
             )
         })
     }
@@ -1731,6 +1758,41 @@ interval_secs = 600
         );
         let err = Config::from_toml_str(&text).expect_err("keep_days=0 must fail");
         assert!(err.chain().any(|c| c.to_string().contains("keep_days")));
+    }
+
+    /// A Windows user hand-writing the obvious thing gets a parse error about
+    /// "unicode value digits" that says nothing about what to do about it.
+    /// Perseus ships a Windows installer, so this is a first-run experience:
+    /// the error must name the cause and show the fix.
+    #[test]
+    fn a_windows_path_parse_failure_explains_the_backslash() {
+        let text = "capture_dir = \"C:\\Users\\me\\Astro\"\ndata_dir = \"C:\\ProgramData\\perseus\"\n";
+
+        let err = Config::from_toml_str(text).expect_err("a backslash path must not parse");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("backslash"),
+            "the error must name the backslash as the cause: {msg}"
+        );
+        assert!(
+            msg.contains("single quotes"),
+            "the error must point at single-quoted strings as the fix: {msg}"
+        );
+    }
+
+    /// The hint is for backslash-bearing input only — a unix config that fails
+    /// to parse for an unrelated reason must not be told about Windows paths.
+    #[test]
+    fn a_unix_parse_failure_carries_no_windows_hint() {
+        let err = Config::from_toml_str("[unclosed table\n").expect_err("must not parse");
+
+        let msg = format!("{err:#}");
+
+        assert!(
+            !msg.contains("backslash"),
+            "no Windows hint belongs on a backslash-free config: {msg}"
+        );
     }
 
     #[test]
