@@ -2851,7 +2851,8 @@ fn midpackage_observations(
 /// This test is **load-sensitive by construction**: it uses a timing probe that
 /// needs a competing thread to win a race against an unfair mutex. Measurement:
 /// 4 of 5 isolated runs failed on Windows; on macOS it surfaced three times
-/// during full-suite load (tasks 4, 5, 7) despite passing in isolation. CI
+/// during full-suite load over the course of the 2026-09-07 Windows
+/// test-failure cycle, despite passing in isolation. CI
 /// skips it by name, so a green CI run is not evidence it passed. The invariant
 /// it guards is real and documented in CLAUDE.md; making it deterministic is
 /// recorded as a separate item rather than weakening the test.

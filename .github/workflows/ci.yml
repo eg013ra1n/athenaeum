@@ -96,7 +96,10 @@ jobs:
       # sync's `ingest_releases_conn_between_frames` is a timing probe that needs
       # a competing thread to win a race against an unfair mutex. On Windows, 4 of
       # 5 isolated runs failed; on macOS it surfaced three times during full-suite
-      # load despite passing in isolation.
+      # load despite passing in isolation. The test also self-skips when `CI` is
+      # set, so this flag is belt-and-braces here and does the actual skipping
+      # for a developer running this same command locally without `CI` in the
+      # environment.
       - name: Test workspace
         run: cargo test --workspace -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames
 
@@ -109,10 +112,11 @@ jobs:
   # 2026-09-06 found 39 pre-existing failures behind that gap. This job is the
   # measurement that keeps them closed.
   #
-  # `continue-on-error` is deliberate and TEMPORARY: the job is red on the day it
-  # lands and turns green over the course of the cycle in
-  # docs/superpowers/plans/2026-09-07-windows-test-failures.md, whose last task
-  # removes this line and makes Windows a gate.
+  # `continue-on-error` is deliberate and stays for now: every measurement this
+  # cycle took was `cargo test -p athenaeum-core --lib`, while this job runs
+  # `cargo test --workspace`. Same-class separator/path failures are already
+  # known to exist in athenaeum-web and perseus, so this line comes out only
+  # once a workspace-wide Windows run is actually green.
   build-and-test-windows:
     name: Build and test (Windows)
     runs-on: windows-latest
@@ -132,7 +136,12 @@ jobs:
           rustc --version
           cargo --version
 
+      # This job is expected to be red for now, and the action does not save
+      # a cache on a failed job by default — without this it rebuilds the
+      # whole workspace cold on every run.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # The command MUST stay identical to the Linux job's. Two jobs running
       # different commands drift, and the whole point of this one is that it

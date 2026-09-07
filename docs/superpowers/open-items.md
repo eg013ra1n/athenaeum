@@ -9,23 +9,72 @@ Plans, specs and audits live in `plans/`, `specs/` and `research/` beside this f
 and hold the detail. This file holds only the residue: the checks nobody has run and
 the calls that have already been made.
 
-## Windows: 39 pre-existing test failures, and no CI that would catch them
+## Windows: fixed pending the final measurement; non-core surface still unmeasured
 
-The Rust suite has only ever run on Linux — `.gitlab-ci.yml` contains `cargo test`
-zero times (its Windows job builds the bundle and never tests), and the GitHub
-workflow is `ubuntu-latest`. A Windows run on 2026-09-06 found 39 failures in
-`athenaeum-core`, all pre-existing on `main` and proven so by a baseline diff.
-Root-cause families, file:line attribution and a suggested order are in
-`research/2026-09-06-windows-test-failures.md`. Two are worth pulling forward: a
-five-test family fixed by one `FILE_FLAG_BACKUP_SEMANTICS` flag, and a drift
-guard that cannot run on any Windows checkout because it splits on a hardcoded
-`\n` while `core.autocrlf` gives it CRLF — the repo has no `.gitattributes`.
-One red test in the list is the escape-the-root security guard.
+`docs/superpowers/specs/2026-09-07-windows-test-failures-design.md` §10 has the
+full outcome. `athenaeum-core`'s 39 pre-existing Windows test failures (research:
+`research/2026-09-06-windows-test-failures.md`) are believed closed — every
+family was diagnosed and fixed, including one real production defect (a
+received file's path was stored with a mixed separator on Windows, now fixed in
+`sync/ingest.rs` and, by the same shape, in `sync/project_ingest.rs`) — but no
+single Windows run has yet reported `0 failed` for the whole crate after all
+eight tasks landed; the closest confirmed readings are 34 then 31, taken
+mid-cycle. The `windows-latest` CI job exists (`.github/workflows/ci.yml`) and
+runs on every push, but stays `continue-on-error: true` and non-blocking until
+a workspace-wide green run is actually observed.
 
-**Keeping it current.** A cycle that lands adds its unverified checks here. A check
-that passes is deleted, not ticked — with the date and the measurement, if there was
-one, moved into the cycle's own doc. A decision that gets ratified moves from
-"awaiting a call" into "standing".
+**Non-core Windows surface is unmeasured and known-red.** Nothing in this cycle
+touched `athenaeum-tauri`, `athenaeum-web` or `perseus`, and the CI job's
+`cargo test --workspace` reaches all of them. Two known instances of the exact
+family this cycle fixed:
+`athenaeum-web/src/routes/scan_roots.rs:526` compares a raw `canonicalize()`
+against a value production stores normalized — the same family as this cycle's
+A/E. `crates/perseus/src/` has roughly ten slash-literal `join("M31/…")`
+fixture sites (`pending.rs`, `library.rs`, `web.rs`, `library/delete.rs`) — the
+same construction the scanner sweep (family D/H) fixed in `athenaeum-core`.
+
+**23 unswept slash-joins in `archive/*` tests, plus 3 in export tests.**
+Deliberately not swept this cycle: nothing there fails today and nothing there
+is proven vacuous, but they are the same construction as the three tests this
+cycle found passing vacuously on Windows and could be silently vacuous there
+too. A later cycle's job, with its own judgement about whether each assertion
+still asserts what it claims.
+
+**A Windows working tree cloned before `.gitattributes` landed keeps CRLF.**
+Adding the file does not rewrite files already on disk. A developer (or a CI
+cache) with an older checkout needs `git rm --cached -r . && git reset --hard`
+once. This cost the cycle a full, misleading measurement (a 34-failure reading
+taken on a stale CRLF tree, only reconciled after a second reading on a fresh
+checkout matched it test-for-test).
+
+**Three cross-platform behaviour changes, none Windows-only, none covered by a
+test.** All in the sync receive path (`package::validate_rel_path` /
+`sync::ingest::native_rel_path`): a drive-letter-shaped segment (`X:`) is now
+rejected at *any* depth in a `rel_path`, not just the head — a legal POSIX
+filename like `a/M:31.fits` is now refused where it was accepted before; it
+fails closed at the sender. `native_rel_path` now drops a literal `.` segment.
+It also collapses an empty segment, so `a//b` and a trailing `a/b/` both
+normalize instead of round-tripping the extra separator into the stored path.
+
+**Open question, not a finding.** The Windows failures of
+`sync::ingest_tests::ingest_releases_conn_between_frames` are consistent with
+the starvation mitigation being weaker there than CLAUDE.md's comment assumes:
+`std::thread::yield_now()` on Windows is `SwitchToThread`, which yields only to
+a thread ready on the *same* processor. Nobody has measured whether the W2
+bounded-wait guarantee ("a concurrent lane waits at most one frame") actually
+holds on Windows.
+
+**`ingest_releases_conn_between_frames` still fails roughly 4 of 5 isolated
+runs on a developer Windows machine**, measured during this cycle, unless the
+CI skip flag (`--skip ingest_releases_conn_between_frames`) is passed — the
+test also self-skips when `CI` is set, but a bare local run on Windows will see
+it fail most of the time.
+
+**The collab-contribution path fix (`sync/project_ingest.rs`) has no
+regression test of its own**, unlike its sibling fix in `sync/ingest.rs`
+(`ingest_stores_native_path_matching_landed_file`). Deliberate for this fix —
+the mechanism is identical and already covered on the sibling path — but it is
+a real coverage gap on `project_ingest.rs` specifically.
 
 ---
 

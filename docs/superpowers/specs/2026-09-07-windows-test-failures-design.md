@@ -12,6 +12,19 @@ file:line attribution and a suggested order are in
 `research/2026-09-06-windows-test-failures.md`; this document does not repeat
 them, it decides what to do about them.
 
+**A note on which 39, reconciled after the fact.** That count was measured
+against `main` at `70de6a1d`, not against this branch's own base — though the
+research document independently confirmed the identical named failure set on a
+sibling branch, so the two are the same bugs. The first Windows measurement
+actually taken *on* this branch, after the directory-mtime fix (family B) had
+already landed, read 34; a second reading, after the CRLF-guard fix and the
+hardcoded-forward-slash fix, read 31. The research document's own family sum
+was 36–37 against the headline 39 (§5); the two failures it never placed in
+any family were `api::sync::tests::storage_report_counts_leftovers_after_a_move`
+and `api::sync::tests::transfer_paths_roundtrip_defaults_and_custom` — both
+turned out to be the same fixture cause as families A and E and were fixed by
+the same task (T5).
+
 Two facts frame the work.
 
 **Nothing would have caught these.** `.gitlab-ci.yml` contains `cargo test` zero
@@ -226,8 +239,48 @@ design question — the research document's own ordering, and it stays.
 
 ## 9. Release-note lines owed
 
-Only T7 changes behaviour a user can see; the rest restores a test suite.
+Only the production fixes change behaviour a user can see; the rest restores a
+test suite.
 
-- On Windows, files received from another device now land with native path
-  separators, so a received file is no longer at risk of being catalogued twice
-  once the folder is scanned.
+- On Windows, a file received from another device is now recorded in the
+  catalog using the platform's own path spelling. Previously the recorded path
+  mixed separators, which would have let a later folder scan catalog the same
+  file a second time.
+- The same fix applies to a received project collaboration contribution: its
+  landed path is now recorded in the platform's own spelling too, so the
+  duplicate-copy lookup that keys on it can actually find a match on Windows.
+
+## 10. Outcome
+
+Every family turned out to be test-side except F, which was both.
+
+| Family | Cause | Fix |
+| ---- | ---- | ---- |
+| A [2] | Fixture seeded a raw `canonicalize()` result (`\\?\`-prefixed on Windows) instead of the normalised spelling `add_scan_root` persists. | T5, the shared `canonical_tempdir()` helper. |
+| B [5] | Test helper opened a directory the ordinary way; Windows needs `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle at all. | T2. |
+| C [2] | Assertions compared a built path against a forward-slash literal. | T4. |
+| D [6] | Fixtures built paths with `format!`/embedded-`/` string joins, which Windows treats as a filename character rather than a separator: the file landed at a mixed-separator path, the scanner catalogued it under its own native spelling, and the test's exact-string lookup matched nothing. **The diagnosis is TEST, not production** — the non-destructive in-place rescan path (the one that preserves `files.id`/`frames.id` across an edit) was never at fault. | T6. |
+| E [16] | Same cause as A, across scan-root containment/prefix tests, plus one straggler (`overview_counts_archived_sets_and_distinct_zip_bytes`) that built children with `format!("{arc}/lights.zip")` against a verbatim base — error 123, `InvalidFilename`, for the same forward-slash-as-filename-character reason as D. | T5. |
+| F [4] | Both. Three of the four assertions hardcoded a forward-slash comparison string against a correctly-landed native path (test-side). The fourth exposed a real production defect: `land_payload` joined the wire `rel_path` onto the landing base unconverted, so a nested receive stored a mixed-separator string in `files.path` while the file itself landed correctly on disk — a later folder scan would catalog the same file a second time under its native spelling. | Test-side: `116fb09f`. Production: `558c0e69` (`native_rel_path` in `sync::ingest`), hardened by `5176dffa` after the final review found a drive-letter-mid-segment path-escape in the first version. |
+| G [1] | The terminal-writer drift guard split its own embedded source on a literal `"\n#[cfg(test)]\nmod tests"`, which never matches under `core.autocrlf=true` — the guard silently counted its own test module (26 instead of 12) and could not do its job on any Windows checkout. | T3, plus `.gitattributes` pinning `*.rs eol=lf` as its own revertible commit (D6). |
+| H [1] | Same construction as D (`scan_repairs_moved_project_contribution`), absorbed into T6's sweep. | T6. |
+
+**Three tests were found passing vacuously on Windows** and were de-blinded in
+the same T6 sweep: `scan_leaves_duplicate_project_contribution`,
+`scan_leaves_unknown_project_contribution` and
+`scan_never_catalogs_a_calibrated_artifact`. Each asserted a negative
+(`files_count(...) == 0`, `find_contribution_by_landed_path(...).is_none()`)
+keyed on the same mixed-separator spelling family D produced — a lookup keyed
+on a spelling the catalog can never contain returns "nothing" whatever the
+scanner actually did, so these would have passed even if the scanner had
+wrongly catalogued the artifact. Fixing the fixture is what let them start
+testing anything at all.
+
+The CI job's `continue-on-error: true` (`.github/workflows/ci.yml`) stays.
+Every measurement in this cycle ran `cargo test -p athenaeum-core --lib`; the
+job itself runs `cargo test --workspace`, and same-class separator/path
+failures are already known to exist in `athenaeum-web` (a raw `canonicalize()`
+compared against a value production stores normalised, same family as A/E) and
+in `crates/perseus` (slash-literal `join()` fixtures, the same construction as
+D/H). The line comes out once a workspace-wide Windows run is actually green —
+see `open-items.md` for the residue.

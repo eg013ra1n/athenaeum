@@ -39,6 +39,14 @@ pub(crate) fn canonical_path(path: &std::path::Path) -> PathBuf {
 /// `sync::receiver::tests::every_terminal_writer_announces_or_is_a_named_exemption`.
 /// Without it the next fixture repeats the mistake and only a Windows runner
 /// notices — which is exactly how 39 tests accumulated unmeasured.
+///
+/// Deliberately narrower than "no raw canonicalize anywhere": it walks only
+/// `athenaeum-core/src` (not `tests/`, not the other crates in the workspace),
+/// and it matches the `.canonicalize().unwrap()` / `.canonicalize().expect(`
+/// method-call spelling only — the free-function form
+/// `std::fs::canonicalize(p).unwrap()` is not caught and is already live at a
+/// few sites. A reader should not take a green run of this test as proof the
+/// whole tree is clean.
 #[test]
 fn fixtures_never_seed_a_raw_canonicalized_path() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
