@@ -2847,6 +2847,14 @@ fn midpackage_observations(
 /// the store connection between frames so a concurrent lane (another transfer's
 /// fetch-sink state writes, or its own ingest) waits at most ONE frame, not the
 /// whole multi-GB package.
+///
+/// This test is **load-sensitive by construction**: it uses a timing probe that
+/// needs a competing thread to win a race against an unfair mutex. Measurement:
+/// 4 of 5 isolated runs failed on Windows; on macOS it surfaced three times
+/// during full-suite load (tasks 4, 5, 7) despite passing in isolation. CI
+/// skips it by name, so a green CI run is not evidence it passed. The invariant
+/// it guards is real and documented in CLAUDE.md; making it deterministic is
+/// recorded as a separate item rather than weakening the test.
 #[test]
 fn ingest_releases_conn_between_frames() {
     // This is a timing probe: it can only observe the released window if the
