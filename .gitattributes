@@ -1,0 +1,22 @@
+# Line endings are pinned, not left to core.autocrlf.
+#
+# Several tests read their own source with include_str! and reason about it
+# line by line; one of them (the terminal-writer guard in sync/receiver.rs)
+# silently guarded nothing on Windows because the checkout carried CRLF. Much
+# of this suite also compares paths and text, where a stray \r is a very quiet
+# way to be wrong.
+#
+# There are no .bat/.cmd/.ps1 files in this repository, so nothing here wants
+# CRLF in the working tree.
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.sh text eol=lf
