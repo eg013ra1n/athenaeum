@@ -187,6 +187,62 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Missing-file purge, scan-error reveal, offline re-check (2026-09-07)
+
+Backlog v0.5.6 items 7 and 8.
+
+**The purge defect is fixed and pinned.** `delete_missing_files` ran a bare
+`DELETE FROM files` on both backends, so deleting a MASTER's file from the
+Missing Files panel left its raw source set pointing at a master that existed
+neither on disk nor in the catalog — frames invisible to the matcher, nothing in
+the UI able to undo it (the exact stranding the 2026-08-02 audit C3 fixed on the
+orphan-purge path). Both bodies now call
+`athenaeum_core::relinking::delete_orphaned_files`. New route test
+`deleting_a_master_file_un_supersedes_its_raw_set` (`routes/missing_files.rs`)
+fails on the old code and passes on the new.
+
+- **The Tauri twin has no test of its own** — the command needs a
+  `tauri::State`, and there is no harness for that in this repo. It is the same
+  one-line replacement, verified by reading. Worth one pass in the desktop app:
+  delete a master's missing file, confirm its raw set stops being dimmed and
+  shows no `→ M#<id>` link.
+- Reveal on scan errors needs a genuinely unreadable file to appear at all —
+  truncate a `.fits` to a few hundred bytes inside a scan root, scan, then open
+  **Needs attention → N files failed in last scan**: the row should carry a
+  reveal button that opens the containing folder. The path is recovered by
+  splitting the message on its first `": "`, so a message with no path (a DB
+  error) must show no button.
+- Offline re-check: unmount a drive, select the folder, press **Check again** →
+  "Still not reachable"; remount, press again → the banner goes and Scan
+  now / Relink come back. Repeat on a ROLE folder (Calibration Library) — it
+  hosts the same banner and got the same button.
+- No background polling was added, deliberately: `Path::exists()` on a dead
+  network mount can block for that mount's own timeout. Window-focus re-check
+  stays unbuilt and is still an open question in the backlog.
+
+### Plate-solve input-gate controls (2026-09-07)
+
+Backlog v0.5.6 item 1. Frontend-only: `PlateSolveSettingsPanel.tsx` grew a
+**Batch Concurrency** field in Solver Parameters and an **Input Gate** section
+(`input_gate_enabled` toggle, `input_max_eccentricity`, `input_min_trail_r2`,
+the two numbers disabled while the toggle is off). No Rust change — the three
+commands already round-tripped the whole struct, which is why the fields
+persisted without controls. Gate run: `npx tsc --noEmit` clean. There are no
+frontend tests in this repo to add to.
+
+- The whole acceptance check is by hand: the toggle and both numbers survive
+  Save → restart; **Reset to Defaults** puts back 0.85 / 0.65 / on; the three
+  fields that were already on the tab still save; and a frame the gate
+  previously refused attempts a solve again once the toggle is off.
+- The copy states the measured reference ranges and says plainly that tightening
+  will **not** catch more trailed frames (backlog item 4: the full analysis path
+  under-reports eccentricity on exactly those). Worth reading once on screen —
+  it is the sentence the retracted v0.5.5 release note got wrong.
+- Owner decision, 2026-09-07: the acceptance-gate group
+  (`blind_*`, 7 fields) stays unexposed. It is what stopped v0.5.5's false
+  16–193x solutions from reaching the catalog. If it ever surfaces it belongs
+  behind an "Advanced" disclosure naming the failure it prevents.
+
 ### Integration throughput (2026-09-06)
 
 Spec `docs/superpowers/specs/2026-09-06-integration-throughput-design.md`, branch
@@ -721,3 +777,15 @@ cycle, so anything from them that matters later belongs here or in a plan.
   frames finally show every pixel the sensor recorded.
 - The Blink image cache is now bounded in megabytes as well as in frame count, so a
   full-resolution session cannot quietly grow to gigabytes.
+- The plate-solve input gate — the check that refuses a frame whose stars are
+  streaks before a solve is attempted — now has controls in Settings → Plate
+  Solving: an on/off toggle and the two thresholds it compares. The worker count
+  for batch solving is adjustable in the same place.
+- Deleting a missing file that happens to be a master no longer strands the raw
+  frames it was built from: the source set goes back to being matchable, exactly
+  as it does when a master is removed any other way.
+- Files that could not be read during a scan can now be revealed in the file
+  manager straight from the scan-error list.
+- A folder whose drive went away can be re-checked in place. Plug the drive back
+  in, press **Check again**, and the folder comes back — no more scanning some
+  other folder to make the app notice.
