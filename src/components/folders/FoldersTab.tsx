@@ -137,6 +137,19 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
 
   useEffect(() => { void refreshAux(); }, [refreshAux]);
 
+  /**
+   * Re-check whether an offline folder came back. Availability is only
+   * recomputed on mount and after a mutation, so until this existed the only
+   * way to re-detect a remounted drive was to scan a DIFFERENT folder — that
+   * scan's `refreshAll` re-ran the check for every root as a side effect.
+   * Awaitable so the button can show it is working and say when nothing
+   * changed.
+   */
+  const handleRecheck = useCallback(async () => {
+    await refreshScanRoots();
+    await refreshAux();
+  }, [refreshScanRoots, refreshAux]);
+
   const refreshAll = useCallback(() => {
     void refreshScanRoots();
     void refreshAux();
@@ -452,6 +465,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onRemove={() => root.id && handleRemoveScanRoot(root.id)}
             removing={removingRootId === root.id}
             onMissingChanged={() => void refreshAux()}
+            onRecheck={handleRecheck}
           />
         );
       } else {
@@ -469,6 +483,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             relinkResult={relinkResult?.rootId === root.id ? relinkResult.result : null}
             onScan={() => root.id && handleScan(root.id)}
             onRelink={() => root.id && handleRelink(root.id)}
+            onRecheck={handleRecheck}
             onChangeFolder={() => handleChangeRoleFolder(kind)}
             onReleaseRole={() => handleReleaseRole(kind)}
             onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => reportToggleFailure('duplicates', e)); }}

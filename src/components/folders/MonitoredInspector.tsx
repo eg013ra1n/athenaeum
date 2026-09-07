@@ -6,6 +6,7 @@ import { isTauri } from '../../utils/platform';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { MissingFilesPanel } from '../MissingFilesPanel';
 import { SwitchRow } from './SwitchRow';
+import { RecheckButton } from './RecheckButton';
 import { basename, formatBytes } from './format';
 import type { ScanRootWithAvailability, MissingFileRecord, ScanResult } from '../../types/helpers';
 import type { RelinkResult, ScanRootOverview } from '../../types/models';
@@ -25,10 +26,32 @@ interface MonitoredInspectorProps {
   onToggleUniqueCamera: (v: boolean) => void;
   onToggleMonitor: (v: boolean) => void;
   onRemove: () => void;
+  /** Re-run the availability check for every root — the way back from offline. */
+  onRecheck: () => Promise<void>;
   /** Removal of this root is in flight — the delete walks every file and frame
    *  it owns, so the button has to say so instead of silently doing nothing. */
   removing: boolean;
   onMissingChanged: () => void;
+}
+
+/**
+ * Recover the file path from a scan-error line.
+ *
+ * The scanner formats every per-file error as `"{path}: {message}"`
+ * (`scanner/mod.rs`), so the path is still in the string — which is what lets
+ * a reveal button exist before these errors become structured records. Only an
+ * absolute-looking prefix counts, so pathless messages ("Failed to start DB
+ * transaction: …", "Failed to auto-create calibration sets: …") get no button.
+ *
+ * Known limit of the heuristic: a filename that itself contains `": "` is
+ * truncated here, and the reveal then fails and logs. Nothing worse.
+ */
+function pathFromScanError(message: string): string | null {
+  const sep = message.indexOf(': ');
+  if (sep <= 0) return null;
+  const candidate = message.slice(0, sep);
+  const absolute = candidate.startsWith('/') || /^[A-Za-z]:[\\/]/.test(candidate);
+  return absolute ? candidate : null;
 }
 
 export function MonitoredInspector(props: MonitoredInspectorProps) {
@@ -101,10 +124,16 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
               {overview ? ` ${overview.file_count.toLocaleString()}` : ''} files — Relink points them to the new location;
               frame sets, calibration links and tags survive.
             </p>
-            <button onClick={props.onRelink} disabled={relinking || isScanning}
-              className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
-              <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={props.onRelink} disabled={relinking || isScanning}
+                className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
+                <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
+              </button>
+              {/* A drive that simply came back needs no relink — its path never
+                  changed. Before this button the only way to re-detect it was
+                  to scan some other folder. */}
+              <RecheckButton onRecheck={props.onRecheck} disabled={relinking || isScanning} />
+            </div>
           </div>
         </div>
       )}
@@ -185,7 +214,23 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
                 </button>
                 {errorsOpen && (
                   <div id={`scan-errors-panel-${root.id ?? 'unsaved'}`} className="px-3 py-2 max-h-40 overflow-y-auto space-y-1">
-                    {displayErrors.map((err, i) => <p key={i} className="text-xs text-error/80 font-mono break-all">{err}</p>)}
+                    {displayErrors.map((err, i) => {
+                      const errPath = pathFromScanError(err);
+                      return (
+                        <div key={i} className="flex items-start gap-1.5">
+                          <p className="flex-1 min-w-0 text-xs text-error/80 font-mono break-all">{err}</p>
+                          {isTauri && !offline && errPath && (
+                            <button
+                              onClick={() => revealItemInDir(errPath).catch((e) => console.error('[MonitoredInspector] reveal failed:', e))}
+                              title="Reveal in file manager" aria-label="Reveal in file manager"
+                              className="shrink-0 mt-0.5 p-0.5 rounded text-content-muted hover:text-accent transition"
+                            >
+                              <ExternalLink size={12} />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

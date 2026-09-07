@@ -3,6 +3,7 @@ import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { SwitchRow } from './SwitchRow';
+import { RecheckButton } from './RecheckButton';
 import { Stat, Section } from './MonitoredInspector';
 import { basename, formatBytes } from './format';
 import { ROLE_META, type RoleKind } from './roleMeta';
@@ -33,6 +34,12 @@ interface RoleInspectorProps {
   relinking?: boolean;
   relinkResult?: RelinkResult | null;
   onRelink?: () => void;
+  /**
+   * Re-run the availability check. Optional for the same reason `onRelink` is:
+   * a COVERED calibration library has no root of its own, and the banner that
+   * hosts the button only renders for a non-null offline root.
+   */
+  onRecheck?: () => Promise<void>;
 }
 
 export function RoleInspector(props: RoleInspectorProps) {
@@ -74,12 +81,17 @@ export function RoleInspector(props: RoleInspectorProps) {
             <p className="text-xs text-error/80 mt-0.5 mb-2">
               Drive unmounted, renamed or moved. Relink points the catalog to the new location.
             </p>
-            {props.onRelink && (
-              <button onClick={props.onRelink} disabled={relinking}
-                className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
-                <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
-              </button>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {props.onRelink && (
+                <button onClick={props.onRelink} disabled={relinking}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
+                  <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
+                </button>
+              )}
+              {props.onRecheck && (
+                <RecheckButton onRecheck={props.onRecheck} disabled={relinking} />
+              )}
+            </div>
           </div>
         </div>
       )}
