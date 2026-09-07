@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { ExternalLink, Loader2, Plus, Send, Target } from 'lucide-react';
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
+import { useSessionState } from '../contexts/SessionStateContext';
 import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
@@ -34,7 +36,9 @@ export default function ProjectDetail() {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [gate, setGate] = useState<GateReport | null>(null);
   const [gateError, setGateError] = useState(false);
-  const [tab, setTab] = useState<Tab>('contribute');
+  // Session-scoped so stepping into a linked object and back returns to the
+  // tab you were on.
+  const [tab, setTab] = useSessionState<Tab>('projectDetail.tab', 'contribute');
   const [linkOpen, setLinkOpen] = useState(false);
   const [missing, setMissing] = useState(false);
   const [packages, setPackages] = useState<ProjectPackageView[] | null>(null);
@@ -238,6 +242,7 @@ export default function ProjectDetail() {
   return (
     <div className="space-y-4 p-6">
       <div className="flex flex-wrap items-center gap-3">
+        <HistoryNav fallback="/projects" />
         <h1 className="truncate text-lg font-semibold text-content">{c.title}</h1>
         <span className="flex items-center gap-1 text-xs text-content-muted">
           <Target size={12} /> {c.targetName} · r {c.targetRadiusDeg.toFixed(1)}°

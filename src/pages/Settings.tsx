@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
 import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, UserCircle, ArrowLeftRight } from 'lucide-react';
 import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
@@ -570,9 +571,12 @@ export default function Settings() {
 
   return (
     <div className="p-6 max-w-4xl">
-      <div className="mb-6">
-        <h2 className="text-3xl font-bold">Settings</h2>
-        <p className="text-content-muted">Configure application settings</p>
+      <div className="mb-6 flex items-center gap-2">
+        <HistoryNav />
+        <div>
+          <h2 className="text-3xl font-bold">Settings</h2>
+          <p className="text-content-muted">Configure application settings</p>
+        </div>
       </div>
 
       {/* Tab Navigation */}

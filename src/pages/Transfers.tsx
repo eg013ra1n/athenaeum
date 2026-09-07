@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeftRight } from 'lucide-react';
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
 import { AppDataWarningStrip } from '../components/transfers/AppDataWarningStrip';
 import { TransferRow } from '../components/transfers/TransferRow';
 import { TransferDetail } from '../components/transfers/TransferDetail';
@@ -231,6 +232,7 @@ export default function Transfers() {
   return (
     <div className="flex h-full flex-col p-4 pt-3">
       <div className="mb-3 flex shrink-0 items-center gap-2">
+        <HistoryNav />
         <ArrowLeftRight size={22} className="text-accent" />
         <h2 className="text-2xl font-bold">Transfers</h2>
       </div>

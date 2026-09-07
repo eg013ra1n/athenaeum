@@ -2,6 +2,7 @@ import { useState, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { addMonths, subMonths, addYears, subYears } from 'date-fns';
 import { Loader2, AlertCircle } from 'lucide-react';
+import { HistoryNav } from '../components/HistoryNav';
 import { useCalendarData } from '../hooks/useCalendarData';
 import { useCalendarYearData } from '../hooks/useCalendarYearData';
 import { CalendarMonthNav, type CalendarViewMode } from '../components/calendar/CalendarMonthNav';
@@ -111,7 +112,8 @@ export default function ShootCalendar() {
   return (
     <div className="p-4 pt-3 h-full flex flex-col">
       {/* Header */}
-      <div className="flex-shrink-0 mb-2">
+      <div className="flex-shrink-0 mb-2 flex items-center gap-2">
+        <HistoryNav />
         <h2 className="text-2xl font-bold">
           Shoot Calendar
           <span className="text-sm font-normal text-content-muted ml-3">Browse captures by date with equipment and target information</span>

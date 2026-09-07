@@ -1,6 +1,7 @@
 import { RefreshCw, Target, Users } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useProjects } from '../hooks/useProjects';
+import { HistoryNav } from '../components/HistoryNav';
 
 export default function Projects() {
   const { projects, loading, refreshing, signedOut, refresh } = useProjects();
@@ -10,6 +11,7 @@ export default function Projects() {
   return (
     <div className="p-6 space-y-4">
       <div className="flex items-center gap-3">
+        <HistoryNav />
         <Users size={20} className="text-content-secondary" />
         <h1 className="text-lg font-semibold text-content">Projects</h1>
         <button

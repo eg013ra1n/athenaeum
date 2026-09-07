@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Outlet, NavLink } from 'react-router-dom';
+import { useState, useEffect, useRef } from 'react';
+import { Outlet, NavLink, useLocation } from 'react-router-dom';
 import { Files, Calendar, Target, Focus, Camera, Settings, Trash2, Info, Users, ChevronsLeft, ChevronsRight, ArrowLeftRight } from 'lucide-react';
 import { ArchiveResumeBanner } from './archive/ArchiveResumeBanner';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
@@ -16,6 +16,10 @@ import { RegistrationProgressProvider } from '../contexts/RegistrationProgressCo
 import { RegistrationQueueIndicator } from './RegistrationQueueIndicator';
 import { PlateSolveIndexMissingModal } from './plate-solve';
 import { NotificationProvider } from '../contexts/NotificationContext';
+import { NavHistoryProvider, useNavHistory } from '../contexts/NavHistoryContext';
+import { SessionStateProvider } from '../contexts/SessionStateContext';
+import { useGlobalNavKeys } from '../hooks/useGlobalNavKeys';
+import { useScrollRestoration } from '../hooks/useScrollRestoration';
 import { NotificationBell } from './NotificationBell';
 import { ToastStack } from './Toast';
 import { NotificationPanel } from './NotificationPanel';
@@ -43,10 +47,22 @@ function ContentIndexListener() {
   return null;
 }
 
+/** Mounts the app-wide back/forward shortcuts. Rendered inside
+ * `NavHistoryProvider` for the same reason the listeners above live in their own
+ * components: the hook needs a context the Layout body itself sits above. */
+function GlobalNavKeys() {
+  const { back, forward } = useNavHistory();
+  useGlobalNavKeys(back, forward);
+  return null;
+}
+
 export default function Layout() {
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem('sidebar-collapsed') === 'true'
   );
+  const { pathname } = useLocation();
+  const contentRef = useRef<HTMLDivElement>(null);
+  useScrollRestoration(contentRef);
 
   useEffect(() => {
     localStorage.setItem('sidebar-collapsed', String(collapsed));
@@ -66,6 +82,8 @@ export default function Layout() {
   ];
 
   return (
+    <NavHistoryProvider>
+    <SessionStateProvider>
     <NotificationProvider>
     <TransfersProvider>
     <ScanProgressProvider>
@@ -94,6 +112,11 @@ export default function Layout() {
                 <NavLink
                   key={to}
                   to={to}
+                  // Clicking the page you are already on must not stack a
+                  // duplicate history entry — Back would then appear to do
+                  // nothing. Exact match only: /objects while on /objects/42 is
+                  // a real navigation and still pushes.
+                  replace={pathname === to}
                   title={collapsed ? label : undefined}
                   className={({ isActive }) =>
                     `flex items-center ${collapsed ? 'justify-center px-0' : 'gap-3 px-4'} py-3 rounded-lg transition-colors ${
@@ -132,7 +155,7 @@ export default function Layout() {
           {/* Main Content */}
           <main className="flex-1 overflow-auto flex flex-col">
             <ArchiveResumeBanner />
-            <div className="flex-1 overflow-auto">
+            <div ref={contentRef} className="flex-1 overflow-auto">
               <Outlet />
             </div>
           </main>
@@ -147,6 +170,7 @@ export default function Layout() {
           <AutoUpdateCheck />
           <ProjectMatchesListener />
           <ContentIndexListener />
+          <GlobalNavKeys />
         </div>
         </MasterBuildProvider>
         </RegistrationProgressProvider>
@@ -156,5 +180,7 @@ export default function Layout() {
     </ScanProgressProvider>
     </TransfersProvider>
     </NotificationProvider>
+    </SessionStateProvider>
+    </NavHistoryProvider>
   );
 }

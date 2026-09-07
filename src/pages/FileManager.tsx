@@ -8,6 +8,8 @@ import { AlertDialog } from '../components/AlertDialog';
 import { MissingMetadataView } from '../components/missing-metadata/MissingMetadataView';
 import { DuplicatesView } from '../components/duplicates/DuplicatesView';
 import FoldersTab from '../components/folders/FoldersTab';
+import { HistoryNav } from '../components/HistoryNav';
+import { useSessionState } from '../contexts/SessionStateContext';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
@@ -27,7 +29,9 @@ export default function FileManager() {
   const { scanRoots, error: rootsError, refresh: refreshScanRoots } = useScanRootsWithAvailability();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
-  const [activeTab, setActiveTab] = useState<TabMode>('directories');
+  // Session-scoped so returning to File Manager — from the sidebar or via Back
+  // — lands on the tab you left, not on Folders.
+  const [activeTab, setActiveTab] = useSessionState<TabMode>('files.tab', 'directories');
   const [browserReveal, setBrowserReveal] = useState<DualPaneRevealRequest | undefined>(undefined);
   const location = useLocation();
   const navigate = useNavigate();
@@ -121,7 +125,8 @@ export default function FileManager() {
 
   return (
     <div className="p-4 pt-3 h-full flex flex-col min-h-0">
-      <div className="mb-4">
+      <div className="mb-4 flex items-center gap-2">
+        <HistoryNav />
         <h2 className="text-2xl font-bold">
           File Manager
           <span className="text-sm font-normal text-content-muted ml-3">

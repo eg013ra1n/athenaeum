@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Trash2, RotateCcw, Loader2, Filter, ChevronDown, ChevronRight, Square, CheckSquare, XSquare, Folder, AlertOctagon } from 'lucide-react';
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
 import { format } from 'date-fns';
 import type { BlackHoleEntry } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -348,14 +349,17 @@ export default function BlackHole() {
       {/* Header */}
       <div className="mb-4 flex-shrink-0">
         <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-3xl font-bold">Black Hole</h2>
-            <p className="text-content-muted mt-1">
-              {entries.length} file{entries.length !== 1 ? 's' : ''} • {formatSize(totalSize)} total
-              {selectionCount > 0 && (
-                <span className="text-warning ml-2">• {selectionCount} selected</span>
-              )}
-            </p>
+          <div className="flex items-center gap-2">
+            <HistoryNav />
+            <div>
+              <h2 className="text-3xl font-bold">Black Hole</h2>
+              <p className="text-content-muted mt-1">
+                {entries.length} file{entries.length !== 1 ? 's' : ''} • {formatSize(totalSize)} total
+                {selectionCount > 0 && (
+                  <span className="text-warning ml-2">• {selectionCount} selected</span>
+                )}
+              </p>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">

@@ -407,9 +407,12 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // URL-based jump (same mechanism as the Equipment chip → coverage flow).
   // FrameSetDetail watches searchParams and consumes these to switch tab +
   // seed pendingHighlightCalSet, which CalibrationTableView then highlights.
+  // `replace` because this is a tab switch inside the page we are already on:
+  // FrameSetDetail strips the params again the moment it consumes them, so a
+  // push would leave a dead history entry that makes Back appear to do nothing.
   const handleSetClick = useCallback((setId: number) => {
     const kind = setKindMap.get(setId) ?? 'dark';
-    navigate(`?tab=calibration&highlightSet=${setId}&kind=${kind}`);
+    navigate(`?tab=calibration&highlightSet=${setId}&kind=${kind}`, { replace: true });
   }, [navigate, setKindMap]);
 
   const handleSelectFolder = useCallback(async () => {
@@ -557,7 +560,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                                 ? readiness?.rawSetIdsWithoutMaster[0]
                                 : undefined;
                               if (first !== undefined) handleSetClick(first);
-                              else navigate('?tab=calibration');
+                              else navigate('?tab=calibration', { replace: true });
                             }}
                           >
                             → Coverage

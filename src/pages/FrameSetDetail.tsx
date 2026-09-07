@@ -10,6 +10,8 @@ import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '.
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
+import { HistoryNav } from '../components/HistoryNav';
+import { useNavHistory } from '../contexts/NavHistoryContext';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../components/calibration/utils';
 import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
@@ -38,6 +40,7 @@ const REGISTRATION_ENABLED = import.meta.env.DEV;
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { backOr } = useNavHistory();
   const location = useLocation();
   const { notify } = useNotifications();
   const [detail, setDetail] = useState<FrameSetDetail | null>(null);
@@ -643,7 +646,7 @@ export default function FrameSetDetail() {
       <div className="p-6">
         <div className="mb-4">
           <button
-            onClick={() => navigate('/objects')}
+            onClick={() => backOr('/objects')}
             className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
           >
             <ArrowLeft size={18} />
@@ -668,7 +671,7 @@ export default function FrameSetDetail() {
       <div className="p-6">
         <div className="mb-4">
           <button
-            onClick={() => navigate('/objects')}
+            onClick={() => backOr('/objects')}
             className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
           >
             <ArrowLeft size={18} />
@@ -688,12 +691,7 @@ export default function FrameSetDetail() {
       <div className="bg-surface-elevated rounded-lg p-3 mb-2 border border-border flex-shrink-0">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => navigate('/objects')}
-              className="flex items-center text-content-muted hover:text-content transition pr-3 mr-1 border-r border-border"
-            >
-              <ArrowLeft size={18} />
-            </button>
+            <HistoryNav fallback="/objects" className="pr-3 mr-1 border-r border-border" />
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
               {detail.frames_set?.archived_at && (

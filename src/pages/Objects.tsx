@@ -17,6 +17,8 @@ import { ObjectsTableView } from '../components/ObjectsTableView';
 import type { ObjectsTab } from '../components/ObjectsTableView';
 import { ToolbarContainer, ToolbarButton, ToolbarDivider, ToolbarInfo } from '../components/Toolbar';
 import { useNotifications } from '../contexts/NotificationContext';
+import { useSessionState } from '../contexts/SessionStateContext';
+import { HistoryNav } from '../components/HistoryNav';
 
 export default function Objects() {
   const navigate = useNavigate();
@@ -59,7 +61,9 @@ export default function Objects() {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [filters, setFilters] = useState<ObjectsFilterState>(emptyFilterState);
   const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
-  const [activeTab, setActiveTab] = useState<ObjectsTab>('stage');
+  // Session-scoped: coming back from a frame set (Back, Backspace or the
+  // sidebar) returns to the tab you were on, not to Stage.
+  const [activeTab, setActiveTab] = useSessionState<ObjectsTab>('objects.tab', 'stage');
   const [excludedCount, setExcludedCount] = useState<number>(0);
 
   // For now, using project_id = 1 as default
@@ -743,10 +747,13 @@ export default function Objects() {
       {/* Title block + compact action buttons (kept ~h2 height so the tab
           row still aligns with the File Manager tab strip) */}
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold">
-          Objects Library
-          <span className="text-sm font-normal text-content-muted ml-3">Frame sets grouped by sky coordinates</span>
-        </h2>
+        <div className="flex items-center gap-2">
+          <HistoryNav />
+          <h2 className="text-2xl font-bold">
+            Objects Library
+            <span className="text-sm font-normal text-content-muted ml-3">Frame sets grouped by sky coordinates</span>
+          </h2>
+        </div>
         <div className="flex items-center gap-2">
           {excludedCount > 0 && (
             <button

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
 import { CameraStats } from "../types/models";
 import CameraCard from "../components/CameraCard";
 import CameraDetail from "../components/CameraDetail";
@@ -80,7 +81,8 @@ export default function Equipment() {
 
   return (
     <div className="p-4 pt-3">
-      <div className="mb-4">
+      <div className="mb-4 flex items-center gap-2">
+        <HistoryNav />
         <h2 className="text-2xl font-bold">
           Equipment Library
           <span className="text-sm font-normal text-content-muted ml-3">Browse instruments with captured frames and calibration library management</span>

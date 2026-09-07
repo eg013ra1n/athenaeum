@@ -46,7 +46,7 @@ import {
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { revealItemInDir } from '../../api/desktop';
-import { isTauri } from '../../utils/platform';
+import { isTauri, isMac } from '../../utils/platform';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
 import { ImageTypeValues } from '../../types/helpers';
 import type { FileWithFrame, Frame } from '../../types/models';
@@ -953,7 +953,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   }, [visibleListing, paneScanRoots, state.activePane, state.panes]);
 
   // True when ANY confirm/prompt dialog is open. Pane shortcuts (F-keys,
-  // Tab, Cmd+I, Cmd+A, Space, Enter, arrows, Backspace) are suppressed in
+  // Tab, Cmd+I, Cmd+A, Space, Enter, arrows) are suppressed in
   // that case so they can't accidentally fire underneath the dialog.
   const isModalOpen = !!(confirmMove || confirmDelete || mkdirState || renameState || blinkFrames || sendOpen);
 
@@ -1035,7 +1035,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           ...listing.files.map((f) => f.file.path),
         ]);
         dispatch({ type: 'set_selection', pane: state.activePane, selection: all });
-      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && !e.altKey && !e.metaKey) {
         const order = keyboardOrder(state.activePane);
         if (order.length === 0) return;
         e.preventDefault();
@@ -1076,10 +1076,12 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         // Always preventDefault so the page doesn't scroll.
         e.preventDefault();
         openBlink();
-      } else if (e.key === 'Backspace') {
-        // Backspace = navigate up one level (clamped to scan root, scoped
-        // to the active pane's universe so the left pane can't escape its
-        // camera-touching roots in filter mode).
+      } else if (e.key === 'ArrowUp' && (e.altKey || e.metaKey)) {
+        // Alt+Up (Cmd+Up on macOS) = navigate up one level (clamped to scan
+        // root, scoped to the active pane's universe so the left pane can't
+        // escape its camera-touching roots in filter mode). This used to be
+        // Backspace, which is now the app-wide "back one page" shortcut —
+        // one key cannot mean both without surprising the user.
         const active = state.panes[state.activePane];
         const rootPaths = paneScanRoots(state.activePane).map((r) => r.path);
         const parent = getClampedParent(active.cwd, rootPaths);
@@ -1114,7 +1116,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       {/* Shortcut toolbar — clickable equivalents of the keyboard shortcuts
           driving the active pane. Visual style matches the Analysis-tab
           toolbar (Analysis is the canonical reference for app-wide button
-          styling). Pane-navigation shortcuts (Tab / Enter / Backspace) are
+          styling). Pane-navigation shortcuts (Tab / Enter / Alt+Up) are
           NOT buttons — they're keyboard-only and surfaced as notes in the
           status bar below. Both surfaces call the same handlers, so
           keyboard shortcuts continue to work unchanged. */}
@@ -1380,7 +1382,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           {activePaneListing && ` · ${activePaneListing.files.length} files`}
         </div>
         <div className="font-mono">
-          Tab switch · Enter open · ⌫ up · ↑↓ navigate · Shift+click range · ⌘A select all
+          Tab switch · Enter open · {isMac ? '⌥↑' : 'Alt+↑'} up · ↑↓ navigate · Shift+click range · ⌘A select all
         </div>
       </div>
 

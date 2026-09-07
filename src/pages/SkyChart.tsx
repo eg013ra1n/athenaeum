@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
 import { useNavigate, useNavigationType } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
 import { DrawingMode, SelectionResult } from '../types/selection';
@@ -1303,7 +1304,10 @@ export default function SkyChart() {
       {/* Header */}
       <div className="flex-shrink-0 py-[14px] px-4 border-b border-border bg-surface-elevated flex items-center justify-between">
         {/* Left: Title */}
-        <h2 className="text-2xl font-bold text-content">Sky Chart</h2>
+        <div className="flex items-center gap-2">
+          <HistoryNav />
+          <h2 className="text-2xl font-bold text-content">Sky Chart</h2>
+        </div>
 
         {/* Right: Controls */}
         <div className="flex items-center gap-4">

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
+import { HistoryNav } from '../components/HistoryNav';
 import { openUrl } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
@@ -163,7 +164,8 @@ function DependencyTable({ deps }: { deps: Dependency[] }) {
 export default function About() {
   return (
     <div className="p-8 max-w-4xl mx-auto space-y-10">
-      <div className="text-center py-6">
+      <div className="relative text-center py-6">
+        <HistoryNav className="absolute left-0 top-6" />
         <h1 className="text-4xl font-medium text-success font-antiqua tracking-widest">ATHENAEUM</h1>
         <p className="text-content-muted text-sm mt-2 font-mono">
           v{__APP_VERSION__} ({__GIT_COMMIT__})
