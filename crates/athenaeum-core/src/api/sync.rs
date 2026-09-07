@@ -11620,7 +11620,7 @@ mod tests {
         let conn = db.conn();
         // Seed the root in canonical form (what `add_scan_root` persists) and
         // never create it on disk — that is an unplugged drive.
-        let base = tmp.path().canonicalize().unwrap();
+        let base = crate::test_support::canonical_path(tmp.path());
         let offline = base.join("unplugged").join("lights");
         assert!(!offline.exists());
         crate::db::upsert_scan_root(&conn, offline.to_str().unwrap(), "normal").unwrap();
@@ -11672,7 +11672,7 @@ mod tests {
         let (tmp, ctx) = test_ctx();
         let db = db(&ctx).unwrap();
         let conn = db.conn();
-        let base = tmp.path().canonicalize().unwrap();
+        let base = crate::test_support::canonical_path(tmp.path());
         let allowed = base.join("allowed");
         std::fs::create_dir_all(&allowed).unwrap();
         let outside = base.join("outside").join("new");
@@ -11700,7 +11700,7 @@ mod tests {
         let (tmp, ctx) = test_ctx();
         let db = db(&ctx).unwrap();
         let conn = db.conn();
-        let base = tmp.path().canonicalize().unwrap();
+        let base = crate::test_support::canonical_path(tmp.path());
         let root = base.join("lights");
         std::fs::create_dir_all(&root).unwrap();
         crate::db::upsert_scan_root(&conn, root.to_str().unwrap(), "normal").unwrap();
@@ -11754,11 +11754,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             paths.outgoing.configured.as_deref(),
-            Some(out.canonicalize().unwrap().to_str().unwrap())
+            Some(crate::test_support::canonical_path(&out).to_str().unwrap())
         );
         assert_eq!(
             PathBuf::from(&paths.working.effective),
-            work.canonicalize().unwrap()
+            crate::test_support::canonical_path(&work)
         );
         // Not bound yet -> a configured working dir does not demand a restart.
         assert!(!paths.working.restart_required);
@@ -11781,7 +11781,7 @@ mod tests {
             crate::db::get_setting(&conn, keys::SYNC_INCOMING_WORKING_DIR_PREVIOUS)
                 .unwrap()
                 .as_deref(),
-            Some(work.canonicalize().unwrap().to_str().unwrap())
+            Some(crate::test_support::canonical_path(&work).to_str().unwrap())
         );
     }
 
@@ -12003,7 +12003,7 @@ mod tests {
         assert_eq!(report.leftover_bytes, 4096);
         assert_eq!(
             PathBuf::from(&report.working_dir),
-            work.canonicalize().unwrap()
+            crate::test_support::canonical_path(&work)
         );
 
         // Cleanup refuses while bound there, then frees when not.

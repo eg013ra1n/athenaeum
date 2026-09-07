@@ -79,7 +79,9 @@ pub fn resolve_archive_root(
     if let Some((path, _)) = rows.iter().find(|(_, d)| *d == 1) {
         return Ok(path.clone());
     }
-    anyhow::bail!("multiple archive folders configured but no default — pick a destination explicitly");
+    anyhow::bail!(
+        "multiple archive folders configured but no default — pick a destination explicitly"
+    );
 }
 
 #[cfg(test)]
@@ -106,8 +108,12 @@ mod tests {
         conn.execute(
             "INSERT INTO archive_roots (path, is_default) VALUES ('/arch', 0)",
             [],
-        ).unwrap();
-        assert_eq!(resolve_archive_root(&conn, &settings, None).unwrap(), "/arch");
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_archive_root(&conn, &settings, None).unwrap(),
+            "/arch"
+        );
     }
 
     #[test]
@@ -116,11 +122,16 @@ mod tests {
         conn.execute(
             "INSERT INTO archive_roots (path, is_default) VALUES ('/a', 0), ('/b', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let err = resolve_archive_root(&conn, &settings, None).unwrap_err();
         assert!(format!("{err:#}").contains("no default"));
 
-        conn.execute("UPDATE archive_roots SET is_default = 1 WHERE path = '/b'", []).unwrap();
+        conn.execute(
+            "UPDATE archive_roots SET is_default = 1 WHERE path = '/b'",
+            [],
+        )
+        .unwrap();
         assert_eq!(resolve_archive_root(&conn, &settings, None).unwrap(), "/b");
     }
 
@@ -130,7 +141,8 @@ mod tests {
         conn.execute(
             "INSERT INTO archive_roots (path, is_default) VALUES ('/arch', 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             resolve_archive_root(&conn, &settings, Some("/arch")).unwrap(),
             "/arch",
@@ -142,13 +154,8 @@ mod tests {
     #[test]
     fn resolve_accepts_respelled_configured_root() {
         let (conn, settings) = test_ctx();
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let (_dir, canonical_path) = crate::test_support::canonical_tempdir();
+        let canonical = canonical_path.to_string_lossy().to_string();
         conn.execute(
             "INSERT INTO archive_roots (path, label, is_default) VALUES (?1, NULL, 1)",
             [&canonical],

@@ -1006,8 +1006,7 @@ mod mkdir_target_tests {
 
     #[test]
     fn mkdir_rejects_parent_traversal_against_allowed_roots() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let (_dir, root) = crate::test_support::canonical_tempdir();
         let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
         // escape attempt via ..
         let evil = root.join("..").join("evil-dir");
@@ -1018,8 +1017,7 @@ mod mkdir_target_tests {
 
     #[test]
     fn mkdir_allows_legit_path_under_allowed_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let (_dir, root) = crate::test_support::canonical_tempdir();
         let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
         let target = root.join("new-subdir");
         let r = resolve_mkdir_target(&target.to_string_lossy(), &policy).unwrap();
@@ -1028,8 +1026,7 @@ mod mkdir_target_tests {
 
     #[test]
     fn mkdir_rejects_dotdot_final_component() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let (_dir, root) = crate::test_support::canonical_tempdir();
         let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
         let evil = format!("{}/..", root.display());
         assert!(resolve_mkdir_target(&evil, &policy).is_err());
@@ -1037,8 +1034,7 @@ mod mkdir_target_tests {
 
     #[test]
     fn mkdir_fails_closed_when_parent_does_not_exist() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let (_dir, root) = crate::test_support::canonical_tempdir();
         let policy = PathPolicy::AllowAll;
         let target = root.join("nonexistent-parent").join("child");
         assert!(resolve_mkdir_target(&target.to_string_lossy(), &policy).is_err());
@@ -1226,16 +1222,29 @@ pub fn verify_duplicate_pair(
     let (path_b, size_b, mtime_b, hash_b) = load(file_b)?;
 
     let a_current = crate::duplicates::backfill::disk_matches_row(
-        std::path::Path::new(&path_a), size_a, &mtime_a);
+        std::path::Path::new(&path_a),
+        size_a,
+        &mtime_a,
+    );
     let b_current = crate::duplicates::backfill::disk_matches_row(
-        std::path::Path::new(&path_b), size_b, &mtime_b);
+        std::path::Path::new(&path_b),
+        size_b,
+        &mtime_b,
+    );
 
     let usable = |h: &Option<String>| h.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
     if a_current && b_current {
         if let (Some(ha), Some(hb)) = (usable(&hash_a), usable(&hash_b)) {
-            tracing::debug!(file_a, file_b, identical = (ha == hb),
-                "verify pair: decided from stored hashes");
-            return Ok(VerifyPairResult { identical: ha == hb, method: VerifyMethod::StoredHash });
+            tracing::debug!(
+                file_a,
+                file_b,
+                identical = (ha == hb),
+                "verify pair: decided from stored hashes"
+            );
+            return Ok(VerifyPairResult {
+                identical: ha == hb,
+                method: VerifyMethod::StoredHash,
+            });
         }
     }
 
@@ -1265,7 +1274,10 @@ pub fn verify_duplicate_pair(
         tracing::debug!(file_a, file_b, "verify pair: identical, hashes banked");
     }
 
-    Ok(VerifyPairResult { identical, method: VerifyMethod::Bytes })
+    Ok(VerifyPairResult {
+        identical,
+        method: VerifyMethod::Bytes,
+    })
 }
 
 #[cfg(test)]
@@ -1294,11 +1306,15 @@ mod verify_pair_tests {
     }
 
     fn stored_hash(conn: &rusqlite::Connection, id: i64) -> Option<String> {
-        conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", [id], |r| r.get(0))
-            .unwrap()
+        conn.query_row("SELECT strong_hash FROM files WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
     }
 
-    fn setup(bodies: &[(&str, &[u8])]) -> (tempfile::TempDir, ServiceContext, Vec<std::path::PathBuf>) {
+    fn setup(
+        bodies: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, ServiceContext, Vec<std::path::PathBuf>) {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         let mut paths = Vec::new();
@@ -1341,7 +1357,10 @@ mod verify_pair_tests {
         let body = vec![0x42u8; 30_000];
         let (_tmp, ctx, _paths) = setup(&[("a.fits", &body), ("b.fits", &body)]);
 
-        assert_eq!(super::verify_duplicate_pair(&ctx, 1, 2).unwrap().method, VerifyMethod::Bytes);
+        assert_eq!(
+            super::verify_duplicate_pair(&ctx, 1, 2).unwrap().method,
+            VerifyMethod::Bytes
+        );
         let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
         assert!(r.identical);
         assert_eq!(r.method, VerifyMethod::StoredHash);
@@ -1352,12 +1371,15 @@ mod verify_pair_tests {
     /// the mismatch verdict needs no read either.
     #[test]
     fn differing_stored_hashes_decide_mismatch_without_reading() {
-        let (tmp, ctx, _paths) = setup(&[("a.fits", &vec![1u8; 9_000]), ("b.fits", &vec![2u8; 9_000])]);
+        let (tmp, ctx, _paths) =
+            setup(&[("a.fits", &vec![1u8; 9_000]), ("b.fits", &vec![2u8; 9_000])]);
         {
             let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
             let conn = db.conn();
-            conn.execute("UPDATE files SET strong_hash = 'aaaa' WHERE id = 1", []).unwrap();
-            conn.execute("UPDATE files SET strong_hash = 'bbbb' WHERE id = 2", []).unwrap();
+            conn.execute("UPDATE files SET strong_hash = 'aaaa' WHERE id = 1", [])
+                .unwrap();
+            conn.execute("UPDATE files SET strong_hash = 'bbbb' WHERE id = 2", [])
+                .unwrap();
         }
 
         let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
@@ -1378,25 +1400,43 @@ mod verify_pair_tests {
             let conn = db.conn();
             // Row 1 lies about its size — and carries a hash that would win
             // the shortcut if staleness were ignored.
-            conn.execute("UPDATE files SET size = 1, strong_hash = 'stale' WHERE id = 1", []).unwrap();
-            conn.execute("UPDATE files SET strong_hash = 'stale' WHERE id = 2", []).unwrap();
+            conn.execute(
+                "UPDATE files SET size = 1, strong_hash = 'stale' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE files SET strong_hash = 'stale' WHERE id = 2", [])
+                .unwrap();
         }
 
         let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
         assert!(r.identical);
-        assert_eq!(r.method, VerifyMethod::Bytes, "stale row must disqualify the shortcut");
+        assert_eq!(
+            r.method,
+            VerifyMethod::Bytes,
+            "stale row must disqualify the shortcut"
+        );
 
         let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
         let conn = db.conn();
-        assert_eq!(stored_hash(&conn, 1).as_deref(), Some("stale"), "stale row must not be rewritten");
-        assert_ne!(stored_hash(&conn, 2).as_deref(), Some("stale"), "current row banks the fresh hash");
+        assert_eq!(
+            stored_hash(&conn, 1).as_deref(),
+            Some("stale"),
+            "stale row must not be rewritten"
+        );
+        assert_ne!(
+            stored_hash(&conn, 2).as_deref(),
+            Some("stale"),
+            "current row banks the fresh hash"
+        );
     }
 
     /// A mismatching pair stores nothing: the compare early-exits, so no
     /// full-content digest exists to store.
     #[test]
     fn a_mismatching_pair_stores_nothing() {
-        let (tmp, ctx, _paths) = setup(&[("a.fits", &vec![1u8; 9_000]), ("b.fits", &vec![2u8; 9_000])]);
+        let (tmp, ctx, _paths) =
+            setup(&[("a.fits", &vec![1u8; 9_000]), ("b.fits", &vec![2u8; 9_000])]);
 
         let r = super::verify_duplicate_pair(&ctx, 1, 2).unwrap();
         assert!(!r.identical);

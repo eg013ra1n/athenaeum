@@ -1730,17 +1730,14 @@ mod delete_guard_tests {
         std::fs::create_dir_all(&calib).unwrap();
 
         let conn = test_conn();
-        let root_path = root
-            .path()
-            .canonicalize()
-            .unwrap()
+        let root_path = crate::test_support::canonical_path(root.path())
             .to_string_lossy()
             .to_string();
         crate::db::upsert_scan_root(&conn, &root_path, "normal").unwrap();
         crate::db::set_setting(
             &conn,
             crate::settings::keys::CALIBRATION_LIBRARY_DIR,
-            &calib.canonicalize().unwrap().to_string_lossy(),
+            &crate::test_support::canonical_path(&calib).to_string_lossy(),
         )
         .unwrap();
 
@@ -1756,17 +1753,14 @@ mod delete_guard_tests {
         let lib = TempDir::new().unwrap();
 
         let conn = test_conn();
-        let root_a_path = root_a
-            .path()
-            .canonicalize()
-            .unwrap()
+        let root_a_path = crate::test_support::canonical_path(root_a.path())
             .to_string_lossy()
             .to_string();
         crate::db::upsert_scan_root(&conn, &root_a_path, "normal").unwrap();
         crate::db::set_setting(
             &conn,
             crate::settings::keys::CALIBRATION_LIBRARY_DIR,
-            &lib.path().canonicalize().unwrap().to_string_lossy(),
+            &crate::test_support::canonical_path(lib.path()).to_string_lossy(),
         )
         .unwrap();
 
@@ -1778,10 +1772,7 @@ mod delete_guard_tests {
         let lib_root = TempDir::new().unwrap();
 
         let conn = test_conn();
-        let lib_root_path = lib_root
-            .path()
-            .canonicalize()
-            .unwrap()
+        let lib_root_path = crate::test_support::canonical_path(lib_root.path())
             .to_string_lossy()
             .to_string();
         // No `calibration.library_dir` setting — resolve falls back to the
@@ -1801,10 +1792,7 @@ mod delete_guard_tests {
         let new_lib = TempDir::new().unwrap();
 
         let conn = test_conn();
-        let old_lib_root_path = old_lib_root
-            .path()
-            .canonicalize()
-            .unwrap()
+        let old_lib_root_path = crate::test_support::canonical_path(old_lib_root.path())
             .to_string_lossy()
             .to_string();
         // Vestigial: still registered as a calibration_library-kind root,
@@ -1813,7 +1801,7 @@ mod delete_guard_tests {
         crate::db::set_setting(
             &conn,
             crate::settings::keys::CALIBRATION_LIBRARY_DIR,
-            &new_lib.path().canonicalize().unwrap().to_string_lossy(),
+            &crate::test_support::canonical_path(new_lib.path()).to_string_lossy(),
         )
         .unwrap();
 
@@ -1827,17 +1815,14 @@ mod delete_guard_tests {
         std::fs::create_dir_all(&calib).unwrap();
 
         let conn = test_conn();
-        let root_path = root
-            .path()
-            .canonicalize()
-            .unwrap()
+        let root_path = crate::test_support::canonical_path(root.path())
             .to_string_lossy()
             .to_string();
         crate::db::upsert_scan_root(&conn, &root_path, "normal").unwrap();
         crate::db::set_setting(
             &conn,
             crate::settings::keys::CALIBRATION_LIBRARY_DIR,
-            &calib.canonicalize().unwrap().to_string_lossy(),
+            &crate::test_support::canonical_path(&calib).to_string_lossy(),
         )
         .unwrap();
 
@@ -2052,18 +2037,21 @@ mod candidate_tests {
     /// Canonicalized path string of an existing directory — used both for the
     /// `upsert_scan_root` write and the `conflicting_path` assertion.
     fn canon(path: &Path) -> String {
-        path.canonicalize().unwrap().to_string_lossy().to_string()
+        crate::test_support::canonical_path(path)
+            .to_string_lossy()
+            .to_string()
     }
 
     #[test]
     fn normal_inside_existing_root_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("root");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let root = tmp_base.join("root");
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let c = conn();
         crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
-        let v = classify_folder_candidate(&c, "normal", &sub.canonicalize().unwrap()).unwrap();
+        let v = classify_folder_candidate(&c, "normal", &crate::test_support::canonical_path(&sub))
+            .unwrap();
         assert!(!v.ok);
         assert_eq!(v.reason.as_deref(), Some("inside_existing"));
         assert_eq!(v.conflicting_path.as_deref(), Some(canon(&root).as_str()));
@@ -2071,76 +2059,94 @@ mod candidate_tests {
 
     #[test]
     fn normal_containing_existing_root_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("parent");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let parent = tmp_base.join("parent");
         let root = parent.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let c = conn();
         crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
-        let v = classify_folder_candidate(&c, "normal", &parent.canonicalize().unwrap()).unwrap();
+        let v =
+            classify_folder_candidate(&c, "normal", &crate::test_support::canonical_path(&parent))
+                .unwrap();
         assert_eq!(v.reason.as_deref(), Some("contains_existing"));
     }
 
     #[test]
     fn normal_duplicate_is_already_monitored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("root");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let root = tmp_base.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let c = conn();
         crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
-        let v = classify_folder_candidate(&c, "normal", &root.canonicalize().unwrap()).unwrap();
+        let v =
+            classify_folder_candidate(&c, "normal", &crate::test_support::canonical_path(&root))
+                .unwrap();
         assert_eq!(v.reason.as_deref(), Some("already_monitored"));
     }
 
     #[test]
     fn calibration_inside_existing_is_ok_covered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("root");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let root = tmp_base.join("root");
         let sub = root.join("masters");
         std::fs::create_dir_all(&sub).unwrap();
         let c = conn();
         crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
-        let v = classify_folder_candidate(&c, "calibration_library", &sub.canonicalize().unwrap())
-            .unwrap();
+        let v = classify_folder_candidate(
+            &c,
+            "calibration_library",
+            &crate::test_support::canonical_path(&sub),
+        )
+        .unwrap();
         assert!(v.ok);
         assert_eq!(v.placement.as_deref(), Some("covered"));
     }
 
     #[test]
     fn calibration_standalone_is_ok_standalone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("masters");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let dir = tmp_base.join("masters");
         std::fs::create_dir_all(&dir).unwrap();
-        let v =
-            classify_folder_candidate(&conn(), "calibration_library", &dir.canonicalize().unwrap())
-                .unwrap();
+        let v = classify_folder_candidate(
+            &conn(),
+            "calibration_library",
+            &crate::test_support::canonical_path(&dir),
+        )
+        .unwrap();
         assert!(v.ok);
         assert_eq!(v.placement.as_deref(), Some("standalone"));
     }
 
     #[test]
     fn taken_role_is_role_taken() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a");
-        let b = tmp.path().join("b");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let a = tmp_base.join("a");
+        let b = tmp_base.join("b");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
         let c = conn();
         crate::db::upsert_scan_root(&c, &canon(&a), "sync_incoming").unwrap();
-        let v = classify_folder_candidate(&c, "sync_incoming", &b.canonicalize().unwrap()).unwrap();
+        let v = classify_folder_candidate(
+            &c,
+            "sync_incoming",
+            &crate::test_support::canonical_path(&b),
+        )
+        .unwrap();
         assert_eq!(v.reason.as_deref(), Some("role_taken"));
         assert_eq!(v.conflicting_path.as_deref(), Some(canon(&a).as_str()));
     }
 
     #[test]
     fn archive_kind_skips_placement_checks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("root");
+        let (_tmp, tmp_base) = crate::test_support::canonical_tempdir();
+        let root = tmp_base.join("root");
         let sub = root.join("archive");
         std::fs::create_dir_all(&sub).unwrap();
         let c = conn();
         crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
-        let v = classify_folder_candidate(&c, "archive", &sub.canonicalize().unwrap()).unwrap();
+        let v =
+            classify_folder_candidate(&c, "archive", &crate::test_support::canonical_path(&sub))
+                .unwrap();
         assert!(v.ok);
     }
 }
@@ -2166,7 +2172,9 @@ mod switch_library_tests {
     fn mkdirs(tmp: &tempfile::TempDir, name: &str) -> String {
         let p = tmp.path().join(name);
         std::fs::create_dir_all(&p).unwrap();
-        p.canonicalize().unwrap().to_string_lossy().to_string()
+        crate::test_support::canonical_path(&p)
+            .to_string_lossy()
+            .to_string()
     }
 
     fn insert_file(ctx: &ServiceContext, path: &str) {
@@ -2696,7 +2704,9 @@ mod overview_tests {
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         let root = tmp.path().join("astro");
         std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let root = crate::test_support::canonical_path(&root)
+            .to_string_lossy()
+            .to_string();
         let added = add_scan_root(&ctx, root.clone(), &PathPolicy::AllowAll, None).unwrap();
         {
             let db = ctx.db.get().unwrap();
@@ -2752,7 +2762,9 @@ mod overview_tests {
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         let root = tmp.path().join("my_astro");
         std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let root = crate::test_support::canonical_path(&root)
+            .to_string_lossy()
+            .to_string();
         let added = add_scan_root(&ctx, root.clone(), &PathPolicy::AllowAll, None).unwrap();
         // Sibling that differs from the root only where the `_` sits — derived
         // from the canonicalized root's parent so the two are true siblings.
@@ -2851,17 +2863,23 @@ mod overview_tests {
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         let arc = tmp.path().join("archive");
         std::fs::create_dir_all(&arc).unwrap();
-        let arc = arc.canonicalize().unwrap().to_string_lossy().to_string();
+        let arc = crate::test_support::canonical_path(&arc);
+        let arc_str = arc.to_string_lossy().to_string();
         let other = tmp.path().join("archive_other");
         std::fs::create_dir_all(&other).unwrap();
-        let other = other.canonicalize().unwrap().to_string_lossy().to_string();
+        let other = crate::test_support::canonical_path(&other)
+            .to_string_lossy()
+            .to_string();
 
         // Two real zips (10 + 20 bytes) plus one recorded path that is gone,
         // and a 40-byte zip belonging to a calibration-originals operation.
-        let zip_a = format!("{arc}/lights.zip");
-        let zip_b = format!("{arc}/flats.zip");
-        let zip_gone = format!("{arc}/vanished.zip");
-        let zip_cal = format!("{arc}/calibration_originals.zip");
+        let zip_a = arc.join("lights.zip").to_string_lossy().to_string();
+        let zip_b = arc.join("flats.zip").to_string_lossy().to_string();
+        let zip_gone = arc.join("vanished.zip").to_string_lossy().to_string();
+        let zip_cal = arc
+            .join("calibration_originals.zip")
+            .to_string_lossy()
+            .to_string();
         std::fs::write(&zip_a, [0u8; 10]).unwrap();
         std::fs::write(&zip_b, [0u8; 20]).unwrap();
         std::fs::write(&zip_cal, [0u8; 40]).unwrap();
@@ -2869,7 +2887,7 @@ mod overview_tests {
         {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();
-            for path in [&arc, &other] {
+            for path in [&arc_str, &other] {
                 conn.execute(
                     "INSERT INTO archive_roots (path) VALUES (?1)",
                     rusqlite::params![path],
@@ -2885,7 +2903,7 @@ mod overview_tests {
                 .unwrap();
                 conn.last_insert_rowid()
             };
-            let op = op_id(&arc);
+            let op = op_id(&arc_str);
             let op_other = op_id(&other);
 
             // Phase-2 calibration-originals archive under `arc`: a real
@@ -2901,7 +2919,7 @@ mod overview_tests {
                 "INSERT INTO archive_operations
                     (calibration_set_id, archive_root_path, compression, status, started_at)
                  VALUES (?1, ?2, 'deflate', 'completed', '2026-01-05T00:00:00Z')",
-                rusqlite::params![cal_set, arc],
+                rusqlite::params![cal_set, arc_str],
             )
             .unwrap();
             let op_cal = conn.last_insert_rowid();
@@ -2945,7 +2963,7 @@ mod overview_tests {
 
         let ov = get_folder_overview(&ctx).unwrap();
         assert_eq!(ov.archive_roots.len(), 2);
-        let a = ov.archive_roots.iter().find(|r| r.path == arc).unwrap();
+        let a = ov.archive_roots.iter().find(|r| r.path == arc_str).unwrap();
         assert_eq!(a.set_count, 2);
         // 10 + 20 + 0 for the vanished zip; zip_a counted once, not twice, and
         // the 40-byte calibration-originals zip excluded with its operation.
@@ -3052,7 +3070,9 @@ mod missing_files_tests {
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         let root = tmp.path().join("my_astro");
         std::fs::create_dir_all(&root).unwrap();
-        let root_str = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let root_str = crate::test_support::canonical_path(&root)
+            .to_string_lossy()
+            .to_string();
         let added = add_scan_root(&ctx, root_str.clone(), &PathPolicy::AllowAll, None).unwrap();
         {
             let db = ctx.db.get().unwrap();

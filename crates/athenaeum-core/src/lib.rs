@@ -47,6 +47,9 @@ pub mod registration;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod ts_export;
 pub mod api;
+// Shared test fixtures. Test-only — nothing outside `#[cfg(test)]` may use it.
+#[cfg(test)]
+pub(crate) mod test_support;
 // integration/banded reads raw pixels via astroimage — `render` feature.
 #[cfg(feature = "render")]
 pub mod integration;
