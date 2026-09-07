@@ -112,21 +112,29 @@ jobs:
   # 2026-09-06 found 39 pre-existing failures behind that gap. This job is the
   # measurement that keeps them closed.
   #
-  # `continue-on-error` is deliberate and stays for now: every measurement this
-  # cycle took was `cargo test -p athenaeum-core --lib`, while this job runs
-  # `cargo test --workspace`. Same-class separator/path failures are already
-  # known to exist in athenaeum-web and perseus, so this line comes out only
-  # once a workspace-wide Windows run is actually green.
-  # `--no-fail-fast` (below) means this job now runs all 41 test binaries
-  # instead of stopping at the first one that fails, so the 60-minute budget
-  # is load-bearing where it previously was not: a fail-fast run of this same
+  # This job is BLOCKING. `continue-on-error: true` was removed on 2026-09-07
+  # once its own stated condition was met: a workspace-wide Windows run that is
+  # actually green — 41 binaries, 2529 passed, 0 failed, measured twice with
+  # this job's exact command (athenaeum-core 1728, perseus 439, athenaeum-web
+  # 27, athenaeum-lib 9). Before that, perseus alone contributed 227 failures
+  # from one cause; see the Windows section of docs/superpowers/open-items.md.
+  #
+  # Two caveats worth knowing before debugging a red run here:
+  #   - Every green reading came from one developer Windows box (31.5 GB,
+  #     `-j 4`). A windows-latest runner is 4 CPUs / 16 GB. A failure that is
+  #     load- or timing-shaped may be the hardware, not a regression.
+  #   - The two `--skip`s below are load-bearing, not cosmetic. Removing either
+  #     is expected to make this job fail intermittently — see open-items.md.
+  #
+  # `--no-fail-fast` (below) means this job runs all 41 test binaries instead
+  # of stopping at the first one that fails, so the 60-minute budget is
+  # load-bearing where it previously was not: a fail-fast run of this same
   # command stopped ~40s into athenaeum-core, while a full run compiles and
   # executes every binary. Compilation still dominates the wall clock, so 60
   # is expected to hold, but it is no longer slack against a stopped-early run.
   build-and-test-windows:
     name: Build and test (Windows)
     runs-on: windows-latest
-    continue-on-error: true
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -142,9 +150,10 @@ jobs:
           rustc --version
           cargo --version
 
-      # This job is expected to be red for now, and the action does not save
-      # a cache on a failed job by default — without this it rebuilds the
-      # whole workspace cold on every run.
+      # `cache-on-failure` is kept now that the job is blocking: the action
+      # does not save a cache on a failed job by default, so a single red run
+      # would otherwise make every following run rebuild the workspace cold —
+      # exactly when a fast feedback loop matters most.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -159,10 +168,8 @@ jobs:
       # it stops at the first binary that fails, so this job would report on
       # athenaeum-core alone and never execute the other 40 — a real run of
       # the fail-fast form went green on that basis while 228 failures in
-      # athenaeum-web and perseus sat unexecuted behind it. Most of what
-      # --no-fail-fast now surfaces from perseus is a single known, deferred
-      # cause (a TOML-escaping fixture bug) plus a handful of undiagnosed
-      # timeouts — see the Windows section of docs/superpowers/open-items.md
-      # before re-diagnosing it.
+      # athenaeum-web and perseus sat unexecuted behind it. That is the whole
+      # reason this job is trustworthy now, and why the flag must never be
+      # dropped to "speed the job up": it would go green on one binary again.
       - name: Test workspace
         run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames

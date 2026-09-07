@@ -24,20 +24,30 @@ received file's path was stored with a mixed separator on Windows, now fixed in
 `sync/ingest.rs` and, by the same shape, in `sync/project_ingest.rs`) — but no
 single Windows run has yet reported `0 failed` for the whole crate after all
 eight tasks landed; the closest confirmed readings are 34 then 31, taken
-mid-cycle. The `windows-latest` CI job exists (`.github/workflows/ci.yml`) and
-runs on every push, but stays `continue-on-error: true` and non-blocking until
-a workspace-wide green run is actually observed.
+mid-cycle. That gap is now closed — see the workspace-wide green reading
+below. The `windows-latest` CI job exists (`.github/workflows/ci.yml`) and runs
+on every push.
 
-**Non-core Windows surface is unmeasured and known-red.** Nothing in this cycle
-touched `athenaeum-tauri`, `athenaeum-web` or `perseus`, and the CI job's
-`cargo test --workspace` reaches all of them. Two known instances of the exact
-family this cycle fixed:
-`athenaeum-web/src/routes/scan_roots.rs:526` compares a raw `canonicalize()`
-against a value production stores normalized — the same family as this cycle's
-A/E. `crates/perseus/src/` has 14 slash-literal `join("M31/…")` fixture sites
-(3 in `pending.rs`, 3 in `library.rs`, 6 in `web.rs`, 2 in `library/delete.rs`)
-— the same construction the scanner sweep (family D/H) fixed in
-`athenaeum-core`.
+**Windows is measured green, workspace-wide.** At `6dcff6fe`, twice, with the
+CI job's own command: 41 binaries, 2529 passed, 0 failed, exit 0 —
+`athenaeum-core` 1728, `perseus` 439, `athenaeum-web` 27, `athenaeum-lib` 9.
+The first fully green Windows workspace run in the project's history. perseus
+went 227 → 31 → 0 across two fixes; the whole 227 was one cause (a path
+spliced into a TOML basic string) wearing four symptoms — a parse error, nine
+supervisor `Elapsed(())` timeouts, one `expect_err` that succeeded for the
+wrong reason, and 27 more hidden in raw-string fixtures a first, too-narrow
+drift guard could not see.
+
+**One measurement is still owed on real CI hardware.** Every green reading is
+from one developer Windows box (31.5 GB, `-j 4`). A `windows-latest` runner is
+4 CPUs and 16 GB with no such headroom, and no amount of measuring on that box
+settles it — the first run on the actual runner is the only thing that will.
+
+**`crates/perseus/src/` still has 14 slash-literal `join("M31/…")` fixture
+sites** (3 in `pending.rs`, 3 in `library.rs`, 6 in `web.rs`, 2 in
+`library/delete.rs`) — the same construction the scanner sweep (family D/H)
+fixed in `athenaeum-core`. They pass on Windows today; they were never the
+cause of perseus's 227 and are unswept, not cleared.
 
 **23 unswept slash-joins in `archive/*` tests, plus 3 in export tests.**
 Deliberately not swept this cycle: nothing there fails today and nothing there
@@ -94,26 +104,36 @@ never ran the other 40 — the output was byte-identical to a core-only run.
 Found by running the job's own command on a real Windows machine, after every
 review had passed the job.
 
-**perseus: 227 Windows failures, 217 from one cause.** TOML basic strings
-treat `\` as an escape introducer, so every fixture that hand-builds config
-TOML with a Windows path fails to parse (`too few unicode value digits` on
-`\U` in `C:\Users`). The fix is single-quoted TOML literal strings in the
-fixture builders. Deliberately deferred: it is a different crate and a third
-construction of the "Windows path meets a string format" theme, and —
-decisively — 9 undiagnosed supervisor/run timeouts keep perseus red
-regardless, so fixing the 217 does not unblock the gate.
+**Five tests passed vacuously this cycle, and re-measurement found none of
+them.** Three in `scanner/mod.rs` asserted absence at a path the catalog could
+never spell. One was an `expect_err` that succeeded because the config failed
+to parse, never reaching the condition it named. The fifth is the one worth
+remembering, because the platform difference was in a **dependency** rather
+than in our own code: `library/delete.rs` wrote a one-byte fake `perseus.db`
+and then opened it, and SQLite silently **overwrites** a short non-database
+file on macOS/Linux while refusing it on Windows (`SQLITE_NOTADB`). So "the
+agent's own database survives" passed on macOS while the opener had already
+destroyed the bytes it claimed to protect. A green suite is not evidence that
+its assertions mean anything; only reading them is.
 
-**perseus: 9 undiagnosed timeouts** ("first launch never reached Running:
-Elapsed(())") plus 1 assertion on a `disk_max_pct` error chain. The only
-genuinely unknown part of the Windows surface. May be downstream of the
-config failures, may be Windows timing, may be a real defect.
+**A drift guard is only as wide as the spelling it matches.** The perseus
+guard shipped matching escaped quotes (`"data_dir = \"{}\""`) and reported the
+crate clean while seven raw-string fixtures (`r#"data_dir = "{}""#`) still
+carried the bug — 27 failures behind a green guard. It was widened to look
+inside raw-string literals too. Both perseus guards do line- and
+substring-oriented matching over source, so they are only trustworthy on an
+LF working tree; the Windows box agrees with macOS *because* of the forced
+`git rm --cached -r . && git reset --hard` earlier in this cycle. A fresh
+Windows clone that does not honour `.gitattributes` should not be assumed to
+give the same reading.
 
-**A user-facing documentation gap, not a code bug.** perseus production
-never writes config TOML — it only reads a hand-written file — but a Windows
-user writing `capture_dir = "C:\Users\me\Astro"` hits the identical confusing
-parse error, and the documented example at `crates/perseus/src/config.rs:9`
-is Unix-only. If perseus is supported on Windows, that example should show a
-Windows-safe form.
+**The two `--skip`s in the Windows CI job are load-bearing, not cosmetic.**
+`ingest_releases_conn_between_frames` is not fixed, it is skipped — measured
+failing 4 of 5 isolated runs on the Windows box. `unclean_shutdown_mid_transfer_resumes_on_restart`
+is skipped alongside it. Whoever removes either skip should expect the job to
+start failing intermittently, and now that the job is a candidate to become
+blocking, that is a trap rather than a nuisance. Both skips are also on the
+Linux job, so the commands stay identical.
 
 **The `format!("{x}/y.fits")` construction is a third member of this class**,
 invisible to a `join("…/…")` grep. 18 such sites existed in
