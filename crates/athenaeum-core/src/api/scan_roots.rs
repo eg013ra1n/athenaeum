@@ -2218,12 +2218,21 @@ mod switch_library_tests {
         let new = mkdirs(&tmp, "lib_new");
         set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
         // A cataloged file under the old library — must be purged with the root.
-        insert_file(&ctx, &format!("{old}/m.fits"));
+        // Built with the platform separator: the purge is a native-separator
+        // byte-range prefix delete (`db::delete_scan_root`), so a `/`-joined
+        // fixture on Windows would fall outside the range it is meant to test.
+        insert_file(
+            &ctx,
+            &Path::new(&old).join("m.fits").to_string_lossy().to_string(),
+        );
         // …and one OUTSIDE it, which must survive: the purge is a path-prefix
         // byte-range delete, not a table wipe. `elsewhere` also sorts below
         // `lib_old` (`e` < `l`), so it is outside the prefix range as well as
         // outside the subtree.
-        let keep = format!("{}/keep.fits", mkdirs(&tmp, "elsewhere"));
+        let keep = Path::new(&mkdirs(&tmp, "elsewhere"))
+            .join("keep.fits")
+            .to_string_lossy()
+            .to_string();
         insert_file(&ctx, &keep);
         let effective =
             switch_calibration_library_dir(&ctx, new.clone(), &PathPolicy::AllowAll).unwrap();
@@ -2313,7 +2322,8 @@ mod switch_library_tests {
         let old = mkdirs(&tmp, "lib_old");
         let new = mkdirs(&tmp, "lib_new");
         set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
-        insert_file(&ctx, &format!("{old}/m.fits"));
+        let old_file = Path::new(&old).join("m.fits").to_string_lossy().to_string();
+        insert_file(&ctx, &old_file);
         // A monitored root on disconnected storage: `canonicalize()` fails on
         // it, so the placement probe hard-errors. Inserted directly — the
         // public add path stat-checks the folder and would refuse it.
@@ -2337,7 +2347,7 @@ mod switch_library_tests {
         );
         assert_eq!(
             file_paths(&ctx),
-            vec![format!("{old}/m.fits")],
+            vec![old_file],
             "a rejected switch must not purge the old library's catalog rows"
         );
         assert_eq!(
@@ -2355,7 +2365,8 @@ mod switch_library_tests {
         let child = mkdirs(&tmp, "parent/child");
         add_scan_root(&ctx, child, &PathPolicy::AllowAll, None).unwrap();
         set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
-        insert_file(&ctx, &format!("{old}/m.fits"));
+        let old_file = Path::new(&old).join("m.fits").to_string_lossy().to_string();
+        insert_file(&ctx, &old_file);
 
         let err = switch_calibration_library_dir(&ctx, parent, &PathPolicy::AllowAll)
             .expect_err("a folder containing an existing root must abort the switch");
@@ -2367,7 +2378,7 @@ mod switch_library_tests {
         );
         assert_eq!(
             file_paths(&ctx),
-            vec![format!("{old}/m.fits")],
+            vec![old_file],
             "a rejected switch must not purge the old library's catalog rows"
         );
     }
@@ -2421,7 +2432,8 @@ mod switch_library_tests {
         let lib = mkdirs(&tmp, "lib_old");
         set_calibration_library_dir(&ctx, lib.clone(), &PathPolicy::AllowAll).unwrap();
         // A cataloged file under it — Release must never purge anything.
-        insert_file(&ctx, &format!("{lib}/m.fits"));
+        let lib_file = Path::new(&lib).join("m.fits").to_string_lossy().to_string();
+        insert_file(&ctx, &lib_file);
 
         clear_calibration_library_dir(&ctx).unwrap();
 
@@ -2441,7 +2453,7 @@ mod switch_library_tests {
         assert_eq!(get_calibration_library_dir(&ctx).unwrap(), None);
         assert_eq!(
             file_paths(&ctx),
-            vec![format!("{lib}/m.fits")],
+            vec![lib_file],
             "Release is catalog-preserving — it is not a removal"
         );
 
@@ -2714,7 +2726,11 @@ mod overview_tests {
             for (name, size) in [("a.fits", 100_i64), ("b.fits", 50)] {
                 conn.execute(
                     "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS')",
-                    rusqlite::params![format!("{root}/{name}"), name, size],
+                    rusqlite::params![
+                        Path::new(&root).join(name).to_string_lossy().to_string(),
+                        name,
+                        size
+                    ],
                 )
                 .unwrap();
             }
@@ -2778,8 +2794,19 @@ mod overview_tests {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();
             for (path, name, size) in [
-                (format!("{root}/a.fits"), "a.fits", 100_i64),
-                (format!("{sibling}/x.fits"), "x.fits", 999),
+                (
+                    Path::new(&root).join("a.fits").to_string_lossy().to_string(),
+                    "a.fits",
+                    100_i64,
+                ),
+                (
+                    Path::new(&sibling)
+                        .join("x.fits")
+                        .to_string_lossy()
+                        .to_string(),
+                    "x.fits",
+                    999,
+                ),
             ] {
                 conn.execute(
                     "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS')",
@@ -3077,10 +3104,17 @@ mod missing_files_tests {
         {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();
-            // Missing file genuinely under the root (never created on disk):
+            // Missing file genuinely under the root (never created on disk).
+            // Built with the platform separator: `check_missing_files_in_scan_root`
+            // matches via the native-separator-only byte-range prefix
+            // (`db::scan_root_prefix_predicate`), so a `/`-joined fixture on
+            // Windows would fall outside the range it is meant to test.
             conn.execute(
                 "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'gone.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
-                rusqlite::params![format!("{root_str}/gone.fits")],
+                rusqlite::params![Path::new(&root_str)
+                    .join("gone.fits")
+                    .to_string_lossy()
+                    .to_string()],
             )
             .unwrap();
             // Sibling-root row, also absent on disk — must NOT be reported under this root.
