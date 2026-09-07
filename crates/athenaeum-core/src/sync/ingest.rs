@@ -440,7 +440,7 @@ fn process_frame(
     // Guard the record's rel_path (untrusted, wire-supplied) before joining.
     package::validate_rel_path(&record.rel_path)
         .with_context(|| format!("reject unsafe rel_path {}", record.rel_path))?;
-    let payload = package_dir.join(&record.rel_path);
+    let payload = package_dir.join(native_rel_path(&record.rel_path));
 
     // 1. Verify integrity: full-content xxh3 must match the manifest.
     let actual = match package::xxh3_full_file(&payload) {
@@ -771,13 +771,28 @@ fn link_or_copy(src: &Path, dest: &Path, force_copy: bool) -> Result<()> {
     Ok(())
 }
 
+/// Convert a wire `rel_path` into a native relative path.
+///
+/// The wire contract is forward-slash — `package::validate_rel_path` rejects a
+/// backslash, a drive letter and any non-`Normal` component, and `filename_of`
+/// splits on '/' — so splitting on '/' is the whole conversion.
+///
+/// Joining the raw string instead is wrong on Windows in a way that is easy to
+/// miss: every filesystem call accepts the mixed-separator result, so the file
+/// lands correctly and a directory walk looks normal. What breaks is the string
+/// stored in `files.path`, which then never matches the native spelling the
+/// scanner writes for the same file — one file, two catalog rows.
+fn native_rel_path(rel_path: &str) -> PathBuf {
+    rel_path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
 /// Land an accepted payload mirroring the sender's tree under `<landing_base>/<rel_path>`,
 /// tmp-link (copy on refusal) + atomic rename, collision-suffixed. `landing_base` is the
 /// package's resolved landing directory (`<incoming_root>/<sender_slug>[/<batch_slug>]`,
 /// Transfers Status Model v2 §D2); `rel_path` is `validate_rel_path`-guarded in
 /// `process_frame`, so the join cannot escape `<landing_base>/`. Returns the final path.
 fn land_payload(landing_base: &Path, payload: &Path, record: &ManifestRecord) -> Result<PathBuf> {
-    let dest = unique_path(&landing_base.join(Path::new(&record.rel_path)));
+    let dest = unique_path(&landing_base.join(native_rel_path(&record.rel_path)));
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create landing dir {}", parent.display()))?;

@@ -249,7 +249,12 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
         .unwrap();
     assert!(
-        path.ends_with("M31/2026-07-10/lights/L_0001.fits"),
+        Path::new(&path).ends_with(
+            Path::new("M31")
+                .join("2026-07-10")
+                .join("lights")
+                .join("L_0001.fits")
+        ),
         "catalog path mirrors rel_path: {path}"
     );
 }
@@ -667,6 +672,77 @@ fn ingest_lands_files_and_rows() {
         strong.as_deref(),
         Some(outcome.receipts[0].xxh3.as_str()),
         "ingest banks the verified manifest hash as strong_hash"
+    );
+}
+
+/// A nested wire `rel_path` must reach `files.path` in the platform's own
+/// spelling. `Path::join` appends an embedded forward slash verbatim, so before
+/// `native_rel_path` the catalog held `...\a/b/c.fits` on Windows while the file
+/// walked from disk was `...\a\b\c.fits` — one file the scanner would catalog
+/// twice. Asserted as "the stored path IS the file on disk", which is a real
+/// check on every platform rather than a `contains('/')` that would mean nothing
+/// off Windows.
+#[test]
+fn ingest_stores_native_path_matching_landed_file() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let (pkg_dir, announce) = build_nested_package(
+        tmp.path(),
+        "frame-native-path-1",
+        "M31/2026-07-10/lights/L_9001.fits",
+        ORIGIN_DEVICE,
+    );
+
+    let conn = catalog_conn();
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.ingested, 1);
+
+    let stored_path: String = conn
+        .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+
+    // Ground truth: walk the landing tree and find the one file that actually
+    // landed on disk.
+    let landed: Vec<PathBuf> = walkdir::WalkDir::new(&incoming)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+    assert_eq!(landed.len(), 1, "exactly one file landed: {landed:?}");
+    let landed = &landed[0];
+
+    // Half 1: `Path` equality is component-wise (both '/' and '\' parse as
+    // separators on Windows), so this holds regardless of whether the bug is
+    // fixed — it documents the invariant but does NOT exercise it.
+    assert_eq!(
+        Path::new(&stored_path),
+        landed.as_path(),
+        "catalog path and the landed file must name the same path"
+    );
+
+    // Half 2: this is the assertion that fails before the fix. Before
+    // `native_rel_path`, `files.path` held the wire rel_path's forward
+    // slashes verbatim (Path::join never rewrites an embedded separator), so
+    // on Windows the stored STRING diverged byte-for-byte from `landed`'s own
+    // native-separator rendering even though the two named the same file —
+    // exactly the mismatch that made the scanner catalog it a second time.
+    // Do not delete this half as "redundant" with the assertion above: it is
+    // the one that does the work.
+    assert_eq!(
+        stored_path,
+        landed.to_string_lossy(),
+        "catalog path string must equal the landed file's own rendering"
     );
 }
 
