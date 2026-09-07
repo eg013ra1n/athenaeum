@@ -712,7 +712,7 @@ mod tests {
         init_db(&conn).unwrap();
         let cfg = PlateSolveConfig::default();
 
-        let mut seed = |fid: i64, ecc: f64, trail: f64| {
+        let seed = |fid: i64, ecc: f64, trail: f64| {
             conn.execute(
                 "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
                  VALUES (?1,?2,?3,0,'2025-01-01','FITS','2025-01-01')",

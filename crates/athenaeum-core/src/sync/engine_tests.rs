@@ -4080,7 +4080,7 @@ async fn a_resumed_pull_continues_the_progress_instead_of_restarting_it() {
             frame_uuid: format!("uuid-{}", if i == 0 { "a" } else { "b" }),
         })
         .collect();
-    let id = engine
+    engine
         .enqueue_package(&pkg, None, announce_files, PackageLayout::Batch)
         .await
         .unwrap();

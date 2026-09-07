@@ -127,6 +127,23 @@ LF working tree; the Windows box agrees with macOS *because* of the forced
 Windows clone that does not honour `.gitattributes` should not be assumed to
 give the same reading.
 
+**Windows runs ZERO collab tests, and the dead-code warnings are the only sign
+of it.** 11 collab tests are `#[cfg(unix)]` (8 in `api/collab_exchange.rs`, 3 in
+`api/collab_e2e_tests.rs`), so on Windows they do not compile and their ~17
+helper functions warn as never-used — that is 17 of the 28 warnings the Windows
+job emits, against 3 on Linux. The stated reason for the gate is "a multi-thread
+runtime, because the loopback engines/receivers run their event loops on
+background tasks", which Tokio supports on Windows, so the gate looks historical
+rather than reasoned. Nobody has tried removing it.
+
+**Do not "clean up" those warnings by deleting the helpers or adding
+`#[allow(dead_code)]`** — that erases the only signal that a whole subsystem is
+unmeasured on a platform whose CI job is now blocking. The two honest moves are
+to make the tests run on Windows (gaining real coverage, and the warnings go
+away as a side effect) or to put the same `#[cfg(unix)]` on the helpers and keep
+this entry. Note collab coverage is already thin: 9 further collab tests are
+`#[ignore]`d pending the publish rework (calibrated-export v2 §8a, decision C).
+
 **The two `--skip`s in the Windows CI job are load-bearing, not cosmetic.**
 `ingest_releases_conn_between_frames` is not fixed, it is skipped — measured
 failing 4 of 5 isolated runs on the Windows box. `unclean_shutdown_mid_transfer_resumes_on_restart`

@@ -46,7 +46,6 @@ fn load_catalog(ctx: &ServiceContext) -> Option<std::sync::Arc<DsoCatalog>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::plate_solve::dso_lookup::DsoCatalog;
 
     /// The editor's question, answered the way a person types it.

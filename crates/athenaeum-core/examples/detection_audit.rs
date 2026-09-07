@@ -19,8 +19,6 @@ use astroimage::{ImageAnalyzer, ImageConverter};
 use image::{Rgb, RgbImage};
 use imageproc::drawing::draw_hollow_circle_mut;
 
-const DOWNSCALE: usize = 2;
-
 fn to_display_y(star_y: f64, full_height: usize) -> f64 {
     full_height as f64 - 1.0 - star_y
 }
