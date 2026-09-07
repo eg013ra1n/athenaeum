@@ -259,12 +259,14 @@ pub async fn delete_missing_files(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
-    let placeholders_str = placeholders.join(",");
-
-    // Delete from files table (CASCADE will handle frames, missing_files, etc.)
-    let delete_sql = format!("DELETE FROM files WHERE id IN ({})", placeholders_str);
-    conn.execute(&delete_sql, rusqlite::params_from_iter(file_ids.iter()))
+    // Not a bare `DELETE FROM files`: a master's file needs its raw source set
+    // un-superseded and its consumers repointed first, or the raw frames stay
+    // invisible to the matcher with nothing left in the UI to undo it
+    // (2026-08-02 audit C3). `delete_orphaned_files` is the one path that does
+    // both — the Black Hole, void and orphan-purge flows all go through it.
+    // Pinned by `deleting_a_master_file_un_supersedes_its_raw_set` on the web
+    // mirror of this command.
+    athenaeum_core::relinking::delete_orphaned_files(&conn, &file_ids)
         .map_err(|e| e.to_string())?;
 
     Ok(())
