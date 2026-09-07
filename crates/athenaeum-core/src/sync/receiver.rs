@@ -5385,9 +5385,9 @@ mod tests {
             "every file lands under the batch dir"
         );
         assert!(
-            landed.iter().any(|p| p
-                .to_string_lossy()
-                .contains("camera_ASI/lights/L_0002.fits")),
+            landed
+                .iter()
+                .any(|p| p.ends_with(Path::new("camera_ASI").join("lights").join("L_0002.fits"))),
             "the nested rel_path is preserved: {landed:?}"
         );
 

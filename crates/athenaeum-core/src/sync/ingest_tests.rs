@@ -229,7 +229,10 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
     let slug = super::ingest::sanitize_slug(&node_id_hex(&sender_node));
     let expected = incoming
         .join(&slug)
-        .join("M31/2026-07-10/lights/L_0001.fits");
+        .join("M31")
+        .join("2026-07-10")
+        .join("lights")
+        .join("L_0001.fits");
     assert!(
         expected.exists(),
         "file must mirror rel_path under the peer slug: {}",
@@ -413,7 +416,7 @@ fn ingest_dot_only_device_name_lands_under_hex_slug_not_above_incoming_root() {
     );
     let hex_slug = super::ingest::sanitize_slug(PEER_HEX);
     assert!(
-        landed_path.ends_with(&format!("{hex_slug}/L_dotty.fits")),
+        Path::new(&landed_path).ends_with(Path::new(&hex_slug).join("L_dotty.fits")),
         "a dot-only device name falls back to the hex slug: {landed_path}"
     );
 }
@@ -457,7 +460,7 @@ fn ingest_lands_under_resolved_device_name() {
         "landed file exists on disk"
     );
     assert!(
-        landed_path.ends_with("My_Mac_Book/L_named.fits"),
+        Path::new(&landed_path).ends_with(Path::new("My_Mac_Book").join("L_named.fits")),
         "lands under the sanitized device name, not the hex slug: {landed_path}"
     );
     // The hex-slug dir must NOT exist (the friendly name replaced it).
@@ -634,7 +637,7 @@ fn ingest_lands_files_and_rows() {
     );
     let slug = super::ingest::sanitize_slug(PEER_HEX);
     assert!(
-        landed_path.ends_with(&format!("{slug}/L_0001.fits")),
+        Path::new(&landed_path).ends_with(Path::new(&slug).join("L_0001.fits")),
         "mirrors rel_path under the peer slug: {landed_path}"
     );
 
@@ -3223,7 +3226,9 @@ fn received_master_set_matches_scanner_ingestion() {
     let scan_dir = tmp.path().join("scan");
     std::fs::create_dir_all(&scan_dir).unwrap();
     std::fs::copy(
-        pkg.join("camera_testcam/DARKS_1/master_dark.fits"),
+        pkg.join("camera_testcam")
+            .join("DARKS_1")
+            .join("master_dark.fits"),
         scan_dir.join("master_dark.fits"),
     )
     .unwrap();
