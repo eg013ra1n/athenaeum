@@ -206,9 +206,14 @@ mod tests {
         // sanitize_for_filename replaces whitespace with '_' (see
         // archive::path_layout::sanitize_for_filename), so the camera token
         // is "ZWO_ASI2600MM_Pro", not the raw "ZWO ASI2600MM Pro".
+        // Compared as a path, not as a string: `master_relative_path` joins
+        // components, so the separator is the platform's and a forward-slash
+        // literal is only right on unix.
         assert_eq!(
-            p.to_string_lossy(),
-            "ZWO_ASI2600MM_Pro/MasterDark/master_dark_300s_-10C_g100_bin1x1_2026-06-28.fits"
+            p,
+            std::path::Path::new("ZWO_ASI2600MM_Pro")
+                .join("MasterDark")
+                .join("master_dark_300s_-10C_g100_bin1x1_2026-06-28.fits")
         );
     }
 
@@ -225,8 +230,10 @@ mod tests {
             date: "2026-07-01",
         });
         assert_eq!(
-            p.to_string_lossy(),
-            "cam/MasterFlat/master_flat_Ha_1.55s_2026-07-01.fits"
+            p,
+            std::path::Path::new("cam")
+                .join("MasterFlat")
+                .join("master_flat_Ha_1.55s_2026-07-01.fits")
         );
     }
 
