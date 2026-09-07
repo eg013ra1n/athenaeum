@@ -2789,7 +2789,9 @@ mod overview_tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let sibling = format!("{parent}/myXastro");
+        // Sibling-ness is in the leaf name ("myXastro" vs "my_astro"), not in a
+        // missing separator before the suffix — this join creates a true filesystem child.
+        let sibling = Path::new(&parent).join("myXastro").to_string_lossy().to_string();
         {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();

@@ -44,7 +44,11 @@ Deliberately not swept this cycle: nothing there fails today and nothing there
 is proven vacuous, but they are the same construction as the three tests this
 cycle found passing vacuously on Windows and could be silently vacuous there
 too. A later cycle's job, with its own judgement about whether each assertion
-still asserts what it claims.
+still asserts what it claims. The drift guard in `crates/athenaeum-core/src/test_support.rs`
+that walks the codebase for this class of site scans **only `athenaeum-core/src`**,
+not the crate's `tests/` directory and not the other workspace crates — which is why
+an `athenaeum-web` fixture of the same family went unnoticed until a Windows run
+found it.
 
 **A Windows working tree cloned before `.gitattributes` landed keeps CRLF.**
 Adding the file does not rewrite files already on disk. A developer (or a CI
