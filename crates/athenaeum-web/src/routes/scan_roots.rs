@@ -523,7 +523,11 @@ mod relink_tests {
             [],
             |row| row.get(0),
         ).unwrap();
-        let expected = new_root.canonicalize().unwrap().to_string_lossy().to_string();
+        // Production normalizes at the write boundary (normalize_path strips
+        // Windows' \\?\ verbatim prefix), so the expectation must too.
+        let expected = api::normalize_path(&new_root.canonicalize().unwrap())
+            .to_string_lossy()
+            .to_string();
         assert_eq!(updated_path, expected, "scan_roots.path must be updated on a full match");
     }
 

@@ -101,7 +101,7 @@ jobs:
       # for a developer running this same command locally without `CI` in the
       # environment.
       - name: Test workspace
-        run: cargo test --workspace -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames
+        run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames
 
       - name: Typecheck frontend
         run: npx tsc --noEmit
@@ -117,6 +117,12 @@ jobs:
   # `cargo test --workspace`. Same-class separator/path failures are already
   # known to exist in athenaeum-web and perseus, so this line comes out only
   # once a workspace-wide Windows run is actually green.
+  # `--no-fail-fast` (below) means this job now runs all 41 test binaries
+  # instead of stopping at the first one that fails, so the 60-minute budget
+  # is load-bearing where it previously was not: a fail-fast run of this same
+  # command stopped ~40s into athenaeum-core, while a full run compiles and
+  # executes every binary. Compilation still dominates the wall clock, so 60
+  # is expected to hold, but it is no longer slack against a stopped-early run.
   build-and-test-windows:
     name: Build and test (Windows)
     runs-on: windows-latest
@@ -149,5 +155,14 @@ jobs:
       - name: Compile workspace and tests
         run: cargo test --workspace --no-run
 
+      # `cargo test` is fail-fast across test binaries: without --no-fail-fast
+      # it stops at the first binary that fails, so this job would report on
+      # athenaeum-core alone and never execute the other 40 — a real run of
+      # the fail-fast form went green on that basis while 228 failures in
+      # athenaeum-web and perseus sat unexecuted behind it. Most of what
+      # --no-fail-fast now surfaces from perseus is a single known, deferred
+      # cause (a TOML-escaping fixture bug) plus a handful of undiagnosed
+      # timeouts — see the Windows section of docs/superpowers/open-items.md
+      # before re-diagnosing it.
       - name: Test workspace
-        run: cargo test --workspace -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames
+        run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames

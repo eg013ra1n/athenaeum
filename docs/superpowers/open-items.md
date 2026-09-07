@@ -82,6 +82,42 @@ regression test of its own**, unlike its sibling fix in `sync/ingest.rs`
 the mechanism is identical and already covered on the sibling path — but it is
 a real coverage gap on `project_ingest.rs` specifically.
 
+**The CI job needed `--no-fail-fast`**; without it the job measured one crate
+and reported on nine, and would have gone green while 228 failures sat
+unexecuted. `cargo test` is fail-fast across test binaries, so `cargo test
+--workspace` stopped at the first binary that failed (`athenaeum-core`) and
+never ran the other 40 — the output was byte-identical to a core-only run.
+Found by running the job's own command on a real Windows machine, after every
+review had passed the job.
+
+**perseus: 227 Windows failures, 217 from one cause.** TOML basic strings
+treat `\` as an escape introducer, so every fixture that hand-builds config
+TOML with a Windows path fails to parse (`too few unicode value digits` on
+`\U` in `C:\Users`). The fix is single-quoted TOML literal strings in the
+fixture builders. Deliberately deferred: it is a different crate and a third
+construction of the "Windows path meets a string format" theme, and —
+decisively — 9 undiagnosed supervisor/run timeouts keep perseus red
+regardless, so fixing the 217 does not unblock the gate.
+
+**perseus: 9 undiagnosed timeouts** ("first launch never reached Running:
+Elapsed(())") plus 1 assertion on a `disk_max_pct` error chain. The only
+genuinely unknown part of the Windows surface. May be downstream of the
+config failures, may be Windows timing, may be a real defect.
+
+**A user-facing documentation gap, not a code bug.** perseus production
+never writes config TOML — it only reads a hand-written file — but a Windows
+user writing `capture_dir = "C:\Users\me\Astro"` hits the identical confusing
+parse error, and the documented example at `crates/perseus/src/config.rs:9`
+is Unix-only. If perseus is supported on Windows, that example should show a
+Windows-safe form.
+
+**The `format!("{x}/y.fits")` construction is a third member of this class**,
+invisible to a `join("…/…")` grep. 18 such sites existed in
+`api/scan_roots.rs` alone and the crate-wide survey reported that file as
+having none. Any future guard for this class must cover both constructions —
+and note that a naive one would false-positive on URLs, which legitimately
+contain forward slashes.
+
 ---
 
 ## Standing decisions — do not re-flag these
