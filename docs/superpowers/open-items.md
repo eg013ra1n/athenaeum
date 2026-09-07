@@ -9,6 +9,11 @@ Plans, specs and audits live in `plans/`, `specs/` and `research/` beside this f
 and hold the detail. This file holds only the residue: the checks nobody has run and
 the calls that have already been made.
 
+**Keeping it current.** A cycle that lands adds its unverified checks here. A check
+that passes is deleted, not ticked — with the date and the measurement, if there was
+one, moved into the cycle's own doc. A decision that gets ratified moves from
+"awaiting a call" into "standing".
+
 ## Windows: fixed pending the final measurement; non-core surface still unmeasured
 
 `docs/superpowers/specs/2026-09-07-windows-test-failures-design.md` §10 has the
@@ -29,9 +34,10 @@ touched `athenaeum-tauri`, `athenaeum-web` or `perseus`, and the CI job's
 family this cycle fixed:
 `athenaeum-web/src/routes/scan_roots.rs:526` compares a raw `canonicalize()`
 against a value production stores normalized — the same family as this cycle's
-A/E. `crates/perseus/src/` has roughly ten slash-literal `join("M31/…")`
-fixture sites (`pending.rs`, `library.rs`, `web.rs`, `library/delete.rs`) — the
-same construction the scanner sweep (family D/H) fixed in `athenaeum-core`.
+A/E. `crates/perseus/src/` has 14 slash-literal `join("M31/…")` fixture sites
+(3 in `pending.rs`, 3 in `library.rs`, 6 in `web.rs`, 2 in `library/delete.rs`)
+— the same construction the scanner sweep (family D/H) fixed in
+`athenaeum-core`.
 
 **23 unswept slash-joins in `archive/*` tests, plus 3 in export tests.**
 Deliberately not swept this cycle: nothing there fails today and nothing there

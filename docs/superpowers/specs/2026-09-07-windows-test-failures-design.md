@@ -248,7 +248,8 @@ test suite.
   file a second time.
 - The same fix applies to a received project collaboration contribution: its
   landed path is now recorded in the platform's own spelling too, so the
-  duplicate-copy lookup that keys on it can actually find a match on Windows.
+  scanner recognises a received contribution instead of reporting it as a
+  second copy.
 
 ## 10. Outcome
 
@@ -264,6 +265,10 @@ Every family turned out to be test-side except F, which was both.
 | F [4] | Both. Three of the four assertions hardcoded a forward-slash comparison string against a correctly-landed native path (test-side). The fourth exposed a real production defect: `land_payload` joined the wire `rel_path` onto the landing base unconverted, so a nested receive stored a mixed-separator string in `files.path` while the file itself landed correctly on disk — a later folder scan would catalog the same file a second time under its native spelling. | Test-side: `116fb09f`. Production: `558c0e69` (`native_rel_path` in `sync::ingest`), hardened by `5176dffa` after the final review found a drive-letter-mid-segment path-escape in the first version. |
 | G [1] | The terminal-writer drift guard split its own embedded source on a literal `"\n#[cfg(test)]\nmod tests"`, which never matches under `core.autocrlf=true` — the guard silently counted its own test module (26 instead of 12) and could not do its job on any Windows checkout. | T3, plus `.gitattributes` pinning `*.rs eol=lf` as its own revertible commit (D6). |
 | H [1] | Same construction as D (`scan_repairs_moved_project_contribution`), absorbed into T6's sweep. | T6. |
+
+The table sums to 37, short of the headline 39 — the two failures never
+attributed to a family are named in §1's reconciliation, which traces both to
+the same T5 fix as families A and E.
 
 **Three tests were found passing vacuously on Windows** and were de-blinded in
 the same T6 sweep: `scan_leaves_duplicate_project_contribution`,
