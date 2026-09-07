@@ -5988,16 +5988,30 @@ mod tests {
     fn every_terminal_writer_announces_or_is_a_named_exemption() {
         /// Count state-write call sites in a file's PRODUCTION half, ignoring
         /// comment lines (so prose mentioning the function never moves the number).
+        ///
+        /// Line-based rather than a split on a `"\n…"` literal: with
+        /// `core.autocrlf=true` — git's Windows default — the embedded source
+        /// carries CRLF, such a literal never matches, and the guard silently
+        /// counts its own test module. `str::lines` strips the `\r`, so this is
+        /// true on either checkout. `.gitattributes` pins the endings as well;
+        /// this does not depend on that.
         fn write_sites(src: &str) -> usize {
-            src.split("\n#[cfg(test)]\nmod tests")
-                .next()
-                .unwrap_or(src)
-                .lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    !t.starts_with("//") && t.contains("set_inbound_state(")
-                })
-                .count()
+            let mut count = 0usize;
+            let mut lines = src.lines().peekable();
+            while let Some(line) = lines.next() {
+                if line.trim_end() == "#[cfg(test)]"
+                    && lines
+                        .peek()
+                        .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+                {
+                    break;
+                }
+                let t = line.trim_start();
+                if !t.starts_with("//") && t.contains("set_inbound_state(") {
+                    count += 1;
+                }
+            }
+            count
         }
 
         assert_eq!(
