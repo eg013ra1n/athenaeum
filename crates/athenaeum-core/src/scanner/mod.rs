@@ -2106,7 +2106,7 @@ mod inplace_tests {
     #[test]
     fn rescan_after_mtime_change_preserves_session_members() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("M33/L_001.fits");
+        let f = scan.path().join("M33").join("L_001.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         crate::archive::restore::tests::write_minimal_fits(&f);
 
@@ -2201,7 +2201,7 @@ mod inplace_tests {
     #[test]
     fn rescan_recovers_orphaned_files_row_with_no_frames() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("M33/L_002.fits");
+        let f = scan.path().join("M33").join("L_002.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         crate::archive::restore::tests::write_minimal_fits(&f);
 
@@ -2288,7 +2288,7 @@ mod inplace_tests {
     #[test]
     fn rescan_updates_bayer_offsets_and_roworder_in_place() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("OSC/L_001.fits");
+        let f = scan.path().join("OSC").join("L_001.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         // First ingest: an OSC frame whose header declares no offsets.
         write_fits_with_extra_cards(&f, &["BAYERPAT= 'RGGB    '"]);
@@ -2361,7 +2361,7 @@ mod inplace_tests {
     #[test]
     fn rescan_syncs_stored_header_blob_with_frames_columns() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("OSC/L_001.fits");
+        let f = scan.path().join("OSC").join("L_001.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         write_fits_with_extra_cards(&f, &["BAYERPAT= 'RGGB    '"]);
 
@@ -2437,7 +2437,7 @@ mod inplace_tests {
     #[test]
     fn parallel_rescan_after_mtime_change_preserves_session_members() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("M33/L_001.fits");
+        let f = scan.path().join("M33").join("L_001.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         crate::archive::restore::tests::write_minimal_fits(&f);
 
@@ -2511,7 +2511,7 @@ mod inplace_tests {
     #[test]
     fn parallel_rescan_preserves_user_override_edits() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("M33/L_003.fits");
+        let f = scan.path().join("M33").join("L_003.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         crate::archive::restore::tests::write_minimal_fits(&f);
 
@@ -2677,7 +2677,7 @@ mod inplace_tests {
     #[test]
     fn scan_leaves_content_hash_null_when_hashing_is_off() {
         let scan = TempDir::new().unwrap();
-        let f = scan.path().join("M33/L_001.fits");
+        let f = scan.path().join("M33").join("L_001.fits");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         crate::archive::restore::tests::write_minimal_fits(&f);
 
@@ -2752,7 +2752,7 @@ mod moved_file_guard_tests {
         let tmp = TempDir::new().unwrap();
 
         // Offline root: registered in scan_roots but never created on disk.
-        let offline_root = tmp.path().join("offline-volume/astro");
+        let offline_root = tmp.path().join("offline-volume").join("astro");
         // Online root: real, existing directory for the "new" file.
         let online_root = tmp.path().join("online-volume");
         std::fs::create_dir_all(&online_root).unwrap();
@@ -2944,21 +2944,21 @@ mod moved_file_guard_tests {
         )
         .unwrap();
 
-        let under_missing = missing_root.join("a/b.fits");
+        let under_missing = missing_root.join("a").join("b.fits");
         assert_eq!(
             path_under_unavailable_scan_root(&conn, under_missing.to_str().unwrap()).unwrap(),
             Some(missing_root.to_str().unwrap().to_string()),
             "a path under a missing scan root must report unavailable, naming that root"
         );
 
-        let under_existing = existing_root.join("a/b.fits");
+        let under_existing = existing_root.join("a").join("b.fits");
         assert_eq!(
             path_under_unavailable_scan_root(&conn, under_existing.to_str().unwrap()).unwrap(),
             None,
             "a path under an existing scan root must report available"
         );
 
-        let elsewhere = tmp.path().join("elsewhere/c.fits");
+        let elsewhere = tmp.path().join("elsewhere").join("c.fits");
         assert_eq!(
             path_under_unavailable_scan_root(&conn, elsewhere.to_str().unwrap()).unwrap(),
             None,
@@ -3090,7 +3090,7 @@ mod calibrated_light_scan_tests {
     fn scan_never_catalogs_a_calibrated_artifact() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
-            let cal = root.path().join("M42/c_L_0001.fits");
+            let cal = root.path().join("M42").join("c_L_0001.fits");
             write_calibrated_light(&cal, "uuid-src", "L_0001.fits", "BDF");
             let cal_str = cal.to_str().unwrap().to_string();
 
@@ -3260,7 +3260,7 @@ mod calibrated_light_scan_tests {
     fn scan_skips_known_project_contribution() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
-            let cal = root.path().join("proj/Alice/c_L_0001.fits");
+            let cal = root.path().join("proj").join("Alice").join("c_L_0001.fits");
             write_project_contribution(&cal, "uuid-k", "L_0001.fits", "proj-1");
             let cal_str = cal.to_str().unwrap().to_string();
             let xxh3 = crate::package::xxh3_full_file(&cal).unwrap();
@@ -3283,14 +3283,14 @@ mod calibrated_light_scan_tests {
     fn scan_repairs_moved_project_contribution() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
-            let cal = root.path().join("proj/Alice/c_L_0002.fits");
+            let cal = root.path().join("proj").join("Alice").join("c_L_0002.fits");
             write_project_contribution(&cal, "uuid-m", "L_0002.fits", "proj-1");
             let cal_str = cal.to_str().unwrap().to_string();
             let xxh3 = crate::package::xxh3_full_file(&cal).unwrap();
 
             let conn = fresh_db(root.path(), 1);
             // Old landed_path does not exist on disk.
-            let gone = root.path().join("old/gone/c_L_0002.fits");
+            let gone = root.path().join("old").join("gone").join("c_L_0002.fits");
             seed_contribution(&conn, "proj-1", "pkg-1", gone.to_str().unwrap(), &xxh3);
 
             let result = run_scan(parallel, root.path(), &conn, 1);
@@ -3316,7 +3316,7 @@ mod calibrated_light_scan_tests {
             let xxh3 = crate::package::xxh3_full_file(&kept).unwrap();
 
             // The duplicate copy sits inside the scan root (byte-identical).
-            let dup = root.path().join("proj/Alice/c_L_0003.fits");
+            let dup = root.path().join("proj").join("Alice").join("c_L_0003.fits");
             write_project_contribution(&dup, "uuid-d", "L_0003.fits", "proj-1");
             let dup_str = dup.to_str().unwrap().to_string();
 
@@ -3343,7 +3343,7 @@ mod calibrated_light_scan_tests {
     fn scan_leaves_unknown_project_contribution() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
-            let cal = root.path().join("proj/Alice/c_L_orphan.fits");
+            let cal = root.path().join("proj").join("Alice").join("c_L_orphan.fits");
             write_project_contribution(&cal, "uuid-o", "L_orphan.fits", "proj-1");
             let cal_str = cal.to_str().unwrap().to_string();
 
