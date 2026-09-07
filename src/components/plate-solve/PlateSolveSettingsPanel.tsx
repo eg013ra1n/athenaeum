@@ -552,6 +552,104 @@ export function PlateSolveSettingsPanel() {
               distant objects. Default 0.5&deg;.
             </p>
           </div>
+
+          {/* Batch Concurrency */}
+          <div>
+            <label className="block text-sm font-medium text-content-secondary mb-1">
+              Batch Concurrency
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={16}
+              step={1}
+              value={config.batch_concurrency}
+              onChange={(e) => setField('batch_concurrency', parseInt(e.target.value, 10) || 0)}
+              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+            />
+            <p className="mt-1 text-xs text-content-muted">
+              Worker threads for batch solving. Each worker solves one frame at a
+              time and shares the star-detection thread pool with the others.
+              <code>0</code> means auto &mdash; <code>cores / 3</code>, clamped to
+              2&ndash;8. Default 0.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Input Gate */}
+      <section>
+        <h4 className="text-sm font-semibold uppercase tracking-wider text-content-muted mb-3">
+          Input Gate
+        </h4>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={config.input_gate_enabled}
+            onChange={(e) => setField('input_gate_enabled', e.target.checked)}
+            className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+          />
+          <span>Refuse trailed frames before solving</span>
+        </label>
+        <p className="mt-2 mb-4 text-xs text-content-muted">
+          A frame is refused when its own analysis reports a median star
+          eccentricity of at least the first value <strong>and</strong> a trail-fit
+          R&sup2; of at least the second &mdash; both, never either alone. Measured on
+          real frames: ones that solve correctly sit at eccentricity
+          0.62&ndash;0.72 with R&sup2; 0.30&ndash;0.57, hopeless ones at
+          0.90&ndash;0.96 with 0.73&ndash;0.93. Loosening these lets more frames
+          attempt a solve. Tightening them will <em>not</em> reliably catch more
+          trailed frames &mdash; the analysis under-reports eccentricity on exactly
+          those frames, so it rates many of them as round.
+        </p>
+        <div
+          className={`grid grid-cols-1 gap-4 sm:grid-cols-2 ${
+            config.input_gate_enabled ? '' : 'opacity-50'
+          }`}
+        >
+          {/* Max median eccentricity */}
+          <div>
+            <label className="block text-sm font-medium text-content-secondary mb-1">
+              Max Median Eccentricity
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.01}
+              disabled={!config.input_gate_enabled}
+              value={config.input_max_eccentricity}
+              onChange={(e) =>
+                setField('input_max_eccentricity', parseFloat(e.target.value) || 0)
+              }
+              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed"
+            />
+            <p className="mt-1 text-xs text-content-muted">
+              How elongated the average star may be before the frame is a
+              candidate for refusal. Default 0.85.
+            </p>
+          </div>
+
+          {/* Min trail R-squared */}
+          <div>
+            <label className="block text-sm font-medium text-content-secondary mb-1">
+              Min Trail R&sup2;
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.01}
+              disabled={!config.input_gate_enabled}
+              value={config.input_min_trail_r2}
+              onChange={(e) => setField('input_min_trail_r2', parseFloat(e.target.value) || 0)}
+              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed"
+            />
+            <p className="mt-1 text-xs text-content-muted">
+              How well the elongation lines up along one direction &mdash; high
+              means a tracking failure rather than soft seeing. Default 0.65.
+            </p>
+          </div>
         </div>
       </section>
 
