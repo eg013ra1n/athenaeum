@@ -1198,6 +1198,7 @@ fn startup_catch_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
     use athenaeum_core::fits_writer::write_fits_f32;
@@ -1381,11 +1382,11 @@ mod tests {
             // scheduled tests measure against. A named 45 s reads far better in
             // those assertions than an implicit 16 s.
             let toml = format!(
-                "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n\
+                "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"auto\"\n\
                  stability_secs=30\npoll_interval_secs=5\n\
                  [retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-                capture.display(),
-                data.display()
+                toml_path(&capture),
+                toml_path(&data)
             );
             let config = Config::from_toml_str(&toml).unwrap();
 

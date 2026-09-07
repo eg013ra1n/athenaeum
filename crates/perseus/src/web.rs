@@ -3835,6 +3835,7 @@ fn sent_manifest_summary(package_ref: &str) -> (Vec<String>, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     use crate::supervisor::AgentState;
     use athenaeum_core::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
@@ -3965,9 +3966,9 @@ mod tests {
     fn sample_toml(dir: &std::path::Path) -> String {
         // `dir` exists (tempdir), so the capture-dir existence check passes.
         format!(
-            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\nmode = \"auto\"\n[retention]\npolicy = \"keep_days\"\ndry_run = true\nkeep_days = 21\n",
-            dir.display(),
-            dir.display()
+            "capture_dir = {}\ndata_dir = {}\npairing_ticket = \"t\"\nmode = \"auto\"\n[retention]\npolicy = \"keep_days\"\ndry_run = true\nkeep_days = 21\n",
+            toml_path(&dir),
+            toml_path(&dir)
         )
     }
 
@@ -4118,11 +4119,11 @@ mod tests {
     async fn status_reports_the_next_scheduled_send() {
         let (state, tmp) = test_state().await;
         let toml_str = format!(
-            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\n\
+            "capture_dir = {}\ndata_dir = {}\npairing_ticket = \"t\"\n\
              mode = \"scheduled\"\nschedule_times = [\"06:00\"]\n\
              [retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            tmp.path().display(),
-            tmp.path().display()
+            toml_path(tmp.path()),
+            toml_path(tmp.path())
         );
         *state.config.write().await = Config::from_toml_str(&toml_str).unwrap();
 
@@ -4687,8 +4688,8 @@ mod tests {
         let batches =
             Arc::new(crate::batch_store::BatchStore::open(tmp.path().join("sync.db")).unwrap());
         let toml_str = format!(
-            "capture_dir = \"{d}\"\ndata_dir = \"{d}\"\nmode = \"auto\"\n[account]\nhub_url = \"https://test-hub.artfrom.space\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            d = tmp.path().display()
+            "capture_dir = {d}\ndata_dir = {d}\nmode = \"auto\"\n[account]\nhub_url = \"https://test-hub.artfrom.space\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = toml_path(tmp.path())
         );
         let config_path = tmp.path().join("perseus.toml");
         std::fs::write(&config_path, &toml_str).unwrap();
@@ -7267,9 +7268,9 @@ mod tests {
         let batches = Arc::new(crate::batch_store::BatchStore::open(&db).unwrap());
 
         let toml_str = format!(
-            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\nmode = \"manual\"\n[retention]\npolicy = \"keep_days\"\ndry_run = true\nkeep_days = 21\n",
-            cap.display(),
-            data.display()
+            "capture_dir = {}\ndata_dir = {}\npairing_ticket = \"t\"\nmode = \"manual\"\n[retention]\npolicy = \"keep_days\"\ndry_run = true\nkeep_days = 21\n",
+            toml_path(&cap),
+            toml_path(&data)
         );
         let config_path = tmp.path().join("perseus.toml");
         std::fs::write(&config_path, &toml_str).unwrap();
@@ -8759,9 +8760,9 @@ mod tests {
         let seen = Arc::new(crate::seen::SeenStore::open(&db).unwrap());
         let batches = Arc::new(crate::batch_store::BatchStore::open(&db).unwrap());
         let toml_str = format!(
-            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\nmode = \"manual\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            cap.display(),
-            data.display()
+            "capture_dir = {}\ndata_dir = {}\npairing_ticket = \"t\"\nmode = \"manual\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            toml_path(&cap),
+            toml_path(&data)
         );
         let config_path = tmp.path().join("perseus.toml");
         std::fs::write(&config_path, &toml_str).unwrap();

@@ -2231,6 +2231,7 @@ mod tests {
 #[cfg(test)]
 mod retention_tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     use athenaeum_core::package::MANIFEST_FILENAME;
     use athenaeum_core::sharing::types::FrameReceipt;
@@ -2348,9 +2349,9 @@ mod retention_tests {
         std::fs::create_dir_all(&capture).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let toml = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"on_confirm\"\ndry_run=true\n",
-            capture.display(),
-            data.display()
+            "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"on_confirm\"\ndry_run=true\n",
+            toml_path(&capture),
+            toml_path(&data)
         );
         let config = Config::from_toml_str(&toml).unwrap();
         // Store + seen share the one perseus.db file (WAL) — the production wiring.
@@ -2990,6 +2991,7 @@ mod retention_tests {
 #[cfg(test)]
 mod multi_target_tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     use athenaeum_core::sharing::loopback::{LoopbackNetwork, LoopbackTransport};
     use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
@@ -3327,9 +3329,9 @@ mod multi_target_tests {
         let data = tmp.join("data");
         std::fs::create_dir_all(&data).unwrap();
         let toml = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-            tmp.display(),
-            data.display()
+            "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            toml_path(&tmp),
+            toml_path(&data)
         );
         let config = Config::from_toml_str(&toml).unwrap();
         let batches = crate::batch_store::BatchStore::open(tmp.join("sync.db")).unwrap();
@@ -3511,9 +3513,9 @@ mod multi_target_tests {
         std::fs::create_dir_all(&cap).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let toml = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-            cap.display(),
-            data.display()
+            "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            toml_path(&cap),
+            toml_path(&data)
         );
         let config = Config::from_toml_str(&toml).unwrap();
 
@@ -3569,10 +3571,10 @@ mod multi_target_tests {
         // spawns never flushes on its own — the only rows here are the two
         // `enqueue_file` calls below.
         let toml = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"manual\"\n\
+            "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"manual\"\n\
              mirror_hierarchy=true\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-            cap.display(),
-            data.display()
+            toml_path(&cap),
+            toml_path(&data)
         );
         let config = Config::from_toml_str(&toml).unwrap();
 
@@ -3685,6 +3687,7 @@ mod multi_target_tests {
 #[cfg(test)]
 mod batch_package_tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
     use athenaeum_core::fits_writer::write_fits_f32;
@@ -3723,9 +3726,9 @@ mod batch_package_tests {
             .collect();
 
         let toml = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-            capture.display(),
-            data.display()
+            "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            toml_path(&capture),
+            toml_path(&data)
         );
         let config = Config::from_toml_str(&toml).unwrap();
         (config, capture, files)

@@ -669,6 +669,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::toml_path;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -869,12 +870,12 @@ mod tests {
     ) {
         let dirs_toml = dirs
             .iter()
-            .map(|d| format!("\"{}\"", d.display()))
+            .map(|d| toml_path(d))
             .collect::<Vec<_>>()
             .join(", ");
         let text = format!(
-            "data_dir = \"{}\"\nmode = \"{}\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\n{}[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            data_dir.display(),
+            "data_dir = {}\nmode = \"{}\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\n{}[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            toml_path(&data_dir),
             mode,
             dirs_toml,
             extra
@@ -896,8 +897,8 @@ mod tests {
         write_config_atomic(
             &cfg_path,
             &format!(
-                "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = []\n[account]\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-                data.path().display()
+                "data_dir = {}\nmode = \"auto\"\ncapture_dirs = []\n[account]\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+                toml_path(data.path())
             ),
         );
 
@@ -1209,9 +1210,9 @@ mod tests {
             write_config_atomic(
                 &cfg_path,
                 &format!(
-                    "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = [\"{}\"]\npairing_ticket = \"t\"\ntargets = [{}]\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-                    data.path().display(),
-                    cap.path().display(),
+                    "data_dir = {}\nmode = \"auto\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\ntargets = [{}]\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+                    toml_path(data.path()),
+                    toml_path(cap.path()),
                     targets
                 ),
             );
@@ -1284,9 +1285,9 @@ mod tests {
         write_config_atomic(
             &cfg_path,
             &format!(
-                "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = [\"{}\"]\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-                data.path().display(),
-                cap.path().display()
+                "data_dir = {}\nmode = \"auto\"\ncapture_dirs = [{}]\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+                toml_path(data.path()),
+                toml_path(cap.path())
             ),
         );
         handle.wake.notify_one();

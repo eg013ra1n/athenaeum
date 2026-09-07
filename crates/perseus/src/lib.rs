@@ -65,6 +65,8 @@ pub mod run;
 pub mod schedule;
 pub mod seen;
 pub mod supervisor;
+#[cfg(test)]
+mod test_support;
 #[cfg(feature = "tray")]
 pub mod tray;
 pub mod watcher;

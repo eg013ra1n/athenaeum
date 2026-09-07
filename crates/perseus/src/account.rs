@@ -917,6 +917,7 @@ fn prompt(label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     #[test]
     fn hub_host_extracts_bare_host() {
@@ -1645,8 +1646,8 @@ mod tests {
     fn write_rename_config(dir: &Path, hub_url: &str, target: &str) -> PathBuf {
         let p = dir.join("perseus.toml");
         let text = format!(
-            "capture_dir = \"{d}\"\ndata_dir = \"{d}\"\nmode = \"auto\"\ntargets = [\"{t}\"]\n[account]\nhub_url = \"{h}\"\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            d = dir.display(),
+            "capture_dir = {d}\ndata_dir = {d}\nmode = \"auto\"\ntargets = [\"{t}\"]\n[account]\nhub_url = \"{h}\"\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = toml_path(&dir),
             t = target,
             h = hub_url,
         );

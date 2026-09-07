@@ -447,6 +447,7 @@ pub(crate) fn policy_str(p: &RetentionPolicy) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*; // brings in `RetentionPolicy` too (via the module's own import)
+    use crate::test_support::toml_path;
 
     /// A comment-carrying config with the two live-deletion soak keys present.
     /// `/tmp` exists on every unix test host, so `validate()`'s capture-dir
@@ -614,8 +615,8 @@ i_have_verified_the_soak = false
     fn write_min_config(dir: &Path) -> std::path::PathBuf {
         let p = dir.join("perseus.toml");
         let text = format!(
-            "# top comment\ncapture_dirs = [\"{d}\"]\ndata_dir = \"{d}\"\nmode = \"auto\"\ntargets = [\"studio-mac\"]\ndevice_name = \"old-name\"\n[account]\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            d = dir.display()
+            "# top comment\ncapture_dirs = [{d}]\ndata_dir = {d}\nmode = \"auto\"\ntargets = [\"studio-mac\"]\ndevice_name = \"old-name\"\n[account]\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = toml_path(&dir)
         );
         std::fs::write(&p, text).unwrap();
         p
@@ -912,8 +913,8 @@ i_have_verified_the_soak = false
     fn write_account_only_no_targets_config(dir: &Path) -> std::path::PathBuf {
         let p = dir.join("perseus.toml");
         let text = format!(
-            "# top comment\ncapture_dir = \"{d}\"\ndata_dir = \"{d}\"\nmode = \"auto\"\n[account]\nhub_url = \"https://test-hub.artfrom.space\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
-            d = dir.display()
+            "# top comment\ncapture_dir = {d}\ndata_dir = {d}\nmode = \"auto\"\n[account]\nhub_url = \"https://test-hub.artfrom.space\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = toml_path(&dir)
         );
         std::fs::write(&p, text).unwrap();
         p

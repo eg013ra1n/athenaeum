@@ -892,6 +892,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::toml_path;
     use athenaeum_core::package::{write_package, PayloadKind, MANIFEST_VERSION};
 
     /// A config whose `capture_dirs` are exactly `dirs` (created on disk) and
@@ -904,12 +905,12 @@ mod tests {
         }
         let list = dirs
             .iter()
-            .map(|d| format!("\"{}\"", d.display()))
+            .map(|d| toml_path(d))
             .collect::<Vec<_>>()
             .join(", ");
         let toml = format!(
-            "capture_dirs = [{list}]\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-            data.display()
+            "capture_dirs = [{list}]\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            toml_path(&data)
         );
         Config::from_toml_str(&toml).unwrap()
     }

@@ -779,6 +779,7 @@ impl DeleteReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::toml_path;
 
     use athenaeum_core::sync::store::StandaloneSyncStore;
 
@@ -796,10 +797,10 @@ mod tests {
         std::fs::create_dir_all(&cap).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let toml = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"manual\"\n\
+            "capture_dir={}\ndata_dir={}\npairing_ticket=\"t\"\nmode=\"manual\"\n\
              [retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
-            cap.display(),
-            data.display()
+            toml_path(&cap),
+            toml_path(&data)
         );
         let config = Config::from_toml_str(&toml).unwrap();
         (tmp, config, cap)
