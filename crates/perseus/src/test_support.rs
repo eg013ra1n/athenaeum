@@ -121,14 +121,17 @@ mod tests {
 /// Guards the whole crate against the construction [`toml_path`] exists to
 /// replace: a path spliced into a TOML **basic** string.
 ///
-/// Deliberately narrow. It walks only `crates/perseus/src` and only flags a
-/// `format!` that contains BOTH an escaped quote and a `.display()` argument —
-/// the exact shape that produced 227 Windows failures. A `format!` with quotes
-/// but no path (`mode = \"{}\"` over a `&str`) is fine and stays fine, as is a
-/// `.display()` with no quotes around it; the guard has no opinion on either.
+/// It walks only `crates/perseus/src` and flags a `format!` that wraps a
+/// `.display()` in a TOML quote — see [`splices_a_path_into_a_basic_string`]
+/// for the two spellings it recognises. A `format!` with quotes but no path
+/// (`mode = \"{}\"` over a `&str`) is fine and stays fine, as is a `.display()`
+/// with no quotes around it; the guard has no opinion on either.
 ///
-/// The sibling guard in `athenaeum-core/src/test_support.rs` scans only that
-/// crate's `src`, which is precisely why this class survived here unnoticed.
+/// Its own scope is the lesson twice over. The sibling guard in
+/// `athenaeum-core/src/test_support.rs` scans only that crate's `src`, which is
+/// why this class survived in perseus unnoticed — and this guard's first
+/// version matched only escaped quotes, which let seven raw-string fixtures
+/// through and left 27 failures standing after it reported the crate clean.
 #[test]
 fn fixtures_never_splice_a_path_into_a_toml_basic_string() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -148,12 +151,7 @@ fn fixtures_never_splice_a_path_into_a_toml_basic_string() {
 
         for (offset, _) in text.match_indices("format!(") {
             let body = balanced_call_body(&text, offset + "format!(".len());
-            // An escaped quote plus a `.display()` in the same `format!`: a path
-            // is being wrapped in a TOML basic string. Catches the assignment
-            // form (`data_dir = \"{}\"`) and the array-element form
-            // (`format!("\"{}\"", d.display())`) alike — the latter has no `=`
-            // in it at all, which an assignment-shaped guard would miss.
-            if body.contains("\\\"") && body.contains(".display()") {
+            if splices_a_path_into_a_basic_string(body) {
                 let line = text[..offset].lines().count();
                 violations.push(format!(
                     "{}:{}",
@@ -172,6 +170,107 @@ fn fixtures_never_splice_a_path_into_a_toml_basic_string() {
          parse. Sites:\n  {}",
         violations.join("\n  ")
     );
+}
+
+/// A fixture may not hard-code an absolute capture directory.
+///
+/// `validate()` checks that every capture dir exists, so a fixture that names
+/// one is asserting the host's filesystem layout. `/tmp` exists on every unix
+/// test host and on no Windows one, which cost three `config_edit` tests a
+/// Windows run — the doc comment above the fixture stated the assumption
+/// outright, which is what makes it a class rather than an oversight.
+///
+/// `data_dir` is deliberately not covered: it is never checked for existence,
+/// so `data_dir = "/d"` is a harmless placeholder rather than a claim.
+#[test]
+fn fixtures_never_hard_code_an_absolute_capture_dir() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut violations = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&src).into_iter().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        // This module spells the forbidden shapes out as the patterns it
+        // searches for, so it matches itself.
+        if path == src.join("test_support.rs") {
+            continue;
+        }
+        for (i, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
+            // Doc comments carry the documented `perseus.toml` example, which
+            // is prose about a real deployment, not a fixture.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let hit = line.contains("capture_dir = \"/")
+                || line.contains("capture_dir=\"/")
+                || line.contains("capture_dirs = [\"/")
+                || line.contains("capture_dirs=[\"/")
+                || line.contains("capture_dir = \\\"/")
+                || line.contains("capture_dirs = [\\\"/");
+            if hit {
+                violations.push(format!(
+                    "{}:{}",
+                    path.strip_prefix(&src).unwrap().display(),
+                    i + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a fixture hard-codes an absolute capture directory, which asserts the \
+         test host's filesystem layout — `/tmp` does not exist on Windows. Build \
+         the path from a `tempfile::tempdir()` and render it with \
+         `test_support::toml_path()`. Sites:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// Whether a `format!` body wraps a `.display()` in a TOML basic string.
+///
+/// Two spellings, because a fixture may write its TOML either way:
+///
+/// - an ordinary string literal, where the TOML quote is escaped in source
+///   (`"data_dir = \"{}\""`), and
+/// - a raw string, where it is a plain quote (`r#"data_dir = "{}""#`).
+///
+/// The raw arm is not hypothetical: the escaped-only guard shipped first and
+/// was structurally blind to all seven raw-string fixtures in `config.rs`,
+/// which a Windows run then found — 27 failures the guard had declared clean.
+///
+/// The raw arm looks only *inside* raw-string literals, because a bare `"{`
+/// outside one matches every ordinary `format!("{}", p.display())` in the
+/// crate, none of which is TOML.
+fn splices_a_path_into_a_basic_string(body: &str) -> bool {
+    if !body.contains(".display()") {
+        return false;
+    }
+    if body.contains("\\\"") {
+        return true;
+    }
+    raw_string_bodies(body)
+        .iter()
+        .any(|raw| raw.contains("\"{"))
+}
+
+/// The contents of every `r#"…"#` literal in `body`.
+fn raw_string_bodies(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("r#\"") {
+        let after = &rest[i + 3..];
+        match after.find("\"#") {
+            Some(j) => {
+                out.push(&after[..j]);
+                rest = &after[j + 2..];
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// The text between `start` and the `)` that closes the call opened before it,

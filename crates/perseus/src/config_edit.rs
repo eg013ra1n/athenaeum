@@ -450,13 +450,19 @@ mod tests {
     use crate::test_support::toml_path;
 
     /// A comment-carrying config with the two live-deletion soak keys present.
-    /// `/tmp` exists on every unix test host, so `validate()`'s capture-dir
-    /// existence check passes; `pairing_ticket` satisfies the pairing-route gate.
-    fn with_comments() -> String {
-        r#"
+    /// The capture dir is the caller's own temp dir so `validate()`'s
+    /// capture-dir existence check passes on every platform; `pairing_ticket`
+    /// satisfies the pairing-route gate.
+    ///
+    /// This used to hard-code `/tmp` on the stated assumption that it "exists on
+    /// every unix test host". It does not exist on Windows, and three tests
+    /// failed there on the missing directory alone.
+    fn with_comments(capture: &Path) -> String {
+        format!(
+            r#"
 # my precious comment
-capture_dir = "/tmp"
-data_dir = "/tmp"
+capture_dir = {capture}
+data_dir = {capture}
 pairing_ticket = "ticket-abc"
 mode = "auto"
 
@@ -464,8 +470,9 @@ mode = "auto"
 policy = "keep_everything"   # inline comment
 dry_run = true
 i_have_verified_the_soak = false
-"#
-        .to_string()
+"#,
+            capture = toml_path(capture)
+        )
     }
 
     /// A web edit rewrites only the whitelisted `[retention]` keys, preserving
@@ -474,7 +481,7 @@ i_have_verified_the_soak = false
     fn retention_edit_preserves_comments_and_soak_keys() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("perseus.toml");
-        std::fs::write(&p, with_comments()).unwrap();
+        std::fs::write(&p, with_comments(dir.path())).unwrap();
 
         let edit = RetentionEdit {
             policy: RetentionPolicy::KeepDays,
@@ -518,9 +525,10 @@ i_have_verified_the_soak = false
         // inline comment on `data_dir` and a standalone comment on `[retention]`
         // — so they must survive. (A comment attached directly to the removed
         // key legitimately goes with it; see the module contract.)
-        let original = "\
-capture_dir = \"/tmp\"
-data_dir = \"/tmp\"  # keep this data dir
+        let original = format!(
+            "\
+capture_dir = {capture}
+data_dir = {capture}  # keep this data dir
 pairing_ticket = \"ticket-abc\"
 mode = \"auto\"
 
@@ -529,7 +537,9 @@ mode = \"auto\"
 policy = \"keep_everything\"
 dry_run = true
 i_have_verified_the_soak = false
-";
+",
+            capture = toml_path(dir.path())
+        );
         std::fs::write(&p, original).unwrap();
 
         let a = tempfile::tempdir().unwrap();
@@ -569,7 +579,7 @@ i_have_verified_the_soak = false
     fn capture_dirs_edit_nonexistent_dir_rejected_and_file_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("perseus.toml");
-        let original = with_comments();
+        let original = with_comments(dir.path());
         std::fs::write(&p, &original).unwrap();
 
         let missing = dir.path().join("does-not-exist");
@@ -594,7 +604,7 @@ i_have_verified_the_soak = false
     fn capture_dirs_edit_empty_list_rejected_and_file_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("perseus.toml");
-        let original = with_comments();
+        let original = with_comments(dir.path());
         std::fs::write(&p, &original).unwrap();
 
         let err = apply_capture_dirs_edit(&p, &[]).expect_err("an empty list must be rejected");
@@ -708,7 +718,7 @@ i_have_verified_the_soak = false
     fn upload_limit_edit_preserves_comments_and_other_keys() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("perseus.toml");
-        std::fs::write(&p, with_comments()).unwrap();
+        std::fs::write(&p, with_comments(dir.path())).unwrap();
 
         let cfg = apply_upload_limit_edit(&p, 8).unwrap();
         assert_eq!(cfg.max_upload_mbps, 8);
@@ -957,7 +967,7 @@ i_have_verified_the_soak = false
     fn retention_edit_cannot_enable_live_deletion() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("perseus.toml");
-        let original = with_comments();
+        let original = with_comments(dir.path());
         std::fs::write(&p, &original).unwrap();
 
         let edit = RetentionEdit {

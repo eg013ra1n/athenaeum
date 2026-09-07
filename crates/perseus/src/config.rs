@@ -1004,7 +1004,7 @@ mod tests {
     fn good_toml(capture_dir: &Path) -> String {
         format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/var/lib/perseus"
 pairing_ticket = "ticket-abc"
 mode = "auto"
@@ -1012,7 +1012,7 @@ mode = "auto"
 policy = "keep_everything"
 dry_run = true
 "#,
-            capture_dir.display()
+            toml_path(&capture_dir)
         )
     }
 
@@ -1122,14 +1122,14 @@ dry_run = true
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
 [retention]
 policy = "on_confirm"
 "#,
-            capture.path().display()
+            toml_path(capture.path())
         );
         let cfg = Config::from_toml_str(&text).expect("valid config");
         assert!(cfg.retention.dry_run, "dry_run must default to true");
@@ -1140,12 +1140,12 @@ policy = "on_confirm"
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
 "#,
-            capture.path().display()
+            toml_path(capture.path())
         );
         let cfg = Config::from_toml_str(&text).expect("valid config");
         assert_eq!(cfg.retention.policy, RetentionPolicy::KeepEverything);
@@ -1453,7 +1453,7 @@ mode = "auto"
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/d"
 mode = "auto"
 targets = ["Studio Mac"]
@@ -1463,7 +1463,7 @@ email = "me@example.com"
 policy = "keep_everything"
 dry_run = true
 "#,
-            capture.path().display()
+            toml_path(capture.path())
         );
         let cfg = Config::from_toml_str(&text).expect("account+targets config is valid");
         assert!(cfg.pairing_ticket.is_none(), "no ticket needed with [account] + targets");
@@ -1483,7 +1483,7 @@ dry_run = true
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/d"
 mode = "auto"
 device_name = "Observatory Pi"
@@ -1496,7 +1496,7 @@ allow_default_relays = true
 policy = "keep_everything"
 dry_run = true
 "#,
-            capture.path().display()
+            toml_path(capture.path())
         );
         let cfg = Config::from_toml_str(&text).unwrap();
         assert_eq!(cfg.device_name.as_deref(), Some("Observatory Pi"));
@@ -1577,7 +1577,7 @@ dry_run = true
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
@@ -1586,7 +1586,7 @@ stability_secs = 0
 policy = "keep_everything"
 dry_run = true
 "#,
-            capture.path().display()
+            toml_path(capture.path())
         );
         assert!(Config::from_toml_str(&text).is_err());
     }
@@ -1710,7 +1710,7 @@ mode = "auto"
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
-capture_dir = "{}"
+capture_dir = {}
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
@@ -1721,7 +1721,7 @@ keep_days = 7
 disk_max_pct = 80
 interval_secs = 600
 "#,
-            capture.path().display()
+            toml_path(capture.path())
         );
         let cfg = Config::from_toml_str(&text).expect("valid config");
         assert_eq!(cfg.retention.keep_days, 7);
