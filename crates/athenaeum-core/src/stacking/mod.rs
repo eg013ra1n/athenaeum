@@ -4,5 +4,6 @@
 //! and weighting / selection (`weights`). Orchestration, configuration and
 //! persistence follow in later plans.
 
+pub mod measure;
 pub mod psf_signal;
 pub mod robust;
