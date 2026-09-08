@@ -6,5 +6,9 @@
 
 pub mod eigen;
 pub mod linear;
+pub mod pixel_map;
+pub mod polynomial;
 
 pub use linear::{Linear, LinearKind, Pair};
+pub use pixel_map::{InverseMap, PixelMap};
+pub use polynomial::{Distortion, Polynomial2D};
