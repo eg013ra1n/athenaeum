@@ -189,7 +189,17 @@ on disk for the lights + calibration side; the same enum gates the frame-set
 
 - **`lightsOnly`** — raw lights, no calibration frames at all.
 - **`rawWithCalibrationSets`** (default) — the behavior described above:
-  raw lights plus whatever raw calibration sets are already linked.
+  raw lights plus the raw calibration sets behind their links. Where a link
+  names an Athenaeum-built master (a build repoints every consumer link of the
+  raw set onto the master), the raw set that master superseded is exported
+  instead — the master file itself never lands in this mode; that is
+  `rawWithMasters`. The substitution follows the raw set's own links, so a
+  raw flat comes with its raw darks. An imported master (nothing raw behind
+  it) is kept and reported in the run's warnings. Raw originals that are not
+  on disk — archived after the build, or moved — block the mode up front
+  ("N raw calibration file(s) missing on disk — restore from archive first",
+  `ExportReadiness.missingRawCalibrationFiles`), the same way a missing
+  master file blocks `calibratedLights`.
 - **`rawWithMasters`** — raw lights, calibration side restricted to already-built
   master files (`calibration_set.is_master_library = 1`). Strict: a linked set
   that still has raw frames is a blocking error, not a silent omission.

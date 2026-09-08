@@ -83,6 +83,15 @@ pub struct ExportReadiness {
     /// partway through a batch, and the two MUST keep counting the identical
     /// set.
     pub missing_master_files: i64,
+    /// Raw calibration files the sets mode would copy that are not on disk:
+    /// the originals behind a built master (the sets mode swaps every built
+    /// master for the raw set it superseded —
+    /// `export::data_collector::resolve_raw_calibration_sets`) archived after
+    /// the build, or moved. The same walk the transform runs, so the tab and
+    /// the run refuse the same files. A plain raw set that never had a master
+    /// is not counted: its missing files fail per file in the run, as they
+    /// always have.
+    pub missing_raw_calibration_files: i64,
     pub file_counts: ExportFileCounts,
 }
 
@@ -123,6 +132,14 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
         ExportMode::LightsOnly => Ok(()),
         ExportMode::RawWithCalibrationSets | ExportMode::RawWithMasters if nothing_linked => Err(
             "No calibration is linked to this set — only the lights would land".to_string(),
+        ),
+        // The sets mode lands the raw originals behind every built master; an
+        // original that is not on disk (archived after the build, or moved)
+        // is refused here, up front, with the transform's own sentence.
+        ExportMode::RawWithCalibrationSets if r.missing_raw_calibration_files > 0 => Err(
+            crate::export::data_collector::missing_raw_originals_sentence(
+                r.missing_raw_calibration_files,
+            ),
         ),
         ExportMode::RawWithCalibrationSets => Ok(()),
         ExportMode::RawWithMasters if r.raw_sets_without_master == 0 => Ok(()),
@@ -264,6 +281,15 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
             .map_err(|e| ApiError::Internal(format!("raw-set readiness: {e:#}")))?;
     let file_counts = crate::export::data_collector::export_file_counts(conn, &data)
         .map_err(|e| ApiError::Internal(format!("export file counts: {e:#}")))?;
+    // The sets mode's own walk, on a copy: which raw originals it would swap
+    // in for a built master are not on disk. The transform refuses those, so
+    // the tab must say so before the run.
+    let mut raw_sets = data.clone();
+    let missing_raw_calibration_files =
+        crate::export::data_collector::resolve_raw_calibration_sets(conn, &mut raw_sets)
+            .map_err(|e| ApiError::Internal(format!("raw-originals readiness: {e:#}")))?
+            .missing_originals
+            .len() as i64;
 
     tracing::debug!(
         set_id,
@@ -271,6 +297,7 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
         unlinked_lights,
         raw_sets = raw_set_ids_without_master.len(),
         missing_master_files,
+        missing_raw_calibration_files,
         "export readiness computed"
     );
     Ok(ExportReadiness {
@@ -279,6 +306,7 @@ fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportRead
         raw_sets_without_master: raw_set_ids_without_master.len() as i64,
         raw_set_ids_without_master,
         missing_master_files,
+        missing_raw_calibration_files,
         file_counts,
     })
 }
@@ -600,6 +628,7 @@ mod tests {
             raw_sets_without_master: 0,
             raw_set_ids_without_master: vec![],
             missing_master_files: 0,
+            missing_raw_calibration_files: 0,
             file_counts: Default::default(),
         };
         for mode in [
@@ -689,6 +718,25 @@ mod tests {
         assert_eq!(
             msg,
             "2 master file(s) missing on disk — restore from archive first"
+        );
+
+        // A missing raw ORIGINAL blocks only the sets mode — the one mode that
+        // would copy that file.
+        let missing_raw = ExportReadiness {
+            missing_raw_calibration_files: 2,
+            ..ready.clone()
+        };
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithMasters,
+            ExportMode::CalibratedLights,
+        ] {
+            assert!(check_mode_ready(&missing_raw, mode).is_ok(), "{mode:?}");
+        }
+        let msg = check_mode_ready(&missing_raw, ExportMode::RawWithCalibrationSets).unwrap_err();
+        assert_eq!(
+            msg,
+            "2 raw calibration file(s) missing on disk — restore from archive first"
         );
     }
 
@@ -953,6 +1001,49 @@ mod tests {
             assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
         }
         assert_eq!(r.file_counts.calibrated_lights, 2);
+    }
+
+    /// A light whose Dark link the build repointed onto a built master
+    /// (`register_master` step 5), with the raw originals archived afterwards:
+    /// the sets mode — which lands those originals — is blocked with the
+    /// restore sentence; every other mode is untouched by it.
+    #[test]
+    fn archived_raw_originals_block_the_sets_mode() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_masters(&conn);
+        // `/raw/...` paths with nothing behind them: the archived shape.
+        let raw = seed_raw_set_with_frames(&conn, 200, "Dark", 2);
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 100 WHERE id = ?1",
+            [raw],
+        )
+        .unwrap();
+        add_link(&conn, 1, 100, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.raw_sets_without_master, 0,
+            "the link names a built master"
+        );
+        assert_eq!(r.missing_raw_calibration_files, 2);
+        assert_eq!(
+            r.file_counts.raw_with_calibration_sets,
+            1 + 2,
+            "counted, on disk or not"
+        );
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::RawWithCalibrationSets).unwrap_err(),
+            "2 raw calibration file(s) missing on disk — restore from archive first"
+        );
+        for mode in [
+            ExportMode::LightsOnly,
+            ExportMode::RawWithMasters,
+            ExportMode::CalibratedLights,
+        ] {
+            assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
+        }
     }
 }
 

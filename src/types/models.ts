@@ -715,7 +715,18 @@ rawSetIdsWithoutMaster: Array<number>,
  * partway through a batch, and the two MUST keep counting the identical
  * set.
  */
-missingMasterFiles: number, fileCounts: ExportFileCounts, };
+missingMasterFiles: number, 
+/**
+ * Raw calibration files the sets mode would copy that are not on disk:
+ * the originals behind a built master (the sets mode swaps every built
+ * master for the raw set it superseded —
+ * `export::data_collector::resolve_raw_calibration_sets`) archived after
+ * the build, or moved. The same walk the transform runs, so the tab and
+ * the run refuse the same files. A plain raw set that never had a master
+ * is not counted: its missing files fail per file in the run, as they
+ * always have.
+ */
+missingRawCalibrationFiles: number, fileCounts: ExportFileCounts, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

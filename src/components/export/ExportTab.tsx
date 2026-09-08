@@ -71,11 +71,17 @@ const MODE_FALLBACK_ORDER: ExportMode[] = ['rawWithCalibrationSets', ...EXPORT_M
  *  both gate on `rawSetsWithoutMaster`, and the calibrated mode's blocker ORDER
  *  is masters-missing → unlinked-lights → missing master FILES (a build is what
  *  can also change where a light's links resolve to; a missing FILE is a
- *  distinct failure from "not built yet"). */
+ *  distinct failure from "not built yet"). The sets mode lands the raw
+ *  originals behind every built master, so it is the one mode a raw original
+ *  missing on disk (archived after the build) blocks. */
 function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
   const nothingLinked = r.total > 0 && r.unlinkedLights === r.total;
   if ((mode === 'rawWithCalibrationSets' || mode === 'rawWithMasters') && nothingLinked) {
     return 'No calibration is linked to this set — only the lights would land';
+  }
+  if (mode === 'rawWithCalibrationSets' && r.missingRawCalibrationFiles > 0) {
+    const n = r.missingRawCalibrationFiles;
+    return `${n} raw calibration file(s) missing on disk — restore from archive first`;
   }
   if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
     const n = r.rawSetsWithoutMaster;

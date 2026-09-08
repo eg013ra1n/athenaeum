@@ -14,7 +14,7 @@ use crate::export::models::{
 use crate::fits_writer::keywords::Bayer;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Collect all export data for a frame set
 ///
@@ -170,8 +170,12 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
 /// Rewrite an already-collected [`ExportData`] for the chosen [`ExportMode`],
 /// returning warnings to fold into the export summary.
 ///
-/// - [`ExportMode::RawWithCalibrationSets`] (default): no change — the caller
-///   gets today's behavior bit-for-bit (zero-regression path).
+/// - [`ExportMode::RawWithCalibrationSets`] (default): the raw originals stand
+///   in for every Athenaeum-built master in the tree
+///   ([`resolve_raw_calibration_sets`]) — a build repoints the lights' links
+///   onto the master, and this mode promises the raw frames. A tree with no
+///   built master in it is left bit-for-bit as collected. Originals that are
+///   not on disk refuse the run (the readiness gate's sentence).
 /// - [`ExportMode::LightsOnly`]: every calibration node is dropped; the raw
 ///   light paths are left exactly as collected.
 /// - [`ExportMode::RawWithMasters`]: lights stay raw and only master files are
@@ -197,7 +201,7 @@ pub fn apply_export_mode(
 ) -> Result<Vec<String>> {
     tracing::debug!(frame_set_id = data.frame_set_id, ?mode, "applying export mode");
     match mode {
-        ExportMode::RawWithCalibrationSets => Ok(Vec::new()),
+        ExportMode::RawWithCalibrationSets => apply_raw_with_calibration_sets(conn, data),
         ExportMode::LightsOnly => {
             drop_calibration_nodes(data);
             Ok(Vec::new())
@@ -344,8 +348,9 @@ pub fn master_set_ids(conn: &Connection, data: &ExportData) -> Result<HashSet<i6
 
 /// Count-only walk for `ExportReadiness.file_counts` (spec 2026-08-28 §5): what
 /// each mode would place, never bailing. `raw_with_masters` counts a raw set as
-/// zero files (strict mode would refuse it) — the count is informational, the
-/// gate is `check_mode_ready`.
+/// zero files (strict mode would refuse it); `raw_with_calibration_sets` counts
+/// the raw originals behind every built master, on disk or not — the count is
+/// informational, the gate is `check_mode_ready`.
 pub fn export_file_counts(conn: &Connection, data: &ExportData) -> Result<ExportFileCounts> {
     use crate::export::file_organizer::compute_wbpp_placements;
     let lights: i64 = data
@@ -354,7 +359,9 @@ pub fn export_file_counts(conn: &Connection, data: &ExportData) -> Result<Export
         .flat_map(|g| g.subgroups.iter())
         .map(|sg| sg.frames.len() as i64)
         .sum();
-    let raw_with_calibration_sets = compute_wbpp_placements(data).len() as i64;
+    let mut raw_sets = data.clone();
+    resolve_raw_calibration_sets(conn, &mut raw_sets)?;
+    let raw_with_calibration_sets = compute_wbpp_placements(&raw_sets).len() as i64;
     let mut masters_only = data.clone();
     for group in &mut masters_only.groups {
         for subgroup in &mut group.subgroups {
@@ -411,6 +418,177 @@ fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Ve
         );
     }
     Ok(Vec::new())
+}
+
+/// What the raw-set substitution walk found ([`resolve_raw_calibration_sets`]).
+#[derive(Debug, Default)]
+pub struct RawSetResolution {
+    /// Master sets kept in place because nothing raw stands behind them: an
+    /// imported master has no superseded set to swap in. Ascending, distinct.
+    pub kept_masters: Vec<i64>,
+    /// Paths of substituted raw frames that are not on disk — originals
+    /// archived after the build, or moved. Distinct.
+    pub missing_originals: BTreeSet<String>,
+}
+
+/// The raw set `master_set_id` superseded, if any. `superseded_by_set_id` is
+/// the pointer `register_master` writes and `delete_master` /
+/// `db::master_unregister` clear, so a master that is gone can never send the
+/// walk to a raw set it no longer replaces.
+fn superseded_raw_set(conn: &Connection, master_set_id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM calibration_set WHERE superseded_by_set_id = ?1 ORDER BY id LIMIT 1",
+            [master_set_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Put the raw originals back behind every Athenaeum-built master in the tree
+/// (`rawWithCalibrationSets`).
+///
+/// Building a master repoints every consumer link of the raw set onto the
+/// master (`calibration_library::register::register_master`, step 5), so the
+/// tree `collect_export_data` walks names the master where the operator asked
+/// for the raw frames. This walk swaps each such node for the raw set it
+/// superseded — rebuilt from the raw set's OWN rows and links at the depth the
+/// collector gave the node, then resolved again underneath, so a lineage built
+/// bottom-up (master dark, then master flat) comes back whole. A master with
+/// no superseded set behind it (imported) is the only calibration the catalog
+/// holds for that link: it stays, and is reported. Every substituted original
+/// is stat'ed once, so a caller can refuse an archived set up front instead of
+/// failing per file partway through a run.
+///
+/// Pure planning: reads the catalog and the disk, writes neither, and never
+/// bails on what it finds — the transform and the readiness gate decide what
+/// a finding means, and the count-only walk ignores it.
+pub fn resolve_raw_calibration_sets(
+    conn: &Connection,
+    data: &mut ExportData,
+) -> Result<RawSetResolution> {
+    let mut out = RawSetResolution::default();
+    let mut stat_done: HashSet<i64> = HashSet::new();
+    for group in &mut data.groups {
+        for subgroup in &mut group.subgroups {
+            for node in [
+                subgroup.flat.as_mut(),
+                subgroup.dark.as_mut(),
+                subgroup.bias.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                resolve_raw_node(conn, node, 0, &mut out, &mut stat_done)?;
+            }
+        }
+    }
+    out.kept_masters.sort_unstable();
+    out.kept_masters.dedup();
+    Ok(out)
+}
+
+/// One node of the walk. `depth` is the node's position in the collector's own
+/// recursion (0 = a light's direct link, 1 = its sub-calibration, 2 = terminal),
+/// so a substituted raw set is rebuilt with the builder the collector would
+/// have used there and the tree keeps its shape.
+fn resolve_raw_node(
+    conn: &Connection,
+    info: &mut CalibrationSetInfo,
+    depth: u8,
+    out: &mut RawSetResolution,
+    stat_done: &mut HashSet<i64>,
+) -> Result<()> {
+    if is_master_set(conn, info.set_id)? {
+        match superseded_raw_set(conn, info.set_id)? {
+            Some(raw_id) => {
+                let score = info.match_score;
+                let mut raw = match depth {
+                    0 => build_calibration_set_info(conn, raw_id, score, false, false)?,
+                    1 => build_calibration_set_info_shallow(conn, raw_id, score, false, false)?,
+                    _ => build_calibration_set_info_terminal(conn, raw_id, score, false, false)?,
+                };
+                // The link's own verdicts (date, temperature) rode onto the
+                // master with the relink; they describe this match, whichever
+                // set stands behind it.
+                raw.warnings = info.warnings.clone();
+                tracing::debug!(
+                    master_set_id = info.set_id,
+                    raw_set_id = raw_id,
+                    count = raw.frame_count,
+                    "raw-sets mode: raw set stands in for its master"
+                );
+                if stat_done.insert(raw_id) {
+                    for frame in &raw.frames {
+                        if std::fs::metadata(&frame.file_path).is_err() {
+                            tracing::warn!(
+                                raw_set_id = raw_id,
+                                frame_id = frame.frame_id,
+                                path = %frame.file_path,
+                                "raw calibration original missing on disk"
+                            );
+                            out.missing_originals.insert(frame.file_path.clone());
+                        }
+                    }
+                }
+                *info = raw;
+            }
+            None => {
+                tracing::debug!(
+                    set_id = info.set_id,
+                    "raw-sets mode: imported master has no raw set behind it, kept"
+                );
+                out.kept_masters.push(info.set_id);
+            }
+        }
+    }
+    for child in [
+        info.dark_flat.as_deref_mut(),
+        info.dark.as_deref_mut(),
+        info.bias.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        resolve_raw_node(conn, child, depth + 1, out, stat_done)?;
+    }
+    Ok(())
+}
+
+/// `rawWithCalibrationSets`: the raw originals stand in for built masters
+/// ([`resolve_raw_calibration_sets`]). Originals that are not on disk refuse
+/// the run with the readiness gate's own sentence — the API-layer gate
+/// (`api::lights::check_mode_ready`) runs first; this is the backstop, the
+/// same division as [`apply_raw_with_masters`]. A kept imported master is a
+/// warning the run folds into its result.
+fn apply_raw_with_calibration_sets(
+    conn: &Connection,
+    data: &mut ExportData,
+) -> Result<Vec<String>> {
+    let found = resolve_raw_calibration_sets(conn, data)?;
+    if !found.missing_originals.is_empty() {
+        anyhow::bail!(
+            "{}",
+            missing_raw_originals_sentence(found.missing_originals.len() as i64)
+        );
+    }
+    Ok(found
+        .kept_masters
+        .iter()
+        .map(|id| {
+            format!(
+                "Calibration set #{id} is an imported master with no raw frames in the \
+                 catalog — its master file is exported as is"
+            )
+        })
+        .collect())
+}
+
+/// The one sentence for "raw originals not on disk", shared by the transform's
+/// backstop and `api::lights::check_mode_ready` so the tab and the run never
+/// disagree.
+pub fn missing_raw_originals_sentence(n: i64) -> String {
+    format!("{n} raw calibration file(s) missing on disk — restore from archive first")
 }
 
 /// Mark every light for calibration-at-export and rename it to its output.
@@ -1516,8 +1694,17 @@ pub fn collect_export_summary(
         "equipment info collected"
     );
 
-    // Build filter group summaries
-    let filter_groups = build_filter_group_summaries(conn, &export_data)?;
+    // Build filter group summaries. The calibration details describe what the
+    // mode LANDS when it lands calibration at all — in the sets mode the raw
+    // set stands in for its master, and the panel's "Dark: N frames" must
+    // agree with the tree. The two modes that ship no calibration keep
+    // describing the links, so the panel can still say what each light is
+    // matched to.
+    let detail_source = match mode {
+        ExportMode::LightsOnly | ExportMode::CalibratedLights => &export_data,
+        ExportMode::RawWithCalibrationSets | ExportMode::RawWithMasters => &shaped,
+    };
+    let filter_groups = build_filter_group_summaries(conn, detail_source)?;
     tracing::debug!(frame_set_id, count = filter_groups.len(), "filter groups built");
 
     // Build folder preview — from the data as the mode shapes it
@@ -2587,7 +2774,9 @@ mod export_mode_tests {
         .unwrap();
     }
 
-    /// Regression pin: the default mode never touches the collected data.
+    /// Regression pin: with no master in the tree, the default mode never
+    /// touches the collected data (a built master is substituted — see the
+    /// `raw_sets_mode_*` tests below).
     #[test]
     fn default_mode_is_bit_for_bit_noop() {
         let conn = mem();
@@ -3042,5 +3231,249 @@ mod export_mode_tests {
             "raw dark set contributes nothing"
         );
         assert_eq!(counts.calibrated_lights, 2);
+    }
+
+    // ── rawWithCalibrationSets: raw originals stand in for built masters ─────
+
+    /// A raw set whose member files really exist under `dir` — the raw-sets
+    /// substitution stats every original it swaps in, so a fixture pointing at
+    /// a literal `/raw/...` path would read as "archived" and refuse the mode.
+    fn seed_raw_set_on_disk(
+        conn: &Connection,
+        dir: &std::path::Path,
+        set_id: i64,
+        imagetyp: &str,
+        n: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2026-07-05', 0)",
+            params![set_id, imagetyp],
+        )
+        .unwrap();
+        for i in 0..n {
+            let file_id = set_id * 100 + i + 5_000_000;
+            let frame_id = set_id * 100 + i + 6_000_000;
+            let filename = format!("{imagetyp}_{set_id}_{i}.fits");
+            let path = dir.join(&filename);
+            std::fs::write(&path, [0u8; 4]).unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 4, '2026-07-05T00:00:00Z', 'FITS')",
+                params![file_id, path.to_string_lossy(), filename],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+                params![frame_id, file_id, imagetyp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// A sub-calibration link between two SETS (a flat set's own dark).
+    fn add_set_link(conn: &Connection, source_set_id: i64, target_set_id: i64, cal_type: &str) {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (?1, 'calibration_set', ?2, ?3, '2026-07-05T00:00:00Z')",
+            params![source_set_id, target_set_id, cal_type],
+        )
+        .unwrap();
+    }
+
+    /// What `calibration_library::register::register_master` does to the
+    /// catalog once a master is built: every consumer link of the raw set is
+    /// repointed onto the master, and the raw set is marked superseded.
+    fn supersede(conn: &Connection, raw_set_id: i64, master_set_id: i64) {
+        conn.execute(
+            "UPDATE calibration_set_to_frames SET calibration_set_id = ?1
+             WHERE calibration_set_id = ?2",
+            params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+    }
+
+    /// `rel_dir/filename` of every placement, sorted.
+    fn placed_paths(data: &ExportData) -> Vec<String> {
+        let mut v: Vec<String> = crate::export::file_organizer::compute_wbpp_placements(data)
+            .into_iter()
+            .map(|p| format!("{}/{}", p.rel_dir, p.filename))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The 2026-09-08 report: a built master repoints the lights' links onto
+    /// itself, so the sets mode — which walks the links — landed the master
+    /// where the operator asked for the raw frames. The mode swaps every
+    /// Athenaeum-built master for the raw set it superseded.
+    #[test]
+    fn raw_sets_mode_exports_the_originals_behind_a_built_master() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let raw = seed_raw_set_on_disk(&conn, tmp.path(), 100, "Dark", 2);
+        let master = seed_master_set(&conn, 200, "Dark");
+        add_link(&conn, 10, raw, "Dark");
+        supersede(&conn, raw, master);
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        assert_eq!(
+            data.groups[0].subgroups[0].dark.as_ref().unwrap().set_id,
+            master,
+            "the link now names the master"
+        );
+
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets, None).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let dark = data.groups[0].subgroups[0].dark.as_ref().unwrap();
+        assert_eq!((dark.set_id, dark.frame_count), (raw, 2));
+        assert_eq!(
+            placed_paths(&data),
+            vec![
+                "camera_testcam/DARKS_100/Dark_100_0.fits",
+                "camera_testcam/DARKS_100/Dark_100_1.fits",
+                "camera_testcam/DARKS_100/lights/light_10.fits",
+            ]
+        );
+
+        // The per-mode count the Export tab shows follows the substitution.
+        let fresh = collect_export_data(&conn, 1).unwrap();
+        let counts = export_file_counts(&conn, &fresh).unwrap();
+        assert_eq!(counts.raw_with_calibration_sets, 1 + 2);
+        assert_eq!(counts.raw_with_masters, 1 + 1);
+    }
+
+    /// The substitution follows the raw set's OWN links, so a lineage built
+    /// bottom-up (master dark first, then the master flat) comes back whole:
+    /// raw flats with their raw darks under them, no master anywhere.
+    #[test]
+    fn raw_sets_mode_resolves_the_whole_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let raw_flat = seed_raw_set_on_disk(&conn, tmp.path(), 100, "Flat", 3);
+        let raw_dark = seed_raw_set_on_disk(&conn, tmp.path(), 101, "Dark", 2);
+        add_link(&conn, 10, raw_flat, "Flat");
+        add_link(&conn, 10, raw_dark, "Dark");
+        add_set_link(&conn, raw_flat, raw_dark, "Dark");
+        let master_dark = seed_master_set(&conn, 301, "Dark");
+        supersede(&conn, raw_dark, master_dark);
+        let master_flat = seed_master_set(&conn, 300, "Flat");
+        supersede(&conn, raw_flat, master_flat);
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets, None).unwrap();
+        let sg = &data.groups[0].subgroups[0];
+        let flat = sg.flat.as_ref().unwrap();
+        assert_eq!((flat.set_id, flat.frame_count), (raw_flat, 3));
+        let flat_dark = flat.dark.as_ref().unwrap();
+        assert_eq!(
+            (flat_dark.set_id, flat_dark.frame_count),
+            (raw_dark, 2),
+            "the flat's own dark is the raw dark too"
+        );
+        let dark = sg.dark.as_ref().unwrap();
+        assert_eq!((dark.set_id, dark.frame_count), (raw_dark, 2));
+
+        let placed = placed_paths(&data);
+        assert!(placed.iter().all(|p| !p.contains("master_")), "{placed:?}");
+        assert_eq!(placed.len(), 1 + 3 + 2, "{placed:?}");
+        assert!(
+            placed
+                .iter()
+                .any(|p| p == "camera_testcam/DARKS_101/FLAT_100/Flat_100_0.fits"),
+            "{placed:?}"
+        );
+    }
+
+    /// An imported master (nothing superseded behind it) is the only
+    /// calibration the catalog has for that link: it stays, and the run says so.
+    #[test]
+    fn raw_sets_mode_keeps_an_imported_master_and_reports_it() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let flat = seed_master_set(&conn, 200, "Flat");
+        add_link(&conn, 10, flat, "Flat");
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets, None).unwrap();
+        let node = data.groups[0].subgroups[0].flat.as_ref().unwrap();
+        assert_eq!((node.set_id, node.frame_count), (flat, 1));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("#200") && warnings[0].contains("imported"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Originals that are not on disk (archived after the build, or moved) are
+    /// refused up front with the gate's own sentence — not N per-file copy
+    /// failures partway through the run. The count-only walk still counts them.
+    #[test]
+    fn raw_sets_mode_refuses_originals_that_are_not_on_disk() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        // `/raw/...` paths that exist nowhere: the archived shape.
+        let raw = seed_raw_set(&conn, 100, "Dark", 2);
+        let master = seed_master_set(&conn, 200, "Dark");
+        add_link(&conn, 10, raw, "Dark");
+        supersede(&conn, raw, master);
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let err = apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets, None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "2 raw calibration file(s) missing on disk — restore from archive first"
+        );
+        let fresh = collect_export_data(&conn, 1).unwrap();
+        let counts = export_file_counts(&conn, &fresh).unwrap();
+        assert_eq!(counts.raw_with_calibration_sets, 1 + 2, "the count never bails");
+    }
+
+    /// The summary's calibration detail describes what the mode lands: in the
+    /// sets mode that is the raw set (its frame count), not the one-file master
+    /// the links name; the masters mode keeps describing the master.
+    #[test]
+    fn raw_sets_summary_describes_the_raw_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let raw = seed_raw_set_on_disk(&conn, tmp.path(), 100, "Dark", 2);
+        let master = seed_master_set(&conn, 200, "Dark");
+        add_link(&conn, 10, raw, "Dark");
+        supersede(&conn, raw, master);
+        let cfg = WbppExportConfig::default();
+
+        let sets = collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithCalibrationSets, None)
+            .unwrap();
+        let dark = sets.filter_groups[0].dark_info.as_ref().unwrap();
+        assert_eq!((dark.set_id, dark.frame_count), (raw, 2));
+        assert_eq!(sets.total_files, 1 + 2);
+
+        let masters =
+            collect_export_summary(&conn, 1, &cfg, ExportMode::RawWithMasters, None).unwrap();
+        let dark = masters.filter_groups[0].dark_info.as_ref().unwrap();
+        assert_eq!((dark.set_id, dark.frame_count), (master, 1));
     }
 }

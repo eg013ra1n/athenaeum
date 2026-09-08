@@ -190,10 +190,15 @@ mod tests {
         }
         // raw dark set 100 with two frames; master flat set 200 with one file
         conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library) VALUES (100, 'Dark', '2026-07-05', 0)", []).unwrap();
+        // The raw darks are on disk too: the sets mode stats every original it
+        // swaps in for a built master, so once `build_master_dark` supersedes
+        // this set, a path with nothing behind it would read as "archived".
         for i in [0i64, 1] {
             let id = 500 + i;
+            let dark_path = dir.join(format!("D_{i}.fits"));
+            std::fs::write(&dark_path, [0u8; 4]).unwrap();
             conn.execute("INSERT INTO files (id, path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
-                params![id, format!("/raw/D_{i}.fits"), format!("D_{i}.fits")]).unwrap();
+                params![id, dark_path.to_string_lossy(), format!("D_{i}.fits")]).unwrap();
             conn.execute(
                 "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?1, 'Dark')",
                 params![id],
@@ -412,5 +417,49 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// A built master repoints the lights' links onto itself; the sets mode
+    /// swaps it back for the raw set it superseded, so the originals travel as
+    /// raw frames and the built master never does. The imported master flat
+    /// (nothing raw behind it) still travels as a master.
+    #[test]
+    fn raw_sets_mode_sends_the_originals_not_the_built_master() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(tmp.path());
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            seed(&conn, tmp.path());
+            build_master_dark(&conn, tmp.path());
+        }
+        let raw = frame_set_entries(&ctx, 1, ExportMode::RawWithCalibrationSets, &opts()).unwrap();
+        assert_eq!(raw.len(), 2 + 2 + 1, "{raw:?}");
+        assert!(
+            raw.iter()
+                .all(|e| !e.rel_path.ends_with("master_dark.fits")),
+            "{raw:?}"
+        );
+        assert!(
+            raw.iter()
+                .any(|e| e.rel_path == "camera_testcam/DARKS_100/D_0.fits"
+                    && e.kind == PayloadKind::RawFrame),
+            "{raw:?}"
+        );
+        assert!(
+            raw.iter().any(
+                |e| e.rel_path == "camera_testcam/DARKS_100/FLAT_200/master_flat.fits"
+                    && e.kind == PayloadKind::Master
+            ),
+            "{raw:?}"
+        );
+        // The masters mode is the one that ships the built master.
+        let masters = frame_set_entries(&ctx, 1, ExportMode::RawWithMasters, &opts()).unwrap();
+        assert!(
+            masters
+                .iter()
+                .any(|e| e.rel_path.ends_with("master_dark.fits") && e.kind == PayloadKind::Master),
+            "{masters:?}"
+        );
     }
 }

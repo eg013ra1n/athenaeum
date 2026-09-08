@@ -187,6 +187,33 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Lights + calibration sets export lands raw originals, not built masters (2026-09-08)
+
+Owner report: the "Lights + calibration sets" mode exported Athenaeum-built
+masters. Root cause: a master build repoints every consumer link onto the master
+(`register_master` step 5), and the sets-mode transform was a no-op over the
+linked tree. Fix: `export::data_collector::resolve_raw_calibration_sets` swaps
+each built master for the raw set it superseded, following the raw set's own
+links; imported masters stay (warning); originals not on disk block the mode up
+front (`ExportReadiness.missing_raw_calibration_files`, both export and send).
+Pinned by six collector/summary tests, one send test and two readiness tests.
+
+- Export a set whose darks AND flats have built masters, mode **Lights +
+  calibration sets**: the tree and the disk must hold the raw darks under
+  `DARKS_<raw id>` and the raw flats under `FLAT_<raw id>`, and no
+  `master_*.fits` anywhere. The tab's file count must equal what landed.
+  **Lights + masters** on the same set must still land only the master files.
+- Same set after **Archive originals** on one of those raw sets: the sets-mode
+  radio must read "N raw calibration file(s) missing on disk — restore from
+  archive first" and the tab must fall back to another mode; restore the
+  archive and the mode comes back.
+- A frame set linked to an IMPORTED master (dropped into the Calibration
+  Library by hand): the sets mode must still run, land the master file, and
+  the completion notification's warnings must name the set as an imported
+  master exported as is.
+- Frame-set **Send** in the sets mode after a build: the receiver must get the
+  raw frames (regrouped into sets by its post-package pass), not the master.
+
 ### Missing-file purge, scan-error reveal, offline re-check (2026-09-07)
 
 Backlog v0.5.6 items 7 and 8.
@@ -789,3 +816,8 @@ cycle, so anything from them that matters later belongs here or in a plan.
 - A folder whose drive went away can be re-checked in place. Plug the drive back
   in, press **Check again**, and the folder comes back — no more scanning some
   other folder to make the app notice.
+- The **Lights + calibration sets** export and send now land the raw calibration
+  frames again once masters have been built from them. Building a master had
+  quietly turned this mode into a copy of **Lights + masters**; the raw sets are
+  back, with their own darks and biases beneath them. Raw frames that were
+  archived after the build are reported up front, before anything is written.

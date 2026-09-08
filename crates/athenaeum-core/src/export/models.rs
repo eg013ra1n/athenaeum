@@ -841,8 +841,13 @@ pub enum ExportMode {
     /// 2026-08-28 D2): a linked set that still has raw frames is an error, not
     /// a silent omission — what the summary shows is what lands.
     RawWithMasters,
-    /// Current behavior (default): raw lights plus whatever raw calibration sets
-    /// are linked.
+    /// Default: raw lights plus the raw calibration sets behind their links.
+    /// Where a link names an Athenaeum-built master, the raw set that master
+    /// superseded is exported instead — the build repointed the link, this
+    /// mode promises the raw frames (`data_collector::resolve_raw_calibration_sets`).
+    /// An imported master, with nothing raw behind it, stays and is reported;
+    /// raw originals that are not on disk (archived after the build) block the
+    /// mode up front (`ExportReadiness.missing_raw_calibration_files`).
     RawWithCalibrationSets,
 }
 
