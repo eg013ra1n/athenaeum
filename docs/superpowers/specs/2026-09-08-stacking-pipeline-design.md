@@ -289,9 +289,12 @@ pub trait FrameSource: Sync {
 }
 ```
 
-- `FileSource` — today's `BandSource` (raw FITS by position). Gains 3-plane
-  reads: a plane offset per file, everything else unchanged. Master builds
-  keep using it and keep their fingerprint.
+- `FileSource` — today's `BandSource` (raw FITS by position), unchanged:
+  1-plane, master builds keep using it and keep their fingerprint. Three-plane
+  positional reads live in a small sibling, `PlaneReader` (one file, one
+  plane at a time, the same `PlaneKind` decode), which is what
+  `RegisteredSource`, the measurement stage and drizzle read calibrated
+  frames through — no stage reads a multi-plane file banded across frames.
 - `RegisteredSource` — one entry per included frame: calibrated file (f32,
   1 or 3 planes), inverse transform, kernel, clamping. `read_band` maps the
   band boundary densely through the inverse (every 32 px along the four
@@ -489,8 +492,10 @@ part. Rows from the retired flow are simply overwritten by the
 `UNIQUE(frames_set_id, frame_id)` upsert.
 
 `transform_json`: `{ "kind": "homography", "m": [9 f64], "distortion":
-{ "kind": "polynomial", "order": 3, "forward": {"a": [..], "b": [..]},
-"inverse": {"ap": [..], "bp": [..]} } | null }`; `inverse_json` holds the
+{ "order": 3, "center": [cx, cy], "scale": s, "forward": {"a": [..], "b": [..]},
+"inverse": {"ap": [..], "bp": [..]} } | null }` — the polynomial acts on
+coordinates normalized as `u = (x − cx)/s`, `v = (y − cy)/s` (reference
+centre and half the longer side) for conditioning; `inverse_json` holds the
 inverse linear part. `stacking_runs.summary_json` and the per-run
 `runs/run-<id>.json` file (same content: config, reference, groups, per-frame
 rows, stats) are the provenance, modelled on `master_provenance`.
