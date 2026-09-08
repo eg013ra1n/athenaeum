@@ -50,7 +50,7 @@ impl Default for FitParams {
         FitParams {
             centroid_tolerance_px: 1.5,
             growth: 1.0,
-            max_iter: 50,
+            max_iter: 100,
             conv_tol: 1e-5,
             max_rejects: 5,
         }
@@ -132,8 +132,45 @@ fn stamp_radius(sigma: f64) -> usize {
     ((5.0 * sigma).ceil() as usize).clamp(6, 48)
 }
 
-/// Fit one seed with a fixed β; `None` when the stamp leaves the image,
-/// the fit fails, or the acceptance rules (math reference §1.4) reject it.
+/// Orientation and axis ratio of a stamp from its background-subtracted
+/// second moments: `(sigma_major, sigma_minor, theta)` with θ the angle of
+/// the major axis, `½·atan2(2μxy, μxx − μyy)`. `None` when the stamp has no
+/// positive signal or degenerate moments.
+fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<(f64, f64, f64)> {
+    let (mut sw, mut sx, mut sy) = (0.0f64, 0.0f64, 0.0f64);
+    for p in px {
+        let w = (p.value - b0).max(0.0);
+        sw += w;
+        sx += w * p.x;
+        sy += w * p.y;
+    }
+    if sw <= 0.0 {
+        return None;
+    }
+    let (cx, cy) = (sx / sw, sy / sw);
+    let (mut mxx, mut myy, mut mxy) = (0.0f64, 0.0f64, 0.0f64);
+    for p in px {
+        let w = (p.value - b0).max(0.0);
+        let (dx, dy) = (p.x - cx, p.y - cy);
+        mxx += w * dx * dx;
+        myy += w * dy * dy;
+        mxy += w * dx * dy;
+    }
+    let (mxx, myy, mxy) = (mxx / sw, myy / sw, mxy / sw);
+    let tr = mxx + myy;
+    let disc = ((mxx - myy).powi(2) + 4.0 * mxy * mxy).sqrt();
+    let (l1, l2) = (0.5 * (tr + disc), 0.5 * (tr - disc));
+    if !(l2 > 0.0) || !l1.is_finite() {
+        return None;
+    }
+    let theta = 0.5 * (2.0 * mxy).atan2(mxx - myy);
+    Some((l1.sqrt(), l2.sqrt(), theta))
+}
+
+/// Fit one seed with a fixed β, seeded from the field σ (size) and the
+/// stamp's second moments (orientation and axis ratio); `None` when the
+/// stamp leaves the image, the fit fails, or the acceptance rules (math
+/// reference §1.4) reject it.
 fn fit_one(
     data: &[f32],
     w: usize,
@@ -172,15 +209,25 @@ fn fit_one(
     }
     let b0 = median_in_place(&mut vals) as f64;
     let a0 = (peak - b0).max(1e-9);
+    // Size from the field σ (flux/peak), orientation and axis ratio from the
+    // stamp's moments: a circular θ = 0 seed leaves an elongated star in an
+    // axis-aligned local minimum, and Moffat wings inflate the moments' size.
+    let (sx0, sy0, th0) = match moment_ellipse(&px, b0) {
+        Some((major, minor, theta)) => {
+            let q = (major / minor).clamp(1.0, 4.0).sqrt();
+            (sigma0 * q, sigma0 / q, theta)
+        }
+        None => (sigma0, sigma0, 0.0),
+    };
     let fit = fit_moffat_2d_fixed_beta(
         &px,
         b0,
         a0,
         seed.x,
         seed.y,
-        sigma0,
-        sigma0,
-        0.0,
+        sx0,
+        sy0,
+        th0,
         beta,
         p.max_iter,
         p.conv_tol,
@@ -211,7 +258,11 @@ fn accept(
     ]
     .iter()
     .all(|v| v.is_finite());
-    if !m.converged || !finite || m.a <= 0.0 || m.alpha_x <= 0.0 || m.alpha_y <= 0.0 {
+    // The fitter's residual-convergence branch cannot fire at exactly zero
+    // cost, so a fit that reproduces the data to 1e-4 of its amplitude counts
+    // as settled even when the flag is off (only noiseless data gets there).
+    let settled = m.converged || m.fit_residual < 1e-4;
+    if !settled || !finite || m.a <= 0.0 || m.alpha_x <= 0.0 || m.alpha_y <= 0.0 {
         return None;
     }
     if (m.x0 - seed.x).abs() > p.centroid_tolerance_px
