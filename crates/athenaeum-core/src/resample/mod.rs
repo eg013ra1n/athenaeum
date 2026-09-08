@@ -3,5 +3,9 @@
 //! window a band of output rows needs. Pure math, no I/O, ungated.
 
 pub mod kernels;
+pub mod warp;
+pub mod window;
 
 pub use kernels::{Interpolation, Taps};
+pub use warp::{sample_at, warp_rows, Plane};
+pub use window::{source_window, SourceWindow};

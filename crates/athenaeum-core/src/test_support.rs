@@ -97,3 +97,71 @@ fn fixtures_never_seed_a_raw_canonicalized_path() {
          `TempDir` just to canonicalize a path you already have."
     );
 }
+
+/// Row-major float plane with Gaussian stars `(x, y, amplitude)` of common
+/// `sigma` on a flat `background`. Pixel centres at integer coordinates.
+pub(crate) fn gaussian_field(
+    w: usize,
+    h: usize,
+    stars: &[(f64, f64, f64)],
+    sigma: f64,
+    background: f32,
+) -> Vec<f32> {
+    let mut data = vec![background; w * h];
+    let s2 = 2.0 * sigma * sigma;
+    for &(sx, sy, amp) in stars {
+        let r = (5.0 * sigma).ceil() as i64;
+        let (cx, cy) = (sx.round() as i64, sy.round() as i64);
+        for y in (cy - r).max(0)..=(cy + r).min(h as i64 - 1) {
+            for x in (cx - r).max(0)..=(cx + r).min(w as i64 - 1) {
+                let d2 = (x as f64 - sx).powi(2) + (y as f64 - sy).powi(2);
+                data[y as usize * w + x as usize] += (amp * (-d2 / s2).exp()) as f32;
+            }
+        }
+    }
+    data
+}
+
+/// Background-subtracted intensity-weighted centroid in a `(2r+1)²` box
+/// around `(x0, y0)`. NaN samples are skipped.
+pub(crate) fn centroid(
+    data: &[f32],
+    w: usize,
+    x0: f64,
+    y0: f64,
+    r: usize,
+    background: f32,
+) -> (f64, f64) {
+    let (cx, cy) = (x0.round() as i64, y0.round() as i64);
+    let h = data.len() / w;
+    let (mut sx, mut sy, mut sw) = (0.0f64, 0.0f64, 0.0f64);
+    for y in (cy - r as i64).max(0)..=(cy + r as i64).min(h as i64 - 1) {
+        for x in (cx - r as i64).max(0)..=(cx + r as i64).min(w as i64 - 1) {
+            let v = data[y as usize * w + x as usize];
+            if !v.is_finite() {
+                continue;
+            }
+            let v = (v - background).max(0.0) as f64;
+            sx += v * x as f64;
+            sy += v * y as f64;
+            sw += v;
+        }
+    }
+    (sx / sw, sy / sw)
+}
+
+/// Background-subtracted flux in the same box (NaN skipped).
+pub(crate) fn flux(data: &[f32], w: usize, x0: f64, y0: f64, r: usize, background: f32) -> f64 {
+    let (cx, cy) = (x0.round() as i64, y0.round() as i64);
+    let h = data.len() / w;
+    let mut sum = 0.0f64;
+    for y in (cy - r as i64).max(0)..=(cy + r as i64).min(h as i64 - 1) {
+        for x in (cx - r as i64).max(0)..=(cx + r as i64).min(w as i64 - 1) {
+            let v = data[y as usize * w + x as usize];
+            if v.is_finite() {
+                sum += (v - background) as f64;
+            }
+        }
+    }
+    sum
+}
