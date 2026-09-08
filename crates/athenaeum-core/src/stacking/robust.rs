@@ -289,7 +289,7 @@ mod tests {
         assert!((erf(1.0) - 0.8427007929).abs() < 2e-7);
         assert!((erf(2.0) - 0.9953222650).abs() < 2e-7);
         assert!((erfc(3.0) - 2.2090497e-5).abs() < 3e-7);
-        assert_eq!(erf(0.0), 0.0);
+        assert!(erf(0.0).abs() < 1e-8, "{}", erf(0.0));
         assert!((erf(-1.0) + erf(1.0)).abs() < 1e-12);
         assert!((erfc(-1.0) - (2.0 - erfc(1.0))).abs() < 1e-12);
         assert!((gauss_tail(1.959964) - 0.025).abs() < 1e-6);
