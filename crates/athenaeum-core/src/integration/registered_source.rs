@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::banded::{BandPlanes, PlaneKind};
 use super::plane_reader::PlaneReader;
@@ -191,9 +191,15 @@ impl FrameSource for RegisteredSource {
         self.frames.len() * self.width * 4
     }
 
+    /// Charges the output band AND the f32 scratch the resample writes first
+    /// (twice `bytes_per_row`); the `Whole` window fallback additionally holds
+    /// one f32 source plane per in-flight worker, which is not budgeted here —
+    /// the engine's per-job budget (a quarter of RAM divided by the compute
+    /// concurrency) is what leaves room for it.
     fn band_rows_for_budget(&self, budget_bytes: usize) -> usize {
         let per_row = self
             .bytes_per_row()
+            .saturating_mul(2)
             .saturating_add(self.width.saturating_mul(8))
             .max(1);
         (budget_bytes / per_row).max(1)
@@ -237,6 +243,16 @@ impl FrameSource for RegisteredSource {
         } else {
             let first_err: Mutex<Option<IntegrationError>> = Mutex::new(None);
             let abort = AtomicBool::new(false);
+            // A worker that bails because `cancel` (or `abort`, set only by an
+            // erroring worker and therefore already covered by the error path
+            // below) is raised must be reported as `Cancelled`, never as `Ok`
+            // over a half-filled `scratch` — relying on the post-join re-check
+            // to catch a flag that could, in principle, have been lowered
+            // again would leave the guarantee resting on an unwritten
+            // assumption. `saw_cancel` makes it structural: any worker that
+            // actually saw the cancel stamps it before returning, and the
+            // final check ORs that in alongside a fresh read of `cancel`.
+            let saw_cancel = AtomicBool::new(false);
             let mut groups: Vec<Vec<(usize, &mut Vec<f32>)>> =
                 (0..workers).map(|_| Vec::new()).collect();
             for (i, dst) in scratch.iter_mut().enumerate() {
@@ -246,9 +262,11 @@ impl FrameSource for RegisteredSource {
                 for group in groups {
                     let first_err = &first_err;
                     let abort = &abort;
+                    let saw_cancel = &saw_cancel;
                     scope.spawn(move || {
                         for (i, dst) in group {
                             if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
+                                saw_cancel.store(true, Ordering::Relaxed);
                                 return;
                             }
                             match self.fill_frame(i, y0, rows, dst) {
@@ -258,6 +276,12 @@ impl FrameSource for RegisteredSource {
                                     let mut slot = first_err.lock().unwrap();
                                     if slot.is_none() {
                                         *slot = Some(e);
+                                    } else {
+                                        warn!(
+                                            frame = i,
+                                            error = %e,
+                                            "registered band worker error discarded, an earlier error is reported"
+                                        );
                                     }
                                     return;
                                 }
@@ -269,7 +293,7 @@ impl FrameSource for RegisteredSource {
             if let Some(e) = first_err.into_inner().unwrap() {
                 return Err(e);
             }
-            if cancel.load(Ordering::Relaxed) {
+            if saw_cancel.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                 return Err(IntegrationError::Cancelled);
             }
         }
@@ -348,8 +372,9 @@ mod tests {
             (W, H, 3, 1)
         );
         assert_eq!(src.bytes_per_row(), 3 * W * 4);
-        // 3 frames × 200 px × 4 B + 200 × 8 B headroom = 4000 B per row.
-        assert_eq!(src.band_rows_for_budget(80_000), 20);
+        // 3 frames × 200 px × 4 B × 2 (out + scratch) + 200 × 8 B headroom
+        // = 6400 B per row.
+        assert_eq!(src.band_rows_for_budget(80_000), 12);
         assert!(src
             .plane_kinds()
             .iter()
@@ -451,6 +476,21 @@ mod tests {
         let mut planes = BandPlanes::new(&src);
         let cancel = AtomicBool::new(true);
         let r = src.read_band_with_progress(0, 10, &mut planes, 1, &|_| {}, &cancel);
+        assert!(matches!(r, Err(IntegrationError::Cancelled)));
+    }
+
+    #[test]
+    fn parallel_cancel_never_returns_a_half_filled_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let src =
+            RegisteredSource::open(&frames(dir.path()), W, H, 0, Interpolation::Bilinear, 0.3)
+                .unwrap();
+        let mut planes = BandPlanes::new(&src);
+        let cancel = AtomicBool::new(true);
+        // Three workers, the flag already raised: every worker skips its
+        // frames, and the skip must surface as Cancelled — never as an Ok
+        // over zero-filled buffers.
+        let r = src.read_band_with_progress(0, 10, &mut planes, 3, &|_| {}, &cancel);
         assert!(matches!(r, Err(IntegrationError::Cancelled)));
     }
 
