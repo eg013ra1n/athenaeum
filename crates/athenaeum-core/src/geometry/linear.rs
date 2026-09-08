@@ -191,11 +191,42 @@ fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     Some(out)
 }
 
+/// True when the points are not (nearly) collinear: the centred 2×2 scatter
+/// matrix must have a determinant that is not a rounding remnant of its own
+/// diagonal. Scale-relative, so it means the same thing at 6000 px and at 2 px.
+fn well_spread(points: impl Iterator<Item = (f64, f64)> + Clone, weights: Option<&[f64]>) -> bool {
+    let (mut sw, mut cx, mut cy) = (0.0, 0.0, 0.0);
+    for (i, (x, y)) in points.clone().enumerate() {
+        let w = weight_at(weights, i);
+        sw += w;
+        cx += w * x;
+        cy += w * y;
+    }
+    if sw <= 0.0 {
+        return false;
+    }
+    cx /= sw;
+    cy /= sw;
+    let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+    for (i, (x, y)) in points.enumerate() {
+        let w = weight_at(weights, i);
+        let (dx, dy) = (x - cx, y - cy);
+        sxx += w * dx * dx;
+        syy += w * dy * dy;
+        sxy += w * dx * dy;
+    }
+    let det = sxx * syy - sxy * sxy;
+    det.is_finite() && det > 1e-10 * sxx * syy && sxx > 0.0 && syy > 0.0
+}
+
 /// Weighted least-squares affine: two independent 3-parameter regressions
 /// on centred coordinates (centring keeps the normal equations conditioned
 /// for 6000-pixel frames).
 pub fn fit_affine(pairs: &[Pair], weights: Option<&[f64]>) -> Option<Linear> {
     if pairs.len() < 3 {
+        return None;
+    }
+    if !well_spread(pairs.iter().map(|p| p.0), weights) {
         return None;
     }
     let mut sw = 0.0;
@@ -280,6 +311,11 @@ fn normalization(points: impl Iterator<Item = (f64, f64)> + Clone) -> Option<Nor
 /// scaled so `m[2][2] == 1`.
 pub fn fit_homography(pairs: &[Pair], weights: Option<&[f64]>) -> Option<Linear> {
     if pairs.len() < 4 {
+        return None;
+    }
+    if !well_spread(pairs.iter().map(|p| p.0), weights)
+        || !well_spread(pairs.iter().map(|p| p.1), weights)
+    {
         return None;
     }
     let ns = normalization(pairs.iter().map(|p| p.0))?;
@@ -533,6 +569,23 @@ mod tests {
             "collinear/duplicate points"
         );
         assert!(fit_homography(&[p, p, p, p], None).is_none());
+        // Distinct but collinear subject points: y = 30 + 1.7 x.
+        let line: Vec<Pair> = [100.0, 1500.0, 2900.0, 4300.0, 5700.0]
+            .iter()
+            .map(|&x| ((x, 30.0 + 1.7 * x), (x + 5.0, 30.0 + 1.7 * x - 3.0)))
+            .collect();
+        assert!(
+            fit_affine(&line, None).is_none(),
+            "distinct collinear points must be refused"
+        );
+        assert!(
+            fit_homography(&line, None).is_none(),
+            "distinct collinear points must be refused"
+        );
+        // A well-spread set is still accepted (regression guard for the new check).
+        let truth = similarity(1.0, 1.0, 0.0, 0.0);
+        let ok = pairs_under(&truth, &points(12, 4), 0.0);
+        assert!(fit_affine(&ok, None).is_some() && fit_homography(&ok, None).is_some());
     }
 
     #[test]
