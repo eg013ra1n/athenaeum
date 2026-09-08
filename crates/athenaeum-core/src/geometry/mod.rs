@@ -9,8 +9,10 @@ pub mod kdtree;
 pub mod linear;
 pub mod pixel_map;
 pub mod polynomial;
+pub mod ransac;
 
 pub use kdtree::KdTree2;
 pub use linear::{Linear, LinearKind, Pair};
 pub use pixel_map::{InverseMap, PixelMap};
 pub use polynomial::{Distortion, Polynomial2D};
+pub use ransac::{ransac_fit, refit_weighted, Quality, RansacConfig, RansacResult, RefitResult};
