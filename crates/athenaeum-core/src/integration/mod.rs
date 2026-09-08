@@ -11,6 +11,7 @@ pub mod io_policy;
 pub mod plane_reader;
 pub mod registered_source;
 pub mod source;
+pub mod stats;
 pub mod storage_class;
 
 #[derive(Debug)]

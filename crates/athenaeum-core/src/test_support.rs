@@ -165,3 +165,21 @@ pub(crate) fn flux(data: &[f32], w: usize, x0: f64, y0: f64, r: usize, backgroun
     }
     sum
 }
+
+/// Adds zero-mean Gaussian noise of `sigma` in place (Box–Muller over a
+/// SplitMix64 stream seeded by `seed`), so a fixture's noise is reproducible.
+pub(crate) fn add_noise(data: &mut [f32], sigma: f32, seed: u64) {
+    let mut rng = crate::geometry::ransac::SplitMix64(seed);
+    let mut i = 0;
+    while i < data.len() {
+        let u1 = rng.next_f64().max(1e-12);
+        let u2 = rng.next_f64();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let (s, c) = (2.0 * std::f64::consts::PI * u2).sin_cos();
+        data[i] += (r * c) as f32 * sigma;
+        if i + 1 < data.len() {
+            data[i + 1] += (r * s) as f32 * sigma;
+        }
+        i += 2;
+    }
+}
