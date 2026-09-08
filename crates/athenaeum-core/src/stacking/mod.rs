@@ -7,3 +7,4 @@
 pub mod measure;
 pub mod psf_signal;
 pub mod robust;
+pub mod weights;
