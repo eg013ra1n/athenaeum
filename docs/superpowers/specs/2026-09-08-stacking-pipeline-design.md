@@ -154,7 +154,16 @@ camera here) are resampled into the reference geometry like any other.
 for the rejection pass)**, `lanczos3`, `lanczos4`, `mitchellNetravali`.
 `clampingThreshold` (0.30) applies the math reference's two clamping rules:
 the per-row/column linear replacement for the bicubic spline, the
-negative-lobe attenuation for Lanczos. The resampler is a gather: for every
+negative-lobe attenuation for Lanczos — both applied **separably**, once per
+axis (a 2-D split of every product weight by sign over-counts the negative
+lobes on smooth star flanks; measured on the M1 Plan 1 synthetic field it
+inflated Lanczos-4 star flux by +1.5 %, the separable form leaves
++0.1–0.2 %, Lanczos-3 is unbiased). Two measured kernel properties the
+acceptance run must keep in mind: windowed-sinc kernels carry a
+phase-dependent first-moment error of ~0.02 px (uniform over a frame at a
+given sub-pixel phase; the cubic kernels have linear precision and sit at
+1e-4 px), and Lanczos-4 with the 0.3 clamp keeps the residual one-signed
++0.1–0.2 % flux inflation just named. The resampler is a gather: for every
 output pixel, inverse-map to source coordinates, evaluate the kernel. The
 inverse map is the stored inverse (homography inverse; polynomial inverse
 coefficients), evaluated per pixel with Horner-form polynomials.
