@@ -426,6 +426,10 @@ pub const N_STAR_FROM_MAD: f64 = 2.48308;
 /// Mesh cell of the large-scale background model (model scale ≈ 256 px).
 pub const BACKGROUND_MODEL_CELL_PX: usize = 128;
 pub const MRS_LAYERS: usize = 4;
+/// Gaussian noise-propagation factor of the first B3-spline à-trous layer
+/// (math reference §2.1): the estimator measures layer-1 coefficients, which
+/// carry this fraction of the pixel noise σ.
+pub const MRS_LAYER0_GAIN: f32 = 0.8907;
 /// Chauvenet's criterion, the rejection limit for the mean-flux vector.
 pub const RCR_LIMIT: f64 = 0.5;
 
@@ -520,11 +524,12 @@ pub fn background_residual(data: &[f32], w: usize, h: usize) -> Option<(f64, f64
 /// MRS noise (`estimate_noise_mrs`, 4 layers). The estimator carries an
 /// absolute floor tuned for 16-bit ADU data, so callers feed it ADU-scaled
 /// values (`measure::ADU_SCALE`); `None` when the result sits on that
-/// floor (a constant or near-constant plane).
+/// floor (a constant or near-constant plane). The raw estimate is divided by
+/// `MRS_LAYER0_GAIN` to recover σ from the first layer's coefficients (§2.2).
 pub fn noise_mrs(data: &[f32], w: usize, h: usize) -> Option<f32> {
-    let n = astroimage::analysis::background::estimate_noise_mrs(data, w, h, MRS_LAYERS);
-    if n.is_finite() && n > 0.002 {
-        Some(n)
+    let raw = astroimage::analysis::background::estimate_noise_mrs(data, w, h, MRS_LAYERS);
+    if raw.is_finite() && raw > 0.002 {
+        Some(raw / MRS_LAYER0_GAIN)
     } else {
         None
     }
