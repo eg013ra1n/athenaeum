@@ -417,6 +417,146 @@ pub fn fit_stars(
     }
 }
 
+pub const PSFSW_NUM: f64 = 5.326e-6;
+pub const PSFSW_DEN: f64 = 9.0e6;
+pub const PSFSNR_NUM: f64 = 1.316e-7;
+pub const PSFSNR_DEN: f64 = 4.987e6;
+/// `N* = 2.48308·MAD(R)`: the MAD of a half-normal sample to its σ.
+pub const N_STAR_FROM_MAD: f64 = 2.48308;
+/// Mesh cell of the large-scale background model (model scale ≈ 256 px).
+pub const BACKGROUND_MODEL_CELL_PX: usize = 128;
+pub const MRS_LAYERS: usize = 4;
+/// Chauvenet's criterion, the rejection limit for the mean-flux vector.
+pub const RCR_LIMIT: f64 = 0.5;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SignalTotals {
+    /// `Σ signal_i` over every accepted fit.
+    pub tflux: f64,
+    /// `Σ mean_i` after RCR and Winsorization of the mean fluxes.
+    pub tmean_flux: f64,
+    /// Mean fluxes RCR flagged (and Winsorization replaced).
+    pub rejected: usize,
+}
+
+fn kahan_sum(it: impl Iterator<Item = f64>) -> f64 {
+    let (mut s, mut c) = (0.0f64, 0.0f64);
+    for x in it {
+        let y = x - c;
+        let t = s + y;
+        c = (t - s) - y;
+        s = t;
+    }
+    s
+}
+
+/// `TFlux` and `TMeanFlux` (math reference §1.1): the mean-flux vector is
+/// cleaned by RCR (limit 0.5) and Winsorized so nothing leaves the sum.
+pub fn signal_totals(fits: &[StarFit]) -> SignalTotals {
+    if fits.is_empty() {
+        return SignalTotals {
+            tflux: 0.0,
+            tmean_flux: 0.0,
+            rejected: 0,
+        };
+    }
+    let means: Vec<f64> = fits.iter().map(StarFit::mean_flux).collect();
+    let r = crate::stacking::robust::rcr(&means, RCR_LIMIT);
+    let w = crate::stacking::robust::winsorize(&means, &r.kept);
+    SignalTotals {
+        tflux: kahan_sum(fits.iter().map(|f| f.signal)),
+        tmean_flux: kahan_sum(w.iter().copied()),
+        rejected: r.rejected,
+    }
+}
+
+/// Frame FWHM and eccentricity: residual-weighted means over the fits
+/// (`ω_i = res_min / res_i`, residuals floored at 1e-6). `None` without fits.
+pub fn frame_shape(fits: &[StarFit]) -> Option<(f64, f64)> {
+    if fits.is_empty() {
+        return None;
+    }
+    let res_min = fits
+        .iter()
+        .map(|f| f.residual.max(1e-6))
+        .fold(f64::INFINITY, f64::min);
+    let (mut sw, mut sf, mut se) = (0.0, 0.0, 0.0);
+    for f in fits {
+        let w = res_min / f.residual.max(1e-6);
+        sw += w;
+        sf += w * f.fwhm();
+        se += w * f.eccentricity();
+    }
+    Some((sf / sw, se / sw))
+}
+
+/// `M*`, `N*` of the large-scale background residual (math reference
+/// §1.3): the model `L` is the mesh background (cell 128 px);
+/// `R = {L − v : v ≠ 0, v < L}` over the stratified sample;
+/// `M* = median(R)`, `N* = 2.48308·MAD(R)`. `None` below 100 residuals.
+pub fn background_residual(data: &[f32], w: usize, h: usize) -> Option<(f64, f64)> {
+    let bg = astroimage::analysis::background::estimate_background_mesh(
+        data,
+        w,
+        h,
+        BACKGROUND_MODEL_CELL_PX,
+    );
+    let model = bg.background_map?;
+    let mut r: Vec<f32> = Vec::with_capacity(data.len() / 32);
+    crate::integration::stats::for_each_stratified(w, h, |i| {
+        let (v, l) = (data[i], model[i]);
+        if v.is_finite() && l.is_finite() && v != 0.0 && v < l {
+            r.push(l - v);
+        }
+    });
+    if r.len() < 100 {
+        return None;
+    }
+    let m = median_in_place(&mut r);
+    let mad = crate::integration::stats::mad_about(&r, m);
+    Some((m as f64, N_STAR_FROM_MAD * mad as f64))
+}
+
+/// MRS noise (`estimate_noise_mrs`, 4 layers). The estimator carries an
+/// absolute floor tuned for 16-bit ADU data, so callers feed it ADU-scaled
+/// values (`measure::ADU_SCALE`); `None` when the result sits on that
+/// floor (a constant or near-constant plane).
+pub fn noise_mrs(data: &[f32], w: usize, h: usize) -> Option<f32> {
+    let n = astroimage::analysis::background::estimate_noise_mrs(data, w, h, MRS_LAYERS);
+    if n.is_finite() && n > 0.002 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// `PSFSW = (5.326e-6 · TFlux · TMeanFlux) / (9.0e6 · σ_N · M*)`; 0 when
+/// the denominator is not positive.
+pub fn psf_signal_weight(tflux: f64, tmean_flux: f64, sigma_n: f64, m_star: f64) -> f64 {
+    if !(sigma_n > 0.0) || !(m_star > 0.0) {
+        return 0.0;
+    }
+    let w = PSFSW_NUM * tflux * tmean_flux / (PSFSW_DEN * sigma_n * m_star);
+    if w.is_finite() && w > 0.0 {
+        w
+    } else {
+        0.0
+    }
+}
+
+/// `PSFSNR = (1.316e-7 · TFlux²) / (4.987e6 · σ_N²)`; 0 when σ_N ≤ 0.
+pub fn psf_snr(tflux: f64, sigma_n: f64) -> f64 {
+    if !(sigma_n > 0.0) {
+        return 0.0;
+    }
+    let s = PSFSNR_NUM * tflux * tflux / (PSFSNR_DEN * sigma_n * sigma_n);
+    if s.is_finite() {
+        s
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +770,116 @@ mod tests {
             "\"moffat4\""
         );
         assert_eq!(PsfModel::default(), PsfModel::Auto);
+    }
+
+    use crate::test_support::add_noise;
+
+    fn fit_with(mean: f64) -> StarFit {
+        StarFit {
+            x: 0.0,
+            y: 0.0,
+            background: 0.0,
+            amplitude: 1.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            fwtm_x: 6.0,
+            fwtm_y: 6.0,
+            theta: 0.0,
+            beta: 4.0,
+            residual: 0.01,
+            signal: mean * 10.0,
+            area: 10.0,
+        }
+    }
+
+    #[test]
+    fn totals_winsorize_the_rcr_rejects_but_sum_every_signal() {
+        let mut fits: Vec<StarFit> = (0..40)
+            .map(|j| fit_with(0.9 + 0.2 * j as f64 / 39.0))
+            .collect();
+        fits.push(fit_with(50.0)); // a saturated fit
+        fits.push(fit_with(0.01)); // a blended / failed fit
+        let t = signal_totals(&fits);
+        assert_eq!(t.rejected, 2);
+        assert!((t.tflux - 900.1).abs() < 1e-6, "{}", t.tflux);
+        assert!((t.tmean_flux - 42.0).abs() < 1e-6, "{}", t.tmean_flux);
+        let empty = signal_totals(&[]);
+        assert_eq!(
+            (empty.tflux, empty.tmean_flux, empty.rejected),
+            (0.0, 0.0, 0)
+        );
+    }
+
+    #[test]
+    fn frame_shape_weights_by_residual() {
+        let mut a = fit_with(1.0);
+        a.fwhm_x = 4.0;
+        a.fwhm_y = 4.0;
+        a.residual = 0.01;
+        let mut b = fit_with(1.0);
+        b.fwhm_x = 8.0;
+        b.fwhm_y = 2.0;
+        b.residual = 0.03;
+        // ω = 1 and 1/3: FWHM = (4 + 4/3)/(4/3) = 4; ecc = (0 + 0.96825/3)/(4/3) = 0.24206
+        let (fwhm, ecc) = frame_shape(&[a, b]).unwrap();
+        assert!((fwhm - 4.0).abs() < 1e-9, "{fwhm}");
+        assert!((ecc - 0.24206).abs() < 1e-4, "{ecc}");
+        assert!(frame_shape(&[]).is_none());
+    }
+
+    #[test]
+    fn background_residual_of_pure_noise_is_half_normal() {
+        let (w, h) = (512, 512);
+        let mut data = vec![0.1f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] += 0.005 * x as f32 / w as f32; // a 5 % gradient the model must follow
+            }
+        }
+        add_noise(&mut data, 0.01, 21);
+        let (m, n) = background_residual(&data, w, h).unwrap();
+        assert!((m - 0.006745).abs() < 0.15 * 0.006745, "M* {m}");
+        assert!((n - 0.01).abs() < 0.10 * 0.01, "N* {n}");
+        assert!(background_residual(&[0.5; 64], 8, 8).is_none());
+    }
+
+    #[test]
+    fn mrs_noise_tracks_the_true_sigma_and_survives_stars() {
+        let (w, h) = (512, 512);
+        let mut plain = vec![1000.0f32; w * h]; // ADU-scaled units, 20 ADU of noise
+        add_noise(&mut plain, 20.0, 31);
+        let n = noise_mrs(&plain, w, h).unwrap();
+        assert!((n - 20.0).abs() < 0.05 * 20.0, "pure noise: {n}");
+        let stars: Vec<(f64, f64, f64)> = (0..200)
+            .map(|i| {
+                (
+                    16.0 + (i % 20) as f64 * 24.0,
+                    16.0 + (i / 20) as f64 * 48.0,
+                    500.0 + 100.0 * (i % 7) as f64,
+                )
+            })
+            .collect();
+        let mut field = gaussian_field(w, h, &stars, 2.0, 1000.0);
+        add_noise(&mut field, 20.0, 32);
+        let n = noise_mrs(&field, w, h).unwrap();
+        assert!((n - 20.0).abs() < 0.08 * 20.0, "star field: {n}");
+        assert!(noise_mrs(&[5.0; 256], 16, 16).is_none());
+    }
+
+    #[test]
+    fn estimator_formulas_by_hand() {
+        let w = psf_signal_weight(1000.0, 50.0, 0.01, 0.007);
+        assert!((w - 5.326e-6 * 1000.0 * 50.0 / (9.0e6 * 0.01 * 0.007)).abs() < 1e-12);
+        assert_eq!(psf_signal_weight(1000.0, 50.0, 0.0, 0.007), 0.0);
+        assert_eq!(psf_signal_weight(1000.0, 50.0, 0.01, 0.0), 0.0);
+        let s = psf_snr(1000.0, 0.01);
+        assert!((s - 1.316e-7 * 1e6 / (4.987e6 * 1e-4)).abs() < 1e-9);
+        assert_eq!(psf_snr(1000.0, 0.0), 0.0);
+        // scale invariance: everything ×65535 gives the same weights
+        let k = 65535.0;
+        assert!(
+            (psf_signal_weight(1000.0 * k, 50.0 * k, 0.01 * k, 0.007 * k) - w).abs() < 1e-9 * w
+        );
+        assert!((psf_snr(1000.0 * k, 0.01 * k) - s).abs() < 1e-9 * s);
     }
 }
