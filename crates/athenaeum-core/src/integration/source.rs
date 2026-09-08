@@ -17,7 +17,8 @@ pub trait FrameSource: Sync {
     fn bytes_per_row(&self) -> usize;
     fn band_rows_for_budget(&self, budget_bytes: usize) -> usize;
     /// Fill rows `[y0, y0 + rows)` of every frame into `out`, calling
-    /// `on_bytes` once per frame with the bytes read from disk, checking
+    /// `on_bytes` once per frame with that frame's accounted share of the
+    /// band (see the contract below — not its true disk traffic), checking
     /// `cancel` between frames.
     /// Contract: the values passed to `on_bytes` over one band sum to
     /// exactly `rows × bytes_per_row()` — the engine derives `bytes_total`

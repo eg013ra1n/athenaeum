@@ -55,12 +55,28 @@ impl PlaneReader {
     }
 
     /// Rows `[y0, y0 + rows)` of `plane`, decoded into `dst` (len `rows × width`).
+    /// Allocates a fresh byte buffer per call; a loop over many bands should
+    /// use [`PlaneReader::read_rows_with_scratch`].
     pub fn read_rows(
         &self,
         plane: usize,
         y0: usize,
         rows: usize,
         dst: &mut [f32],
+    ) -> Result<(), IntegrationError> {
+        let mut scratch = Vec::new();
+        self.read_rows_with_scratch(plane, y0, rows, dst, &mut scratch)
+    }
+
+    /// Same as [`PlaneReader::read_rows`], reusing `scratch` for the raw
+    /// bytes (grown as needed, never shrunk; untouched when `rows == 0`).
+    pub fn read_rows_with_scratch(
+        &self,
+        plane: usize,
+        y0: usize,
+        rows: usize,
+        dst: &mut [f32],
+        scratch: &mut Vec<u8>,
     ) -> Result<(), IntegrationError> {
         if plane >= self.channels {
             return Err(IntegrationError::BadInput(format!(
@@ -86,11 +102,14 @@ impl PlaneReader {
             return Ok(());
         }
         let bpp = self.kind.bytes_per_sample();
-        let mut raw = vec![0u8; rows * self.width * bpp];
+        let need = rows * self.width * bpp;
+        if scratch.len() < need {
+            scratch.resize(need, 0);
+        }
         let offset =
             self.data_offset + plane as u64 * self.plane_bytes() + (y0 * self.width * bpp) as u64;
-        pread_exact(&self.file, &mut raw, offset)?;
-        self.kind.decode_run(&raw, 0, dst);
+        pread_exact(&self.file, &mut scratch[..need], offset)?;
+        self.kind.decode_run(&scratch[..need], 0, dst);
         Ok(())
     }
 
@@ -234,5 +253,51 @@ mod tests {
         assert_eq!(crate::integration::banded::probe_bitpix(&p), None);
         let (m, _) = f32_fixture(dir.path(), "mono.fits", 6, 5, 1);
         assert_eq!(crate::integration::banded::probe_bitpix(&m), Some(-32));
+    }
+
+    #[test]
+    fn zero_rows_is_ok_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, _) = f32_fixture(dir.path(), "mono.fits", 4, 4, 1);
+        let r = PlaneReader::open(&p).unwrap();
+        let mut dst: [f32; 0] = [];
+        r.read_rows(0, 2, 0, &mut dst).unwrap();
+        let mut scratch = vec![7u8; 3];
+        r.read_rows_with_scratch(0, 4, 0, &mut dst, &mut scratch).unwrap();
+        assert_eq!(scratch, vec![7u8; 3], "zero rows must not touch the scratch buffer");
+    }
+
+    #[test]
+    fn a_non_fits_file_is_bad_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"hello, not a fits file").unwrap();
+        assert!(matches!(
+            PlaneReader::open(&p),
+            Err(IntegrationError::BadInput(_))
+        ));
+    }
+
+    #[test]
+    fn read_plane_returns_the_middle_plane_of_an_rgb_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, data) = f32_fixture(dir.path(), "rgb.fits", 6, 5, 3);
+        let r = PlaneReader::open(&p).unwrap();
+        assert_eq!(r.read_plane(1).unwrap(), data[30..60].to_vec());
+    }
+
+    #[test]
+    fn scratch_reuse_matches_fresh_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, data) = f32_fixture(dir.path(), "mono.fits", 9, 7, 1);
+        let r = PlaneReader::open(&p).unwrap();
+        let mut scratch = Vec::new();
+        let mut a = vec![0f32; 2 * 9];
+        r.read_rows_with_scratch(0, 1, 2, &mut a, &mut scratch).unwrap();
+        assert_eq!(&a[..], &data[9..27]);
+        let mut b = vec![0f32; 4 * 9];
+        r.read_rows_with_scratch(0, 3, 4, &mut b, &mut scratch).unwrap();
+        assert_eq!(&b[..], &data[27..63]);
+        assert!(scratch.len() >= 4 * 9 * 4, "scratch grows to the largest read");
     }
 }
