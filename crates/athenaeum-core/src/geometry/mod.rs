@@ -5,10 +5,12 @@
 //! reference, `inverse` maps reference → subject.
 
 pub mod eigen;
+pub mod kdtree;
 pub mod linear;
 pub mod pixel_map;
 pub mod polynomial;
 
+pub use kdtree::KdTree2;
 pub use linear::{Linear, LinearKind, Pair};
 pub use pixel_map::{InverseMap, PixelMap};
 pub use polynomial::{Distortion, Polynomial2D};
