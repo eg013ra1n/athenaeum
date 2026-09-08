@@ -27,8 +27,8 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 /// How one frame's raw band bytes decode to physical samples. Carried per
 /// frame because a set may legally mix bit depths, and because the
 /// decode-and-spill fallback produces little-endian f32 while FITS is big.
-#[derive(Clone, Copy)]
-pub(crate) enum PlaneKind {
+#[derive(Clone, Copy, Debug)]
+pub enum PlaneKind {
     U8 { bzero: f32, bscale: f32 },
     I16Be { bzero: f32, bscale: f32 },
     I32Be { bzero: f32, bscale: f32 },
@@ -81,7 +81,7 @@ impl PlaneKind {
 
     /// Bulk decode of `dst.len()` consecutive samples starting at `start` —
     /// a tight typed loop per arm so the optimizer can vectorize it.
-    fn decode_run(self, b: &[u8], start: usize, dst: &mut [f32]) {
+    pub(crate) fn decode_run(self, b: &[u8], start: usize, dst: &mut [f32]) {
         let bpp = self.bytes_per_sample();
         let src = &b[start * bpp..(start + dst.len()) * bpp];
         match self {
@@ -121,7 +121,7 @@ impl PlaneKind {
 /// Build the decode kind for a probed FITS primary HDU. `bitpix` is always
 /// one of `8 | 16 | 32 | -32 | -64` here — `probe_fits` validates that before
 /// ever constructing a `FrameReader::Fits`, so no other value can reach this.
-fn plane_kind_for_bitpix(bitpix: i32, bzero: f64, bscale: f64) -> PlaneKind {
+pub(crate) fn plane_kind_for_bitpix(bitpix: i32, bzero: f64, bscale: f64) -> PlaneKind {
     match bitpix {
         8 => PlaneKind::U8 { bzero: bzero as f32, bscale: bscale as f32 },
         16 => PlaneKind::I16Be { bzero: bzero as f32, bscale: bscale as f32 },
@@ -137,6 +137,63 @@ enum FrameReader {
     Fits { file: File, data_offset: u64, kind: PlaneKind },
     /// Raw little-endian f32 scratch spill (one full frame, row-major).
     Scratch { file: File, kind: PlaneKind },
+}
+
+/// Positional exact read — `pread`-style on unix, a `seek_read` loop on
+/// Windows. No cursor is involved on unix; on Windows every call carries its
+/// own offset, so concurrent calls on one handle stay safe as long as no
+/// cursor-based read is ever mixed in (see `FrameReader::read_exact_at`).
+pub(crate) fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // `read_exact_at` retries internally on `ErrorKind::Interrupted`
+        // (same policy as `Read::read_exact`) — a signal-interrupted
+        // syscall resumes rather than surfacing a spurious error. The
+        // Windows arm below has no equivalent retry loop for that kind;
+        // see its comment for why that's not a gap.
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        // `seek_read` may return a short read; loop until the buffer is
+        // full or the file ends. There is no `read_exact_at` on Windows.
+        //
+        // No `ErrorKind::Interrupted` retry here, unlike the unix arm
+        // above — deliberately: `Interrupted` models a POSIX signal
+        // arriving mid-syscall, and `ReadFile` (what `seek_read` wraps)
+        // has no equivalent concept to interrupt it with, so this arm
+        // can never actually observe that error kind.
+        //
+        // `seek_read` also moves the file's cursor, unlike a true `pread`
+        // — safe here ONLY because nothing that reads through a
+        // `FrameReader`'s handle goes through a cursor any more (fix
+        // round 1, M5): every such read is positional. That invariant
+        // covers the one cursor-based read a `FrameReader`'s handle ever
+        // sees: `probe_fits` reads the header with a plain `read_exact`
+        // BEFORE the handle becomes a `FrameReader` (review 2026-09-06 F6
+        // reuses that handle instead of reopening the path). From then on
+        // every read is positional, so where the cursor came to rest is
+        // irrelevant. Concurrent calls on one handle are still safe
+        // because each `seek_read` carries its own offset. Do NOT
+        // reintroduce a seek-based (`Seek`/`SeekFrom`) read on a
+        // `FrameReader`'s file anywhere in this module — it would
+        // silently race this cursor against concurrent `read_exact_at`
+        // calls on the same `File`, on Windows only, invisibly to every
+        // CI job (the Windows build only runs on a tag, never a branch
+        // push).
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read while filling a band",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
 }
 
 impl FrameReader {
@@ -155,56 +212,7 @@ impl FrameReader {
             FrameReader::Fits { file, data_offset, .. } => (file, *data_offset),
             FrameReader::Scratch { file, .. } => (file, 0),
         };
-        #[cfg(unix)]
-        {
-            // `read_exact_at` retries internally on `ErrorKind::Interrupted`
-            // (same policy as `Read::read_exact`) — a signal-interrupted
-            // syscall resumes rather than surfacing a spurious error. The
-            // Windows arm below has no equivalent retry loop for that kind;
-            // see its comment for why that's not a gap.
-            file.read_exact_at(buf, base + offset)
-        }
-        #[cfg(windows)]
-        {
-            // `seek_read` may return a short read; loop until the buffer is
-            // full or the file ends. There is no `read_exact_at` on Windows.
-            //
-            // No `ErrorKind::Interrupted` retry here, unlike the unix arm
-            // above — deliberately: `Interrupted` models a POSIX signal
-            // arriving mid-syscall, and `ReadFile` (what `seek_read` wraps)
-            // has no equivalent concept to interrupt it with, so this arm
-            // can never actually observe that error kind.
-            //
-            // `seek_read` also moves the file's cursor, unlike a true `pread`
-            // — safe here ONLY because nothing that reads through a
-            // `FrameReader`'s handle goes through a cursor any more (fix
-            // round 1, M5): every such read is positional. That invariant
-            // covers the one cursor-based read a `FrameReader`'s handle ever
-            // sees: `probe_fits` reads the header with a plain `read_exact`
-            // BEFORE the handle becomes a `FrameReader` (review 2026-09-06 F6
-            // reuses that handle instead of reopening the path). From then on
-            // every read is positional, so where the cursor came to rest is
-            // irrelevant. Concurrent calls on one handle are still safe
-            // because each `seek_read` carries its own offset. Do NOT
-            // reintroduce a seek-based (`Seek`/`SeekFrom`) read on a
-            // `FrameReader`'s file anywhere in this module — it would
-            // silently race this cursor against concurrent `read_exact_at`
-            // calls on the same `File`, on Windows only, invisibly to every
-            // CI job (the Windows build only runs on a tag, never a branch
-            // push).
-            let mut done = 0usize;
-            while done < buf.len() {
-                let n = file.seek_read(&mut buf[done..], base + offset + done as u64)?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "short read while filling a band",
-                    ));
-                }
-                done += n;
-            }
-            Ok(())
-        }
+        pread_exact(file, buf, base + offset)
     }
 }
 
@@ -214,7 +222,7 @@ pub struct BandSource {
     height: usize,
 }
 
-struct FitsInfo { data_offset: u64, bitpix: i32, naxis: i32, w: usize, h: usize, naxis3: usize, bzero: f64, bscale: f64 }
+pub(crate) struct FitsInfo { pub(crate) data_offset: u64, pub(crate) bitpix: i32, pub(crate) naxis: i32, pub(crate) w: usize, pub(crate) h: usize, pub(crate) naxis3: usize, pub(crate) bzero: f64, pub(crate) bscale: f64 }
 
 /// Scan primary-header blocks for END; harvest the handful of numeric cards
 /// the direct reader needs. Returns the open handle alongside the info so the
@@ -224,7 +232,7 @@ struct FitsInfo { data_offset: u64, bitpix: i32, naxis: i32, w: usize, h: usize,
 /// header read leaves the cursor past the header; every read a `FrameReader`
 /// makes is positional, so that never matters. Returns None for anything that
 /// should take the decode-and-spill fallback (never errors on odd files).
-fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
+pub(crate) fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     let mut f = File::open(path).ok()?;
     let mut info = FitsInfo { data_offset: 0, bitpix: 0, naxis: 0, w: 0, h: 0, naxis3: 1, bzero: 0.0, bscale: 1.0 };
     let mut block = [0u8; BLOCK as usize];
@@ -255,7 +263,11 @@ fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
     }
     info.data_offset = blocks * BLOCK;
     let ok_bitpix = matches!(info.bitpix, 8 | 16 | 32 | -32 | -64);
-    if info.naxis == 2 && info.naxis3 == 1 && ok_bitpix && info.w > 0 && info.h > 0 {
+    // A plain 2-D image, or a 3-D one with one or three planes (a
+    // debayered calibrated light). Anything else takes the spill path.
+    let ok_shape = (info.naxis == 2 && info.naxis3 == 1)
+        || (info.naxis == 3 && (info.naxis3 == 1 || info.naxis3 == 3));
+    if ok_shape && ok_bitpix && info.w > 0 && info.h > 0 {
         Some((f, info))
     } else {
         None
@@ -382,6 +394,10 @@ fn round_robin_groups<T>(items: impl IntoIterator<Item = T>, workers: usize) -> 
 /// why the spill lives outside this function.
 fn probe_one(p: &Path) -> Result<ProbeOutcome, IntegrationError> {
     match probe_fits(p) {
+        // Multi-plane files are `PlaneReader`'s business; a banded source
+        // stays single-plane and lets the spill path raise its 1-channel
+        // error exactly as before.
+        Some((_, info)) if info.naxis3 != 1 => Ok(ProbeOutcome::NeedsSpill),
         Some((file, info)) => Ok(ProbeOutcome::Fits(
             FrameReader::Fits {
                 file,
@@ -811,6 +827,20 @@ impl BandPlanes {
         assert_eq!(dst.len(), self.rows * self.width, "decode_frame_into: dst must be rows * width");
         self.kinds[frame].decode_run(&self.bufs[frame], 0, dst);
     }
+
+    /// A band buffer set for a source that is not a `BandSource` (a
+    /// resampling source hands in its own per-frame kinds — always
+    /// `PlaneKind::F32Le`, the native little-endian f32 it writes).
+    pub(crate) fn with_kinds(kinds: Vec<PlaneKind>, width: usize) -> BandPlanes {
+        BandPlanes { bufs: vec![Vec::new(); kinds.len()], kinds, width, rows: 0 }
+    }
+
+    pub(crate) fn width(&self) -> usize { self.width }
+
+    pub(crate) fn set_rows(&mut self, rows: usize) { self.rows = rows; }
+
+    /// One frame's raw band buffer, for a source that fills it itself.
+    pub(crate) fn buf_mut(&mut self, frame: usize) -> &mut Vec<u8> { &mut self.bufs[frame] }
 }
 
 #[cfg(test)]

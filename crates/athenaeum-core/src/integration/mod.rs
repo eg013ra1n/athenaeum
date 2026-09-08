@@ -8,6 +8,7 @@ pub mod cfa;
 pub mod combine;
 pub mod engine;
 pub mod io_policy;
+pub mod plane_reader;
 pub mod storage_class;
 
 #[derive(Debug)]
@@ -30,5 +31,7 @@ impl std::fmt::Display for IntegrationError {
 }
 impl std::error::Error for IntegrationError {}
 impl From<std::io::Error> for IntegrationError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
