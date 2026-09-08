@@ -86,7 +86,20 @@ impl PixelMap {
     }
 
     pub fn from_json(s: &str) -> Result<PixelMap, serde_json::Error> {
-        serde_json::from_str(s)
+        let map: PixelMap = serde_json::from_str(s)?;
+        if let Some(d) = &map.distortion {
+            if !d.is_well_formed() {
+                return Err(<serde_json::Error as serde::de::Error>::custom(
+                    "malformed distortion: order must be 2..=4 with one finite coefficient per term and a positive finite scale",
+                ));
+            }
+        }
+        if map.linear.inverse().is_none() {
+            return Err(<serde_json::Error as serde::de::Error>::custom(
+                "singular linear transform",
+            ));
+        }
+        Ok(map)
     }
 }
 
@@ -101,6 +114,7 @@ impl InverseMap for PixelMap {
 mod tests {
     use super::*;
     use crate::geometry::linear::{Linear, LinearKind};
+    use crate::geometry::polynomial::{Distortion, Polynomial2D};
 
     #[test]
     fn linear_map_round_trips_and_serializes() {
@@ -138,5 +152,41 @@ mod tests {
         let id = Linear::identity();
         let m: &dyn InverseMap = &id;
         assert_eq!(m.inverse(3.0, 4.0), (3.0, 4.0));
+    }
+
+    #[test]
+    fn from_json_rejects_a_malformed_distortion() {
+        let l = Linear::identity();
+        let good = PixelMap::linear(l).unwrap().to_json();
+        // Splice in a distortion whose order is out of range and whose
+        // coefficient vectors are too short for it.
+        let bad = good.replace(
+            "\"distortion\":null",
+            "\"distortion\":{\"order\":5,\"center\":[0.0,0.0],\"scale\":1.0,\
+             \"forward\":{\"order\":5,\"ax\":[1.0],\"ay\":[1.0]},\
+             \"inverse\":{\"order\":5,\"ax\":[1.0],\"ay\":[1.0]}}",
+        );
+        assert_ne!(good, bad, "the splice must have matched");
+        assert!(PixelMap::from_json(&bad).is_err());
+        // A well-formed distortion round-trips.
+        let d = Distortion {
+            order: 2,
+            center: (10.0, 20.0),
+            scale: 100.0,
+            forward: Polynomial2D {
+                order: 2,
+                ax: vec![0.1, 0.2, 0.3],
+                ay: vec![0.4, 0.5, 0.6],
+            },
+            inverse: Polynomial2D {
+                order: 2,
+                ax: vec![-0.1, -0.2, -0.3],
+                ay: vec![-0.4, -0.5, -0.6],
+            },
+        };
+        assert!(d.is_well_formed());
+        let map = PixelMap::with_distortion(l, d).unwrap();
+        let back = PixelMap::from_json(&map.to_json()).unwrap();
+        assert_eq!(map, back);
     }
 }

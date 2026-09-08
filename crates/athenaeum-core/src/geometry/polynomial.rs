@@ -33,10 +33,24 @@ pub struct Polynomial2D {
 }
 
 impl Polynomial2D {
+    /// True when `order` is 2..=4, both coefficient vectors have exactly one
+    /// entry per term of that order, and every coefficient is finite — what
+    /// `fit` always produces and what `eval` assumes.
+    pub fn is_well_formed(&self) -> bool {
+        (2..=4).contains(&self.order)
+            && self.ax.len() == term_exponents(self.order).len()
+            && self.ay.len() == self.ax.len()
+            && self.ax.iter().chain(self.ay.iter()).all(|c| c.is_finite())
+    }
+
     /// Evaluates `(Σ ax_k u^i v^j, Σ ay_k u^i v^j)` with power tables
     /// (`order` is at most 4, so this is a dozen multiplies).
     #[inline]
     pub fn eval(&self, u: f64, v: f64) -> (f64, f64) {
+        debug_assert!(
+            self.is_well_formed(),
+            "Polynomial2D::eval on a malformed polynomial"
+        );
         let mut pu = [1.0f64; 5];
         let mut pv = [1.0f64; 5];
         for k in 1..=self.order as usize {
@@ -150,6 +164,17 @@ pub struct Distortion {
 }
 
 impl Distortion {
+    pub fn is_well_formed(&self) -> bool {
+        self.scale.is_finite()
+            && self.scale > 0.0
+            && self.center.0.is_finite()
+            && self.center.1.is_finite()
+            && self.forward.order == self.order
+            && self.inverse.order == self.order
+            && self.forward.is_well_formed()
+            && self.inverse.is_well_formed()
+    }
+
     #[inline]
     pub fn norm(&self, x: f64, y: f64) -> (f64, f64) {
         (
