@@ -226,4 +226,13 @@ mod tests {
             .expect("must be rejected");
         assert!(format!("{err}").contains("1-channel"), "{err}");
     }
+
+    #[test]
+    fn probe_bitpix_still_answers_none_for_a_three_plane_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, _) = f32_fixture(dir.path(), "rgb.fits", 6, 5, 3);
+        assert_eq!(crate::integration::banded::probe_bitpix(&p), None);
+        let (m, _) = f32_fixture(dir.path(), "mono.fits", 6, 5, 1);
+        assert_eq!(crate::integration::banded::probe_bitpix(&m), Some(-32));
+    }
 }

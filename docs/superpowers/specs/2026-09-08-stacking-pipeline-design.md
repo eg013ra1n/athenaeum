@@ -493,21 +493,23 @@ stacking_set_config(frames_set_id PK FK ON DELETE CASCADE,
 ```
 
 `registration_results` gains, via the guarded `ALTER TABLE` pattern:
-`model TEXT`, `transform_json TEXT`, `inverse_json TEXT`, `inlier_ratio REAL`,
+`model TEXT`, `transform_json TEXT`, `inlier_ratio REAL`,
 `peak_error_px REAL`, `scale REAL`, `rotation_deg REAL`,
 `flipped INTEGER NOT NULL DEFAULT 0`, `config_hash TEXT`,
 `source_kind TEXT` (`calibrated`). The `affine_*` columns keep the linear
 part. Rows from the retired flow are simply overwritten by the
 `UNIQUE(frames_set_id, frame_id)` upsert.
 
-`transform_json`: `{ "kind": "homography", "m": [9 f64], "distortion":
-{ "order": 3, "center": [cx, cy], "scale": s, "forward": {"a": [..], "b": [..]},
-"inverse": {"ap": [..], "bp": [..]} } | null }` — the polynomial acts on
-coordinates normalized as `u = (x − cx)/s`, `v = (y − cy)/s` (reference
-centre and half the longer side) for conditioning; `inverse_json` holds the
-inverse linear part. `stacking_runs.summary_json` and the per-run
-`runs/run-<id>.json` file (same content: config, reference, groups, per-frame
-rows, stats) are the provenance, modelled on `master_provenance`.
+`transform_json` is `PixelMap::to_json()` verbatim — `{ "linear": { "kind":
+"homography", "m": [[..],[..],[..]] }, "linearInv": { … }, "distortion": null |
+{ "order": 3, "center": [cx, cy], "scale": s, "forward": { "order": 3, "ax":
+[..], "ay": [..] }, "inverse": { … } } }`. The polynomial acts on coordinates
+normalized as `u = (x − cx)/s`, `v = (y − cy)/s` (reference centre and half the
+longer side) for conditioning. `linearInv` is recomputed from `linear` on
+load, so a stored inverse can never disagree with its forward matrix.
+`stacking_runs.summary_json` and the per-run `runs/run-<id>.json` file (same
+content: config, reference, groups, per-frame rows, stats) are the
+provenance, modelled on `master_provenance`.
 
 ### 9.2 Configuration
 

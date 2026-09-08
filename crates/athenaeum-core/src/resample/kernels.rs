@@ -275,6 +275,19 @@ mod tests {
     ];
 
     #[test]
+    fn kernel_constants_are_pinned_by_known_values() {
+        assert!((keys(0.5, -0.5) - 0.5625).abs() < 1e-6);
+        assert!((keys(1.5, -0.5) + 0.0625).abs() < 1e-6);
+        assert!((cubic_bspline(0.0) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((cubic_bspline(1.0) - 1.0 / 6.0).abs() < 1e-6);
+        assert!((mitchell(0.0, 1.0 / 3.0, 1.0 / 3.0) - 16.0 / 18.0).abs() < 1e-6);
+        assert!((mitchell(1.0, 1.0 / 3.0, 1.0 / 3.0) - 1.0 / 18.0).abs() < 1e-6);
+        assert!((lanczos(0.5, 3.0) - 0.607_927).abs() < 1e-5);
+        assert!((lanczos(1.5, 3.0) + 0.135_095).abs() < 1e-5);
+        assert!((lanczos(2.5, 3.0) - 0.024_318).abs() < 1e-5);
+    }
+
+    #[test]
     fn every_kernel_partitions_unity() {
         for k in ALL {
             for frac in [0.0f32, 0.25, 0.5, 0.9, 0.999] {

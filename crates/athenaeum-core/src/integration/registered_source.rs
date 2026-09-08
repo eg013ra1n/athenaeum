@@ -5,7 +5,7 @@
 //! row window, warp it into the band, hand the engine native f32.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, warn};
@@ -233,12 +233,20 @@ impl FrameSource for RegisteredSource {
         // is the only place that touches `out`, so the parallel part never
         // needs a mutable borrow of it.
         let mut scratch: Vec<Vec<f32>> = (0..n).map(|_| vec![0f32; rows * w]).collect();
+        // `on_bytes` reports the engine's own accounted share (`rows ×
+        // bytes_per_row`, see the `FrameSource::read_band_with_progress`
+        // contract) — never the true disk traffic, which can differ (a
+        // `Whole`-window read, a narrower BITPIX). The real figure is kept
+        // here only for the debug log below.
+        let disk_bytes = AtomicU64::new(0);
         if workers == 1 {
             for (i, dst) in scratch.iter_mut().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(IntegrationError::Cancelled);
                 }
-                on_bytes(self.fill_frame(i, y0, rows, dst)?);
+                let disk = self.fill_frame(i, y0, rows, dst)?;
+                disk_bytes.fetch_add(disk, Ordering::Relaxed);
+                on_bytes((rows * self.width * 4) as u64);
             }
         } else {
             let first_err: Mutex<Option<IntegrationError>> = Mutex::new(None);
@@ -263,6 +271,7 @@ impl FrameSource for RegisteredSource {
                     let first_err = &first_err;
                     let abort = &abort;
                     let saw_cancel = &saw_cancel;
+                    let disk_bytes = &disk_bytes;
                     scope.spawn(move || {
                         for (i, dst) in group {
                             if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
@@ -270,7 +279,10 @@ impl FrameSource for RegisteredSource {
                                 return;
                             }
                             match self.fill_frame(i, y0, rows, dst) {
-                                Ok(bytes) => on_bytes(bytes),
+                                Ok(bytes) => {
+                                    disk_bytes.fetch_add(bytes, Ordering::Relaxed);
+                                    on_bytes((rows * w * 4) as u64);
+                                }
                                 Err(e) => {
                                     abort.store(true, Ordering::Relaxed);
                                     let mut slot = first_err.lock().unwrap();
@@ -300,7 +312,14 @@ impl FrameSource for RegisteredSource {
         for (i, s) in scratch.iter().enumerate() {
             store_f32_le(out.buf_mut(i), s);
         }
-        debug!(y0, rows, frames = n, workers, "registered band resampled");
+        debug!(
+            y0,
+            rows,
+            frames = n,
+            workers,
+            disk_bytes = disk_bytes.load(Ordering::Relaxed),
+            "registered band resampled"
+        );
         Ok(())
     }
 }
@@ -391,8 +410,23 @@ mod tests {
         let fr = frames(dir.path());
         let src = RegisteredSource::open(&fr, W, H, 0, Interpolation::BicubicBSpline, 0.3).unwrap();
         let mut planes = BandPlanes::new(&src);
-        src.read_band_with_progress(37, 20, &mut planes, 2, &|_| {}, &AtomicBool::new(false))
-            .unwrap();
+        let reported = std::sync::atomic::AtomicU64::new(0);
+        src.read_band_with_progress(
+            37,
+            20,
+            &mut planes,
+            2,
+            &|b| {
+                reported.fetch_add(b, std::sync::atomic::Ordering::Relaxed);
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            reported.load(std::sync::atomic::Ordering::Relaxed),
+            20 * W as u64 * 4 * 3,
+            "on_bytes must sum to rows × bytes_per_row over the band"
+        );
         assert_eq!(planes.rows(), 20);
         for (i, f) in fr.iter().enumerate() {
             let reader = PlaneReader::open(&f.path).unwrap();

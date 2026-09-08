@@ -279,7 +279,9 @@ pub(crate) fn probe_fits(path: &Path) -> Option<(File, FitsInfo)> {
 /// exactly the files the decode-and-spill fallback covers, whose original bit
 /// depth this probe cannot speak for).
 pub fn probe_bitpix(path: &Path) -> Option<i32> {
-    probe_fits(path).map(|(_, i)| i.bitpix)
+    // The 3-D shapes `probe_fits` accepts for `PlaneReader` are still spilled by
+    // `BandSource`, and this probe answers for the banded reader's world.
+    probe_fits(path).filter(|(_, i)| i.naxis == 2 && i.naxis3 == 1).map(|(_, i)| i.bitpix)
 }
 
 /// Test-only observation hook (fix round 1, I1 regression pin): records

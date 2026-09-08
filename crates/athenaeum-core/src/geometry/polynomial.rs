@@ -105,7 +105,11 @@ impl Polynomial2D {
         }
         let ax = solve_dense(&ata, &atx)?;
         let ay = solve_dense(&ata, &aty)?;
-        Some(Polynomial2D { order, ax, ay })
+        let p = Polynomial2D { order, ax, ay };
+        if !p.is_well_formed() {
+            return None;
+        }
+        Some(p)
     }
 }
 
@@ -122,8 +126,7 @@ fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
         })
         .collect();
     for col in 0..n {
-        let pivot =
-            (col..n).max_by(|&i, &j| m[i][col].abs().partial_cmp(&m[j][col].abs()).unwrap())?;
+        let pivot = (col..n).max_by(|&i, &j| m[i][col].abs().total_cmp(&m[j][col].abs()))?;
         if m[pivot][col].abs() < 1e-14 {
             return None;
         }
@@ -192,7 +195,7 @@ impl Distortion {
         center: (f64, f64),
         scale: f64,
     ) -> Option<Distortion> {
-        if scale <= 0.0 {
+        if !(scale > 0.0) {
             return None;
         }
         linear.inverse()?;
@@ -311,5 +314,18 @@ mod tests {
     fn too_few_samples_returns_none() {
         let samples = vec![((0.0, 0.0), (0.0, 0.0)); 3];
         assert!(Polynomial2D::fit(3, &samples, None).is_none());
+    }
+
+    #[test]
+    fn nan_input_yields_none_not_a_panic() {
+        let mut samples: Vec<((f64, f64), (f64, f64))> = grid(2.0, 2.0, 0.25)
+            .into_iter()
+            .map(|(u, v)| ((u - 1.0, v - 1.0), (0.1 * u, -0.1 * v)))
+            .collect();
+        samples[3].1 .0 = f64::NAN;
+        assert!(Polynomial2D::fit(3, &samples, None).is_none());
+        let linear = Linear::identity();
+        let pairs: Vec<Pair> = vec![((0.0, 0.0), (0.0, 0.0)); 20];
+        assert!(Distortion::fit(2, &linear, &pairs, None, (0.0, 0.0), f64::NAN).is_none());
     }
 }

@@ -19,6 +19,10 @@ pub trait FrameSource: Sync {
     /// Fill rows `[y0, y0 + rows)` of every frame into `out`, calling
     /// `on_bytes` once per frame with the bytes read from disk, checking
     /// `cancel` between frames.
+    /// Contract: the values passed to `on_bytes` over one band sum to
+    /// exactly `rows × bytes_per_row()` — the engine derives `bytes_total`
+    /// from `bytes_per_row`, so a source that reports its true disk traffic
+    /// in different units makes the progress overshoot and regress.
     fn read_band_with_progress(
         &self,
         y0: usize,

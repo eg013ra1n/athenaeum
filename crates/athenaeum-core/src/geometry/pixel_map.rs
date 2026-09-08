@@ -94,12 +94,14 @@ impl PixelMap {
                 ));
             }
         }
-        if map.linear.inverse().is_none() {
-            return Err(<serde_json::Error as serde::de::Error>::custom(
-                "singular linear transform",
-            ));
-        }
-        Ok(map)
+        let linear_inv = map.linear.inverse().ok_or_else(|| {
+            <serde_json::Error as serde::de::Error>::custom("singular linear transform")
+        })?;
+        Ok(PixelMap {
+            linear: map.linear,
+            linear_inv,
+            distortion: map.distortion,
+        })
     }
 }
 
@@ -188,5 +190,32 @@ mod tests {
         let map = PixelMap::with_distortion(l, d).unwrap();
         let back = PixelMap::from_json(&map.to_json()).unwrap();
         assert_eq!(map, back);
+    }
+
+    #[test]
+    fn from_json_recomputes_a_corrupted_stored_inverse() {
+        let linear = Linear {
+            kind: LinearKind::Affine,
+            m: [[1.0, 0.0, 12.5], [0.0, 1.0, -7.25], [0.0, 0.0, 1.0]],
+        };
+        let map = PixelMap::linear(linear).unwrap();
+        let good = map.to_json();
+        let stored_inv = format!(
+            "\"linearInv\":{}",
+            serde_json::to_string(&map.linear_inv).unwrap()
+        );
+        assert!(
+            good.contains(&stored_inv),
+            "expected to find the stored inverse in the JSON"
+        );
+        // Splice in a wrong-but-well-formed inverse (a similarity that scales
+        // by 2) — a stale/hand-edited inverse must never survive `from_json`.
+        let corrupted = good.replace(
+            &stored_inv,
+            "\"linearInv\":{\"kind\":\"similarity\",\"m\":[[2.0,0.0,0.0],[0.0,2.0,0.0],[0.0,0.0,1.0]]}",
+        );
+        assert_ne!(good, corrupted, "the splice must have matched");
+        let back = PixelMap::from_json(&corrupted).unwrap();
+        assert_eq!(back.linear_inv, linear.inverse().unwrap());
     }
 }

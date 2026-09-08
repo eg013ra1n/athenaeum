@@ -292,7 +292,7 @@ pub fn refit_weighted(
     current.sort_unstable();
     current.dedup();
     let mut rounds = 0usize;
-    let mut linear: Option<Linear> = None;
+    let mut linear: Linear;
     // The inlier set produced by the PREVIOUS round, compared against this
     // round's own output to detect convergence. `None` on the first round:
     // there is no previous round yet, so round 1 can never "converge" — the
@@ -320,7 +320,7 @@ pub fn refit_weighted(
             .filter(|(_, &e)| e <= clip_sigma * r.max(1e-9))
             .map(|(&i, _)| i)
             .collect();
-        linear = Some(t);
+        linear = t;
         if next.len() < 3 {
             break;
         }
@@ -343,7 +343,6 @@ pub fn refit_weighted(
             break;
         }
     }
-    let linear = linear?;
     let subset: Vec<Pair> = current.iter().map(|&i| pairs[i]).collect();
     let res = residuals(&linear, &subset);
     let rms_px = rms(&res);
