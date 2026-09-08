@@ -258,10 +258,13 @@ fn accept(
     ]
     .iter()
     .all(|v| v.is_finite());
-    // The fitter's residual-convergence branch cannot fire at exactly zero
-    // cost, so a fit that reproduces the data to 1e-4 of its amplitude counts
-    // as settled even when the flag is off (only noiseless data gets there).
-    let settled = m.converged || m.fit_residual < 1e-4;
+    // The fitter's convergence flag is not an acceptance criterion: its LM
+    // stops with the flag off after `max_rejects` unimproving steps, which is
+    // where a model-mismatch minimum (a Gaussian star under any fixed-β
+    // Moffat) always ends, and the submodule's own star measurement never
+    // reads it. The gates below decide; the residual cap only rejects a fit
+    // whose RMS residual reaches the amplitude, i.e. explains nothing.
+    let settled = m.fit_residual.is_finite() && m.fit_residual < 1.0;
     if !settled || !finite || m.a <= 0.0 || m.alpha_x <= 0.0 || m.alpha_y <= 0.0 {
         return None;
     }
@@ -684,6 +687,11 @@ mod tests {
         assert_eq!(
             out.beta, 10.0,
             "a Gaussian field is closest to the largest β"
+        );
+        assert!(
+            out.fits.len() >= 60,
+            "Gaussian stars under a Moffat model must still be accepted: {}",
+            out.fits.len()
         );
     }
 
