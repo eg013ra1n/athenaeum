@@ -158,6 +158,10 @@ solver = ["dep:solvemyastro"]
 name = "band_profile"
 required-features = ["render"]
 
+[[example]]
+name = "measure_probe"
+required-features = ["render", "solver"]
+
 [dev-dependencies]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
