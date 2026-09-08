@@ -213,6 +213,17 @@ Pinned by six collector/summary tests, one send test and two readiness tests.
   master exported as is.
 - Frame-set **Send** in the sets mode after a build: the receiver must get the
   raw frames (regrouped into sets by its post-package pass), not the master.
+- **Folders → Calibration Library now has the Needs-attention section** (the
+  same evening: the owner deleted 11 master files, the rail showed "11 missing"
+  on the library folder, and the role inspector had no panel to act on them —
+  the Missing Files panel was wired only into the monitored-folder inspector;
+  the block is now one shared `MissingFilesDisclosure`). Select the library
+  folder, open "N files missing from disk", select all, **Delete from database**:
+  every raw set behind those masters must lose its dimming and `→ M#` link on
+  Equipment, and the lights' calibration links must point at the raw sets
+  again. The monitored-folder inspector must behave exactly as before (same
+  block, moved). Not exercised live — the dev catalog has no library root with
+  missing files; verified by type-check and bundle only.
 
 ### Missing-file purge, scan-error reveal, offline re-check (2026-09-07)
 
@@ -821,3 +832,6 @@ cycle, so anything from them that matters later belongs here or in a plan.
   quietly turned this mode into a copy of **Lights + masters**; the raw sets are
   back, with their own darks and biases beneath them. Raw frames that were
   archived after the build are reported up front, before anything is written.
+- The Calibration Library folder now lists its missing files like any other
+  folder, so a master whose file is gone can be removed from the catalog right
+  there — which also hands its raw frames back to the matcher.

@@ -4,6 +4,7 @@ import { isTauri } from '../../utils/platform';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { SwitchRow } from './SwitchRow';
 import { RecheckButton } from './RecheckButton';
+import { MissingFilesDisclosure } from './MissingFilesDisclosure';
 import { Stat, Section } from './MonitoredInspector';
 import { basename, formatBytes } from './format';
 import { ROLE_META, type RoleKind } from './roleMeta';
@@ -40,12 +41,27 @@ interface RoleInspectorProps {
    * hosts the button only renders for a non-null offline root.
    */
   onRecheck?: () => Promise<void>;
+  /**
+   * Missing-file count for this root and the host's refresh after a purge or
+   * relocate — the same Needs-attention section a monitored folder gets. A
+   * role folder is scanned like any other, so its files go missing like any
+   * other; without this the Calibration Library showed the rail badge and no
+   * way to act on it, and a master whose file was gone could not be purged
+   * (which is what un-supersedes its raw set). Optional for the COVERED
+   * calibration library (`root === null`), which has no root to count for.
+   */
+  missingCount?: number;
+  onMissingChanged?: () => void;
 }
 
 export function RoleInspector(props: RoleInspectorProps) {
   const meta = ROLE_META[props.kind];
   const { root, dir, coveredBy, overview, relinking, relinkResult } = props;
   const offline = root ? !root.is_available : false;
+  const missingCount = props.missingCount ?? 0;
+  // Offline read-only (spec §5.4) and only for a persisted root — the same
+  // gate as MonitoredInspector's `showMissing`.
+  const showMissing = root != null && root.id != null && !offline && missingCount > 0;
   return (
     <div className="flex-1 min-w-0 bg-surface-elevated rounded-lg p-5 overflow-y-auto">
       <div className="flex items-start justify-between gap-3">
@@ -140,6 +156,13 @@ export function RoleInspector(props: RoleInspectorProps) {
             <SwitchRow title="Include in duplicate detection" checked={root.find_duplicates} onChange={props.onToggleDuplicates}
               description="Files here are content-hashed and compared against every other folder with this enabled." />
           )}
+        </Section>
+      )}
+
+      {showMissing && root?.id != null && (
+        <Section title="Needs attention">
+          <MissingFilesDisclosure rootId={root.id} missingCount={missingCount}
+            onMissingChanged={props.onMissingChanged ?? (() => { /* covered library: nothing to refresh */ })} />
         </Section>
       )}
     </div>

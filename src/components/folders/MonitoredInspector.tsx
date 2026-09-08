@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react';
 import { RefreshCw, ExternalLink, AlertTriangle, AlertCircle, ChevronDown, ChevronRight, Loader2, CheckCircle2, Info } from 'lucide-react';
-import { api } from '../../api';
 import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { formatTimestamp } from '../../utils/dateFormatting';
-import { MissingFilesPanel } from '../MissingFilesPanel';
+import { MissingFilesDisclosure } from './MissingFilesDisclosure';
 import { SwitchRow } from './SwitchRow';
 import { RecheckButton } from './RecheckButton';
 import { basename, formatBytes } from './format';
-import type { ScanRootWithAvailability, MissingFileRecord, ScanResult } from '../../types/helpers';
+import type { ScanRootWithAvailability, ScanResult } from '../../types/helpers';
 import type { RelinkResult, ScanRootOverview } from '../../types/models';
 
 interface MonitoredInspectorProps {
@@ -58,9 +57,6 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
   const { root, overview, missingCount, scanResult, isScanning, relinking, relinkResult, removing } =
     props;
   const offline = !root.is_available;
-  const [missingOpen, setMissingOpen] = useState(false);
-  const [missingFiles, setMissingFiles] = useState<MissingFileRecord[] | null>(null);
-  const [missingError, setMissingError] = useState<string | null>(null);
   const [errorsOpen, setErrorsOpen] = useState(false);
   const displayErrors = scanResult?.errors ?? root.last_scan_errors ?? [];
   // Missing-file actions (recheck / delete / relocate) mutate the catalog, so they are
@@ -68,19 +64,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
   // which nothing can be fetched for. The parse-error log below stays visible offline.
   const showMissing = !offline && missingCount > 0 && root.id != null;
 
-  useEffect(() => { setMissingOpen(false); setMissingFiles(null); setMissingError(null); setErrorsOpen(false); }, [root.id]);
-
-  const loadMissing = async () => {
-    if (root.id == null) return;
-    try {
-      const files = await api.invoke<MissingFileRecord[]>('get_missing_files', { rootId: root.id });
-      setMissingFiles(files);
-      setMissingError(null);
-    } catch (e) {
-      console.error('[MonitoredInspector] get_missing_files failed:', e);
-      setMissingError(String(e));
-    }
-  };
+  useEffect(() => { setErrorsOpen(false); }, [root.id]);
 
   return (
     <div className="flex-1 min-w-0 bg-surface-elevated rounded-lg p-5 overflow-y-auto">
@@ -180,29 +164,8 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
       {(showMissing || displayErrors.length > 0) && (
         <Section title="Needs attention">
           <div className="space-y-2">
-            {showMissing && (
-              <div className="rounded-lg border border-orange/40 bg-surface">
-                <button onClick={() => { const next = !missingOpen; setMissingOpen(next); if (next && !missingFiles) void loadMissing(); }}
-                  aria-expanded={missingOpen} aria-controls={`missing-files-panel-${root.id ?? 'unsaved'}`}
-                  className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-orange hover:bg-orange/10 rounded-lg transition">
-                  {missingOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                  <AlertTriangle size={14} /> {missingCount} file{missingCount !== 1 ? 's' : ''} missing from disk
-                </button>
-                {missingOpen && (
-                  <div id={`missing-files-panel-${root.id ?? 'unsaved'}`}>
-                    {missingError
-                      ? <div className="p-3 flex items-center gap-2 text-xs text-error">
-                          <AlertCircle size={12} className="shrink-0" />
-                          <span className="flex-1 min-w-0 break-all">Could not load the missing-file list — {missingError}</span>
-                          <button onClick={() => { setMissingError(null); void loadMissing(); }}
-                            className="shrink-0 px-2 py-0.5 rounded border border-error/50 hover:bg-error-muted transition">Retry</button>
-                        </div>
-                      : missingFiles && root.id != null
-                        ? <div className="p-2"><MissingFilesPanel rootId={root.id} missingFiles={missingFiles} onRefresh={() => { void loadMissing(); props.onMissingChanged(); }} /></div>
-                        : <div className="p-3 text-xs text-content-muted flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> loading…</div>}
-                  </div>
-                )}
-              </div>
+            {showMissing && root.id != null && (
+              <MissingFilesDisclosure rootId={root.id} missingCount={missingCount} onMissingChanged={props.onMissingChanged} />
             )}
             {displayErrors.length > 0 && (
               <div className="rounded-lg border border-error/30 bg-surface">

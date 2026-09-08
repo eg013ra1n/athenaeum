@@ -488,6 +488,8 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onReleaseRole={() => handleReleaseRole(kind)}
             onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => reportToggleFailure('duplicates', e)); }}
             onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => reportToggleFailure('monitor', e)); }}
+            missingCount={root.id ? (missingCounts[root.id] ?? 0) : 0}
+            onMissingChanged={() => void refreshAux()}
           />
         );
       }
