@@ -18,6 +18,7 @@ pub mod relinking;
 pub mod frames_set_metadata;
 pub mod logging;
 pub mod events;
+pub mod resample;
 pub mod scanner;
 pub mod monitor;
 pub mod auto_merge;
