@@ -17,6 +17,9 @@ pub enum SourceWindow {
     Whole,
 }
 
+/// `radius` must be `interp.radius()` of the kernel the band will be warped
+/// with — a smaller value produces a window the warp will silently clamp
+/// into (caught by a debug assertion in `Plane::at`).
 #[allow(clippy::too_many_arguments)]
 pub fn source_window(
     map: &dyn InverseMap,

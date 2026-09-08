@@ -35,6 +35,13 @@ impl<'a> Plane<'a> {
     fn at(&self, x: isize, y: isize) -> f32 {
         let xc = x.clamp(0, self.width as isize - 1) as usize;
         let yc = y.clamp(0, self.full_height as isize - 1) as usize;
+        debug_assert!(
+            yc >= self.y_offset && yc < self.y_offset + self.height,
+            "tap row {yc} outside the source window [{}, {}) — the window was computed \
+             with a smaller kernel radius than the one used to warp",
+            self.y_offset,
+            self.y_offset + self.height
+        );
         let yl = yc.clamp(self.y_offset, self.y_offset + self.height - 1) - self.y_offset;
         self.data[yl * self.width + xc]
     }
@@ -250,6 +257,14 @@ mod tests {
                 Interpolation::Lanczos3 | Interpolation::Lanczos4 => 0.05,
                 _ => 0.02,
             };
+            // Lanczos-4 with the 0.3 clamp keeps a measured +0.1..0.2 % one-signed
+            // flux inflation on stars (the clamp attenuates its negative lobes on
+            // smooth flanks); every other kernel is at 1e-4. Bounds sized so a
+            // regression is caught, not hidden.
+            let flux_tol = match k {
+                Interpolation::Lanczos4 => 0.005,
+                _ => 0.001,
+            };
             for &(sx, sy, _) in &STARS {
                 let (cx, cy) = centroid(&out, W, sx, sy, 7, BG);
                 assert!(
@@ -259,7 +274,7 @@ mod tests {
                 let f_out = flux(&out, W, sx, sy, 7, BG);
                 let f_ref = flux(&reference, W, sx, sy, 7, BG);
                 assert!(
-                    ((f_out - f_ref) / f_ref).abs() < 0.005,
+                    ((f_out - f_ref) / f_ref).abs() < flux_tol,
                     "{k:?}: flux {f_out} vs {f_ref}"
                 );
             }
