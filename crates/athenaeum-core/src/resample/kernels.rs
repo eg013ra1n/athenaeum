@@ -2,9 +2,11 @@
 //!
 //! Weights are evaluated per axis at a fractional offset `frac ∈ [0, 1)`
 //! measured from `floor(coord)`; the caller applies them to the taps starting
-//! at `floor(coord) + first_tap_offset()`. Every kernel's weights are
-//! normalized to sum to one (a constant field resamples to itself).
-//! Formulas: math reference §5.4.
+//! at `floor(coord) + first_tap_offset()`. `Nearest` is the exception: its
+//! single tap sits at `floor(coord + 0.5)`, not at `floor(coord)` — `taps_for`
+//! is the entry point every caller must use for tap placement. Every kernel's
+//! weights are normalized to sum to one (a constant field resamples to
+//! itself). Formulas: math reference §5.4.
 
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +83,9 @@ impl Interpolation {
     }
 
     /// Fills `out[..n]` with the weights for fractional offset `frac ∈ [0, 1)`
-    /// and returns `n`. Weights sum to one.
+    /// and returns `n`. Weights sum to one. For `Nearest`, the returned
+    /// weight belongs to the rounded tap that `taps_for` places, not to
+    /// `floor(coord)`.
     pub fn weights(self, frac: f32, out: &mut [f32; 8]) -> usize {
         let n = self.taps();
         match self {
