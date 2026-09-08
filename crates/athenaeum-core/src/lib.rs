@@ -19,6 +19,7 @@ pub mod frames_set_metadata;
 pub mod logging;
 pub mod events;
 pub mod resample;
+pub mod geometry;
 pub mod scanner;
 pub mod monitor;
 pub mod auto_merge;
