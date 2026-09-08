@@ -222,8 +222,18 @@ Pinned by six collector/summary tests, one send test and two readiness tests.
   every raw set behind those masters must lose its dimming and `→ M#` link on
   Equipment, and the lights' calibration links must point at the raw sets
   again. The monitored-folder inspector must behave exactly as before (same
-  block, moved). Not exercised live — the dev catalog has no library root with
-  missing files; verified by type-check and bundle only.
+  block, moved).
+  **Verified 2026-09-08 by click-through** on the web build against a COPY of
+  the live catalog (the desktop window could not be driven: this machine grants
+  the agent shell neither screen-recording nor accessibility permission). The
+  role folder rendered "3 files missing from disk" with the full panel; the
+  monitored folder rendered "1 file missing from disk" (singular correct, the
+  moved block intact); selecting all three and pressing Delete from DB
+  un-superseded raw sets 669/911/1265, removed master sets 1737/1741/1744, and
+  repointed every LDN 1272 light link onto a raw set (7 links, all
+  `is_master_library = 0`). What is still unexercised: the same flow in the
+  DESKTOP shell on the live catalog. The desktop dev build launches and boots
+  clean.
 
 ### Missing-file purge, scan-error reveal, offline re-check (2026-09-07)
 
