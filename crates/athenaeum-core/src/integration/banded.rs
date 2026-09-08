@@ -794,13 +794,8 @@ pub struct BandPlanes {
 }
 
 impl BandPlanes {
-    pub fn new(src: &BandSource) -> BandPlanes {
-        BandPlanes {
-            bufs: vec![Vec::new(); src.frame_count()],
-            kinds: src.plane_kinds(),
-            width: src.width(),
-            rows: 0,
-        }
+    pub fn new<S: super::source::FrameSource + ?Sized>(src: &S) -> BandPlanes {
+        BandPlanes::with_kinds(src.plane_kinds(), src.width())
     }
 
     pub fn frame_count(&self) -> usize { self.kinds.len() }

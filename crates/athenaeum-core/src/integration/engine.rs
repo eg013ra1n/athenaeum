@@ -7,6 +7,8 @@
 use super::banded::{BandPlanes, BandSource};
 use super::combine::{combine_pixel, IntegrationRecipe};
 use super::io_policy::IoPolicy;
+use super::registered_source::RegisteredSource;
+use super::source::FrameSource;
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -143,8 +145,8 @@ pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
 /// multi-band runs on tiny images; production passes the machine- and
 /// storage-resolved policy from `integration::io_policy::resolve`.
 #[allow(clippy::too_many_arguments)]
-fn run_banded(
-    src: &BandSource,
+fn run_banded<S: FrameSource + ?Sized>(
+    src: &S,
     scales: &[f32],
     precal: Option<&FlatPrecal>,
     recipe: IntegrationRecipe,
@@ -374,6 +376,23 @@ fn integrate_bias_like_inner(
     let src = BandSource::open_with_cancel(paths, scratch_dir, io.read_concurrency, cancel)?;
     let scales = vec![1.0f32; src.frame_count()];
     run_banded(&src, &scales, None, recipe, pool, cancel, &progress, io)
+}
+
+/// Integrates lazily resampled registered frames (spec §6.1): every band is
+/// resampled from the calibrated files through their transforms on the
+/// way in, so no registered file is ever written. Scales are 1; weights,
+/// offsets and rejection maps arrive with Plan 4.
+#[allow(clippy::too_many_arguments)]
+pub fn integrate_registered(
+    src: &RegisteredSource,
+    recipe: IntegrationRecipe,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: EngineProgress<'_>,
+    io: IoPolicy,
+) -> Result<IntegrationOutput, IntegrationError> {
+    let scales = vec![1.0f32; src.frame_count()];
+    run_banded(src, &scales, None, recipe, pool, cancel, &progress, io)
 }
 
 #[allow(clippy::too_many_arguments)]
