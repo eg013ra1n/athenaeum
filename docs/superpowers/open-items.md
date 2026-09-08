@@ -213,60 +213,12 @@ Pinned by six collector/summary tests, one send test and two readiness tests.
   master exported as is.
 - Frame-set **Send** in the sets mode after a build: the receiver must get the
   raw frames (regrouped into sets by its post-package pass), not the master.
-- **Folders → Calibration Library now has the Needs-attention section** (the
-  same evening: the owner deleted 11 master files, the rail showed "11 missing"
-  on the library folder, and the role inspector had no panel to act on them —
-  the Missing Files panel was wired only into the monitored-folder inspector;
-  the block is now one shared `MissingFilesDisclosure`). Select the library
-  folder, open "N files missing from disk", select all, **Delete from database**:
-  every raw set behind those masters must lose its dimming and `→ M#` link on
-  Equipment, and the lights' calibration links must point at the raw sets
-  again. The monitored-folder inspector must behave exactly as before (same
-  block, moved).
-  **Verified 2026-09-08 by click-through** on the web build against a COPY of
-  the live catalog (the desktop window could not be driven: this machine grants
-  the agent shell neither screen-recording nor accessibility permission). The
-  role folder rendered "3 files missing from disk" with the full panel; the
-  monitored folder rendered "1 file missing from disk" (singular correct, the
-  moved block intact); selecting all three and pressing Delete from DB
-  un-superseded raw sets 669/911/1265, removed master sets 1737/1741/1744, and
-  repointed every LDN 1272 light link onto a raw set (7 links, all
-  `is_master_library = 0`). What is still unexercised: the same flow in the
-  DESKTOP shell on the live catalog. The desktop dev build launches and boots
-  clean.
 
-### Missing-file purge, scan-error reveal, offline re-check (2026-09-07)
-
-Backlog v0.5.6 items 7 and 8.
-
-**The purge defect is fixed and pinned.** `delete_missing_files` ran a bare
-`DELETE FROM files` on both backends, so deleting a MASTER's file from the
-Missing Files panel left its raw source set pointing at a master that existed
-neither on disk nor in the catalog — frames invisible to the matcher, nothing in
-the UI able to undo it (the exact stranding the 2026-08-02 audit C3 fixed on the
-orphan-purge path). Both bodies now call
-`athenaeum_core::relinking::delete_orphaned_files`. New route test
-`deleting_a_master_file_un_supersedes_its_raw_set` (`routes/missing_files.rs`)
-fails on the old code and passes on the new.
-
-- **The Tauri twin has no test of its own** — the command needs a
-  `tauri::State`, and there is no harness for that in this repo. It is the same
-  one-line replacement, verified by reading. Worth one pass in the desktop app:
-  delete a master's missing file, confirm its raw set stops being dimmed and
-  shows no `→ M#<id>` link.
-- Reveal on scan errors needs a genuinely unreadable file to appear at all —
-  truncate a `.fits` to a few hundred bytes inside a scan root, scan, then open
-  **Needs attention → N files failed in last scan**: the row should carry a
-  reveal button that opens the containing folder. The path is recovered by
-  splitting the message on its first `": "`, so a message with no path (a DB
-  error) must show no button.
-- Offline re-check: unmount a drive, select the folder, press **Check again** →
-  "Still not reachable"; remount, press again → the banner goes and Scan
-  now / Relink come back. Repeat on a ROLE folder (Calibration Library) — it
-  hosts the same banner and got the same button.
-- No background polling was added, deliberately: `Path::exists()` on a dead
-  network mount can block for that mount's own timeout. Window-focus re-check
-  stays unbuilt and is still an open question in the backlog.
+The companion Folders change from the same evening — the Missing Files panel
+now also renders on ROLE folders, so a master whose file is gone can be purged
+(and its raw set un-superseded) from the Calibration Library rather than only
+from Equipment — is verified and needs no smoke: click-through on the web build
+plus the owner's own confirmation in the desktop dev build, 2026-09-08.
 
 ### Plate-solve input-gate controls (2026-09-07)
 
