@@ -43,6 +43,24 @@ its exact anchors depend on the code the predecessor produced.
 | 4 | Combiner v2 + engine (weights, offsets, survivor masks, rejection maps, channel loop) + WCS card writer + master cards + scanner skip rule | `FrameSource`, `RegisteredSource` |
 | 5 | Run orchestration (`stacking/{config,groups,plan,run,paths,naming,provenance}`), tables, commands ×2, `ts_export`, events, the Stacking tab and Settings section, removal of the old tab, LDN 1272 acceptance run, docs | everything above |
 
+**Real-data checkpoints (added 2026-09-08 on the owner's question; mandatory,
+before Plan 5's acceptance run):**
+
+- **Checkpoint A, after Plan 3** — register the app's own calibrated FITS of
+  the LDN 1272 mono and OSC lights onto the reference frame the WBPP run used
+  (`2025-10-18_02-02-02_0073`) and compare per frame with the `.xdrz`
+  `AlignmentMatrix` in `~/Pictures/Calibration Test/LDN1272-Output/registered/`
+  (translation, rotation, scale within 0.05 px / 0.001° / 1e-4) and our RMS
+  against WBPP's `delta_RMS` (0.28–0.72 px observed). Result goes to
+  `docs/superpowers/research/` as a note.
+- **Checkpoint B, after Plan 4** — integrate the 208-frame mono group with our
+  engine (weights + global normalization, linear fit 5.0/3.5) and compare with
+  `master/masterLight_…_mono.xisf`: MRS noise within 5 %, rejected fraction in
+  1–4 %, FWHM/eccentricity of the master, no residual trails at 400 %.
+- WBPP's intermediates are XISF and `PlaneReader` reads FITS: the input is the
+  app's calibrated export of the same raw lights; the WBPP files are read with
+  the existing XISF parser as the reference only.
+
 ## Global Constraints
 
 - Logic lives in `crates/athenaeum-core`; nothing in this plan touches
