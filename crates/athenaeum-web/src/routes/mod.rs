@@ -222,10 +222,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
         .route("/api/get_frame_fov_summary", post(plate_solve::get_frame_fov_summary))
         .route("/api/download_catalog_layers", post(plate_solve::download_catalog_layers))
-        // Registration (stacking preparation)
-        .route("/api/register_frame_set", post(registration::register_frame_set))
-        .route("/api/get_frame_set_registration", post(registration::get_frame_set_registration))
-        .route("/api/cancel_frame_set_registration", post(registration::cancel_frame_set_registration))
+        // Registration (persisted reference frame)
         .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
         .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
 
@@ -496,7 +493,6 @@ pub(crate) mod tests {
             active_exports: Arc::new(Mutex::new(HashMap::new())),
             active_analyses: Arc::new(Mutex::new(HashMap::new())),
             active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-            active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             active_stacks: Arc::new(Mutex::new(HashMap::new())),

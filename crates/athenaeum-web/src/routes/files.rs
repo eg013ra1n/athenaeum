@@ -285,9 +285,14 @@ pub async fn browse_directories(
         },
         // "stacking" (M1 Plan 5b, plan ruling 6): the Stacking tab's own
         // folder picker resolves against the same roots as "scan" (and the
-        // Transfers picker, which also passes "scan") — kept as an explicit
-        // arm rather than only relying on the catch-all below.
-        "scan" | "stacking" | _ => state.allowed_paths.clone(),
+        // Transfers picker, which also passes "scan").
+        "scan" | "stacking" => state.allowed_paths.clone(),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown browse_directories scope: {other}"),
+            ))
+        }
     };
 
     api::browse_directories(args.path, &root_paths).map(Json).map_err(api_err)

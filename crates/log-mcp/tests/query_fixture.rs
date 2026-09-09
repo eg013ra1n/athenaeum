@@ -127,10 +127,13 @@ fn malformed_line_does_not_abort_the_scan() {
 
 #[test]
 fn list_operations_includes_registration_span_close() {
-    // Registration is a sync-fn span opened in `athenaeum_core::registration::
-    // service::register_frame_set` (`info_span!("registration", frame_set_id
-    // = frames_set_id)`), entered — not `.instrument()`-attached to a future —
-    // so its close event has the same shape as any other operation span.
+    // Historical shape check: the plate-solve-era registration service (since
+    // retired) opened a sync-fn span `info_span!("registration", frame_set_id
+    // = frames_set_id)`, entered — not `.instrument()`-attached to a future —
+    // so its close event has the same shape as any other operation span. This
+    // fixture line replicates that shape to pin span-close parsing for any
+    // span carrying a `frame_set_id` field, independent of which feature
+    // opens it.
     // Own fixture file/dir (not the shared `FIXTURE_LINES`) so this doesn't
     // perturb the other tests' fixed operation counts.
     let dir = tempfile::TempDir::new().expect("tempdir");

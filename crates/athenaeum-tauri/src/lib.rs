@@ -74,7 +74,6 @@ pub fn run() {
                     active_exports: Arc::new(Mutex::new(HashMap::new())),
                     active_analyses: Arc::new(Mutex::new(HashMap::new())),
                     active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-                    active_registrations: Arc::new(Mutex::new(HashMap::new())),
                     active_archives: Arc::new(Mutex::new(HashMap::new())),
                     active_master_builds: Arc::new(Mutex::new(HashMap::new())),
                     active_stacks: Arc::new(Mutex::new(HashMap::new())),
@@ -432,10 +431,7 @@ pub fn run() {
             commands::add_archive_root,
             commands::delete_archive_root,
             commands::set_default_archive_root,
-            // Registration (stacking preparation)
-            commands::register_frame_set,
-            commands::get_frame_set_registration,
-            commands::cancel_frame_set_registration,
+            // Registration (persisted reference frame)
             commands::set_frame_set_reference,
             commands::get_frame_set_reference,
             // Stacking (M1 Plan 5a)

@@ -42,11 +42,6 @@ pub struct PlateSolveHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
-/// Handle to track an active frame-set registration operation.
-pub struct RegistrationHandle {
-    pub cancel_flag: Arc<AtomicBool>,
-}
-
 /// Handle to track an active archive operation (ZIP archive feature).
 /// Only one archive operation can run at a time, but the map allows
 /// querying state by operation_id.
@@ -79,8 +74,6 @@ pub struct ServiceContext {
     pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
     pub active_analyses: Arc<Mutex<HashMap<i64, AnalysisHandle>>>,
     pub active_plate_solves: Arc<Mutex<HashMap<i64, PlateSolveHandle>>>,
-    /// Active registration operations, keyed by `frames_set_id`.
-    pub active_registrations: Arc<Mutex<HashMap<i64, RegistrationHandle>>>,
     /// Active archive operations (ZIP archive feature). Capped at one at a
     /// time by command-layer enforcement; HashMap form keeps the same shape
     /// as the other active-handle maps for consistency.
@@ -159,7 +152,6 @@ impl ServiceContext {
             active_exports: Arc::new(Mutex::new(HashMap::new())),
             active_analyses: Arc::new(Mutex::new(HashMap::new())),
             active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-            active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "render", feature = "solver"))]

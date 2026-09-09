@@ -515,53 +515,6 @@ export type FrameSetReference = { framesSetId: number, referenceFrameId: number,
  */
 setAt: string, };
 
-export type RegistrationRecord = { id: number | null, framesSetId: number, frameId: number, referenceFrameId: number, isReference: boolean, crpix1: number | null, crpix2: number | null, crval1: number | null, crval2: number | null, cd11: number | null, cd12: number | null, cd21: number | null, cd22: number | null, affineA1: number | null, affineB1: number | null, affineC1: number | null, affineA2: number | null, affineB2: number | null, affineC2: number | null, matchedStars: number, rmsResidualPx: number, 
-/**
- * RMS in arcsec: `rms_residual_px * pixel_scale_arcsec`. `None` when the
- * reference pixel scale is unavailable (rare).
- */
-rmsResidualArcsec: number | null, 
-/**
- * `"aligned"` | `"aligned_flipped"` | `"reference"` | `"failed"`.
- * `"aligned_flipped"` is an aligned variant (not a distinct outcome): the
- * fitted transform includes a reflection (meridian-flipped sub).
- */
-status: string, 
-/**
- * Error message for failed rows.
- */
-error: string | null, computeTimeMs: number, registeredAt: string, 
-/**
- * Resolved model: the linear kind's serde name, `+polynomial<o>` when a
- * distortion was fitted. `None` on rows written by the old service.
- */
-model: string | null, 
-/**
- * `PixelMap::to_json()` verbatim (spec §9.1).
- */
-transformJson: string | null, inlierRatio: number | null, 
-/**
- * Larger of the two per-axis peak residuals, px.
- */
-peakErrorPx: number | null, scale: number | null, rotationDeg: number | null, 
-/**
- * The linear part has a negative determinant (a meridian flip).
- */
-flipped: boolean, 
-/**
- * Hash of the registration config + reference identity that produced
- * this row (spec §9.3).
- */
-configHash: string | null, 
-/**
- * `"calibrated"` for v2 rows; `None` for rows of the old service.
- */
-sourceKind: string | null, };
-
-export type StackingPrepProgressEvent = { frameId: number, current: number, total: number, status: string, matchedStars: number | null, rmsPx: number | null, error: string | null, filename: string | null, };
-
-export type StackingPrepCompleteEvent = { referenceFrameId: number, aligned: number, failed: number, total: number, };
-
 export type LoggingConfig = { level: string, modules: { [key in string]: string }, };
 
 export type LoggingConfigResponse = { config: LoggingConfig, envOverrideActive: boolean, };

@@ -20,10 +20,9 @@
 //! `spawn_blocking` boundary moves OUT to each wrapper, which constructs its
 //! concrete emitter (`TauriProgressEmitter`/`SseProgressEmitter`) *inside*
 //! the blocking closure and calls this function synchronously from there.
-//! This exactly mirrors the pre-existing (non-`api::*`)
-//! `registration::register_frame_set` / `commands/registration.rs` +
-//! `routes/registration.rs` pattern: sync core fn + `&dyn ProgressEmitter`,
-//! wrapper owns the blocking boundary.
+//! Same shape as `api::stacking::start_stacking`'s `Arc<dyn ProgressEmitter>`
+//! parameter: sync core fn + a boxed emitter, wrapper owns the blocking
+//! boundary.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

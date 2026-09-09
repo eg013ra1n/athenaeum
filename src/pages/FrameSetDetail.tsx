@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, AlignHorizontalJustifyCenter, Users, SquareStack } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -19,7 +19,6 @@ import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
-import { StackingPrepTab } from '../components/StackingPrepTab';
 import { StackingTab } from '../components/stacking/StackingTab';
 import { revealItemInDir, openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
@@ -29,19 +28,13 @@ import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
 import type { ArchivedFrameSetSummary } from '../types/helpers';
 
-type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'registration' | 'stacking';
+type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'stacking';
 
-// The Registration (frame alignment / stacking preparation) feature is still
-// under active development. It stays fully functional in dev builds so work can
-// continue, but is disabled in production/release builds (the tab is shown
-// greyed with an "under development" tooltip). Gated on the Vite dev flag, which
-// is true for `tauri dev` / `dev:web` and false for `tauri build` / `build:web`.
-const REGISTRATION_ENABLED = import.meta.env.DEV;
-
-// The Stacking tab (M1) replaces the plate-solve-era registration flow above,
-// but stays behind the same dev-only flag until the M1 acceptance run passes
-// (stacking plan 5b, ruling 3) — functional in dev builds, greyed with an
-// "under development" tooltip in production/release builds.
+// The Stacking tab (M1) stays behind the Vite dev flag until the M1
+// acceptance run passes (stacking plan 5b, ruling 3) — functional in dev
+// builds, greyed with an "under development" tooltip in production/release
+// builds. True for `tauri dev` / `dev:web`, false for `tauri build` /
+// `build:web`.
 const STACKING_ENABLED = import.meta.env.DEV;
 
 export default function FrameSetDetail() {
@@ -93,19 +86,16 @@ export default function FrameSetDetail() {
   // (e.g. clicking a `#setId` in the Export tab's WarningsPanel pushes
   // `?tab=calibration&highlightSet=…&kind=…` and we re-consume them).
   const [searchParams, setSearchParams] = useSearchParams();
-  // 'registration' deep-link always falls back to 'analysis' on initial render
-  // (we don't know the gate state yet). The searchParams useEffect below will
-  // switch to 'registration' once the reference state is resolved if appropriate.
+  // STACKING_ENABLED is a synchronous build-time flag — safe to resolve
+  // immediately on initial render, unlike gating that depends on data still
+  // loading on first render.
   const initialTabFromUrl: FrameSetTab | undefined =
     searchParams.get('tab') === 'calibration' ? 'calibration'
     : searchParams.get('tab') === 'history' ? 'history'
     : searchParams.get('tab') === 'analysis' ? 'analysis'
     : searchParams.get('tab') === 'export' ? 'export'
-    // STACKING_ENABLED is a synchronous build-time flag (unlike the
-    // registration tab's gating below, which needs data that is still
-    // loading on first render) — safe to resolve immediately.
     : searchParams.get('tab') === 'stacking' && STACKING_ENABLED ? 'stacking'
-    : undefined; // 'registration' intentionally excluded — gating not known yet
+    : undefined;
   const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
 
   const initialHighlightSetId = (() => {
@@ -139,17 +129,6 @@ export default function FrameSetDetail() {
       setActiveTab(tabParam);
     } else if (tabParam === 'stacking') {
       setActiveTab(STACKING_ENABLED ? 'stacking' : 'analysis');
-    } else if (tabParam === 'registration') {
-      // Only allow direct navigation to registration if it is enabled and not
-      // gated. In production REGISTRATION_ENABLED is false, so a deep link can
-      // never land on the under-development tab. registrationTabReady may not be
-      // resolved yet on first render (reference still loading); fall back to
-      // 'analysis' if it's clearly unavailable.
-      if (REGISTRATION_ENABLED && referenceFrameId !== undefined && registrationTabReady) {
-        setActiveTab('registration');
-      } else {
-        setActiveTab('analysis');
-      }
     }
 
     const id = highlightSetParam != null && /^\d+$/.test(highlightSetParam)
@@ -342,14 +321,10 @@ export default function FrameSetDetail() {
   // Analysis data for SNR display in tree
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
 
-  // User-chosen reference frame for Stacking Preparation gating.
+  // User-chosen reference frame — set from the Analysis tab's "Set as
+  // reference" star, read by the stacking run.
   // null = none chosen, undefined = not yet loaded.
   const [referenceFrameId, setReferenceFrameId] = useState<number | null | undefined>(undefined);
-
-  // The registration tab is enabled only when (a) analysis exists and (b) a
-  // reference frame has been chosen.
-  const registrationTabReady =
-    analysisData.size > 0 && referenceFrameId != null && referenceFrameId !== undefined;
 
   // Reactive blackhole state — derives file IDs from hierarchy, fetches status, listens for events
   const allFileIds = useMemo(() => {
@@ -894,32 +869,13 @@ export default function FrameSetDetail() {
         {([
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
           { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
-          { key: 'registration' as FrameSetTab, label: 'Registration', icon: AlignHorizontalJustifyCenter },
           { key: 'stacking' as FrameSetTab, label: 'Stacking', icon: SquareStack },
           { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => {
-          // Registration is disabled in production (under development) and, in
-          // dev, additionally gated until the lights are analyzed and a
-          // reference is chosen.
-          const isUnderDev = key === 'registration' && !REGISTRATION_ENABLED;
-          const isGated =
-            key === 'registration' && (isUnderDev || !registrationTabReady);
-          const gateTooltip =
-            key === 'registration'
-              ? isUnderDev
-                ? 'Registration is under development — available in a future release.'
-                : !registrationTabReady
-                  ? analysisData.size === 0
-                    ? 'Analyze the lights first, then choose a reference frame in the Analysis tab'
-                    : 'Choose a reference frame in the Analysis tab to enable stacking preparation'
-                  : undefined
-              : undefined;
-
-          // Stacking is disabled in production (under development, same as
-          // Registration above) and, in every build, gated on the set
-          // actually having light frames (spec §11: "gated only on the set
-          // has lights").
+          // Stacking is disabled in production (under development) and, in
+          // every build, gated on the set actually having light frames
+          // (spec §11: "gated only on the set has lights").
           const stackingUnderDev = key === 'stacking' && !STACKING_ENABLED;
           const stackingHasLights = (calibrationHierarchy?.total_frames ?? 0) > 0;
           const isStackingGated = key === 'stacking' && (stackingUnderDev || !stackingHasLights);
@@ -931,8 +887,8 @@ export default function FrameSetDetail() {
                   ? 'This set has no light frames yet.'
                   : undefined
               : undefined;
-          const gated = isGated || isStackingGated;
-          const tooltip = gateTooltip ?? stackingTooltip;
+          const gated = isStackingGated;
+          const tooltip = stackingTooltip;
           return (
             <button
               key={key}
@@ -964,12 +920,6 @@ export default function FrameSetDetail() {
         ) : calibrationHierarchy ? (
           activeTab === 'history' ? (
             <FrameSetHistoryTab key={historyRefreshKey} frameSetId={parseInt(id!)} />
-          ) : activeTab === 'registration' ? (
-            <StackingPrepTab
-              framesSetId={parseInt(id!)}
-              frameSetName={detail?.frames_set?.name ?? undefined}
-              referenceFrameId={referenceFrameId ?? null}
-            />
           ) : activeTab === 'stacking' ? (
             // Fix round 1 (Task 3, Critical #2), belt-and-braces: `StackingTab`
             // guards its own draft/persist state against a set switch

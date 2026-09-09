@@ -114,7 +114,7 @@ pub async fn get_analysis_for_frame_set(
 /// (see its doc comment) — it can't be moved into `spawn_blocking` itself,
 /// so this wrapper owns the blocking boundary: the emitter is constructed
 /// *inside* the closure, then the shared handler is called synchronously
-/// from there. Mirrors `routes/registration.rs::register_frame_set`.
+/// from there. Mirrors `routes/stacking.rs::start_stacking`.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn analyze_frame_set(
     State(state): State<WebAppState>,
@@ -195,7 +195,6 @@ mod analysis_config_tests {
             active_exports: Arc::new(Mutex::new(HashMap::new())),
             active_analyses: Arc::new(Mutex::new(HashMap::new())),
             active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-            active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             active_stacks: Arc::new(Mutex::new(HashMap::new())),

@@ -260,19 +260,6 @@ export interface MasterBuildCompleteEvent {
   warning?: string | null;
 }
 
-/** Registration status for a single frame. Note: the generated
- *  `RegistrationRecord.status` / `StackingPrepProgressEvent.status` fields
- *  are plain `string` (Rust field type is `String`, not an enum), so this
- *  narrower literal union is no longer structurally enforced there — kept
- *  here for call sites that still want the documented value set. */
-export type FrameRegistrationStatus =
-  | 'pending'
-  | 'aligning'
-  | 'aligned'
-  | 'aligned_flipped'
-  | 'reference'
-  | 'failed';
-
 /** Response from `compute_flat_contour_plot`. The `pixelsB64` field is the
  *  final 8-bit grayscale display image (length == width*height) base64-
  *  encoded for JSON transport. The frontend paints those bytes directly

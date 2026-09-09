@@ -635,10 +635,27 @@ actually written).
 | `get_stacking_defaults` / `set_stacking_defaults` / `reset_stacking_defaults` | global `StackingConfig` |
 | `get_stacking_paths` / `set_stacking_paths` | `{ working: PathSetting, output: PathSetting }` / `{ working?, output? }` (`null` = reset) |
 | `get_stacking_work_usage` / `cleanup_stacking_work` | `{ setId }` → bytes per artifact kind / `{ setId, what: "registered" | "intermediates" | "all" }` |
+| `get_stacking_presets` (plan 5b Task 1, the 15th command) | `{}` → `StackingPresets { default, fastPreview, maximumQuality }` — pure, no ctx; the one Rust source of truth the preset selector diffs the current config against, so the tab never re-implements the transforms |
 
-Retired: `register_frame_set`, `cancel_frame_set_registration`,
-`get_frame_set_registration` (both backends, `ts_export`, TS types).
-Kept: `set_frame_set_reference`, `get_frame_set_reference`.
+**Retirement DONE (plan 5b Task 6, 2026-09-09):** `register_frame_set`,
+`cancel_frame_set_registration`, `get_frame_set_registration` are retired —
+removed from both backends (`commands/registration.rs` /
+`routes/registration.rs`, `generate_handler!` / `build_router`), from
+`ts_export.rs` (`StackingPrepProgressEvent`/`StackingPrepCompleteEvent`, and
+by the same "no command returns it any more" logic, `RegistrationRecord` —
+its Rust type stays, reached directly from `registration::db`), and from the
+frontend (`StackingPrepTab`, `useRegistrationProgress`,
+`RegistrationProgressContext`, `RegistrationQueueIndicator`, the
+`registration` tab entry in `FrameSetDetail.tsx`). `registration::service`
+and `registration::reference` (orphaned once `register_frame_set` was gone)
+are deleted; `registration::db`, `registration_results`, and
+`set_frame_set_reference`/`get_frame_set_reference` stay — the stacking run
+writes/reads the table, the Analysis tab's "Set as reference" star still
+calls the two kept commands. **No `StackingQueueIndicator` was ever added**
+(ruling 2, §11.2 below): the sidebar's `ComputeQueueIndicator` already lists
+a running stack (label `"Stacking · <set name>"`) with cancel, so a second
+widget for the same job was never built — the retired
+`RegistrationQueueIndicator` has no stacking-side replacement.
 Every command wears `#[tracing::instrument(skip_all, err)]`; new model types
 go into `ts_export.rs`.
 
@@ -740,9 +757,13 @@ Below 1200 px the inspector drops under the board as an accordion.
 - Hook `src/hooks/useStackingRuns.ts` + `StackingContext.tsx` — modelled on
   `useMasterBuilds` (backend owns admission, events carry `runId`/`setId`,
   one completion per start, `notify()` on completion, `library-updated`
-  dispatch); `StackingQueueIndicator.tsx` wraps `QueueIndicator` like the
-  registration one it replaces; `ComputeJobKind` gains `stacking` on both
-  sides.
+  dispatch); `ComputeJobKind` gains `stacking` on both sides. **No
+  `StackingQueueIndicator.tsx`** (plan 5b ruling 2, superseding this
+  section's original text): the run rides the shared `ComputeQueue`
+  (`ComputeJobKind::Stacking`, label `"Stacking · <set name>"`) that the
+  sidebar's existing `ComputeQueueIndicator` already lists with a cancel
+  button — a second widget for the same job would duplicate it. The retired
+  `RegistrationQueueIndicator` is not replaced.
 - Settings → **Stacking** section: the same inspector panels bound to the
   global defaults, the two default `FolderCard`s, "Reset to built-in
   defaults".
@@ -751,10 +772,12 @@ Below 1200 px the inspector drops under the board as an accordion.
 
 ### 11.3 Removed
 
-`StackingPrepTab.tsx`, `useRegistrationProgress.ts`,
-`RegistrationProgressContext.tsx`, `RegistrationQueueIndicator.tsx`, the
-`REGISTRATION_ENABLED` flag (replaced by `STACKING_ENABLED =
-import.meta.env.DEV` until M1 ships, then removed).
+**DONE (plan 5b Task 6, 2026-09-09):** `StackingPrepTab.tsx`,
+`useRegistrationProgress.ts`, `RegistrationProgressContext.tsx`,
+`RegistrationQueueIndicator.tsx`, the `REGISTRATION_ENABLED` flag and the
+`registration` tab entry in `FrameSetDetail.tsx` are gone. `STACKING_ENABLED
+= import.meta.env.DEV` stays until the M1 acceptance run passes, then is
+removed the same way.
 
 ## 12. Web / Docker
 

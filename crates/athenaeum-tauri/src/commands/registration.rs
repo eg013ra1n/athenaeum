@@ -1,133 +1,21 @@
-//! Tauri commands for the stacking-preparation registration feature.
+//! Tauri commands for the persisted stacking reference frame.
 //!
-//! These are thin wrappers: real logic lives in `athenaeum_core::registration`.
-//! Progress is emitted via Tauri `app.emit` on `stacking-prep-progress` and
-//! `stacking-prep-complete`, mirroring the pattern in `plate_solve.rs`.
+//! The plate-solve-era registration command trio (run / list / cancel a
+//! frame-to-frame alignment pass over a frame set) was retired 2026-09-09 —
+//! the M1 stacking pipeline (`commands/stacking.rs`) replaces that flow.
+//! `set_frame_set_reference` / `get_frame_set_reference` stay: the Analysis
+//! tab's "Set as reference" star writes here, and the stacking run reads it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use tauri::State;
 
-use tauri::{Emitter, State};
-
-use athenaeum_core::plate_solve::config;
-use athenaeum_core::registration;
-use athenaeum_core::registration::db::{
-    get_registration_for_frame_set, RegistrationRecord,
-};
 use athenaeum_core::registration::{
     get_frame_set_reference as core_get_frame_set_reference,
-    set_frame_set_reference as core_set_frame_set_reference,
-    FrameSetReference,
+    set_frame_set_reference as core_set_frame_set_reference, FrameSetReference,
 };
-use athenaeum_core::services::RegistrationHandle;
 
 use super::AppState;
-use super::plate_solve::{require_bright_cache, require_star_cache};
-
-// ── progress event forwarding emitter ────────────────────────────────────────
-
-/// Bridges `ProgressEmitter::emit_json` into Tauri's event system.
-struct TauriEmitter {
-    app: tauri::AppHandle,
-}
-
-impl athenaeum_core::events::ProgressEmitter for TauriEmitter {
-    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
-        let _ = self.app.emit(event_name, payload);
-    }
-}
 
 // ── commands ──────────────────────────────────────────────────────────────────
-
-/// Begin (or re-run) registration for all LIGHT members of `frames_set_id`.
-///
-/// Resolves the star cache, registers a cancellable handle, then runs
-/// `registration::register_frame_set` on a blocking thread.  Progress events
-/// are emitted on `stacking-prep-progress`; the completion summary on
-/// `stacking-prep-complete`.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn register_frame_set(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    frames_set_id: i64,
-    reference_frame_id: Option<i64>,
-) -> Result<(), String> {
-    let star_cache = require_star_cache(&state)?;
-    let bright_cache = require_bright_cache(&state);
-    let ps_config = {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        config::load_config(&db.conn())
-    };
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut handles = state.ctx.active_registrations.lock().unwrap();
-        handles.insert(frames_set_id, RegistrationHandle { cancel_flag: cancel_flag.clone() });
-    }
-
-    let ctx = state.ctx.clone();
-    let app_clone = app.clone();
-    let cancel = cancel_flag.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let db = ctx.db.get().ok_or_else(|| "Database not initialized".to_string())?;
-        let conn = db.conn();
-        let emitter = TauriEmitter { app: app_clone };
-
-        registration::register_frame_set(
-            &conn,
-            frames_set_id,
-            reference_frame_id,
-            star_cache.as_ref(),
-            bright_cache.as_deref(),
-            &ps_config,
-            &emitter,
-            Some(cancel.as_ref()),
-        )
-        .map(|_summary| ())
-        .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("Registration task panicked: {e}"))?;
-
-    {
-        let mut handles = state.ctx.active_registrations.lock().unwrap();
-        handles.remove(&frames_set_id);
-    }
-
-    result
-}
-
-/// Retrieve all persisted registration rows for a frame set.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn get_frame_set_registration(
-    state: State<'_, AppState>,
-    frames_set_id: i64,
-) -> Result<Vec<RegistrationRecord>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    get_registration_for_frame_set(&conn, frames_set_id)
-        .map_err(|e| e.to_string())
-}
-
-/// Signal the running registration for `frames_set_id` to stop cooperatively.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn cancel_frame_set_registration(
-    state: State<'_, AppState>,
-    frames_set_id: i64,
-) -> Result<(), String> {
-    let handles = state.ctx.active_registrations.lock().unwrap();
-    if let Some(handle) = handles.get(&frames_set_id) {
-        handle.cancel_flag.store(true, Ordering::Relaxed);
-        tracing::info!(frame_set_id = frames_set_id, "registration cancel flag set");
-    } else {
-        tracing::debug!(frame_set_id = frames_set_id, "no active registration to cancel");
-    }
-    Ok(())
-}
 
 /// Persist the user-chosen reference frame for a frame set.
 ///
@@ -141,8 +29,7 @@ pub async fn set_frame_set_reference(
 ) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    core_set_frame_set_reference(&conn, frames_set_id, frame_id)
-        .map_err(|e| e.to_string())
+    core_set_frame_set_reference(&conn, frames_set_id, frame_id).map_err(|e| e.to_string())
 }
 
 /// Return the persisted user-chosen reference frame for a frame set, if any.
@@ -154,7 +41,5 @@ pub async fn get_frame_set_reference(
 ) -> Result<Option<FrameSetReference>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    core_get_frame_set_reference(&conn, frames_set_id)
-        .map_err(|e| e.to_string())
+    core_get_frame_set_reference(&conn, frames_set_id).map_err(|e| e.to_string())
 }
-

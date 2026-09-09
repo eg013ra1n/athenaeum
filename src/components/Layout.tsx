@@ -13,8 +13,6 @@ import { StackingProvider } from '../contexts/StackingContext';
 import { ComputeQueueIndicator } from './ComputeQueueIndicator';
 import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
 import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
-import { RegistrationProgressProvider } from '../contexts/RegistrationProgressContext';
-import { RegistrationQueueIndicator } from './RegistrationQueueIndicator';
 import { PlateSolveIndexMissingModal } from './plate-solve';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { NavHistoryProvider, useNavHistory } from '../contexts/NavHistoryContext';
@@ -91,7 +89,6 @@ export default function Layout() {
       <ExportProgressProvider>
         <AnalysisProgressProvider>
         <PlateSolveProgressProvider>
-        <RegistrationProgressProvider>
         <MasterBuildProvider>
         <StackingProvider>
         <div className="flex h-screen bg-surface text-content">
@@ -138,7 +135,6 @@ export default function Layout() {
             <ComputeQueueIndicator collapsed={collapsed} />
             <TransferIndicator collapsed={collapsed} />
             <PlateSolveQueueIndicator collapsed={collapsed} />
-            <RegistrationQueueIndicator collapsed={collapsed} />
             <NotificationBell collapsed={collapsed} />
 
             <div className={`${collapsed ? 'p-2' : 'p-4'} pt-0`}>
@@ -176,7 +172,6 @@ export default function Layout() {
         </div>
         </StackingProvider>
         </MasterBuildProvider>
-        </RegistrationProgressProvider>
         </PlateSolveProgressProvider>
         </AnalysisProgressProvider>
       </ExportProgressProvider>

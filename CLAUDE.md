@@ -50,11 +50,11 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 ## Module Map
 
-**`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs` and `examples/integrate_probe.rs`.
+**`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4), `config`/`groups`/`paths`/`plan`/`run`/`provenance` (config precedence, group discovery, artifact paths, the plan gate, the run thread, provenance rows — Plan 5a orchestration) plus `api/stacking.rs` (the command-facing orchestration layer both hosts call); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs` and `examples/integrate_probe.rs`. See **## Stacking** below for the tab, the commands and the acceptance state.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 235 functions across 22 modules (re-measured 2026-09-06 — `resolve_object_name` added; was 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 249 functions across 23 modules (re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
-`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar`
+`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar` `stacking`
 
 Frontend pages live in `src/pages/`; routing in `src/App.tsx` (React Router v7, `/` → `/files`).
 
@@ -388,6 +388,118 @@ against the bundled DSO catalog (`dso_lookup`, name index + `Messier`/
 position always wins. The metadata editor confirms a typed name live via
 `resolve_object_name` (both backends), so naming a target is a usable repair
 for coordinate-less frames.
+
+## Stacking
+
+In-app light stacking — the frame set's own master light(s), built from its
+matched calibration and a chosen reference, with no external stacker. Spec:
+`docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`; M1 plans in
+`docs/superpowers/plans/`: `2026-09-08-stacking-m1-plan1-pixel-path.md`,
+`2026-09-09-stacking-m1-plan{2-measurement,3-registration,4-integration,
+5a-orchestration,5b-stacking-tab}.md`. Retired
+2026-09-09: the plate-solve-era registration flow (`register_frame_set` /
+`get_frame_set_registration` / `cancel_frame_set_registration`, dev-only
+`StackingPrepTab`) this feature replaces — `registration::db` and
+`set/get_frame_set_reference` stay (the stacking run writes/reads
+`registration_results`; the Analysis tab's "Set as reference" star still
+calls them).
+
+**Pipeline stages** (`stacking::plan::Stage`, spec §2): `Masters` (0.5 —
+build/rebuild whatever the export-readiness gate found missing, dependency
+order bias/darkflat → dark → flat, so a run never blocks on a master it can
+build itself) → `Calibrate` (reuses the calibrated-lights export engine
+verbatim) → `Measure` → `Reference` (one frame for the whole set — highest
+weight, or the user's pinned choice via `set_frame_set_reference`) →
+`Register` (registration v2: quad-seeded RANSAC + distortion) → `Normalize`
+→ `Integrate` (banded, weighted, Auto rejection) → `Drizzle` (M3, off in M1)
+→ `Output` (master-light header/naming/writers + WCS/SIP from the stored
+solve). `Calibrate`/`Measure`/`Register` are the only cacheable per-frame
+stages (`stacking_artifacts`, keyed by a per-stage config hash — spec §9.3;
+`StackingPlan.stale_stages` lists which of the three a fresh run would have
+to redo).
+
+**The plan gate** (`stacking::plan::build_plan`, DB + cheap FS probes, no
+pixel I/O) returns a `StackingPlan`: groups (`stacking::groups`, catalog
+grouping by instrument/color-mode/filter/binning/geometry), the resolved
+config + its hash, the reference, folder/space state, and ordered blockers
+(`code` ∈ `masters | links | masterFiles | reference | folders | space |
+frames | unsupported`) — reusing the calibrated-export readiness gate
+(`ExportReadiness`) for the masters/links checks, so the two features can
+never disagree about what "ready to calibrate" means. A blocking `code` at
+the front of the list stops `start_stacking` cold; anything past it is
+informational (e.g. a stale-stage note).
+
+**The run** (`stacking::run`): `start_stacking` validates the plan, inserts
+the `stacking_runs` + group rows, registers a cancel handle on
+`ServiceContext::active_stacks` (gated `#[cfg(all(feature = "render",
+feature = "solver"))]`, matching `stacking`'s own home — absent in a headless
+build), and spawns a dedicated `stacking-run-<id>` thread admitted through
+the shared `ComputeQueue` (`ComputeJobKind::Stacking`, label `"Stacking ·
+<set name>"` — no separate queue widget, see below). `cancel_stacking` flips
+the cancel flag; the thread notices it between frames/groups and unwinds
+cleanly. `heal_interrupted_runs` runs on demand (not host-startup-driven)
+from every `api::stacking` entry point, finishing any run row a crashed
+process left stuck as `"failed"` with `error = "interrupted by a restart"`.
+Progress rides `stacking-progress` (per stage/group/frame, throttled 300 ms)
+and exactly one `stacking-complete` fires from the run's single exit path
+regardless of success/cancel/failure/panic.
+
+**15 commands** (`api/stacking.rs` + `commands/stacking.rs` +
+`routes/stacking.rs`, all mirrored on both hosts): `get_stacking_plan`,
+`start_stacking`, `cancel_stacking`, `get_stacking_runs`, `get_stacking_run`,
+`get_stacking_config`, `set_stacking_config`, `get_stacking_presets` (Default
+/ Fast preview / Maximum quality, a single Rust source of truth so the tab
+never re-implements the transforms), `get_stacking_defaults`,
+`set_stacking_defaults`, `reset_stacking_defaults`, `get_stacking_paths`,
+`set_stacking_paths`, `get_stacking_work_usage`, `cleanup_stacking_work`.
+
+**The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
+the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →
+`PipelineBoard`/`StageRow` (the 9 stages, `stageSummary.ts` — a pure function
+shared with `StageInspector`, never reads run state) + `GroupsTable`;
+`StageInspector` + one config panel per stage
+(`panels/{Masters,Calibrate,Debayer,Measure,Reference,Register,Normalize,
+Integrate,Drizzle,Output}Panel.tsx`) for configuration; `FramesTable` (manual
+exclusion is the ONE frame-level write from the tab — everything else is
+read-only run output) and `ResultsPanel` + `ProvenanceModal`. **No
+`StackingQueueIndicator`**: the sidebar's existing `ComputeQueueIndicator`
+already lists every queue entry including a running stack, with cancel — a
+second widget for the same job would duplicate it (plan 5b ruling 2). The
+tab stays behind `STACKING_ENABLED = import.meta.env.DEV` (`FrameSetDetail.tsx`,
+gated only on the set having light frames) until the M1 acceptance run
+passes.
+
+**Settings → Stacking** (`src/components/settings/StackingSection.tsx`):
+global config defaults (`get/set/reset_stacking_defaults`, the same
+`StackingConfig` tree a set can override) and the working/output folders
+(`get/set_stacking_paths` — `stacking::paths`, on-disk layout
+`<working_dir>/<set_slug>/{calibrated,registered,ln,runs}/…`; the web folder
+picker's `browse_directories` scope `"stacking"` resolves against the same
+roots as `"scan"`, plan 5b ruling 6). Per-set override lives in
+`stacking_set_config`; precedence is WHOLE-CONFIG (spec §9.2, `resolve_config`)
+— a stored per-set document, when present, IS the run's config with no
+field-level merge against the global default; only with no per-set override
+does the global default JSON apply the same way, and with neither, the
+built-in default.
+
+**Beyond M1** (spec §14): **M2** — local normalization (MMT background
+models, PSF-flux scale with RCR, `.athln` sidecars, `NormalizePanel`'s LN
+block goes live). **M3** — drizzle (exact clipping, forward mapping, M1's
+rejection bitmaps turned on, `DrizzlePanel` goes live). **M4** — polish:
+thin-plate-spline distortion, ESD/RCR/min-max/large-scale rejection, Bayer
+drizzle, XISF output, cataloging masters, preset management, and **mixed
+pixel scales in one set** (owner requirement 2026-09-09 — co-registered
+mode resamples every group into the reference geometry, native mode keeps a
+per-group reference with no cross-group registration; until M4 the plan gate
+names a foreign-scale group as a blocker instead of registration silently
+dropping its frames).
+
+**Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
+plan,run,provenance,measure,weights,register,integrate,master_cards}.rs`,
+`crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
+fits_writer/wcs.rs`; dev probes `examples/{measure,register,integrate}_probe.rs`.
+Frontend: `src/components/stacking/` (above),
+`src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.
 
 ## Reference
 

@@ -47,7 +47,7 @@ pub async fn reset_analysis_config(state: State<'_, AppState>) -> Result<Analysi
 /// (see its doc comment) — it can't be moved into `spawn_blocking` itself,
 /// so this wrapper owns the blocking boundary: the emitter is constructed
 /// *inside* the closure, then the shared handler is called synchronously
-/// from there. Mirrors `commands/registration.rs::register_frame_set`.
+/// from there. Mirrors `commands/stacking.rs::start_stacking`.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn analyze_frame_set(

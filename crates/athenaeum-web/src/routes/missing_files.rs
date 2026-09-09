@@ -385,7 +385,6 @@ mod delete_missing_files_tests {
             active_exports: Arc::new(Mutex::new(HashMap::new())),
             active_analyses: Arc::new(Mutex::new(HashMap::new())),
             active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-            active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             active_stacks: Arc::new(Mutex::new(HashMap::new())),
