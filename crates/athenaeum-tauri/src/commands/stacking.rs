@@ -44,7 +44,11 @@ pub async fn get_stacking_plan(
 
 /// Start a stacking run. Returns as soon as the run thread is spawned;
 /// `stacking-progress` / `stacking-complete` events arrive through
-/// `TauriProgressEmitter`.
+/// `TauriProgressEmitter`. Fix round 1, item 1: passes the SAME `POLICY`
+/// `get_stacking_plan`/`set_stacking_paths` use (desktop's `AllowAll`) — a
+/// config-supplied `paths.workingDir`/`paths.outputDir` override is a
+/// caller-controlled path, so plan and start must agree on what the host
+/// allows.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn start_stacking(
@@ -58,6 +62,7 @@ pub async fn start_stacking(
     api::start_stacking(
         state.ctx.clone(),
         emitter,
+        &POLICY,
         env!("CARGO_PKG_VERSION").to_string(),
         set_id,
         config,

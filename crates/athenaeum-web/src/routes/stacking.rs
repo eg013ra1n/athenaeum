@@ -74,7 +74,10 @@ pub struct GetStackingConfigArgs {
 pub struct SetStackingConfigArgs {
     pub set_id: i64,
     pub config: StackingConfig,
-    #[serde(default)]
+    // Fix round 1, item 5: REQUIRED, not `#[serde(default)]` — the Tauri
+    // side already rejects a call omitting `excludedFrameIds` (a required
+    // positional argument there); an omitting web caller must not be able
+    // to silently wipe a set's manual exclusions by defaulting to `[]`.
     pub excluded_frame_ids: Vec<i64>,
 }
 
@@ -140,16 +143,22 @@ pub async fn get_stacking_plan(
 ///
 /// Start a stacking run. Returns as soon as the run thread is spawned;
 /// `stacking-progress` / `stacking-complete` SSE events are emitted via
-/// `SseProgressEmitter` from that thread.
+/// `SseProgressEmitter` from that thread. Fix round 1, item 1: passes
+/// `state.allowed_paths`'s policy — the SAME one `get_stacking_plan`/
+/// `set_stacking_paths` use — since a config-supplied
+/// `paths.workingDir`/`paths.outputDir` override is a caller-controlled
+/// path, not necessarily an already-stored settings one.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_stacking(
     State(state): State<WebAppState>,
     Json(args): Json<StartStackingArgs>,
 ) -> Result<Json<StartedStacking>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
     let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
     api::start_stacking(
         state.ctx.clone(),
         emitter,
+        &policy,
         env!("CARGO_PKG_VERSION").to_string(),
         args.set_id,
         args.config,

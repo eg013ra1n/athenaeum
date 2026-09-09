@@ -379,7 +379,7 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
 
 // ── build_plan ──────────────────────────────────────────────────────────────
 
-fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<String, ApiError> {
+pub(crate) fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<String, ApiError> {
     conn.query_row(
         "SELECT name FROM frames_set WHERE id = ?1",
         params![frames_set_id],
@@ -389,7 +389,10 @@ fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<String, ApiEr
     .ok_or_else(|| ApiError::NotFound(format!("frame set {frames_set_id} not found")))
 }
 
-fn read_global_config_json(conn: &Connection, settings: &SettingsManager) -> Option<String> {
+pub(crate) fn read_global_config_json(
+    conn: &Connection,
+    settings: &SettingsManager,
+) -> Option<String> {
     match settings.get_with_precedence(conn, keys::STACKING_DEFAULTS, "") {
         Ok(value) => {
             let trimmed = value.trim();

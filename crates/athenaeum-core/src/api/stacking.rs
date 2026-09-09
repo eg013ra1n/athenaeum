@@ -15,14 +15,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::api::sync::{validate_transfer_dir, OverlapRule, PathSetting};
 use crate::api::{db, ApiError, PathPolicy};
 use crate::db::stacking::{
     active_run_for_set, get_run, get_set_config, list_frame_rows, list_groups, list_runs,
-    set_set_config, StackingRunFrameRow, StackingRunGroupRow, StackingRunRow,
+    set_set_config, SetConfigRow, StackingRunFrameRow, StackingRunGroupRow, StackingRunRow,
 };
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -32,7 +32,9 @@ use crate::stacking::groups::set_slug;
 use crate::stacking::paths::{
     cleanup_work, resolve_dirs, validate_dirs, work_usage, CleanupWhat, WorkUsage, WorkingLayout,
 };
-use crate::stacking::plan::{build_plan, StackingPlan, Stage};
+use crate::stacking::plan::{
+    build_plan, frame_set_name, read_global_config_json, StackingPlan, Stage,
+};
 use crate::stacking::provenance::RunSummary;
 use crate::stacking::run::{self, StartedStacking};
 
@@ -106,15 +108,20 @@ pub fn get_stacking_plan(
 }
 
 /// Start a stacking run for `set_id`. Delegates straight to
-/// [`crate::stacking::run::start_stacking`], which re-validates the
-/// ALREADY-STORED working/output settings — never a raw, caller-typed path
-/// (the one place that enters the system is [`set_stacking_paths`], which
-/// takes an explicit [`PathPolicy`]) — so this call passes
-/// [`PathPolicy::AllowAll`] internally, same as `build_plan`'s own tests and
-/// `run.rs`'s own test suite do.
+/// [`crate::stacking::run::start_stacking`], forwarding `policy` unchanged.
+///
+/// Fix round 1, item 1: a caller-supplied `config` can carry its OWN
+/// `paths.workingDir`/`paths.outputDir` override (spec §9.2) — those are not
+/// necessarily the already-stored settings paths, so `policy` must be the
+/// SAME host sandbox [`get_stacking_plan`] validates against, not
+/// [`PathPolicy::AllowAll`] hard-coded here. Without this, `get_stacking_plan`
+/// could refuse a sandbox-external folder with a `folders` blocker while
+/// `start_stacking` ran and wrote there anyway — plan and start must never
+/// disagree about what the host allows (spec §12).
 pub fn start_stacking(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
+    policy: &PathPolicy,
     app_version: String,
     set_id: i64,
     config: Option<StackingConfig>,
@@ -123,7 +130,7 @@ pub fn start_stacking(
     run::start_stacking(
         ctx,
         emitter,
-        &PathPolicy::AllowAll,
+        policy,
         app_version,
         set_id,
         config,
@@ -186,34 +193,10 @@ pub fn get_stacking_run(ctx: &ServiceContext, run_id: i64) -> Result<StackingRun
 
 // ── Config (per-set override + global defaults) ─────────────────────────
 
-/// The global `stacking.defaults` setting, precedence-resolved (runtime
-/// override > DB > unset) exactly the way [`build_plan`] itself reads it —
-/// mirrors `stacking::plan`'s own private `read_global_config_json`, kept as
-/// a small local copy since that helper isn't `pub(crate)` and this module
-/// needs the identical precedence a run will actually see.
-fn global_defaults_json(conn: &Connection, settings: &SettingsManager) -> Option<String> {
-    match settings.get_with_precedence(conn, keys::STACKING_DEFAULTS, "") {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "stacking: failed reading global defaults; using built-in defaults"
-            );
-            None
-        }
-    }
-}
-
-/// [`global_defaults_json`], but also tolerates the catalog `Database` not
-/// being initialized yet — a fresh install's very first read, or a test
-/// harness that deliberately leaves `ServiceContext::db` unset (see
+/// [`crate::stacking::plan::read_global_config_json`], but also tolerates the
+/// catalog `Database` not being initialized yet — a fresh install's very
+/// first read, or a test harness that deliberately leaves
+/// `ServiceContext::db` unset (see
 /// `routes::stacking::tests::get_stacking_defaults_no_db_needed`, which pins
 /// this contract at the router level: reading defaults must not need a live
 /// catalog connection). Same "log, never propagate" shape as
@@ -222,7 +205,7 @@ fn global_defaults_json(conn: &Connection, settings: &SettingsManager) -> Option
 /// state, not a crash.
 fn global_defaults_json_best_effort(ctx: &ServiceContext) -> Option<String> {
     match db(ctx) {
-        Ok(db_handle) => global_defaults_json(&db_handle.conn(), &ctx.settings),
+        Ok(db_handle) => read_global_config_json(&db_handle.conn(), &ctx.settings),
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -231,6 +214,28 @@ fn global_defaults_json_best_effort(ctx: &ServiceContext) -> Option<String> {
             None
         }
     }
+}
+
+/// A frame set's resolved [`StackingConfig`]: its own stored override
+/// (`set_row`), if any, else the global default, else the built-in default —
+/// whole-config precedence (spec §9.2), never field-level merging. The SAME
+/// reader [`get_stacking_config`] uses, factored out (fix round 1, item 3)
+/// so [`get_stacking_work_usage`]/[`cleanup_stacking_work`] resolve a set's
+/// `paths.workingDir`/`paths.outputDir` override through the identical path
+/// [`build_plan`] and `get_stacking_config` do — a drift here would mean the
+/// usage/cleanup handlers report on a different folder than the one a run
+/// (or the config the Stacking tab is showing) actually uses.
+fn resolve_set_stacking_config(
+    conn: &Connection,
+    settings: &SettingsManager,
+    set_row: Option<&SetConfigRow>,
+) -> Result<StackingConfig, ApiError> {
+    let global_json = read_global_config_json(conn, settings);
+    resolve_config(
+        set_row.map(|r| r.config_json.as_str()),
+        global_json.as_deref(),
+    )
+    .map_err(|e| ApiError::Internal(format!("failed to parse stacking config: {e}")))
 }
 
 /// A frame set's resolved stacking config: its own stored override, if any,
@@ -243,12 +248,7 @@ pub fn get_stacking_config(
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
     let set_row = get_set_config(&conn, set_id)?;
-    let global_json = global_defaults_json(&conn, &ctx.settings);
-    let config = resolve_config(
-        set_row.as_ref().map(|r| r.config_json.as_str()),
-        global_json.as_deref(),
-    )
-    .map_err(|e| ApiError::Internal(format!("failed to parse stacking config: {e}")))?;
+    let config = resolve_set_stacking_config(&conn, &ctx.settings, set_row.as_ref())?;
     Ok(StackingSetConfig {
         config,
         excluded_frame_ids: set_row
@@ -318,22 +318,6 @@ fn configured_setting(conn: &Connection, key: &str) -> Result<Option<String>, Ap
     Ok(crate::db::get_setting(conn, key)?
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty()))
-}
-
-/// The frame set's own name, for the working-layout slug
-/// ([`crate::stacking::groups::set_slug`]). Mirrors `stacking::plan`'s own
-/// private `frame_set_name` (same query, same not-found mapping) — that
-/// helper isn't `pub(crate)` either, and this is the same small,
-/// self-contained inline-query pattern already used independently in
-/// `api::collab`/`api::sync`.
-fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<String, ApiError> {
-    conn.query_row(
-        "SELECT name FROM frames_set WHERE id = ?1",
-        rusqlite::params![frames_set_id],
-        |r| r.get(0),
-    )
-    .optional()?
-    .ok_or_else(|| ApiError::NotFound(format!("frame set {frames_set_id} not found")))
 }
 
 /// The two stacking folders as configured/effective right now.
@@ -451,12 +435,19 @@ pub fn set_stacking_paths(
     get_stacking_paths(ctx)
 }
 
-/// A frame set's working-layout byte usage. `None` for the global working
-/// folder (unset) reads as all zeros — there is nothing on disk to probe.
+/// A frame set's working-layout byte usage. Fix round 1, item 2: resolves
+/// the SET's own config (its `paths.workingDir` override, if any, else the
+/// global default — [`resolve_set_stacking_config`], the same reader
+/// [`get_stacking_config`] uses) rather than only ever the global setting —
+/// a set overriding its own working folder previously reported all-zero
+/// usage against a folder nothing was ever written to. `None` (global AND
+/// set both unset) reads as all zeros — there is nothing on disk to probe.
 pub fn get_stacking_work_usage(ctx: &ServiceContext, set_id: i64) -> Result<WorkUsage, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
-    let dirs = resolve_dirs(&conn, &ctx.settings, &PathsConfig::default());
+    let set_row = get_set_config(&conn, set_id)?;
+    let cfg = resolve_set_stacking_config(&conn, &ctx.settings, set_row.as_ref())?;
+    let dirs = resolve_dirs(&conn, &ctx.settings, &cfg.paths);
     let Some(working) = dirs.working else {
         return Ok(WorkUsage::default());
     };
@@ -468,8 +459,25 @@ pub fn get_stacking_work_usage(ctx: &ServiceContext, set_id: i64) -> Result<Work
 /// Remove part or all of a frame set's working-layout subtrees. Refuses
 /// while a run is active for the set (`Conflict`) — cleaning up under a
 /// running pipeline would delete artifacts a live stage is about to read or
-/// write. No working folder configured ⇒ nothing to clean, `Ok(0)` (mirrors
-/// [`get_stacking_work_usage`]'s "unset reads as zero").
+/// write. No working folder configured (set override AND global both unset)
+/// ⇒ nothing to clean, `Ok(0)` (mirrors [`get_stacking_work_usage`]'s
+/// "unset reads as zero"). Fix round 1, item 2: resolves the SET's own
+/// config the same way `get_stacking_work_usage` now does, so a set that
+/// overrides `paths.workingDir` gets cleaned up against the tree it actually
+/// wrote to, not the (possibly unrelated, possibly unset) global folder.
+///
+/// Fix round 1, item 6 (documented limitation, no code change): the
+/// `Conflict` guard above is keyed on `set_id` (`stacking_runs.frames_set_id`),
+/// but the working-layout tree on disk is keyed on `set_slug(name)` —
+/// [`crate::stacking::groups::set_slug`] sanitizes a frame set's NAME, not
+/// its id. Two frame sets sharing the same sanitized name would therefore
+/// share one on-disk tree while each has its OWN independent `Conflict`
+/// gate; and a `stacking_runs` row a crashed process left `running` (no
+/// live `active_stacks` handle) blocks `cleanup_stacking_work` for that set
+/// until the row is finished (`finish_run`) or the run is genuinely
+/// resumed/cancelled — there is no time-based staleness override here.
+/// Plan 5b's run-history/results panel is where an operator sees and clears
+/// a stuck row; this handler intentionally does not second-guess it.
 pub fn cleanup_stacking_work(
     ctx: &ServiceContext,
     set_id: i64,
@@ -484,7 +492,9 @@ pub fn cleanup_stacking_work(
         )));
     }
 
-    let dirs = resolve_dirs(&conn, &ctx.settings, &PathsConfig::default());
+    let set_row = get_set_config(&conn, set_id)?;
+    let cfg = resolve_set_stacking_config(&conn, &ctx.settings, set_row.as_ref())?;
+    let dirs = resolve_dirs(&conn, &ctx.settings, &cfg.paths);
     let Some(working) = dirs.working else {
         return Ok(0);
     };
@@ -497,12 +507,58 @@ pub fn cleanup_stacking_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::NullEmitter;
     use crate::stacking::config::CleanupPolicy;
+    use crate::stacking::test_fixtures::{self, LightSpec};
 
     fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
         (tmp, ctx)
+    }
+
+    /// A frame set with 3 real LIGHT frames + a linked master dark/flat —
+    /// enough for `build_plan`'s masters/links (Gate 1) and reference
+    /// (Gate 2, `Auto` never blocks) checks to pass cleanly, so a test can
+    /// reach the folders/space gates deterministically. `db_path` must be
+    /// the SAME file the test's `ServiceContext` pools connections against
+    /// (`stacking::test_fixtures::frame_set_with_conn`'s own contract) —
+    /// mirrors `stacking::run::tests::seed_ready`, duplicated here (not
+    /// `pub(crate)` there, and this task's file scope doesn't touch
+    /// `run.rs`) at a fraction of its size, since this module's own tests
+    /// never need `run.rs`'s fan-out/registration machinery.
+    fn seed_ready_fixture(
+        db_path: &std::path::Path,
+        set_name: &str,
+    ) -> (test_fixtures::Fixture, Vec<i64>) {
+        let conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(conn, set_name);
+
+        let times = [
+            "2025-01-01T00:00:00",
+            "2025-01-01T00:05:00",
+            "2025-01-01T00:10:00",
+        ];
+        let mut light_ids = Vec::with_capacity(times.len());
+        for (i, t) in times.iter().enumerate() {
+            let stem = format!("f{i}");
+            let spec = LightSpec {
+                stem: &stem,
+                instrume: "cam",
+                filter: None,
+                binning: 1,
+                width: 64,
+                height: 48,
+                exptime: 60.0,
+                date_obs: t,
+                bayerpat: None,
+                write_file: true,
+            };
+            let (id, _path) = test_fixtures::add_light(&fixture, &spec);
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, 64, 48);
+        (fixture, light_ids)
     }
 
     #[test]
@@ -605,5 +661,190 @@ mod tests {
         assert_eq!(p2.working.effective, "");
         assert!(p2.output.configured.is_none());
         assert_eq!(p2.output.effective, "");
+    }
+
+    /// Fix round 1, item 1: `start_stacking` must forward the HOST's own
+    /// `PathPolicy` to `run::start_stacking`, not a hard-coded `AllowAll` —
+    /// a config-supplied `paths.workingDir`/`paths.outputDir` override is a
+    /// caller-controlled path, the exact case `PathPolicy` sandboxing
+    /// exists for (spec §12). A ready fixture (masters+links+reference all
+    /// clear) with a config override pointing at a REAL tempdir the policy
+    /// does NOT allow must refuse with `Invalid` (the `folders` blocker,
+    /// wrapped by `start_stacking`'s own "first blocker -> Invalid" rule) —
+    /// not silently run and write outside the sandbox.
+    #[test]
+    fn start_refuses_a_folder_outside_the_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        let (fixture, light_ids) = seed_ready_fixture(&db_path, "Test Set");
+        let _ = &light_ids;
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut cfg = StackingConfig::default();
+        cfg.paths.working_dir = Some(work_dir.path().to_string_lossy().into_owned());
+        cfg.paths.output_dir = Some(out_dir.path().to_string_lossy().into_owned());
+
+        // A THIRD directory is the only one the policy allows — neither
+        // `work_dir` nor `out_dir` is under it. `canonical_tempdir` (not a
+        // raw `.canonicalize()`) so `PathPolicy::AllowedRoots` holds the
+        // normalized spelling production stores, per
+        // `test_support::fixtures_never_seed_a_raw_canonicalized_path`.
+        let (_allowed_root, allowed_root_path) = crate::test_support::canonical_tempdir();
+        let policy = PathPolicy::AllowedRoots(vec![allowed_root_path]);
+
+        let err = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &policy,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+
+        assert!(
+            crate::db::stacking::list_runs(&fixture.conn, fixture.set_id, 10)
+                .unwrap()
+                .is_empty(),
+            "a refused start must not insert a run row"
+        );
+    }
+
+    /// Fix round 1, item 2: `get_stacking_work_usage`/`cleanup_stacking_work`
+    /// must resolve the SET's own `paths.workingDir` override, not only the
+    /// global setting — before the fix, a set overriding its working folder
+    /// reported all-zero usage (looking at the wrong, unset global folder)
+    /// and `cleanup` walked/deleted nothing while the set's real artifacts
+    /// sat untouched on disk.
+    #[test]
+    fn usage_and_cleanup_honour_the_sets_folder_override() {
+        let (_tmp, ctx) = test_ctx();
+        let set_id = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            crate::db::create_frames_set(
+                &conn,
+                Some("Test Set"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let group_dir = work_dir
+            .path()
+            .join(set_slug("Test Set"))
+            .join("calibrated")
+            .join("g");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(group_dir.join("x.bin"), vec![0u8; 1024]).unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.paths.working_dir = Some(work_dir.path().to_string_lossy().into_owned());
+        set_stacking_config(&ctx, set_id, cfg, Vec::new()).unwrap();
+
+        let usage = get_stacking_work_usage(&ctx, set_id).unwrap();
+        assert_eq!(usage.calibrated_bytes, 1024);
+        assert_eq!(usage.total_bytes, 1024);
+
+        let freed = cleanup_stacking_work(&ctx, set_id, CleanupWhat::Intermediates).unwrap();
+        assert_eq!(freed, 1024);
+        assert!(!group_dir.join("x.bin").exists());
+    }
+
+    /// Fix round 1, item 7: no active run ⇒ `cleanup_stacking_work` reads
+    /// the SAME `stacking_runs` row a real `active_run_for_set` query would
+    /// (`status IN ('planning', 'running')`) and refuses.
+    #[test]
+    fn cleanup_conflicts_while_a_run_is_active() {
+        let (_tmp, ctx) = test_ctx();
+        let set_id = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            crate::db::create_frames_set(
+                &conn,
+                Some("Test Set"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let run_id = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            let run_id = crate::db::stacking::insert_run(
+                &conn,
+                &crate::db::stacking::NewRun {
+                    frames_set_id: set_id,
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: "/w",
+                    output_dir: "/o",
+                },
+            )
+            .unwrap();
+            crate::db::stacking::set_run_status(&conn, run_id, "running").unwrap();
+            run_id
+        };
+
+        let err = cleanup_stacking_work(&ctx, set_id, CleanupWhat::All).unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        let _ = run_id;
+    }
+
+    /// Fix round 1, item 7: no working folder (global unset, no set
+    /// override) ⇒ `get_stacking_work_usage` reads all zeros without
+    /// touching disk or requiring the set to have anything on it.
+    #[test]
+    fn usage_is_zero_without_a_working_folder() {
+        let (_tmp, ctx) = test_ctx();
+        let set_id = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            crate::db::create_frames_set(
+                &conn,
+                Some("Test Set"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let usage = get_stacking_work_usage(&ctx, set_id).unwrap();
+        assert_eq!(usage.total_bytes, 0);
+        assert_eq!(usage.calibrated_bytes, 0);
+        assert_eq!(usage.registered_bytes, 0);
+        assert_eq!(usage.ln_bytes, 0);
+        assert_eq!(usage.runs_bytes, 0);
     }
 }

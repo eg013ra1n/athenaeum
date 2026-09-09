@@ -1,4 +1,4 @@
-//! Assembles the 6 frontend type files from the Rust model types.
+//! Assembles the 7 frontend type files from the Rust model types.
 //! Diffed against disk by tests/ts_contract.rs; regenerate with:
 //!   TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 //!
@@ -6,8 +6,11 @@
 //! (.superpowers/sdd/p1-ts-inventory.md): one line per mapped declaration, in
 //! the order it appeared in the original hand-written file. Cross-checked:
 //! none of the 138 mapped types reference a type that lives in a *different*
-//! one of the 6 output files, so none of the preambles below need an
-//! `import type { .. } from './other-file'` line.
+//! one of the original 6 output files, so none of THOSE SIX preambles need
+//! an `import type { .. } from './other-file'` line. The 7th file
+//! (`stacking.ts`, M1 Plan 5a Task 9) is the one exception: it imports
+//! `FlatNormMode`, `ExportReadiness`, `LightCalParams`, `PathSetting` from
+//! `./models` rather than redeclaring them.
 
 use ts_rs::TS;
 
