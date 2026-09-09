@@ -847,7 +847,8 @@ WCS, `DrizzlePanel` live, acceptance (FWHM ratio vs WBPP drizzle).
 Thin-plate spline distortion (+ local distortion loop), ESD, RCR, min/max,
 large-scale rejection, Bayer drizzle (stage 1 keeps the CFA mosaic), XISF
 output, cataloging masters (a `master_light` entity linked to the set and a
-preview in the Results cards), preset management.
+preview in the Results cards), preset management, **mixed pixel scales in
+one set** (co-registered and native modes, §15 — owner requirement).
 
 ## 15. Deferred and open
 
@@ -858,3 +859,22 @@ preview in the Results cards), preset management.
   values, to be set from the M4 acceptance run.
 - Whether masters should be cataloged and how they appear in the Objects
   page: M4 decision, after the owner has used M1–M3 output for a while.
+- **Mixed pixel scales in one set — required (owner, 2026-09-09).** M1
+  registers every group onto the set's one reference and refuses a frame
+  whose fitted scale is outside `[0.8, 1.25]` (§3.6), so a bin-2 group, a
+  second telescope with another focal length, or a camera with another
+  pixel size cannot join the set's masters today — the group key's
+  binning × geometry split keeps them apart, and registration then drops
+  every frame of the foreign-scale group. Planned as an M4 item (after
+  drizzle, which changes the output scale for every group alike), with two
+  modes the owner picks per set: (a) **co-registered** — widen the scale
+  gate, resample every group into the reference geometry (the finer scale
+  loses resolution, the coarser is upsampled) and keep one master per group
+  in one geometry; (b) **native** — a per-group reference (the group's
+  best-weighted frame) and a master in the group's own geometry, no
+  cross-group registration. Both keep the group key. Until then the plan
+  gate should report a group whose scale the reference cannot accept as a
+  named blocker ("group `<key>` is at ×2.0 the reference's pixel scale —
+  not supported yet") instead of failing every frame at registration — an
+  M2 quick win, decided from the header's binning and, when both frames
+  have a plate solve, the ratio of their pixel scales.
