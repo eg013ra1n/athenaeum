@@ -30,13 +30,6 @@ import type { ArchivedFrameSetSummary } from '../types/helpers';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'stacking';
 
-// The Stacking tab (M1) stays behind the Vite dev flag until the M1
-// acceptance run passes (stacking plan 5b, ruling 3) — functional in dev
-// builds, greyed with an "under development" tooltip in production/release
-// builds. True for `tauri dev` / `dev:web`, false for `tauri build` /
-// `build:web`.
-const STACKING_ENABLED = import.meta.env.DEV;
-
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -86,15 +79,12 @@ export default function FrameSetDetail() {
   // (e.g. clicking a `#setId` in the Export tab's WarningsPanel pushes
   // `?tab=calibration&highlightSet=…&kind=…` and we re-consume them).
   const [searchParams, setSearchParams] = useSearchParams();
-  // STACKING_ENABLED is a synchronous build-time flag — safe to resolve
-  // immediately on initial render, unlike gating that depends on data still
-  // loading on first render.
   const initialTabFromUrl: FrameSetTab | undefined =
     searchParams.get('tab') === 'calibration' ? 'calibration'
     : searchParams.get('tab') === 'history' ? 'history'
     : searchParams.get('tab') === 'analysis' ? 'analysis'
     : searchParams.get('tab') === 'export' ? 'export'
-    : searchParams.get('tab') === 'stacking' && STACKING_ENABLED ? 'stacking'
+    : searchParams.get('tab') === 'stacking' ? 'stacking'
     : undefined;
   const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
 
@@ -125,10 +115,8 @@ export default function FrameSetDetail() {
 
     if (!tabParam && !highlightSetParam && !kindParam) return;
 
-    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export') {
+    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export' || tabParam === 'stacking') {
       setActiveTab(tabParam);
-    } else if (tabParam === 'stacking') {
-      setActiveTab(STACKING_ENABLED ? 'stacking' : 'analysis');
     }
 
     const id = highlightSetParam != null && /^\d+$/.test(highlightSetParam)
@@ -873,20 +861,13 @@ export default function FrameSetDetail() {
           { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => {
-          // Stacking is disabled in production (under development) and, in
-          // every build, gated on the set actually having light frames
-          // (spec §11: "gated only on the set has lights").
-          const stackingUnderDev = key === 'stacking' && !STACKING_ENABLED;
+          // Stacking is gated only on the set actually having light frames
+          // (spec §11: "gated only on the set has lights"); the dev-only
+          // flag came off with the M1 acceptance run (2026-09-10).
           const stackingHasLights = (calibrationHierarchy?.total_frames ?? 0) > 0;
-          const isStackingGated = key === 'stacking' && (stackingUnderDev || !stackingHasLights);
+          const isStackingGated = key === 'stacking' && !stackingHasLights;
           const stackingTooltip =
-            key === 'stacking'
-              ? stackingUnderDev
-                ? 'Stacking is under development — available in a future release.'
-                : !stackingHasLights
-                  ? 'This set has no light frames yet.'
-                  : undefined
-              : undefined;
+            key === 'stacking' && !stackingHasLights ? 'This set has no light frames yet.' : undefined;
           const gated = isStackingGated;
           const tooltip = stackingTooltip;
           return (
