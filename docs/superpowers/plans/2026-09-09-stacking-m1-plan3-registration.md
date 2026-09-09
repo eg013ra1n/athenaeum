@@ -169,6 +169,16 @@ per-frame `delta_RMS`. Results go to
   sidecar/write/compare error exits 1. (5) `ROWORDER` copies through to
   registered frames (orientation, not CFA). (6) The example no longer names
   the external stacker.
+- **Task 9 — re-pairing through the refit model.** Correspondences were
+  built once through the quad seed within 3.8 px; the seed's accuracy falls
+  off with distance from the matched quads, so on the real data the
+  identity-like subjects paired 1858–1933 of 2000 stars but the 8° / 0.8 %
+  mono subject 870 and the cross-camera 11° subject 241 (overlap index
+  0.35). `align` now re-pairs every subject star through the refit linear
+  model and runs RANSAC + refit again on the larger set
+  (`Alignment.repaired` counts the gain); a failed second pass keeps the
+  first with a warning. `pair_through` / `ransac_and_refit` are the
+  extracted steps 2 and 3–4.
 
 ## Carry-forwards from Plan 2's final review (for this plan's author and the next ones)
 

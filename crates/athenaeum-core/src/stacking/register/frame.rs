@@ -125,6 +125,7 @@ pub fn identity_registration(reference: &ReferenceStars) -> FrameRegistration {
             distortion_order: None,
             seed_matches: 0,
             pairs: reference.stars.len(),
+            repaired: 0,
             inliers: reference.stars.len(),
             inlier_ratio: 1.0,
             rms_px: 0.0,

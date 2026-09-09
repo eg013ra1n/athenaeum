@@ -12,7 +12,7 @@ use super::detect::Star;
 use super::{DistortionChoice, ModelChoice, RegistrationConfig};
 use crate::geometry::{
     ransac_fit, refit_weighted, Distortion, KdTree2, Linear, LinearKind, Pair, PixelMap,
-    RansacConfig,
+    RansacConfig, RansacResult, RefitResult,
 };
 
 /// Quad-ratio tolerance of the seed matcher (the plate solver's default).
@@ -87,6 +87,9 @@ pub struct Alignment {
     pub seed_matches: usize,
     /// Correspondences the seed produced.
     pub pairs: usize,
+    /// Pairs added by the re-pairing pass through the refit model (0 when
+    /// the seed already paired the field).
+    pub repaired: usize,
     /// Refit inliers.
     pub inliers: usize,
     pub inlier_ratio: f64,
@@ -190,6 +193,86 @@ fn residual_stats(map: &PixelMap, pairs: &[Pair]) -> (f64, f64, (f64, f64)) {
     (rms, var.sqrt(), (px, py))
 }
 
+/// Correspondences through `model`: every subject star's nearest reference
+/// star within `radius`, with the pair's combined centroid σ
+/// (`√(σ_s² + σ_r²)` per axis) when both stars carry one.
+struct Pairing {
+    pairs: Vec<Pair>,
+    sigmas: Vec<(f64, f64)>,
+    all_sigmas: bool,
+}
+
+fn pair_through(
+    model: &Linear,
+    subject: &[Star],
+    reference: &[Star],
+    tree: &KdTree2,
+    radius: f64,
+) -> Pairing {
+    let mut p = Pairing {
+        pairs: Vec::new(),
+        sigmas: Vec::new(),
+        all_sigmas: true,
+    };
+    for s in subject {
+        let (px, py) = model.apply(s.x, s.y);
+        if let Some((j, _)) = tree.nearest_within(px, py, radius) {
+            let r = &reference[j];
+            p.pairs.push(((s.x, s.y), (r.x, r.y)));
+            match (s.sigma, r.sigma) {
+                (Some(a), Some(b)) => p.sigmas.push((
+                    (a.0 * a.0 + b.0 * b.0).sqrt(),
+                    (a.1 * a.1 + b.1 * b.1).sqrt(),
+                )),
+                _ => {
+                    p.all_sigmas = false;
+                    p.sigmas.push((0.0, 0.0));
+                }
+            }
+        }
+    }
+    p
+}
+
+/// Steps 3–4: RANSAC on the model resolved from the pair count, then the
+/// σ-weighted refit with `auto` re-resolved from the inlier count (it can
+/// only step down).
+fn ransac_and_refit(
+    pairing: &Pairing,
+    cfg: &RegistrationConfig,
+    reference_geometry: (usize, usize),
+) -> Result<(RansacResult, RefitResult, LinearKind), AlignError> {
+    let pairs = &pairing.pairs;
+    let ransac_kind = resolve_model(cfg.model, pairs.len());
+    let mut rc = RansacConfig::new(
+        ransac_kind,
+        reference_geometry.0 as f64,
+        reference_geometry.1 as f64,
+    );
+    rc.tolerance_px = cfg.ransac_tolerance_px;
+    rc.max_iterations = cfg.ransac_max_iterations;
+    rc.min_inliers = MIN_INLIERS;
+    let ransac = ransac_fit(pairs, &rc).ok_or(AlignError::TooFewInliers { inliers: 0 })?;
+    if ransac.inliers.len() < MIN_INLIERS {
+        return Err(AlignError::TooFewInliers {
+            inliers: ransac.inliers.len(),
+        });
+    }
+    let kind = resolve_model(cfg.model, ransac.inliers.len());
+    let sig = pairing.all_sigmas.then_some(pairing.sigmas.as_slice());
+    let refit = refit_weighted(pairs, &ransac.inliers, sig, kind, CLIP_SIGMA).ok_or(
+        AlignError::TooFewInliers {
+            inliers: ransac.inliers.len(),
+        },
+    )?;
+    if refit.inliers.len() < MIN_INLIERS {
+        return Err(AlignError::TooFewInliers {
+            inliers: refit.inliers.len(),
+        });
+    }
+    Ok((ransac, refit, kind))
+}
+
 /// Fit the distortion jointly with the linear part's affine correction
 /// (`Distortion::fit_joint`), twice.
 fn fit_distortion(
@@ -236,62 +319,41 @@ pub fn align(
     // 2. Correspondences through the seed, nearest reference star within 2·tol.
     let tree = KdTree2::build(&ref_pts);
     let radius = 2.0 * cfg.ransac_tolerance_px;
-    let mut pairs: Vec<Pair> = Vec::new();
-    let mut sigmas: Vec<(f64, f64)> = Vec::new();
-    let mut all_sigmas = true;
-    for s in subject {
-        let (px, py) = seed.apply(s.x, s.y);
-        if let Some((j, _)) = tree.nearest_within(px, py, radius) {
-            let r = &reference[j];
-            pairs.push(((s.x, s.y), (r.x, r.y)));
-            match (s.sigma, r.sigma) {
-                (Some(a), Some(b)) => sigmas.push((
-                    (a.0 * a.0 + b.0 * b.0).sqrt(),
-                    (a.1 * a.1 + b.1 * b.1).sqrt(),
-                )),
-                _ => {
-                    all_sigmas = false;
-                    sigmas.push((0.0, 0.0));
-                }
+    let mut pairing = pair_through(&seed, subject, reference, &tree, radius);
+    if pairing.pairs.len() < MIN_INLIERS {
+        return Err(AlignError::TooFewMatches {
+            matches: pairing.pairs.len(),
+        });
+    }
+
+    // 3–4. RANSAC and the σ-weighted refit.
+    let (mut ransac, mut refit, mut kind) = ransac_and_refit(&pairing, cfg, reference_geometry)?;
+    let mut warnings = Vec::new();
+
+    // 4b. Re-pair through the refit model: the seed is an affine fitted on
+    // the matched quads and its accuracy falls off with distance from them
+    // (a 1e-3 relative error is 6 px at the far edge, beyond the pairing
+    // radius), so a rotated or rescaled subject pairs only near them. One
+    // pass through the refit model recovers the rest of the field.
+    let mut repaired = 0usize;
+    let again = pair_through(&refit.linear, subject, reference, &tree, radius);
+    if again.pairs.len() > pairing.pairs.len() {
+        match ransac_and_refit(&again, cfg, reference_geometry) {
+            Ok((r2, f2, k2)) => {
+                repaired = again.pairs.len() - pairing.pairs.len();
+                pairing = again;
+                ransac = r2;
+                refit = f2;
+                kind = k2;
             }
+            Err(e) => warnings.push(format!(
+                "re-pairing through the refit model failed ({e}); seed pairs kept"
+            )),
         }
     }
-    if pairs.len() < MIN_INLIERS {
-        return Err(AlignError::TooFewMatches {
-            matches: pairs.len(),
-        });
-    }
-
-    // 3. RANSAC on the model resolved from the correspondence count.
-    let ransac_kind = resolve_model(cfg.model, pairs.len());
-    let mut rc = RansacConfig::new(
-        ransac_kind,
-        reference_geometry.0 as f64,
-        reference_geometry.1 as f64,
-    );
-    rc.tolerance_px = cfg.ransac_tolerance_px;
-    rc.max_iterations = cfg.ransac_max_iterations;
-    rc.min_inliers = MIN_INLIERS;
-    let ransac = ransac_fit(&pairs, &rc).ok_or(AlignError::TooFewInliers { inliers: 0 })?;
-    if ransac.inliers.len() < MIN_INLIERS {
-        return Err(AlignError::TooFewInliers {
-            inliers: ransac.inliers.len(),
-        });
-    }
-
-    // 4. σ-weighted refit; `auto` re-resolves from the inlier count (it can only step down).
-    let kind = resolve_model(cfg.model, ransac.inliers.len());
-    let sig = all_sigmas.then_some(sigmas.as_slice());
-    let refit = refit_weighted(&pairs, &ransac.inliers, sig, kind, CLIP_SIGMA).ok_or(
-        AlignError::TooFewInliers {
-            inliers: ransac.inliers.len(),
-        },
-    )?;
-    if refit.inliers.len() < MIN_INLIERS {
-        return Err(AlignError::TooFewInliers {
-            inliers: refit.inliers.len(),
-        });
-    }
+    let pairs = &pairing.pairs;
+    let sigmas = &pairing.sigmas;
+    let all_sigmas = pairing.all_sigmas;
     let mut linear = refit.linear;
     let refit_scale = refit.linear.scale();
     if !(refit_scale >= SCALE_RANGE.0 && refit_scale <= SCALE_RANGE.1) {
@@ -300,7 +362,6 @@ pub fn align(
 
     // 5. Optional distortion on the refit inliers.
     let inlier_pairs: Vec<Pair> = refit.inliers.iter().map(|&i| pairs[i]).collect();
-    let mut warnings = Vec::new();
     let cross_geometry = subject_geometry != reference_geometry;
     let wanted = match cfg.distortion {
         DistortionChoice::Auto => {
@@ -390,6 +451,7 @@ pub fn align(
         distortion_order,
         seed_matches,
         pairs: pairs.len(),
+        repaired,
         inliers: refit.inliers.len(),
         inlier_ratio: refit.inliers.len() as f64 / pairs.len() as f64,
         rms_px,
@@ -725,5 +787,52 @@ mod tests {
             None,
             "no quality"
         );
+    }
+
+    #[test]
+    fn re_pairing_through_the_refit_model_recovers_the_field() {
+        // 6000×4000 field, 8° rotation, 0.8 % scale. A model with a 2e-3
+        // scale error pairs only the stars near the origin within 3.8 px;
+        // the exact model pairs every star scene() kept.
+        let (w, h) = (6000.0, 4000.0);
+        let subject = field(11, 1500, w, h);
+        let truth = similarity(1.008, 8.0, 300.0, -200.0);
+        let (subject, reference) = scene(&subject, &truth, 0.05, 0, w, h, 12);
+        let ref_pts: Vec<(f64, f64)> = reference.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        let radius = 2.0 * RegistrationConfig::default().ransac_tolerance_px;
+        let exact = pair_through(&truth, &subject, &reference, &tree, radius);
+        let off = pair_through(
+            &similarity(1.008 * 1.002, 8.0, 300.0, -200.0),
+            &subject,
+            &reference,
+            &tree,
+            radius,
+        );
+        assert!(exact.pairs.len() >= 1000, "exact {}", exact.pairs.len());
+        assert!(exact.all_sigmas);
+        assert!(
+            off.pairs.len() < exact.pairs.len() / 3,
+            "off {} exact {}",
+            off.pairs.len(),
+            exact.pairs.len()
+        );
+        // End to end, whatever the seed's accuracy, the final pairing is complete.
+        let a = align(
+            &subject,
+            &reference,
+            (w as usize, h as usize),
+            (w as usize, h as usize),
+            &RegistrationConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            a.pairs as f64 >= 0.98 * exact.pairs.len() as f64,
+            "aligned pairs {} exact {} repaired {}",
+            a.pairs,
+            exact.pairs.len(),
+            a.repaired
+        );
+        assert!(a.rms_px < 0.1, "rms {}", a.rms_px);
     }
 }

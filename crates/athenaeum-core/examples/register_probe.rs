@@ -243,6 +243,7 @@ fn main() {
     out["model"] = serde_json::json!(model_name(a.model, a.distortion_order));
     out["seedMatches"] = serde_json::json!(a.seed_matches);
     out["pairs"] = serde_json::json!(a.pairs);
+    out["repaired"] = serde_json::json!(a.repaired);
     out["inliers"] = serde_json::json!(a.inliers);
     out["inlierRatio"] = serde_json::json!(a.inlier_ratio);
     out["rmsPx"] = serde_json::json!(a.rms_px);
