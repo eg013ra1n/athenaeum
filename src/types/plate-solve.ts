@@ -105,6 +105,11 @@ camera_defaults: { [key in string]: number },
  * density top-up; see `solvemyastro build-bright-cache`). When
  * `None` or absent, solvemyastro uses only the deep catalog. The verify
  * stage always uses the deep catalog regardless of this setting.
+ *
+ * Unread since 2026-09-10 (the plate-solve-era registration flow that
+ * consulted this field, `require_bright_cache`, was retired): kept for
+ * JSON compatibility with a stored config; the solver resolves its
+ * caches itself — see `resolve_layer_caches`.
  */
 bright_cache_path: string | null, };
 
