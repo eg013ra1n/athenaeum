@@ -1,3 +1,4 @@
+pub mod equipment;
 use axum::{
     Router,
     extract::State,
@@ -81,6 +82,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
         // Files
         .route("/api/get_files", post(files::get_files))
+        .route("/api/is_existing_directory", post(files::is_existing_directory))
         .route("/api/get_files_by_directory", post(files::get_files_by_directory))
         .route("/api/get_directory_contents", post(files::get_directory_contents))
         .route("/api/get_camera_directories", post(files::get_camera_directories))
@@ -131,6 +133,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
         // Calibration
         .route("/api/get_equipment_cameras", post(calibration::get_equipment_cameras))
+        .route("/api/get_equipment_profiles", post(equipment::get_equipment_profiles))
+        .route("/api/save_equipment_profile", post(equipment::save_equipment_profile))
+        .route("/api/delete_equipment_profile", post(equipment::delete_equipment_profile))
+        .route("/api/get_equipment_evidence", post(equipment::get_equipment_evidence))
+        .route("/api/confirm_equipment_match", post(equipment::confirm_equipment_match))
+        .route("/api/clear_equipment_match", post(equipment::clear_equipment_match))
+
         .route("/api/get_dark_library", post(calibration::get_dark_library))
         .route("/api/has_dark_library", post(calibration::has_dark_library))
         .route("/api/get_master_dark_library", post(calibration::get_master_dark_library))
