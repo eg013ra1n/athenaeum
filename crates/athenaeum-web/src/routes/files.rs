@@ -402,3 +402,18 @@ pub async fn rename_path(
     api::rename_path(&state.ctx, args.old_path, args.new_name, &policy).map_err(api_err)?;
     Ok(StatusCode::OK)
 }
+
+#[derive(serde::Deserialize)]
+pub struct LocationArgs {
+    pub path: String,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn is_existing_directory(
+    State(state): State<WebAppState>,
+    Json(args): Json<LocationArgs>,
+) -> Result<Json<bool>, (StatusCode, String)> {
+    api::is_existing_directory(args.path, &allowed_roots_policy(&state.allowed_paths))
+        .map(Json)
+        .map_err(api_err)
+}

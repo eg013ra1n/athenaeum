@@ -273,6 +273,7 @@ pub fn run() {
             commands::rename_path,
             commands::get_duplicates,
             commands::get_directory_contents,
+            commands::is_existing_directory,
             commands::get_camera_directories,
             commands::get_camera_directory_contents,
             commands::get_setting,

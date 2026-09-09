@@ -1,6 +1,7 @@
 // Desktop-only features — Tauri plugins that have no web equivalent.
 // In web mode these are safe no-ops or use browser fallbacks.
 
+import { api } from './index';
 import { isTauri } from '../utils/platform';
 
 /**
@@ -18,28 +19,33 @@ export async function openUrl(url: string): Promise<void> {
 
 /**
  * Reveal a file/directory in the system file explorer.
- * Only works in Tauri desktop mode — no-op in web mode.
+ * Web mode copies the path to the clipboard.
  */
 export async function revealItemInDir(path: string): Promise<void> {
   if (isTauri) {
+    await api.invoke<boolean>('is_existing_directory', { path });
     const { revealItemInDir: tauriReveal } = await import('@tauri-apps/plugin-opener');
     await tauriReveal(path);
+  } else {
+    await copyPaths([path]);
   }
-  // Web: no-op — there's no system file explorer to open
 }
 
 /**
- * Open a directory (or file) directly with the system's default handler —
+ * Open a directory directly with the system's default handler —
  * for a folder this opens the folder itself, unlike `revealItemInDir` which
  * reveals an item within its parent's explorer window.
- * Only works in Tauri desktop mode — no-op in web mode.
+ * Web mode copies the path to the clipboard.
  */
 export async function openPath(path: string): Promise<void> {
   if (isTauri) {
+    if (!(await api.invoke<boolean>('is_existing_directory', { path })))
+      throw new Error('The path is not a directory');
     const { openPath: tauriOpenPath } = await import('@tauri-apps/plugin-opener');
     await tauriOpenPath(path);
+  } else {
+    await copyPaths([path]);
   }
-  // Web: no-op — there's no system file explorer to open
 }
 
 /**
@@ -72,4 +78,10 @@ export async function pickFile(options?: {
     }) as Promise<string | null>;
   }
   return null;
+}
+
+/** Browser clipboard errors propagate so callers can offer selectable path text. */
+export async function copyPaths(paths: string[]): Promise<void> {
+  if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable');
+  await navigator.clipboard.writeText(paths.join('\n'));
 }
