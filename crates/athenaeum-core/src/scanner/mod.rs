@@ -2517,21 +2517,36 @@ mod inplace_tests {
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
-            [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()],
+        )
+        .unwrap();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let scan1 = scan_directory_parallel(
-            scan.path(), 1, &conn, &NullEmitter, cancel.clone(), false,
+        let scan1 =
+            scan_directory_parallel(scan.path(), 1, &conn, &NullEmitter, cancel.clone(), false);
+        assert!(
+            scan1.errors.is_empty(),
+            "first scan must succeed: {:?}",
+            scan1.errors
         );
-        assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
 
         // User edits the frame's metadata (the FITS header says OBJECT = 'M33').
         conn.execute(
             "UPDATE frames SET object = 'NGC 598 (edited)', override = 1
              WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
             [f.to_str().unwrap()],
-        ).unwrap();
+        )
+        .unwrap();
+
+        let solved_id: i64 = conn
+            .query_row("SELECT id FROM frames LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        crate::plate_solve::storage::update_frame_from_solve(
+            &conn, solved_id, 10.155262, 40.679846, 9.96, None, false,
+        )
+        .unwrap();
 
         // Touch — advance mtime by at least one filesystem tick.
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -2539,21 +2554,42 @@ mod inplace_tests {
         std::fs::write(&f, bytes).unwrap();
 
         let cancel2 = Arc::new(AtomicBool::new(false));
-        let scan2 = scan_directory_parallel(
-            scan.path(), 1, &conn, &NullEmitter, cancel2, false,
+        let scan2 = scan_directory_parallel(scan.path(), 1, &conn, &NullEmitter, cancel2, false);
+        assert!(
+            scan2.errors.is_empty(),
+            "rescan must succeed: {:?}",
+            scan2.errors
         );
-        assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
-        assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
+        assert_eq!(
+            scan2.files_processed, 1,
+            "the modified file must be re-parsed"
+        );
 
-        let (object, override_flag, db_mtime): (String, i64, String) = conn.query_row(
-            "SELECT fr.object, fr.override, fi.modified_at
+        let (object, override_flag, db_mtime): (String, i64, String) = conn
+            .query_row(
+                "SELECT fr.object, fr.override, fi.modified_at
              FROM frames fr JOIN files fi ON fi.id = fr.file_id
              WHERE fi.path = ?1",
-            [f.to_str().unwrap()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
-        assert_eq!(object, "NGC 598 (edited)",
-            "user-edited OBJECT must survive the re-parse");
+                [f.to_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            object, "NGC 598 (edited)",
+            "user-edited OBJECT must survive the re-parse"
+        );
+        let position: (f64, f64, f64) = conn
+            .query_row(
+                "SELECT ra,dec,rotation FROM frames WHERE id=?1",
+                [solved_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            position,
+            (10.155262, 40.679846, 9.96),
+            "rescan must keep solved astrometry"
+        );
         assert_eq!(override_flag, 1, "override flag must survive the re-parse");
 
         // The files row must still be refreshed so the file is classified

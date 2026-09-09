@@ -673,6 +673,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn saved_astrometry_wins_over_stale_headers_and_failed_retries() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO files(id,path,filename,size,modified_at,format) VALUES (1,'/m31.fits','m31.fits',0,'2026-09-09','FITS')",[]).unwrap();
+        conn.execute("INSERT INTO frames(id,file_id) VALUES (1,1)", [])
+            .unwrap();
+        let cfg = PlateSolveConfig::default();
+        assert!(matches!(
+            store_result(&conn, 1, &mk_result(120, 800, 0.15, 1.9, 1.0), None, &cfg).unwrap(),
+            StoreOutcome::Persisted
+        ));
+        let stale = Frame {
+            id: Some(1),
+            file_id: 1,
+            ra: Some(157.3),
+            dec: Some(40.8),
+            objctra: Some("10:29:12".into()),
+            objctdec: Some("+40:48:00".into()),
+            ..Frame::default()
+        };
+        let hints = crate::plate_solve::hints::extract_hints(&stale, Some(&conn));
+        assert_eq!((hints.ra, hints.dec), (Some(123.45), Some(67.89)));
+        assert!(matches!(
+            store_result(&conn, 1, &mk_result(1, 800, 0.001, 1.9, 1.0), None, &cfg).unwrap(),
+            StoreOutcome::RejectedLowConfidence { .. }
+        ));
+        let position: (f64, f64, i64) = conn
+            .query_row("SELECT ra,dec,override FROM frames WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(position, (123.45, 67.89, 1));
+        assert_eq!(
+            crate::plate_solve::storage::get_plate_solve(&conn, 1)
+                .unwrap()
+                .unwrap()
+                .crval1,
+            123.45
+        );
+    }
+
     /// A blind solve that lands on six matches is noise, and the app must
     /// refuse it even though the solver returned it. Real numbers, from a
     /// DSLR frame with no FOCALLEN/XPIXSZ in its header (so the scale check
