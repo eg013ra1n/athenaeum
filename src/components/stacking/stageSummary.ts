@@ -320,6 +320,20 @@ export function stableStringify(value: unknown): string {
   return JSON.stringify(sortKeysDeep(value));
 }
 
+/**
+ * Every field except `paths` — the preset comparison (`StackingTab`'s
+ * toolbar selector and, Plan 5b Task 5, `StackingSection`'s global-defaults
+ * selector) ignores the folder override, which is never part of what makes
+ * a config "Default"/"Fast preview"/"Maximum quality" (Task 3 "Decisions"
+ * item 3). Exported here (moved out of `StackingTab.tsx`, which now imports
+ * it) so the two preset selectors share one implementation instead of a
+ * second hand copy.
+ */
+export function withoutPaths(config: StackingConfig): Omit<StackingConfig, 'paths'> {
+  const { paths: _paths, ...rest } = config;
+  return rest;
+}
+
 function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === 'object') {

@@ -2,13 +2,14 @@ import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
-import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, UserCircle, ArrowLeftRight } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, UserCircle, ArrowLeftRight, SquareStack } from 'lucide-react';
 import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import LoggingSettings from '../components/settings/LoggingSettings';
 import AccountSection from '../components/settings/AccountSection';
 import SyncSection from '../components/settings/SyncSection';
 import TransfersSection from '../components/settings/TransfersSection';
+import StackingSection from '../components/settings/StackingSection';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
@@ -86,9 +87,9 @@ export default function Settings() {
   // "Open Plate-Solve Settings" CTA on the index-missing modal) land on the
   // right tab without an extra click.
   const [searchParams, setSearchParams] = useSearchParams();
-  type SettingsTab = 'general' | 'transfers' | 'calibration' | 'analysis' | 'plate_solving';
+  type SettingsTab = 'general' | 'transfers' | 'stacking' | 'calibration' | 'analysis' | 'plate_solving';
   const tabFromUrl = (searchParams.get('tab') ?? '') as SettingsTab | '';
-  const validTabs: readonly SettingsTab[] = ['general', 'transfers', 'calibration', 'analysis', 'plate_solving'];
+  const validTabs: readonly SettingsTab[] = ['general', 'transfers', 'stacking', 'calibration', 'analysis', 'plate_solving'];
   const initialTab: SettingsTab = validTabs.includes(tabFromUrl as SettingsTab)
     ? (tabFromUrl as SettingsTab)
     : 'general';
@@ -604,6 +605,17 @@ export default function Settings() {
           Transfers
         </button>
         <button
+          onClick={() => setActiveTab('stacking')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'stacking'
+              ? 'bg-surface-elevated text-white border-b-2 border-accent'
+              : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'
+          }`}
+        >
+          <SquareStack size={18} />
+          Stacking
+        </button>
+        <button
           onClick={() => setActiveTab('calibration')}
           className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
             activeTab === 'calibration'
@@ -650,6 +662,23 @@ export default function Settings() {
             Where transfers keep their working data, how fast they may upload, how many may arrive at once.
           </p>
           <TransfersSection />
+        </div>
+      )}
+
+      {/* Stacking Tab — global pipeline defaults (every frame set with no
+          stored override runs this) plus the two default working/output
+          folders. Per-set overrides live on each frame set's own Stacking
+          tab. */}
+      {activeTab === 'stacking' && (
+        <div className="mb-6 bg-surface-elevated rounded-lg p-6">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <SquareStack size={20} />
+            Stacking
+          </h3>
+          <p className="text-xs text-content-muted mb-4">
+            Pipeline defaults and the two default folders every frame set uses unless it sets its own.
+          </p>
+          <StackingSection />
         </div>
       )}
 

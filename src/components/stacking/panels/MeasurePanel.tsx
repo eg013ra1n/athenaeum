@@ -63,8 +63,11 @@ export interface MeasurePanelProps {
   onChange: (next: StackingConfig) => void;
   disabled?: boolean;
   defaults: StackingConfig;
-  onRemeasure: () => void;
-  remeasureDisabled: boolean;
+  /** Absent in `StageInspector`'s `'global'` mode (Settings → Stacking has
+   *  no run to re-measure) — the button is hidden entirely rather than
+   *  rendered disabled with nothing to call. */
+  onRemeasure?: () => void;
+  remeasureDisabled?: boolean;
 }
 
 export function MeasurePanel({
@@ -250,21 +253,23 @@ export function MeasurePanel({
         </label>
       </div>
 
-      <div className="pt-3 border-t border-border/60">
-        <button
-          type="button"
-          onClick={onRemeasure}
-          disabled={remeasureDisabled}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-            remeasureDisabled
-              ? 'bg-surface text-content-muted cursor-not-allowed'
-              : 'bg-accent text-surface hover:bg-accent-hover'
-          }`}
-        >
-          <RefreshCw size={14} />
-          Re-measure
-        </button>
-      </div>
+      {onRemeasure && (
+        <div className="pt-3 border-t border-border/60">
+          <button
+            type="button"
+            onClick={onRemeasure}
+            disabled={remeasureDisabled}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+              remeasureDisabled
+                ? 'bg-surface text-content-muted cursor-not-allowed'
+                : 'bg-accent text-surface hover:bg-accent-hover'
+            }`}
+          >
+            <RefreshCw size={14} />
+            Re-measure
+          </button>
+        </div>
+      )}
     </div>
   );
 }

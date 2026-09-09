@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Play, Square, ChevronDown, FolderOpen, AlertTriangle, Loader2 } from 'lucide-react';
+import { Play, Square, ChevronDown, ChevronRight, FolderOpen, AlertTriangle, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
@@ -18,12 +18,14 @@ import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
 import { FramesTable, type LightFrameRef } from './FramesTable';
 import { ResultsPanel } from './ResultsPanel';
-import { stableStringify, type BoardStage } from './stageSummary';
+import { stableStringify, withoutPaths, type BoardStage } from './stageSummary';
 import {
   readSelectedStage,
   writeSelectedStage,
   readFramesCollapsed,
   writeFramesCollapsed,
+  readInspectorCollapsed,
+  writeInspectorCollapsed,
 } from './stackingPrefs';
 
 export interface StackingTabProps {
@@ -59,15 +61,6 @@ function formatGB(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
-/** Every field except `paths` — the preset comparison (and `applyPreset`)
- *  ignore the per-set folder override, which is never part of what makes a
- *  config "Default"/"Fast preview"/"Maximum quality" (plan 5b Task 3
- *  "Decisions" item 3). */
-function withoutPaths(config: StackingConfig): Omit<StackingConfig, 'paths'> {
-  const { paths: _paths, ...rest } = config;
-  return rest;
-}
-
 /**
  * The Stacking tab (spec §11) — plans, configures, runs and watches an M1
  * stacking run for one frame set. Owns the plan fetch, the (unsaved) config
@@ -98,6 +91,12 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const [rerunMenuOpen, setRerunMenuOpen] = useState(false);
   const [presetMenuOpen, setPresetMenuOpen] = useState(false);
   const [framesCollapsed, setFramesCollapsed] = useState<boolean>(readFramesCollapsed);
+  // Task 5, Decisions item 3: below the `lg` breakpoint the inspector moves
+  // under the board as its own collapsible disclosure (the board/inspector
+  // side-by-side split no longer has the width for both) — same
+  // collapsed/expanded convention as the Frames table above, persisted the
+  // same way.
+  const [inspectorCollapsed, setInspectorCollapsed] = useState<boolean>(readInspectorCollapsed);
   // Lifted up from `ResultsPanel` (a sibling of `FramesTable`, not its
   // parent) so the Frames table can join its rows against the Results
   // panel's currently-selected run without either component reaching into
@@ -163,6 +162,14 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     setFramesCollapsed((prev) => {
       const next = !prev;
       writeFramesCollapsed(next);
+      return next;
+    });
+  }, []);
+
+  const handleToggleInspectorCollapsed = useCallback(() => {
+    setInspectorCollapsed((prev) => {
+      const next = !prev;
+      writeInspectorCollapsed(next);
       return next;
     });
   }, []);
@@ -682,17 +689,34 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
           </div>
         </div>
 
-        <div className="lg:w-[38%] min-w-0">
-          <StageInspector
-            stage={selectedStage}
-            config={draftConfig}
-            onChange={handleConfigChange}
-            plan={plan}
-            disabled={running || starting}
-            presetDefault={presets.default}
-            onRemeasure={handleRemeasure}
-            remeasureDisabled={remeasureDisabled}
-          />
+        <div className="lg:w-[38%] min-w-0 space-y-2">
+          {/* Below `lg` only: a summary button naming the selected stage,
+           *  toggling the panel below it — `lg` and up hides this button
+           *  entirely and the panel is always shown (Task 2/3's original
+           *  side-by-side shape, unchanged). One `StageInspector` mount
+           *  either way, so a panel with its own fetch on mount (Output's
+           *  `get_stacking_paths`) never runs twice. */}
+          <button
+            type="button"
+            onClick={handleToggleInspectorCollapsed}
+            aria-expanded={!inspectorCollapsed}
+            className="lg:hidden w-full flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-surface-elevated text-sm font-medium text-content hover:text-content-secondary transition-colors"
+          >
+            {inspectorCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            {STAGE_LABEL[selectedStage]}
+          </button>
+          <div className={`${inspectorCollapsed ? 'hidden' : 'block'} lg:block`}>
+            <StageInspector
+              stage={selectedStage}
+              config={draftConfig}
+              onChange={handleConfigChange}
+              plan={plan}
+              disabled={running || starting}
+              presetDefault={presets.default}
+              onRemeasure={handleRemeasure}
+              remeasureDisabled={remeasureDisabled}
+            />
+          </div>
         </div>
       </div>
 

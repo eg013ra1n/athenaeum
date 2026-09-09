@@ -76,6 +76,31 @@ export function writeFramesCollapsed(collapsed: boolean): void {
   }
 }
 
+/** localStorage key for the inspector's collapsed state below the `lg`
+ *  breakpoint (Task 5, Decisions item 3). */
+export const STACKING_INSPECTOR_COLLAPSED_KEY = 'athenaeum.stacking.inspectorCollapsed';
+
+/** Read whether the (narrow-layout) inspector disclosure is collapsed
+ *  (default `false` — expanded — when unset/corrupt, matching the Frames
+ *  table's own default above). */
+export function readInspectorCollapsed(): boolean {
+  try {
+    return localStorage.getItem(STACKING_INSPECTOR_COLLAPSED_KEY) === 'true';
+  } catch (err) {
+    console.warn('[stackingPrefs] read inspector-collapsed failed:', err);
+    return false;
+  }
+}
+
+/** Persist whether the (narrow-layout) inspector disclosure is collapsed. */
+export function writeInspectorCollapsed(collapsed: boolean): void {
+  try {
+    localStorage.setItem(STACKING_INSPECTOR_COLLAPSED_KEY, String(collapsed));
+  } catch (err) {
+    console.warn('[stackingPrefs] write inspector-collapsed failed:', err);
+  }
+}
+
 /** localStorage key prefix for the Results panel's last-selected run — one
  *  entry per frame set (a run id from one set is meaningless for another,
  *  unlike the selected stage, which is one global preference). */

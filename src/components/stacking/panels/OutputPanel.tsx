@@ -21,13 +21,24 @@ export interface OutputPanelProps {
   onChange: (next: StackingConfig) => void;
   plan: StackingPlan | null;
   disabled?: boolean;
+  /** Task 5: `'global'` is `StackingSection`'s usage (Settings → Stacking) —
+   *  a per-set folder OVERRIDE is meaningless against the global defaults
+   *  themselves (`config.paths` stays `null`/`null` there; the two DEFAULT
+   *  folders are their own cards elsewhere on that page), so the two
+   *  override cards below and their picker modal are hidden, and the
+   *  `get_stacking_paths` fetch that only feeds their "Default: …" line is
+   *  skipped. Cleanup policy and format are unaffected — they still apply
+   *  to the global default. Defaults to `'perSet'`, Task 3/4's unchanged
+   *  behavior. */
+  mode?: 'perSet' | 'global';
 }
 
-export function OutputPanel({ config, onChange, plan, disabled }: OutputPanelProps) {
+export function OutputPanel({ config, onChange, plan, disabled, mode = 'perSet' }: OutputPanelProps) {
   const [globalPaths, setGlobalPaths] = useState<StackingPaths | null>(null);
   const [browsing, setBrowsing] = useState<'working' | 'output' | null>(null);
 
   useEffect(() => {
+    if (mode === 'global') return;
     let cancelled = false;
     (async () => {
       try {
@@ -38,7 +49,7 @@ export function OutputPanel({ config, onChange, plan, disabled }: OutputPanelPro
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [mode]);
 
   const setPath = (which: 'workingDir' | 'outputDir', value: string | null) => {
     onChange({ ...config, paths: { ...config.paths, [which]: value } });
@@ -74,24 +85,28 @@ export function OutputPanel({ config, onChange, plan, disabled }: OutputPanelPro
 
   return (
     <div className="space-y-3">
-      <FolderCard
-        title="Working folder"
-        hint="Where this run stages registered/intermediate frames."
-        setting={workingSetting}
-        onChoose={() => choose('working')}
-        onReset={() => setPath('workingDir', null)}
-        error={null}
-        busy={!!disabled}
-      />
-      <FolderCard
-        title="Output folder"
-        hint="Where this run writes its master(s)."
-        setting={outputSetting}
-        onChoose={() => choose('output')}
-        onReset={() => setPath('outputDir', null)}
-        error={null}
-        busy={!!disabled}
-      />
+      {mode === 'perSet' && (
+        <>
+          <FolderCard
+            title="Working folder"
+            hint="Where this run stages registered/intermediate frames."
+            setting={workingSetting}
+            onChoose={() => choose('working')}
+            onReset={() => setPath('workingDir', null)}
+            error={null}
+            busy={!!disabled}
+          />
+          <FolderCard
+            title="Output folder"
+            hint="Where this run writes its master(s)."
+            setting={outputSetting}
+            onChoose={() => choose('output')}
+            onReset={() => setPath('outputDir', null)}
+            error={null}
+            busy={!!disabled}
+          />
+        </>
+      )}
 
       <div>
         <label className="block text-xs text-content-secondary mb-1">Cleanup policy</label>

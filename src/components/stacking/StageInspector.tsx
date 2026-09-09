@@ -27,9 +27,20 @@ export interface StageInspectorProps {
    *  5b Task 3 "Decisions" item 1). */
   presetDefault: StackingConfig;
   /** Measure panel's "Re-measure" button (`startRun(setId, config,
-   *  'measure')`), wired by `StackingTab` since it needs `useStackingContext`. */
-  onRemeasure: () => void;
-  remeasureDisabled: boolean;
+   *  'measure')`), wired by `StackingTab` since it needs `useStackingContext`.
+   *  Task 5: `StackingSection` (Settings → Stacking) binds this inspector to
+   *  the GLOBAL defaults, which have no run to re-measure — both props are
+   *  absent there, and `MeasurePanel` hides the button entirely rather than
+   *  rendering it disabled with nothing to call. */
+  onRemeasure?: () => void;
+  remeasureDisabled?: boolean;
+  /** Task 5: `'perSet'` (default) is the frame-set Stacking tab's own usage,
+   *  unchanged from Task 3/4. `'global'` is `StackingSection`'s usage —
+   *  `config.paths` stays `null`/`null` in the saved global defaults (a
+   *  per-set folder OVERRIDE is meaningless there), so the Output panel
+   *  hides its two folder-override cards; everything else in every panel
+   *  (including Output's cleanup policy / format) is unchanged. */
+  mode?: 'perSet' | 'global';
 }
 
 const STAGE_TITLE: Record<BoardStage, string> = {
@@ -53,6 +64,7 @@ export function StageInspector({
   presetDefault,
   onRemeasure,
   remeasureDisabled,
+  mode = 'perSet',
 }: StageInspectorProps) {
   return (
     <div className="bg-surface-elevated rounded-lg p-4 h-full">
@@ -85,7 +97,7 @@ export function StageInspector({
       )}
       {stage === 'drizzle' && <DrizzlePanel config={config} />}
       {stage === 'output' && (
-        <OutputPanel config={config} onChange={onChange} plan={plan} disabled={disabled} />
+        <OutputPanel config={config} onChange={onChange} plan={plan} disabled={disabled} mode={mode} />
       )}
     </div>
   );
