@@ -23,7 +23,7 @@
 //! `api/calibration.rs` inner-fn precedent); the public handler is a thin
 //! `ctx` → `conn` wrapper.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection};
@@ -93,6 +93,37 @@ pub struct ExportReadiness {
     /// always have.
     pub missing_raw_calibration_files: i64,
     pub file_counts: ExportFileCounts,
+    /// Plan 5b Task 8 (owner requirement 2026-09-09 — "the pipeline builds
+    /// its own masters"): the `raw_set_ids_without_master` subset the
+    /// stacking pipeline's stage 0.5 CAN build — every member frame's
+    /// `files.path` exists on disk and the set has at least
+    /// [`crate::api::masters::MIN_MASTER_FRAMES`] members. `Vec<i64>`, not a
+    /// blocker: the calibrated-lights EXPORT gate ([`check_mode_ready`])
+    /// still treats every id in `raw_set_ids_without_master` as blocking —
+    /// only the stacking plan's own gate (`stacking::plan::build_plan`)
+    /// reads this split.
+    #[serde(default)]
+    pub raw_sets_buildable: Vec<i64>,
+    /// The `raw_set_ids_without_master` subset that CANNOT be built right
+    /// now, with why (`"fewer than N frames"` / `"N of M raw frames missing
+    /// on disk"` / `"archived — restore first"`). Every id here is also a
+    /// `raw_set_ids_without_master` entry — this is a reason breakdown of
+    /// that same list, not a separate tally.
+    #[serde(default)]
+    pub raw_sets_unbuildable: Vec<(i64, String)>,
+    /// Master `calibration_set` ids among the resolved masters counted by
+    /// `missing_master_files` whose file the stacking pipeline's stage 0.5
+    /// CAN rebuild: a `master_provenance` row exists and
+    /// [`crate::api::masters::check_rebuild_source_ready`] passes for its
+    /// source set.
+    #[serde(default)]
+    pub masters_rebuildable: Vec<i64>,
+    /// The missing-master subset that CANNOT be rebuilt, with why (`"no
+    /// provenance"` when the master was not built by Athenaeum, else the
+    /// `check_rebuild_source_ready` failure text — archived originals or
+    /// missing source frames).
+    #[serde(default)]
+    pub masters_unrebuildable: Vec<(i64, String)>,
 }
 
 // ── Membership ──────────────────────────────────────────────────────────────
@@ -225,7 +256,12 @@ pub(crate) fn compute_export_readiness(
     // reads it in that case, so a bias file gone from disk must not block a
     // run that would never touch it.
     let mut unlinked_lights = 0i64;
-    let mut master_paths: BTreeSet<PathBuf> = BTreeSet::new();
+    // Path -> the MASTER calibration_set id that path belongs to
+    // (`ResolvedMaster::set_id`) — Plan 5b Task 8 needs the id, not just the
+    // path, to classify a missing master as rebuildable or not; a `BTreeMap`
+    // keeps the same distinct-by-path dedup the old `BTreeSet<PathBuf>` gave
+    // (two different master sets never share one on-disk file).
+    let mut master_paths: BTreeMap<PathBuf, i64> = BTreeMap::new();
     for (frame_id, _filename) in members {
         let links = get_links_for_frame(conn, frame_id)?;
         if links.is_empty() {
@@ -233,30 +269,29 @@ pub(crate) fn compute_export_readiness(
             continue;
         }
 
-        let dark_path = match link_set_id(&links, "Dark") {
+        let dark = match link_set_id(&links, "Dark") {
             Some(set_id) => resolve_master(conn, set_id)
-                .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
-                .map(|m| PathBuf::from(m.path)),
+                .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?,
             None => None,
         };
-        if let Some(p) = &dark_path {
-            master_paths.insert(p.clone());
+        if let Some(m) = &dark {
+            master_paths.insert(PathBuf::from(&m.path), m.set_id);
         }
 
         if let Some(set_id) = link_set_id(&links, "Flat") {
             if let Some(master) = resolve_master(conn, set_id)
                 .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
             {
-                master_paths.insert(PathBuf::from(master.path));
+                master_paths.insert(PathBuf::from(master.path), master.set_id);
             }
         }
 
-        if dark_path.is_none() {
+        if dark.is_none() {
             if let Some(set_id) = link_set_id(&links, "Bias") {
                 if let Some(master) = resolve_master(conn, set_id)
                     .map_err(|e| ApiError::Internal(format!("resolve master {set_id}: {e:#}")))?
                 {
-                    master_paths.insert(PathBuf::from(master.path));
+                    master_paths.insert(PathBuf::from(master.path), master.set_id);
                 }
             }
         }
@@ -266,16 +301,39 @@ pub(crate) fn compute_export_readiness(
     // `error!(path = …)`); the export path was silently discarding the paths
     // after counting them, leaving no way — UI or log — to learn which master
     // to restore.
-    let missing_master_files = master_paths
+    let missing_masters: Vec<(&PathBuf, i64)> = master_paths
         .iter()
-        .filter(|p| {
+        .filter(|(p, _)| {
             let missing = std::fs::metadata(p).is_err();
             if missing {
                 tracing::warn!(path = %p.display(), "master file missing on disk");
             }
             missing
         })
-        .count() as i64;
+        .map(|(p, &id)| (p, id))
+        .collect();
+    let missing_master_files = missing_masters.len() as i64;
+
+    // Plan 5b Task 8: which of those missing masters stage 0.5 can rebuild —
+    // `master_provenance` row + `check_rebuild_source_ready` Ok for its
+    // source set (decision 3: reuses the SAME manual-rebuild precondition).
+    let mut masters_rebuildable: Vec<i64> = Vec::new();
+    let mut masters_unrebuildable: Vec<(i64, String)> = Vec::new();
+    for (_, master_set_id) in &missing_masters {
+        match classify_master_rebuildability(conn, *master_set_id) {
+            Ok(None) => masters_rebuildable.push(*master_set_id),
+            Ok(Some(reason)) => masters_unrebuildable.push((*master_set_id, reason)),
+            Err(error) => {
+                tracing::warn!(
+                    master_set_id = *master_set_id,
+                    %error,
+                    "stacking: failed to classify missing master rebuildability; treating as unrebuildable"
+                );
+                masters_unrebuildable
+                    .push((*master_set_id, format!("could not be checked: {error}")));
+            }
+        }
+    }
 
     let data = crate::export::collect_export_data(conn, set_id)
         .map_err(|e| ApiError::Internal(format!("collect export data for readiness: {e:#}")))?;
@@ -294,12 +352,36 @@ pub(crate) fn compute_export_readiness(
             .missing_originals
             .len() as i64;
 
+    // Plan 5b Task 8: which of `raw_set_ids_without_master` stage 0.5 can
+    // build right now — every member frame on disk and at least
+    // `MIN_MASTER_FRAMES` of them (decision 3).
+    let mut raw_sets_buildable: Vec<i64> = Vec::new();
+    let mut raw_sets_unbuildable: Vec<(i64, String)> = Vec::new();
+    for &raw_set_id in &raw_set_ids_without_master {
+        match classify_raw_set_buildability(conn, raw_set_id) {
+            Ok(None) => raw_sets_buildable.push(raw_set_id),
+            Ok(Some(reason)) => raw_sets_unbuildable.push((raw_set_id, reason)),
+            Err(error) => {
+                tracing::warn!(
+                    raw_set_id,
+                    %error,
+                    "stacking: failed to classify raw calibration set buildability; treating as unbuildable"
+                );
+                raw_sets_unbuildable.push((raw_set_id, format!("could not be checked: {error}")));
+            }
+        }
+    }
+
     tracing::debug!(
         set_id,
         total,
         unlinked_lights,
         raw_sets = raw_set_ids_without_master.len(),
+        raw_sets_buildable = raw_sets_buildable.len(),
+        raw_sets_unbuildable = raw_sets_unbuildable.len(),
         missing_master_files,
+        masters_rebuildable = masters_rebuildable.len(),
+        masters_unrebuildable = masters_unrebuildable.len(),
         missing_raw_calibration_files,
         "export readiness computed"
     );
@@ -311,7 +393,85 @@ pub(crate) fn compute_export_readiness(
         missing_master_files,
         missing_raw_calibration_files,
         file_counts,
+        raw_sets_buildable,
+        raw_sets_unbuildable,
+        masters_rebuildable,
+        masters_unrebuildable,
     })
+}
+
+// ── Plan 5b Task 8: buildable/rebuildable classification ────────────────────
+
+/// Whether raw calibration set `raw_set_id` (already known to have no built
+/// master — a `raw_set_ids_without_master` entry) can be built by the
+/// stacking pipeline's stage 0.5 right now. `Ok(None)` = buildable; `Ok(Some(reason))`
+/// names why not, in priority order: too few members, then archived, then
+/// plain missing — matching [`crate::api::masters::check_rebuild_source_ready`]'s
+/// own archived-vs-missing distinction for a rebuild's source set.
+fn classify_raw_set_buildability(
+    conn: &Connection,
+    raw_set_id: i64,
+) -> Result<Option<String>, ApiError> {
+    let frame_count: i64 = conn.query_row(
+        "SELECT frame_count FROM calibration_set WHERE id = ?1",
+        [raw_set_id],
+        |r| r.get(0),
+    )?;
+    if frame_count < crate::api::masters::MIN_MASTER_FRAMES {
+        return Ok(Some(format!(
+            "fewer than {} frames",
+            crate::api::masters::MIN_MASTER_FRAMES
+        )));
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT fi.path, fi.archived_in_operation FROM calibration_set_frames csf
+         JOIN frames f ON f.id = csf.frame_id
+         JOIN files fi ON fi.id = f.file_id
+         WHERE csf.set_id = ?1",
+    )?;
+    let rows: Vec<(String, Option<i64>)> = stmt
+        .query_map([raw_set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total = rows.len();
+    let missing: Vec<&(String, Option<i64>)> = rows
+        .iter()
+        .filter(|(p, _)| !std::path::Path::new(p).exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    if missing.iter().any(|(_, archived)| archived.is_some()) {
+        return Ok(Some("archived — restore first".to_string()));
+    }
+    Ok(Some(format!(
+        "{} of {total} raw frames missing on disk",
+        missing.len()
+    )))
+}
+
+/// Whether missing master `master_set_id` can be rebuilt by the stacking
+/// pipeline's stage 0.5 right now: a `master_provenance` row must exist, and
+/// its source set must pass [`crate::api::masters::check_rebuild_source_ready`] —
+/// the SAME precondition the manual "Rebuild" action uses, so the readiness
+/// split and a manual rebuild attempt never disagree.
+fn classify_master_rebuildability(
+    conn: &Connection,
+    master_set_id: i64,
+) -> Result<Option<String>, ApiError> {
+    let Some(prov) = crate::db::master_provenance::get(conn, master_set_id).map_err(|e| {
+        ApiError::Internal(format!("read master provenance {master_set_id}: {e:#}"))
+    })?
+    else {
+        return Ok(Some("no provenance".to_string()));
+    };
+    let Some(source_set_id) = prov.source_set_id else {
+        return Ok(Some("no provenance".to_string()));
+    };
+    match crate::api::masters::check_rebuild_source_ready(conn, source_set_id) {
+        Ok(()) => Ok(None),
+        Err(e) => Ok(Some(e.to_string())),
+    }
 }
 
 /// Export/send readiness for every mode in one call (spec 2026-08-28 §5, v2
@@ -633,6 +793,10 @@ mod tests {
             missing_master_files: 0,
             missing_raw_calibration_files: 0,
             file_counts: Default::default(),
+            raw_sets_buildable: vec![],
+            raw_sets_unbuildable: vec![],
+            masters_rebuildable: vec![],
+            masters_unrebuildable: vec![],
         };
         for mode in [
             ExportMode::LightsOnly,
@@ -836,6 +1000,101 @@ mod tests {
         assert!(check_mode_ready(&r, ExportMode::RawWithCalibrationSets).is_ok());
     }
 
+    /// A raw (non-master) calibration set with `n` member frames whose files
+    /// ACTUALLY EXIST on disk and whose `frame_count` column matches `n` —
+    /// unlike `seed_raw_set_with_frames` (fabricated, never-written paths,
+    /// `frame_count` left at the schema default of 0), this is the shape
+    /// `classify_raw_set_buildability` calls buildable.
+    fn seed_raw_set_real_files(
+        conn: &Connection,
+        dir: &std::path::Path,
+        set_id: i64,
+        imagetyp: &str,
+        n: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library, frame_count)
+             VALUES (?1, ?2, '2026-09-09', 0, ?3)",
+            params![set_id, imagetyp, n],
+        )
+        .unwrap();
+        for i in 0..n {
+            let file_id = set_id * 100 + i + 7_000_000;
+            let frame_id = set_id * 100 + i + 7_500_000;
+            let path = dir.join(format!("{imagetyp}_{set_id}_{i}.fits"));
+            std::fs::write(&path, b"raw sub-frame bytes").unwrap();
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2026-09-09T00:00:00Z', 'FITS')",
+                params![
+                    file_id,
+                    path.to_string_lossy(),
+                    format!("{imagetyp}_{set_id}_{i}.fits")
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+                params![frame_id, file_id, imagetyp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// Plan 5b Task 8 (owner requirement 2026-09-09), decision 3: a raw set
+    /// with every member frame on disk and at least `MIN_MASTER_FRAMES` is
+    /// `raw_sets_buildable`; one with a missing member is
+    /// `raw_sets_unbuildable`, and the reason names the count — the stacking
+    /// plan's own gate reads this split instead of blocking on
+    /// `raw_sets_without_master` outright.
+    #[test]
+    fn raw_set_buildability_splits_by_frames_on_disk() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_light(&conn, 2, session);
+        seed_masters(&conn);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let buildable = seed_raw_set_real_files(&conn, tmp.path(), 300, "Dark", 3);
+        add_link(&conn, 1, buildable, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+
+        let unbuildable = seed_raw_set_real_files(&conn, tmp.path(), 301, "Dark", 3);
+        // A real gap — one member's file removed after seeding — not a
+        // never-written placeholder.
+        std::fs::remove_file(tmp.path().join("Dark_301_1.fits")).unwrap();
+        add_link(&conn, 2, unbuildable, "Dark");
+        add_link(&conn, 2, 101, "Flat");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.raw_set_ids_without_master, vec![300, 301]);
+        assert_eq!(
+            r.raw_sets_buildable,
+            vec![300],
+            "{:?}",
+            r.raw_sets_buildable
+        );
+        assert_eq!(
+            r.raw_sets_unbuildable.len(),
+            1,
+            "{:?}",
+            r.raw_sets_unbuildable
+        );
+        assert_eq!(r.raw_sets_unbuildable[0].0, unbuildable);
+        assert!(
+            r.raw_sets_unbuildable[0].1.contains("1 of 3"),
+            "{:?}",
+            r.raw_sets_unbuildable
+        );
+    }
+
     /// A BUILT master set (`is_master_library = 1`) with one real member frame
     /// whose file lives at `path` — real enough for `resolve_master` to return
     /// `Some`, so the C-2 missing-file stat has something to stat (`seed_masters`'
@@ -904,6 +1163,69 @@ mod tests {
         ] {
             assert!(check_mode_ready(&r, mode).is_ok(), "{mode:?}");
         }
+    }
+
+    /// Plan 5b Task 8 (owner requirement 2026-09-09), decision 3: a missing
+    /// master with a `master_provenance` row AND a source set whose frames
+    /// are all on disk is `masters_rebuildable`; a missing master with no
+    /// provenance row at all (imported, or built outside the app) is
+    /// `masters_unrebuildable`, reason `"no provenance"` — the stacking
+    /// plan's own gate reads this split instead of blocking on
+    /// `missing_master_files` outright.
+    #[test]
+    fn master_rebuildability_splits_by_provenance() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_light(&conn, 2, session);
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Rebuildable: provenance row + real source frames on disk, master
+        // FILE missing (never written — same "archived or moved" shape as
+        // `missing_master_file_blocks_calibrated_mode`).
+        let rebuildable_master = 400;
+        let rebuildable_path = tmp.path().join("master_dark_rebuildable.fits");
+        seed_master_with_file(&conn, rebuildable_master, "MasterDark", &rebuildable_path);
+        let source = seed_raw_set_real_files(&conn, tmp.path(), 401, "Dark", 3);
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: rebuildable_master,
+                source_set_id: Some(source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, rebuildable_master, "Dark");
+
+        // Unrebuildable: master FILE missing, no provenance row at all.
+        let unrebuildable_master = 402;
+        let unrebuildable_path = tmp.path().join("master_dark_unrebuildable.fits");
+        seed_master_with_file(
+            &conn,
+            unrebuildable_master,
+            "MasterDark",
+            &unrebuildable_path,
+        );
+        add_link(&conn, 2, unrebuildable_master, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 2);
+        assert_eq!(
+            r.masters_rebuildable,
+            vec![rebuildable_master],
+            "{:?}",
+            r.masters_rebuildable
+        );
+        assert_eq!(
+            r.masters_unrebuildable,
+            vec![(unrebuildable_master, "no provenance".to_string())],
+            "{:?}",
+            r.masters_unrebuildable
+        );
     }
 
     /// Review fix #1: a light linked to a resolved master Dark AND a master

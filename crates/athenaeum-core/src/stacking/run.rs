@@ -66,10 +66,10 @@ use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, is_fresh, measurement_hash_for, registration_hash_for, registration_row_is_fresh,
-    HashMemo, Stage,
+    HashMemo, MasterWork, PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
-    RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
+    MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
 use crate::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, to_record,
@@ -182,6 +182,11 @@ pub(crate) struct RunContext {
     pub(crate) config: StackingConfig,
     pub(crate) hash: String,
     pub(crate) plan_groups: Vec<IntegrationGroup>,
+    /// Stage 0.5's work list (spec §2 row 0.5, owner requirement 2026-09-09),
+    /// as resolved by the plan gate at `start_stacking` time — the SAME list
+    /// `stage_masters` executes, in order. Empty when there is nothing to
+    /// build or rebuild.
+    pub(crate) masters_to_build: Vec<PlanMaster>,
     /// Manually-excluded frame ids (spec §9.1's `stacking_set_config.excluded_frame_ids`,
     /// already resolved by the plan gate) — a frame in here is skipped by
     /// every stage, never calibrated/measured/registered/integrated.
@@ -570,6 +575,7 @@ pub fn start_stacking(
             scale_estimator: plan.config.normalization.scale_estimator,
         },
         groups: Vec::new(),
+        masters_built: Vec::new(),
         stages: Vec::new(),
         warnings: Vec::new(),
         error: None,
@@ -584,6 +590,7 @@ pub fn start_stacking(
         config: plan.config,
         hash: plan.config_hash,
         plan_groups,
+        masters_to_build: plan.masters_to_build,
         excluded: plan.excluded_frame_ids,
         group_ids,
         layout,
@@ -815,6 +822,13 @@ fn run_pipeline(rc: &mut RunContext) -> Result<(), RunError> {
         set_run_status(&conn, rc.run_id, "running")?;
     }
 
+    stage_masters(rc)?;
+
+    #[cfg(test)]
+    if rc.fail_after_stage == Some(Stage::Masters) {
+        panic!("injected test failure after stage masters");
+    }
+
     stage_calibrate(rc)?;
 
     #[cfg(test)]
@@ -844,6 +858,149 @@ fn run_pipeline(rc: &mut RunContext) -> Result<(), RunError> {
     }
 
     stage_output(rc)?;
+
+    Ok(())
+}
+
+// ── Stage 0.5: the run builds/rebuilds its own masters ──────────────────────
+//
+// Spec §2 row 0.5, owner requirement 2026-09-09 ("the pipeline should build
+// the calibration masters itself when they are missing"). The plan gate
+// (`stacking::plan::build_plan`) already resolved WHICH masters to build —
+// `RunContext::masters_to_build` is that SAME list, carried over verbatim
+// from `start_stacking`'s own plan (never re-derived here) — this stage just
+// executes it, in order, before calibration ever runs.
+
+/// Build or rebuild every [`PlanMaster`] in `rc.masters_to_build`, in order
+/// (bias/darkflat before dark before flat — the list is already sorted that
+/// way by [`crate::stacking::plan::collect_masters_to_build`]'s
+/// `type_build_rank` sort, mirroring the manual batch-build's own dependency
+/// order). A no-op — no progress event, no timing entry — when there is
+/// nothing to build (`plan.mastersToBuild` empty): most runs never touch
+/// this stage at all.
+///
+/// Runs entirely on THIS thread via [`crate::api::masters::build_master_inline`]
+/// under `Admission::Inherited` — `run_pipeline`'s own `ComputeJobKind::Stacking`
+/// permit (acquired above, held for the whole pipeline) covers the pixel
+/// work, so this never touches the `ComputeQueue` a second time (see
+/// `Admission`'s own doc comment for why a second acquire here would be
+/// wrong, not just redundant).
+///
+/// A build/rebuild failure is FATAL to the whole run (`RunError::Other`) —
+/// the run cannot calibrate a light against a master that was never built;
+/// a cancel (either the run's own cancel flag, checked between items, or one
+/// `build_master_inline` itself observes mid-build) unwinds through
+/// `RunError::Cancelled`, same as every other stage.
+///
+/// A rebuilt master's file changes size/mtime on disk, which the stage-1
+/// hash (`calibration_hash_for`) reads straight back via `resolved_master_paths`
+/// — a light whose calibration plan resolves to a master this stage just
+/// rebuilt therefore computes a DIFFERENT stage-1 hash than any previous
+/// run recorded, so its `calibrated` artifact (if any existed) reads as
+/// stale automatically and stage 1 regenerates it. By design: a rebuilt
+/// master's pixels really did change, so anything calibrated against the
+/// old ones must not be reused as if nothing happened.
+fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
+    let items = rc.masters_to_build.clone();
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let stage_start = Instant::now();
+    let total = items.len();
+
+    for (i, item) in items.iter().enumerate() {
+        rc.check_cancel()?;
+        // Emitted BEFORE the build starts, naming the master about to be
+        // built/rebuilt — a multi-minute integration otherwise leaves the
+        // Stacking tab showing the previous item's label for the whole
+        // duration (research §8's "a multi-minute operation that logs
+        // nothing is indistinguishable from a hung one", same reasoning
+        // `api::masters::log_build_started` was added for).
+        rc.progress(
+            Stage::Masters,
+            None,
+            i + 1,
+            total,
+            0,
+            0,
+            None,
+            Some(item.label.clone()),
+        );
+
+        let item_start = Instant::now();
+
+        // `MasterWork::Build`'s target is `BuildTarget::New` directly — the
+        // item's own `set_id` IS the raw source set. `MasterWork::Rebuild`'s
+        // `set_id` is the MASTER set id (see `PlanMaster`'s doc comment), so
+        // it must be resolved into a `BuildTarget::Rebuild` (+ its own
+        // source set id) first — the SAME resolution the manual "Rebuild"
+        // action uses (`crate::api::masters::rebuild_master`), via the
+        // shared helper both now call.
+        let (source_set_id, target) = match item.kind {
+            MasterWork::Build => (item.set_id, crate::api::masters::BuildTarget::New),
+            MasterWork::Rebuild => {
+                let conn = db(&rc.ctx)?.conn();
+                crate::api::masters::resolve_rebuild_target(&conn, item.set_id).map_err(|e| {
+                    RunError::Other(format!("master build failed for set {}: {e}", item.set_id))
+                })?
+            }
+        };
+
+        let build_result = crate::api::masters::build_master_inline(
+            &rc.ctx,
+            rc.emitter.as_ref(),
+            &rc.app_version,
+            source_set_id,
+            target,
+            &rc.cancel,
+        );
+
+        let master_set_id = match build_result {
+            Ok((id, warning)) => {
+                if let Some(w) = warning {
+                    rc.warnings.push(w);
+                }
+                id
+            }
+            Err(crate::api::masters::BuildStepError::Cancelled) => return Err(RunError::Cancelled),
+            Err(crate::api::masters::BuildStepError::Other(msg)) => {
+                return Err(RunError::Other(format!(
+                    "master build failed for set {}: {msg}",
+                    item.set_id
+                )));
+            }
+        };
+
+        let path = {
+            let conn = db(&rc.ctx)?.conn();
+            crate::api::masters::master_file_path(&conn, master_set_id)?
+                .map(|(_, p)| p)
+                .unwrap_or_default()
+        };
+
+        let duration_ms = item_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            run_id = rc.run_id,
+            set_id = item.set_id,
+            kind = item.kind.as_str(),
+            duration_ms,
+            "master built"
+        );
+
+        rc.summary.masters_built.push(MasterBuilt {
+            set_id: item.set_id,
+            kind: item.kind,
+            master_set_id,
+            path,
+            duration_ms,
+        });
+    }
+
+    rc.timings.push(crate::stacking::provenance::StageTiming {
+        stage: Stage::Masters,
+        duration_ms: stage_start.elapsed().as_millis() as u64,
+    });
 
     Ok(())
 }
@@ -3498,6 +3655,7 @@ pub(crate) fn test_context(
             scale_estimator: config.normalization.scale_estimator,
         },
         groups: Vec::new(),
+        masters_built: Vec::new(),
         stages: Vec::new(),
         warnings: Vec::new(),
         error: None,
@@ -3512,6 +3670,7 @@ pub(crate) fn test_context(
         config,
         hash,
         plan_groups,
+        masters_to_build: Vec::new(),
         excluded: Vec::new(),
         group_ids,
         layout,
@@ -5254,6 +5413,145 @@ mod tests {
             masters[0]["groupKey"].as_str(),
             Some(group.group_key.as_str())
         );
+    }
+
+    // ── Stage 0.5: the run builds/rebuilds its own masters ────────────────
+
+    /// Owner requirement 2026-09-09 ("the pipeline should build the
+    /// calibration masters itself when they are missing"): the Task 6/7
+    /// fixture's TWO master files deleted from disk — provenance rows and
+    /// their real raw source sub-frames intact, via `add_master_dark_and_flat`'s
+    /// real `register_master` registration (Task 8) — `start_stacking`
+    /// rebuilds both inside stage 0.5, BEFORE calibrate, and the run still
+    /// finishes `done`.
+    #[test]
+    fn deleted_masters_are_rebuilt_by_stage_masters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let master_path = |set_id: i64| -> String {
+            fixture
+                .conn
+                .query_row(
+                    "SELECT fi.path FROM calibration_set_frames csf
+                     JOIN frames fr ON fr.id = csf.frame_id
+                     JOIN files fi ON fi.id = fr.file_id
+                     WHERE csf.set_id = ?1",
+                    [set_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let dark_path = master_path(dark_set);
+        let flat_path = master_path(flat_set);
+        // Before: both master files exist (the fixture just wrote them).
+        assert!(
+            Path::new(&dark_path).exists(),
+            "fixture sanity: dark master written"
+        );
+        assert!(
+            Path::new(&flat_path).exists(),
+            "fixture sanity: flat master written"
+        );
+        std::fs::remove_file(&dark_path).unwrap();
+        std::fs::remove_file(&flat_path).unwrap();
+        assert!(!Path::new(&dark_path).exists());
+        assert!(!Path::new(&flat_path).exists());
+
+        let recorder = Arc::new(Recording::new());
+        let started = start_stacking(
+            ctx.clone(),
+            recorder.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("start should succeed");
+
+        wait_for_run(&ctx, started.run_id);
+
+        let run_row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_row.status, "done", "{run_row:?}");
+
+        // After: both masters rebuilt AT THEIR ORIGINAL LIBRARY PATHS.
+        assert!(
+            Path::new(&dark_path).exists(),
+            "dark master must be rebuilt at its original path"
+        );
+        assert!(
+            Path::new(&flat_path).exists(),
+            "flat master must be rebuilt at its original path"
+        );
+
+        // Progress: stage `masters` reports 2/2 before `calibrate` ever ticks.
+        let events = recorder.events(STACKING_PROGRESS_EVENT);
+        let masters_indices: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["stage"].as_str() == Some("masters"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!masters_indices.is_empty(), "no masters progress events");
+        let last_masters = &events[*masters_indices.last().unwrap()];
+        assert_eq!(
+            last_masters["current"].as_u64(),
+            Some(2),
+            "{last_masters:?}"
+        );
+        assert_eq!(last_masters["total"].as_u64(), Some(2), "{last_masters:?}");
+        let first_calibrate_index = events
+            .iter()
+            .position(|e| e["stage"].as_str() == Some("calibrate"))
+            .expect("a calibrate progress event exists");
+        assert!(
+            *masters_indices.last().unwrap() < first_calibrate_index,
+            "masters progress must finish before calibrate starts: masters at {masters_indices:?}, calibrate first at {first_calibrate_index}"
+        );
+
+        // The summary lists two masters_built, one per rebuilt master.
+        let summary: RunSummary = serde_json::from_str(
+            run_row
+                .summary_json
+                .as_deref()
+                .expect("summary_json stored"),
+        )
+        .unwrap();
+        assert_eq!(
+            summary.masters_built.len(),
+            2,
+            "{:?}",
+            summary.masters_built
+        );
+        let rebuilt_master_set_ids: std::collections::HashSet<i64> = summary
+            .masters_built
+            .iter()
+            .map(|m| m.master_set_id)
+            .collect();
+        assert_eq!(
+            rebuilt_master_set_ids,
+            std::collections::HashSet::from([dark_set, flat_set]),
+            "{:?}",
+            summary.masters_built
+        );
+        for m in &summary.masters_built {
+            assert_eq!(m.kind, MasterWork::Rebuild, "{m:?}");
+            assert!(Path::new(&m.path).exists(), "{m:?}");
+        }
     }
 
     #[test]

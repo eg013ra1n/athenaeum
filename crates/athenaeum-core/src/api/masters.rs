@@ -600,7 +600,14 @@ fn load_set_row(conn: &rusqlite::Connection, set_id: i64) -> Result<SetRow, ApiE
 /// `plan_batch` is. Distinguishes "archived" (actionable: restore first)
 /// from "missing" (the file is just gone) when cheap to do so via
 /// `files.archived_in_operation`.
-fn check_rebuild_source_ready(
+///
+/// `pub(crate)`: Plan 5b Task 8's stacking stage 0.5 reuses this SAME check —
+/// both `api::lights::compute_export_readiness` (deciding which missing
+/// masters are `masters_rebuildable`) and `stacking::run::stage_masters`
+/// (the run's own pre-rebuild guard, via [`resolve_rebuild_target`]) must
+/// agree with this function's manual-rebuild precondition on what "ready to
+/// rebuild" means.
+pub(crate) fn check_rebuild_source_ready(
     conn: &rusqlite::Connection,
     source_set_id: i64,
 ) -> Result<(), ApiError> {
@@ -761,8 +768,13 @@ pub fn preview_master_build(
 /// mode into "cancelled" (queue-cancel or mid-integration cancel — both
 /// surface identically to the caller) or "other" (a message suitable for
 /// the `master-build-complete` event's `error` field).
+/// `pub(crate)`: Plan 5b Task 8's `stacking::run::stage_masters` matches on
+/// this directly — a stage-0.5 build failure maps `Cancelled` to
+/// `RunError::Cancelled` and `Other` to `RunError::Other`, the same
+/// distinction [`run_master_build_thread`] draws for the manual build/rebuild
+/// flows.
 #[derive(Debug)]
-enum BuildStepError {
+pub(crate) enum BuildStepError {
     Cancelled,
     Other(String),
 }
@@ -813,7 +825,12 @@ impl From<IntegrationError> for BuildStepError {
 /// identity and every consumer relink from the original registration stay
 /// exactly as they were; only the pixels on disk and the provenance
 /// bookkeeping change.
-enum BuildTarget {
+///
+/// `pub(crate)`: Plan 5b Task 8's `stacking::run::stage_masters` builds these
+/// itself (`New` for a `MasterWork::Build` plan item, the resolved `Rebuild`
+/// from [`resolve_rebuild_target`] for a `MasterWork::Rebuild` one) and passes
+/// them straight into [`build_master_inline`].
+pub(crate) enum BuildTarget {
     New,
     Rebuild {
         master_set_id: i64,
@@ -955,13 +972,32 @@ impl Drop for ClaimGuard {
     }
 }
 
-/// The whole build: acquire queue slot -> load member paths/set row ->
-/// resolve combine/precal -> integrate -> write -> register (or, for a
-/// rebuild, update-in-place — see `BuildTarget`). Every early exit is a
-/// plain `?`/`Err` return — `run_master_build_thread` (the only caller)
-/// always removes the handle and always emits `master-build-complete`
-/// afterward, so there's no cleanup duty here beyond the filename claim,
-/// which `ClaimGuard` releases by RAII on every exit (`?`, `Err`, panic).
+/// Whether [`run_build`] should acquire its own [`crate::services::compute_queue::ComputeQueue`]
+/// permit (`Acquire` — today's behaviour: every manual build/rebuild call
+/// site owns no permit of its own) or trust that its caller already holds
+/// one for the whole operation (`Inherited`). Plan 5b Task 8: the stacking
+/// run acquires ONE `ComputeJobKind::Stacking` permit for its entire
+/// pipeline (`stacking::run::run_pipeline`) before stage 0.5 ever runs, so a
+/// nested `Acquire` here would either deadlock at `compute.max_concurrent ==
+/// 1` (the run's own permit already occupies the one slot) or, above that,
+/// silently let two heavy jobs run at once. `Inherited` must never reach
+/// [`crate::services::compute_queue::ComputeQueue::acquire`] — see the
+/// `admission_inherited_never_acquires` test.
+pub(crate) enum Admission {
+    Acquire,
+    Inherited,
+}
+
+/// The whole build: acquire queue slot (unless `admission` says the caller
+/// already holds one) -> load member paths/set row -> resolve combine/precal
+/// -> integrate -> write -> register (or, for a rebuild, update-in-place —
+/// see `BuildTarget`). Every early exit is a plain `?`/`Err` return —
+/// `run_master_build_thread` (the manual build/rebuild caller) always
+/// removes the handle and always emits `master-build-complete` afterward, so
+/// there's no cleanup duty here beyond the filename claim, which
+/// `ClaimGuard` releases by RAII on every exit (`?`, `Err`, panic).
+/// `build_master_inline` (the stacking-run caller, `Admission::Inherited`)
+/// has no handle/thread/event of its own — see its doc comment.
 ///
 /// On success returns `(master_set_id, build_warning)` — the warning is the
 /// non-fatal "the data had undefined pixels" note (audit C2) that the single
@@ -975,17 +1011,25 @@ fn run_build(
     recipe: &MasterRecipe,
     cancel_flag: &Arc<AtomicBool>,
     target: BuildTarget,
+    admission: Admission,
 ) -> Result<(i64, Option<String>), BuildStepError> {
-    let label = format!("Master build: calibration set {set_id}");
     // Bound (not discarded with `_`) so the permit's Drop — which releases
     // the concurrency slot — fires at the end of THIS function's scope,
     // before `run_master_build_thread` removes the handle / emits the
-    // completion event. Prefixed with `_` only to silence the "never read"
-    // lint; it's still held, just never read.
-    let (_permit, _job_id) = ctx
-        .compute_queue
-        .acquire(ComputeJobKind::MasterBuild, &label, cancel_flag.clone())
-        .map_err(|_queue_cancelled| BuildStepError::Cancelled)?;
+    // completion event. `None` under `Inherited`: there is no second permit
+    // to hold or release — the caller's own permit (the stacking run's
+    // `ComputeJobKind::Stacking` one) already covers this whole call.
+    let _permit = match admission {
+        Admission::Acquire => {
+            let label = format!("Master build: calibration set {set_id}");
+            let (permit, _job_id) = ctx
+                .compute_queue
+                .acquire(ComputeJobKind::MasterBuild, &label, cancel_flag.clone())
+                .map_err(|_queue_cancelled| BuildStepError::Cancelled)?;
+            Some(permit)
+        }
+        Admission::Inherited => None,
+    };
 
     // Named `db_handle` (not `db`) — a local binding named `db` would shadow
     // the `db(ctx)` helper fn for the rest of this scope, breaking the
@@ -1569,6 +1613,7 @@ fn run_master_build_thread(
             &recipe,
             &cancel_flag,
             target,
+            Admission::Acquire,
         )
     })) {
         Ok(r) => r,
@@ -1861,6 +1906,118 @@ pub fn start_master_builds_batch(
     })
 }
 
+/// `files.id`/`files.path` for a calibration set's single member file — the
+/// query [`resolve_rebuild_target`] and Plan 5b Task 8's `stage_masters` both
+/// need after a `New` build to learn where the just-registered master
+/// actually landed. `None` when the set has no member file on record (a
+/// master row that somehow lost its frame link).
+pub(crate) fn master_file_path(
+    conn: &rusqlite::Connection,
+    set_id: i64,
+) -> Result<Option<(i64, String)>, ApiError> {
+    // LIMIT 1: a master is a 1:1 calibration_set by invariant (exactly one
+    // member frame) — same defensive `LIMIT 1` as `select_flat_precal`'s
+    // precal-master lookup.
+    Ok(conn
+        .query_row(
+            "SELECT fi.id, fi.path FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             WHERE csf.set_id = ?1 LIMIT 1",
+            [set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Resolve a [`BuildTarget::Rebuild`] for master set `master_set_id`: the
+/// RAW source set id from its `master_provenance` row, the precondition that
+/// every source member frame is still on disk
+/// ([`check_rebuild_source_ready`]), and the master's own existing file
+/// row/path. The exact three facts a rebuild needs, pulled out of
+/// `rebuild_master`'s own pre-spawn block so Plan 5b Task 8's
+/// `stacking::run::stage_masters` (a `MasterWork::Rebuild` plan item names
+/// the MASTER set id — see `PlanMaster`'s doc comment — not the source one)
+/// can resolve the same target identically instead of re-deriving it.
+pub(crate) fn resolve_rebuild_target(
+    conn: &rusqlite::Connection,
+    master_set_id: i64,
+) -> Result<(i64, BuildTarget), ApiError> {
+    let prov = crate::db::master_provenance::get(conn, master_set_id)?.ok_or_else(|| {
+        ApiError::Invalid(
+            "master was not built by Athenaeum — no provenance recorded, cannot rebuild".into(),
+        )
+    })?;
+    let source_set_id = prov.source_set_id.ok_or_else(|| {
+        ApiError::Invalid(
+            "master was not built by Athenaeum — no source set recorded, cannot rebuild".into(),
+        )
+    })?;
+
+    check_rebuild_source_ready(conn, source_set_id)?;
+
+    let (master_file_id, target_path) =
+        master_file_path(conn, master_set_id)?.ok_or_else(|| {
+            ApiError::NotFound(format!("master set {master_set_id} has no file on record"))
+        })?;
+
+    Ok((
+        source_set_id,
+        BuildTarget::Rebuild {
+            master_set_id,
+            master_file_id,
+            target_path: PathBuf::from(target_path),
+        },
+    ))
+}
+
+/// Stage 0.5 (spec §2 row 0.5, owner requirement 2026-09-09): the validation
+/// `start_master_build`/`rebuild_master` do, PLUS a fresh Auto recipe
+/// resolution, run entirely on the STACKING RUN's own thread —
+/// `admission: Admission::Inherited` (the run's own `ComputeJobKind::Stacking`
+/// permit already covers this call — see [`Admission`]'s doc). No spawned
+/// thread, no `active_master_builds` handle (the stacking run's own cancel
+/// handle, `RunContext::cancel`, already covers cancellation for the whole
+/// pipeline including this stage), no `master-build-complete` event (the
+/// stacking run's own `stacking-progress`/`stacking-complete` events carry
+/// the outcome instead — see `stacking::run::stage_masters`).
+///
+/// `run_build` may still emit `master-build-progress` for this call — its
+/// per-band/per-combine callbacks are unconditional, so a build driven this
+/// way ticks the same event a manual build does. Harmless: nothing in the
+/// Stacking tab listens for `master-build-progress`; the stacking run's own
+/// `masters` progress row is what the UI actually shows.
+///
+/// Returns the master's `calibration_set` id either way — `New`: the
+/// just-registered master (same as `run_build`'s own `New` return); `Rebuild`:
+/// `target`'s own `master_set_id`, echoed back (same as `run_build`'s
+/// `Rebuild` arm) — matching `run_build`'s existing contract, so the caller
+/// never has to branch on `target` to know which id came back.
+pub(crate) fn build_master_inline(
+    ctx: &ServiceContext,
+    emitter: &dyn ProgressEmitter,
+    app_version: &str,
+    set_id: i64,
+    target: BuildTarget,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(i64, Option<String>), BuildStepError> {
+    let recipe = MasterRecipe {
+        combine: None,
+        synthetic_bias: None,
+        archive_after: false,
+    };
+    run_build(
+        ctx,
+        emitter,
+        app_version,
+        set_id,
+        &recipe,
+        cancel,
+        target,
+        Admission::Inherited,
+    )
+}
+
 /// Re-integrate an existing Athenaeum-built master IN PLACE from the SAME
 /// source frames that originally built it (Task 13) — same target file
 /// (atomic replace via `write_fits_f32`, no collision suffix), refreshed
@@ -1887,42 +2044,10 @@ pub fn rebuild_master(
     app_version: String,
     master_set_id: i64,
 ) -> Result<(), ApiError> {
-    let (source_set_id, master_file_id, target_path) = {
+    let (source_set_id, target) = {
         let db = db(&ctx)?;
         let conn = db.conn();
-
-        let prov = crate::db::master_provenance::get(&conn, master_set_id)?.ok_or_else(|| {
-            ApiError::Invalid(
-                "master was not built by Athenaeum — no provenance recorded, cannot rebuild".into(),
-            )
-        })?;
-        let source_set_id = prov.source_set_id.ok_or_else(|| {
-            ApiError::Invalid(
-                "master was not built by Athenaeum — no source set recorded, cannot rebuild".into(),
-            )
-        })?;
-
-        check_rebuild_source_ready(&conn, source_set_id)?;
-
-        // LIMIT 1: a master is a 1:1 calibration_set by invariant (exactly
-        // one member frame), so this never actually needs to disambiguate —
-        // matches `select_flat_precal`'s defensive `LIMIT 1` on the same
-        // shape of query.
-        let master_file: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT fi.id, fi.path FROM calibration_set_frames csf
-             JOIN frames f ON f.id = csf.frame_id
-             JOIN files fi ON fi.id = f.file_id
-             WHERE csf.set_id = ?1 LIMIT 1",
-                [master_set_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let (master_file_id, target_path) = master_file.ok_or_else(|| {
-            ApiError::NotFound(format!("master set {master_set_id} has no file on record"))
-        })?;
-
-        (source_set_id, master_file_id, target_path)
+        resolve_rebuild_target(&conn, master_set_id)?
     };
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1950,11 +2075,6 @@ pub fn rebuild_master(
         combine: None,
         synthetic_bias: None,
         archive_after: false,
-    };
-    let target = BuildTarget::Rebuild {
-        master_set_id,
-        master_file_id,
-        target_path: PathBuf::from(target_path),
     };
 
     let thread_ctx = ctx.clone();
@@ -4404,6 +4524,7 @@ mod tests {
             &recipe,
             &Arc::new(AtomicBool::new(false)),
             BuildTarget::New,
+            Admission::Acquire,
         )
         .expect("the master flat must build");
 
@@ -4461,6 +4582,120 @@ mod tests {
         // central-third mean — so a consumer that knows only ATH_FNRM is
         // unaffected by the three above.
         near("ATH_FNRM", 2750.0);
+    }
+
+    // ── Admission (Plan 5b Task 8): `Inherited` must never reach the queue ──
+
+    /// A real (parseable) raw Dark sub-frame FITS — `run_build`'s
+    /// [`BuildTarget::New`] path reads and combines actual pixel bytes, unlike
+    /// `seed_source_with_files`'s placeholder bytes (fine for
+    /// `check_rebuild_source_ready`'s `Path::exists`-only check, not for a
+    /// real integration pass).
+    fn write_raw_dark_frame(path: &std::path::Path, side: usize, value: f32) {
+        use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
+        let cards = HeaderBuilder::new(FrameKind::Dark)
+            .instrume("TestCam")
+            .exptime(60.0)
+            .binning(1, 1)
+            .build()
+            .unwrap();
+        write_fits_f32(path, side, side, 1, &vec![value; side * side], &cards).unwrap();
+    }
+
+    /// A buildable raw Dark set: `n` real FITS sub-frames on disk, joined the
+    /// same way `run_build`'s member-path query expects.
+    fn seed_buildable_dark_set(conn: &Connection, dir: &std::path::Path, n: usize) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, frame_count) VALUES ('Dark', '2026-09-09', ?1)",
+            [n as i64],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        for i in 0..n {
+            let p = dir.join(format!("dark{i}.fits"));
+            write_raw_dark_frame(&p, 8, 100.0);
+            let size = std::fs::metadata(&p).unwrap().len() as i64;
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, '2026-09-09', 'FITS')",
+                rusqlite::params![p.to_string_lossy(), format!("dark{i}.fits"), size],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, instrume, exptime, binning)
+                 VALUES (?1, 'Dark', 'TestCam', 60.0, '1x1')",
+                [file_id],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// The seam the Admission enum exists for: a `ComputeQueue` at
+    /// `max_concurrent = 1` (the default), with the test's OWN permit already
+    /// occupying the one slot — simulating the stacking run's own
+    /// `ComputeJobKind::Stacking` permit, already held before stage 0.5 ever
+    /// calls `build_master_inline`. If `Admission::Inherited` ever regressed
+    /// into calling `ComputeQueue::acquire` again, this single-threaded test
+    /// would deadlock (the holder's permit is never released — it is held for
+    /// the test's entire body): `run_build(.., Admission::Inherited)` must
+    /// complete and return `Ok` without ever touching the queue.
+    #[test]
+    fn admission_inherited_never_acquires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            seed_buildable_dark_set(&conn, &src, 3)
+        };
+
+        let ctx = build_test_ctx(database);
+        let (_holder_permit, _holder_job_id) = ctx
+            .compute_queue
+            .acquire(
+                ComputeJobKind::Stacking,
+                "test holder — simulates the stacking run's own permit",
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("the test's own permit must be admitted immediately (nothing else queued)");
+
+        let recipe = MasterRecipe {
+            combine: Some(IntegrationRecipe::median(Rejection::None)),
+            synthetic_bias: None,
+            archive_after: false,
+        };
+        let result = run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::New,
+            Admission::Inherited,
+        );
+        assert!(
+            result.is_ok(),
+            "an Inherited build must never block behind the caller's own already-held permit: {result:?}"
+        );
     }
 
     /// An `IntegrationOutput` with zeroed pixel data and plausible timing/size

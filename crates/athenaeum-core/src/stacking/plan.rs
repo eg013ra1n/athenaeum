@@ -18,13 +18,12 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::api::lights::{check_mode_ready, compute_export_readiness, ExportReadiness};
+use crate::api::lights::{compute_export_readiness, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
 use crate::db::stacking::{
     active_run_for_set, find_artifact, get_set_config, list_frame_rows, list_runs,
     StackingArtifactRow,
 };
-use crate::export::models::ExportMode;
 use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
 use crate::registration::db::{
     get_frame_set_reference, get_registration_for_frame_set, RegistrationRecord,
@@ -40,9 +39,18 @@ use crate::stacking::paths::{self, EstimateInputs};
 /// One pipeline stage (spec §10.2's `stage` enum, minus the `Ok`-only
 /// distinction between "never run" and "cached"). [`Self::as_str`] is the
 /// same spelling the progress/complete events use.
+///
+/// `Masters` (spec §2 row 0.5, owner requirement 2026-09-09 — "the pipeline
+/// builds its own masters") is FIRST: it runs before `Calibrate`, building or
+/// rebuilding every [`PlanMaster`] the gate listed as planned work rather
+/// than a blocker. It carries no cache of its own (unlike `Calibrate`/
+/// `Measure`/`Register`, which `stale_stages` tracks) — a master is either
+/// already on disk (nothing to do) or it isn't (planned work every run
+/// re-attempts), so `stale_stages` never lists it (see [`build_plan`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum Stage {
+    Masters,
     Calibrate,
     Measure,
     Reference,
@@ -56,6 +64,7 @@ pub enum Stage {
 impl Stage {
     pub fn as_str(self) -> &'static str {
         match self {
+            Stage::Masters => "masters",
             Stage::Calibrate => "calibrate",
             Stage::Measure => "measure",
             Stage::Reference => "reference",
@@ -66,6 +75,46 @@ impl Stage {
             Stage::Output => "output",
         }
     }
+}
+
+/// One [`PlanMaster`]'s kind of work: `Build` a raw calibration set that has
+/// never had a master (`ExportReadiness::raw_sets_buildable`), or `Rebuild`
+/// a built master whose file is missing but whose source is still
+/// recoverable (`ExportReadiness::masters_rebuildable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum MasterWork {
+    Build,
+    Rebuild,
+}
+
+impl MasterWork {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MasterWork::Build => "build",
+            MasterWork::Rebuild => "rebuild",
+        }
+    }
+}
+
+/// One master the stage-0.5 run would build or rebuild (spec §2 row 0.5).
+/// `set_id` follows [`ExportReadiness`]'s own two lists: for `Build` it is
+/// the RAW calibration set id (`raw_sets_buildable`); for `Rebuild` it is the
+/// MASTER calibration set id (`masters_rebuildable`) — `stacking::run`'s
+/// `stage_masters` resolves a `Rebuild` item's source set itself, via
+/// `crate::api::masters::resolve_rebuild_target`. `frame_count` is always the
+/// count of RAW frames that would actually be combined — the source set's
+/// own `calibration_set.frame_count` in both cases (a master set is always
+/// `frame_count = 1` by invariant, which would say nothing useful about the
+/// work about to happen).
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanMaster {
+    pub set_id: i64,
+    pub kind: MasterWork,
+    pub imagetyp: String,
+    pub frame_count: i64,
+    pub label: String,
 }
 
 /// One reason the plan refuses to run (or a strictly informational note the
@@ -133,6 +182,13 @@ pub struct StackingPlan {
     pub blockers: Vec<PlanBlocker>,
     pub warnings: Vec<String>,
     pub readiness: ExportReadiness,
+    /// Stage 0.5's work list (spec §2 row 0.5, owner requirement 2026-09-09):
+    /// every buildable raw set and rebuildable missing master, sorted by
+    /// [`crate::api::masters::type_build_rank`] then id — bias/darkflat
+    /// before dark before flat, the same dependency order
+    /// `start_master_builds_batch` submits a manual batch in, so a flat
+    /// built by stage 0.5 sees its own precal master already on disk.
+    pub masters_to_build: Vec<PlanMaster>,
     pub reference: PlanReference,
     pub frame_count: usize,
     pub included_count: usize,
@@ -633,6 +689,132 @@ fn compute_register_stale(
     Ok(false)
 }
 
+// ── Stage 0.5: masters to build (spec §2 row 0.5) ───────────────────────────
+
+/// `(imagetyp, frame_count)` for a calibration set — the two fields a
+/// [`PlanMaster`] needs beyond its id, read straight off `calibration_set`.
+fn calibration_set_imagetyp_and_count(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<(String, i64), ApiError> {
+    Ok(conn.query_row(
+        "SELECT imagetyp, frame_count FROM calibration_set WHERE id = ?1",
+        [set_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+/// A short human label for a calibration set — `"Dark 180s -10C TestCam"`
+/// style — for the Stacking tab's masters-to-build row. No dedicated
+/// calibration-set display-name helper exists elsewhere in the codebase
+/// (Coverage's own table builds its labels in the frontend); this is a
+/// small, self-contained one rather than reaching for the calibration
+/// library's file-NAMING helper (`calibration_library::paths::master_relative_path`),
+/// which produces a filesystem-safe slug, not prose. Falls back to
+/// `"<imagetyp> · set <id>"` if the row can't be read — shouldn't happen,
+/// since `set_id` came from the readiness split moments ago, but a label is
+/// never worth failing the whole plan over.
+fn calibration_set_label(conn: &Connection, set_id: i64, imagetyp: &str) -> String {
+    let row: Option<(Option<f64>, Option<f64>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT exptime, ccd_temp, instrume, filter FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .unwrap_or(None);
+    let Some((exptime, ccd_temp, instrume, filter)) = row else {
+        return format!("{imagetyp} · set {set_id}");
+    };
+    let mut parts = vec![imagetyp.to_string()];
+    if imagetyp == "Flat" {
+        if let Some(f) = filter {
+            parts.push(f);
+        }
+    }
+    if let Some(e) = exptime {
+        parts.push(format!("{e:.0}s"));
+    }
+    if let Some(t) = ccd_temp {
+        parts.push(format!("{t:.0}\u{00B0}C"));
+    }
+    if let Some(i) = instrume {
+        parts.push(i);
+    }
+    parts.join(" ")
+}
+
+/// Stage 0.5's work list (spec §2 row 0.5): every buildable raw set
+/// (`readiness.raw_sets_buildable`) as a `Build` item, every rebuildable
+/// missing master (`readiness.masters_rebuildable`) as a `Rebuild` item —
+/// resolving a rebuild item's imagetyp/frame_count off its RAW SOURCE set
+/// (via `master_provenance`, same as `run_build`'s own Rebuild path reads),
+/// never the master's own `calibration_set` row (always `frame_count = 1` by
+/// invariant, which would say nothing about the work about to happen).
+/// Sorted by [`crate::api::masters::type_build_rank`] then id — the same
+/// dependency order a manual batch build submits in
+/// (`start_master_builds_batch`), so a flat this stage builds sees its own
+/// precal master already on disk.
+///
+/// Read failures are logged and the item is dropped rather than failing the
+/// whole plan — a set/master the readiness split named moments ago should
+/// always resolve; if it somehow doesn't, the stage-0.5 run will simply not
+/// list it (and the run itself re-derives the SAME plan before executing, so
+/// a real inconsistency surfaces there instead of silently building nothing).
+fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> Vec<PlanMaster> {
+    let mut items: Vec<PlanMaster> = Vec::new();
+
+    for &raw_set_id in &readiness.raw_sets_buildable {
+        match calibration_set_imagetyp_and_count(conn, raw_set_id) {
+            Ok((imagetyp, frame_count)) => {
+                let label = calibration_set_label(conn, raw_set_id, &imagetyp);
+                items.push(PlanMaster {
+                    set_id: raw_set_id,
+                    kind: MasterWork::Build,
+                    imagetyp,
+                    frame_count,
+                    label,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(raw_set_id, %error, "stacking: could not read buildable raw set; dropped from masters_to_build");
+            }
+        }
+    }
+
+    for &master_set_id in &readiness.masters_rebuildable {
+        let source_set_id = match crate::db::master_provenance::get(conn, master_set_id) {
+            Ok(Some(prov)) => prov.source_set_id,
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(master_set_id, %error, "stacking: could not read master provenance; dropped from masters_to_build");
+                None
+            }
+        };
+        let Some(source_set_id) = source_set_id else {
+            continue;
+        };
+        match calibration_set_imagetyp_and_count(conn, source_set_id) {
+            Ok((imagetyp, frame_count)) => {
+                let label = calibration_set_label(conn, source_set_id, &imagetyp);
+                items.push(PlanMaster {
+                    set_id: master_set_id,
+                    kind: MasterWork::Rebuild,
+                    imagetyp,
+                    frame_count,
+                    label,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(master_set_id, source_set_id, %error, "stacking: could not read rebuild source set; dropped from masters_to_build");
+            }
+        }
+    }
+
+    items.sort_by_key(|m| (crate::api::masters::type_build_rank(&m.imagetyp), m.set_id));
+    items
+}
+
 /// Build the plan for a frame set: its groups, the resolved config, every
 /// gate blocker (spec §2, checked in a fixed order so the first blocker a
 /// user sees is always the most fundamental one), and which of the three
@@ -653,24 +835,66 @@ pub fn build_plan(
 
     let groups = group_frames(conn, frames_set_id, &cfg.grouping)?;
     let readiness = compute_export_readiness(conn, frames_set_id)?;
+    let masters_to_build = collect_masters_to_build(conn, &readiness);
 
     let mut blockers: Vec<PlanBlocker> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Gate 1: masters/links/masterFiles — the export-v2 gate's own sentence,
-    // just re-coded per the ordered readiness counts it was derived from.
-    if let Err(message) = check_mode_ready(&readiness, ExportMode::CalibratedLights) {
-        let code = if readiness.raw_sets_without_master > 0 {
-            "masters"
-        } else if readiness.unlinked_lights > 0 {
-            "links"
-        } else if readiness.missing_master_files > 0 {
-            "masterFiles"
+    // Gate 1: masters/links/masterFiles — reinterpreted 2026-09-09 (owner
+    // requirement — "the pipeline should build the calibration masters
+    // itself when they are missing"). The export-v2 gate
+    // (`check_mode_ready`'s CalibratedLights arms) blocked on
+    // `raw_sets_without_master`/`missing_master_files` outright; the
+    // stacking gate instead blocks ONLY the subset the readiness split says
+    // cannot be built/rebuilt (`raw_sets_unbuildable`/`masters_unrebuildable`)
+    // — everything else became `masters_to_build` above, planned work for
+    // stage 0.5 rather than a blocker. Same relative priority as the export
+    // gate's own arms (masters, then links, then masterFiles) and the same
+    // sentence style, just re-derived from the split fields instead of
+    // calling `check_mode_ready` directly.
+    if !readiness.raw_sets_unbuildable.is_empty() {
+        let n = readiness.raw_sets_unbuildable.len();
+        let first_reason = readiness.raw_sets_unbuildable[0].1.as_str();
+        blockers.push(PlanBlocker {
+            code: "masters".to_string(),
+            message: format!(
+                "Build masters first — {n} set{} cannot be built: {first_reason}",
+                if n == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    if readiness.unlinked_lights > 0 {
+        let n = readiness.unlinked_lights;
+        blockers.push(PlanBlocker {
+            code: "links".to_string(),
+            message: format!(
+                "{n} light{} {} no calibration links",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "has" } else { "have" }
+            ),
+        });
+    }
+    if !readiness.masters_unrebuildable.is_empty() {
+        let n = readiness.masters_unrebuildable.len();
+        // Every unrebuildable reason is archival ("archived — restore
+        // first") -> the export gate's own C-2 sentence; a mix (or a
+        // "no provenance"/missing-not-archived reason) names the first
+        // reason instead, since "restore from archive" would be actively
+        // wrong advice for those.
+        let all_archival = readiness
+            .masters_unrebuildable
+            .iter()
+            .all(|(_, reason)| reason.contains("archived"));
+        let message = if all_archival {
+            format!("{n} master file(s) missing on disk — restore from archive first")
         } else {
-            "links"
+            format!(
+                "{n} master file(s) missing on disk and cannot be rebuilt: {}",
+                readiness.masters_unrebuildable[0].1
+            )
         };
         blockers.push(PlanBlocker {
-            code: code.to_string(),
+            code: "masterFiles".to_string(),
             message,
         });
     }
@@ -894,6 +1118,7 @@ pub fn build_plan(
         blockers,
         warnings,
         readiness,
+        masters_to_build,
         reference,
         frame_count,
         included_count,
@@ -1013,6 +1238,192 @@ mod tests {
             vec![Stage::Calibrate, Stage::Measure, Stage::Register]
         );
         assert!(plan.estimate_bytes > 0);
+    }
+
+    /// Owner requirement 2026-09-09 ("the pipeline should build the
+    /// calibration masters itself when they are missing"): a raw calibration
+    /// set with every member frame on disk becomes planned work
+    /// (`masters_to_build == [Build]`) instead of the `masters` blocker.
+    #[test]
+    fn plan_lists_buildable_raw_set_instead_of_blocking() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let raw_dark = test_fixtures::add_raw_linked_dark(&f, &ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(
+            !plan.blockers.iter().any(|b| b.code == "masters"),
+            "a buildable raw set must not block: {:?}",
+            plan.blockers
+        );
+        assert_eq!(
+            plan.masters_to_build.len(),
+            1,
+            "{:?}",
+            plan.masters_to_build
+        );
+        assert_eq!(plan.masters_to_build[0].set_id, raw_dark);
+        assert_eq!(plan.masters_to_build[0].kind, MasterWork::Build);
+        assert_eq!(plan.masters_to_build[0].imagetyp, "Dark");
+        assert_eq!(plan.masters_to_build[0].frame_count, 3);
+    }
+
+    /// A built master whose FILE is missing but whose `master_provenance`
+    /// row and raw source frames are intact becomes planned work
+    /// (`masters_to_build == [Rebuild]`) instead of the `masterFiles`
+    /// blocker.
+    #[test]
+    fn plan_lists_rebuildable_missing_master_instead_of_blocking() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, _flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        // Delete the dark master's FILE from disk — provenance + real raw
+        // source frames stay (the `master_provenance` row `add_master_dark_and_flat`
+        // now writes via the real `register_master` path).
+        let dark_path: String = f
+            .conn
+            .query_row(
+                "SELECT fi.path FROM calibration_set_frames csf
+                 JOIN frames fr ON fr.id = csf.frame_id
+                 JOIN files fi ON fi.id = fr.file_id
+                 WHERE csf.set_id = ?1",
+                [dark_set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        std::fs::remove_file(&dark_path).unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(
+            !plan.blockers.iter().any(|b| b.code == "masterFiles"),
+            "a rebuildable missing master must not block: {:?}",
+            plan.blockers
+        );
+        assert_eq!(
+            plan.masters_to_build.len(),
+            1,
+            "{:?}",
+            plan.masters_to_build
+        );
+        assert_eq!(plan.masters_to_build[0].set_id, dark_set);
+        assert_eq!(plan.masters_to_build[0].kind, MasterWork::Rebuild);
+        assert_eq!(plan.masters_to_build[0].imagetyp, "Dark");
+    }
+
+    /// A built master whose FILE is missing AND has no `master_provenance`
+    /// row (imported, or built outside the app) is not something stage 0.5
+    /// can do anything about — it stays the `masterFiles` blocker, naming
+    /// "no provenance".
+    #[test]
+    fn plan_blocks_missing_master_with_no_provenance() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+
+        // An "imported" master: a calibration_set + files/frames row, NO
+        // master_provenance — the file is never written to disk (the
+        // "archived or moved" shape).
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
+                 VALUES ('MasterDark', '2025-01-01', 1, 1)",
+                [],
+            )
+            .unwrap();
+        let master_set_id = f.conn.last_insert_rowid();
+        let missing_path = f.dir.path().join("imported_master_dark.fits");
+        f.conn
+            .execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 0, '2025-01-01', 'FITS')",
+                rusqlite::params![missing_path.to_string_lossy(), "imported_master_dark.fits"],
+            )
+            .unwrap();
+        let file_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterDark', 1)",
+                [file_id],
+            )
+            .unwrap();
+        let frame_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![master_set_id, frame_id],
+            )
+            .unwrap();
+        for &light_id in &ids {
+            f.conn
+                .execute(
+                    "INSERT INTO calibration_set_to_frames
+                        (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                     VALUES (?1, 'frame', ?2, 'Dark', '2025-01-01T00:00:00Z')",
+                    rusqlite::params![light_id, master_set_id],
+                )
+                .unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(
+            plan.masters_to_build.is_empty(),
+            "{:?}",
+            plan.masters_to_build
+        );
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|b| b.code == "masterFiles")
+            .expect("masterFiles blocker");
+        assert!(blocker.message.contains("no provenance"), "{:?}", blocker);
     }
 
     #[test]
@@ -1151,6 +1562,7 @@ mod tests {
     #[test]
     fn stage_as_str_matches_the_wire_spelling() {
         for (s, name) in [
+            (Stage::Masters, "masters"),
             (Stage::Calibrate, "calibrate"),
             (Stage::Measure, "measure"),
             (Stage::Reference, "reference"),

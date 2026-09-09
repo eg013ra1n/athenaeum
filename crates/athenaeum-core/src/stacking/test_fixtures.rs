@@ -204,19 +204,29 @@ fn insert_light_row(
 }
 
 /// A built master dark (constant 100 ADU) + a built master flat (constant
-/// 0.5, `ATH_FNRM = 0.5`) — both float32 FITS on disk, both registered as
-/// `calibration_set` rows with `is_master_library = 1` (the row shape
-/// `api::lights.rs`'s `seed_master_with_file` uses), and linked ("Dark" /
+/// 0.5, `ATH_FNRM = 0.5`) — both float32 FITS on disk, both registered
+/// through the REAL `calibration_library::register::register_master` path
+/// (Task 8: not just fabricated `calibration_set` rows — a real RAW source
+/// set of `MIN_MASTER_FRAMES` sub-frames on disk behind each, plus the
+/// `master_provenance` row registration always writes) and linked ("Dark" /
 /// "Flat") to every frame id in `light_frame_ids`. Returns `(dark_set_id,
-/// flat_set_id)`.
+/// flat_set_id)` — the MASTER ids, as before this task (every existing
+/// caller's assertions about the returned ids are unaffected; the raw
+/// source sets are new rows nothing here returns or otherwise names).
+///
+/// Task 8 needs the provenance + real source frames so stage 0.5's rebuild
+/// path (`check_rebuild_source_ready` + `run_build`'s `BuildTarget::Rebuild`)
+/// has something real to re-integrate when a test deletes the master FILE
+/// from disk afterward — see `stacking::run`'s
+/// `deleted_masters_are_rebuilt_by_stage_masters` test.
 pub(crate) fn add_master_dark_and_flat(
     f: &Fixture,
     light_frame_ids: &[i64],
     width: usize,
     height: usize,
 ) -> (i64, i64) {
-    let dark_set = seed_master(f, "MasterDark", width, height, 100.0, None);
-    let flat_set = seed_master(f, "MasterFlat", width, height, 0.5, Some(0.5));
+    let dark_set = seed_registered_master(f, "Dark", "MasterDark", width, height, 100.0, None);
+    let flat_set = seed_registered_master(f, "Flat", "MasterFlat", width, height, 0.5, Some(0.5));
     for &frame_id in light_frame_ids {
         link_calibration(&f.conn, frame_id, dark_set, "Dark");
         link_calibration(&f.conn, frame_id, flat_set, "Flat");
@@ -224,35 +234,26 @@ pub(crate) fn add_master_dark_and_flat(
     (dark_set, flat_set)
 }
 
-/// One built master: a `calibration_set` row (`is_master_library = 1`,
-/// `frame_count = 1`) plus a `files`/`frames` row pointing at a real
-/// constant-value float32 FITS on disk (`ATH_FNRM` stamped when given, the
-/// way the calibration library normalizes a master flat).
-fn seed_master(
+/// One RAW (not-yet-built) sub-calibration frame on disk: a real constant-
+/// value float32 FITS, `files`/`frames` rows, no `calibration_set` link —
+/// the caller joins it into a `calibration_set_frames` row itself. Shared by
+/// [`seed_registered_master`] (the source set behind a built master) and
+/// [`add_raw_linked_dark`] (a raw set with no master yet).
+fn write_raw_subframe(
     f: &Fixture,
     imagetyp: &str,
     width: usize,
     height: usize,
     value: f32,
-    ath_fnrm: Option<f64>,
+    index: usize,
+    set_id: i64,
 ) -> i64 {
-    f.conn
-        .execute(
-            "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
-             VALUES (?1, '2025-01-01', 1, 1)",
-            params![imagetyp],
-        )
-        .unwrap();
-    let set_id = f.conn.last_insert_rowid();
-
-    let filename = format!("{}_{set_id}.fits", imagetyp.to_ascii_lowercase());
+    let filename = format!("{}_{set_id}_{index}.fits", imagetyp.to_ascii_lowercase());
     let path = f.dir.path().join(&filename);
     let data = vec![value; width * height];
-    let mut cards = vec![Card::new("IMAGETYP", CardValue::Str(imagetyp.to_string())).unwrap()];
-    if let Some(n) = ath_fnrm {
-        cards.push(Card::new("ATH_FNRM", CardValue::Real(n)).unwrap());
-    }
-    write_fits_f32(&path, width, height, 1, &data, &cards).expect("write fixture master FITS");
+    let cards = vec![Card::new("IMAGETYP", CardValue::Str(imagetyp.to_string())).unwrap()];
+    write_fits_f32(&path, width, height, 1, &data, &cards)
+        .expect("write fixture raw sub-frame FITS");
     let (size, modified_at) = file_identity(&path);
 
     f.conn
@@ -266,19 +267,112 @@ fn seed_master(
 
     f.conn
         .execute(
-            "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, ?2, 1)",
+            "INSERT INTO frames (file_id, imagetyp) VALUES (?1, ?2)",
             params![file_id, imagetyp],
         )
         .unwrap();
-    let frame_id = f.conn.last_insert_rowid();
+    f.conn.last_insert_rowid()
+}
+
+/// One built master, registered through the REAL `register_master` path: a
+/// RAW source `calibration_set` of `MIN_MASTER_FRAMES` real sub-frames on
+/// disk, a real constant-value float32 master FITS (`ATH_FNRM` stamped when
+/// given), then `register_master` — which parses the just-written master
+/// file, creates its `files`/`frames`/`calibration_set` rows, writes the
+/// `master_provenance` row, and supersedes the raw source set — exactly the
+/// same path an in-app master build takes (see
+/// `calibration_library::register::register_master`'s own doc comment).
+/// Returns the MASTER `calibration_set` id.
+fn seed_registered_master(
+    f: &Fixture,
+    raw_imagetyp: &str,
+    master_imagetyp: &str,
+    width: usize,
+    height: usize,
+    value: f32,
+    ath_fnrm: Option<f64>,
+) -> i64 {
+    const MIN_MASTER_FRAMES: usize = 3;
 
     f.conn
         .execute(
-            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
-            params![set_id, frame_id],
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
+             VALUES (?1, '2025-01-01', 0, ?2)",
+            params![raw_imagetyp, MIN_MASTER_FRAMES as i64],
         )
         .unwrap();
+    let source_set_id = f.conn.last_insert_rowid();
+    for i in 0..MIN_MASTER_FRAMES {
+        let frame_id = write_raw_subframe(f, raw_imagetyp, width, height, value, i, source_set_id);
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![source_set_id, frame_id],
+            )
+            .unwrap();
+    }
 
+    let master_filename = format!(
+        "{}_{source_set_id}.fits",
+        master_imagetyp.to_ascii_lowercase()
+    );
+    let master_path = f.dir.path().join(&master_filename);
+    let data = vec![value; width * height];
+    let mut cards =
+        vec![Card::new("IMAGETYP", CardValue::Str(master_imagetyp.to_string())).unwrap()];
+    if let Some(n) = ath_fnrm {
+        cards.push(Card::new("ATH_FNRM", CardValue::Real(n)).unwrap());
+    }
+    write_fits_f32(&master_path, width, height, 1, &data, &cards)
+        .expect("write fixture master FITS");
+
+    let recipe_json = serde_json::json!({
+        "combine": "median",
+        "engine": "athenaeum-fixture",
+    })
+    .to_string();
+    let reg = crate::calibration_library::register::register_master(
+        &f.conn,
+        source_set_id,
+        &master_path,
+        &recipe_json,
+    )
+    .expect("fixture master registration must succeed");
+    reg.master_set_id
+}
+
+/// A raw (NOT YET BUILT) calibration set — `MIN_MASTER_FRAMES` real FITS
+/// sub-frames on disk, `frame_count` set to match — linked directly to
+/// `light_frame_ids` (no master exists behind these links at all). Task 8's
+/// "the plan lists a buildable raw set instead of blocking" test needs this
+/// shape: unlike [`add_master_dark_and_flat`], there is nothing built yet.
+pub(crate) fn add_raw_linked_dark(
+    f: &Fixture,
+    light_frame_ids: &[i64],
+    width: usize,
+    height: usize,
+) -> i64 {
+    const MIN_MASTER_FRAMES: usize = 3;
+    f.conn
+        .execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
+             VALUES ('Dark', '2025-01-01', 0, ?1)",
+            [MIN_MASTER_FRAMES as i64],
+        )
+        .unwrap();
+    let set_id = f.conn.last_insert_rowid();
+    for i in 0..MIN_MASTER_FRAMES {
+        let frame_id = write_raw_subframe(f, "Dark", width, height, 100.0, i, set_id);
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+    }
+    for &light_id in light_frame_ids {
+        link_calibration(&f.conn, light_id, set_id, "Dark");
+    }
     set_id
 }
 

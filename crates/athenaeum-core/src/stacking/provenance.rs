@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::integration::stats::ScaleEstimator;
 use crate::stacking::config::{ReferenceMode, StackingConfig};
 use crate::stacking::integrate::GroupStats;
-use crate::stacking::plan::Stage;
+use crate::stacking::plan::{MasterWork, Stage};
 
 /// One stage's wall-clock cost, in the order it ran
 /// (`run.rs`'s `RunContext::timings`).
@@ -28,6 +28,23 @@ use crate::stacking::plan::Stage;
 #[serde(rename_all = "camelCase")]
 pub struct StageTiming {
     pub stage: Stage,
+    pub duration_ms: u64,
+}
+
+/// One master stage 0.5 built or rebuilt (spec §2 row 0.5, owner requirement
+/// 2026-09-09). `set_id` echoes the [`crate::stacking::plan::PlanMaster`]
+/// that drove this item — the raw set id for `Build`, the master set id for
+/// `Rebuild` (see that struct's own doc comment); `master_set_id` is always
+/// the resulting MASTER's `calibration_set` id (identical to `set_id` for a
+/// `Rebuild` item, different for `Build`). `path` is the master's on-disk
+/// path after the build.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterBuilt {
+    pub set_id: i64,
+    pub kind: MasterWork,
+    pub master_set_id: i64,
+    pub path: String,
     pub duration_ms: u64,
 }
 
@@ -133,6 +150,12 @@ pub struct RunSummary {
     pub reference: SummaryReference,
     pub measurement: SummaryMeasurement,
     pub groups: Vec<SummaryGroup>,
+    /// Stage 0.5's own result list (spec §2 row 0.5, owner requirement
+    /// 2026-09-09) — every master the run built or rebuilt before
+    /// calibrating. Empty when `masters_to_build` was empty (nothing to do)
+    /// or the run never reached stage 0.5 (a blocker or an earlier failure).
+    #[serde(default)]
+    pub masters_built: Vec<MasterBuilt>,
     pub stages: Vec<StageTiming>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
