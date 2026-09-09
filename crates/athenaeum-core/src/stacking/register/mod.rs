@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resample::Interpolation;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelChoice {
     /// Homography from 30 correspondences, affine from 12, similarity below.
@@ -26,7 +26,7 @@ pub enum ModelChoice {
     Homography,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum DistortionChoice {
     #[default]
@@ -55,7 +55,7 @@ impl DistortionChoice {
 /// Detection cuts. There is no detection sigma: the fast detector's
 /// adaptive ladder is threshold-free (it targets `maxStars`), so `minSnr`
 /// is the sensitivity dial.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DetectionConfig {
     pub min_snr: f32,
@@ -72,7 +72,7 @@ impl Default for DetectionConfig {
 }
 
 /// Spec §9.2 `registration` block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RegistrationConfig {
     pub model: ModelChoice,

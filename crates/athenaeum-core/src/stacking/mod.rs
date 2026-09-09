@@ -8,8 +8,12 @@
 //! configuration, the Auto rejection rule, per-frame normalization and
 //! weights, weighted banded integration per plane) and `master_cards` (the
 //! master-light header, §9.5 file naming, and the master/rejection-map
-//! writers).
+//! writers). Plan 5a (M1 orchestration) adds `config` (spec §9.2/§9.3: the
+//! whole `StackingConfig` tree, its built-in presets, whole-config
+//! precedence over a stored set/global override, and the per-stage config
+//! hashes artifacts key off).
 
+pub mod config;
 pub mod integrate;
 pub mod master_cards;
 pub mod measure;

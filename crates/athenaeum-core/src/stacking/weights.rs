@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::measure::{ChannelMeasurement, FrameMeasurement};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum WeightMode {
     #[default]
@@ -22,7 +22,7 @@ pub enum WeightMode {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FormulaWeights {
     pub fwhm: f64,
@@ -245,7 +245,7 @@ pub fn compute_weights(
     out
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SelectionConfig {
     /// Frames below this fraction of the group's maximum weight are excluded.
@@ -253,6 +253,11 @@ pub struct SelectionConfig {
     pub max_fwhm_px: Option<f64>,
     pub max_eccentricity: Option<f64>,
     pub min_stars: Option<usize>,
+    /// A frame whose registration failed is dropped from its group (spec
+    /// §9.2). Read by the run orchestration, not by [`select_frames`] —
+    /// this stage has no registration outcome to check, so the field is
+    /// carried here only so a stored config round-trips.
+    pub exclude_on_registration_failure: bool,
 }
 
 impl Default for SelectionConfig {
@@ -262,6 +267,7 @@ impl Default for SelectionConfig {
             max_fwhm_px: None,
             max_eccentricity: None,
             min_stars: None,
+            exclude_on_registration_failure: true,
         }
     }
 }
@@ -270,6 +276,8 @@ impl Default for SelectionConfig {
 /// spec's order: manual exclusion, missing weight input, the weight gate,
 /// then the optional FWHM / eccentricity / star-count filters (frame-level:
 /// channel means for FWHM and eccentricity, the channel minimum for stars).
+/// `SelectionConfig::exclude_on_registration_failure` is not read here — see
+/// its own doc comment.
 pub fn select_frames(
     inputs: &[WeightInput],
     weights: &[FrameWeight],
@@ -512,6 +520,7 @@ mod tests {
             max_fwhm_px: Some(4.0),
             max_eccentricity: Some(0.5),
             min_stars: Some(50),
+            ..Default::default()
         };
         let r = select_frames(&inputs, &w, &manual, &cfg);
         assert_eq!(r[0], None);

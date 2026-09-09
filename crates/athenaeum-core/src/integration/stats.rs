@@ -111,7 +111,7 @@ fn stddev_about_mean(v: &[f32]) -> f64 {
     (ss / (n - 1) as f64).sqrt()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ScaleEstimator {
     #[default]
@@ -219,7 +219,7 @@ pub fn noise_scale_factors(values: &[f32]) -> Option<(f32, f32)> {
 }
 
 /// Output normalization modes (spec §5.1, math reference §3.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutputNormalization {
     None,
@@ -232,7 +232,7 @@ pub enum OutputNormalization {
 
 /// Rejection normalization modes (math reference §3.3); `Local` carries
 /// per-frame grids instead of a pair (M2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum RejectionNormalization {
     None,

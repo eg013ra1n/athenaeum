@@ -315,7 +315,7 @@ fn default_true() -> bool {
 /// written before a field existed — decodes the rest to
 /// [`CalibratedLightOptions::default`] instead of failing the whole request;
 /// `{}` is a valid, fully-defaulted payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibratedLightOptions {
     /// Normalize the master flat by its own level before dividing (spec §2).

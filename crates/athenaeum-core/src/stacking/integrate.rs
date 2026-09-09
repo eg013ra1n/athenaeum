@@ -28,7 +28,7 @@ use crate::stacking::measure::{measure_plane, FrameMeasurement, MeasureOptions};
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
 /// spec §9.2 `integration:`; every field defaulted, camelCase on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct IntegrationConfig {
     /// The master builder's `Combination` — one enum, one spelling
@@ -62,7 +62,7 @@ impl Default for IntegrationConfig {
 /// normalization is M2 — see [`RejectionNormalization::Local`] — and is
 /// carried here as an opaque, defaulted value so a stored config round-trips
 /// even though M1 refuses it at [`integrate_group`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NormalizationConfig {
     pub output: OutputNormalization,
@@ -71,13 +71,44 @@ pub struct NormalizationConfig {
     /// stage-3 location/scale is `MeasureOptions::scale_estimator` — the
     /// orchestrator (Plan 5) keeps the two equal.
     pub scale_estimator: ScaleEstimator,
+    /// Local (small-scale) normalization settings (spec §5.2, M2). Carried
+    /// here as an opaque, defaulted block so a stored config round-trips
+    /// before M2 lands — `integrate_group` never reads it.
+    #[serde(default)]
+    pub local: LocalNormalizationConfig,
+}
+
+/// spec §9.2 `normalization.local:` (M2). `enabled` stays `false` until the
+/// local-normalization stage exists; every other field is carried so the
+/// block round-trips through a stored config unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LocalNormalizationConfig {
+    pub enabled: bool,
+    /// Tile size in pixels for the local-normalization grid.
+    pub scale: u32,
+    pub reference_frames: u32,
+    pub psf_model: crate::stacking::psf_signal::PsfModel,
+    pub local_scale: bool,
+}
+
+impl Default for LocalNormalizationConfig {
+    fn default() -> Self {
+        LocalNormalizationConfig {
+            enabled: false,
+            scale: 1024,
+            reference_frames: 20,
+            psf_model: crate::stacking::psf_signal::PsfModel::Auto,
+            local_scale: false,
+        }
+    }
 }
 
 /// spec §6.3: the user's rejection choice, resolved to a concrete
 /// [`Rejection`] once the group size is known.
 /// camelCase on the wire; the resolved `Rejection` persisted in master recipes
 /// stays snake_case — the two JSON shapes are not interchangeable.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -744,6 +775,27 @@ mod tests {
             "scaleZeroOffset"
         );
         assert_eq!(serde_json::to_value(&n).unwrap()["scaleEstimator"], "bwmv");
+        assert_eq!(n.local, LocalNormalizationConfig::default());
+        let nv = serde_json::to_value(&n).unwrap();
+        assert_eq!(nv["local"]["enabled"], false);
+        assert_eq!(nv["local"]["scale"], 1024);
+        assert_eq!(nv["local"]["referenceFrames"], 20);
+        assert_eq!(nv["local"]["psfModel"], "auto");
+        assert_eq!(nv["local"]["localScale"], false);
+        let with_local: NormalizationConfig = serde_json::from_str(
+            r#"{"local":{"enabled":true,"scale":512,"referenceFrames":8,"psfModel":"moffat4","localScale":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_local.local,
+            LocalNormalizationConfig {
+                enabled: true,
+                scale: 512,
+                reference_frames: 8,
+                psf_model: crate::stacking::psf_signal::PsfModel::Moffat4,
+                local_scale: true,
+            }
+        );
     }
 
     #[test]

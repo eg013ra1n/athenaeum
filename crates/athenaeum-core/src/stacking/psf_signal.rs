@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::integration::stats::median_in_place;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum PsfModel {
     /// Fit the brightest `AUTO_SAMPLE` seeds with every β in `AUTO_BETAS`
