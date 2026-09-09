@@ -81,6 +81,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
         // Files
         .route("/api/get_files", post(files::get_files))
+        .route("/api/get_folder_type_breakdown", post(files::get_folder_type_breakdown))
         .route("/api/get_files_by_directory", post(files::get_files_by_directory))
         .route("/api/get_directory_contents", post(files::get_directory_contents))
         .route("/api/get_camera_directories", post(files::get_camera_directories))

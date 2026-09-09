@@ -402,3 +402,23 @@ pub async fn rename_path(
     api::rename_path(&state.ctx, args.old_path, args.new_name, &policy).map_err(api_err)?;
     Ok(StatusCode::OK)
 }
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderTypeArgs {
+    pub path: String,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_folder_type_breakdown(
+    State(state): State<WebAppState>,
+    Json(args): Json<FolderTypeArgs>,
+) -> Result<Json<athenaeum_core::api::folder_counts::FolderTypeBreakdown>, (StatusCode, String)> {
+    athenaeum_core::api::folder_counts::get_folder_type_breakdown(
+        &state.ctx,
+        args.path,
+        &allowed_roots_policy(&state.allowed_paths),
+    )
+    .map(Json)
+    .map_err(api_err)
+}

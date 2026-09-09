@@ -293,3 +293,17 @@ pub async fn rename_path(
 ) -> Result<(), String> {
     api::rename_path(&state.ctx, old_path, new_name, &PathPolicy::AllowAll).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_folder_type_breakdown(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<athenaeum_core::api::folder_counts::FolderTypeBreakdown, String> {
+    athenaeum_core::api::folder_counts::get_folder_type_breakdown(
+        &state.ctx,
+        path,
+        &PathPolicy::AllowAll,
+    )
+    .map_err(|e| e.to_string())
+}
