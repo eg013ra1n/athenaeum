@@ -1,5 +1,6 @@
 // src/components/calibration/CalibrationTableView.tsx
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import { useEffectiveExposures } from '../../hooks/useEffectiveExposures';
 import { useNavigate } from 'react-router-dom';
 import { ExternalLink, Hammer } from 'lucide-react';
 import type {
@@ -227,6 +228,8 @@ function deriveTableData(
   allFrames: EnrichedLightFrame[],
   visibleFrameIds: Set<number> | undefined,
   analysisData: Map<number, FrameAnalysis> | undefined,
+  effectiveIds: Set<number> | null,
+  snrExposureIds: Set<number> | null,
 ): DerivedTableData {
   // Build a camera → filterGroup map, merging across dates
   const cameraMap = new Map<string, {
@@ -359,23 +362,34 @@ function deriveTableData(
         }
 
         const temps = groupFrames.map(f => f.ccd_temp);
-        const dates = groupFrames.map(f => f.date_obs).filter((d): d is string => d != null).sort();
+        const dates = groupFrames
+          .map(f => f.date_obs)
+          .filter((d): d is string => d != null)
+          .sort();
 
         // Compute metrics from analysis data
         let avgFwhm: number | null = null;
         let avgEcc: number | null = null;
         let avgSnr: number | null = null;
         if (analysisData) {
-          let fwhmSum = 0, fwhmCount = 0;
-          let eccSum = 0, eccCount = 0;
-          let snrSumSq = 0, snrCount = 0;
+          let fwhmSum = 0,
+            fwhmCount = 0;
+          let eccSum = 0,
+            eccCount = 0;
+          let snrSumSq = 0,
+            snrCount = 0;
           for (const f of groupFrames) {
             const a = analysisData.get(f.frame_id);
             if (a) {
-              fwhmSum += a.median_fwhm; fwhmCount++;
-              eccSum += a.median_eccentricity; eccCount++;
-              const linear = Math.pow(10, a.frame_snr / 20);
-              snrSumSq += linear * linear; snrCount++;
+              fwhmSum += a.median_fwhm;
+              fwhmCount++;
+              eccSum += a.median_eccentricity;
+              eccCount++;
+              if (snrExposureIds?.has(f.frame_id)) {
+                const linear = Math.pow(10, a.frame_snr / 20);
+                snrSumSq += linear * linear;
+                snrCount++;
+              }
             }
           }
           if (fwhmCount > 0) avgFwhm = fwhmSum / fwhmCount;
@@ -403,8 +417,15 @@ function deriveTableData(
           avgFwhm,
           avgEcc,
           avgSnr,
-          totalIntegration: fg.exptime != null ? groupFrames.length * fg.exptime : null,
-          sortTemp: temps.filter((t): t is number => t != null).reduce((a, b) => a + b, 0) / (temps.filter(t => t != null).length || 1) || null,
+          totalIntegration:
+            effectiveIds === null
+              ? null
+              : groupFrames
+                  .filter(f => effectiveIds.has(f.frame_id))
+                  .reduce((sum, f) => sum + Math.max(0, f.exptime ?? 0), 0),
+          sortTemp:
+            temps.filter((t): t is number => t != null).reduce((a, b) => a + b, 0) /
+              (temps.filter(t => t != null).length || 1) || null,
           sortDate: dates[0] ?? null,
         });
       }
@@ -797,7 +818,7 @@ function LightsTable({
         <thead>
           <tr className="border-b border-border/40">
             <th className="px-1.5 py-1.5 w-5 sticky top-0 z-10 bg-surface-elevated" />
-            <SortTh field="frameCount" label="Frames" {...thProps} />
+            <SortTh field="frameCount" label="Files" {...thProps} />
             <SortTh field="filter" label="Filter" {...thProps} />
             <SortTh field="exptime" label="Exp" {...thProps} />
             <SortTh field="sortTemp" label="Temp" {...thProps} />
@@ -809,7 +830,7 @@ function LightsTable({
             {!compact && <SortTh field="avgFwhm" label="FWHM" {...thProps} />}
             {!compact && <SortTh field="avgEcc" label="Ecc" {...thProps} />}
             {!compact && <SortTh field="avgSnr" label="SNR" {...thProps} />}
-            {!compact && <SortTh field="totalIntegration" label="Total" {...thProps} />}
+            {!compact && <SortTh field="totalIntegration" label="Integration" {...thProps} />}
           </tr>
         </thead>
         <tbody>
@@ -1326,9 +1347,22 @@ export function CalibrationTableView({
   const biasSectionRef = useRef<HTMLDivElement>(null);
   const lightsSectionRef = useRef<HTMLDivElement>(null);
 
+  const effectiveIds = useEffectiveExposures(
+    allFrames.filter(f => !visibleFrameIds || visibleFrameIds.has(f.frame_id)).map(f => f.frame_id),
+    JSON.stringify(allFrames.map(f => [f.exptime, f.date_obs, f.camera, f.filter])),
+  );
+  const snrExposureIds = useEffectiveExposures(
+    allFrames
+      .filter(
+        f => (!visibleFrameIds || visibleFrameIds.has(f.frame_id)) && analysisData?.has(f.frame_id),
+      )
+      .map(f => f.frame_id),
+    JSON.stringify(allFrames.map(f => [f.exptime, f.date_obs, f.camera, f.filter])),
+  );
   const derived = useMemo(
-    () => deriveTableData(data, allFrames, visibleFrameIds, analysisData),
-    [data, allFrames, visibleFrameIds, analysisData]
+    () =>
+      deriveTableData(data, allFrames, visibleFrameIds, analysisData, effectiveIds, snrExposureIds),
+    [data, allFrames, visibleFrameIds, analysisData, effectiveIds, snrExposureIds],
   );
 
   const { lightRows, flatRows, darkRows, biasRows } = derived;

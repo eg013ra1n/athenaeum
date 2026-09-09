@@ -7,6 +7,7 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from './plate-solve/PlateSolveBatchPanel';
+import { ExposureVersionReview } from './ExposureVersionReview';
 import { ToolbarButton, ToolbarContainer } from './Toolbar';
 
 interface Props {
@@ -26,6 +27,7 @@ export function ObjectPlateSolveToolbar({
   onClear,
   onSolveComplete,
 }: Props) {
+  const [reviewIds, setReviewIds] = useState<number[] | null>(null);
   const [preparing, setPreparing] = useState(false);
   const preparingRef = useRef(false);
   const panelRef = useRef<PlateSolveBatchPanelHandle>(null);
@@ -70,6 +72,13 @@ export function ObjectPlateSolveToolbar({
 
   return (
     <div className="mb-4 space-y-2">
+      {reviewIds && (
+        <ExposureVersionReview
+          objectIds={reviewIds}
+          onClose={() => setReviewIds(null)}
+          onChanged={onSolveComplete}
+        />
+      )}
       <ToolbarContainer>
         <ToolbarButton disabled={disabled || !visibleCount} onClick={onSelectAll}>
           Select All ({visibleCount})
@@ -84,6 +93,12 @@ export function ObjectPlateSolveToolbar({
           title="Solve all available LIGHT frames in the selected objects, including frames with existing coordinates."
         >
           {preparing ? 'Preparing frames…' : `Plate Solve Selected (${selectedIds.length})`}
+        </ToolbarButton>
+        <ToolbarButton
+          disabled={disabled || !selectedIds.length}
+          onClick={() => setReviewIds([...selectedIds])}
+        >
+          Review processing / versions
         </ToolbarButton>
         <span className="text-xs text-content-muted self-center">
           {selectedIds.length} selected · Select All applies to this tab and current filters

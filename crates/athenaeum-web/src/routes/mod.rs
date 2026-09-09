@@ -112,6 +112,11 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_blink_threads", post(settings::set_blink_threads))
         // Frame sets
         .route("/api/auto_generate_frame_sets", post(frame_sets::auto_generate_frame_sets))
+        .route("/api/get_exposure_version_review", post(frame_sets::get_exposure_version_review))
+        .route("/api/get_effective_exposure_frame_ids", post(frame_sets::get_effective_exposure_frame_ids))
+        .route("/api/confirm_exposure_version_link", post(frame_sets::confirm_exposure_version_link))
+        .route("/api/unlink_exposure_version", post(frame_sets::unlink_exposure_version))
+        .route("/api/set_processing_stage", post(frame_sets::set_processing_stage))
         .route("/api/get_frames_sets", post(frame_sets::get_frames_sets))
         .route("/api/get_object_plate_solve_frame_ids", post(frame_sets::get_object_plate_solve_frame_ids))
         .route("/api/get_frame_set_detail", post(frame_sets::get_frame_set_detail))

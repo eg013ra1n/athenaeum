@@ -1257,7 +1257,7 @@ export default function Objects() {
                   {formatExposureTime(frames_set.total_exp_time)}
                 </span>
                 <span className="text-content-muted">
-                  {member_count} frame{member_count !== 1 ? 's' : ''}
+                  {member_count} file{member_count !== 1 ? 's' : ''}
                 </span>
               </div>
 

@@ -1,3 +1,4 @@
+import { useEffectiveExposures } from '../hooks/useEffectiveExposures';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
@@ -344,12 +345,20 @@ export default function FrameSetDetail() {
     const ids: number[] = [];
     for (const dg of calibrationHierarchy.date_groups)
       for (const cg of dg.camera_groups)
-        for (const fg of cg.filter_groups)
-          for (const f of fg.light_frames)
-            ids.push(f.file_id);
+        for (const fg of cg.filter_groups) for (const f of fg.light_frames) ids.push(f.file_id);
     return ids;
   }, [calibrationHierarchy]);
   const { blackholedFileIds } = useBlackholeEvents(allFileIds);
+
+  const snrFrames = calibrationHierarchy
+    ? buildCameraFilterTree(calibrationHierarchy).allFrames.filter(
+        f => !blackholedFileIds.has(f.file_id) && analysisData.has(f.frame_id),
+      )
+    : [];
+  const snrExposureIds = useEffectiveExposures(
+    snrFrames.map(f => f.frame_id),
+    JSON.stringify(snrFrames.map(f => [f.exptime, f.date_obs, f.camera, f.filter])),
+  );
 
   // Compute stacked SNR per filter group for calibration tab tree: dB→linear, sqrt(sum(linear²)), back to dB
   const calibrationFilterSnrMap = useMemo(() => {
@@ -363,7 +372,7 @@ export default function FrameSetDetail() {
         let sumSq = 0;
         let count = 0;
         for (const f of frames) {
-          if (blackholedFileIds.has(f.file_id)) continue;
+          if (blackholedFileIds.has(f.file_id) || !snrExposureIds?.has(f.frame_id)) continue;
           const a = analysisData.get(f.frame_id);
           if (a) {
             const linear = Math.pow(10, a.frame_snr / 20);
@@ -378,7 +387,7 @@ export default function FrameSetDetail() {
       }
     }
     return map.size > 0 ? map : undefined;
-  }, [calibrationHierarchy, analysisData, blackholedFileIds]);
+  }, [calibrationHierarchy, analysisData, blackholedFileIds, snrExposureIds]);
 
   // Load data on mount and when navigating back
   useEffect(() => {
@@ -838,15 +847,37 @@ export default function FrameSetDetail() {
               Publish as project
             </button>
             <div className="flex items-center gap-1.5 text-sm text-content-muted">
-              <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
+              <span>
+                <span className="font-medium text-content">
+                  {calibrationHierarchy?.total_frames ?? '-'}
+                </span>{' '}
+                files
+              </span>
               <span>·</span>
-              <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
+              <span>
+                <span className="font-medium text-success">
+                  {calibrationHierarchy?.calibrated_frames ?? '-'}
+                </span>{' '}
+                calibrated
+              </span>
               <span>·</span>
-              <span><span className="font-medium text-warning">{calibrationHierarchy?.uncalibrated_frames ?? '-'}</span> uncalibrated</span>
+              <span>
+                <span className="font-medium text-warning">
+                  {calibrationHierarchy?.uncalibrated_frames ?? '-'}
+                </span>{' '}
+                uncalibrated
+              </span>
               <span>·</span>
-              <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
+              <span>
+                <span className="font-medium text-accent">
+                  {calibrationHierarchy?.date_groups.length ?? '-'}
+                </span>{' '}
+                sessions
+              </span>
               <span>·</span>
-              <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
+              <span className="font-medium text-content">
+                {formatExposureTime(detail.frames_set?.total_exp_time)}
+              </span>
             </div>
           </div>
         </div>

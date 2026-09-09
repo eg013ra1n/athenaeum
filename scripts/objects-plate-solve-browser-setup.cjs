@@ -27,11 +27,24 @@ async page => {
     window.__emit=(name,payload)=>(window.__listeners[name]||[]).forEach(cb=>cb(payload));
     const sets=[['Orion',false,false],['Andromeda',false,false],['Rosette',true,false],['Archived',true,true]].map(([name,is_custom,is_archived],i)=>({frames_set:{id:i+1,name,is_custom,is_archived, objctra:'05 35 00',objctdec:'-05 23 00',date_obs_start:'2026-01-01',date_obs_end:'2026-01-02',total_exp_time:3600},member_count:2}));
     const settings={};
+    const versions=['calibrated','registered','integrated','unknown'].map((stage,i)=>({frameId:i+1,filename:['siril_calibrated.fit','pixinsight_registered.xisf','dss_stack.fits','light.fit'][i],path:'/isolated-fixture/'+(i+1),dateObs:'2026-05-21T11:31:25Z',camera:'QHYminiCam8M',exposureSeconds:300,filter:'G',width:3856,height:2180,classification:{stage,steps:[stage],evidence:[stage==='integrated'?'NCOMBINE=20: multiple input images':'Fixture processing history'],confidence:'header evidence',sourceId:null,sourceName:null},exposureId:null,manualStage:false}));
     export const api={
       listen:async(name,cb)=>{(window.__listeners[name]??=[]).push(cb);return()=>window.__listeners[name]=window.__listeners[name].filter(x=>x!==cb)},
       invoke:async(command,args={})=>{
         window.__calls.push({command,args});
         if(command==='get_frames_sets')return sets;
+        if(command==='get_exposure_version_review'){
+          const linked=versions[0].exposureId && versions[0].exposureId===versions[1].exposureId;
+          const count=versions.filter(v=>v.classification.stage!=='integrated').length-(linked?1:0);
+          const suggestions=linked?[]:[{leftId:1,rightId:2,confidence:'needs review',evidence:['Observation time, camera, exposure duration and filter agree']}];
+          return {versions,suggestions,suggestionCount:suggestions.length,exposureCount:count,exposureSeconds:count*300};
+        }
+        if(command==='confirm_exposure_version_link'){versions[0].exposureId=versions[1].exposureId='fixture-group';return;}
+        if(command==='unlink_exposure_version'){versions.find(v=>v.frameId===args.frameId).exposureId=null;return;}
+        if(command==='set_processing_stage'){
+          if(window.__stageError)throw Error('Fixture update rejected');
+          const v=versions.find(v=>v.frameId===args.frameId);v.classification.stage=args.stage||'unknown';v.manualStage=!!args.stage;return;
+        }
         if(command==='get_setting')return settings[args.key]??args.defaultValue;
         if(command==='set_setting'){settings[args.key]=args.value;return;}
         if(command==='get_excluded_frames_count')return 0;

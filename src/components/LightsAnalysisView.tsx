@@ -1,3 +1,4 @@
+import { useEffectiveExposures } from '../hooks/useEffectiveExposures';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
 import { api } from '../api';
@@ -158,11 +159,16 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   // Split into active and blackholed frames
   const allFrames = useMemo(
     () => allFramesRaw.filter(f => !blackholedFileIds.has(f.file_id)),
-    [allFramesRaw, blackholedFileIds]
+    [allFramesRaw, blackholedFileIds],
   );
   const blackholedFrames = useMemo(
     () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
-    [allFramesRaw, blackholedFileIds]
+    [allFramesRaw, blackholedFileIds],
+  );
+
+  const snrExposureIds = useEffectiveExposures(
+    allFrames.filter(f => analysisData.has(f.frame_id)).map(f => f.frame_id),
+    JSON.stringify(allFrames.map(f => [f.exptime, f.date_obs, f.camera, f.filter])),
   );
 
   // Compute stacked SNR per filter group: convert dB→linear, sqrt(sum(linear²)), back to dB
@@ -174,7 +180,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
       let sumSq = 0;
       let count = 0;
       for (const f of frames) {
-        if (blackholedFileIds.has(f.file_id)) continue;
+        if (blackholedFileIds.has(f.file_id) || !snrExposureIds?.has(f.frame_id)) continue;
         const a = analysisData.get(f.frame_id);
         if (a) {
           const linear = Math.pow(10, a.frame_snr / 20);
@@ -188,7 +194,14 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
       }
     }
     return map.size > 0 ? map : undefined;
-  }, [analysisData, viewMode, dateTree.framesByKey, mergedTree.framesByKey, blackholedFileIds]);
+  }, [
+    analysisData,
+    viewMode,
+    dateTree.framesByKey,
+    mergedTree.framesByKey,
+    blackholedFileIds,
+    snrExposureIds,
+  ]);
 
   // Load existing analysis data on mount
   useEffect(() => {

@@ -131,7 +131,7 @@ export function CalendarYearList({
               {MONTH_NAMES[month.month - 1]}
             </h4>
             <span className="text-xs text-content-muted">
-              {month.totalFrameCount} frames | {formatExposure(month.totalExposureSeconds)}
+              {month.totalFrameCount} exposures | {formatExposure(month.totalExposureSeconds)}
             </span>
           </div>
 

@@ -132,7 +132,7 @@ export function ObjectsTableView({
               Coords <SortIcon field="coordinates" />
             </th>
             <th className={headerClass} onClick={() => handleSort('frames')}>
-              # <SortIcon field="frames" />
+              Files <SortIcon field="frames" />
             </th>
             <th className={`${headerClass} hidden lg:table-cell`} onClick={() => handleSort('exposure')}>
               <Clock size={10} className="inline mr-0.5" />
