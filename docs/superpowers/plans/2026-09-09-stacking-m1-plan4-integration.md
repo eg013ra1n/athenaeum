@@ -53,6 +53,18 @@
   Checkpoint B (n = 208 rejects a 2–3 % population identically to the old
   formula).
 
+- **Task 3 — rejection sides are classified per frame, not by walking `work`.**
+  The plan's sketch read the rejected entries back out of `work` after the
+  combiner; the rejection routines compact survivors forward destructively,
+  so those entries are overwritten (a rejection not in the tail vanished
+  from the maps and the per-frame counts while `rejected_fraction` stayed
+  right). The engine now keeps the rejection value per frame (`rej_vals`)
+  and a `present` mask per pixel and classifies every present-but-unmasked
+  frame against the survivors' median (`work[..len − rejected]`). The
+  per-sample atomics became per-row flushes (one `fetch_add` per frame per
+  row). A regression test puts the outlier in frame 0 under a sorting
+  algorithm, and a multi-band maps-on test pins the global row offset.
+
 ## Carry-forwards taken up here (from Plans 1–3)
 
 - Plan 1: `read_rows_with_scratch` gets its consumer — `RegisteredSource` workers reuse a byte scratch and an f32 window buffer per worker (Task 3). The warp runs on the caller's rayon context (the injected pool installs it); the "global pool vs injected pool" note is closed by running `warp_rows` inside `pool.install` in the engine (it already is: `read_band_with_progress` is called from the engine thread and its workers are the source's own; no change). Worker panics inside `read_band_with_progress`'s scoped workers propagate as a panic to the build thread's `catch_unwind` (masters) — Plan 5's stacking job uses the same thread pattern; noted, not changed.

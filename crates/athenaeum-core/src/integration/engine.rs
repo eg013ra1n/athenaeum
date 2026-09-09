@@ -92,10 +92,10 @@ pub struct EngineProgress<'a> {
     /// combine: a progress indicator frozen at 100% reads as "finished and
     /// stuck", worse than one frozen partway.
     ///
-    /// Fired from inside `run_banded`'s `par_chunks_mut` row loop via an
-    /// `AtomicUsize` row counter, periodically (a row stride, not every
-    /// row — see the counter's call site) rather than on every row, as
-    /// `(rows_combined_so_far, total_rows, bytes_done, bytes_total)`:
+    /// Fired from `band_loop`'s per-row tick, on both the master and the
+    /// stacking path, via an `AtomicUsize` row counter, periodically (a row
+    /// stride, not every row — see the counter's call site) rather than on
+    /// every row, as `(rows_combined_so_far, total_rows, bytes_done, bytes_total)`:
     ///
     /// - `rows_combined_so_far`/`total_rows` are GLOBAL across the whole
     ///   run — every band's rows feed the same counter, in whatever order
@@ -142,7 +142,8 @@ pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
 
 /// What a band-combine closure receives: the decoded band, the output rows
 /// it must fill, the band's first global row, and the progress hook it must
-/// tick once per output row (`rows_done_total, total_rows, bytes_read, bytes_total`).
+/// call once per finished row, which reports `(rows_done_total, total_rows,
+/// bytes_read, bytes_total)` to `on_combine`.
 struct BandJob<'a> {
     planes: &'a BandPlanes,
     out_band: &'a mut [f32],
@@ -457,7 +458,9 @@ pub struct StackOutput {
     pub rejection_high: Option<Vec<f32>>,
     /// Rejected samples per frame (range + algorithm), indexed by frame.
     pub rejected_per_frame: Vec<u64>,
-    /// Samples the frame actually contributed (finite, in coverage), per frame.
+    /// Usable finite raw samples the frame offered, per frame — counted
+    /// before range and algorithm rejection (a range-rejected sample is a
+    /// sample, then a rejection).
     pub samples_per_frame: Vec<u64>,
     pub rejected_low: u64,
     pub rejected_high: u64,
@@ -488,8 +491,19 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
             params.weights.len()
         )));
     }
-    if params.weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+    if params
+        .rejection
+        .iter()
+        .chain(params.output.iter())
+        .any(|p| !p.scale.is_finite() || !p.offset.is_finite())
+    {
+        return Err(IntegrationError::BadInput("normalization pairs must be finite".into()));
+    }
+    if params.weights.iter().any(|wt| !wt.is_finite() || *wt < 0.0) {
         return Err(IntegrationError::BadInput("weights must be finite and non-negative".into()));
+    }
+    if params.weights.iter().all(|wt| *wt == 0.0) {
+        return Err(IntegrationError::BadInput("every weight is zero".into()));
     }
     if n > u16::MAX as usize {
         return Err(IntegrationError::BadInput(format!("{n} frames exceed the 65535-frame stack limit")));
@@ -536,50 +550,70 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                 // Per-worker scratch, allocated once per ROW (not per pixel):
                 // `work`/`out_vals`/`mask` feed `combine_pixel_weighted`,
                 // `scratch` is its own reused survivor-value buffer (Task 1
-                // fix round).
+                // fix round). `rej_vals`/`present` are FRAME-indexed (unlike
+                // `work`, which the rejection routines compact forward
+                // destructively — `work[kept..]` ends up holding duplicated
+                // survivor entries, not the rejected ones, so a rejection
+                // can never be recovered by walking `work` after the call;
+                // see the fix-round-1 ruling in the plan doc). The
+                // `row_*` counters below fold every per-sample update into
+                // one atomic flush per frame per row instead of one atomic
+                // per sample.
                 let mut work: Vec<(f32, u16)> = Vec::with_capacity(n);
                 let mut out_vals = vec![0f32; n];
                 let mut mask = vec![0u64; words];
                 let mut scratch: Vec<f32> = Vec::with_capacity(n);
+                let mut rej_vals = vec![0f32; n];
+                let mut present = vec![0u64; words];
+                let mut row_samples = vec![0u32; n];
+                let mut row_rejected = vec![0u32; n];
+                let mut row_bad = vec![0u32; n];
+                let mut row_rej_total = 0usize;
+                let mut row_low = 0u64;
+                let mut row_high = 0u64;
+                let mut row_all_bad = 0usize;
                 for (x, out_px) in out_row.iter_mut().enumerate() {
                     work.clear();
                     combine::mask_clear(&mut mask);
+                    combine::mask_clear(&mut present);
                     let idx = row_in_band * width + x;
                     let mut low_here = 0u32;
                     let mut high_here = 0u32;
                     for i in 0..n {
                         let raw = planes.sample(i, idx);
                         if !raw.is_finite() {
-                            bad_samples[i].fetch_add(1, Ordering::Relaxed);
+                            row_bad[i] += 1;
                             continue;
                         }
-                        samples_per_frame[i].fetch_add(1, Ordering::Relaxed);
+                        row_samples[i] += 1;
                         if let Some(lo) = params.range_low {
                             if raw <= lo {
                                 low_here += 1;
-                                rejected_per_frame[i].fetch_add(1, Ordering::Relaxed);
+                                row_rejected[i] += 1;
                                 continue;
                             }
                         }
                         if let Some(hi) = params.range_high {
                             if raw >= hi {
                                 high_here += 1;
-                                rejected_per_frame[i].fetch_add(1, Ordering::Relaxed);
+                                row_rejected[i] += 1;
                                 continue;
                             }
                         }
                         let rej = params.rejection[i].apply(raw);
                         let outv = params.output[i].apply(raw);
                         if !rej.is_finite() || !outv.is_finite() {
-                            bad_samples[i].fetch_add(1, Ordering::Relaxed);
+                            row_bad[i] += 1;
                             continue;
                         }
                         out_vals[i] = outv;
+                        rej_vals[i] = rej;
+                        combine::mask_set(&mut present, i);
                         work.push((rej, i as u16));
                     }
                     if work.is_empty() {
                         *out_px = 0.0;
-                        all_bad.fetch_add(1, Ordering::Relaxed);
+                        row_all_bad += 1;
                     } else {
                         let (val, rej_count) = combine::combine_pixel_weighted(
                             &mut work,
@@ -591,40 +625,60 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                         );
                         *out_px = val;
                         if rej_count > 0 {
-                            rejected.fetch_add(rej_count, Ordering::Relaxed);
-                            // Side of each rejected sample: below the survivors'
-                            // median of the rejection copy → low, else high.
-                            let mut surv: Vec<f32> = work
-                                .iter()
-                                .filter(|&&(_, i)| combine::mask_get(&mask, i as usize))
-                                .map(|&(v, _)| v)
-                                .collect();
-                            let median = if surv.is_empty() {
-                                let mut all: Vec<f32> = work.iter().map(|&(v, _)| v).collect();
-                                all.sort_by(|a, b| a.total_cmp(b));
-                                all[all.len() / 2]
-                            } else {
-                                surv.sort_by(|a, b| a.total_cmp(b));
-                                surv[surv.len() / 2]
-                            };
-                            for &(v, i) in work.iter() {
-                                if !combine::mask_get(&mask, i as usize) {
-                                    rejected_per_frame[i as usize].fetch_add(1, Ordering::Relaxed);
-                                    if v < median { low_here += 1 } else { high_here += 1 }
+                            row_rej_total += rej_count;
+                            // Survivors are the compacted prefix; the rejected
+                            // entries were overwritten by the compaction, so the
+                            // side of each rejection is decided per FRAME from
+                            // the values kept in `rej_vals`, against the
+                            // survivors' median (all rejected → the median of
+                            // every present value).
+                            let kept = work.len() - rej_count;
+                            scratch.clear();
+                            let source = if kept > 0 { &work[..kept] } else { &work[..] };
+                            scratch.extend(source.iter().map(|&(v, _)| v));
+                            scratch.sort_by(|a, b| a.total_cmp(b));
+                            let median = scratch[scratch.len() / 2];
+                            for i in 0..n {
+                                if combine::mask_get(&present, i) && !combine::mask_get(&mask, i) {
+                                    row_rejected[i] += 1;
+                                    if rej_vals[i] < median {
+                                        low_here += 1
+                                    } else {
+                                        high_here += 1
+                                    }
                                 }
                             }
                         }
                     }
-                    if low_here > 0 {
-                        rejected_low.fetch_add(low_here as u64, Ordering::Relaxed);
-                    }
-                    if high_here > 0 {
-                        rejected_high.fetch_add(high_here as u64, Ordering::Relaxed);
-                    }
+                    row_low += low_here as u64;
+                    row_high += high_here as u64;
                     if maps {
                         low_row[x] = low_here as f32;
                         high_row[x] = high_here as f32;
                     }
+                }
+                for i in 0..n {
+                    if row_samples[i] > 0 {
+                        samples_per_frame[i].fetch_add(row_samples[i] as u64, Ordering::Relaxed);
+                    }
+                    if row_rejected[i] > 0 {
+                        rejected_per_frame[i].fetch_add(row_rejected[i] as u64, Ordering::Relaxed);
+                    }
+                    if row_bad[i] > 0 {
+                        bad_samples[i].fetch_add(row_bad[i] as usize, Ordering::Relaxed);
+                    }
+                }
+                if row_rej_total > 0 {
+                    rejected.fetch_add(row_rej_total, Ordering::Relaxed);
+                }
+                if row_low > 0 {
+                    rejected_low.fetch_add(row_low, Ordering::Relaxed);
+                }
+                if row_high > 0 {
+                    rejected_high.fetch_add(row_high, Ordering::Relaxed);
+                }
+                if row_all_bad > 0 {
+                    all_bad.fetch_add(row_all_bad, Ordering::Relaxed);
                 }
                 tick();
             });
@@ -1521,5 +1575,96 @@ mod tests {
         }
         assert_eq!(master.rejected_fraction, stack.base.rejected_fraction);
         assert!(stack.rejection_low.is_none() && stack.rejection_high.is_none());
+    }
+
+    #[test]
+    fn a_rejection_in_the_first_frame_under_a_sorting_algorithm_reaches_the_maps() {
+        // Frame 0 has a COLD pixel (0.02, not range-rejected) at (3,2); frames
+        // 1–3 are flat 0.20. PercentileClip sorts ascending first, so the cold
+        // sample sits at work[0] and the forward compaction of the three
+        // survivors overwrites it — the defect the review found: the rejection
+        // used to vanish from the maps and the per-frame counts.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |x, y| if (x, y) == (3, 2) { 0.02 } else { 0.20 }),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "d.fits", w, h, |_, _| 0.20),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 4];
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &[1.0; 4],
+            range_low: Some(0.0),
+            range_high: None,
+            rejection_maps: true,
+        };
+        let out = integrate_stack(
+            &src,
+            &params,
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.5, high: 0.5 }),
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        assert!((out.base.data[2 * w + 3] - 0.20).abs() < 1e-6);
+        assert_eq!(out.rejection_low.as_ref().unwrap()[2 * w + 3], 1.0);
+        assert_eq!(out.rejection_high.as_ref().unwrap()[2 * w + 3], 0.0);
+        assert_eq!(out.rejected_per_frame, vec![1, 0, 0, 0]);
+        assert_eq!((out.rejected_low, out.rejected_high), (1, 0));
+        assert_eq!(out.rejection_low.as_ref().unwrap().iter().sum::<f32>(), 1.0);
+        assert_eq!(out.rejection_high.as_ref().unwrap().iter().sum::<f32>(), 0.0);
+    }
+
+    #[test]
+    fn rejection_maps_land_on_the_right_global_rows_across_bands() {
+        // 16×64, a tiny band budget → several bands; a cold pixel at (3,40)
+        // and a hot pixel at (5,50) in frame 0 must land at their global rows.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 64usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |x, y| match (x, y) {
+                (3, 40) => 0.02,
+                (5, 50) => 0.95,
+                _ => 0.20,
+            }),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "d.fits", w, h, |_, _| 0.20),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 4];
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &[1.0; 4],
+            range_low: None,
+            range_high: None,
+            rejection_maps: true,
+        };
+        let out = integrate_stack(
+            &src,
+            &params,
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.5, high: 0.5 }),
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(4096),
+        )
+        .unwrap();
+        assert!(out.base.bands >= 2, "expected a multi-band run, got {}", out.base.bands);
+        let low = out.rejection_low.as_ref().unwrap();
+        let high = out.rejection_high.as_ref().unwrap();
+        assert_eq!(low[40 * w + 3], 1.0);
+        assert_eq!(high[50 * w + 5], 1.0);
+        assert_eq!(low.iter().sum::<f32>(), 1.0);
+        assert_eq!(high.iter().sum::<f32>(), 1.0);
+        assert_eq!(out.rejected_per_frame, vec![2, 0, 0, 0]);
+        assert!(out.base.data.iter().all(|v| (v - 0.20).abs() < 1e-6));
     }
 }
