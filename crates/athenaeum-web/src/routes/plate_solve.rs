@@ -5,11 +5,16 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use athenaeum_core::db::load_frame_with_path;
+use athenaeum_core::plate_solve::attempts::{
+    self, PlateSolveCompleteEvent, PlateSolveProgressEvent,
+};
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::hints::extract_hints;
 use athenaeum_core::plate_solve::service::SolveResult;
-use athenaeum_core::plate_solve::{describe_solve_failure, service, storage, SolveHints, StoreOutcome};
+use athenaeum_core::plate_solve::{
+    describe_solve_failure, service, storage, SolveHints, StoreOutcome,
+};
 use athenaeum_core::services::PlateSolveHandle;
 
 use crate::events::SseEvent;
@@ -88,32 +93,8 @@ pub struct FrameIdArgs {
 #[serde(rename_all = "camelCase")]
 pub struct BatchArgs {
     pub frame_ids: Vec<i64>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PlateSolveProgressEvent {
-    frame_id: i64,
-    current: usize,
-    total: usize,
-    status: String,
-    matched_stars: Option<usize>,
-    rms_arcsec: Option<f64>,
-    error: Option<String>,
-    /// Machine code for a failure (solvemyastro `FailureClass` or
-    /// `REJECTED_LOW_CONFIDENCE`); lets the UI group/style reasons.
-    failure_code: Option<String>,
-    /// Frame filename, so the UI can label per-frame rows without a lookup.
-    filename: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PlateSolveCompleteEvent {
-    solved: usize,
-    failed: usize,
-    total: usize,
-    total_time_ms: u64,
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 /// Request body for `set_plate_solve_config`. The frontend calls
@@ -250,12 +231,10 @@ pub async fn plate_solve_batch(
     let total = work_items.len();
 
     // Concurrency: config override, else auto (~1 worker per 3 cores, max 8).
-    let concurrency = if ps_config.batch_concurrency == 0 {
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        (cores / 3).max(2).min(8)
-    } else {
-        (ps_config.batch_concurrency as usize).clamp(1, 16)
-    };
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let concurrency = config::batch_workers(ps_config.batch_concurrency, args.sequential, cores);
     tracing::info!(total, workers = concurrency, "plate solve batch starting");
 
     let ctx = state.ctx.clone();
@@ -372,7 +351,12 @@ pub async fn plate_solve_batch(
                                             frame_id: *frame_id,
                                             current: done,
                                             total,
-                                            status: "failed".into(),
+                                            status: if code.as_deref() == Some("CANCELLED") {
+                                                "cancelled"
+                                            } else {
+                                                "failed"
+                                            }
+                                            .into(),
                                             matched_stars: None,
                                             rms_arcsec: None,
                                             error: Some(error.clone()),
@@ -420,8 +404,24 @@ pub async fn plate_solve_batch(
                                 dso.as_deref(),
                                 ps_config.as_ref(),
                             ) {
-                                Ok(StoreOutcome::Persisted) => solved += 1,
+                                Ok(StoreOutcome::Persisted) => {
+                                    solved += 1;
+                                    if let Err(error) =
+                                        attempts::record(&conn, *frame_id, "solved", None, None)
+                                    {
+                                        tracing::error!(frame_id, %error, "failed to record solve status");
+                                    }
+                                }
                                 Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
+                                    if let Err(error) = attempts::record(
+                                        &conn,
+                                        *frame_id,
+                                        "failed",
+                                        Some("REJECTED_LOW_CONFIDENCE"),
+                                        Some(&reason),
+                                    ) {
+                                        tracing::error!(frame_id, %error, "failed to record solve status");
+                                    }
                                     // The Phase-2 "solved" event already reached the
                                     // UI; emit a correction so the frame flips to
                                     // failed with the rejection reason.
@@ -446,12 +446,42 @@ pub async fn plate_solve_batch(
                                 }
                                 Err(e) => {
                                     tracing::error!(frame_id, error = %e, "failed to store plate solve result, solve outcome lost");
+                                    if let Err(error) = attempts::record(
+                                        &conn,
+                                        *frame_id,
+                                        "failed",
+                                        Some("STORAGE_ERROR"),
+                                        Some(&e.to_string()),
+                                    ) {
+                                        tracing::error!(frame_id, %error, "failed to record solve status");
+                                    }
                                     failed += 1;
                                 }
                             }
                         }
-                        WorkResult::Failed { .. } => {
-                            failed += 1;
+                        WorkResult::Failed {
+                            frame_id,
+                            error,
+                            code,
+                            ..
+                        } => {
+                            let status = if code.as_deref() == Some("CANCELLED") {
+                                "cancelled"
+                            } else {
+                                "failed"
+                            };
+                            if let Err(error) = attempts::record(
+                                &conn,
+                                *frame_id,
+                                status,
+                                code.as_deref(),
+                                Some(error),
+                            ) {
+                                tracing::error!(frame_id, %error, "failed to record solve status");
+                            }
+                            if code.as_deref() != Some("CANCELLED") {
+                                failed += 1;
+                            }
                         }
                     }
                 }
@@ -476,6 +506,8 @@ pub async fn plate_solve_batch(
                     failed,
                     total,
                     total_time_ms: start.elapsed().as_millis() as u64,
+                    cancelled: cancel_flag.load(Ordering::Relaxed),
+                    not_processed: total.saturating_sub(solved + failed),
                 })
                 .unwrap_or_default(),
             });
@@ -495,6 +527,8 @@ pub async fn plate_solve_batch(
                     failed: total,
                     total,
                     total_time_ms: 0,
+                    cancelled: false,
+                    not_processed: 0,
                 })
                 .unwrap_or_default(),
             });
@@ -1026,4 +1060,20 @@ mod plate_solve_config_tests {
              this is what closes the silent-mismatch hole (axum returns 422/400 for this shape)"
         );
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SolveAttemptsArgs {
+    pub frame_ids: Vec<i64>,
+    pub failed_only: bool,
+}
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_plate_solve_attempts(
+    State(state): State<WebAppState>,
+    Json(args): Json<SolveAttemptsArgs>,
+) -> Result<Json<Vec<attempts::SolveAttempt>>, (StatusCode, String)> {
+    attempts::get(&state.ctx, args.frame_ids, args.failed_only)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }

@@ -1,6 +1,12 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+export type SolveAttempt = { frameId: number, filename: string, path: string, status: string, code: string | null, error: string | null, attemptedAt: string, };
+
+export type PlateSolveProgressEvent = { frameId: number, current: number, total: number, status: string, matchedStars: number | null, rmsArcsec: number | null, error: string | null, failureCode: string | null, filename: string | null, };
+
+export type PlateSolveCompleteEvent = { solved: number, failed: number, total: number, totalTimeMs: number, cancelled: boolean, notProcessed: number, };
+
 export type PlateSolveConfig = { 
 /**
  * SIP distortion polynomial order passed to `solvemyastro` (2 or 3).
@@ -28,6 +34,11 @@ autofind_tolerance_deg: number,
  * shares the global rayon pool for intra-frame star detection.
  */
 batch_concurrency: number, 
+/**
+ * Per-frame elapsed time budget in seconds, including fallback attempts.
+ * Zero disables the cooperative deadline; default 60 seconds.
+ */
+frame_timeout_seconds: number, 
 /**
  * Apply the stricter acceptance gate before persisting a solve (defends
  * against catalog-corruption false positives writing WCS/focal length

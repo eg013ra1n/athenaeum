@@ -10,6 +10,9 @@ export default {
         antiqua: ['"Book Antiqua"', 'Palatino', '"Palatino Linotype"', 'serif'],
       },
       colors: {
+        // Modal scrim and text on accent-filled controls.
+        overlay: '#000000',
+        'on-accent': '#2e3440',
         // Polar Night (backgrounds)
         surface: {
           DEFAULT: '#2e3440', // nord0 - base background

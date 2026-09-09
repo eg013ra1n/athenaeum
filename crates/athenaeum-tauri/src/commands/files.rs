@@ -293,3 +293,9 @@ pub async fn rename_path(
 ) -> Result<(), String> {
     api::rename_path(&state.ctx, old_path, new_name, &PathPolicy::AllowAll).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn is_existing_directory(path: String) -> Result<bool, String> {
+    api::is_existing_directory(path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+}

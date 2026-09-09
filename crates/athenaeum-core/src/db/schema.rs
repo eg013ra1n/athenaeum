@@ -2269,6 +2269,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         conn.execute(stmt, [])?;
     }
 
+    crate::plate_solve::attempts::init_schema(conn)?;
+
     // One-time data repairs (settings-flag gated). Best-effort by design: a
     // repair failure must not brick catalog init — the error is logged here
     // and the flag stays unstamped so the next start retries.

@@ -5,6 +5,9 @@ use serde::Serialize;
 use tauri::{Emitter, State};
 
 use athenaeum_core::db::load_frame_with_path;
+use athenaeum_core::plate_solve::attempts::{
+    self, PlateSolveCompleteEvent, PlateSolveProgressEvent,
+};
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::{DsoCatalog, ResolvedObject};
 use athenaeum_core::plate_solve::hints::extract_hints;
@@ -190,36 +193,13 @@ pub async fn reset_plate_solve_config(
 
 // ========== Solve Commands ==========
 
-#[derive(Clone, Serialize)]
-struct PlateSolveProgressEvent {
-    frame_id: i64,
-    current: usize,
-    total: usize,
-    status: String,
-    matched_stars: Option<usize>,
-    rms_arcsec: Option<f64>,
-    error: Option<String>,
-    /// Machine code for a failure (solvemyastro `FailureClass` or
-    /// `REJECTED_LOW_CONFIDENCE` / `PANIC`); lets the UI group/style reasons.
-    failure_code: Option<String>,
-    /// Frame filename, so the UI can label per-frame rows without a lookup.
-    filename: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-struct PlateSolveCompleteEvent {
-    solved: usize,
-    failed: usize,
-    total: usize,
-    total_time_ms: u64,
-}
-
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn plate_solve_batch(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     frame_ids: Vec<i64>,
+    sequential: Option<bool>,
 ) -> Result<(), String> {
     // ── Phase 1: load everything on the main thread (holds DB lock) ──
     let (ps_config, layer_caches, dso, cancel_flag, work_items) = {
@@ -313,12 +293,14 @@ pub async fn plate_solve_batch(
     // Choose concurrency: config override, else auto (~1 worker per 3 cores).
     // Lower cap than analysis (8 vs 16) because each solve already uses the
     // shared rayon pool for intra-frame star detection.
-    let concurrency = if ps_config.batch_concurrency == 0 {
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        (cores / 3).max(2).min(8)
-    } else {
-        (ps_config.batch_concurrency as usize).clamp(1, 16)
-    };
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let concurrency = config::batch_workers(
+        ps_config.batch_concurrency,
+        sequential.unwrap_or(false),
+        cores,
+    );
     tracing::info!(total, workers = concurrency, "plate solve batch starting");
 
     // ── Phase 2: parallel solve on a scoped thread pool ──
@@ -455,7 +437,7 @@ pub async fn plate_solve_batch(
                                     frame_id: *frame_id,
                                     current: done,
                                     total,
-                                    status: "failed".into(),
+                                    status: if code.as_deref() == Some("CANCELLED") { "cancelled" } else { "failed" }.into(),
                                     matched_stars: None,
                                     rms_arcsec: None,
                                     error: Some(error.clone()),
@@ -504,8 +486,24 @@ pub async fn plate_solve_batch(
                         dso.as_deref(),
                         ps_config.as_ref(),
                     ) {
-                        Ok(StoreOutcome::Persisted) => solved += 1,
+                        Ok(StoreOutcome::Persisted) => {
+                            solved += 1;
+                            if let Err(error) =
+                                attempts::record(&conn, *frame_id, "solved", None, None)
+                            {
+                                tracing::error!(frame_id, %error, "failed to record solve status");
+                            }
+                        }
                         Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
+                            if let Err(error) = attempts::record(
+                                &conn,
+                                *frame_id,
+                                "failed",
+                                Some("REJECTED_LOW_CONFIDENCE"),
+                                Some(&reason),
+                            ) {
+                                tracing::error!(frame_id, %error, "failed to record solve status");
+                            }
                             // The Phase-2 "solved" event already reached the UI;
                             // emit a correction so the frame flips to failed with
                             // the rejection reason (totals count it as failed too).
@@ -527,12 +525,38 @@ pub async fn plate_solve_batch(
                         }
                         Err(e) => {
                             tracing::error!(frame_id, error = %e, "failed to store plate solve result, solve outcome lost");
+                            if let Err(error) = attempts::record(
+                                &conn,
+                                *frame_id,
+                                "failed",
+                                Some("STORAGE_ERROR"),
+                                Some(&e.to_string()),
+                            ) {
+                                tracing::error!(frame_id, %error, "failed to record solve status");
+                            }
                             failed += 1;
                         }
                     }
                 }
-                WorkResult::Failed { .. } => {
-                    failed += 1;
+                WorkResult::Failed {
+                    frame_id,
+                    error,
+                    code,
+                    ..
+                } => {
+                    let status = if code.as_deref() == Some("CANCELLED") {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    if let Err(error) =
+                        attempts::record(&conn, *frame_id, status, code.as_deref(), Some(error))
+                    {
+                        tracing::error!(frame_id, %error, "failed to record solve status");
+                    }
+                    if code.as_deref() != Some("CANCELLED") {
+                        failed += 1;
+                    }
                 }
             }
         }
@@ -557,6 +581,8 @@ pub async fn plate_solve_batch(
             failed,
             total,
             total_time_ms: start.elapsed().as_millis() as u64,
+            cancelled: cancel_flag.load(Ordering::Relaxed),
+            not_processed: total.saturating_sub(solved + failed),
         },
     );
 
@@ -914,5 +940,17 @@ pub async fn download_catalog_layers(
     .await
     .map_err(|e| format!("download task panicked: {e}"))?;
 
-    result.map(|p| p.display().to_string()).map_err(|e| e.to_string())
+    result
+        .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_plate_solve_attempts(
+    state: State<'_, AppState>,
+    frame_ids: Vec<i64>,
+    failed_only: bool,
+) -> Result<Vec<attempts::SolveAttempt>, String> {
+    attempts::get(&state.ctx, frame_ids, failed_only).map_err(|e| e.to_string())
 }

@@ -168,13 +168,15 @@ pub fn solve_frame_with_hints(
     // Propagate the solver error verbatim (no lossy context wrapper) so the
     // structured `solvemyastro::SolveFailure` stays at the top of the chain
     // and `plate_solve::failure::describe_solve_failure` can downcast it.
-    let solution = solvemyastro::solve(
-        std::path::Path::new(file_path),
-        &sma_hints,
-        caches,
-        &sma_cfg,
-        cancel,
-    )?;
+    let solution = super::budget::run(config.frame_timeout_seconds, cancel, |frame_cancel| {
+        solvemyastro::solve(
+            std::path::Path::new(file_path),
+            &sma_hints,
+            caches,
+            &sma_cfg,
+            Some(frame_cancel),
+        )
+    })?;
 
     let total_ms = total_start.elapsed().as_millis() as u64;
 

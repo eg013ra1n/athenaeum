@@ -81,6 +81,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
         // Files
         .route("/api/get_files", post(files::get_files))
+        .route("/api/is_existing_directory", post(files::is_existing_directory))
         .route("/api/get_files_by_directory", post(files::get_files_by_directory))
         .route("/api/get_directory_contents", post(files::get_directory_contents))
         .route("/api/get_camera_directories", post(files::get_camera_directories))
@@ -112,6 +113,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Frame sets
         .route("/api/auto_generate_frame_sets", post(frame_sets::auto_generate_frame_sets))
         .route("/api/get_frames_sets", post(frame_sets::get_frames_sets))
+        .route("/api/get_object_plate_solve_frame_ids", post(frame_sets::get_object_plate_solve_frame_ids))
         .route("/api/get_frame_set_detail", post(frame_sets::get_frame_set_detail))
         .route("/api/delete_frames_set", post(frame_sets::delete_frames_set))
         .route("/api/delete_auto_generated_frame_sets", post(frame_sets::delete_auto_generated_frame_sets))
@@ -212,6 +214,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))
         .route("/api/reset_plate_solve_config", post(plate_solve::reset_plate_solve_config))
         .route("/api/plate_solve_batch", post(plate_solve::plate_solve_batch))
+        .route("/api/get_plate_solve_attempts", post(plate_solve::get_plate_solve_attempts))
         .route("/api/cancel_plate_solve", post(plate_solve::cancel_plate_solve))
         .route("/api/autofind_objects_from_coordinates", post(plate_solve::autofind_objects_from_coordinates))
         .route("/api/cancel_autofind_objects", post(plate_solve::cancel_autofind_objects))

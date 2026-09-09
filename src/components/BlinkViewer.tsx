@@ -1,3 +1,4 @@
+import { SolveFailureBadge } from './plate-solve/FailedSolvesReview';
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { api } from '../api';
 import { isTauri } from '../utils/platform';
@@ -1002,6 +1003,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col">
+      <SolveFailureBadge frameId={currentFrame?.frame?.id} />
       {/* TOP TOOLBAR */}
       <ToolBar
         currentIndex={currentIndex}

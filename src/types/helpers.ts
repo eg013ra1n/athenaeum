@@ -439,27 +439,7 @@ export function supportsWarningMode(
 // plate-solve.ts TS-ONLY material
 // ============================================================================
 
-export interface PlateSolveProgressEvent {
-  frame_id: number;
-  current: number;
-  total: number;
-  status: "solving" | "solved" | "failed";
-  matched_stars?: number;
-  rms_arcsec?: number;
-  error?: string;
-  /** Machine code for a failure (solvemyastro FailureClass, e.g. "VERIFY_GAP",
-   * or "REJECTED_LOW_CONFIDENCE" / "PANIC"). Lets the UI group/style reasons. */
-  failure_code?: string;
-  /** Frame filename, for labelling per-frame rows without a separate lookup. */
-  filename?: string;
-}
-
-export interface PlateSolveCompleteEvent {
-  solved: number;
-  failed: number;
-  total: number;
-  total_time_ms: number;
-}
+export type { PlateSolveProgressEvent, PlateSolveCompleteEvent } from './plate-solve';
 
 export interface CatalogStatusInfo {
   name: string;
