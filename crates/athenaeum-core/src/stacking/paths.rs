@@ -34,28 +34,53 @@ impl WorkingLayout {
         }
     }
 
+    /// `root/calibrated` — the parent of every group's calibrated-frame
+    /// subdirectory. One accessor per subtree (this and the three below),
+    /// so `work_usage`/`cleanup_work` never repeat the literal.
+    pub fn calibrated_root(&self) -> PathBuf {
+        self.root.join("calibrated")
+    }
+
+    /// `root/registered` — the parent of every group's registered-frame
+    /// subdirectory.
+    pub fn registered_root(&self) -> PathBuf {
+        self.root.join("registered")
+    }
+
+    /// `root/ln` — the parent of every group's local-normalization
+    /// subdirectory (M2; not written by anything in M1, but part of the
+    /// layout and the usage/cleanup accounting from this task onward).
+    pub fn ln_root(&self) -> PathBuf {
+        self.root.join("ln")
+    }
+
+    /// `root/runs` — one JSON snapshot per run (see [`Self::run_json`]).
+    pub fn runs_root(&self) -> PathBuf {
+        self.root.join("runs")
+    }
+
     /// `root/calibrated/<group_key>` — stage-1 calibrated frames for one
     /// integration group.
     pub fn calibrated_dir(&self, group_key: &str) -> PathBuf {
-        self.root.join("calibrated").join(group_key)
+        self.calibrated_root().join(group_key)
     }
 
     /// `root/registered/<group_key>` — stage-5 registered frames for one
     /// integration group.
     pub fn registered_dir(&self, group_key: &str) -> PathBuf {
-        self.root.join("registered").join(group_key)
+        self.registered_root().join(group_key)
     }
 
-    /// `root/ln/<group_key>` — stage-6 local-normalization intermediates
-    /// (M2; not written by anything in M1, but part of the layout and the
-    /// usage/cleanup accounting from this task onward).
+    /// `root/ln/<group_key>` — stage-6 local-normalization intermediates.
     pub fn ln_dir(&self, group_key: &str) -> PathBuf {
-        self.root.join("ln").join(group_key)
+        self.ln_root().join(group_key)
     }
 
-    /// `root/runs` — one JSON snapshot per run (see [`Self::run_json`]).
+    /// `root/runs` — same as [`Self::runs_root`]; kept as its own name since
+    /// it predates the other three `_root` accessors and is the one other
+    /// tasks (e.g. [`Self::run_json`]) already call.
     pub fn runs_dir(&self) -> PathBuf {
-        self.root.join("runs")
+        self.runs_root()
     }
 
     /// `root/runs/run-<run_id>.json`.
@@ -132,9 +157,10 @@ fn pick_dir(
 }
 
 /// The two folders after validation: normalized, created, writable, and
-/// checked against each other. `warnings` carries scan-root-overlap
-/// sentences (see [`OverlapRule::Warn`]) — non-fatal for stacking folders,
-/// unlike the transfer folders `validate_transfer_dir` was written for.
+/// checked against each other. `warnings` carries stacking-worded
+/// scan-root-overlap sentences (see [`OverlapRule::Warn`] and
+/// [`overlap_sentence`]) — non-fatal for stacking folders, unlike the
+/// transfer folders `validate_transfer_dir` was written for.
 #[derive(Debug, Clone)]
 pub struct ValidatedDirs {
     pub working: PathBuf,
@@ -146,27 +172,39 @@ pub struct ValidatedDirs {
 /// Each goes through [`crate::api::sync::validate_transfer_dir`] with
 /// [`OverlapRule::Warn`] — a stacking folder overlapping a monitored scan
 /// root is worth flagging (the scanner would try to ingest intermediate/
-/// output FITS as if they were new frames) but must not by itself block a
-/// run the way it blocks a transfer folder. Two further rules are specific to
-/// this pair: the two folders must differ, and the working folder must not
-/// sit inside the output folder (scratch files would then land inside
-/// whatever the user treats as "the finished stack", including anything they
-/// export or archive from there). The reverse nesting — output inside
-/// working — is allowed.
+/// output FITS as if they were new frames — except every file this pipeline
+/// writes carries a scanner-skip card, so it never actually would) but must
+/// not by itself block a run the way it blocks a transfer folder. Two
+/// further rules are specific to this pair: the two folders must differ,
+/// and the working folder must not sit inside the output folder (scratch
+/// files would then land inside whatever the user treats as "the finished
+/// stack", including anything they export or archive from there). The
+/// reverse nesting — output inside working — is allowed.
+///
+/// A folder either call had to create (it did not already exist) is removed
+/// again on a later rejection — the same leaf-only, best-effort contract
+/// `validate_transfer_dir` keeps for its own later steps, extended here to
+/// the two rules above it: a folder validated is a folder that must exist by
+/// the time this function returns `Ok`, but a rejected save must not litter
+/// the filesystem with a folder the operator will never get to use.
 pub fn validate_dirs(
     conn: &Connection,
     policy: &PathPolicy,
     working: &str,
     output: &str,
 ) -> Result<ValidatedDirs, ApiError> {
-    let (working_path, working_warning) = crate::api::sync::validate_transfer_dir(
+    // Recorded before either call can create anything.
+    let working_existed = Path::new(working.trim()).exists();
+    let output_existed = Path::new(output.trim()).exists();
+
+    let (working_path, working_overlap_root) = crate::api::sync::validate_transfer_dir(
         conn,
         policy,
         working,
         "Stacking working folder",
         OverlapRule::Warn,
     )?;
-    let (output_path, output_warning) = crate::api::sync::validate_transfer_dir(
+    let (output_path, output_overlap_root) = crate::api::sync::validate_transfer_dir(
         conn,
         policy,
         output,
@@ -175,19 +213,29 @@ pub fn validate_dirs(
     )?;
 
     if working_path == output_path {
+        remove_if_created(&working_path, working_existed);
+        remove_if_created(&output_path, output_existed);
         return Err(ApiError::Invalid(
             "working and output folders must differ".into(),
         ));
     }
     if working_path.starts_with(&output_path) {
+        // Nested-child first: removing the parent while the child still
+        // exists would fail (a non-empty directory), leaving both behind.
+        remove_if_created(&working_path, working_existed);
+        remove_if_created(&output_path, output_existed);
         return Err(ApiError::Invalid(
             "the working folder may not sit inside the output folder".into(),
         ));
     }
 
     let mut warnings = Vec::new();
-    warnings.extend(working_warning);
-    warnings.extend(output_warning);
+    if let Some(root) = working_overlap_root {
+        warnings.push(overlap_sentence("Stacking working folder", &root));
+    }
+    if let Some(root) = output_overlap_root {
+        warnings.push(overlap_sentence("Stacking output folder", &root));
+    }
 
     Ok(ValidatedDirs {
         working: working_path,
@@ -196,24 +244,61 @@ pub fn validate_dirs(
     })
 }
 
+/// Word a stacking-specific scan-root-overlap warning from the overlapping
+/// root's own path (`OverlapRule::Warn`'s payload) — deliberately not the
+/// transfer-folder sentence `validate_transfer_dir` uses for
+/// `OverlapRule::Reject`, since a stacking folder overlapping a monitored
+/// root is allowed, not an error, and the scanner-skip-card reason is
+/// specific to what this pipeline writes.
+fn overlap_sentence(label: &str, overlapping_root_path: &str) -> String {
+    format!(
+        "{label} overlaps a monitored folder ({overlapping_root_path}) — every artifact and master carries a scanner-skip card, so this is allowed"
+    )
+}
+
+/// Remove `path` if this call is the one that created it (`existed_before ==
+/// false`) — best-effort and leaf-only (`remove_dir`, never
+/// `remove_dir_all`): a folder that was already there, or that is not empty
+/// (e.g. a rejected working-inside-output save leaves the child removed
+/// before the parent, so the parent IS empty by the time this runs — see
+/// [`validate_dirs`]), is left alone rather than risk removing something the
+/// operator did not ask this call to touch.
+fn remove_if_created(path: &Path, existed_before: bool) {
+    if existed_before {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir(path) {
+        tracing::debug!(path = %path.display(), error = %e, "rejected stacking folder left in place");
+    }
+}
+
 /// Free bytes available on the volume holding `path` (`statvfs`'s
 /// `f_bavail * f_frsize`, the same "available to an unprivileged process"
 /// figure `sync::retention::disk_usage_pct` reads). `None` on any error or on
 /// a non-unix platform — a probe failure must never look like "the disk is
-/// full", so the caller treats `None` as "unknown", not zero.
+/// full", so the caller treats `None` as "unknown", not zero. Never silent:
+/// both failure paths (an unrepresentable path, a failed `statvfs` call)
+/// `warn!` before returning `None`.
 #[cfg(unix)]
 pub fn free_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let cpath = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "free space probe failed");
+            return None;
+        }
+    };
     // SAFETY: `stat` is zero-initialised and only read after a successful
     // call; `cpath` is a valid NUL-terminated C string living for the call's
     // duration.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
     if rc != 0 {
-        tracing::warn!(path = %path.display(), "statvfs failed");
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(path = %path.display(), %error, "free space probe failed");
         return None;
     }
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
@@ -274,11 +359,17 @@ pub struct WorkUsage {
     pub total_bytes: u64,
 }
 
+/// Walks each subtree via [`crate::api::sync::dir_size_bytes`] (`walkdir`,
+/// which does not follow symlinks) rather than a second hand-rolled
+/// recursive walker — `std::fs::read_dir` + `Path::is_dir` follows symlinks,
+/// so a symlink-to-directory under e.g. `calibrated/` would recurse forever
+/// on a cyclic link and double-count real files reachable both directly and
+/// through the link.
 pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
-    let calibrated_bytes = dir_bytes(&layout.root.join("calibrated"));
-    let registered_bytes = dir_bytes(&layout.root.join("registered"));
-    let ln_bytes = dir_bytes(&layout.root.join("ln"));
-    let runs_bytes = dir_bytes(&layout.root.join("runs"));
+    let calibrated_bytes = crate::api::sync::dir_size_bytes(&layout.calibrated_root());
+    let registered_bytes = crate::api::sync::dir_size_bytes(&layout.registered_root());
+    let ln_bytes = crate::api::sync::dir_size_bytes(&layout.ln_root());
+    let runs_bytes = crate::api::sync::dir_size_bytes(&layout.runs_root());
     WorkUsage {
         calibrated_bytes,
         registered_bytes,
@@ -286,26 +377,6 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
         runs_bytes,
         total_bytes: calibrated_bytes + registered_bytes + ln_bytes + runs_bytes,
     }
-}
-
-/// Recursive byte total of every regular file under `path`. `0` when `path`
-/// does not exist (or is unreadable) — a missing subtree is not an error
-/// here, it is the common case (a run that never wrote registered frames, a
-/// layout that was just cleaned up).
-fn dir_bytes(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            total += dir_bytes(&p);
-        } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
-        }
-    }
-    total
 }
 
 /// How much of a working layout to remove. Each level removes everything the
@@ -324,45 +395,45 @@ pub enum CleanupWhat {
 }
 
 /// `stacking_artifacts.kind` values covered by [`CleanupWhat::Intermediates`]
-/// (and, since it removes nothing less, [`CleanupWhat::All`]) — every kind
-/// this task's working-folder subtrees (`calibrated/`, `registered/`, `ln/`)
-/// can hold. `runs/` (removed only at `All`) carries no artifact rows of its
-/// own — a run's `run-<id>.json` is a plain snapshot file, not tracked in
-/// `stacking_artifacts`.
+/// — every kind this task's `calibrated/`/`registered/`/`ln/` subtrees can
+/// hold. NOT used by [`CleanupWhat::All`]: `kind` is free-form TEXT, not an
+/// enum this crate can enumerate exhaustively, so `All` clears every row via
+/// [`crate::db::stacking::delete_all_artifacts`] instead — a future kind
+/// this list doesn't yet name must not survive "delete everything" and keep
+/// pointing at files cleanup just removed.
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] =
     &["registered", "calibrated", "ln", "ln_reference", "metrics"];
 
 /// Remove a working layout's subtrees per `what` and the matching
 /// `stacking_artifacts` rows, returning the bytes freed (summed by walking
-/// each subtree before it is removed). Only ever touches directories under
-/// `layout.root` that this task's layout owns (`registered/`, `calibrated/`,
-/// `ln/`, `runs/`) — never `layout.root` itself, and never the output
-/// folder, which this function never sees a path for.
+/// each subtree, symlink-safe via [`crate::api::sync::dir_size_bytes`],
+/// before it is removed). Only ever touches directories under `layout.root`
+/// that this task's layout owns (`registered/`, `calibrated/`, `ln/`,
+/// `runs/`) — never `layout.root` itself, and never the output folder,
+/// which this function never sees a path for.
 pub fn cleanup_work(
     conn: &Connection,
     frames_set_id: i64,
     layout: &WorkingLayout,
     what: CleanupWhat,
 ) -> anyhow::Result<u64> {
-    let mut dirs = vec![layout.root.join("registered")];
-    let kinds: &[&str] = match what {
-        CleanupWhat::Registered => &["registered"],
+    let mut dirs = vec![layout.registered_root()];
+    match what {
+        CleanupWhat::Registered => {}
         CleanupWhat::Intermediates => {
-            dirs.push(layout.root.join("calibrated"));
-            dirs.push(layout.root.join("ln"));
-            INTERMEDIATE_ARTIFACT_KINDS
+            dirs.push(layout.calibrated_root());
+            dirs.push(layout.ln_root());
         }
         CleanupWhat::All => {
-            dirs.push(layout.root.join("calibrated"));
-            dirs.push(layout.root.join("ln"));
-            dirs.push(layout.root.join("runs"));
-            INTERMEDIATE_ARTIFACT_KINDS
+            dirs.push(layout.calibrated_root());
+            dirs.push(layout.ln_root());
+            dirs.push(layout.runs_root());
         }
-    };
+    }
 
     let mut freed = 0u64;
     for dir in &dirs {
-        freed += dir_bytes(dir);
+        freed += crate::api::sync::dir_size_bytes(dir);
         if dir.exists() {
             std::fs::remove_dir_all(dir).map_err(|e| {
                 tracing::warn!(path = %dir.display(), error = %e, "stacking cleanup: remove_dir_all failed");
@@ -371,7 +442,21 @@ pub fn cleanup_work(
         }
     }
 
-    crate::db::stacking::delete_artifacts(conn, frames_set_id, kinds)?;
+    match what {
+        CleanupWhat::Registered => {
+            crate::db::stacking::delete_artifacts(conn, frames_set_id, &["registered"])?;
+        }
+        CleanupWhat::Intermediates => {
+            crate::db::stacking::delete_artifacts(
+                conn,
+                frames_set_id,
+                INTERMEDIATE_ARTIFACT_KINDS,
+            )?;
+        }
+        CleanupWhat::All => {
+            crate::db::stacking::delete_all_artifacts(conn, frames_set_id)?;
+        }
+    }
 
     tracing::debug!(
         frame_set_id = frames_set_id,
@@ -387,7 +472,7 @@ pub fn cleanup_work(
 mod tests {
     use super::*;
     use crate::db::schema::init_db;
-    use crate::db::stacking::{delete_artifacts, NewArtifact};
+    use crate::db::stacking::{delete_artifacts, list_artifacts, NewArtifact};
     use crate::stacking::config::PathsConfig;
     use crate::stacking::groups::GroupFrame;
 
@@ -510,6 +595,42 @@ mod tests {
         assert!(validated.output.is_dir());
         assert_eq!(validated.warnings.len(), 1, "{:?}", validated.warnings);
         assert!(validated.warnings[0].contains("monitored folder"));
+        assert!(
+            validated.warnings[0].contains(overlapping_root.to_str().unwrap()),
+            "the warning names the overlapping SCAN ROOT's path, not the stacking folder's: {}",
+            validated.warnings[0]
+        );
+        assert!(
+            !validated.warnings[0].contains("ingest transfer copies"),
+            "the reused transfer-folder sentence must not leak into a stacking warning: {}",
+            validated.warnings[0]
+        );
+    }
+
+    #[test]
+    fn validate_dirs_removes_stray_folders_on_rejection() {
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PathPolicy::AllowAll;
+
+        // Two fresh, non-existent, nested paths (working inside output):
+        // both get created by validation, then the nesting check rejects —
+        // neither may be left behind.
+        let output = tmp.path().join("output-new");
+        let working = output.join("scratch-new");
+        assert!(!output.exists());
+        assert!(!working.exists());
+
+        let err = validate_dirs(
+            &c,
+            &policy,
+            working.to_str().unwrap(),
+            output.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        assert!(!working.exists(), "the folder this call created is removed");
+        assert!(!output.exists(), "the folder this call created is removed");
     }
 
     // ── free_bytes ───────────────────────────────────────────────────────
@@ -681,7 +802,13 @@ mod tests {
             200,
         );
 
-        // Intermediates: also removes calibrated/.
+        // A future artifact kind this crate doesn't yet name — `kind` is
+        // free-form TEXT, so nothing stops one existing before the code that
+        // understands it does. `Intermediates` (a fixed kind list) must
+        // leave it alone; only `All` may sweep it.
+        seed_artifact(&c, set_id, "future", "/nowhere", 0);
+
+        // Intermediates: also removes calibrated/, but not the unknown kind.
         let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
         assert_eq!(freed, 300);
         assert!(!layout.registered_dir("g").exists());
@@ -690,6 +817,13 @@ mod tests {
             layout.root.exists(),
             "the layout's own root is never removed"
         );
+        let remaining = list_artifacts(&c, set_id, None).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "Intermediates does not touch a kind it doesn't name: {remaining:?}"
+        );
+        assert_eq!(remaining[0].kind, "future");
 
         // The output folder — a sibling directory this function never sees a
         // path for — is never touched by any level.
@@ -699,5 +833,41 @@ mod tests {
         write_bytes(&output_file, 42);
         cleanup_work(&c, set_id, &layout, CleanupWhat::All).unwrap();
         assert!(output_file.exists(), "output folder untouched");
+        assert!(
+            list_artifacts(&c, set_id, None).unwrap().is_empty(),
+            "All drops every artifact row, including a kind it doesn't name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_usage_and_cleanup_do_not_follow_symlinks() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (2, 'Sym')", [])
+            .unwrap();
+        let set_id = 2;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+
+        let group_dir = layout.calibrated_dir("g");
+        let real_dir = group_dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        write_bytes(&real_dir.join("f.fits"), 1024);
+        // A symlink back to the group directory itself — a cycle that would
+        // recurse forever (and inflate the byte total) if the walker
+        // followed it. `remove_dir_all` does not follow it either, so the
+        // symlink itself is simply removed along with everything else.
+        std::os::unix::fs::symlink(&group_dir, group_dir.join("loop")).unwrap();
+
+        let usage = work_usage(&layout);
+        assert_eq!(
+            usage.calibrated_bytes, 1024,
+            "the symlink is neither followed nor double-counted"
+        );
+
+        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
+        assert_eq!(freed, 1024);
+        assert!(!layout.calibrated_dir("g").exists());
     }
 }

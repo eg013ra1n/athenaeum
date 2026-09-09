@@ -194,7 +194,10 @@ pub(crate) fn sync_dirs(ctx: &ServiceContext) -> Result<SyncDirs, ApiError> {
 /// original, still-only behavior for the transfer-folder settings) fails the
 /// call outright; `Warn` (stacking's working/output folders, spec §9.6 —
 /// scratch/output trees are not ingested the way a transfer landing folder
-/// would be) returns the same sentence as a non-fatal warning instead.
+/// would be) returns the overlapping scan root's own path as a non-fatal
+/// fact instead, leaving the caller to word its own warning (a stacking
+/// folder is not a transfer folder — "the scanner would ingest transfer
+/// copies" is the wrong reason for a stacking caller to give).
 pub(crate) enum OverlapRule {
     Reject,
     // Only constructed by `stacking::paths::validate_dirs`, gated
@@ -207,9 +210,11 @@ pub(crate) enum OverlapRule {
 /// Validate (and create) a transfer folder the operator typed or picked
 /// (transfer-prepare spec §6.3). Order: absolute → `PathPolicy` (lexical) →
 /// create → canonicalize → `PathPolicy` (resolved) → no scan-root overlap →
-/// write probe. Returns the normalized path to persist, plus a scan-root
-/// overlap warning when `overlap` is [`OverlapRule::Warn`] and one exists
-/// (`None` otherwise). `label` names the setting in messages.
+/// write probe. Returns the normalized path to persist, plus — when
+/// `overlap` is [`OverlapRule::Warn`] and a scan root overlaps — that root's
+/// own path (`None` otherwise, and always `None` under
+/// [`OverlapRule::Reject`], which fails the call instead). `label` names the
+/// setting in messages.
 ///
 /// The policy is checked TWICE on purpose. The lexical pre-check runs before
 /// `create_dir_all` so a sandboxed host (athenaeum-web's `AllowedRoots`, from
@@ -258,14 +263,23 @@ pub(crate) fn validate_transfer_dir(
         let mut overlap_warning = None;
         if let Err(e) = crate::api::scan_roots::check_scan_root_overlap(conn, &path) {
             match e {
-                ApiError::Conflict(_) => {
-                    tracing::warn!(path = %path.display(), error = %e, "transfer folder overlaps a scan root");
-                    let sentence = format!(
-                        "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
-                    );
+                ApiError::Conflict(ref msg) => {
+                    tracing::warn!(path = %path.display(), error = %msg, "transfer folder overlaps a scan root");
                     match overlap {
-                        OverlapRule::Reject => return Err(ApiError::Invalid(sentence)),
-                        OverlapRule::Warn => overlap_warning = Some(sentence),
+                        OverlapRule::Reject => {
+                            return Err(ApiError::Invalid(format!(
+                                "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
+                            )));
+                        }
+                        OverlapRule::Warn => {
+                            // `check_scan_root_overlap` exposes no structured
+                            // data, only these two message shapes carry the
+                            // offending root's own path (single-quoted); the
+                            // third shape (exact match) carries none because
+                            // there the overlapping root's path IS `path`
+                            // itself, which `overlap_root_path` falls back to.
+                            overlap_warning = Some(overlap_root_path(msg, &path));
+                        }
                     }
                 }
                 other => return Err(other),
@@ -290,6 +304,22 @@ pub(crate) fn validate_transfer_dir(
         }
     }
     outcome
+}
+
+/// Best-effort extraction of the offending scan root's own path from
+/// [`crate::api::scan_roots::check_scan_root_overlap`]'s `ApiError::Conflict`
+/// message — that function returns only a human sentence, no structured
+/// data. Two of its three sentence shapes name the root in single quotes
+/// (`"... existing scan root '<path>' ..."`); the third (`candidate` exactly
+/// equals a registered root) names nothing because the overlapping root's
+/// path IS `candidate` — the fallback this returns for any message with no
+/// quoted substring, which for `OverlapRule::Warn`'s caller is a correct
+/// answer, not a guess.
+fn overlap_root_path(msg: &str, candidate: &Path) -> String {
+    msg.split('\'')
+        .nth(1)
+        .map(str::to_string)
+        .unwrap_or_else(|| candidate.display().to_string())
 }
 
 /// Build the receiver's live per-package landing resolver. It re-reads the
@@ -4675,7 +4705,11 @@ pub async fn delete_transfer_history(
 /// A directory's total on-disk size — the recursive sum of regular-file lengths.
 /// Best-effort: an unreadable entry (permission / vanished mid-walk) contributes
 /// 0 and never fails, so a stats/cleanup pass never aborts on one bad file.
-fn dir_size_bytes(dir: &Path) -> u64 {
+/// `walkdir` does not follow symlinks by default, so a symlinked subdirectory
+/// (or file) is skipped rather than recursed into or double-counted — load-
+/// bearing for `stacking::paths::work_usage`/`cleanup_work`, which reuse this
+/// (`pub(crate)`) rather than a second hand-rolled walker.
+pub(crate) fn dir_size_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
     for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
         if entry.file_type().is_file() {

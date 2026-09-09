@@ -612,6 +612,21 @@ pub fn delete_artifacts(conn: &Connection, frames_set_id: i64, kinds: &[&str]) -
     Ok(n)
 }
 
+/// Delete every artifact row for a frame set, regardless of `kind` — unlike
+/// [`delete_artifacts`], which only removes the kinds it is given.
+/// `stacking_artifacts.kind` is free-form TEXT, not an enum the schema can
+/// enumerate, so a caller clearing "everything" (`CleanupWhat::All`) must not
+/// name a fixed kind list: a future stage adding a new kind this crate
+/// doesn't know about yet would otherwise survive `All` and keep pointing at
+/// files that cleanup just deleted. Returns the number of rows removed.
+pub fn delete_all_artifacts(conn: &Connection, frames_set_id: i64) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM stacking_artifacts WHERE frames_set_id = ?1",
+        params![frames_set_id],
+    )?;
+    Ok(n)
+}
+
 // ---------------------------------------------------------------------
 // Per-frame-set persisted configuration
 // ---------------------------------------------------------------------
@@ -880,6 +895,17 @@ mod tests {
         .unwrap();
         assert_eq!(list_artifacts(&c, set, None).unwrap().len(), 2);
         assert_eq!(delete_artifacts(&c, set, &["calibrated"]).unwrap(), 1);
+        assert_eq!(
+            list_artifacts(&c, set, None).unwrap().len(),
+            1,
+            "only the calibrated row is gone"
+        );
+        assert_eq!(
+            delete_all_artifacts(&c, set).unwrap(),
+            1,
+            "the remaining ln_reference row goes too, by no kind name at all"
+        );
+        assert!(list_artifacts(&c, set, None).unwrap().is_empty());
     }
 
     #[test]
