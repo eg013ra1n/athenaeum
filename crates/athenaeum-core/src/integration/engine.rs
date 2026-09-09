@@ -5,13 +5,14 @@
 //! band via the shared image pool.
 
 use super::banded::{BandPlanes, BandSource};
-use super::combine::{combine_pixel, IntegrationRecipe};
+use super::combine::{self, combine_pixel, IntegrationRecipe};
 use super::io_policy::IoPolicy;
 use super::registered_source::RegisteredSource;
 use super::source::FrameSource;
+use super::stats::NormalizationPair;
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub struct IntegrationOutput {
     pub width: usize,
@@ -139,24 +140,42 @@ pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
     if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
-/// Shared banded-combine core. `scale[i]`/`precal` transform frame i's
-/// samples before combining: v' = (v - precal(i, pixel)) * scale[i].
-/// `io.band_budget_bytes` is injectable (module-internal) so tests can force
-/// multi-band runs on tiny images; production passes the machine- and
-/// storage-resolved policy from `integration::io_policy::resolve`.
+/// What a band-combine closure receives: the decoded band, the output rows
+/// it must fill, the band's first global row, and the progress hook it must
+/// tick once per output row (`rows_done_total, total_rows, bytes_read, bytes_total`).
+struct BandJob<'a> {
+    planes: &'a BandPlanes,
+    out_band: &'a mut [f32],
+    y0: usize,
+    rows: usize,
+    width: usize,
+}
+
+struct BandStats {
+    read_duration: std::time::Duration,
+    combine_duration: std::time::Duration,
+    band_rows: usize,
+    bands: usize,
+    bytes_read: u64,
+}
+
+/// The read / progress / cancel / timing skeleton shared by every banded
+/// integration. `combine(job, tick)` fills `job.out_band` (rows × width) and
+/// calls `tick()` once per finished row. `io.band_budget_bytes` is injectable
+/// (module-internal) so tests can force multi-band runs on tiny images;
+/// production passes the machine- and storage-resolved policy from
+/// `integration::io_policy::resolve`.
 #[allow(clippy::too_many_arguments)]
-fn run_banded<S: FrameSource + ?Sized>(
+fn band_loop<S: FrameSource + ?Sized>(
     src: &S,
-    scales: &[f32],
-    precal: Option<&FlatPrecal>,
-    recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
     progress: &EngineProgress<'_>,
     io: IoPolicy,
-) -> Result<IntegrationOutput, IntegrationError> {
-    use rayon::prelude::*;
-    let (w, h, n) = (src.width(), src.height(), src.frame_count());
+    out: &mut [f32],
+    combine: &(dyn Fn(BandJob<'_>, &(dyn Fn() + Sync)) -> Result<(), IntegrationError> + Sync),
+) -> Result<BandStats, IntegrationError> {
+    let (w, h) = (src.width(), src.height());
     let band_rows = src.band_rows_for_budget(io.band_budget_bytes).min(h);
     let bands_total = h.div_ceil(band_rows);
     // Computed once, next to `band_rows`, and referenced from every band's
@@ -165,13 +184,6 @@ fn run_banded<S: FrameSource + ?Sized>(
     // total than this once `integrate_flat_inner` wraps it with pass 1.
     let per_row_bytes = src.bytes_per_row();
     let bytes_total = (h * per_row_bytes) as u64;
-    let mut out = vec![0f32; w * h];
-    let rejected = AtomicUsize::new(0);
-    // Non-finite accounting (audit C2). Plain counters shared across the rayon
-    // rows, so Relaxed is enough — nothing else is published through them, and
-    // the reads below happen after every worker has joined.
-    let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-    let all_bad = AtomicUsize::new(0);
     let mut planes = BandPlanes::new(src);
     let mut read_duration = std::time::Duration::ZERO;
     let mut combine_duration = std::time::Duration::ZERO;
@@ -243,75 +255,33 @@ fn run_banded<S: FrameSource + ?Sized>(
             return Err(IntegrationError::Cancelled);
         }
 
-        // `y0` (the band's first global row) is captured by the closure below
-        // for the precal MasterFrame row index (`gy = y0 + row_in_band`). It
-        // must stay in scope for the closure's lifetime — do not hoist the
-        // closure out of this `for` loop or split it into a free function
-        // without threading `y0` through explicitly.
+        // `y0` (the band's first global row) rides in `BandJob` for callers
+        // that need the global row index (e.g. the precal MasterFrame path's
+        // `gy = y0 + row_in_band`).
         let t_combine = std::time::Instant::now();
         let out_band = &mut out[y0 * w..(y0 + rows) * w];
-        pool.install(|| {
-            out_band
-                .par_chunks_mut(w)                       // one row per work item
-                .enumerate()
-                .for_each(|(row_in_band, out_row)| {
-                    let mut column: Vec<f32> = Vec::with_capacity(n);
-                    for (x, out_px) in out_row.iter_mut().enumerate() {
-                        column.clear();
-                        let idx = row_in_band * w + x;
-                        for i in 0..n {
-                            let mut v = planes.sample(i, idx);
-                            if let Some(p) = precal {
-                                match p {
-                                    FlatPrecal::MasterFrame { data, width, .. } => {
-                                        let gy = y0 + row_in_band;
-                                        v -= data[gy * *width + x];
-                                    }
-                                    FlatPrecal::SyntheticBias(b) => v -= *b,
-                                    FlatPrecal::None => {}
-                                }
-                            }
-                            v *= scales[i];
-                            if !v.is_finite() {
-                                // FITS: NaN in float data means "undefined
-                                // pixel" — excluded from the stack (with
-                                // accounting), exactly like an out-of-range
-                                // rejection. Passing it on would panic the
-                                // winsorized estimator (`f64::clamp` with NaN
-                                // bounds) or bake NaN into the master.
-                                bad_samples[i].fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                            column.push(v);
-                        }
-                        if column.is_empty() {
-                            *out_px = 0.0;
-                            all_bad.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            let (val, rej) = combine_pixel(&mut column, recipe);
-                            *out_px = val;
-                            if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
-                        }
-                    }
-                    // Fix wave item 2: one relaxed increment per ROW — this
-                    // closure runs once per row (the outer `par_chunks_mut(w)`
-                    // already chunks by row, not per pixel), so this is the
-                    // only per-pixel-adjacent cost paid here, matching the
-                    // review's "one relaxed increment and nothing else"
-                    // requirement. `done` can arrive at the tick below
-                    // slightly out of order under concurrency (two threads'
-                    // `fetch_add`s can interleave with their two `on_combine`
-                    // calls) — harmless here because bytes_done/bytes_total
-                    // are frozen for this whole band's combine regardless
-                    // (see `EngineProgress::on_combine`'s doc), so the one
-                    // hard monotonicity requirement (bytes, not rows) still
-                    // holds by construction, not by luck.
-                    let done = rows_combined.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % COMBINE_TICK_ROWS == 0 || done == h {
-                        (progress.on_combine)(done, h, bytes_read, bytes_total);
-                    }
-                });
-        });
+        // Fix wave item 2: the byte pair `tick` reports is frozen for this
+        // whole band's combine (see `EngineProgress::on_combine`'s doc) —
+        // captured as a plain `u64` copy here, not a reference to the outer
+        // `bytes_read`, so the tick closure below never observes a LATER
+        // band's value.
+        let bytes_read_for_tick = bytes_read;
+        let tick = || {
+            // Fix wave item 2: one relaxed increment per ROW — `combine`
+            // calls this once per row, matching the review's "one relaxed
+            // increment and nothing else" requirement. `done` can arrive
+            // slightly out of order under concurrency (two threads'
+            // `fetch_add`s can interleave with their two `on_combine`
+            // calls) — harmless here because bytes_done/bytes_total are
+            // frozen for this whole band's combine regardless, so the one
+            // hard monotonicity requirement (bytes, not rows) still holds
+            // by construction, not by luck.
+            let done = rows_combined.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % COMBINE_TICK_ROWS == 0 || done == h {
+                (progress.on_combine)(done, h, bytes_read_for_tick, bytes_total);
+            }
+        };
+        pool.install(|| combine(BandJob { planes: &planes, out_band, y0, rows, width: w }, &tick))?;
         combine_duration += t_combine.elapsed();
         // Fix wave item 1: same reasoning as the post-read check above, for
         // the OTHER half of a band's work — the combine is the actually
@@ -323,6 +293,87 @@ fn run_banded<S: FrameSource + ?Sized>(
         }
         (progress.on_band)(band_idx + 1, bands_total, bytes_read, bytes_total);
     }
+
+    Ok(BandStats {
+        read_duration,
+        combine_duration,
+        band_rows,
+        bands: bands_total,
+        bytes_read,
+    })
+}
+
+/// Shared banded-combine core (the unweighted master path). `scale[i]`/`precal`
+/// transform frame i's samples before combining: v' = (v - precal(i, pixel)) * scale[i].
+#[allow(clippy::too_many_arguments)]
+fn run_banded<S: FrameSource + ?Sized>(
+    src: &S,
+    scales: &[f32],
+    precal: Option<&FlatPrecal>,
+    recipe: IntegrationRecipe,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: &EngineProgress<'_>,
+    io: IoPolicy,
+) -> Result<IntegrationOutput, IntegrationError> {
+    use rayon::prelude::*;
+    let (w, h, n) = (src.width(), src.height(), src.frame_count());
+    let mut out = vec![0f32; w * h];
+    let rejected = AtomicUsize::new(0);
+    // Non-finite accounting (audit C2). Plain counters shared across the rayon
+    // rows, so Relaxed is enough — nothing else is published through them, and
+    // the reads below happen after every worker has joined.
+    let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+    let all_bad = AtomicUsize::new(0);
+
+    let stats = band_loop(src, pool, cancel, progress, io, &mut out, &|job, tick| {
+        let BandJob { planes, out_band, y0, width, .. } = job;
+        out_band
+            .par_chunks_mut(width)                       // one row per work item
+            .enumerate()
+            .for_each(|(row_in_band, out_row)| {
+                let mut column: Vec<f32> = Vec::with_capacity(n);
+                for (x, out_px) in out_row.iter_mut().enumerate() {
+                    column.clear();
+                    let idx = row_in_band * width + x;
+                    for i in 0..n {
+                        let mut v = planes.sample(i, idx);
+                        if let Some(p) = precal {
+                            match p {
+                                FlatPrecal::MasterFrame { data, width, .. } => {
+                                    let gy = y0 + row_in_band;
+                                    v -= data[gy * *width + x];
+                                }
+                                FlatPrecal::SyntheticBias(b) => v -= *b,
+                                FlatPrecal::None => {}
+                            }
+                        }
+                        v *= scales[i];
+                        if !v.is_finite() {
+                            // FITS: NaN in float data means "undefined
+                            // pixel" — excluded from the stack (with
+                            // accounting), exactly like an out-of-range
+                            // rejection. Passing it on would panic the
+                            // winsorized estimator (`f64::clamp` with NaN
+                            // bounds) or bake NaN into the master.
+                            bad_samples[i].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        column.push(v);
+                    }
+                    if column.is_empty() {
+                        *out_px = 0.0;
+                        all_bad.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let (val, rej) = combine_pixel(&mut column, recipe);
+                        *out_px = val;
+                        if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
+                    }
+                }
+                tick();
+            });
+        Ok(())
+    })?;
 
     // Every input sample was finiteness-checked above, so a non-finite OUTPUT
     // could only come out of the combiner itself — unreachable by
@@ -343,11 +394,11 @@ fn run_banded<S: FrameSource + ?Sized>(
         flat_norm: None,
         bad_samples_per_frame: bad_samples.into_iter().map(|a| a.into_inner()).collect(),
         all_bad_pixels: all_bad.into_inner(),
-        read_duration,
-        combine_duration,
-        band_rows,
-        bands: bands_total,
-        bytes_read,
+        read_duration: stats.read_duration,
+        combine_duration: stats.combine_duration,
+        band_rows: stats.band_rows,
+        bands: stats.bands,
+        bytes_read: stats.bytes_read,
     })
 }
 
@@ -378,10 +429,249 @@ fn integrate_bias_like_inner(
     run_banded(&src, &scales, None, recipe, pool, cancel, &progress, io)
 }
 
+/// Per-frame inputs of the stacking path, all indexed by the source's frame order.
+pub struct StackParams<'a> {
+    /// Rejection-normalization pair per frame (applied to the working copy).
+    pub rejection: &'a [NormalizationPair],
+    /// Output-normalization pair per frame (applied to the averaged values).
+    pub output: &'a [NormalizationPair],
+    /// Weight per frame (the plane's normalized weight; ≥ 0).
+    pub weights: &'a [f32],
+    /// Range rejection on RAW values: reject `raw <= range_low` (when Some) and `raw >= range_high` (when Some).
+    pub range_low: Option<f32>,
+    pub range_high: Option<f32>,
+    /// Accumulate per-pixel low/high rejection counts.
+    pub rejection_maps: bool,
+}
+
+/// `base.rejected_fraction` counts ALGORITHM rejections only, exactly like
+/// the unweighted master path's meaning of that field. `rejected_low` +
+/// `rejected_high` below additionally count RANGE rejections — they are the
+/// numbers to compare against an external "Total rejected samples" line;
+/// divide by the sum of `samples_per_frame` for that fraction, not by
+/// `base.rejected_fraction`'s denominator.
+pub struct StackOutput {
+    pub base: IntegrationOutput,
+    /// Per-pixel rejected-sample counts, low and high sides (`Some` when requested).
+    pub rejection_low: Option<Vec<f32>>,
+    pub rejection_high: Option<Vec<f32>>,
+    /// Rejected samples per frame (range + algorithm), indexed by frame.
+    pub rejected_per_frame: Vec<u64>,
+    /// Samples the frame actually contributed (finite, in coverage), per frame.
+    pub samples_per_frame: Vec<u64>,
+    pub rejected_low: u64,
+    pub rejected_high: u64,
+}
+
+/// Weighted, normalized banded integration with survivor accounting (spec
+/// §6.1–6.2). Per sample: finiteness (missing coverage is skipped, not
+/// rejected), range rejection on the raw value, then the rejection copy
+/// `raw·rs + ro` decides survival and the output copy `raw·os + oo` is what
+/// the survivors' weighted mean (or median) is taken over.
+#[allow(clippy::too_many_arguments)]
+pub fn integrate_stack<S: FrameSource + ?Sized>(
+    src: &S,
+    params: &StackParams<'_>,
+    recipe: IntegrationRecipe,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: EngineProgress<'_>,
+    io: IoPolicy,
+) -> Result<StackOutput, IntegrationError> {
+    use rayon::prelude::*;
+    let (w, h, n) = (src.width(), src.height(), src.frame_count());
+    if params.rejection.len() != n || params.output.len() != n || params.weights.len() != n {
+        return Err(IntegrationError::BadInput(format!(
+            "stack params for {} / {} / {} frames, source has {n}",
+            params.rejection.len(),
+            params.output.len(),
+            params.weights.len()
+        )));
+    }
+    if params.weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+        return Err(IntegrationError::BadInput("weights must be finite and non-negative".into()));
+    }
+    if n > u16::MAX as usize {
+        return Err(IntegrationError::BadInput(format!("{n} frames exceed the 65535-frame stack limit")));
+    }
+    let mut out = vec![0f32; w * h];
+    let rejected = AtomicUsize::new(0);
+    let rejected_low = AtomicU64::new(0);
+    let rejected_high = AtomicU64::new(0);
+    let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+    let rejected_per_frame: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    let samples_per_frame: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    let all_bad = AtomicUsize::new(0);
+    let maps = params.rejection_maps;
+    // Rejection-map row storage, banded via a per-band lock (not per pixel —
+    // see the loop below): full-image sized when maps are requested, or a
+    // single reusable band-sized scratch pair when they are not, so the
+    // `combine` closure can always zip three real row iterators without a
+    // branch inside the row loop. Allocated once per RUN either way.
+    let band_rows_cap = src.band_rows_for_budget(io.band_budget_bytes).min(h).max(1);
+    let map_low = std::sync::Mutex::new(if maps { vec![0f32; w * h] } else { vec![0f32; band_rows_cap * w] });
+    let map_high = std::sync::Mutex::new(if maps { vec![0f32; w * h] } else { vec![0f32; band_rows_cap * w] });
+
+    let stats = band_loop(src, pool, cancel, &progress, io, &mut out, &|job, tick| {
+        let BandJob { planes, out_band, y0, rows, width } = job;
+        let words = combine::mask_words(n);
+        let mut low_guard = map_low.lock().unwrap();
+        let mut high_guard = map_high.lock().unwrap();
+        let low_band: &mut [f32] = if maps {
+            &mut low_guard[y0 * width..(y0 + rows) * width]
+        } else {
+            &mut low_guard[..rows * width]
+        };
+        let high_band: &mut [f32] = if maps {
+            &mut high_guard[y0 * width..(y0 + rows) * width]
+        } else {
+            &mut high_guard[..rows * width]
+        };
+        out_band
+            .par_chunks_mut(width)
+            .zip(low_band.par_chunks_mut(width))
+            .zip(high_band.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(row_in_band, ((out_row, low_row), high_row))| {
+                // Per-worker scratch, allocated once per ROW (not per pixel):
+                // `work`/`out_vals`/`mask` feed `combine_pixel_weighted`,
+                // `scratch` is its own reused survivor-value buffer (Task 1
+                // fix round).
+                let mut work: Vec<(f32, u16)> = Vec::with_capacity(n);
+                let mut out_vals = vec![0f32; n];
+                let mut mask = vec![0u64; words];
+                let mut scratch: Vec<f32> = Vec::with_capacity(n);
+                for (x, out_px) in out_row.iter_mut().enumerate() {
+                    work.clear();
+                    combine::mask_clear(&mut mask);
+                    let idx = row_in_band * width + x;
+                    let mut low_here = 0u32;
+                    let mut high_here = 0u32;
+                    for i in 0..n {
+                        let raw = planes.sample(i, idx);
+                        if !raw.is_finite() {
+                            bad_samples[i].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        samples_per_frame[i].fetch_add(1, Ordering::Relaxed);
+                        if let Some(lo) = params.range_low {
+                            if raw <= lo {
+                                low_here += 1;
+                                rejected_per_frame[i].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                        if let Some(hi) = params.range_high {
+                            if raw >= hi {
+                                high_here += 1;
+                                rejected_per_frame[i].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                        let rej = params.rejection[i].apply(raw);
+                        let outv = params.output[i].apply(raw);
+                        if !rej.is_finite() || !outv.is_finite() {
+                            bad_samples[i].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        out_vals[i] = outv;
+                        work.push((rej, i as u16));
+                    }
+                    if work.is_empty() {
+                        *out_px = 0.0;
+                        all_bad.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let (val, rej_count) = combine::combine_pixel_weighted(
+                            &mut work,
+                            &out_vals,
+                            params.weights,
+                            recipe,
+                            &mut mask,
+                            &mut scratch,
+                        );
+                        *out_px = val;
+                        if rej_count > 0 {
+                            rejected.fetch_add(rej_count, Ordering::Relaxed);
+                            // Side of each rejected sample: below the survivors'
+                            // median of the rejection copy → low, else high.
+                            let mut surv: Vec<f32> = work
+                                .iter()
+                                .filter(|&&(_, i)| combine::mask_get(&mask, i as usize))
+                                .map(|&(v, _)| v)
+                                .collect();
+                            let median = if surv.is_empty() {
+                                let mut all: Vec<f32> = work.iter().map(|&(v, _)| v).collect();
+                                all.sort_by(|a, b| a.total_cmp(b));
+                                all[all.len() / 2]
+                            } else {
+                                surv.sort_by(|a, b| a.total_cmp(b));
+                                surv[surv.len() / 2]
+                            };
+                            for &(v, i) in work.iter() {
+                                if !combine::mask_get(&mask, i as usize) {
+                                    rejected_per_frame[i as usize].fetch_add(1, Ordering::Relaxed);
+                                    if v < median { low_here += 1 } else { high_here += 1 }
+                                }
+                            }
+                        }
+                    }
+                    if low_here > 0 {
+                        rejected_low.fetch_add(low_here as u64, Ordering::Relaxed);
+                    }
+                    if high_here > 0 {
+                        rejected_high.fetch_add(high_here as u64, Ordering::Relaxed);
+                    }
+                    if maps {
+                        low_row[x] = low_here as f32;
+                        high_row[x] = high_here as f32;
+                    }
+                }
+                tick();
+            });
+        Ok(())
+    })?;
+
+    // Every input sample was finiteness-checked above, so a non-finite OUTPUT
+    // could only come out of the combiner itself — unreachable by
+    // construction (same guard as the unweighted path).
+    if let Some(bad) = out.iter().find(|v| !v.is_finite()) {
+        return Err(IntegrationError::Decode(format!(
+            "internal: non-finite value {bad} survived input filtering"
+        )));
+    }
+
+    let map_low = map_low.into_inner().unwrap();
+    let map_high = map_high.into_inner().unwrap();
+    let total_samples = (w * h * n).max(1);
+    Ok(StackOutput {
+        base: IntegrationOutput {
+            width: w,
+            height: h,
+            data: out,
+            rejected_fraction: rejected.load(Ordering::Relaxed) as f64 / total_samples as f64,
+            flat_norm: None,
+            bad_samples_per_frame: bad_samples.into_iter().map(|a| a.into_inner()).collect(),
+            all_bad_pixels: all_bad.into_inner(),
+            read_duration: stats.read_duration,
+            combine_duration: stats.combine_duration,
+            band_rows: stats.band_rows,
+            bands: stats.bands,
+            bytes_read: stats.bytes_read,
+        },
+        rejection_low: maps.then_some(map_low),
+        rejection_high: maps.then_some(map_high),
+        rejected_per_frame: rejected_per_frame.into_iter().map(|a| a.into_inner()).collect(),
+        samples_per_frame: samples_per_frame.into_iter().map(|a| a.into_inner()).collect(),
+        rejected_low: rejected_low.into_inner(),
+        rejected_high: rejected_high.into_inner(),
+    })
+}
+
 /// Integrates lazily resampled registered frames (spec §6.1): every band is
 /// resampled from the calibrated files through their transforms on the
-/// way in, so no registered file is ever written. Scales are 1; weights,
-/// offsets and rejection maps arrive with Plan 4.
+/// way in, so no registered file is ever written. Thin wrapper over
+/// `integrate_stack`: identity normalization pairs, unit weights, no range
+/// rejection, no rejection maps.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_registered(
     src: &RegisteredSource,
@@ -391,8 +681,18 @@ pub fn integrate_registered(
     progress: EngineProgress<'_>,
     io: IoPolicy,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    let scales = vec![1.0f32; src.frame_count()];
-    run_banded(src, &scales, None, recipe, pool, cancel, &progress, io)
+    let n = src.frame_count();
+    let identity = vec![NormalizationPair::IDENTITY; n];
+    let unit_weights = vec![1.0f32; n];
+    let params = StackParams {
+        rejection: &identity,
+        output: &identity,
+        weights: &unit_weights,
+        range_low: None,
+        range_high: None,
+        rejection_maps: false,
+    };
+    Ok(integrate_stack(src, &params, recipe, pool, cancel, progress, io)?.base)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1123,5 +1423,103 @@ mod tests {
                 "bytes_done must never regress across ticks: {:?} then {:?}", pair[0], pair[1]
             );
         }
+    }
+
+    #[test]
+    fn stack_path_weights_normalizes_and_counts_rejections_per_side_and_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        // Four frames: 0 and 1 flat 0.20; 2 flat 0.40 (twice the level — the
+        // output pair maps it back onto 0.20); 3 flat 0.20 with a hot pixel
+        // 0.95 at (3,2) and a dead pixel 0.0 at (5,5) (range-low).
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.40),
+            write(dir.path(), "d.fits", w, h, |x, y| {
+                if (x, y) == (3, 2) { 0.95 } else if (x, y) == (5, 5) { 0.0 } else { 0.20 }
+            }),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = NormalizationPair::IDENTITY;
+        let half = NormalizationPair { scale: 0.5, offset: 0.0 };
+        let params = StackParams {
+            rejection: &[ident, ident, half, ident],
+            output: &[ident, ident, half, ident],
+            weights: &[1.0, 1.0, 1.0, 3.0],
+            range_low: Some(0.0),
+            range_high: None,
+            rejection_maps: true,
+        };
+        let progress = EngineProgress { on_band: &nop(), on_combine: &nop() };
+        // sigma_high 1.0, not the brief's 2.0 (measured deviation, Task 3):
+        // `combine::stddev` is Bessel-corrected (n-1 denominator). With n=4
+        // and 3 of the 4 rejection-normalized values EXACTLY equal (0.20 here),
+        // one outlier's z-score against that sample std is always exactly
+        // (n-1)/sqrt(n) = 3/sqrt(4) = 1.5 — independent of the outlier's
+        // magnitude (the classic small-n sigma-clip "masking" effect: the
+        // outlier inflates its own std enough to hide). sigma_high=2.0 > 1.5
+        // therefore never rejects the hot pixel here, at ANY hot-pixel value —
+        // confirmed empirically: at 2.0 the hot pixel came out as the
+        // weighted mean of all 4 survivors, 0.575, not 0.20. sigma_high=1.5
+        // (the exact boundary) still doesn't reject either: the survivor test
+        // is `xf <= hi`, and at that threshold the outlier sits AT `hi`, not
+        // past it. sigma_high=1.0 gives clear margin (z=1.5 > 1.0) while
+        // sigma_low stays at the brief's 3.0 (the three inliers' own z ≈
+        // -0.577 is nowhere near either threshold, so they are unaffected).
+        let out = integrate_stack(
+            &src,
+            &params,
+            IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 3.0, sigma_high: 1.0 }),
+            &pool(),
+            &AtomicBool::new(false),
+            progress,
+            io(1 << 20),
+        )
+        .unwrap();
+        let px = |x: usize, y: usize| out.base.data[y * w + x];
+        // An ordinary pixel: all four survive, weighted mean of 0.20s = 0.20.
+        assert!((px(0, 0) - 0.20).abs() < 1e-6, "{}", px(0, 0));
+        // Hot pixel: frame 3 rejected high; the rest average to 0.20.
+        assert!((px(3, 2) - 0.20).abs() < 1e-6, "{}", px(3, 2));
+        assert_eq!(out.rejection_high.as_ref().unwrap()[2 * w + 3], 1.0);
+        assert_eq!(out.rejection_low.as_ref().unwrap()[2 * w + 3], 0.0);
+        // Dead pixel: frame 3 range-rejected low, counted low.
+        assert!((px(5, 5) - 0.20).abs() < 1e-6, "{}", px(5, 5));
+        assert_eq!(out.rejection_low.as_ref().unwrap()[5 * w + 5], 1.0);
+        assert_eq!(out.rejected_per_frame, vec![0, 0, 0, 2]);
+        assert_eq!(out.samples_per_frame, vec![128, 128, 128, 128]);
+        assert_eq!((out.rejected_low, out.rejected_high), (1, 1));
+        assert!(out.base.data.iter().all(|v| (v - 0.20).abs() < 1e-6));
+    }
+
+    #[test]
+    fn stack_path_with_unit_inputs_equals_the_master_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (24usize, 10usize);
+        let paths: Vec<_> = (0..7)
+            .map(|i| {
+                write(dir.path(), &format!("f{i}.fits"), w, h, move |x, y| {
+                    0.1 + 0.01 * ((x * 7 + y * 3 + i * 11) % 13) as f32 + if (x + y + i) % 17 == 0 { 0.3 } else { 0.0 }
+                })
+            })
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let recipe = IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 });
+        let master = integrate_bias_like(&paths, recipe, &pool(), dir.path(), &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 7];
+        let params = StackParams {
+            rejection: &ident, output: &ident, weights: &[1.0; 7],
+            range_low: None, range_high: None, rejection_maps: false,
+        };
+        let stack = integrate_stack(&src, &params, recipe, &pool(), &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap();
+        assert_eq!(master.data.len(), stack.base.data.len());
+        for (i, (a, b)) in master.data.iter().zip(&stack.base.data).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "pixel {i}: {a} vs {b}");
+        }
+        assert_eq!(master.rejected_fraction, stack.base.rejected_fraction);
+        assert!(stack.rejection_low.is_none() && stack.rejection_high.is_none());
     }
 }

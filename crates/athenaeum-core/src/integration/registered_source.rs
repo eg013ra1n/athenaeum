@@ -114,13 +114,19 @@ impl RegisteredSource {
     }
 
     /// Resample one frame's band into `dst` (`rows × width` f32). Returns
-    /// the source bytes read.
+    /// the source bytes read. `raw_scratch`/`src_buf` are a per-WORKER pair
+    /// (Task 3, Plan 4) the caller reuses across every frame/band it fills —
+    /// grown, never freed, instead of a fresh f32 allocation on every call.
+    /// The `Whole` window fallback (a full-height read) shares the same
+    /// buffers, just at their largest extent.
     fn fill_frame(
         &self,
         i: usize,
         y0: usize,
         rows: usize,
         dst: &mut [f32],
+        raw_scratch: &mut Vec<u8>,
+        src_buf: &mut Vec<f32>,
     ) -> Result<u64, IntegrationError> {
         let (reader, map) = &self.frames[i];
         let (sw, sh) = (reader.width(), reader.height());
@@ -144,10 +150,10 @@ impl RegisteredSource {
             debug!(frame = i, y0, rows, "band maps outside the source");
             return Ok(0);
         }
-        let mut src = vec![0f32; src_rows * sw];
-        reader.read_rows(self.plane, sy0, src_rows, &mut src)?;
+        src_buf.resize(src_rows * sw, 0.0);
+        reader.read_rows_with_scratch(self.plane, sy0, src_rows, &mut src_buf[..src_rows * sw], raw_scratch)?;
         let plane = Plane {
-            data: &src,
+            data: &src_buf[..src_rows * sw],
             width: sw,
             height: src_rows,
             y_offset: sy0,
@@ -240,11 +246,15 @@ impl FrameSource for RegisteredSource {
         // here only for the debug log below.
         let disk_bytes = AtomicU64::new(0);
         if workers == 1 {
+            // A single worker's scratch pair, reused across every frame in
+            // the band (Task 3, Plan 4) — see `fill_frame`'s doc.
+            let mut raw_scratch: Vec<u8> = Vec::new();
+            let mut src_buf: Vec<f32> = Vec::new();
             for (i, dst) in scratch.iter_mut().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(IntegrationError::Cancelled);
                 }
-                let disk = self.fill_frame(i, y0, rows, dst)?;
+                let disk = self.fill_frame(i, y0, rows, dst, &mut raw_scratch, &mut src_buf)?;
                 disk_bytes.fetch_add(disk, Ordering::Relaxed);
                 on_bytes((rows * self.width * 4) as u64);
             }
@@ -273,12 +283,16 @@ impl FrameSource for RegisteredSource {
                     let saw_cancel = &saw_cancel;
                     let disk_bytes = &disk_bytes;
                     scope.spawn(move || {
+                        // This worker's own scratch pair (Task 3, Plan 4) —
+                        // never shared with another thread's group.
+                        let mut raw_scratch: Vec<u8> = Vec::new();
+                        let mut src_buf: Vec<f32> = Vec::new();
                         for (i, dst) in group {
                             if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
                                 saw_cancel.store(true, Ordering::Relaxed);
                                 return;
                             }
-                            match self.fill_frame(i, y0, rows, dst) {
+                            match self.fill_frame(i, y0, rows, dst, &mut raw_scratch, &mut src_buf) {
                                 Ok(bytes) => {
                                     disk_bytes.fetch_add(bytes, Ordering::Relaxed);
                                     on_bytes((rows * w * 4) as u64);
