@@ -61,6 +61,7 @@ pub mod masters;
 pub mod sync;
 pub mod account;
 pub mod collab;
+pub mod stacking;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -84,3 +85,4 @@ pub use masters::*;
 pub use sync::*;
 pub use account::*;
 pub use collab::*;
+pub use stacking::*;

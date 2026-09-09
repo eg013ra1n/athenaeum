@@ -37,6 +37,7 @@ mod plate_solve;
 mod registration;
 mod archive;
 mod masters;
+mod stacking;
 pub(crate) mod sync;
 mod account;
 mod collab;
@@ -227,6 +228,21 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/cancel_frame_set_registration", post(registration::cancel_frame_set_registration))
         .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
         .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
+
+        .route("/api/get_stacking_plan", post(stacking::get_stacking_plan))
+        .route("/api/start_stacking", post(stacking::start_stacking))
+        .route("/api/cancel_stacking", post(stacking::cancel_stacking))
+        .route("/api/get_stacking_runs", post(stacking::get_stacking_runs))
+        .route("/api/get_stacking_run", post(stacking::get_stacking_run))
+        .route("/api/get_stacking_config", post(stacking::get_stacking_config))
+        .route("/api/set_stacking_config", post(stacking::set_stacking_config))
+        .route("/api/get_stacking_defaults", post(stacking::get_stacking_defaults))
+        .route("/api/set_stacking_defaults", post(stacking::set_stacking_defaults))
+        .route("/api/reset_stacking_defaults", post(stacking::reset_stacking_defaults))
+        .route("/api/get_stacking_paths", post(stacking::get_stacking_paths))
+        .route("/api/set_stacking_paths", post(stacking::set_stacking_paths))
+        .route("/api/get_stacking_work_usage", post(stacking::get_stacking_work_usage))
+        .route("/api/cleanup_stacking_work", post(stacking::cleanup_stacking_work))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
         .route("/api/set_archive_root_path", post(archive::set_archive_root_path))
@@ -437,8 +453,11 @@ async fn read_fits_image_rustafits_stub(
     (StatusCode::NOT_IMPLEMENTED, "read_fits_image_rustafits is not available in web mode".to_string())
 }
 
+// `pub(crate)` (Plan 5a Task 9): `routes::stacking`'s own router-level test
+// reuses this real-`WebAppState` builder rather than hand-rolling a second
+// one — same reasoning as the doc comment on `test_state` itself.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::events::SseEvent;
     use athenaeum_core::cache::MemoryImageCache;
@@ -467,7 +486,7 @@ mod tests {
     /// it's `None`. That 500 is exactly the "request got past auth" signal
     /// this test needs; a real DB would add setup cost without changing
     /// what's being verified (auth middleware coverage, not handler logic).
-    fn test_state(api_key: Option<&str>) -> WebAppState {
+    pub(crate) fn test_state(api_key: Option<&str>) -> WebAppState {
         let ctx = Arc::new(ServiceContext {
             db: OnceLock::new(),
             settings: Arc::new(SettingsManager::new()),

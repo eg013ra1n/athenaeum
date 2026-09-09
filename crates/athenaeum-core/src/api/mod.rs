@@ -67,6 +67,13 @@ pub mod export;
 #[cfg(feature = "render")]
 pub mod collab;
 
+// M1 stacking pipeline command layer (Plan 5a Task 9): plan/start/cancel a
+// run, run history/detail, per-set config + global defaults, working/output
+// folders. Gated on the same two features `stacking`/`ServiceContext::active_stacks`
+// already are — the module doesn't exist at all in a headless build.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod stacking;
+
 // Slice-5 capstone: the three-instance collaboration E2E (publish → moderation →
 // swarm delivery → project WBPP export) exercised in one process over the
 // in-memory loopback transport. Test-only, and additionally render-gated because
