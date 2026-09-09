@@ -245,6 +245,21 @@ Frontend: `BoardStage` gains `'masters'` as row `0 · Masters` (state `off` when
 
 **Ruling 11 (added 2026-09-09):** the acceptance run (Task 7) starts with the masters folder as it is — empty — and the run's stage 0.5 rebuilds the 11 masters; that is the honest demonstration the owner asked for. Manual rebuilding through the masters API is the fallback only if this task fails to land.
 
+### Task 8b: Stage 0.5 also rebuilds the pre-calibration masters a missing flat master reads (found by Task 7, 2026-09-10; executes before Task 7's run)
+
+**Files:**
+- Modify: `crates/athenaeum-core/src/api/masters.rs` (`select_flat_precal` → `pub(crate)`), `crates/athenaeum-core/src/api/lights.rs` (`compute_export_readiness` + tests), `crates/athenaeum-core/src/stacking/plan.rs` (tests), spec §2 stage 0.5 row (one sentence), `CLAUDE.md` → Stacking (the `Masters` sentence)
+
+**Why:** on the real LDN 1272 catalog the readiness walk lists the 7 masters the lights link directly, but a missing master FLAT is rebuilt through `select_flat_precal` (DarkFlat → Dark → Bias over the raw flat set's own `calibration_set_to_frames` rows), and `load_precal_pixels` fails with "pre-cal master unreadable" when that chosen master's file is missing too — no fallback. Spec §2 stage 0.5 promises "a run never blocks on a master it can build itself".
+
+**Rule:** after the light-link pass, one transitive pass over the missing masters — for every missing `MasterFlat` with a provenance `source_set_id`, ask `select_flat_precal(conn, source_set_id, source_set.exptime, None)`; when the choice is `PrecalChoice::Master { set_id, path, .. }` and the file is missing, it joins `missing_masters` (dedup by path, `warn!(path, "pre-calibration master file missing on disk")`) and the rebuildability split. One level only (a dark/darkflat/bias needs no pre-calibration). A flat master whose own file exists contributes nothing. `collect_masters_to_build`'s `type_build_rank` order already builds it first.
+
+**Tests:** `missing_flat_master_lists_its_missing_precal_master` (readiness lists both, both rebuildable), `existing_flat_master_does_not_list_its_precal_master` (0 missing), `missing_flat_master_with_unrebuildable_precal_master` (precal without provenance → unrebuildable → `masters` blocker), `masters_to_build_orders_precal_before_flat`.
+
+**Commit:** `fix(stacking): stage 0.5 also rebuilds the pre-calibration masters a missing flat master reads`.
+
+---
+
 ## Self-review (done while writing)
 
 **Spec coverage.** §11 structure, components, prefs, hook/context, notifications, Settings section, removal list (Tasks 2–6); §10.1 retirement (Task 6) and the presets addition (Task 1, ruling 1); §10.2 events consumed with the cancelled-flag pattern (Task 2); §9.4 folder picking (Tasks 3, 5; scope check Task 1); §12 web parity (the smokes run on the web build); §13 acceptance (Task 7); §14 items 12–14 (Tasks 2–7). Not here by design: M2/M3 panels are rendered disabled; a frontend test runner (ruling 5); master thumbnails (M4).
