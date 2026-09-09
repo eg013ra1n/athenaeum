@@ -190,11 +190,26 @@ pub(crate) fn sync_dirs(ctx: &ServiceContext) -> Result<SyncDirs, ApiError> {
     })
 }
 
+/// How [`validate_transfer_dir`] treats a scan-root overlap: `Reject` (the
+/// original, still-only behavior for the transfer-folder settings) fails the
+/// call outright; `Warn` (stacking's working/output folders, spec §9.6 —
+/// scratch/output trees are not ingested the way a transfer landing folder
+/// would be) returns the same sentence as a non-fatal warning instead.
+pub(crate) enum OverlapRule {
+    Reject,
+    // Only constructed by `stacking::paths::validate_dirs`, gated
+    // `all(feature = "render", feature = "solver")` — unused (and so
+    // flagged dead code) under `--no-default-features`.
+    #[allow(dead_code)]
+    Warn,
+}
+
 /// Validate (and create) a transfer folder the operator typed or picked
 /// (transfer-prepare spec §6.3). Order: absolute → `PathPolicy` (lexical) →
 /// create → canonicalize → `PathPolicy` (resolved) → no scan-root overlap →
-/// write probe. Returns the normalized path to persist. `label` names the
-/// setting in messages.
+/// write probe. Returns the normalized path to persist, plus a scan-root
+/// overlap warning when `overlap` is [`OverlapRule::Warn`] and one exists
+/// (`None` otherwise). `label` names the setting in messages.
 ///
 /// The policy is checked TWICE on purpose. The lexical pre-check runs before
 /// `create_dir_all` so a sandboxed host (athenaeum-web's `AllowedRoots`, from
@@ -213,7 +228,8 @@ pub(crate) fn validate_transfer_dir(
     policy: &crate::api::PathPolicy,
     raw: &str,
     label: &str,
-) -> Result<PathBuf, ApiError> {
+    overlap: OverlapRule,
+) -> Result<(PathBuf, Option<String>), ApiError> {
     let raw = raw.trim();
     let candidate = Path::new(raw);
     if raw.is_empty() || !candidate.is_absolute() {
@@ -231,7 +247,7 @@ pub(crate) fn validate_transfer_dir(
         ApiError::Invalid(format!("{label}: cannot create folder: {e}"))
     })?;
 
-    let outcome = (|| -> Result<PathBuf, ApiError> {
+    let outcome = (|| -> Result<(PathBuf, Option<String>), ApiError> {
         let path = crate::api::scan_roots::normalize_path(&candidate.canonicalize().map_err(
             |e| {
                 tracing::warn!(path = %candidate.display(), error = %e, "transfer folder resolve failed");
@@ -239,15 +255,22 @@ pub(crate) fn validate_transfer_dir(
             },
         )?);
         policy.check(&path)?;
-        crate::api::scan_roots::check_scan_root_overlap(conn, &path).map_err(|e| match e {
-            ApiError::Conflict(_) => {
-                tracing::warn!(path = %path.display(), error = %e, "transfer folder overlaps a scan root");
-                ApiError::Invalid(format!(
-                    "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
-                ))
+        let mut overlap_warning = None;
+        if let Err(e) = crate::api::scan_roots::check_scan_root_overlap(conn, &path) {
+            match e {
+                ApiError::Conflict(_) => {
+                    tracing::warn!(path = %path.display(), error = %e, "transfer folder overlaps a scan root");
+                    let sentence = format!(
+                        "{label}: must not be inside or contain a monitored folder — the scanner would ingest transfer copies"
+                    );
+                    match overlap {
+                        OverlapRule::Reject => return Err(ApiError::Invalid(sentence)),
+                        OverlapRule::Warn => overlap_warning = Some(sentence),
+                    }
+                }
+                other => return Err(other),
             }
-            other => other,
-        })?;
+        }
         let probe = path.join(".athenaeum-write-test");
         if let Err(e) = std::fs::write(&probe, b"probe") {
             tracing::warn!(path = %path.display(), error = %e, "transfer folder write probe failed");
@@ -258,7 +281,7 @@ pub(crate) fn validate_transfer_dir(
         if let Err(e) = std::fs::remove_file(&probe) {
             tracing::warn!(path = %probe.display(), error = %e, "transfer folder probe cleanup failed");
         }
-        Ok(path)
+        Ok((path, overlap_warning))
     })();
 
     if outcome.is_err() && created {
@@ -5126,21 +5149,29 @@ pub async fn set_transfer_paths(
         // `validate_transfer_dir` creates + normalizes the folder, so the value
         // persisted below is already the resolved one.
         let out_path = match outgoing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(raw) => Some(validate_transfer_dir(
-                &conn,
-                policy,
-                raw,
-                "Outgoing staging folder",
-            )?),
+            Some(raw) => Some(
+                validate_transfer_dir(
+                    &conn,
+                    policy,
+                    raw,
+                    "Outgoing staging folder",
+                    OverlapRule::Reject,
+                )?
+                .0,
+            ),
             None => None,
         };
         let work_path = match working.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(raw) => Some(validate_transfer_dir(
-                &conn,
-                policy,
-                raw,
-                "Incoming working folder",
-            )?),
+            Some(raw) => Some(
+                validate_transfer_dir(
+                    &conn,
+                    policy,
+                    raw,
+                    "Incoming working folder",
+                    OverlapRule::Reject,
+                )?
+                .0,
+            ),
             None => None,
         };
         let eff_out = out_path
@@ -11541,11 +11572,12 @@ mod tests {
         let db = db(&ctx).unwrap();
         let conn = db.conn();
         let target = tmp.path().join("staging-new");
-        let got = validate_transfer_dir(
+        let (got, _) = validate_transfer_dir(
             &conn,
             &crate::api::PathPolicy::AllowAll,
             target.to_str().unwrap(),
             "Outgoing staging folder",
+            OverlapRule::Reject,
         )
         .unwrap();
         assert!(got.is_dir(), "created on validation");
@@ -11560,9 +11592,14 @@ mod tests {
         let (tmp, ctx) = test_ctx();
         let db = db(&ctx).unwrap();
         let conn = db.conn();
-        let err =
-            validate_transfer_dir(&conn, &crate::api::PathPolicy::AllowAll, "relative/x", "X")
-                .unwrap_err();
+        let err = validate_transfer_dir(
+            &conn,
+            &crate::api::PathPolicy::AllowAll,
+            "relative/x",
+            "X",
+            OverlapRule::Reject,
+        )
+        .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "relative: {err:?}");
 
         // A monitored root: inside it, equal to it, and containing it are all rejected.
@@ -11575,6 +11612,7 @@ mod tests {
                 &crate::api::PathPolicy::AllowAll,
                 candidate.to_str().unwrap(),
                 "X",
+                OverlapRule::Reject,
             )
             .unwrap_err();
             assert!(
@@ -11600,6 +11638,7 @@ mod tests {
             &crate::api::PathPolicy::AllowAll,
             ro.to_str().unwrap(),
             "X",
+            OverlapRule::Reject,
         )
         .unwrap_err();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -11627,11 +11666,12 @@ mod tests {
 
         // (a) An unrelated folder still validates: the unresolvable root is
         //     warned about and compared by its stored path, not fatal.
-        let got = validate_transfer_dir(
+        let (got, _) = validate_transfer_dir(
             &conn,
             &crate::api::PathPolicy::AllowAll,
             base.join("staging").to_str().unwrap(),
             "Outgoing staging folder",
+            OverlapRule::Reject,
         )
         .unwrap();
         assert!(
@@ -11648,6 +11688,7 @@ mod tests {
             &crate::api::PathPolicy::AllowAll,
             base.to_str().unwrap(),
             "X",
+            OverlapRule::Reject,
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "contains: {err:?}");
@@ -11682,6 +11723,7 @@ mod tests {
             &crate::api::PathPolicy::AllowedRoots(vec![allowed]),
             outside.to_str().unwrap(),
             "X",
+            OverlapRule::Reject,
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
@@ -11712,6 +11754,7 @@ mod tests {
             &crate::api::PathPolicy::AllowAll,
             inside.to_str().unwrap(),
             "X",
+            OverlapRule::Reject,
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
@@ -11723,6 +11766,7 @@ mod tests {
             &crate::api::PathPolicy::AllowAll,
             root.to_str().unwrap(),
             "X",
+            OverlapRule::Reject,
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");

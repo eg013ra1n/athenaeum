@@ -11,16 +11,19 @@
 //! writers). Plan 5a (M1 orchestration) adds `config` (spec §9.2/§9.3: the
 //! whole `StackingConfig` tree, its built-in presets, whole-config
 //! precedence over a stored set/global override, and the per-stage config
-//! hashes artifacts key off) and `groups` (spec §2: integration groups from
+//! hashes artifacts key off), `groups` (spec §2: integration groups from
 //! the catalog — grouping keys, the group-key string, the frame-set slug —
 //! plus, `cfg(test)`, the catalog fixture builder every later task in this
-//! plan reuses).
+//! plan reuses), and `paths` (spec §9.6: working/output folder resolution
+//! and validation, the on-disk working layout, free-space and byte-usage
+//! probes, a run's byte-footprint estimate, and working-folder cleanup).
 
 pub mod config;
 pub mod groups;
 pub mod integrate;
 pub mod master_cards;
 pub mod measure;
+pub mod paths;
 pub mod psf_signal;
 pub mod register;
 pub mod robust;
