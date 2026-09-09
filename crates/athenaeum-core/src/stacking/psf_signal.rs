@@ -898,9 +898,10 @@ mod tests {
 
     #[test]
     fn background_residual_refuses_a_length_mismatch() {
-        // `data.len()` (63) disagrees with `w * h` (64) — a public fn must
-        // not index out of bounds on a caller's bad geometry.
-        assert!(background_residual(&[0.5; 63], 8, 8).is_none());
+        // A length that would read out of bounds without the guard — the
+        // stratified sample over 512x512 touches indices near `w * h - 1`,
+        // so a caller-supplied buffer one short of `w * h` used to panic.
+        assert!(background_residual(&vec![0.0f32; 512 * 512 - 1], 512, 512).is_none());
     }
 
     #[test]

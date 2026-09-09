@@ -195,7 +195,15 @@ pub fn measure_plane_with_seeds(
             }
         }
         SeedSource::Full => {
-            let mut analyzer = ImageAnalyzer::new().with_max_stars(opts.max_stars);
+            // `measure_cap` defaults to 500 and truncates AFTER measurement
+            // (unlike `with_max_stars`, which caps detection) — left at the
+            // default, the full path only ever measures the 500 brightest
+            // detections regardless of `opts.max_stars`, starving PSFSW/PSF
+            // SNR (both quadratic in fitted-star count) against the fast
+            // arm's much larger seed set. 0 measures every detection.
+            let mut analyzer = ImageAnalyzer::new()
+                .with_max_stars(opts.max_stars)
+                .with_measure_cap(0);
             if let Some(p) = pool {
                 analyzer = analyzer.with_thread_pool(Arc::clone(p));
             }
@@ -203,6 +211,7 @@ pub fn measure_plane_with_seeds(
                 Ok(r) => r
                     .stars
                     .iter()
+                    .filter(|s| s.snr >= opts.min_snr && s.peak > 0.0)
                     .map(|s| Seed {
                         x: s.x as f64,
                         y: s.y as f64,
