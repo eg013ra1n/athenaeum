@@ -4,6 +4,7 @@ import type { StackingConfig, StackingPlan } from '../../types/stacking';
 import type { RunOutcome, RunProgress } from '../../hooks/useStackingRuns';
 
 const ROWS: { stage: BoardStage; index: number; label: string }[] = [
+  { stage: 'masters', index: 0, label: 'Masters' },
   { stage: 'calibrate', index: 1, label: 'Calibrate' },
   { stage: 'debayer', index: 2, label: 'Debayer' },
   { stage: 'measure', index: 3, label: 'Measure & select' },
@@ -72,7 +73,7 @@ export function PipelineBoard({
             stage={stage}
             label={label}
             state={rowState(stage, plan, progress, outcome, config)}
-            summary={stageSummary(stage, config)}
+            summary={stageSummary(stage, config, plan)}
             progress={progress?.stage === stage ? progress : undefined}
             selected={selectedStage === stage}
             onSelect={() => onSelectStage(stage)}

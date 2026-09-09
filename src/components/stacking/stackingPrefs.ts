@@ -20,6 +20,7 @@ import type { BoardStage } from './stageSummary';
 export const STACKING_SELECTED_STAGE_KEY = 'athenaeum.stacking.selectedStage';
 
 const VALID_STAGES: readonly BoardStage[] = [
+  'masters',
   'calibrate',
   'debayer',
   'measure',

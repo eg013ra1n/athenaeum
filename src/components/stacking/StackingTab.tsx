@@ -40,6 +40,7 @@ export interface StackingTabProps {
 }
 
 const STAGE_LABEL: Record<BoardStage, string> = {
+  masters: 'Masters',
   calibrate: 'Calibrate',
   debayer: 'Debayer',
   measure: 'Measure & select',

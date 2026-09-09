@@ -752,7 +752,42 @@ missingMasterFiles: number,
  * is not counted: its missing files fail per file in the run, as they
  * always have.
  */
-missingRawCalibrationFiles: number, fileCounts: ExportFileCounts, };
+missingRawCalibrationFiles: number, fileCounts: ExportFileCounts, 
+/**
+ * Plan 5b Task 8 (owner requirement 2026-09-09 — "the pipeline builds
+ * its own masters"): the `raw_set_ids_without_master` subset the
+ * stacking pipeline's stage 0.5 CAN build — every member frame's
+ * `files.path` exists on disk and the set has at least
+ * [`crate::api::masters::MIN_MASTER_FRAMES`] members. `Vec<i64>`, not a
+ * blocker: the calibrated-lights EXPORT gate ([`check_mode_ready`])
+ * still treats every id in `raw_set_ids_without_master` as blocking —
+ * only the stacking plan's own gate (`stacking::plan::build_plan`)
+ * reads this split.
+ */
+rawSetsBuildable: Array<number>, 
+/**
+ * The `raw_set_ids_without_master` subset that CANNOT be built right
+ * now, with why (`"fewer than N frames"` / `"N of M raw frames missing
+ * on disk"` / `"archived — restore first"`). Every id here is also a
+ * `raw_set_ids_without_master` entry — this is a reason breakdown of
+ * that same list, not a separate tally.
+ */
+rawSetsUnbuildable: Array<[number, string]>, 
+/**
+ * Master `calibration_set` ids among the resolved masters counted by
+ * `missing_master_files` whose file the stacking pipeline's stage 0.5
+ * CAN rebuild: a `master_provenance` row exists and
+ * [`crate::api::masters::check_rebuild_source_ready`] passes for its
+ * source set.
+ */
+mastersRebuildable: Array<number>, 
+/**
+ * The missing-master subset that CANNOT be rebuilt, with why (`"no
+ * provenance"` when the master was not built by Athenaeum, else the
+ * `check_rebuild_source_ready` failure text — archived originals or
+ * missing source frames).
+ */
+mastersUnrebuildable: Array<[number, string]>, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

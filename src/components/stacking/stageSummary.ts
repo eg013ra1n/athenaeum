@@ -23,8 +23,11 @@ import type {
 import type { FlatNormMode } from '../../types/models';
 import type { RunOutcome, RunProgress } from '../../hooks/useStackingRuns';
 
-/** Backend pipeline stages, in execution order. */
+/** Backend pipeline stages, in execution order. `'masters'` (stage 0.5, owner
+ *  requirement 2026-09-09 — the run builds its own missing calibration
+ *  masters) runs first. */
 export const STAGES: readonly Stage[] = [
+  'masters',
   'calibrate',
   'measure',
   'reference',
@@ -169,9 +172,30 @@ export function cleanupLabel(v: StackingConfig['output']['cleanup']): string {
  * One-line description of a stage's current configuration. Pure function of
  * `config` alone — never reads plan/progress/outcome (Ruling 8), so this is
  * safe to call from both the board row and (Task 3) the inspector header.
+ *
+ * `'masters'` is the ONE exception (Plan 5b Task 8, owner requirement
+ * 2026-09-09): stage 0.5 has no config knobs of its own to summarize — its
+ * "configuration" IS the plan's own work list — so this row's summary reads
+ * `plan.mastersToBuild` instead. `plan` is optional and defaults to `null`
+ * so every other stage's call site (and the inspector header, which may not
+ * always have a plan handy) keeps working unchanged.
  */
-export function stageSummary(stage: BoardStage, config: StackingConfig): string {
+export function stageSummary(
+  stage: BoardStage,
+  config: StackingConfig,
+  plan?: StackingPlan | null,
+): string {
   switch (stage) {
+    case 'masters': {
+      const items = plan?.mastersToBuild ?? [];
+      const toBuild = items.filter((m) => m.kind === 'build').length;
+      const toRebuild = items.filter((m) => m.kind === 'rebuild').length;
+      if (toBuild === 0 && toRebuild === 0) return 'Nothing to build';
+      const parts: string[] = [];
+      if (toBuild > 0) parts.push(`${toBuild} to build`);
+      if (toRebuild > 0) parts.push(`${toRebuild} to rebuild`);
+      return parts.join(', ');
+    }
     case 'calibrate': {
       const parts = [
         config.calibration.flatNorm
@@ -213,11 +237,19 @@ export function stageSummary(stage: BoardStage, config: StackingConfig): string 
  *  deliberately absent — the backend reuses that one code for both the LN
  *  and drizzle "arrives in a later milestone" blockers (`plan.rs` Gate 6),
  *  so it is disambiguated below by which optional stage is actually turned
- *  on, not by parsing the blocker's message text. */
+ *  on, not by parsing the blocker's message text.
+ *
+ *  `masters`/`masterFiles` moved from `calibrate` to `masters` (Plan 5b Task
+ *  8, owner requirement 2026-09-09): the gate reinterpretation means these
+ *  two codes now name a raw set/master stage 0.5 CANNOT build/rebuild —
+ *  still the reason calibrate has nothing to work with, but the row the
+ *  operator needs to look at is the new Masters one. `links` stays on
+ *  `calibrate` — an unlinked light is a calibrate-stage input problem no
+ *  master build can fix. */
 const BLOCKER_STAGE: Partial<Record<string, BoardStage>> = {
-  masters: 'calibrate',
+  masters: 'masters',
+  masterFiles: 'masters',
   links: 'calibrate',
-  masterFiles: 'calibrate',
   reference: 'reference',
   folders: 'output',
   space: 'output',
@@ -280,6 +312,18 @@ export function rowState(
   // normalization stays `ready` (labelled "global") when its toggle is off
   // — LN is the optional PART of the `normalize` stage, not the whole row.
   if (stage === 'drizzle' && !config.drizzle.enabled) return 'off';
+
+  // 0. Masters (stage 0.5, Plan 5b Task 8) is off when there is nothing to
+  // build/rebuild AND no masters/masterFiles blocker either — most runs
+  // never touch this stage at all. When either is true, fall through to the
+  // normal precedence chain below (progress/blockers/outcome/ready) exactly
+  // like any other stage — `masters` is a real member of `STAGES` now, so
+  // step 1's progress-index comparison already handles it correctly.
+  if (stage === 'masters') {
+    const hasWork = (plan?.mastersToBuild.length ?? 0) > 0;
+    const hasBlocker = plan ? isBlockedBy('masters', plan.blockers, config) : false;
+    if (!hasWork && !hasBlocker) return 'off';
+  }
 
   // 1. Live progress outranks everything below it.
   if (progress) {

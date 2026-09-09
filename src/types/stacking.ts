@@ -151,7 +151,11 @@ export type StackingPresets = { default: StackingConfig, fastPreview: StackingCo
 
 export type ColorMode = "mono" | "osc";
 
-export type Stage = "calibrate" | "measure" | "reference" | "register" | "normalize" | "integrate" | "drizzle" | "output";
+export type Stage = "masters" | "calibrate" | "measure" | "reference" | "register" | "normalize" | "integrate" | "drizzle" | "output";
+
+export type MasterWork = "build" | "rebuild";
+
+export type PlanMaster = { setId: number, kind: MasterWork, imagetyp: string, frameCount: number, label: string, };
 
 export type PlanBlocker = { code: string, message: string, };
 
@@ -159,7 +163,16 @@ export type PlanGroup = { key: string, instrume: string | null, colorMode: Color
 
 export type PlanReference = { mode: ReferenceMode, frameId: number | null, filename: string | null, onDisk: boolean, };
 
-export type StackingPlan = { setId: number, setName: string, config: StackingConfig, configHash: string, groups: Array<PlanGroup>, blockers: Array<PlanBlocker>, warnings: Array<string>, readiness: ExportReadiness, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, };
+export type StackingPlan = { setId: number, setName: string, config: StackingConfig, configHash: string, groups: Array<PlanGroup>, blockers: Array<PlanBlocker>, warnings: Array<string>, readiness: ExportReadiness, 
+/**
+ * Stage 0.5's work list (spec §2 row 0.5, owner requirement 2026-09-09):
+ * every buildable raw set and rebuildable missing master, sorted by
+ * [`crate::api::masters::type_build_rank`] then id — bias/darkflat
+ * before dark before flat, the same dependency order
+ * `start_master_builds_batch` submits a manual batch in, so a flat
+ * built by stage 0.5 sees its own precal master already on disk.
+ */
+mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, };
 
 export type StackingRunRow = { id: number, framesSetId: number, status: string, startedAt: string, finishedAt: string | null, configJson: string, configHash: string, referenceFrameId: number | null, referenceMode: string, workingDir: string, outputDir: string, summaryJson: string | null, error: string | null, };
 
@@ -179,7 +192,16 @@ export type SummaryGroup = { key: string, frameCount: number, includedCount: num
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 
-export type RunSummary = { runId: number, setId: number, setName: string, appVersion: string, startedAt: string, finishedAt: string | null, status: string, config: StackingConfig, configHash: string, reference: SummaryReference, measurement: SummaryMeasurement, groups: Array<SummaryGroup>, stages: Array<StageTiming>, warnings: Array<string>, error: string | null, };
+export type MasterBuilt = { setId: number, kind: MasterWork, masterSetId: number, path: string, durationMs: number, };
+
+export type RunSummary = { runId: number, setId: number, setName: string, appVersion: string, startedAt: string, finishedAt: string | null, status: string, config: StackingConfig, configHash: string, reference: SummaryReference, measurement: SummaryMeasurement, groups: Array<SummaryGroup>, 
+/**
+ * Stage 0.5's own result list (spec §2 row 0.5, owner requirement
+ * 2026-09-09) — every master the run built or rebuilt before
+ * calibrating. Empty when `masters_to_build` was empty (nothing to do)
+ * or the run never reached stage 0.5 (a blocker or an earlier failure).
+ */
+mastersBuilt: Array<MasterBuilt>, stages: Array<StageTiming>, warnings: Array<string>, error: string | null, };
 
 export type StackingProgressEvent = { runId: number, setId: number, stage: Stage, groupKey: string | null, current: number, total: number, percent: number, bytesDone: number, bytesTotal: number, frameId: number | null, message: string | null, };
 

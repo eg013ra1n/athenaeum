@@ -4,6 +4,7 @@
 // never persists on its own — `StackingTab` owns the debounce and the
 // `set_stacking_config` write (spec §11.2 "submit state, never a re-read").
 
+import { MastersPanel } from './panels/MastersPanel';
 import { CalibratePanel } from './panels/CalibratePanel';
 import { DebayerPanel } from './panels/DebayerPanel';
 import { MeasurePanel } from './panels/MeasurePanel';
@@ -44,6 +45,7 @@ export interface StageInspectorProps {
 }
 
 const STAGE_TITLE: Record<BoardStage, string> = {
+  masters: '0 · Masters',
   calibrate: '1 · Calibrate',
   debayer: '2 · Debayer',
   measure: '3 · Measure & select',
@@ -69,6 +71,7 @@ export function StageInspector({
   return (
     <div className="bg-surface-elevated rounded-lg p-4 h-full">
       <h4 className="text-sm font-medium text-content mb-3">{STAGE_TITLE[stage]}</h4>
+      {stage === 'masters' && <MastersPanel plan={plan} />}
       {stage === 'calibrate' && (
         <CalibratePanel config={config} onChange={onChange} plan={plan} disabled={disabled} />
       )}

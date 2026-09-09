@@ -50,9 +50,12 @@ function routeFolderError(
   return touched === 'working' ? { working: msg, output: null } : { working: null, output: msg };
 }
 
-// The nine board stages (Task 3's `StageInspector` switch) — the `masters`
-// stage does not exist yet (Task 8 adds it). Same order as `StackingTab`'s
-// own `STAGE_LABEL`/board.
+// The nine board stages (Task 3's `StageInspector` switch). Task 8's new
+// `masters` stage is DELIBERATELY excluded here (unlike `StackingTab`'s own
+// board): stage 0.5 has no config of its own to edit — its inspector reads
+// `plan.mastersToBuild`, and there is no per-set plan in the GLOBAL defaults
+// editor (this component edits config independent of any frame set). Same
+// order as `StackingTab`'s own `STAGE_LABEL`/board otherwise.
 const STAGES: readonly BoardStage[] = [
   'calibrate',
   'debayer',
@@ -66,6 +69,9 @@ const STAGES: readonly BoardStage[] = [
 ];
 
 const STAGE_LABEL: Record<BoardStage, string> = {
+  // Never rendered — `masters` is excluded from `STAGES` above — but
+  // `Record<BoardStage, string>` requires every key.
+  masters: 'Masters',
   calibrate: 'Calibrate',
   debayer: 'Debayer',
   measure: 'Measure & select',
