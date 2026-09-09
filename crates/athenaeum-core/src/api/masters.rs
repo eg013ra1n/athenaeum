@@ -295,8 +295,12 @@ pub(crate) fn type_build_rank(imagetyp: &str) -> u8 {
 /// `preview_master_build` only ever calls `describe()` on it. This split is
 /// deliberate: preview must never do full-image I/O just to render a
 /// description string.
+///
+/// `pub(crate)`: Plan 5b Task 8b's `api::lights::compute_export_readiness`
+/// pattern-matches `PrecalChoice::Master` directly — see
+/// [`select_flat_precal`]'s own doc comment for why.
 #[derive(Debug, Clone, PartialEq)]
-enum PrecalChoice {
+pub(crate) enum PrecalChoice {
     Master {
         set_id: i64,
         imagetyp: String,
@@ -344,8 +348,13 @@ struct RawPrecalCandidate {
 /// warnings collected along the way, and every raw sub-cal set skipped en
 /// route — the last of these is what lets `preview_master_build` offer a
 /// "build its master first" shortcut instead of just the warning string.
-struct PrecalSelection {
-    choice: PrecalChoice,
+///
+/// `pub(crate)`, `choice` field `pub(crate)`: Task 8b's readiness gate needs
+/// only the WHAT, never the warnings/raw-candidates (those stay
+/// module-private — nobody outside `api::masters` builds a preview
+/// description).
+pub(crate) struct PrecalSelection {
+    pub(crate) choice: PrecalChoice,
     warnings: Vec<String>,
     raw_candidates: Vec<RawPrecalCandidate>,
 }
@@ -361,7 +370,14 @@ struct PrecalSelection {
 /// AND inside the build thread (so a just-built darkflat master — earlier in
 /// a batch — is visible at build time, not preview time; the build thread
 /// only uses `.choice`, it ignores `raw_candidates`).
-fn select_flat_precal(
+///
+/// `pub(crate)` (Plan 5b Task 8b, no behaviour change): a missing MASTER
+/// FLAT is rebuilt by re-running exactly this chain over its raw source
+/// set, so `api::lights::compute_export_readiness` calls it too — to find
+/// out whether the pre-calibration master that chain would pick is ALSO
+/// missing, before stage 0.5 discovers "pre-cal master unreadable" partway
+/// through rebuilding the flat.
+pub(crate) fn select_flat_precal(
     conn: &rusqlite::Connection,
     set_id: i64,
     set_exptime: Option<f64>,

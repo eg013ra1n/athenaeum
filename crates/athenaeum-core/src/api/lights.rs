@@ -301,36 +301,101 @@ pub(crate) fn compute_export_readiness(
     // `error!(path = …)`); the export path was silently discarding the paths
     // after counting them, leaving no way — UI or log — to learn which master
     // to restore.
-    let missing_masters: Vec<(&PathBuf, i64)> = master_paths
+    //
+    // Owned (not borrowed from `master_paths`) because Plan 5b Task 8b's
+    // transitive pass below adds entries the light-link pass above never
+    // saw; `BTreeMap` keeps the same distinct-by-path dedup discipline.
+    let mut missing_masters: BTreeMap<PathBuf, i64> = BTreeMap::new();
+    for (path, &master_set_id) in &master_paths {
+        if std::fs::metadata(path).is_err() {
+            tracing::warn!(path = %path.display(), "master file missing on disk");
+            missing_masters.insert(path.clone(), master_set_id);
+        }
+    }
+
+    // Plan 5b Task 8b (found by the Task 7 acceptance run on the real LDN
+    // 1272 catalog): a missing MASTER FLAT is rebuilt from its raw source set
+    // via `select_flat_precal`'s DarkFlat -> Dark -> Bias chain
+    // (`api::masters::select_flat_precal`) — if the pre-calibration master
+    // that chain would pick is ALSO missing, `load_precal_pixels` fails with
+    // "pre-cal master unreadable" and stage 0.5 never gets that far. One
+    // transitive pass, one level only (a dark/darkflat/bias needs no
+    // pre-calibration of its own): for every master ALREADY found missing
+    // above whose `calibration_set.imagetyp` is `MasterFlat`, resolve its
+    // provenance's `source_set_id` and re-run the SAME selection the flat's
+    // own rebuild will make (`synthetic_bias = None` — the Master arm is
+    // chosen before the synthetic step, so the choice is identical to what
+    // `run_build` will make). A flat master whose own file EXISTS is never
+    // touched here — its pre-calibration master is not read again by anyone,
+    // which keeps `missing_master_files` meaning exactly "files the next
+    // calibration or rebuild would read".
+    let initial_missing: Vec<(PathBuf, i64)> = missing_masters
         .iter()
-        .filter(|(p, _)| {
-            let missing = std::fs::metadata(p).is_err();
-            if missing {
-                tracing::warn!(path = %p.display(), "master file missing on disk");
-            }
-            missing
-        })
-        .map(|(p, &id)| (p, id))
+        .map(|(p, &id)| (p.clone(), id))
         .collect();
+    for (_, master_set_id) in &initial_missing {
+        let imagetyp: String = conn.query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            params![master_set_id],
+            |r| r.get(0),
+        )?;
+        if imagetyp != "MasterFlat" {
+            continue;
+        }
+        let Some(prov) = crate::db::master_provenance::get(conn, *master_set_id).map_err(|e| {
+            ApiError::Internal(format!("read master provenance {master_set_id}: {e:#}"))
+        })?
+        else {
+            continue;
+        };
+        let Some(source_set_id) = prov.source_set_id else {
+            continue;
+        };
+        let source_exptime: Option<f64> = conn.query_row(
+            "SELECT exptime FROM calibration_set WHERE id = ?1",
+            params![source_set_id],
+            |r| r.get(0),
+        )?;
+        let sel =
+            crate::api::masters::select_flat_precal(conn, source_set_id, source_exptime, None)?;
+        if let crate::api::masters::PrecalChoice::Master {
+            set_id: precal_set_id,
+            path: precal_path,
+            ..
+        } = sel.choice
+        {
+            let precal_path = PathBuf::from(precal_path);
+            let already_known = missing_masters.contains_key(&precal_path);
+            if !already_known && std::fs::metadata(&precal_path).is_err() {
+                tracing::warn!(
+                    path = %precal_path.display(),
+                    "pre-calibration master file missing on disk"
+                );
+                missing_masters.insert(precal_path, precal_set_id);
+            }
+        }
+    }
     let missing_master_files = missing_masters.len() as i64;
 
-    // Plan 5b Task 8: which of those missing masters stage 0.5 can rebuild —
-    // `master_provenance` row + `check_rebuild_source_ready` Ok for its
-    // source set (decision 3: reuses the SAME manual-rebuild precondition).
+    // Plan 5b Task 8 (extended by Task 8b to cover the transitive
+    // pre-calibration masters above too): which of those missing masters
+    // stage 0.5 can rebuild — `master_provenance` row +
+    // `check_rebuild_source_ready` Ok for its source set (decision 3: reuses
+    // the SAME manual-rebuild precondition), run over the UNION.
     let mut masters_rebuildable: Vec<i64> = Vec::new();
     let mut masters_unrebuildable: Vec<(i64, String)> = Vec::new();
-    for (_, master_set_id) in &missing_masters {
-        match classify_master_rebuildability(conn, *master_set_id) {
-            Ok(None) => masters_rebuildable.push(*master_set_id),
-            Ok(Some(reason)) => masters_unrebuildable.push((*master_set_id, reason)),
+    for &master_set_id in missing_masters.values() {
+        match classify_master_rebuildability(conn, master_set_id) {
+            Ok(None) => masters_rebuildable.push(master_set_id),
+            Ok(Some(reason)) => masters_unrebuildable.push((master_set_id, reason)),
             Err(error) => {
                 tracing::warn!(
-                    master_set_id = *master_set_id,
+                    master_set_id,
                     %error,
                     "stacking: failed to classify missing master rebuildability; treating as unrebuildable"
                 );
                 masters_unrebuildable
-                    .push((*master_set_id, format!("could not be checked: {error}")));
+                    .push((master_set_id, format!("could not be checked: {error}")));
             }
         }
     }
@@ -579,6 +644,20 @@ mod tests {
              (source_id, source_type, calibration_set_id, calibration_type, matched_at)
              VALUES (?1, 'frame', ?2, ?3, '2026-07-05T00:00:00Z')",
             params![frame_id, set_id, cal_type],
+        )
+        .unwrap();
+    }
+
+    /// A raw calibration set's own sub-cal link — e.g. a raw flat set's own
+    /// Dark link — `source_type = 'calibration_set'`, the shape
+    /// `select_flat_precal` walks (mirrors `api::masters`'s own `link` test
+    /// helper).
+    fn add_set_link(conn: &Connection, source_set_id: i64, target_set_id: i64, cal_type: &str) {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (?1, 'calibration_set', ?2, ?3, '2026-09-09T00:00:00Z')",
+            params![source_set_id, target_set_id, cal_type],
         )
         .unwrap();
     }
@@ -1284,6 +1363,193 @@ mod tests {
         assert_eq!(
             r.masters_unrebuildable,
             vec![(unrebuildable_master, "no provenance".to_string())],
+            "{:?}",
+            r.masters_unrebuildable
+        );
+    }
+
+    /// Plan 5b Task 8b (found by the Task 7 acceptance run on the real LDN
+    /// 1272 catalog): a missing MASTER FLAT (500) is rebuilt from its raw
+    /// source set (501) via `select_flat_precal`'s DarkFlat -> Dark -> Bias
+    /// chain — 501's own Dark sub-cal link names a missing MasterDark (502),
+    /// so stage 0.5 must list 502 too, or the flat's rebuild would fail with
+    /// "pre-cal master unreadable" on the first flat.
+    #[test]
+    fn missing_flat_master_lists_its_missing_precal_master() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Missing MasterFlat 500, provenance -> raw flat source set 501.
+        let flat_path = tmp.path().join("master_flat_500.fits");
+        seed_master_with_file(&conn, 500, "MasterFlat", &flat_path);
+        let flat_source = seed_raw_set_real_files(&conn, tmp.path(), 501, "Flat", 3);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [flat_source],
+        )
+        .unwrap();
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 500,
+                source_set_id: Some(flat_source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, 500, "Flat");
+
+        // 501's own Dark sub-cal link: missing MasterDark 502, provenance ->
+        // raw dark source set 503 with real files on disk.
+        let dark_path = tmp.path().join("master_dark_502.fits");
+        seed_master_with_file(&conn, 502, "MasterDark", &dark_path);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [502],
+        )
+        .unwrap();
+        let dark_source = seed_raw_set_real_files(&conn, tmp.path(), 503, "Dark", 3);
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 502,
+                source_set_id: Some(dark_source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_set_link(&conn, flat_source, 502, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 2, "{r:?}");
+        let mut rebuildable = r.masters_rebuildable.clone();
+        rebuildable.sort();
+        assert_eq!(rebuildable, vec![500, 502], "{:?}", r.masters_rebuildable);
+        assert!(
+            r.masters_unrebuildable.is_empty(),
+            "{:?}",
+            r.masters_unrebuildable
+        );
+    }
+
+    /// Same shape, but the MasterFlat's own FILE exists on disk — its
+    /// pre-calibration master must never be inspected: `missing_master_files`
+    /// must count exactly the files the next calibration or rebuild would
+    /// actually read, and nobody reads a built flat's precal master again.
+    #[test]
+    fn existing_flat_master_does_not_list_its_precal_master() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+
+        // MasterFlat 500's file EXISTS this time.
+        let flat_path = tmp.path().join("master_flat_500.fits");
+        std::fs::write(&flat_path, b"flat").unwrap();
+        seed_master_with_file(&conn, 500, "MasterFlat", &flat_path);
+        let flat_source = seed_raw_set_real_files(&conn, tmp.path(), 501, "Flat", 3);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [flat_source],
+        )
+        .unwrap();
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 500,
+                source_set_id: Some(flat_source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, 500, "Flat");
+
+        // The precal master is missing, but must never be inspected.
+        let dark_path = tmp.path().join("master_dark_502.fits");
+        seed_master_with_file(&conn, 502, "MasterDark", &dark_path);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [502],
+        )
+        .unwrap();
+        add_set_link(&conn, flat_source, 502, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 0, "{r:?}");
+        assert!(
+            r.masters_rebuildable.is_empty(),
+            "{:?}",
+            r.masters_rebuildable
+        );
+    }
+
+    /// Same shape as `missing_flat_master_lists_its_missing_precal_master`,
+    /// but the precal master (502) has NO `master_provenance` row at all
+    /// (imported, or built outside the app) — stage 0.5 cannot do anything
+    /// about it, so it lands in `masters_unrebuildable`, not
+    /// `masters_rebuildable`, with the same "no provenance" reason a
+    /// directly-linked unrebuildable master gets.
+    #[test]
+    fn missing_flat_master_with_unrebuildable_precal_master() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let flat_path = tmp.path().join("master_flat_500.fits");
+        seed_master_with_file(&conn, 500, "MasterFlat", &flat_path);
+        let flat_source = seed_raw_set_real_files(&conn, tmp.path(), 501, "Flat", 3);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [flat_source],
+        )
+        .unwrap();
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 500,
+                source_set_id: Some(flat_source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, 500, "Flat");
+
+        // 502 missing, no provenance row at all.
+        let dark_path = tmp.path().join("master_dark_502.fits");
+        seed_master_with_file(&conn, 502, "MasterDark", &dark_path);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [502],
+        )
+        .unwrap();
+        add_set_link(&conn, flat_source, 502, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 2, "{r:?}");
+        assert_eq!(
+            r.masters_rebuildable,
+            vec![500],
+            "{:?}",
+            r.masters_rebuildable
+        );
+        assert_eq!(
+            r.masters_unrebuildable,
+            vec![(502, "no provenance".to_string())],
             "{:?}",
             r.masters_unrebuildable
         );

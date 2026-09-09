@@ -1454,6 +1454,240 @@ mod tests {
         assert_eq!(plan.masters_to_build[0].imagetyp, "Dark");
     }
 
+    /// Task 8b: a missing MASTER FLAT's rebuild reads its own
+    /// pre-calibration master (`select_flat_precal`'s choice) — when that
+    /// precal master is ALSO missing, `masters_to_build` must list it BEFORE
+    /// the flat, so the run's own dependency order (`type_build_rank`,
+    /// bias/darkflat -> dark -> flat) rebuilds the dark first and the flat's
+    /// rebuild finds it on disk. `test_fixtures` has no ready-made shape for
+    /// "a raw flat source set with its own missing-master Dark sub-cal
+    /// link", so this seeds inline — the same raw-SQL style
+    /// `plan_blocks_missing_master_with_no_provenance` below already uses.
+    #[test]
+    fn masters_to_build_orders_precal_before_flat() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+
+        // Missing MasterFlat 500, provenance -> raw flat source set 501.
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (id, imagetyp, date, is_master_library, exptime)
+                 VALUES (500, 'MasterFlat', '2025-01-01', 1, 2.0)",
+                [],
+            )
+            .unwrap();
+        let flat_missing_path = f.dir.path().join("master_flat_500.fits");
+        f.conn
+            .execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 0, '2025-01-01', 'FITS')",
+                rusqlite::params![flat_missing_path.to_string_lossy(), "master_flat_500.fits"],
+            )
+            .unwrap();
+        let flat_file_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterFlat', 1)",
+                [flat_file_id],
+            )
+            .unwrap();
+        let flat_frame_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, ?1)",
+                [flat_frame_id],
+            )
+            .unwrap();
+
+        // Raw flat source set 501, real member frames on disk
+        // (`check_rebuild_source_ready`'s precondition).
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (id, imagetyp, date, is_master_library, exptime, frame_count)
+                 VALUES (501, 'Flat', '2025-01-01', 0, 2.0, 3)",
+                [],
+            )
+            .unwrap();
+        for i in 0..3 {
+            let path = f.dir.path().join(format!("flat_501_{i}.fits"));
+            std::fs::write(&path, b"flat sub-frame").unwrap();
+            f.conn
+                .execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, 0, '2025-01-01', 'FITS')",
+                    rusqlite::params![path.to_string_lossy(), format!("flat_501_{i}.fits")],
+                )
+                .unwrap();
+            let file_id = f.conn.last_insert_rowid();
+            f.conn
+                .execute(
+                    "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Flat')",
+                    [file_id],
+                )
+                .unwrap();
+            let frame_id = f.conn.last_insert_rowid();
+            f.conn
+                .execute(
+                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (501, ?1)",
+                    [frame_id],
+                )
+                .unwrap();
+        }
+        crate::db::master_provenance::insert(
+            &f.conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 500,
+                source_set_id: Some(501),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        for &light_id in &ids {
+            f.conn
+                .execute(
+                    "INSERT INTO calibration_set_to_frames
+                        (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                     VALUES (?1, 'frame', 500, 'Flat', '2025-01-01T00:00:00Z')",
+                    [light_id],
+                )
+                .unwrap();
+        }
+
+        // 501's own Dark sub-cal link -> missing MasterDark 502.
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (id, imagetyp, date, is_master_library, exptime)
+                 VALUES (502, 'MasterDark', '2025-01-01', 1, 2.0)",
+                [],
+            )
+            .unwrap();
+        let dark_missing_path = f.dir.path().join("master_dark_502.fits");
+        f.conn
+            .execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 0, '2025-01-01', 'FITS')",
+                rusqlite::params![dark_missing_path.to_string_lossy(), "master_dark_502.fits"],
+            )
+            .unwrap();
+        let dark_file_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterDark', 1)",
+                [dark_file_id],
+            )
+            .unwrap();
+        let dark_frame_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (502, ?1)",
+                [dark_frame_id],
+            )
+            .unwrap();
+
+        // Raw dark source set 503, real member frames on disk.
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (id, imagetyp, date, is_master_library, frame_count)
+                 VALUES (503, 'Dark', '2025-01-01', 0, 3)",
+                [],
+            )
+            .unwrap();
+        for i in 0..3 {
+            let path = f.dir.path().join(format!("dark_503_{i}.fits"));
+            std::fs::write(&path, b"dark sub-frame").unwrap();
+            f.conn
+                .execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, 0, '2025-01-01', 'FITS')",
+                    rusqlite::params![path.to_string_lossy(), format!("dark_503_{i}.fits")],
+                )
+                .unwrap();
+            let file_id = f.conn.last_insert_rowid();
+            f.conn
+                .execute(
+                    "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')",
+                    [file_id],
+                )
+                .unwrap();
+            let frame_id = f.conn.last_insert_rowid();
+            f.conn
+                .execute(
+                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (503, ?1)",
+                    [frame_id],
+                )
+                .unwrap();
+        }
+        crate::db::master_provenance::insert(
+            &f.conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 502,
+                source_set_id: Some(503),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_to_frames
+                    (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                 VALUES (501, 'calibration_set', 502, 'Dark', '2025-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(
+            !plan
+                .blockers
+                .iter()
+                .any(|b| b.code == "masterFiles" || b.code == "masters"),
+            "both missing masters are rebuildable, neither should block: {:?}",
+            plan.blockers
+        );
+        assert_eq!(
+            plan.masters_to_build.len(),
+            2,
+            "{:?}",
+            plan.masters_to_build
+        );
+        let set_ids: Vec<i64> = plan.masters_to_build.iter().map(|m| m.set_id).collect();
+        assert_eq!(
+            set_ids,
+            vec![502, 500],
+            "the precal dark must build before the flat that reads it: {:?}",
+            plan.masters_to_build
+        );
+        assert_eq!(plan.masters_to_build[0].kind, MasterWork::Rebuild);
+        assert_eq!(plan.masters_to_build[1].kind, MasterWork::Rebuild);
+    }
+
     /// A built master whose FILE is missing AND has no `master_provenance`
     /// row (imported, or built outside the app) is not something stage 0.5
     /// can do anything about — it stays the `masterFiles` blocker, naming

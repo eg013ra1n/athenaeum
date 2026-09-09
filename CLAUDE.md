@@ -405,7 +405,8 @@ matched calibration and a chosen reference, with no external stacker. Spec:
 calls them).
 
 **Pipeline stages** (`stacking::plan::Stage`, spec §2): `Masters` (0.5 —
-build/rebuild whatever the export-readiness gate found missing, dependency
+build/rebuild whatever the export-readiness gate found missing, including the
+pre-calibration master a missing flat master's rebuild reads, dependency
 order bias/darkflat → dark → flat, so a run never blocks on a master it can
 build itself) → `Calibrate` (reuses the calibrated-lights export engine
 verbatim) → `Measure` → `Reference` (one frame for the whole set — highest
