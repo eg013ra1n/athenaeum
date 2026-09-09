@@ -1,3 +1,4 @@
+import { FileLocationActions } from '../FileLocationActions';
 import { useState, useMemo, useCallback, useRef } from 'react';
 import { FolderOpen, AlertTriangle, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -504,6 +505,7 @@ export function LightsAnalysisTable({
                 )}
                 {!hideLocateColumn && (
                   <td className="w-12 px-1.5 py-1 text-center">
+                    <FileLocationActions compact paths={[frame.file_path]} />
                     <button
                       onClick={e => handleReveal(e, frame.file_path)}
                       className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"

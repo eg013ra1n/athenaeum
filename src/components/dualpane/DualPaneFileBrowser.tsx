@@ -1,3 +1,4 @@
+import { FileLocationActions } from '../FileLocationActions';
 // Far-Manager-style dual-pane file browser.
 //
 // Phase 1 features:
@@ -739,7 +740,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   // Reveal-in-OS handler: F3. Targets the cursor row first (matches Far
   // Manager / Total Commander semantics), then any single selection, then
   // falls back to the active pane's cwd so F3 always does something useful.
-  // No-op on web (revealItemInDir gracefully degrades there).
+  // Web copies the target path.
   const revealInOs = useCallback(() => {
     const active = state.panes[state.activePane];
     let target: string | null = null;
@@ -750,8 +751,15 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     }
     if (!target) target = active.cwd;
     if (!target) return;
-    void revealItemInDir(target).catch((e) => {
+    void revealItemInDir(target).catch(e => {
       console.error('revealItemInDir failed:', e);
+      notify({
+        title: 'Could not reveal path',
+        detail: String(e),
+        kind: 'files',
+        tone: 'warning',
+        hasErrors: true,
+      });
     });
   }, [state.activePane, state.panes]);
 
@@ -1183,11 +1191,15 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           disabled={state.panes[state.activePane].selection.size !== 1}
           onClick={openRename}
         />
+        <FileLocationActions
+          label="Selected file locations"
+          paths={[...state.panes[state.activePane].selection].filter(path => path !== PARENT_ROW)}
+        />
         {isTauri && (
           <ShortcutButton
             variant="neutral"
             icon={<ExternalLink size={12} />}
-            label="Reveal"
+            label={isMac ? 'Reveal in Finder' : 'Show in Folder'}
             title="Reveal cursor row (or current folder) in system file manager (F3)"
             onClick={revealInOs}
           />

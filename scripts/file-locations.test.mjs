@@ -108,3 +108,107 @@ test('desktop preflight prevents reveal on missing paths and opening files as fo
   assert.deepEqual(folder.calls.at(-1), ['open', '/night']);
 });
 
+test('night, camera and filter controls receive their complete distinct memberships', () => {
+  for (const merged of [false, true]) {
+    const name = merged ? 'MergedCameraFilterTree' : 'CameraFilterTree';
+    const exports = {};
+    const locations = [];
+    vm.runInNewContext(compile(`../src/components/calibration/${name}.tsx`), {
+      exports,
+      require: module =>
+        module === '../FileLocationActions'
+          ? {
+              FileLocationActions: props => {
+                locations.push(props);
+                return null;
+              },
+            }
+          : require(module),
+    });
+    const camera = {
+      camera: 'Fixture camera',
+      totalFrameCount: 3,
+      filters: [
+        { key: 'a', label: 'Ha', frameCount: 2 },
+        { key: 'b', label: 'OIII', frameCount: 1 },
+      ],
+    };
+    renderToStaticMarkup(
+      React.createElement(exports[name], {
+        nodes: merged
+          ? [camera]
+          : [
+              {
+                dateKey: '2026-01-01',
+                dateDisplay: 'Jan 1',
+                totalFrameCount: 3,
+                cameras: [camera],
+              },
+            ],
+        checkedKeys: new Set(),
+        onCheckedChange: () => {},
+        locationPathsByKey: new Map([
+          ['a', ['/night-a/1.fits', '/night-b/2.fits']],
+          ['b', ['/night-a/3.fits']],
+        ]),
+      }),
+    );
+    assert.equal(locations.length, merged ? 3 : 4);
+    assert.equal(locations.find(p => p.label === 'Camera file locations').paths.length, 3);
+    assert.equal(
+      locations.filter(p => p.label === 'Filter file locations')[0].paths[1],
+      '/night-b/2.fits',
+    );
+    if (!merged)
+      assert.equal(locations.find(p => p.label === 'Night file locations').paths.length, 3);
+  }
+});
+
+test('object locations resolve every selected object and preserve offline and ZIP paths', async () => {
+  const exports = {};
+  const calls = [];
+  vm.runInNewContext(compile('../src/components/ObjectFileLocations.tsx'), {
+    exports,
+    require: module => {
+      if (module === '../api')
+        return {
+          api: {
+            invoke: async (command, args) => {
+              calls.push([command, args.framesSetId]);
+              return {
+                nights: [
+                  {
+                    sessions: [
+                      {
+                        frames: [
+                          { file: { path: '/offline/' + args.framesSetId + '.fits' } },
+                          {
+                            file: {
+                              path: '/old/source.fits',
+                              archive_zip_path: '/archive/lights.zip',
+                            },
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              };
+            },
+          },
+        };
+      if (module === './FileLocationActions') return { FileLocationActions: () => null };
+      return require(module);
+    },
+  });
+  const element = exports.ObjectFileLocations({ ids: [1, 2] });
+  const paths = await element.props.loadPaths();
+  assert.deepEqual(
+    [...paths],
+    ['/offline/1.fits', '/archive/lights.zip', '/offline/2.fits', '/archive/lights.zip'],
+  );
+  assert.deepEqual(calls, [
+    ['get_frame_set_detail', 1],
+    ['get_frame_set_detail', 2],
+  ]);
+});

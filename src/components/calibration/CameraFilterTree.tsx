@@ -1,8 +1,10 @@
+import { FileLocationActions } from '../FileLocationActions';
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Calendar, Camera, Aperture, ChevronDown, ChevronRight, ChevronsDownUp } from 'lucide-react';
 import type { DateCameraFilterNode } from './utils';
 
 interface CameraFilterTreeProps {
+  locationPathsByKey?: Map<string, string[]>;
   nodes: DateCameraFilterNode[];
   /** Checked filter keys (multi-select) */
   checkedKeys: Set<string>;
@@ -50,23 +52,34 @@ function StyledCheckbox({
         focus:ring-1 focus:ring-accent focus:ring-offset-0
       "
       title={title}
-      onClick={(e) => e.stopPropagation()}
+      onClick={e => e.stopPropagation()}
     />
   );
 }
 
-export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '', checkedLabel, filterSnrMap, footer }: CameraFilterTreeProps) {
+export function CameraFilterTree({
+  nodes,
+  checkedKeys,
+  onCheckedChange,
+  className = '',
+  checkedLabel,
+  filterSnrMap,
+  footer,
+  locationPathsByKey,
+}: CameraFilterTreeProps) {
   const [expandedDates, setExpandedDates] = useState<Set<string>>(
-    () => new Set(nodes.map(n => n.dateKey))
+    () => new Set(nodes.map(n => n.dateKey)),
   );
   const [expandedCameras, setExpandedCameras] = useState<Set<string>>(
-    () => new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`)))
+    () => new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`))),
   );
 
   // Re-expand all when nodes change
   useEffect(() => {
     setExpandedDates(new Set(nodes.map(n => n.dateKey)));
-    setExpandedCameras(new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`))));
+    setExpandedCameras(
+      new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`))),
+    );
   }, [nodes]);
 
   const toggleDate = useCallback((dateKey: string) => {
@@ -249,6 +262,15 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
                     {dateNode.totalFrameCount}
                   </span>
                 </button>
+                {locationPathsByKey && (
+                  <FileLocationActions
+                    compact
+                    label="Night file locations"
+                    paths={dateNode.cameras.flatMap(c =>
+                      c.filters.flatMap(f => locationPathsByKey.get(f.key) ?? []),
+                    )}
+                  />
+                )}
               </div>
 
               {/* Camera level (with indent guide) */}
@@ -286,6 +308,13 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
                               {cam.totalFrameCount}
                             </span>
                           </button>
+                          {locationPathsByKey && (
+                            <FileLocationActions
+                              compact
+                              label="Camera file locations"
+                              paths={cam.filters.flatMap(f => locationPathsByKey.get(f.key) ?? [])}
+                            />
+                          )}
                         </div>
 
                         {/* Filter level (with nested indent guide) */}
@@ -328,6 +357,13 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
                                       {filter.frameCount}
                                     </span>
                                   </button>
+                                  {locationPathsByKey && (
+                                    <FileLocationActions
+                                      compact
+                                      label="Filter file locations"
+                                      paths={locationPathsByKey.get(filter.key) ?? []}
+                                    />
+                                  )}
                                 </div>
                               );
                             })}

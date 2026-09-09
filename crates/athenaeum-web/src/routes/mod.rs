@@ -49,828 +49,276 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Scan roots
         .route("/api/add_scan_root", post(scan_roots::add_scan_root))
         .route("/api/get_scan_roots", post(scan_roots::get_scan_roots))
-        .route(
-            "/api/get_calibration_library_root",
-            post(scan_roots::get_calibration_library_root),
-        )
-        .route(
-            "/api/get_calibration_library_dir",
-            post(scan_roots::get_calibration_library_dir),
-        )
-        .route(
-            "/api/set_calibration_library_dir",
-            post(scan_roots::set_calibration_library_dir),
-        )
-        .route(
-            "/api/clear_calibration_library_dir",
-            post(scan_roots::clear_calibration_library_dir),
-        )
-        .route(
-            "/api/switch_calibration_library_dir",
-            post(scan_roots::switch_calibration_library_dir),
-        )
-        .route(
-            "/api/get_sync_incoming_dir",
-            post(scan_roots::get_sync_incoming_dir),
-        )
-        .route(
-            "/api/set_sync_incoming_dir",
-            post(scan_roots::set_sync_incoming_dir),
-        )
-        .route(
-            "/api/clear_sync_incoming_dir",
-            post(scan_roots::clear_sync_incoming_dir),
-        )
-        .route(
-            "/api/get_collaboration_dir",
-            post(scan_roots::get_collaboration_dir),
-        )
-        .route(
-            "/api/set_collaboration_dir",
-            post(scan_roots::set_collaboration_dir),
-        )
-        .route(
-            "/api/clear_collaboration_dir",
-            post(scan_roots::clear_collaboration_dir),
-        )
-        .route(
-            "/api/validate_folder_candidate",
-            post(scan_roots::validate_folder_candidate),
-        )
-        .route(
-            "/api/get_folder_overview",
-            post(scan_roots::get_folder_overview),
-        )
+        .route("/api/get_calibration_library_root", post(scan_roots::get_calibration_library_root))
+        .route("/api/get_calibration_library_dir", post(scan_roots::get_calibration_library_dir))
+        .route("/api/set_calibration_library_dir", post(scan_roots::set_calibration_library_dir))
+        .route("/api/clear_calibration_library_dir", post(scan_roots::clear_calibration_library_dir))
+        .route("/api/switch_calibration_library_dir", post(scan_roots::switch_calibration_library_dir))
+        .route("/api/get_sync_incoming_dir", post(scan_roots::get_sync_incoming_dir))
+        .route("/api/set_sync_incoming_dir", post(scan_roots::set_sync_incoming_dir))
+        .route("/api/clear_sync_incoming_dir", post(scan_roots::clear_sync_incoming_dir))
+        .route("/api/get_collaboration_dir", post(scan_roots::get_collaboration_dir))
+        .route("/api/set_collaboration_dir", post(scan_roots::set_collaboration_dir))
+        .route("/api/clear_collaboration_dir", post(scan_roots::clear_collaboration_dir))
+        .route("/api/validate_folder_candidate", post(scan_roots::validate_folder_candidate))
+        .route("/api/get_folder_overview", post(scan_roots::get_folder_overview))
         .route("/api/delete_scan_root", post(scan_roots::delete_scan_root))
         .route("/api/start_scan", post(scan_roots::start_scan))
-        .route(
-            "/api/start_scan_with_progress",
-            post(scan_roots::start_scan_with_progress),
-        )
+        .route("/api/start_scan_with_progress", post(scan_roots::start_scan_with_progress))
         .route("/api/cancel_scan", post(scan_roots::cancel_scan))
-        .route(
-            "/api/check_all_scan_roots_availability",
-            post(scan_roots::check_all_scan_roots_availability),
-        )
-        .route(
-            "/api/get_missing_files_counts",
-            post(scan_roots::get_missing_files_counts),
-        )
+        .route("/api/check_all_scan_roots_availability", post(scan_roots::check_all_scan_roots_availability))
+        .route("/api/get_missing_files_counts", post(scan_roots::get_missing_files_counts))
         .route("/api/relink_scan_root", post(scan_roots::relink_scan_root))
-        .route(
-            "/api/set_scan_root_monitor_enabled",
-            post(scan_roots::set_scan_root_monitor_enabled),
-        )
+        .route("/api/set_scan_root_monitor_enabled", post(scan_roots::set_scan_root_monitor_enabled))
         // Missing files
-        .route(
-            "/api/check_missing_files_in_scan_root",
-            post(missing_files::check_missing_files_in_scan_root),
-        )
-        .route(
-            "/api/sync_missing_files",
-            post(missing_files::sync_missing_files),
-        )
-        .route(
-            "/api/get_missing_files",
-            post(missing_files::get_missing_files),
-        )
-        .route(
-            "/api/recheck_missing_files",
-            post(missing_files::recheck_missing_files),
-        )
-        .route(
-            "/api/ignore_missing_file",
-            post(missing_files::ignore_missing_file),
-        )
-        .route(
-            "/api/unignore_missing_file",
-            post(missing_files::unignore_missing_file),
-        )
-        .route(
-            "/api/delete_missing_files",
-            post(missing_files::delete_missing_files),
-        )
-        .route(
-            "/api/relocate_missing_file",
-            post(relocate_missing_file_stub),
-        )
+        .route("/api/check_missing_files_in_scan_root", post(missing_files::check_missing_files_in_scan_root))
+        .route("/api/sync_missing_files", post(missing_files::sync_missing_files))
+        .route("/api/get_missing_files", post(missing_files::get_missing_files))
+        .route("/api/recheck_missing_files", post(missing_files::recheck_missing_files))
+        .route("/api/ignore_missing_file", post(missing_files::ignore_missing_file))
+        .route("/api/unignore_missing_file", post(missing_files::unignore_missing_file))
+        .route("/api/delete_missing_files", post(missing_files::delete_missing_files))
+        .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
         // Files
         .route("/api/get_files", post(files::get_files))
-        .route(
-            "/api/get_files_by_directory",
-            post(files::get_files_by_directory),
-        )
-        .route(
-            "/api/is_existing_directory",
-            post(files::is_existing_directory),
-        )
-        .route(
-            "/api/get_directory_contents",
-            post(files::get_directory_contents),
-        )
-        .route(
-            "/api/get_camera_directories",
-            post(files::get_camera_directories),
-        )
-        .route(
-            "/api/get_camera_directory_contents",
-            post(files::get_camera_directory_contents),
-        )
-        .route(
-            "/api/get_frames_with_missing_metadata",
-            post(files::get_frames_with_missing_metadata),
-        )
-        .route(
-            "/api/bulk_update_frame_metadata",
-            post(files::bulk_update_frame_metadata),
-        )
-        .route(
-            "/api/count_frame_metadata_relations",
-            post(files::count_frame_metadata_relations),
-        )
-        .route(
-            "/api/get_frame_memberships",
-            post(files::get_frame_memberships),
-        )
-        .route(
-            "/api/get_frame_metadata_originals",
-            post(files::get_frame_metadata_originals),
-        )
-        .route(
-            "/api/get_distinct_instrumes",
-            post(files::get_distinct_instrumes),
-        )
-        .route(
-            "/api/get_files_with_frames_by_ids",
-            post(files::get_files_with_frames_by_ids),
-        )
+        .route("/api/is_existing_directory", post(files::is_existing_directory))
+        .route("/api/get_files_by_directory", post(files::get_files_by_directory))
+        .route("/api/get_directory_contents", post(files::get_directory_contents))
+        .route("/api/get_camera_directories", post(files::get_camera_directories))
+        .route("/api/get_camera_directory_contents", post(files::get_camera_directory_contents))
+        .route("/api/get_frames_with_missing_metadata", post(files::get_frames_with_missing_metadata))
+        .route("/api/bulk_update_frame_metadata", post(files::bulk_update_frame_metadata))
+        .route("/api/count_frame_metadata_relations", post(files::count_frame_metadata_relations))
+        .route("/api/get_frame_memberships", post(files::get_frame_memberships))
+        .route("/api/get_frame_metadata_originals", post(files::get_frame_metadata_originals))
+        .route("/api/get_distinct_instrumes", post(files::get_distinct_instrumes))
+        .route("/api/get_files_with_frames_by_ids", post(files::get_files_with_frames_by_ids))
         .route("/api/browse_directories", post(files::browse_directories))
         // Dual-pane file browser
-        .route(
-            "/api/enqueue_move_operation",
-            post(files::enqueue_move_operation),
-        )
+        .route("/api/enqueue_move_operation", post(files::enqueue_move_operation))
         .route("/api/search_catalog", post(files::search_catalog))
-        .route(
-            "/api/resolve_frame_ids_for_paths",
-            post(files::resolve_frame_ids_for_paths),
-        )
+        .route("/api/resolve_frame_ids_for_paths", post(files::resolve_frame_ids_for_paths))
         .route("/api/mkdir_in_scan_root", post(files::mkdir_in_scan_root))
         .route("/api/rename_path", post(files::rename_path))
         // Settings
         .route("/api/get_setting", post(settings::get_setting))
         .route("/api/set_setting", post(settings::set_setting))
         .route("/api/delete_setting", post(settings::delete_setting))
-        .route(
-            "/api/get_logging_config",
-            post(settings::get_logging_config),
-        )
-        .route(
-            "/api/set_logging_config",
-            post(settings::set_logging_config),
-        )
+        .route("/api/get_logging_config", post(settings::get_logging_config))
+        .route("/api/set_logging_config", post(settings::set_logging_config))
         // Cache & blink (Category C — modified behavior in web mode)
         .route("/api/get_cache_stats", post(settings::get_cache_stats))
-        .route(
-            "/api/get_blink_threads_max",
-            post(settings::get_blink_threads_max),
-        )
+        .route("/api/get_blink_threads_max", post(settings::get_blink_threads_max))
         .route("/api/set_blink_threads", post(settings::set_blink_threads))
         // Frame sets
-        .route(
-            "/api/auto_generate_frame_sets",
-            post(frame_sets::auto_generate_frame_sets),
-        )
+        .route("/api/auto_generate_frame_sets", post(frame_sets::auto_generate_frame_sets))
         .route("/api/get_frames_sets", post(frame_sets::get_frames_sets))
-        .route(
-            "/api/get_frame_set_detail",
-            post(frame_sets::get_frame_set_detail),
-        )
-        .route(
-            "/api/delete_frames_set",
-            post(frame_sets::delete_frames_set),
-        )
-        .route(
-            "/api/delete_auto_generated_frame_sets",
-            post(frame_sets::delete_auto_generated_frame_sets),
-        )
-        .route(
-            "/api/rename_frames_set",
-            post(frame_sets::rename_frames_set),
-        )
-        .route(
-            "/api/mark_frame_set_custom",
-            post(frame_sets::mark_frame_set_custom),
-        )
+        .route("/api/get_frame_set_detail", post(frame_sets::get_frame_set_detail))
+        .route("/api/delete_frames_set", post(frame_sets::delete_frames_set))
+        .route("/api/delete_auto_generated_frame_sets", post(frame_sets::delete_auto_generated_frame_sets))
+        .route("/api/rename_frames_set", post(frame_sets::rename_frames_set))
+        .route("/api/mark_frame_set_custom", post(frame_sets::mark_frame_set_custom))
         .route("/api/merge_frame_sets", post(frame_sets::merge_frame_sets))
         .route("/api/split_frame_set", post(frame_sets::split_frame_set))
-        .route(
-            "/api/create_frame_set_from_selection",
-            post(frame_sets::create_frame_set_from_selection),
-        )
-        .route(
-            "/api/archive_frame_set",
-            post(frame_sets::archive_frame_set),
-        )
-        .route(
-            "/api/find_new_frames_for_set",
-            post(frame_sets::find_new_frames_for_set),
-        )
-        .route(
-            "/api/auto_merge_new_frames_for_set",
-            post(frame_sets::auto_merge_new_frames_for_set),
-        )
-        .route(
-            "/api/recalculate_frame_set_nights",
-            post(frame_sets::recalculate_frame_set_nights),
-        )
-        .route(
-            "/api/get_frame_set_merge_log",
-            post(frame_sets::get_frame_set_merge_log),
-        )
+        .route("/api/create_frame_set_from_selection", post(frame_sets::create_frame_set_from_selection))
+        .route("/api/archive_frame_set", post(frame_sets::archive_frame_set))
+        .route("/api/find_new_frames_for_set", post(frame_sets::find_new_frames_for_set))
+        .route("/api/auto_merge_new_frames_for_set", post(frame_sets::auto_merge_new_frames_for_set))
+        .route("/api/recalculate_frame_set_nights", post(frame_sets::recalculate_frame_set_nights))
+        .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         // Excluded frames
-        .route(
-            "/api/get_excluded_frames_with_metadata",
-            post(frame_sets::get_excluded_frames_with_metadata),
-        )
-        .route(
-            "/api/remove_files_from_excluded",
-            post(frame_sets::remove_files_from_excluded),
-        )
-        .route(
-            "/api/get_excluded_frames_count",
-            post(frame_sets::get_excluded_frames_count),
-        )
+        .route("/api/get_excluded_frames_with_metadata", post(frame_sets::get_excluded_frames_with_metadata))
+        .route("/api/remove_files_from_excluded", post(frame_sets::remove_files_from_excluded))
+        .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
         // Calibration
-        .route(
-            "/api/get_equipment_cameras",
-            post(calibration::get_equipment_cameras),
-        )
+        .route("/api/get_equipment_cameras", post(calibration::get_equipment_cameras))
         .route("/api/get_dark_library", post(calibration::get_dark_library))
         .route("/api/has_dark_library", post(calibration::has_dark_library))
-        .route(
-            "/api/get_master_dark_library",
-            post(calibration::get_master_dark_library),
-        )
-        .route(
-            "/api/has_master_dark_library",
-            post(calibration::has_master_dark_library),
-        )
-        .route(
-            "/api/get_master_flat_library",
-            post(calibration::get_master_flat_library),
-        )
-        .route(
-            "/api/has_master_flat_library",
-            post(calibration::has_master_flat_library),
-        )
-        .route(
-            "/api/refresh_calibration_library_for_camera",
-            post(calibration::refresh_calibration_library_for_camera),
-        )
-        .route(
-            "/api/get_calibration_set_frames",
-            post(calibration::get_calibration_set_frames),
-        )
-        .route(
-            "/api/get_calibration_set_consumers",
-            post(calibration::get_calibration_set_consumers),
-        )
-        .route(
-            "/api/find_calibration_for_frame_set",
-            post(calibration::find_calibration_for_frame_set),
-        )
-        .route(
-            "/api/get_calibration_matching_config",
-            post(calibration::get_calibration_matching_config),
-        )
-        .route(
-            "/api/set_calibration_matching_config",
-            post(calibration::set_calibration_matching_config),
-        )
-        .route(
-            "/api/reset_calibration_matching_config",
-            post(calibration::reset_calibration_matching_config),
-        )
+        .route("/api/get_master_dark_library", post(calibration::get_master_dark_library))
+        .route("/api/has_master_dark_library", post(calibration::has_master_dark_library))
+        .route("/api/get_master_flat_library", post(calibration::get_master_flat_library))
+        .route("/api/has_master_flat_library", post(calibration::has_master_flat_library))
+        .route("/api/refresh_calibration_library_for_camera", post(calibration::refresh_calibration_library_for_camera))
+        .route("/api/get_calibration_set_frames", post(calibration::get_calibration_set_frames))
+        .route("/api/get_calibration_set_consumers", post(calibration::get_calibration_set_consumers))
+        .route("/api/find_calibration_for_frame_set", post(calibration::find_calibration_for_frame_set))
+        .route("/api/get_calibration_matching_config", post(calibration::get_calibration_matching_config))
+        .route("/api/set_calibration_matching_config", post(calibration::set_calibration_matching_config))
+        .route("/api/reset_calibration_matching_config", post(calibration::reset_calibration_matching_config))
         // Calibration — Phase 4 routes (hierarchy, manual selection, sub-calibration, metadata)
-        .route(
-            "/api/get_calibration_hierarchy_for_frame_set",
-            post(calibration::get_calibration_hierarchy_for_frame_set),
-        )
-        .route(
-            "/api/get_calibration_set_parameters",
-            post(calibration::get_calibration_set_parameters),
-        )
-        .route(
-            "/api/get_calibration_sets_for_manual_selection",
-            post(calibration::get_calibration_sets_for_manual_selection),
-        )
-        .route(
-            "/api/get_subcalibration_sets_for_manual_selection",
-            post(calibration::get_subcalibration_sets_for_manual_selection),
-        )
-        .route(
-            "/api/get_light_frame_parameters",
-            post(calibration::get_light_frame_parameters),
-        )
-        .route(
-            "/api/manual_assign_calibration",
-            post(calibration::manual_assign_calibration),
-        )
-        .route(
-            "/api/clear_manual_calibration_override",
-            post(calibration::clear_manual_calibration_override),
-        )
-        .route(
-            "/api/manual_assign_subcalibration",
-            post(calibration::manual_assign_subcalibration),
-        )
-        .route(
-            "/api/clear_subcalibration_override",
-            post(calibration::clear_subcalibration_override),
-        )
-        .route(
-            "/api/bulk_update_calibration_metadata",
-            post(calibration::bulk_update_calibration_metadata),
-        )
-        .route(
-            "/api/bulk_restore_calibration_metadata",
-            post(calibration::bulk_restore_calibration_metadata),
-        )
-        .route(
-            "/api/get_custom_metadata_set_ids",
-            post(calibration::get_custom_metadata_set_ids),
-        )
+        .route("/api/get_calibration_hierarchy_for_frame_set", post(calibration::get_calibration_hierarchy_for_frame_set))
+        .route("/api/get_calibration_set_parameters", post(calibration::get_calibration_set_parameters))
+        .route("/api/get_calibration_sets_for_manual_selection", post(calibration::get_calibration_sets_for_manual_selection))
+        .route("/api/get_subcalibration_sets_for_manual_selection", post(calibration::get_subcalibration_sets_for_manual_selection))
+        .route("/api/get_light_frame_parameters", post(calibration::get_light_frame_parameters))
+        .route("/api/manual_assign_calibration", post(calibration::manual_assign_calibration))
+        .route("/api/clear_manual_calibration_override", post(calibration::clear_manual_calibration_override))
+        .route("/api/manual_assign_subcalibration", post(calibration::manual_assign_subcalibration))
+        .route("/api/clear_subcalibration_override", post(calibration::clear_subcalibration_override))
+        .route("/api/bulk_update_calibration_metadata", post(calibration::bulk_update_calibration_metadata))
+        .route("/api/bulk_restore_calibration_metadata", post(calibration::bulk_restore_calibration_metadata))
+        .route("/api/get_custom_metadata_set_ids", post(calibration::get_custom_metadata_set_ids))
         // Duplicates / black hole
         .route("/api/get_duplicates", post(duplicates::get_duplicates))
-        .route(
-            "/api/move_to_black_hole",
-            post(duplicates::move_to_black_hole),
-        )
-        .route(
-            "/api/bulk_move_to_black_hole",
-            post(duplicates::bulk_move_to_black_hole),
-        )
-        .route(
-            "/api/get_black_hole_files",
-            post(duplicates::get_black_hole_files),
-        )
-        .route(
-            "/api/get_blackholed_file_ids",
-            post(duplicates::get_blackholed_file_ids),
-        )
-        .route(
-            "/api/restore_from_black_hole",
-            post(duplicates::restore_from_black_hole),
-        )
+        .route("/api/move_to_black_hole", post(duplicates::move_to_black_hole))
+        .route("/api/bulk_move_to_black_hole", post(duplicates::bulk_move_to_black_hole))
+        .route("/api/get_black_hole_files", post(duplicates::get_black_hole_files))
+        .route("/api/get_blackholed_file_ids", post(duplicates::get_blackholed_file_ids))
+        .route("/api/restore_from_black_hole", post(duplicates::restore_from_black_hole))
         .route("/api/send_to_void", post(duplicates::send_to_void))
         .route("/api/send_all_to_void", post(duplicates::send_all_to_void))
-        .route(
-            "/api/get_duplicate_folders",
-            post(duplicates::get_duplicate_folders),
-        )
-        .route(
-            "/api/set_scan_root_duplicates_flag",
-            post(duplicates::set_scan_root_duplicates_flag),
-        )
-        .route(
-            "/api/set_scan_root_unique_camera_flag",
-            post(duplicates::set_scan_root_unique_camera_flag),
-        )
-        .route(
-            "/api/verify_files_byte_identical",
-            post(duplicates::verify_files_byte_identical),
-        )
-        .route(
-            "/api/verify_duplicate_pair",
-            post(duplicates::verify_duplicate_pair),
-        )
+        .route("/api/get_duplicate_folders", post(duplicates::get_duplicate_folders))
+        .route("/api/set_scan_root_duplicates_flag", post(duplicates::set_scan_root_duplicates_flag))
+        .route("/api/set_scan_root_unique_camera_flag", post(duplicates::set_scan_root_unique_camera_flag))
+        .route("/api/verify_files_byte_identical", post(duplicates::verify_files_byte_identical))
+        .route("/api/verify_duplicate_pair", post(duplicates::verify_duplicate_pair))
         // Export
-        .route(
-            "/api/get_wbpp_export_config",
-            post(export::get_wbpp_export_config),
-        )
-        .route(
-            "/api/set_wbpp_export_config",
-            post(export::set_wbpp_export_config),
-        )
-        .route(
-            "/api/reset_wbpp_export_config",
-            post(export::reset_wbpp_export_config),
-        )
+        .route("/api/get_wbpp_export_config", post(export::get_wbpp_export_config))
+        .route("/api/set_wbpp_export_config", post(export::set_wbpp_export_config))
+        .route("/api/reset_wbpp_export_config", post(export::reset_wbpp_export_config))
         .route("/api/get_export_preview", post(export::get_export_preview))
-        .route(
-            "/api/get_exportable_frame_sets",
-            post(export::get_exportable_frame_sets),
-        )
-        .route(
-            "/api/get_calibration_route",
-            post(export::get_calibration_route),
-        )
-        .route(
-            "/api/get_export_readiness",
-            post(export::get_export_readiness),
-        )
+        .route("/api/get_exportable_frame_sets", post(export::get_exportable_frame_sets))
+        .route("/api/get_calibration_route", post(export::get_calibration_route))
+        .route("/api/get_export_readiness", post(export::get_export_readiness))
         .route("/api/export_to_wbpp", post(export::export_to_wbpp))
         .route("/api/cancel_export", post(export::cancel_export))
         .route("/api/get_export_summary", post(export::get_export_summary))
         .route("/api/get_export_dir", post(export::get_export_dir))
         // Spatial
-        .route(
-            "/api/get_imaging_locations",
-            post(spatial::get_imaging_locations),
-        )
-        .route(
-            "/api/query_frames_in_bounds",
-            post(spatial::query_frames_in_bounds),
-        )
+        .route("/api/get_imaging_locations", post(spatial::get_imaging_locations))
+        .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
         // Calendar
-        .route(
-            "/api/get_calendar_month_data",
-            post(calendar::get_calendar_month_data),
-        )
+        .route("/api/get_calendar_month_data", post(calendar::get_calendar_month_data))
         // Analysis
-        .route(
-            "/api/get_analysis_config",
-            post(analysis::get_analysis_config),
-        )
-        .route(
-            "/api/set_analysis_config",
-            post(analysis::set_analysis_config),
-        )
-        .route(
-            "/api/reset_analysis_config",
-            post(analysis::reset_analysis_config),
-        )
-        .route(
-            "/api/get_analysis_for_frame_set",
-            post(analysis::get_analysis_for_frame_set),
-        )
+        .route("/api/get_analysis_config", post(analysis::get_analysis_config))
+        .route("/api/set_analysis_config", post(analysis::set_analysis_config))
+        .route("/api/reset_analysis_config", post(analysis::reset_analysis_config))
+        .route("/api/get_analysis_for_frame_set", post(analysis::get_analysis_for_frame_set))
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
-        .route(
-            "/api/get_frame_star_metrics",
-            post(analysis::get_frame_star_metrics),
-        )
-        .route(
-            "/api/compute_flat_contour_plot",
-            post(analysis::compute_flat_contour_plot),
-        )
+        .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
+        .route("/api/compute_flat_contour_plot", post(analysis::compute_flat_contour_plot))
         // Compute queue
         .route("/api/get_compute_queue", post(compute::get_compute_queue))
         .route("/api/cancel_compute_job", post(compute::cancel_compute_job))
-        .route(
-            "/api/set_compute_max_concurrent",
-            post(compute::set_compute_max_concurrent),
-        )
-        .route(
-            "/api/get_integration_band_budget",
-            post(compute::get_integration_band_budget),
-        )
-        .route(
-            "/api/set_integration_band_budget",
-            post(compute::set_integration_band_budget),
-        )
+        .route("/api/set_compute_max_concurrent", post(compute::set_compute_max_concurrent))
+        .route("/api/get_integration_band_budget", post(compute::get_integration_band_budget))
+        .route("/api/set_integration_band_budget", post(compute::set_integration_band_budget))
         // Content index
-        .route(
-            "/api/get_content_index_status",
-            post(content_index::get_content_index_status),
-        )
-        .route(
-            "/api/start_content_index",
-            post(content_index::start_content_index),
-        )
+        .route("/api/get_content_index_status", post(content_index::get_content_index_status))
+        .route("/api/start_content_index", post(content_index::start_content_index))
         // Plate solving
-        .route(
-            "/api/get_plate_solve_config",
-            post(plate_solve::get_plate_solve_config),
-        )
-        .route(
-            "/api/set_plate_solve_config",
-            post(plate_solve::set_plate_solve_config),
-        )
-        .route(
-            "/api/reset_plate_solve_config",
-            post(plate_solve::reset_plate_solve_config),
-        )
-        .route(
-            "/api/plate_solve_batch",
-            post(plate_solve::plate_solve_batch),
-        )
-        .route(
-            "/api/cancel_plate_solve",
-            post(plate_solve::cancel_plate_solve),
-        )
-        .route(
-            "/api/autofind_objects_from_coordinates",
-            post(plate_solve::autofind_objects_from_coordinates),
-        )
-        .route(
-            "/api/cancel_autofind_objects",
-            post(plate_solve::cancel_autofind_objects),
-        )
-        .route(
-            "/api/resolve_object_name",
-            post(plate_solve::resolve_object_name),
-        )
-        .route(
-            "/api/get_plate_solve_result",
-            post(plate_solve::get_plate_solve_result),
-        )
-        .route(
-            "/api/delete_plate_solve_for_frame",
-            post(plate_solve::delete_plate_solve_for_frame),
-        )
-        .route(
-            "/api/get_catalog_status",
-            post(plate_solve::get_catalog_status),
-        )
-        .route(
-            "/api/get_frame_fov_summary",
-            post(plate_solve::get_frame_fov_summary),
-        )
-        .route(
-            "/api/download_catalog_layers",
-            post(plate_solve::download_catalog_layers),
-        )
+        .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
+        .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))
+        .route("/api/reset_plate_solve_config", post(plate_solve::reset_plate_solve_config))
+        .route("/api/plate_solve_batch", post(plate_solve::plate_solve_batch))
+        .route("/api/cancel_plate_solve", post(plate_solve::cancel_plate_solve))
+        .route("/api/autofind_objects_from_coordinates", post(plate_solve::autofind_objects_from_coordinates))
+        .route("/api/cancel_autofind_objects", post(plate_solve::cancel_autofind_objects))
+        .route("/api/resolve_object_name", post(plate_solve::resolve_object_name))
+        .route("/api/get_plate_solve_result", post(plate_solve::get_plate_solve_result))
+        .route("/api/delete_plate_solve_for_frame", post(plate_solve::delete_plate_solve_for_frame))
+        .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
+        .route("/api/get_frame_fov_summary", post(plate_solve::get_frame_fov_summary))
+        .route("/api/download_catalog_layers", post(plate_solve::download_catalog_layers))
         // Registration (stacking preparation)
-        .route(
-            "/api/register_frame_set",
-            post(registration::register_frame_set),
-        )
-        .route(
-            "/api/get_frame_set_registration",
-            post(registration::get_frame_set_registration),
-        )
-        .route(
-            "/api/cancel_frame_set_registration",
-            post(registration::cancel_frame_set_registration),
-        )
-        .route(
-            "/api/set_frame_set_reference",
-            post(registration::set_frame_set_reference),
-        )
-        .route(
-            "/api/get_frame_set_reference",
-            post(registration::get_frame_set_reference),
-        )
+        .route("/api/register_frame_set", post(registration::register_frame_set))
+        .route("/api/get_frame_set_registration", post(registration::get_frame_set_registration))
+        .route("/api/cancel_frame_set_registration", post(registration::cancel_frame_set_registration))
+        .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
+        .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
         // Archive feature
-        .route(
-            "/api/get_archive_settings",
-            post(archive::get_archive_settings),
-        )
-        .route(
-            "/api/set_archive_root_path",
-            post(archive::set_archive_root_path),
-        )
-        .route(
-            "/api/set_archive_compression",
-            post(archive::set_archive_compression),
-        )
-        .route(
-            "/api/plan_archive_operation",
-            post(archive::plan_archive_operation),
-        )
-        .route(
-            "/api/start_archive_operation",
-            post(archive::start_archive_operation),
-        )
-        .route(
-            "/api/cancel_archive_operation",
-            post(archive::cancel_archive_operation),
-        )
-        .route(
-            "/api/list_unfinished_archive_operations",
-            post(archive::list_unfinished_archive_operations),
-        )
-        .route(
-            "/api/resume_archive_operation",
-            post(archive::resume_archive_operation),
-        )
-        .route(
-            "/api/rollback_archive_operation",
-            post(archive::rollback_archive_operation),
-        )
-        .route(
-            "/api/list_archived_frame_sets",
-            post(archive::list_archived_frame_sets),
-        )
+        .route("/api/get_archive_settings", post(archive::get_archive_settings))
+        .route("/api/set_archive_root_path", post(archive::set_archive_root_path))
+        .route("/api/set_archive_compression", post(archive::set_archive_compression))
+        .route("/api/plan_archive_operation", post(archive::plan_archive_operation))
+        .route("/api/start_archive_operation", post(archive::start_archive_operation))
+        .route("/api/cancel_archive_operation", post(archive::cancel_archive_operation))
+        .route("/api/list_unfinished_archive_operations", post(archive::list_unfinished_archive_operations))
+        .route("/api/resume_archive_operation", post(archive::resume_archive_operation))
+        .route("/api/rollback_archive_operation", post(archive::rollback_archive_operation))
+        .route("/api/list_archived_frame_sets", post(archive::list_archived_frame_sets))
         .route("/api/list_archive_zips", post(archive::list_archive_zips))
-        .route(
-            "/api/start_restore_operation",
-            post(archive::start_restore_operation),
-        )
-        .route(
-            "/api/get_restore_suggestions",
-            post(archive::get_restore_suggestions),
-        )
+        .route("/api/start_restore_operation", post(archive::start_restore_operation))
+        .route("/api/get_restore_suggestions", post(archive::get_restore_suggestions))
         .route("/api/delete_archive", post(archive::delete_archive))
         .route("/api/list_archive_roots", post(archive::list_archive_roots))
         .route("/api/add_archive_root", post(archive::add_archive_root))
-        .route(
-            "/api/delete_archive_root",
-            post(archive::delete_archive_root),
-        )
-        .route(
-            "/api/set_default_archive_root",
-            post(archive::set_default_archive_root),
-        )
+        .route("/api/delete_archive_root", post(archive::delete_archive_root))
+        .route("/api/set_default_archive_root", post(archive::set_default_archive_root))
         // Master build
-        .route(
-            "/api/preview_master_build",
-            post(masters::preview_master_build),
-        )
+        .route("/api/preview_master_build", post(masters::preview_master_build))
         .route("/api/start_master_build", post(masters::start_master_build))
-        .route(
-            "/api/start_master_builds_batch",
-            post(masters::start_master_builds_batch),
-        )
+        .route("/api/start_master_builds_batch", post(masters::start_master_builds_batch))
         .route("/api/rebuild_master", post(masters::rebuild_master))
-        .route(
-            "/api/cancel_master_build",
-            post(masters::cancel_master_build),
-        )
+        .route("/api/cancel_master_build", post(masters::cancel_master_build))
         .route("/api/delete_master", post(masters::delete_master))
-        .route(
-            "/api/get_master_provenance",
-            post(masters::get_master_provenance),
-        )
-        .route(
-            "/api/archive_calibration_originals",
-            post(masters::archive_calibration_originals),
-        )
-        .route(
-            "/api/restore_calibration_originals",
-            post(masters::restore_calibration_originals),
-        )
-        .route(
-            "/api/clear_stale_archive_markers",
-            post(masters::clear_stale_archive_markers),
-        )
+        .route("/api/get_master_provenance", post(masters::get_master_provenance))
+        .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
+        .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
+        .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
         // Personal sync (Stage I, task A7)
-        .route(
-            "/api/get_sync_pairing_ticket",
-            post(sync::get_sync_pairing_ticket),
-        )
+        .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))
         .route("/api/list_sync_history", post(sync::list_sync_history))
-        .route(
-            "/api/list_terminal_transfers",
-            post(sync::list_terminal_transfers),
-        )
+        .route("/api/list_terminal_transfers", post(sync::list_terminal_transfers))
         .route("/api/list_transfer_files", post(sync::list_transfer_files))
-        .route(
-            "/api/list_transfer_events",
-            post(sync::list_transfer_events),
-        )
-        .route(
-            "/api/enqueue_sync_selection",
-            post(sync::enqueue_sync_selection),
-        )
-        .route(
-            "/api/enqueue_frame_set_send",
-            post(sync::enqueue_frame_set_send),
-        )
+        .route("/api/list_transfer_events", post(sync::list_transfer_events))
+        .route("/api/enqueue_sync_selection", post(sync::enqueue_sync_selection))
+        .route("/api/enqueue_frame_set_send", post(sync::enqueue_frame_set_send))
         .route("/api/retry_sync_package", post(sync::retry_sync_package))
-        .route(
-            "/api/send_now_sync_package",
-            post(sync::send_now_sync_package),
-        )
+        .route("/api/send_now_sync_package", post(sync::send_now_sync_package))
         .route("/api/cancel_sync_package", post(sync::cancel_sync_package))
-        .route(
-            "/api/cancel_incoming_package",
-            post(sync::cancel_incoming_package),
-        )
-        .route(
-            "/api/delete_transfer_history",
-            post(sync::delete_transfer_history),
-        )
-        .route(
-            "/api/get_transfer_storage",
-            post(sync::get_transfer_storage),
-        )
-        .route(
-            "/api/cleanup_finished_transfers",
-            post(sync::cleanup_finished_transfers),
-        )
+        .route("/api/cancel_incoming_package", post(sync::cancel_incoming_package))
+        .route("/api/delete_transfer_history", post(sync::delete_transfer_history))
+        .route("/api/get_transfer_storage", post(sync::get_transfer_storage))
+        .route("/api/cleanup_finished_transfers", post(sync::cleanup_finished_transfers))
         .route("/api/get_transfer_paths", post(sync::get_transfer_paths))
         .route("/api/set_transfer_paths", post(sync::set_transfer_paths))
-        .route(
-            "/api/cleanup_transfer_leftovers",
-            post(sync::cleanup_transfer_leftovers),
-        )
+        .route("/api/cleanup_transfer_leftovers", post(sync::cleanup_transfer_leftovers))
         .route("/api/get_sync_auto_mode", post(sync::get_sync_auto_mode))
         .route("/api/set_sync_auto_mode", post(sync::set_sync_auto_mode))
-        .route(
-            "/api/set_sync_upload_limit",
-            post(sync::set_sync_upload_limit),
-        )
+        .route("/api/set_sync_upload_limit", post(sync::set_sync_upload_limit))
         .route(
             "/api/set_sync_max_concurrent_receives",
             post(sync::set_sync_max_concurrent_receives),
         )
-        .route(
-            "/api/get_sync_device_names",
-            post(sync::get_sync_device_names),
-        )
-        .route(
-            "/api/get_sync_device_capabilities",
-            post(sync::get_sync_device_capabilities),
-        )
+        .route("/api/get_sync_device_names", post(sync::get_sync_device_names))
+        .route("/api/get_sync_device_capabilities", post(sync::get_sync_device_capabilities))
         // Account (Stage II, task B4)
-        .route(
-            "/api/account_sign_in_start",
-            post(account::account_sign_in_start),
-        )
-        .route(
-            "/api/account_sign_in_verify",
-            post(account::account_sign_in_verify),
-        )
+        .route("/api/account_sign_in_start", post(account::account_sign_in_start))
+        .route("/api/account_sign_in_verify", post(account::account_sign_in_verify))
         .route("/api/account_status", post(account::account_status))
         .route("/api/account_sign_out", post(account::account_sign_out))
-        .route(
-            "/api/list_account_devices",
-            post(account::list_account_devices),
-        )
-        .route(
-            "/api/revoke_account_device",
-            post(account::revoke_account_device),
-        )
+        .route("/api/list_account_devices", post(account::list_account_devices))
+        .route("/api/revoke_account_device", post(account::revoke_account_device))
         .route("/api/rename_device", post(account::rename_device))
         // Collaboration projects (Stage II, slice 3)
-        .route(
-            "/api/list_collab_projects",
-            post(collab::list_collab_projects),
-        )
-        .route(
-            "/api/refresh_collab_projects",
-            post(collab::refresh_collab_projects),
-        )
-        .route(
-            "/api/get_collab_project_detail",
-            post(collab::get_collab_project_detail),
-        )
-        .route(
-            "/api/evaluate_collab_gate",
-            post(collab::evaluate_collab_gate),
-        )
-        .route(
-            "/api/list_collab_link_suggestions",
-            post(collab::list_collab_link_suggestions),
-        )
+        .route("/api/list_collab_projects", post(collab::list_collab_projects))
+        .route("/api/refresh_collab_projects", post(collab::refresh_collab_projects))
+        .route("/api/get_collab_project_detail", post(collab::get_collab_project_detail))
+        .route("/api/evaluate_collab_gate", post(collab::evaluate_collab_gate))
+        .route("/api/list_collab_link_suggestions", post(collab::list_collab_link_suggestions))
         .route("/api/set_collab_link", post(collab::set_collab_link))
-        .route(
-            "/api/create_collab_link_intent",
-            post(collab::create_collab_link_intent),
-        )
-        .route(
-            "/api/publish_collab_package",
-            post(collab::publish_collab_package),
-        )
-        .route(
-            "/api/refresh_collab_packages",
-            post(collab::refresh_collab_packages),
-        )
-        .route(
-            "/api/list_collab_packages",
-            post(collab::list_collab_packages),
-        )
-        .route(
-            "/api/download_collab_package",
-            post(collab::download_collab_package),
-        )
-        .route(
-            "/api/set_project_auto_replicate",
-            post(collab::set_project_auto_replicate),
-        )
+        .route("/api/create_collab_link_intent", post(collab::create_collab_link_intent))
+        .route("/api/publish_collab_package", post(collab::publish_collab_package))
+        .route("/api/refresh_collab_packages", post(collab::refresh_collab_packages))
+        .route("/api/list_collab_packages", post(collab::list_collab_packages))
+        .route("/api/download_collab_package", post(collab::download_collab_package))
+        .route("/api/set_project_auto_replicate", post(collab::set_project_auto_replicate))
         .route("/api/sync_project_now", post(collab::sync_project_now))
-        .route(
-            "/api/list_collab_contributions",
-            post(collab::list_collab_contributions),
-        )
-        .route(
-            "/api/list_collab_moderation",
-            post(collab::list_collab_moderation),
-        )
-        .route(
-            "/api/decide_collab_announcement",
-            post(collab::decide_collab_announcement),
-        )
-        .route(
-            "/api/export_collab_project",
-            post(collab::export_collab_project),
-        )
+        .route("/api/list_collab_contributions", post(collab::list_collab_contributions))
+        .route("/api/list_collab_moderation", post(collab::list_collab_moderation))
+        .route("/api/decide_collab_announcement", post(collab::decide_collab_announcement))
+        .route("/api/export_collab_project", post(collab::export_collab_project))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))
         .route("/api/get_database_path", post(get_database_path))
         // Category A — Desktop-only stubs
         .route("/api/check_for_updates", post(check_for_updates))
-        .route(
-            "/api/read_fits_image_rustafits",
-            post(read_fits_image_rustafits_stub),
-        )
+        .route("/api/read_fits_image_rustafits", post(read_fits_image_rustafits_stub))
         // Opt-in ATHENAEUM_API_KEY auth (routes/auth.rs). Layered BEFORE
         // `.with_state` below, on a self-contained key-holder state rather
         // than the full WebAppState — see auth.rs for why. Only wraps the

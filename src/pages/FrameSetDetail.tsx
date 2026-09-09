@@ -1,3 +1,5 @@
+import { ObjectFileLocations } from '../components/ObjectFileLocations';
+import { FileLocationActions } from '../components/FileLocationActions';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
@@ -20,11 +22,10 @@ import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { StackingPrepTab } from '../components/StackingPrepTab';
-import { revealItemInDir, openUrl } from '../api/desktop';
+import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
-import { isTauri } from '../utils/platform';
-import { Upload, FolderOpen } from 'lucide-react';
+import { Upload } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
 import type { ArchivedFrameSetSummary } from '../types/helpers';
 
@@ -694,6 +695,27 @@ export default function FrameSetDetail() {
             <HistoryNav fallback="/objects" className="pr-3 mr-1 border-r border-border" />
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
+              <ObjectFileLocations ids={[parseInt(id!)]} />
+              <details className="text-xs">
+                <summary className="cursor-pointer">Night / session locations</summary>
+                {detail.nights.map((night, nightIndex) => (
+                  <div key={nightIndex}>
+                    <FileLocationActions
+                      label={`Night ${night.imaging_night.start_time}`}
+                      paths={night.sessions.flatMap(session =>
+                        session.frames.map(({ file }) => file.archive_zip_path || file.path),
+                      )}
+                    />
+                    {night.sessions.map((session, sessionIndex) => (
+                      <FileLocationActions
+                        key={sessionIndex}
+                        label={`Session ${session.session.id ?? sessionIndex + 1} · ${session.session.instrume}`}
+                        paths={session.frames.map(({ file }) => file.archive_zip_path || file.path)}
+                      />
+                    ))}
+                  </div>
+                ))}
+              </details>
               {detail.frames_set?.archived_at && (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-warning/20 text-warning text-xs font-medium">
                   <ArchiveIcon size={12} />
@@ -750,33 +772,13 @@ export default function FrameSetDetail() {
                   <Upload size={14} />
                   Unarchive
                 </button>
-                {isTauri && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const opId = detail.frames_set?.archive_operation_id;
-                      if (!opId) {
-                        alert('No archive operation linked to this frame set.');
-                        return;
-                      }
-                      try {
-                        const zips = await listArchiveZips(opId);
-                        const target = zips.find(z => z.exists) ?? zips[0];
-                        if (!target) {
-                          alert('No zip files recorded for this archive operation.');
-                          return;
-                        }
-                        await revealItemInDir(target.path);
-                      } catch (e) {
-                        alert(`Failed to open file manager: ${e}`);
-                      }
-                    }}
-                    title="Reveal the archive zip(s) in the system file manager"
-                    className="flex items-center justify-center rounded-lg border border-border bg-surface-hover p-1.5 text-content-muted hover:text-content hover:brightness-110"
-                  >
-                    <FolderOpen size={14} />
-                  </button>
-                )}
+                <FileLocationActions
+                  label="Archive ZIP locations"
+                  loadPaths={async () => {
+                    const opId = detail.frames_set?.archive_operation_id;
+                    return opId ? (await listArchiveZips(opId)).map(zip => zip.path) : [];
+                  }}
+                />
               </>
             ) : detail.frames_set?.is_archived ? (
               <button

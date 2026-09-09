@@ -1,3 +1,4 @@
+import { ObjectFileLocations } from '../components/ObjectFileLocations';
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
@@ -1108,6 +1109,7 @@ export default function Objects() {
                   : `border-border ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`
               } ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''} ${isDragging ? 'select-none' : ''}`}
             >
+              <ObjectFileLocations ids={[frames_set.id!]} compact />
               {/* Name row */}
               <div className="flex-1 min-w-0 mb-1.5">
                 {editingSetId === frames_set.id ? (

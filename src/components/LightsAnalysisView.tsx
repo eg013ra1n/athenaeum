@@ -1,3 +1,4 @@
+import { FileLocationActions } from './FileLocationActions';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
 import { api } from '../api';
@@ -153,16 +154,23 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
 
   // Select based on viewMode
   const framesByKey = viewMode === 'by-night' ? dateTree.framesByKey : mergedTree.framesByKey;
+  const locationPathsByKey = useMemo(
+    () =>
+      hideLocateColumn
+        ? undefined
+        : new Map([...framesByKey].map(([key, frames]) => [key, frames.map(f => f.file_path)])),
+    [framesByKey, hideLocateColumn],
+  );
   const allFramesRaw = viewMode === 'by-night' ? dateTree.allFrames : mergedTree.allFrames;
 
   // Split into active and blackholed frames
   const allFrames = useMemo(
     () => allFramesRaw.filter(f => !blackholedFileIds.has(f.file_id)),
-    [allFramesRaw, blackholedFileIds]
+    [allFramesRaw, blackholedFileIds],
   );
   const blackholedFrames = useMemo(
     () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
-    [allFramesRaw, blackholedFileIds]
+    [allFramesRaw, blackholedFileIds],
   );
 
   // Compute stacked SNR per filter group: convert dB→linear, sqrt(sum(linear²)), back to dB
@@ -631,40 +639,51 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
             </button>
           </div>
 
+          {!hideLocateColumn && (
+            <FileLocationActions
+              label={hasSelection ? 'Selected frame locations' : 'Displayed frame locations'}
+              paths={displayedFrames
+                .filter(f => !hasSelection || selectedFrameIds.has(f.frame_id))
+                .map(f => f.file_path)}
+            />
+          )}
           {/* Tree */}
           {(() => {
-            const treeFooter = checkedKeys.size > 0 && (onSplit || onCreateCustomSet) ? (
-              <>
-                <div className="flex items-center gap-2 flex-wrap">
-                  {onSplit && (
-                    <button
-                      onClick={handleSplit}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                    >
-                      <Scissors size={14} aria-hidden="true" />
-                      Split
-                    </button>
-                  )}
-                  {onCreateCustomSet && (
-                    <button
-                      onClick={handleCreateCustomSet}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-success"
-                    >
-                      <Plus size={14} aria-hidden="true" />
-                      Create Set
-                    </button>
-                  )}
-                </div>
-              </>
-            ) : undefined;
+            const treeFooter =
+              checkedKeys.size > 0 && (onSplit || onCreateCustomSet) ? (
+                <>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {onSplit && (
+                      <button
+                        onClick={handleSplit}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                      >
+                        <Scissors size={14} aria-hidden="true" />
+                        Split
+                      </button>
+                    )}
+                    {onCreateCustomSet && (
+                      <button
+                        onClick={handleCreateCustomSet}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-success"
+                      >
+                        <Plus size={14} aria-hidden="true" />
+                        Create Set
+                      </button>
+                    )}
+                  </div>
+                </>
+              ) : undefined;
 
-            const label = checkedKeys.size > 0
-              ? `${checkedKeys.size} group${checkedKeys.size !== 1 ? 's' : ''} · ${checkedFrameCount} frame${checkedFrameCount !== 1 ? 's' : ''}`
-              : undefined;
+            const label =
+              checkedKeys.size > 0
+                ? `${checkedKeys.size} group${checkedKeys.size !== 1 ? 's' : ''} · ${checkedFrameCount} frame${checkedFrameCount !== 1 ? 's' : ''}`
+                : undefined;
 
             return viewMode === 'by-night' ? (
               <CameraFilterTree
                 nodes={dateTree.nodes}
+                locationPathsByKey={locationPathsByKey}
                 checkedKeys={checkedKeys}
                 onCheckedChange={handleCheckedChange}
                 className="flex-1 min-h-0"
@@ -675,6 +694,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
             ) : (
               <MergedCameraFilterTree
                 nodes={mergedTree.nodes}
+                locationPathsByKey={locationPathsByKey}
                 checkedKeys={checkedKeys}
                 onCheckedChange={handleCheckedChange}
                 className="flex-1 min-h-0"

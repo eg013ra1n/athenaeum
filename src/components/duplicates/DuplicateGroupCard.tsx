@@ -1,3 +1,4 @@
+import { FileLocationActions } from '../FileLocationActions';
 import React from 'react';
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Circle, Loader2, Sparkles, Trash2 } from 'lucide-react';
 import type { DuplicateFile, DuplicateGroup } from '../../types/models';
@@ -345,6 +346,7 @@ export const DuplicateGroupCard: React.FC<DuplicateGroupCardProps> = ({
                     {willDelete ? <Trash2 size={13} /> : 'Keep'}
                   </span>
                 )}
+                <FileLocationActions compact paths={[file.path]} />
                 <span
                   className={`flex-1 min-w-0 font-mono text-xs truncate ${willDelete ? 'line-through text-content-muted' : ''}`}
                   title={file.path}

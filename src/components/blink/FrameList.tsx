@@ -1,3 +1,4 @@
+import { FileLocationActions } from '../FileLocationActions';
 import React, { memo, useMemo } from "react";
 import {
   Loader2,
@@ -115,6 +116,12 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
 
   return (
     <div className="bg-surface flex flex-col h-full">
+      <FileLocationActions
+        label={selectedFrames.size ? 'Selected frame locations' : 'Blink file locations'}
+        paths={frames
+          .filter((_, index) => !selectedFrames.size || selectedFrames.has(index))
+          .map(({ file }) => file.archive_zip_path || file.path)}
+      />
       {/* Header: selection split button + sort controls */}
       <div className="px-2 py-1.5 border-b border-border flex items-center gap-2">
         {/* Selection split button: [Select All | Count/Unselect | Invert] */}
@@ -148,111 +155,170 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
 
         {/* Sort labels */}
         <div className="flex items-center gap-1 flex-wrap">
-          <SortLabel field="time" label="Time" current={sortField} direction={sortDirection} onClick={onSortChange} />
-          {hasMultipleFilters && <SortLabel field="filter" label="Filter" current={sortField} direction={sortDirection} onClick={onSortChange} />}
-          {hasMultipleExptimes && <SortLabel field="exptime" label="Exp" current={sortField} direction={sortDirection} onClick={onSortChange} />}
-          {hasAnyAnalysis && <>
-            <SortLabel field="fwhm" label="FWHM" current={sortField} direction={sortDirection} onClick={onSortChange} />
-            <SortLabel field="eccentricity" label="Ecc" current={sortField} direction={sortDirection} onClick={onSortChange} />
-            <SortLabel field="frame_snr" label="SNR" current={sortField} direction={sortDirection} onClick={onSortChange} />
-          </>}
+          <SortLabel
+            field="time"
+            label="Time"
+            current={sortField}
+            direction={sortDirection}
+            onClick={onSortChange}
+          />
+          {hasMultipleFilters && (
+            <SortLabel
+              field="filter"
+              label="Filter"
+              current={sortField}
+              direction={sortDirection}
+              onClick={onSortChange}
+            />
+          )}
+          {hasMultipleExptimes && (
+            <SortLabel
+              field="exptime"
+              label="Exp"
+              current={sortField}
+              direction={sortDirection}
+              onClick={onSortChange}
+            />
+          )}
+          {hasAnyAnalysis && (
+            <>
+              <SortLabel
+                field="fwhm"
+                label="FWHM"
+                current={sortField}
+                direction={sortDirection}
+                onClick={onSortChange}
+              />
+              <SortLabel
+                field="eccentricity"
+                label="Ecc"
+                current={sortField}
+                direction={sortDirection}
+                onClick={onSortChange}
+              />
+              <SortLabel
+                field="frame_snr"
+                label="SNR"
+                current={sortField}
+                direction={sortDirection}
+                onClick={onSortChange}
+              />
+            </>
+          )}
         </div>
       </div>
 
       {/* Scrollable frame list */}
       <div className="flex-1 overflow-y-auto select-none">
-        {sortedIndices.map((index) => {
-            const frame = frames[index];
-            const isSelected = selectedFrames.has(index);
-            const isCurrent = index === currentIndex;
-            const isBlackholed = frame.file.id ? blackholedFileIds.has(frame.file.id) : false;
-            const analysis = frame.frame?.id ? analysisMap.get(frame.frame.id) : undefined;
+        {sortedIndices.map(index => {
+          const frame = frames[index];
+          const isSelected = selectedFrames.has(index);
+          const isCurrent = index === currentIndex;
+          const isBlackholed = frame.file.id ? blackholedFileIds.has(frame.file.id) : false;
+          const analysis = frame.frame?.id ? analysisMap.get(frame.frame.id) : undefined;
 
-            // Two independent visual channels so the three states never hide
-            // each other:
-            //   • Background tint encodes *status* — selected (warning) takes
-            //     precedence over blackholed (error), then a faint accent wash
-            //     for a plain current row, then the default.
-            //   • "Current" (the frame on the canvas) adds an inset accent ring
-            //     ON TOP of whatever tint is in effect, so the displayed frame
-            //     is always identifiable — including when it's deleted/selected.
-            let rowClasses = "px-2 py-2 text-xs cursor-pointer transition-colors border-b border-border/40 last:border-b-0";
-            if (isSelected) {
-              rowClasses += " bg-warning/10 text-warning";
-            } else if (isBlackholed) {
-              rowClasses += " bg-error/5 text-content-muted";
-            } else if (isCurrent) {
-              rowClasses += " bg-accent/10 text-content";
-            } else {
-              rowClasses += " bg-surface-elevated text-content-secondary hover:bg-surface-hover";
-            }
-            if (isCurrent) {
-              rowClasses += " ring-2 ring-inset ring-accent";
-            }
+          // Two independent visual channels so the three states never hide
+          // each other:
+          //   • Background tint encodes *status* — selected (warning) takes
+          //     precedence over blackholed (error), then a faint accent wash
+          //     for a plain current row, then the default.
+          //   • "Current" (the frame on the canvas) adds an inset accent ring
+          //     ON TOP of whatever tint is in effect, so the displayed frame
+          //     is always identifiable — including when it's deleted/selected.
+          let rowClasses =
+            'px-2 py-2 text-xs cursor-pointer transition-colors border-b border-border/40 last:border-b-0';
+          if (isSelected) {
+            rowClasses += ' bg-warning/10 text-warning';
+          } else if (isBlackholed) {
+            rowClasses += ' bg-error/5 text-content-muted';
+          } else if (isCurrent) {
+            rowClasses += ' bg-accent/10 text-content';
+          } else {
+            rowClasses += ' bg-surface-elevated text-content-secondary hover:bg-surface-hover';
+          }
+          if (isCurrent) {
+            rowClasses += ' ring-2 ring-inset ring-accent';
+          }
 
-            return (
-              <div
-                key={frame.file.id ?? index}
-                onClick={(e) => onFrameClick(index, e)}
-                className={rowClasses}
-                title={frame.file.filename}
-              >
-                <div className="flex items-center gap-1.5 min-h-[18px]">
-                  {isBlackholed ? (
-                    <button onClick={(e) => onCheckboxClick(index, e)} className="flex-shrink-0 p-0.5 -ml-0.5">
-                      {isSelected ? <CheckSquare size={13} /> : <Trash2 size={13} />}
-                    </button>
-                  ) : (
-                    <button onClick={(e) => onCheckboxClick(index, e)} className="flex-shrink-0 p-0.5 -ml-0.5">
-                      {isSelected ? <CheckSquare size={13} /> : <Square size={13} />}
-                    </button>
-                  )}
-                  <span className="font-mono">{formatTime(frame.frame?.date_obs)}</span>
-                  {hasMultipleFilters && frame.frame?.filter && (
-                    <span className="font-bold text-content-secondary">{frame.frame.filter}</span>
-                  )}
-                  {hasMultipleExptimes && frame.frame?.exptime != null && (
-                    <span className="font-bold text-content-secondary">{frame.frame.exptime}s</span>
-                  )}
-                  {hasAnyAnalysis && analysis && (
-                    <>
-                      <span className={`font-bold ${fwhmColor(analysis.median_fwhm)}`}>{analysis.median_fwhm.toFixed(2)}px</span>
-                      <span className={`font-bold ${eccColor(analysis.median_eccentricity)}`}>{analysis.median_eccentricity.toFixed(2)}</span>
-                      <span className="font-bold text-content-muted">{analysis.frame_snr.toFixed(1)}dB</span>
-                    </>
-                  )}
-                  {loadingIndices.has(index) && (
-                    <Loader2 className="animate-spin flex-shrink-0 ml-auto" size={11} />
-                  )}
+          return (
+            <div
+              key={frame.file.id ?? index}
+              onClick={e => onFrameClick(index, e)}
+              className={rowClasses}
+              title={frame.file.filename}
+            >
+              <div className="flex items-center gap-1.5 min-h-[18px]">
+                {isBlackholed ? (
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      navigate('/files', {
-                        state: { reveal: { path: frame.file.path, token: Date.now() } },
-                      });
-                    }}
-                    className="ml-auto p-1 rounded transition-colors flex-shrink-0 text-content-muted hover:text-content hover:bg-surface-hover"
-                    title="Locate in file browser"
+                    onClick={e => onCheckboxClick(index, e)}
+                    className="flex-shrink-0 p-0.5 -ml-0.5"
                   >
-                    <FolderOpen size={12} />
+                    {isSelected ? <CheckSquare size={13} /> : <Trash2 size={13} />}
                   </button>
-                </div>
+                ) : (
+                  <button
+                    onClick={e => onCheckboxClick(index, e)}
+                    className="flex-shrink-0 p-0.5 -ml-0.5"
+                  >
+                    {isSelected ? <CheckSquare size={13} /> : <Square size={13} />}
+                  </button>
+                )}
+                <span className="font-mono">{formatTime(frame.frame?.date_obs)}</span>
+                {hasMultipleFilters && frame.frame?.filter && (
+                  <span className="font-bold text-content-secondary">{frame.frame.filter}</span>
+                )}
+                {hasMultipleExptimes && frame.frame?.exptime != null && (
+                  <span className="font-bold text-content-secondary">{frame.frame.exptime}s</span>
+                )}
+                {hasAnyAnalysis && analysis && (
+                  <>
+                    <span className={`font-bold ${fwhmColor(analysis.median_fwhm)}`}>
+                      {analysis.median_fwhm.toFixed(2)}px
+                    </span>
+                    <span className={`font-bold ${eccColor(analysis.median_eccentricity)}`}>
+                      {analysis.median_eccentricity.toFixed(2)}
+                    </span>
+                    <span className="font-bold text-content-muted">
+                      {analysis.frame_snr.toFixed(1)}dB
+                    </span>
+                  </>
+                )}
+                {loadingIndices.has(index) && (
+                  <Loader2 className="animate-spin flex-shrink-0 ml-auto" size={11} />
+                )}
+                <FileLocationActions
+                  compact
+                  paths={[frame.file.archive_zip_path || frame.file.path]}
+                />
+                <button
+                  onClick={e => {
+                    e.stopPropagation();
+                    navigate('/files', {
+                      state: { reveal: { path: frame.file.path, token: Date.now() } },
+                    });
+                  }}
+                  className="ml-auto p-1 rounded transition-colors flex-shrink-0 text-content-muted hover:text-content hover:bg-surface-hover"
+                  title="Locate in file browser"
+                >
+                  <FolderOpen size={12} />
+                </button>
               </div>
-            );
-          })}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 });
 
 function fwhmColor(fwhm: number): string {
-  if (fwhm <= 2.5) return "text-success/80";
-  if (fwhm <= 4.0) return "text-warning/80";
-  return "text-error/80";
+  if (fwhm <= 2.5) return 'text-success/80';
+  if (fwhm <= 4.0) return 'text-warning/80';
+  return 'text-error/80';
 }
 
 function eccColor(ecc: number): string {
-  if (ecc <= 0.5) return "text-success/80";
-  if (ecc <= 0.7) return "text-warning/80";
-  return "text-error/80";
+  if (ecc <= 0.5) return 'text-success/80';
+  if (ecc <= 0.7) return 'text-warning/80';
+  return 'text-error/80';
 }

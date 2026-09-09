@@ -1,7 +1,15 @@
 import { useEffect, useState } from 'react';
-import { RefreshCw, ExternalLink, AlertTriangle, AlertCircle, ChevronDown, ChevronRight, Loader2, CheckCircle2, Info } from 'lucide-react';
-import { revealItemInDir } from '../../api/desktop';
-import { isTauri } from '../../utils/platform';
+import {
+  RefreshCw,
+  AlertTriangle,
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  CheckCircle2,
+  Info,
+} from 'lucide-react';
+import { FileLocationActions } from '../FileLocationActions';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { MissingFilesDisclosure } from './MissingFilesDisclosure';
 import { SwitchRow } from './SwitchRow';
@@ -77,10 +85,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
           </div>
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate" title={root.path}>{root.path}</span>
-            {isTauri && !offline && (
-              <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[MonitoredInspector] reveal failed:', e))}
-                title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
-            )}
+            <FileLocationActions compact directories paths={[root.path]} />
           </div>
         </div>
         {!offline && (
@@ -165,32 +170,37 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
         <Section title="Needs attention">
           <div className="space-y-2">
             {showMissing && root.id != null && (
-              <MissingFilesDisclosure rootId={root.id} missingCount={missingCount} onMissingChanged={props.onMissingChanged} />
+              <MissingFilesDisclosure
+                rootId={root.id}
+                missingCount={missingCount}
+                onMissingChanged={props.onMissingChanged}
+              />
             )}
             {displayErrors.length > 0 && (
               <div className="rounded-lg border border-error/30 bg-surface">
-                <button onClick={() => setErrorsOpen((v) => !v)}
-                  aria-expanded={errorsOpen} aria-controls={`scan-errors-panel-${root.id ?? 'unsaved'}`}
-                  className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-error hover:bg-error-muted rounded-lg transition">
+                <button
+                  onClick={() => setErrorsOpen(v => !v)}
+                  aria-expanded={errorsOpen}
+                  aria-controls={`scan-errors-panel-${root.id ?? 'unsaved'}`}
+                  className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-error hover:bg-error-muted rounded-lg transition"
+                >
                   {errorsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                  <AlertCircle size={14} /> {displayErrors.length} file{displayErrors.length !== 1 ? 's' : ''} failed in last scan
+                  <AlertCircle size={14} /> {displayErrors.length} file
+                  {displayErrors.length !== 1 ? 's' : ''} failed in last scan
                 </button>
                 {errorsOpen && (
-                  <div id={`scan-errors-panel-${root.id ?? 'unsaved'}`} className="px-3 py-2 max-h-40 overflow-y-auto space-y-1">
+                  <div
+                    id={`scan-errors-panel-${root.id ?? 'unsaved'}`}
+                    className="px-3 py-2 max-h-40 overflow-y-auto space-y-1"
+                  >
                     {displayErrors.map((err, i) => {
                       const errPath = pathFromScanError(err);
                       return (
                         <div key={i} className="flex items-start gap-1.5">
-                          <p className="flex-1 min-w-0 text-xs text-error/80 font-mono break-all">{err}</p>
-                          {isTauri && !offline && errPath && (
-                            <button
-                              onClick={() => revealItemInDir(errPath).catch((e) => console.error('[MonitoredInspector] reveal failed:', e))}
-                              title="Reveal in file manager" aria-label="Reveal in file manager"
-                              className="shrink-0 mt-0.5 p-0.5 rounded text-content-muted hover:text-accent transition"
-                            >
-                              <ExternalLink size={12} />
-                            </button>
-                          )}
+                          <p className="flex-1 min-w-0 text-xs text-error/80 font-mono break-all">
+                            {err}
+                          </p>
+                          {errPath && <FileLocationActions compact paths={[errPath]} />}
                         </div>
                       );
                     })}

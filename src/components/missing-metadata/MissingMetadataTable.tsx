@@ -1,3 +1,4 @@
+import { FileLocationActions } from '../FileLocationActions';
 import React, { useMemo, useState } from 'react';
 import { CheckCircle2, ChevronDown, ChevronRight, Loader2, Pencil } from 'lucide-react';
 import type { Frame, MissingMetadataRow } from '../../types/models';
@@ -310,91 +311,101 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                     </span>
                   </td>
                 </tr>
-                {!isCollapsed && group.rows.map((item, idx) => {
-                  const frameId = item.frame.id ?? null;
-                  const isSelected = frameId != null && selectedIds.has(frameId);
-                  const flags = computeMissingFlags(item.frame);
-                  const missingKeys = (Object.keys(flags) as (keyof MissingFlags)[]).filter(k => flags[k]);
+                {!isCollapsed &&
+                  group.rows.map((item, idx) => {
+                    const frameId = item.frame.id ?? null;
+                    const isSelected = frameId != null && selectedIds.has(frameId);
+                    const flags = computeMissingFlags(item.frame);
+                    const missingKeys = (Object.keys(flags) as (keyof MissingFlags)[]).filter(
+                      k => flags[k],
+                    );
 
-                  return (
-                    <tr
-                      key={item.file.id ?? `${group.folder}/${idx}`}
-                      className={`${
-                        idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'
-                      } hover:bg-surface-hover transition-colors`}
-                    >
-                      <td className="w-10 px-1.5 py-1 text-center">
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          disabled={frameId == null}
-                          onChange={() => { if (frameId != null) onToggleRow(frameId); }}
-                          className="rounded border-border text-accent focus:ring-accent cursor-pointer disabled:cursor-default disabled:opacity-30"
-                        />
-                      </td>
-                      {/* Filename — when an extra column is present the
+                    return (
+                      <tr
+                        key={item.file.id ?? `${group.folder}/${idx}`}
+                        className={`${
+                          idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'
+                        } hover:bg-surface-hover transition-colors`}
+                      >
+                        <td className="w-10 px-1.5 py-1 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            disabled={frameId == null}
+                            onChange={() => {
+                              if (frameId != null) onToggleRow(frameId);
+                            }}
+                            className="rounded border-border text-accent focus:ring-accent cursor-pointer disabled:cursor-default disabled:opacity-30"
+                          />
+                        </td>
+                        {/* Filename — when an extra column is present the
                           File column is constrained, so we truncate with an
                           ellipsis and rely on the existing `title` attribute
                           for hover-to-see-full. Without an extra column the
                           column auto-sizes and the filename never wraps. */}
-                      <td className={`px-1.5 py-1 ${extraColumn ? 'overflow-hidden' : ''}`}>
-                        <span className="flex items-center gap-1.5 min-w-0">
-                          {onRevealInBrowser ? (
-                            <button
-                              type="button"
-                              onClick={() => onRevealInBrowser(item.file.path)}
-                              title={`Open in file browser — ${item.file.filename}`}
-                              className={`text-sm text-accent hover:underline font-mono text-left min-w-0 ${
-                                extraColumn ? 'truncate' : 'whitespace-nowrap'
-                              }`}
-                            >
-                              {item.file.filename}
-                            </button>
-                          ) : (
-                            <span
-                              className={`text-sm text-content-secondary font-mono min-w-0 ${
-                                extraColumn ? 'truncate' : 'whitespace-nowrap'
-                              }`}
-                              title={item.file.filename}
-                            >
-                              {item.file.filename}
-                            </span>
-                          )}
-                          {item.frame.override_ === true && (
-                            <Pencil
-                              size={11}
-                              className="flex-shrink-0 text-amber-400"
-                              aria-label="Custom metadata applied"
-                            >
-                              <title>Custom metadata applied — open metadata pane (⌘I) to compare with original</title>
-                            </Pencil>
-                          )}
-                        </span>
-                      </td>
-                      <td className="px-1.5 py-1">
-                        <div className="flex flex-wrap gap-1">
-                          {missingKeys.map(key => (
-                            <MissingTag
-                              key={key}
-                              label={TAG_LABELS[key]}
-                              colorClass={TAG_STYLES[key]}
+                        <td className={`px-1.5 py-1 ${extraColumn ? 'overflow-hidden' : ''}`}>
+                          <span className="flex items-center gap-1.5 min-w-0">
+                            <FileLocationActions
+                              compact
+                              paths={[item.file.archive_zip_path || item.file.path]}
                             />
-                          ))}
-                        </div>
-                      </td>
-                      <td className="px-1.5 py-1">
-                        <span className="text-sm text-content-secondary font-mono">
-                          {item.frame.imagetyp ?? (
-                            <span className="text-content-muted italic">—</span>
-                          )}
-                        </span>
-                      </td>
-                      {extraColumn && (
-                        <td className="px-1.5 py-1">{extraColumn.render(item)}</td>
-                      )}
-                    </tr>
-                  );
-                })}
+                            {onRevealInBrowser ? (
+                              <button
+                                type="button"
+                                onClick={() => onRevealInBrowser(item.file.path)}
+                                title={`Open in file browser — ${item.file.filename}`}
+                                className={`text-sm text-accent hover:underline font-mono text-left min-w-0 ${
+                                  extraColumn ? 'truncate' : 'whitespace-nowrap'
+                                }`}
+                              >
+                                {item.file.filename}
+                              </button>
+                            ) : (
+                              <span
+                                className={`text-sm text-content-secondary font-mono min-w-0 ${
+                                  extraColumn ? 'truncate' : 'whitespace-nowrap'
+                                }`}
+                                title={item.file.filename}
+                              >
+                                {item.file.filename}
+                              </span>
+                            )}
+                            {item.frame.override_ === true && (
+                              <Pencil
+                                size={11}
+                                className="flex-shrink-0 text-amber-400"
+                                aria-label="Custom metadata applied"
+                              >
+                                <title>
+                                  Custom metadata applied — open metadata pane (⌘I) to compare with
+                                  original
+                                </title>
+                              </Pencil>
+                            )}
+                          </span>
+                        </td>
+                        <td className="px-1.5 py-1">
+                          <div className="flex flex-wrap gap-1">
+                            {missingKeys.map(key => (
+                              <MissingTag
+                                key={key}
+                                label={TAG_LABELS[key]}
+                                colorClass={TAG_STYLES[key]}
+                              />
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-1.5 py-1">
+                          <span className="text-sm text-content-secondary font-mono">
+                            {item.frame.imagetyp ?? (
+                              <span className="text-content-muted italic">—</span>
+                            )}
+                          </span>
+                        </td>
+                        {extraColumn && <td className="px-1.5 py-1">{extraColumn.render(item)}</td>}
+                      </tr>
+                    );
+                  })}
               </React.Fragment>
             );
           })}
