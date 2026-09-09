@@ -150,6 +150,25 @@ per-frame `delta_RMS`. Results go to
   homography absorbs part of a radial term), and the new `fit_joint` test
   bounds the inverse at 1e-2 px (0.0044 measured: the inverse polynomial
   has no linear terms and the inverse of a cubic is not a cubic).
+- **Task 8 — Checkpoint A follow-ups.** The batch over ten real subjects
+  (RMS 0.10–0.24 px, every frame below the external stacker's own
+  residual) exposed that an order-3 polynomial fitted on the 15 %-overlap
+  corner of one OSC subject extrapolated 178.8 px at the far corners, so
+  (1) `Distortion` records the normalized box it was fitted over (inlier
+  bounding box, 10 % margin per side) and clamps evaluation into it —
+  `PixelMap` forward/inverse go through `forward_displacement` /
+  `inverse_displacement`; a `transform_json` without `domain` stays valid
+  and unbounded — and (2) `distortion: auto` additionally requires the
+  RANSAC overlap index ≥ 0.6 (`AUTO_DISTORTION_MIN_OVERLAP`, a warning
+  names the skip). (3) Corner deltas against the sidecar measure
+  extrapolation and the ±0.5 origin convention under 180° rotations, so the
+  probe reports `starDeltaPx` (median/p95/max over reference stars both
+  maps place inside the subject) as the Checkpoint A metric. (4) The probe's
+  `--compare` normalizes an ADU-scale comparison image by 65535, fills the
+  warp buffer with 0 and matches under the same row order only; any
+  sidecar/write/compare error exits 1. (5) `ROWORDER` copies through to
+  registered frames (orientation, not CFA). (6) The example no longer names
+  the external stacker.
 
 ## Carry-forwards from Plan 2's final review (for this plan's author and the next ones)
 

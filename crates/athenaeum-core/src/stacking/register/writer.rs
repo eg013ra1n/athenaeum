@@ -18,11 +18,13 @@ use crate::resample::{warp_rows, Interpolation, Plane};
 
 /// Source cards a registered frame keeps: acquisition and target metadata
 /// only. The pixel grid is the reference's, so the subject's WCS is wrong
-/// for it, and the frame is resampled, so it has no CFA.
+/// for it, and the frame is resampled, so it has no CFA. `ROWORDER` stays:
+/// it is orientation, not CFA, and a registered frame from a `TOP-DOWN`
+/// subject would otherwise render flipped.
 pub const REGISTERED_COPY_THROUGH: &[&str] = &[
     "EXPTIME", "GAIN", "OFFSET", "EGAIN", "XBINNING", "YBINNING", "XPIXSZ", "YPIXSZ", "CCD-TEMP",
     "SET-TEMP", "INSTRUME", "TELESCOP", "FOCALLEN", "APTDIA", "FILTER", "DATE-OBS", "OBJECT",
-    "OBJCTRA", "OBJCTDEC", "RA", "DEC", "SITELAT", "SITELONG", "SITEELEV", "OBSERVER",
+    "OBJCTRA", "OBJCTDEC", "RA", "DEC", "SITELAT", "SITELONG", "SITEELEV", "OBSERVER", "ROWORDER",
 ];
 
 pub const ATH_REG_VERSION: i64 = 1;
@@ -160,6 +162,7 @@ mod tests {
             Card::new("CRVAL1", CardValue::Real(12.5)).unwrap(),
             Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
             Card::new("DATE-OBS", CardValue::Str("2026-09-09T00:00:00".into())).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
         ];
         write_fits_f32(&subject, w, h, 1, &data, &src_cards).unwrap();
         let map = PixelMap::linear(Linear::from_flat(
@@ -169,7 +172,12 @@ mod tests {
         .unwrap();
         let source = source_cards_from_file(&subject).unwrap();
         let kws: Vec<&str> = source.iter().map(|c| c.keyword.as_str()).collect();
-        assert!(kws.contains(&"EXPTIME") && kws.contains(&"INSTRUME") && kws.contains(&"DATE-OBS"));
+        assert!(
+            kws.contains(&"EXPTIME")
+                && kws.contains(&"INSTRUME")
+                && kws.contains(&"DATE-OBS")
+                && kws.contains(&"ROWORDER")
+        );
         assert!(
             !kws.contains(&"CRVAL1") && !kws.contains(&"BAYERPAT"),
             "{kws:?}"
@@ -224,6 +232,7 @@ mod tests {
         let back = PixelMap::from_json(&header.get_str("ATH_REGT").unwrap()).unwrap();
         assert_eq!(back.forward(1.0, 2.0), (11.0, -3.0));
         assert_eq!(header.get_f64("EXPTIME"), Some(180.0));
+        assert_eq!(header.get_str("ROWORDER").as_deref(), Some("TOP-DOWN"));
         assert!(header.get_str("CRVAL1").is_none() && header.get_str("BAYERPAT").is_none());
     }
 

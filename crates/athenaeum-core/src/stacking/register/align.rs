@@ -27,6 +27,10 @@ pub const AUTO_HOMOGRAPHY_MIN: usize = 30;
 pub const AUTO_AFFINE_MIN: usize = 12;
 /// `distortion: auto` needs this many refit inliers (spec §3.3).
 pub const AUTO_DISTORTION_MIN_INLIERS: usize = 200;
+/// `distortion: auto` also requires the inliers' convex hull to cover this
+/// fraction of the pair hull (the RANSAC overlap index): on a 15 %-overlap
+/// subject a cubic fitted on one corner extrapolated 180 px at the others.
+pub const AUTO_DISTORTION_MIN_OVERLAP: f64 = 0.6;
 /// Refit clipping (spec §3.2 step 4).
 pub const CLIP_SIGMA: f64 = 3.0;
 /// Joint fits: the second round's affine correction is ≈ identity and
@@ -117,6 +121,15 @@ pub fn resolve_model(choice: ModelChoice, n: usize) -> LinearKind {
             }
         }
     }
+}
+
+/// The order `distortion: auto` resolves to: 3 for a cross-geometry subject
+/// with enough, well-spread inliers; `None` keeps the linear model.
+pub fn auto_distortion_order(cross_geometry: bool, inliers: usize, overlap: f64) -> Option<u8> {
+    (cross_geometry
+        && inliers >= AUTO_DISTORTION_MIN_INLIERS
+        && overlap >= AUTO_DISTORTION_MIN_OVERLAP)
+        .then_some(3)
 }
 
 /// `registration_results.model`: the linear kind's serde name, plus
@@ -291,7 +304,18 @@ pub fn align(
     let cross_geometry = subject_geometry != reference_geometry;
     let wanted = match cfg.distortion {
         DistortionChoice::Auto => {
-            (cross_geometry && refit.inliers.len() >= AUTO_DISTORTION_MIN_INLIERS).then_some(3u8)
+            let order =
+                auto_distortion_order(cross_geometry, refit.inliers.len(), ransac.quality.overlap);
+            if order.is_none()
+                && cross_geometry
+                && refit.inliers.len() >= AUTO_DISTORTION_MIN_INLIERS
+            {
+                warnings.push(format!(
+                    "auto distortion skipped: overlap {:.3} below {AUTO_DISTORTION_MIN_OVERLAP}; linear model kept",
+                    ransac.quality.overlap
+                ));
+            }
+            order
         }
         other => other.order(),
     };
@@ -675,6 +699,31 @@ mod tests {
                 .distortion_order,
             Some(3),
             "cross geometry with ≥ 200 inliers: auto fits order 3"
+        );
+    }
+
+    #[test]
+    fn auto_distortion_needs_cross_geometry_enough_inliers_and_overlap() {
+        assert_eq!(auto_distortion_order(true, 200, 0.6), Some(3));
+        assert_eq!(
+            auto_distortion_order(false, 500, 1.0),
+            None,
+            "same geometry"
+        );
+        assert_eq!(
+            auto_distortion_order(true, 199, 1.0),
+            None,
+            "too few inliers"
+        );
+        assert_eq!(
+            auto_distortion_order(true, 500, 0.59),
+            None,
+            "inliers on one side"
+        );
+        assert_eq!(
+            auto_distortion_order(true, 500, f64::NAN),
+            None,
+            "no quality"
         );
     }
 }

@@ -56,8 +56,7 @@ impl PixelMap {
         match &self.distortion {
             None => (px, py),
             Some(d) => {
-                let (u, v) = d.norm(px, py);
-                let (dx, dy) = d.forward.eval(u, v);
+                let (dx, dy) = d.forward_displacement(px, py);
                 (px + dx, py + dy)
             }
         }
@@ -69,8 +68,7 @@ impl PixelMap {
         let (rx, ry) = match &self.distortion {
             None => (x, y),
             Some(d) => {
-                let (u, v) = d.norm(x, y);
-                let (dx, dy) = d.inverse.eval(u, v);
+                let (dx, dy) = d.inverse_displacement(x, y);
                 (x + dx, y + dy)
             }
         };
@@ -90,7 +88,7 @@ impl PixelMap {
         if let Some(d) = &map.distortion {
             if !d.is_well_formed() {
                 return Err(<serde_json::Error as serde::de::Error>::custom(
-                    "malformed distortion: order must be 2..=4 with one finite coefficient per term and a positive finite scale",
+                    "malformed distortion: order must be 2..=4 with one finite coefficient per term, a positive finite scale and an ordered finite domain",
                 ));
             }
         }
@@ -175,6 +173,7 @@ mod tests {
             order: 2,
             center: (10.0, 20.0),
             scale: 100.0,
+            domain: Some([-1.0, -1.0, 1.0, 1.0]),
             forward: Polynomial2D {
                 order: 2,
                 ax: vec![0.1, 0.2, 0.3],
@@ -217,5 +216,28 @@ mod tests {
         assert_ne!(good, corrupted, "the splice must have matched");
         let back = PixelMap::from_json(&corrupted).unwrap();
         assert_eq!(back.linear_inv, linear.inverse().unwrap());
+    }
+
+    #[test]
+    fn distortion_json_without_a_domain_is_unbounded_and_an_inverted_domain_is_rejected() {
+        let l = Linear::identity();
+        let good = PixelMap::linear(l).unwrap().to_json();
+        // A transform_json written before the domain field existed.
+        let old = good.replace(
+            "\"distortion\":null",
+            "\"distortion\":{\"order\":2,\"center\":[0.0,0.0],\"scale\":1.0,\
+             \"forward\":{\"order\":2,\"ax\":[0.0,0.0,0.0],\"ay\":[0.0,0.0,0.0]},\
+             \"inverse\":{\"order\":2,\"ax\":[0.0,0.0,0.0],\"ay\":[0.0,0.0,0.0]}}",
+        );
+        assert_ne!(good, old, "the splice must have matched");
+        let map = PixelMap::from_json(&old).unwrap();
+        assert_eq!(map.distortion.as_ref().unwrap().domain, None);
+        assert_eq!(map.inverse(3.0, 4.0), (3.0, 4.0));
+        let inverted = old.replace(
+            "\"scale\":1.0,",
+            "\"scale\":1.0,\"domain\":[1.0,0.0,-1.0,0.0],",
+        );
+        assert_ne!(old, inverted, "the splice must have matched");
+        assert!(PixelMap::from_json(&inverted).is_err());
     }
 }

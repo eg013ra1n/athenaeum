@@ -135,7 +135,7 @@ configurable). For RGB frames detection runs on the luminance
 | `similarity` | 4 | same rig, few stars (auto below 12 inliers) |
 | `affine` | 6 | auto for 12–29 inliers; the legacy `registration_results` shape |
 | `homography` | 8 | **default**; normalized DLT (Hartley); flips are a negative determinant, nothing special |
-| `polynomial2..4` | + (order+1)(order+2)−6 per axis, per direction | fitted on the residuals of the linear model; forward and inverse fitted independently (the plate solver's SIP convention); auto-enabled for cross-camera groups (different `INSTRUME` or geometry than the reference) with ≥ 200 inliers |
+| `polynomial2..4` | + (order+1)(order+2)−6 per axis, per direction | fitted on the residuals of the linear model; forward and inverse fitted independently (the plate solver's SIP convention); auto-enabled for cross-camera groups (different `INSTRUME` or geometry than the reference) with ≥ 200 inliers whose convex hull covers ≥ 0.6 of the pair hull (the overlap index); an explicit order is always honoured |
 | `tps` (M4) | ≤ 4000 nodes | regularized thin-plate spline, smoothing λ, node pruning by surface simplification, outlier removal |
 
 `model: auto` resolves per frame as above; the resolved model is recorded.
@@ -503,11 +503,16 @@ part. Rows from the retired flow are simply overwritten by the
 
 `transform_json` is `PixelMap::to_json()` verbatim — `{ "linear": { "kind":
 "homography", "m": [[..],[..],[..]] }, "linearInv": { … }, "distortion": null |
-{ "order": 3, "center": [cx, cy], "scale": s, "forward": { "order": 3, "ax":
-[..], "ay": [..] }, "inverse": { … } } }`. The polynomial acts on coordinates
-normalized as `u = (x − cx)/s`, `v = (y − cy)/s` (reference centre and half the
-longer side) for conditioning. `linearInv` is recomputed from `linear` on
-load, so a stored inverse can never disagree with its forward matrix.
+{ "order": 3, "center": [cx, cy], "scale": s, "domain": [u0, v0, u1, v1],
+"forward": { "order": 3, "ax": [..], "ay": [..] }, "inverse": { … } } }`. The
+polynomial acts on coordinates normalized as `u = (x − cx)/s`, `v = (y − cy)/s`
+(reference centre and half the longer side) for conditioning. `domain` is the
+normalized box the polynomials were fitted over (the inliers' bounding box,
+each side inflated by 10 %); evaluation clamps `(u, v)` into it so a far
+corner gets the nearest fitted edge's displacement, never a polynomial
+extrapolation (absent = unbounded, for rows written before the field).
+`linearInv` is recomputed from `linear` on load, so a stored inverse can
+never disagree with its forward matrix.
 `stacking_runs.summary_json` and the per-run `runs/run-<id>.json` file (same
 content: config, reference, groups, per-frame rows, stats) are the
 provenance, modelled on `master_provenance`.

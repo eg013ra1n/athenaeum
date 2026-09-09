@@ -247,7 +247,7 @@ mod tests {
                 (cx + c * u - s * v + dx, cy + s * u + c * v + dy, a)
             })
             .collect();
-        let mut write = |name: &str, list: &[(f64, f64, f64)]| {
+        let write = |name: &str, list: &[(f64, f64, f64)]| {
             let mut plane = gaussian_field(w, h, list, 1.6, 0.08);
             add_noise(&mut plane, 0.002, seed + 11);
             let mut all = Vec::new();

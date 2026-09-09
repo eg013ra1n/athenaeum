@@ -1,11 +1,11 @@
 //! Dev probe for Checkpoint A: register calibrated subjects onto a
 //! calibrated reference and print the alignment as JSON; optionally compare
-//! with a WBPP `.xdrz` sidecar, write the registered frame, or compare our
-//! resampled frame with a WBPP registered image.
+//! with an external `.xdrz` alignment sidecar, write the registered frame,
+//! or compare our resampled frame with an externally registered image.
 //!
 //! cargo run --release -p athenaeum-core --example register_probe -- \
 //!   <reference.fits> <subject.fits> [--xdrz <subject.xdrz>] [--write <dir>] \
-//!   [--compare <wbpp_registered.xisf>] [--model auto|similarity|affine|homography] \
+//!   [--compare <registered.xisf>] [--model auto|similarity|affine|homography] \
 //!   [--distortion off|polynomial2|polynomial3|polynomial4|auto]
 
 use std::path::{Path, PathBuf};
@@ -139,6 +139,43 @@ fn corner_delta(
     worst
 }
 
+/// Per-star disagreement between our reference→subject inverse and the
+/// sidecar matrix (same row order, established on every subject by the
+/// corner check), over the reference stars both maps place inside the
+/// subject: `{ count, medianPx, p95Px, maxPx }`.
+fn star_delta(
+    map: &PixelMap,
+    theirs: &[[f64; 3]; 3],
+    origin: (f64, f64),
+    stars: &[Star],
+    sub_wh: (usize, usize),
+) -> serde_json::Value {
+    let (w, h) = (sub_wh.0 as f64, sub_wh.1 as f64);
+    let inside = |x: f64, y: f64| x >= 0.0 && y >= 0.0 && x < w && y < h;
+    let mut d: Vec<f64> = stars
+        .iter()
+        .filter_map(|s| {
+            let (ox, oy) = map.inverse(s.x, s.y);
+            let (px, py) = apply3(theirs, s.x + origin.0, s.y + origin.1);
+            let (px, py) = (px - origin.0, py - origin.1);
+            (inside(ox, oy) && inside(px, py))
+                .then(|| ((px - ox).powi(2) + (py - oy).powi(2)).sqrt())
+        })
+        .collect();
+    d.sort_by(|a, b| a.total_cmp(b));
+    let at = |q: f64| {
+        d.get(((d.len() as f64 - 1.0) * q).round().max(0.0) as usize)
+            .copied()
+            .unwrap_or(f64::NAN)
+    };
+    serde_json::json!({
+        "count": d.len(),
+        "medianPx": at(0.5),
+        "p95Px": at(0.95),
+        "maxPx": d.last().copied().unwrap_or(f64::NAN),
+    })
+}
+
 fn read_luminance_any(path: &Path) -> Result<(Vec<f32>, usize, usize), String> {
     if path
         .extension()
@@ -248,6 +285,7 @@ fn main() {
                     "theirScale": (sx * sy).sqrt(),
                     "theirRotationDeg": theirs[1][0].atan2(theirs[0][0]).to_degrees(),
                     "cornerDeltaPx": { "sameRowOrder": plain, "flippedRowOrder": flipped },
+                    "starDeltaPx": star_delta(&a.map, &theirs, origin, &reference.stars, (reg.width, reg.height)),
                 });
             }
             Err(e) => out["xdrz"] = serde_json::json!({ "error": e }),
@@ -298,11 +336,20 @@ fn main() {
 
     if let Some(theirs) = &args.compare {
         match read_luminance_any(theirs) {
-            Ok((tl, tw, th)) => {
+            Ok((mut tl, tw, th)) => {
+                // The comparison image may carry ADU-scale values; bring it to [0, 1].
+                let max = tl
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold(0.0f32, f32::max);
+                if max > 1.5 {
+                    tl.iter_mut().for_each(|v| *v /= 65535.0);
+                }
                 // Our resampled luminance of the subject in reference geometry.
                 let ours: Result<(Vec<f32>, usize, usize), String> =
                     read_luminance_any(&args.subject).map(|(sl, sw, sh)| {
-                        let mut o = vec![f32::NAN; reference.width * reference.height];
+                        let mut o = vec![0.0f32; reference.width * reference.height];
                         warp_rows(
                             &Plane::full(&sl, sw, sh),
                             &a.map,
@@ -325,29 +372,15 @@ fn main() {
                         let mut dy = Vec::new();
                         let mut ratio = Vec::new();
                         for s in &stars_o {
-                            // Try both row orders for the WBPP image.
                             let cand = stars_t.iter().min_by(|p, q| {
-                                let d = |t: &Star| {
-                                    ((t.x - s.x).powi(2) + (t.y - s.y).powi(2)).min(
-                                        (t.x - s.x).powi(2)
-                                            + ((th as f64 - 1.0 - t.y) - s.y).powi(2),
-                                    )
-                                };
+                                let d = |t: &Star| (t.x - s.x).powi(2) + (t.y - s.y).powi(2);
                                 d(p).total_cmp(&d(q))
                             });
                             if let Some(t) = cand {
-                                let same = ((t.x - s.x).powi(2) + (t.y - s.y).powi(2)).sqrt();
-                                let flip = ((t.x - s.x).powi(2)
-                                    + ((th as f64 - 1.0 - t.y) - s.y).powi(2))
-                                .sqrt();
-                                let (d, ty) = if same <= flip {
-                                    (same, t.y)
-                                } else {
-                                    (flip, th as f64 - 1.0 - t.y)
-                                };
+                                let d = ((t.x - s.x).powi(2) + (t.y - s.y).powi(2)).sqrt();
                                 if d < 1.5 {
                                     dx.push(t.x - s.x);
-                                    dy.push(ty - s.y);
+                                    dy.push(t.y - s.y);
                                     if t.flux > 0.0 && s.flux > 0.0 {
                                         ratio.push(s.flux / t.flux);
                                     }
@@ -377,5 +410,9 @@ fn main() {
         }
     }
 
+    let failed = ["xdrz", "written", "compare"]
+        .iter()
+        .any(|k| out.get(*k).and_then(|v| v.get("error")).is_some());
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    std::process::exit(if failed { 1 } else { 0 });
 }

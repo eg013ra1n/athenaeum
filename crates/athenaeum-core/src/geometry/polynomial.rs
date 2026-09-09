@@ -225,12 +225,25 @@ fn mat_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
 /// Inverse: `sub = L⁻¹(ref + I(norm(ref)))`.
 /// `norm(x, y) = ((x − cx)/scale, (y − cy)/scale)`; the polynomials return
 /// displacements in pixels.
+/// Fraction of each side's extent added to a fitted domain on both ends.
+pub const DOMAIN_MARGIN: f64 = 0.1;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Distortion {
     pub order: u8,
     pub center: (f64, f64),
     pub scale: f64,
+    /// Normalized-coordinate box `[u_min, v_min, u_max, v_max]` the
+    /// polynomials were fitted over (the samples' bounding box, each side
+    /// inflated by `DOMAIN_MARGIN` of its extent). Evaluation clamps
+    /// `(u, v)` into it, so a pixel far outside the star-covered region
+    /// gets the displacement of the nearest fitted edge instead of a
+    /// polynomial extrapolation (a cubic folded far corners 180 px into
+    /// the subject on a 15 %-overlap frame). `None` = unbounded, which is
+    /// what a `transform_json` written before this field carried.
+    #[serde(default)]
+    pub domain: Option<[f64; 4]>,
     pub forward: Polynomial2D,
     pub inverse: Polynomial2D,
 }
@@ -245,6 +258,9 @@ impl Distortion {
             && self.inverse.order == self.order
             && self.forward.is_well_formed()
             && self.inverse.is_well_formed()
+            && self.domain.map_or(true, |d| {
+                d.iter().all(|v| v.is_finite()) && d[0] <= d[2] && d[1] <= d[3]
+            })
     }
 
     #[inline]
@@ -253,6 +269,33 @@ impl Distortion {
             (x - self.center.0) / self.scale,
             (y - self.center.1) / self.scale,
         )
+    }
+
+    /// `(u, v)` clamped into the fitted domain (identity when unbounded).
+    #[inline]
+    fn clamp(&self, u: f64, v: f64) -> (f64, f64) {
+        match self.domain {
+            None => (u, v),
+            Some(d) => (u.clamp(d[0], d[2]), v.clamp(d[1], d[3])),
+        }
+    }
+
+    /// Forward displacement (pixels) at reference-space point `(x, y)` —
+    /// the linear model's output — evaluated inside the fitted domain.
+    #[inline]
+    pub fn forward_displacement(&self, x: f64, y: f64) -> (f64, f64) {
+        let (u, v) = self.norm(x, y);
+        let (u, v) = self.clamp(u, v);
+        self.forward.eval(u, v)
+    }
+
+    /// Inverse displacement (pixels) at reference pixel `(x, y)`, evaluated
+    /// inside the fitted domain.
+    #[inline]
+    pub fn inverse_displacement(&self, x: f64, y: f64) -> (f64, f64) {
+        let (u, v) = self.norm(x, y);
+        let (u, v) = self.clamp(u, v);
+        self.inverse.eval(u, v)
     }
 
     /// Fits both directions on the residuals of `linear` over `pairs`.
@@ -285,12 +328,16 @@ impl Distortion {
                 (norm(*u, *v), (px - u, py - v))
             })
             .collect();
+        let mut all = fwd_samples.clone();
+        all.extend_from_slice(&inv_samples);
+        let domain = fitted_domain(&all);
         let forward = Polynomial2D::fit(order, &fwd_samples, weights)?;
         let inverse = Polynomial2D::fit(order, &inv_samples, weights)?;
         Some(Distortion {
             order,
             center,
             scale,
+            domain,
             forward,
             inverse,
         })
@@ -344,6 +391,28 @@ impl Distortion {
         let distortion = Distortion::fit(order, &refined, pairs, weights, center, scale)?;
         Some((refined, distortion))
     }
+}
+
+/// Bounding box of the normalized sample coordinates, each side inflated by
+/// `DOMAIN_MARGIN` of its extent; `None` when there are no finite samples.
+fn fitted_domain(samples: &[((f64, f64), (f64, f64))]) -> Option<[f64; 4]> {
+    let mut b = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for ((u, v), _) in samples {
+        b[0] = b[0].min(*u);
+        b[1] = b[1].min(*v);
+        b[2] = b[2].max(*u);
+        b[3] = b[3].max(*v);
+    }
+    if !b.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let (du, dv) = ((b[2] - b[0]) * DOMAIN_MARGIN, (b[3] - b[1]) * DOMAIN_MARGIN);
+    Some([b[0] - du, b[1] - dv, b[2] + du, b[3] + dv])
 }
 
 #[cfg(test)]
@@ -531,5 +600,53 @@ mod tests {
             plain_worst > 0.1,
             "the un-balanced fit must leave the linear residual: {plain_worst}"
         );
+    }
+
+    #[test]
+    fn fitted_domain_clamps_far_pixels_to_the_edge_displacement() {
+        // Stars cover only the central 60 % of a 6000×4000 field.
+        let (w, h) = (6000.0, 4000.0);
+        let (cx, cy) = (w / 2.0, h / 2.0);
+        let k = 5e-11;
+        let linear = Linear::identity();
+        let pairs: Vec<Pair> = grid(w, h, 200.0)
+            .into_iter()
+            .filter(|(x, y)| (x - cx).abs() < 0.3 * w && (y - cy).abs() < 0.3 * h)
+            .map(|(x, y)| ((x, y), barrel(x, y, cx, cy, k)))
+            .collect();
+        let scale = w.max(h) / 2.0;
+        let d = Distortion::fit(3, &linear, &pairs, None, (cx, cy), scale).unwrap();
+        let dom = d.domain.expect("fit records its domain");
+        // Samples span x ∈ [1300, 4700], y ∈ [900, 3100] (± the barrel), i.e.
+        // u ∈ ±0.5667, v ∈ ±0.3667; a 10 % margin per side gives ±0.680 / ±0.440.
+        assert!(
+            (dom[0] + 0.680).abs() < 0.01 && (dom[2] - 0.680).abs() < 0.01,
+            "{dom:?}"
+        );
+        assert!(
+            (dom[1] + 0.440).abs() < 0.01 && (dom[3] - 0.440).abs() < 0.01,
+            "{dom:?}"
+        );
+        // A far pixel evaluates exactly as the nearest domain corner …
+        let far = d.inverse_displacement(-20000.0, -20000.0);
+        let corner = d.inverse_displacement(cx + dom[0] * scale, cy + dom[1] * scale);
+        assert!((far.0 - corner.0).abs() < 1e-12 && (far.1 - corner.1).abs() < 1e-12);
+        // … which is a bounded, sub-5 px displacement for this barrel …
+        assert!((far.0.powi(2) + far.1.powi(2)).sqrt() < 5.0, "{far:?}");
+        // … whereas the unbounded cubic runs away.
+        let mut unbounded = d.clone();
+        unbounded.domain = None;
+        let wild = unbounded.inverse_displacement(-20000.0, -20000.0);
+        assert!((wild.0.powi(2) + wild.1.powi(2)).sqrt() > 100.0, "{wild:?}");
+        // Inside the fitted region the clamp is the identity: the barrel test's
+        // accuracy still holds on every sample.
+        let map = PixelMap::with_distortion(linear, d.clone()).unwrap();
+        for ((x, y), (u, v)) in &pairs {
+            let (bx, by) = map.inverse(*u, *v);
+            assert!(((bx - x).powi(2) + (by - y).powi(2)).sqrt() < 0.01);
+        }
+        // The domain survives the JSON round trip.
+        let back = PixelMap::from_json(&map.to_json()).unwrap();
+        assert_eq!(back.distortion.unwrap().domain, Some(dom));
     }
 }
