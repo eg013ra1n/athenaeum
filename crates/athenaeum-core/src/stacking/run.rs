@@ -2641,32 +2641,73 @@ fn fail_group(
     Ok(GroupOutcome::Failed)
 }
 
-/// One `Integrate`-stage progress tick, throttled by `last_tick`. Percent =
-/// `100 * (plane + frac) / channels`. A free function (not a closure
-/// borrowing `RunContext`) so `on_plane`/`on_band`/`on_combine` — `Sync`
-/// closures the engine may call from any of its own worker threads — can
-/// call it with only cloned-out plain values, and so it is directly
+/// Shared, lock-protected state one group's `Integrate`-stage progress
+/// ticks are latched against (fix round 2). A run emits one group's
+/// `Integrate` progress at a time (`stage_output`'s group loop is
+/// sequential), so a single instance scoped to one [`process_group_output`]
+/// call — not a `HashMap<(Stage, Option<String>), _>` spanning the whole
+/// run — is enough to key the latch by `(stage, group_key)`: this state
+/// itself never sees a second `(stage, group_key)` pair.
+struct IntegrateTickState {
+    last_emit: Instant,
+    /// The highest `percent` emitted so far — monotonic across the WHOLE
+    /// group (by construction: `plane` only advances, `frac` is always in
+    /// `[0, 1]`, so a stale/out-of-order tick's percent can never exceed
+    /// the current watermark).
+    last_percent: f64,
+    /// Which plane `last_bytes_done` belongs to.
+    last_plane: usize,
+    /// The highest `bytes_done` emitted so far FOR `last_plane` — scoped to
+    /// one plane, not the whole group, because `bytes_done`/`bytes_total`
+    /// are the engine's own PER-PLANE pair (`EngineProgress::on_band`'s own
+    /// doc: they reset every plane) — latching it across a plane boundary
+    /// would silently drop every tick of a new plane, since a fresh plane
+    /// always starts back at `bytes_done: 0`.
+    last_bytes_done: u64,
+}
+
+impl IntegrateTickState {
+    fn new() -> Self {
+        IntegrateTickState {
+            last_emit: Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS),
+            last_percent: f64::NEG_INFINITY,
+            last_plane: 0,
+            last_bytes_done: 0,
+        }
+    }
+}
+
+/// One `Integrate`-stage progress tick, throttled AND max-latched against
+/// `state`. Percent = `100 * (plane + frac) / channels`. A free function
+/// (not a closure borrowing `RunContext`) so `on_plane`/`on_band`/`on_combine`
+/// — `Sync` closures the engine may call from any of its own worker threads
+/// — can call it with only cloned-out plain values, and so it is directly
 /// unit-testable on its own (see `emit_integrate_ticks_never_race_percent_backwards`
 /// below).
 ///
-/// Fix round 1, item 1: the throttle guard (`last_tick.lock()`) stays held
-/// THROUGH the emit, not dropped before it. Dropping it first let two
-/// concurrent callers both pass the throttle check, both release the lock,
-/// and then race `emit_event` itself with no ordering relationship to which
-/// one's check-and-update ran first — a later/lower-percent tick could
-/// reach the emitter after an earlier/higher one, sending `percent`
-/// backwards inside a plane, the exact contract `stage_sequence_and_monotonic`
-/// checks. Holding the guard through the emit makes "acquired the lock
-/// first" and "emitted first" the SAME thing — a caller cannot even start
-/// its own check until the previous caller's entire tick (check, update,
-/// compute, emit) is done, so two ticks can never interleave or land out of
-/// the order their callers entered this function. Emitting under the lock
-/// is cheap (a channel send / IPC call); a slow emitter only slows the
-/// engine's own callbacks, the same tradeoff `OUTPUT_WRITE_LOCK` makes for
-/// the master write.
+/// Fix round 1, item 1: the throttle guard (`state.lock()`) stays held
+/// THROUGH the emit, not dropped before it — this makes ONE caller's own
+/// check/update/compute/emit sequence indivisible, so two ticks can never
+/// interleave or land torn. It does NOT, on its own, stop a worker that
+/// read a LOWER `(plane, frac)` and was then descheduled from taking the
+/// lock AFTER a higher tick already went out and emitting the lower value —
+/// atomicity of one critical section says nothing about the relative order
+/// of two SEPARATE critical sections whose inputs were computed outside
+/// the lock. Fix round 2 closes that: a max-latch, held under the SAME
+/// lock as the throttle state, drops (never clamps — clamping would emit
+/// a duplicate percent under a fresh, misleadingly-newer `bytes_done`) any
+/// tick whose `percent` (whole-group scope) or `bytes_done` (current-plane
+/// scope) regresses relative to what has already been emitted for this
+/// `(stage, group_key)`. `force` bypasses the THROTTLE only — the latch
+/// always applies, so the stage's first (`force: true`, plane 0/frac 0) and
+/// last (`force: true`, `percent: 100.0`) events are still guaranteed to be
+/// the true minimum/maximum rather than merely unthrottled. Emitting under
+/// the lock is cheap (a channel send / IPC call); a slow emitter only slows
+/// the engine's own callbacks, the same tradeoff `OUTPUT_WRITE_LOCK` makes
+/// for the master write.
 #[allow(clippy::too_many_arguments)]
 fn emit_integrate_tick(
-    last_tick: &Mutex<Instant>,
+    state: &Mutex<IntegrateTickState>,
     emitter: &dyn ProgressEmitter,
     run_id: i64,
     set_id: i64,
@@ -2679,12 +2720,43 @@ fn emit_integrate_tick(
     force: bool,
 ) {
     let now = Instant::now();
-    let mut last = last_tick.lock().unwrap_or_else(|e| e.into_inner());
-    if !force && now.duration_since(*last) < Duration::from_millis(PROGRESS_THROTTLE_MS) {
+    let percent = 100.0 * (plane as f64 + frac) / channels.max(1) as f64;
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Max-latch (fix round 2), checked BEFORE the throttle so a dropped
+    // tick never resets `last_emit` either. `percent` regressing drops the
+    // tick outright, whatever plane it claims to be from. Otherwise: moving
+    // to a strictly LATER plane re-arms the bytes_done watermark at 0 (a
+    // fresh plane's own counter); staying on the SAME plane still latches
+    // `bytes_done`; a tick claiming an EARLIER plane than what is already
+    // recorded has, by construction, a `percent` that cannot exceed the
+    // current watermark (plane only advances, frac in [0, 1]) — it is
+    // already caught by the percent check above and never reaches here.
+    if percent < s.last_percent {
         return;
     }
-    *last = now;
-    let percent = 100.0 * (plane as f64 + frac) / channels.max(1) as f64;
+    if plane > s.last_plane {
+        s.last_plane = plane;
+        s.last_bytes_done = 0;
+    } else if bytes_done < s.last_bytes_done {
+        return;
+    }
+
+    if !force && now.duration_since(s.last_emit) < Duration::from_millis(PROGRESS_THROTTLE_MS) {
+        return;
+    }
+
+    s.last_emit = now;
+    s.last_percent = percent;
+    s.last_bytes_done = bytes_done;
+    // `s` (the `MutexGuard`) stays alive through the emit below — fix round
+    // 1's own point still holds: the watermark update above only decides
+    // WHICH tick is allowed to claim the next slot, not what order two
+    // already-claimed emits reach the recorder in. Dropping the guard here
+    // would let a second thread claim the NEXT slot and race this thread's
+    // own `emit_event` call, reopening exactly the interleaving fix round 1
+    // closed (a higher, later-claimed tick landing before this one's).
+
     emit_event(
         emitter,
         STACKING_PROGRESS_EVENT,
@@ -2905,8 +2977,7 @@ fn process_group_output(
     // `on_band`/`on_combine` read it back and derive `band_fraction` from
     // the engine's own `bytes_done/bytes_total` pair for that plane.
     let current_plane = std::sync::atomic::AtomicUsize::new(0);
-    let last_tick: Mutex<Instant> =
-        Mutex::new(Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS));
+    let tick_state: Mutex<IntegrateTickState> = Mutex::new(IntegrateTickState::new());
     let emitter = rc.emitter.clone();
     let run_id = rc.run_id;
     let set_id = rc.set_id;
@@ -2915,7 +2986,7 @@ fn process_group_output(
     let on_plane = |p: usize, _total: usize| {
         current_plane.store(p, Ordering::Relaxed);
         emit_integrate_tick(
-            &last_tick,
+            &tick_state,
             emitter.as_ref(),
             run_id,
             set_id,
@@ -2936,7 +3007,7 @@ fn process_group_output(
             0.0
         };
         emit_integrate_tick(
-            &last_tick,
+            &tick_state,
             emitter.as_ref(),
             run_id,
             set_id,
@@ -2952,7 +3023,7 @@ fn process_group_output(
     let on_combine = |_rows: usize, _rows_total: usize, bytes_done: u64, bytes_total: u64| {
         let plane = current_plane.load(Ordering::Relaxed);
         emit_integrate_tick(
-            &last_tick,
+            &tick_state,
             emitter.as_ref(),
             run_id,
             set_id,
@@ -2990,7 +3061,7 @@ fn process_group_output(
         }
     };
     emit_integrate_tick(
-        &last_tick,
+        &tick_state,
         emitter.as_ref(),
         run_id,
         set_id,
@@ -4809,49 +4880,40 @@ mod tests {
 
     #[test]
     fn emit_integrate_ticks_never_race_percent_backwards() {
-        // Fix round 1, item 1: drives the REAL `emit_integrate_tick` (not a
-        // reimplementation) from two genuine `std::thread::scope` threads,
-        // both hitting the SAME `last_tick` mutex.
+        // Fix round 1, item 1 + fix round 2: drives the REAL
+        // `emit_integrate_tick` (not a reimplementation) from two genuine
+        // `std::thread::scope` threads, both hitting the SAME
+        // `IntegrateTickState` mutex, under FULLY DETERMINISTIC turn-taking
+        // — kept alongside `emit_integrate_ticks_never_go_backwards_under_free_racing`
+        // below because it proves something that one cannot: with no
+        // legitimate reason for ANY tick to be stale (every value is
+        // offered to the function in strict, correct order), the max-latch
+        // must never drop a genuinely-valid tick — `events.len() == TOTAL`
+        // below is exactly that "zero false positives" check. The free-race
+        // test proves the opposite direction (stale ticks under genuine
+        // racing are dropped, never delivered backwards) but, precisely
+        // because it allows drops, cannot also prove the latch isn't
+        // OVER-eager.
         //
-        // What this test does NOT do, and why: two threads freely pulling
-        // interleaved values from a shared counter with no coordination
-        // beyond the mutex — tried first — is flaky even against the FIXED
-        // code (confirmed empirically, ~1 in 10 runs, and reproducibly
-        // whenever the OS lets one thread run for a while before the other
-        // is scheduled at all). That is not a gap in this fix: a value a
-        // thread already holds (e.g. `bytes_read_so_far`) is computed
-        // BEFORE `on_band`/`on_combine` ever calls into
-        // `emit_integrate_tick`, and no lock discipline INSIDE this
-        // function can bound how long that caller sits on it before it is
-        // next scheduled — "global monotonic order under arbitrary
-        // scheduling" was never something a mutex around the emit could
-        // promise, and asserting it is what made the free-race version
-        // flaky rather than a faithful regression test.
+        // Fix round 1's own history, preserved: a version of the free-race
+        // test with no coordination beyond the mutex was flaky against the
+        // fix-round-1-only code (~1 in 10 runs) — a value read outside the
+        // lock can sit unsubmitted for an unbounded time regardless of lock
+        // discipline inside this function, so a later, higher tick could
+        // reach the recorder before an earlier, lower one. That is now
+        // fully addressed by fix round 2's max-latch (the stale tick is
+        // dropped, not delivered out of order) — see the free-race test
+        // below, which fix round 1 could not have passed but fix round 2
+        // does, reliably.
         //
-        // What the fix DOES guarantee, and what this deterministically
-        // verifies instead: the whole check-throttle → update → compute →
-        // emit sequence is now one indivisible unit under `last_tick` — a
-        // caller that reaches `.lock()` cannot have its event overtaken by
-        // another caller's, because the other caller cannot even ENTER its
-        // own critical section until the first's is completely done
-        // (before the fix, the guard was dropped after the throttle
-        // check, so two callers could both pass it, both drop the lock,
-        // and then race `emit_event` itself with no ordering relationship
-        // to which one checked first). A shared `turn` counter hands each
-        // value to the thread whose parity matches it, but — this matters —
-        // `turn` only ADVANCES after that thread's own `emit_integrate_tick`
-        // call has fully returned, never before it and never via a
-        // compare-exchange claimed ahead of the call (also tried: claiming
-        // `turn` with a `compare_exchange` immediately before calling let
-        // the two threads' calls run concurrently again, since nothing then
-        // stopped the second thread from claiming ITS turn and racing its
-        // own call against the first's still-in-flight one — it failed the
-        // same way the free-race version did). With the advance strictly
-        // AFTER the call, the expected sequence is well-defined and
-        // non-decreasing by construction; the assertion below is only
-        // meaningful because two REAL threads and the REAL mutex are what
-        // deliver it to the recorder, not a wrapper that reorders on the
-        // test's behalf.
+        // This test's own determinism comes from a shared `turn` counter
+        // that hands each value to the thread whose parity matches it,
+        // advancing only AFTER that thread's own `emit_integrate_tick` call
+        // has fully returned (a `compare_exchange`-before-call variant was
+        // tried and failed the same way the free-race version does, for the
+        // same reason — releasing the next turn before this call's own
+        // critical section is done lets the two threads' calls run
+        // concurrently again).
         struct ThreadPercentRecorder {
             events: Mutex<Vec<f64>>,
         }
@@ -4864,8 +4926,7 @@ mod tests {
             }
         }
 
-        let last_tick: Mutex<Instant> =
-            Mutex::new(Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS));
+        let tick_state: Mutex<IntegrateTickState> = Mutex::new(IntegrateTickState::new());
         let recorder = ThreadPercentRecorder {
             events: Mutex::new(Vec::new()),
         };
@@ -4875,21 +4936,6 @@ mod tests {
 
         let worker = |thread_id: u64| {
             loop {
-                // Take the next value only when it is genuinely this
-                // thread's turn (even values to thread 0, odd to thread 1)
-                // — both threads spin on the SAME shared `turn` counter, so
-                // this still exercises real cross-thread synchronization,
-                // not a single-threaded loop wearing a `std::thread::scope`
-                // costume. Critically, `turn` only advances AFTER this
-                // thread's own `emit_integrate_tick` call returns (not
-                // before it, and not via a compare-exchange claimed ahead
-                // of the call) — advancing it any earlier reopens exactly
-                // the race being tested for: the other thread would then be
-                // free to claim its own turn and call `emit_integrate_tick`
-                // concurrently with this one, which is genuinely racy (this
-                // was tried and DID fail: v+1 claimed via `compare_exchange`
-                // before the call let the two threads' calls interleave,
-                // occasionally delivering v+1 to the recorder before v).
                 let v = turn.load(Ordering::SeqCst);
                 if v >= TOTAL {
                     return;
@@ -4899,7 +4945,7 @@ mod tests {
                     continue;
                 }
                 emit_integrate_tick(
-                    &last_tick,
+                    &tick_state,
                     &recorder,
                     1,
                     1,
@@ -4923,7 +4969,11 @@ mod tests {
         });
 
         let events = recorder.events.into_inner().unwrap();
-        assert_eq!(events.len(), TOTAL as usize, "{events:?}");
+        assert_eq!(
+            events.len(),
+            TOTAL as usize,
+            "the latch must never drop a genuinely valid, in-order tick: {events:?}"
+        );
         let mut last = -1.0f64;
         for &percent in &events {
             assert!(
@@ -4931,6 +4981,89 @@ mod tests {
                 "percent went backwards: {last} -> {percent}"
             );
             last = percent;
+        }
+    }
+
+    #[test]
+    fn emit_integrate_ticks_never_go_backwards_under_free_racing() {
+        // Fix round 2, brief's own test ask: TWO THREADS RACE FREELY — no
+        // external turn-taking, genuine concurrent calls — each pulling its
+        // next `(plane, frac)` from a shared, monotonically increasing
+        // counter immediately before calling the REAL `emit_integrate_tick`.
+        // This is the exact scenario that was flaky before fix round 2 (see
+        // `emit_integrate_ticks_never_race_percent_backwards`'s own doc
+        // comment) — a value fetched early by one thread could sit
+        // unsubmitted while the other thread ran far ahead, and once
+        // finally submitted, land AFTER a much higher percent already on
+        // the wire. The max-latch fixes this not by reordering (impossible
+        // without a queue) but by DROPPING the stale tick outright: the
+        // recorded sequence can be a strict SUBSET of everything fetched,
+        // but whatever subset does get through must never go backwards.
+        // Run 20 times (fresh state each iteration) per the brief, each
+        // iteration racing >= 200 values across the two threads.
+        struct ThreadPercentRecorder {
+            events: Mutex<Vec<f64>>,
+        }
+        impl ProgressEmitter for ThreadPercentRecorder {
+            fn emit_json(&self, _event_name: &str, payload: serde_json::Value) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(payload["percent"].as_f64().unwrap_or(f64::NAN));
+            }
+        }
+
+        const ITERATIONS: usize = 20;
+        const TOTAL: u64 = 250;
+        const CHANNELS: usize = 1;
+
+        for iteration in 0..ITERATIONS {
+            let tick_state: Mutex<IntegrateTickState> = Mutex::new(IntegrateTickState::new());
+            let recorder = ThreadPercentRecorder {
+                events: Mutex::new(Vec::new()),
+            };
+            let counter = std::sync::atomic::AtomicU64::new(0);
+
+            let worker = || loop {
+                let v = counter.fetch_add(1, Ordering::SeqCst);
+                if v >= TOTAL {
+                    break;
+                }
+                emit_integrate_tick(
+                    &tick_state,
+                    &recorder,
+                    1,
+                    1,
+                    "g",
+                    CHANNELS,
+                    0,
+                    v as f64 / TOTAL as f64,
+                    v,
+                    TOTAL,
+                    true, // force: bypass the throttle so every fetched
+                          // value reaches the latch — the latch, not the
+                          // throttle, is what this test exercises.
+                );
+            };
+
+            std::thread::scope(|scope| {
+                scope.spawn(worker);
+                scope.spawn(worker);
+            });
+
+            let events = recorder.events.into_inner().unwrap();
+            assert!(
+                !events.is_empty(),
+                "iteration {iteration}: no ticks recorded at all"
+            );
+            let mut last = -1.0f64;
+            for &percent in &events {
+                assert!(
+                    percent + 1e-9 >= last,
+                    "iteration {iteration}: percent went backwards: {last} -> {percent}"
+                );
+                last = percent;
+            }
         }
     }
 
