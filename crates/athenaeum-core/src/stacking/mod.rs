@@ -4,8 +4,11 @@
 //! and weighting / selection (`weights`). Orchestration, configuration and
 //! persistence follow in later plans. Plan 3 adds `register` (registration
 //! v2: detection, quad-seeded RANSAC alignment, distortion, QA, the
-//! registered-frame writer).
+//! registered-frame writer). Plan 4 adds `integrate` (the group driver:
+//! configuration, the Auto rejection rule, per-frame normalization and
+//! weights, weighted banded integration per plane).
 
+pub mod integrate;
 pub mod measure;
 pub mod psf_signal;
 pub mod register;
