@@ -160,6 +160,13 @@ export type FrameSetDetail = { frames_set: FramesSet, nights: Array<ImagingNight
 
 export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
 
+export type ObservingGoal = { frameSetId: number, filter: string, revision: number, targetSeconds: number, requireAnalysis: boolean, maxFwhmPx: number | null, maxEccentricity: number | null, rejectTrailed: boolean, };
+
+export type ObservingProgress = { filter: string, goal: ObservingGoal | null, accepted: number, rejected: number, unknown: number, acceptedSeconds: number, };
+
+
+
+
 export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, 
 /**
  * Set when this raw set has been superseded by a built master.

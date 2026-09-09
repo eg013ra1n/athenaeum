@@ -7,6 +7,7 @@ import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
+import { ObservingGoalsPanel } from '../components/observing/ObservingGoalsPanel';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
@@ -897,6 +898,8 @@ export default function FrameSetDetail() {
           );
         })}
       </div>
+
+      <ObservingGoalsPanel key={id} frameSetId={parseInt(id!)} />
 
       {/* Main Content */}
       <div className="flex-1 min-h-0">

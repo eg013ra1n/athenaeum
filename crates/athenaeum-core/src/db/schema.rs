@@ -2279,6 +2279,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         tracing::error!(error = ?e, "cfa back-fill repair failed");
     }
 
+    crate::observing_goals::storage::init_schema(conn)?;
     Ok(())
 }
 

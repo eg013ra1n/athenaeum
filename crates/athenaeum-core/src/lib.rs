@@ -70,3 +70,5 @@ pub mod sync;
 pub mod account;
 
 pub mod exposure_versions;
+
+pub mod observing_goals;
