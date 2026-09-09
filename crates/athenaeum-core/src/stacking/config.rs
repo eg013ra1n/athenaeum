@@ -9,6 +9,7 @@
 //! zero/`None`/the field type's own `#[default]` variant.
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::integration::stats::ScaleEstimator;
 use crate::resample::Interpolation;
@@ -261,23 +262,43 @@ pub fn preset(p: StackingPreset) -> StackingConfig {
 /// that field. There is no field-level merge between the two documents.
 /// Only when no set override exists does the global default JSON apply the
 /// same way; with neither, the built-in default.
+///
+/// A decoded document whose `version` differs from
+/// [`STACKING_CONFIG_VERSION`] still decodes fine (every field defaults
+/// through `#[serde(default)]`), but the drift is worth a `warn!` rather
+/// than silently reusing an old/foreign shape's semantics — the in-memory
+/// `StackingConfig` always carries the current version afterward.
 pub fn resolve_config(
     set_json: Option<&str>,
     global_json: Option<&str>,
 ) -> Result<StackingConfig, serde_json::Error> {
-    if let Some(set) = set_json {
-        return serde_json::from_str(set);
+    let mut config: StackingConfig = if let Some(set) = set_json {
+        serde_json::from_str(set)?
+    } else if let Some(global) = global_json {
+        serde_json::from_str(global)?
+    } else {
+        StackingConfig::default()
+    };
+    if config.version != STACKING_CONFIG_VERSION {
+        warn!(
+            version = config.version,
+            expected = STACKING_CONFIG_VERSION,
+            "stacking config version differs; decoding with the current defaults"
+        );
+        config.version = STACKING_CONFIG_VERSION;
     }
-    if let Some(global) = global_json {
-        return serde_json::from_str(global);
-    }
-    Ok(StackingConfig::default())
+    Ok(config)
 }
 
 /// xxh3 of the canonical JSON of the whole resolved config — a run-level
-/// fingerprint, distinct from the per-stage [`stage_hash`] below.
+/// fingerprint, distinct from the per-stage [`stage_hash`] below. Goes
+/// through `serde_json::to_value` before stringifying (the same
+/// sorted-object-keys canonicalization `stage_hash` relies on — this
+/// workspace's `serde_json` has no `preserve_order` feature), so a field
+/// reorder inside any config type never changes the fingerprint.
 pub fn config_hash(cfg: &StackingConfig) -> String {
-    let json = serde_json::to_string(cfg).expect("StackingConfig always serializes");
+    let value = serde_json::to_value(cfg).expect("StackingConfig always serializes");
+    let json = serde_json::to_string(&value).expect("a serde_json::Value always serializes");
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
 }
 
@@ -285,10 +306,22 @@ pub fn config_hash(cfg: &StackingConfig) -> String {
 /// subtree + the upstream hashes it depends on + the source file
 /// identities)`. `config_subtree` is one of [`calibration_subtree`],
 /// [`measurement_subtree`], [`registration_subtree`] (or a future stage's
-/// equivalent) — a `serde_json::Value` map, which this workspace's
-/// `serde_json` (no `preserve_order` feature) always serializes with its
-/// keys sorted, making the JSON canonical regardless of field-declaration
-/// order.
+/// equivalent) — a `serde_json::Value` map. Canonical means every object's
+/// keys sorted, at every level: this workspace's `serde_json` (no
+/// `preserve_order` feature) always serializes a map with sorted keys, and
+/// the envelope this function builds around `config_subtree` is a
+/// `serde_json::Value` too (`serde_json::json!`, not a
+/// `#[derive(Serialize)]` struct, which would serialize in field-declaration
+/// order instead).
+///
+/// **Order-insensitive on both inputs.** `upstream` is sorted lexically and
+/// `sources` by `(file_id, size, modified_at)` before hashing, so a caller
+/// that assembles either from an unordered source (a `HashMap`, a query
+/// with no `ORDER BY`) still gets the same hash every run — an
+/// order-sensitive hash would make every artifact look stale and get
+/// silently recomputed. Duplicate entries are kept, not deduped: a
+/// duplicate is the caller's bug, and a stable hash for it is still the
+/// right answer.
 #[derive(Serialize)]
 pub struct SourceIdentity {
     pub file_id: i64,
@@ -301,17 +334,22 @@ pub fn stage_hash(
     upstream: &[&str],
     sources: &[SourceIdentity],
 ) -> String {
-    #[derive(Serialize)]
-    struct StageHashPayload<'a> {
-        config: &'a serde_json::Value,
-        upstream: &'a [&'a str],
-        sources: &'a [SourceIdentity],
-    }
-    let payload = StageHashPayload {
-        config: config_subtree,
-        upstream,
-        sources,
-    };
+    let mut sorted_upstream: Vec<&str> = upstream.to_vec();
+    sorted_upstream.sort_unstable();
+
+    let mut sorted_sources: Vec<&SourceIdentity> = sources.iter().collect();
+    sorted_sources.sort_by(|a, b| {
+        a.file_id
+            .cmp(&b.file_id)
+            .then(a.size.cmp(&b.size))
+            .then_with(|| a.modified_at.cmp(&b.modified_at))
+    });
+
+    let payload = serde_json::json!({
+        "config": config_subtree,
+        "upstream": sorted_upstream,
+        "sources": sorted_sources,
+    });
     let json = serde_json::to_string(&payload).expect("stage hash payload always serializes");
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
 }
@@ -387,6 +425,11 @@ mod tests {
             "\"format\":\"fits\"",
             "\"cleanup\":\"keepAll\"",
             "\"paths\":{\"workingDir\":null,\"outputDir\":null}",
+            "\"combination\":\"average\"",
+            "\"minWeight\":0.005",
+            "\"rangeLow\":0.0",
+            "\"rangeHigh\":null",
+            "\"drizzle\":{\"enabled\":false,\"scale\":2,\"dropShrink\":0.9,\"kernel\":\"square\",\"useRejection\":true,\"useWeights\":true,\"useLocalNormalization\":true,\"writeWeightMap\":false}",
         ] {
             assert!(s.contains(needle), "{needle} missing in {s}");
         }
@@ -396,10 +439,13 @@ mod tests {
     fn presets() {
         let f = preset(StackingPreset::FastPreview);
         assert_eq!(f.registration.interpolation, Interpolation::Bilinear);
-        assert!(matches!(
+        assert_eq!(
             f.integration.rejection,
-            RejectionChoice::SigmaClip { .. }
-        ));
+            RejectionChoice::SigmaClip {
+                sigma_low: 4.0,
+                sigma_high: 3.0,
+            }
+        );
         assert_eq!(f.output.cleanup, CleanupPolicy::DeleteIntermediates);
         let m = preset(StackingPreset::MaximumQuality);
         assert_eq!(m.registration.distortion, DistortionChoice::Polynomial3);
@@ -426,6 +472,23 @@ mod tests {
             StackingConfig::default()
         );
         assert!(resolve_config(Some("{not json"), None).is_err());
+    }
+
+    #[test]
+    fn resolve_config_normalizes_a_foreign_version() {
+        let c = resolve_config(Some("{\"version\":99}"), None).unwrap();
+        assert_eq!(c.version, STACKING_CONFIG_VERSION);
+        // Every other field still decodes to the current defaults — a
+        // foreign version does not otherwise change how the document is
+        // read (`#[serde(default)]` already tolerates a missing/renamed
+        // field on its own).
+        assert_eq!(
+            c,
+            StackingConfig {
+                version: STACKING_CONFIG_VERSION,
+                ..StackingConfig::default()
+            }
+        );
     }
 
     #[test]
@@ -466,5 +529,76 @@ mod tests {
             "{\"a\":2,\"b\":1}",
             "serde_json orders keys — the canonical form relies on it"
         );
+    }
+
+    #[test]
+    fn stage_hash_is_order_insensitive() {
+        let cfg = StackingConfig::default();
+        let subtree = calibration_subtree(&cfg);
+        let s1 = SourceIdentity {
+            file_id: 1,
+            size: 10,
+            modified_at: "t".into(),
+        };
+        let s2 = SourceIdentity {
+            file_id: 2,
+            size: 20,
+            modified_at: "u".into(),
+        };
+        let forward = stage_hash(
+            &subtree,
+            &["a", "b"],
+            &[
+                SourceIdentity {
+                    file_id: s1.file_id,
+                    size: s1.size,
+                    modified_at: s1.modified_at.clone(),
+                },
+                SourceIdentity {
+                    file_id: s2.file_id,
+                    size: s2.size,
+                    modified_at: s2.modified_at.clone(),
+                },
+            ],
+        );
+        let reversed = stage_hash(&subtree, &["b", "a"], &[s2, s1]);
+        assert_eq!(
+            forward, reversed,
+            "sources/upstream in either order must hash the same"
+        );
+
+        let changed = stage_hash(
+            &subtree,
+            &["a", "b"],
+            &[
+                SourceIdentity {
+                    file_id: 3,
+                    size: 10,
+                    modified_at: "t".into(),
+                },
+                SourceIdentity {
+                    file_id: 2,
+                    size: 20,
+                    modified_at: "u".into(),
+                },
+            ],
+        );
+        assert_ne!(forward, changed, "a changed file_id still changes the hash");
+    }
+
+    #[test]
+    fn config_hash_is_canonical_and_pinned() {
+        let default_hash = config_hash(&StackingConfig::default());
+        let value = serde_json::to_value(StackingConfig::default()).unwrap();
+        let roundtripped: StackingConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            config_hash(&roundtripped),
+            default_hash,
+            "a Value round-trip must not change the fingerprint"
+        );
+        // Pinned once, on this task's implementation — guards every future
+        // field reorder/rename in any config type. If this literal must
+        // change in a later task, that task says why.
+        assert_eq!(default_hash, "268adcec1face673");
     }
 }
