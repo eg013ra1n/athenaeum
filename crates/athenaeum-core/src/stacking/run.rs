@@ -32,16 +32,20 @@ use serde::Serialize;
 use crate::api::{db, ApiError, PathPolicy};
 use crate::calibration_library::cosmetic::HotPixelMapOutcome;
 use crate::db::stacking::{
-    finish_run, get_run, insert_group, insert_run, set_run_reference, set_run_status, update_group,
-    upsert_artifact, upsert_frame_row, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewRun,
+    finish_run, get_run, insert_group, insert_run, set_frame_rejected_fraction, set_run_reference,
+    set_run_status, update_group, upsert_artifact, upsert_frame_row, GroupUpdate, NewArtifact,
+    NewFrameRow, NewGroup, NewRun,
 };
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::{execute_generation, resolve_generation_cached};
 use crate::fits_parser::FitsHeader;
 use crate::geometry::PixelMap;
 use crate::integration::band_budget::total_ram_bytes;
+use crate::integration::engine::EngineProgress;
+use crate::integration::io_policy::IoPolicy;
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::IntegrationError;
+use crate::plate_solve::storage::{get_plate_solve, PlateSolveRecord};
 use crate::registration::db::{
     get_frame_set_reference, get_registration_for_frame_set, upsert_registration,
     RegistrationRecord,
@@ -50,15 +54,23 @@ use crate::services::compute_queue::ComputeJobKind;
 use crate::services::{ServiceContext, StackHandle};
 #[cfg(test)]
 use crate::stacking::config::config_hash;
-use crate::stacking::config::{ReferenceMode, StackingConfig};
+use crate::stacking::config::{CleanupPolicy, ReferenceMode, StackingConfig};
 use crate::stacking::groups::{group_frames, set_slug, ColorMode, GroupFrame, IntegrationGroup};
-use crate::stacking::measure::{measure_frame, FrameMeasurement};
-use crate::stacking::paths::WorkingLayout;
+use crate::stacking::integrate::{
+    integrate_group, GroupInput, GroupProgress, GroupStats, StackFrame,
+};
+use crate::stacking::master_cards::{
+    build_master_light_cards, master_file_name, write_master_light, MasterCardInputs,
+};
+use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
+use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, is_fresh, measurement_hash_for, registration_hash_for, registration_row_is_fresh,
     HashMemo, Stage,
 };
-use crate::stacking::provenance::{RunSummary, SummaryMeasurement, SummaryReference};
+use crate::stacking::provenance::{
+    RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
+};
 use crate::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, to_record,
 };
@@ -181,15 +193,13 @@ pub(crate) struct RunContext {
     /// `write_frame_rows`).
     pub(crate) group_ids: HashMap<String, i64>,
     pub(crate) layout: WorkingLayout,
-    /// The run's output folder (masters land here — Task 8's Output stage).
-    /// Not read by Task 6's own stage (calibrate writes only into `layout`).
-    #[allow(dead_code)]
+    /// The run's output folder — every group's master (and, when requested,
+    /// its rejection maps) lands directly here (Task 8's Output stage).
     pub(crate) output_dir: PathBuf,
     pub(crate) cancel: Arc<AtomicBool>,
-    /// Not read again by Task 6 (only used to seed `summary.app_version` at
-    /// construction) — Task 8's master-card headers (`MasterCardInputs`)
-    /// need it again.
-    #[allow(dead_code)]
+    /// Seeds `summary.app_version` at construction; Task 8's master-card
+    /// headers (`MasterCardInputs::app_version`, the `SWCREATE` card) read it
+    /// again.
     pub(crate) app_version: String,
     pub(crate) warnings: Vec<String>,
     pub(crate) timings: Vec<crate::stacking::provenance::StageTiming>,
@@ -204,6 +214,14 @@ pub(crate) struct RunContext {
     /// (decision 4) — a dark shared by every frame in a group pays the
     /// measurement once.
     pub(crate) hot_maps: HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
+    /// `frame_id -> whether stage 1 REUSED an existing `calibrated` artifact
+    /// for it` (Task 8's own addition — the brief's `SummaryFrame.cached_calibrated`
+    /// has no field on [`MeasuredFrame`] to read it from otherwise, since
+    /// `CalibrateOutcome` is transient and stage 3 builds `MeasuredFrame`
+    /// fresh from the DB, blind to which run wrote the artifact it found).
+    /// Populated once per frame by [`stage_calibrate`]; read by
+    /// [`stage_measure`] when it builds each frame's [`MeasuredFrame`].
+    pub(crate) cached_calibrated: HashMap<i64, bool>,
     /// Frames excluded AT RUN TIME (as opposed to `excluded`'s manual,
     /// pre-run exclusions), with why — stage 1 pushes `(frame_id,
     /// "calibration failed: …")` here; stages 3 and 5 (Task 7) push their
@@ -495,6 +513,7 @@ pub fn start_stacking(
         rerun_from,
         memo: HashMemo::new(),
         hot_maps: HashMap::new(),
+        cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
         measured: HashMap::new(),
         reference_frame_id: None,
@@ -592,6 +611,25 @@ fn run_thread(mut rc: RunContext) {
         }
     };
 
+    // Ruling 15 / brief: `masters` lists every group that actually wrote one
+    // (`SummaryGroup.master_path` is `Some` only then); `success` additionally
+    // requires at least one — `stage_output` already fails the whole run when
+    // no group ever wrote a master, so this is a redundant-but-cheap safety
+    // net, not the primary gate.
+    let masters: Vec<StackingMasterRef> = rc
+        .summary
+        .groups
+        .iter()
+        .filter_map(|g| {
+            g.master_path.clone().map(|path| StackingMasterRef {
+                group_key: g.key.clone(),
+                path,
+                drizzle_path: None,
+            })
+        })
+        .collect();
+    let success = success && !masters.is_empty();
+
     rc.summary.status = status.to_string();
     rc.summary.finished_at =
         Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
@@ -658,10 +696,6 @@ fn run_thread(mut rc: RunContext) {
         "stacking run finished"
     );
 
-    // Tasks 7-8 populate this from every group that actually wrote a master
-    // (ruling 15) — stage 1 alone never does.
-    let masters: Vec<StackingMasterRef> = Vec::new();
-
     emit_event(
         rc.emitter.as_ref(),
         STACKING_COMPLETE_EVENT,
@@ -725,7 +759,7 @@ fn run_pipeline(rc: &mut RunContext) -> Result<(), RunError> {
         panic!("injected test failure after stage register");
     }
 
-    // Task 8: stage_normalize/integrate, stage_output, cleanup.
+    stage_output(rc)?;
 
     Ok(())
 }
@@ -987,8 +1021,13 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
             rc.check_cancel()?;
 
             match calibrate_one_frame(rc, &cfg, group, frame, &scratch)? {
-                CalibrateOutcome::Reused { bytes } | CalibrateOutcome::Generated { bytes } => {
+                CalibrateOutcome::Reused { bytes } => {
                     bytes_done += bytes;
+                    rc.cached_calibrated.insert(frame.frame_id, true);
+                }
+                CalibrateOutcome::Generated { bytes } => {
+                    bytes_done += bytes;
+                    rc.cached_calibrated.insert(frame.frame_id, false);
                 }
                 CalibrateOutcome::Excluded { reason } => {
                     tracing::warn!(
@@ -1049,6 +1088,17 @@ pub(crate) struct MeasuredFrame {
     included: bool,
     reason: Option<String>,
     registration: Option<RegisteredFrameOutcome>,
+    /// Whether stage 1 REUSED an existing `calibrated` artifact for this
+    /// frame rather than writing a fresh one (Task 8's own addition, from
+    /// `RunContext::cached_calibrated` — `false` for a frame excluded before
+    /// reaching that lookup, which is never wrong for those since they never
+    /// had anything to reuse). Feeds `SummaryFrame::cached_calibrated`.
+    cached_calibrated: bool,
+    /// Whether stage 3 reused an existing `metrics` artifact for this frame
+    /// rather than measuring it fresh (Task 8's own addition — set inline,
+    /// in the same branch that already decides "reused", right below).
+    /// Feeds `SummaryFrame::cached_metrics`.
+    cached_metrics: bool,
 }
 
 /// One frame's stage 5 outcome. `cached: true` means an existing
@@ -1209,6 +1259,8 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     included: false,
                     reason: Some("excluded manually".to_string()),
                     registration: None,
+                    cached_calibrated: false,
+                    cached_metrics: false,
                 });
                 continue;
             }
@@ -1222,6 +1274,8 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     included: false,
                     reason: Some(reason.clone()),
                     registration: None,
+                    cached_calibrated: false,
+                    cached_metrics: false,
                 });
                 continue;
             }
@@ -1250,6 +1304,8 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     included: false,
                     reason: Some(reason),
                     registration: None,
+                    cached_calibrated: false,
+                    cached_metrics: false,
                 });
                 continue;
             };
@@ -1263,6 +1319,11 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 Ok(_) => {
                     let reason = "calibrated frame has no planes".to_string();
                     rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                    let cached_calibrated = rc
+                        .cached_calibrated
+                        .get(&frame.frame_id)
+                        .copied()
+                        .unwrap_or(false);
                     entries.push(MeasuredFrame {
                         frame: frame.clone(),
                         calibrated: Some(calibrated_path),
@@ -1272,11 +1333,18 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                         included: false,
                         reason: Some(reason),
                         registration: None,
+                        cached_calibrated,
+                        cached_metrics: false,
                     });
                     continue;
                 }
                 Err(reason) => {
                     rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                    let cached_calibrated = rc
+                        .cached_calibrated
+                        .get(&frame.frame_id)
+                        .copied()
+                        .unwrap_or(false);
                     entries.push(MeasuredFrame {
                         frame: frame.clone(),
                         calibrated: Some(calibrated_path),
@@ -1286,12 +1354,19 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                         included: false,
                         reason: Some(reason),
                         registration: None,
+                        cached_calibrated,
+                        cached_metrics: false,
                     });
                     continue;
                 }
             };
             max_planes = max_planes.max(planes);
 
+            let cached_calibrated = rc
+                .cached_calibrated
+                .get(&frame.frame_id)
+                .copied()
+                .unwrap_or(false);
             entries.push(MeasuredFrame {
                 frame: frame.clone(),
                 calibrated: Some(calibrated_path.clone()),
@@ -1301,6 +1376,8 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 included: false,
                 reason: None,
                 registration: None,
+                cached_calibrated,
+                cached_metrics: false,
             });
             to_measure.push((entries.len() - 1, frame.clone(), calibrated_path));
         }
@@ -1335,6 +1412,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                             match serde_json::from_str::<FrameMeasurement>(payload) {
                                 Ok(m) => {
                                     entries[idx].measurement = Some(m);
+                                    entries[idx].cached_metrics = true;
                                     reused = true;
                                 }
                                 Err(e) => {
@@ -2301,6 +2379,830 @@ fn write_frame_rows(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 
+// ── Stages 6/7/9 (Task 8): normalize, integrate, output ────────────────────
+
+/// One process, one writer: `master_file_name`/`write_master_light`
+/// (`resolve_collision`) are check-then-write, so two groups' writes — even
+/// across two concurrent runs of the same process — must never race on the
+/// same free name (carry-forward).
+static OUTPUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// One included member of a group, snapshotted out of `rc.measured` before
+/// the (possibly slow) integration call so nothing below needs a borrow of
+/// `rc` to survive it — the fields [`crate::stacking::integrate::StackFrame`]
+/// needs, plus `frame_id` (`StackFrame` itself has no identity field).
+struct GroupMember {
+    frame_id: i64,
+    calibrated: PathBuf,
+    map: PixelMap,
+    measurement: FrameMeasurement,
+    weight: FrameWeight,
+    exposure_s: Option<f64>,
+    date_obs: Option<String>,
+}
+
+/// What became of one group at Output time.
+enum GroupOutcome {
+    /// Fewer than 3 included frames — per stage 3, possibly narrowed further
+    /// by a stage-5 registration exclusion — never attempted.
+    Skipped,
+    /// `integrate_group`, the master-card build or the write itself failed
+    /// (anything other than a cancel). The group row is already `failed`
+    /// with the message, a warning already logged/pushed, and a
+    /// `SummaryGroup` with no master already pushed — the caller only needs
+    /// to know this group did not produce one.
+    Failed,
+    /// A master was written; the group row and `SummaryGroup` are already
+    /// updated/pushed.
+    Written,
+}
+
+/// The serde name (camelCase, per every stacking config enum's own
+/// attribute) of an enum value — `MasterCardInputs::weight_mode`/
+/// `::normalization` want the SAME strings the config itself round-trips as
+/// (`"psfSignalWeight"`, `"scaleZeroOffset"`, …), not a hand-written mirror
+/// that could drift from the enum's own `#[serde(rename_all = "camelCase")]`.
+fn enum_serde_name<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Build one [`SummaryFrame`] from a frame's whole stage 3-5 outcome plus,
+/// once integration has run, its `rejected_fraction` (`None` for anything
+/// integration never actually combined — excluded before it ever ran, or
+/// dropped by `integrate_group`'s OWN min-weight floor, a check independent
+/// of `cfg.selection`'s stage-3 floor; `GroupOutput` reports only a COUNT of
+/// such drops, not which frames, so `included`/`SummaryFrame.included` here
+/// still reflect stage 3-5's decision, not that further drop — a known,
+/// narrow gap, not something any of this task's required tests exercises).
+fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> SummaryFrame {
+    let m = entry.measurement.as_ref();
+    let mean_channel =
+        |f: fn(&crate::stacking::measure::ChannelMeasurement) -> f64| -> Option<f64> {
+            m.map(|meas| {
+                if meas.channels.is_empty() {
+                    0.0
+                } else {
+                    meas.channels.iter().map(|c| f(c)).sum::<f64>() / meas.channels.len() as f64
+                }
+            })
+        };
+    let (reg_status, reg_model, reg_rms_px, reg_inliers, reg_inlier_ratio, reg_flipped) =
+        match &entry.registration {
+            Some(RegisteredFrameOutcome::Aligned { record, .. }) => (
+                Some(record.status.clone()),
+                record.model.clone(),
+                Some(record.rms_residual_px),
+                Some(record.matched_stars as usize),
+                record.inlier_ratio,
+                Some(record.flipped),
+            ),
+            Some(RegisteredFrameOutcome::Failed(_)) => {
+                (Some("failed".to_string()), None, None, None, None, None)
+            }
+            None => (Some("skipped".to_string()), None, None, None, None, None),
+        };
+    SummaryFrame {
+        frame_id: entry.frame.frame_id,
+        filename: entry.frame.filename.clone(),
+        included: entry.included,
+        exclusion_reason: entry.reason.clone(),
+        weight: entry.weight.as_ref().map(|w| w.normalized_mean),
+        weight_channels: entry
+            .weight
+            .as_ref()
+            .map(|w| w.normalized.clone())
+            .unwrap_or_default(),
+        fwhm_px: m.map(FrameMeasurement::mean_fwhm_px),
+        eccentricity: m.map(FrameMeasurement::mean_eccentricity),
+        stars: m.map(FrameMeasurement::min_stars),
+        psf_signal_weight: m.map(FrameMeasurement::mean_psf_signal_weight),
+        psf_snr: mean_channel(|c| c.psf_snr),
+        noise: mean_channel(|c| c.noise),
+        reg_status,
+        reg_model,
+        reg_rms_px,
+        reg_inliers,
+        reg_inlier_ratio,
+        reg_flipped,
+        rejected_fraction,
+        calibrated_path: entry.calibrated.as_ref().map(|p| p.display().to_string()),
+        cached_calibrated: entry.cached_calibrated,
+        cached_metrics: entry.cached_metrics,
+        cached_registration: matches!(
+            entry.registration,
+            Some(RegisteredFrameOutcome::Aligned { cached: true, .. })
+        ),
+    }
+}
+
+/// Push one [`SummaryGroup`] for `group` onto `rc.summary.groups` — called
+/// exactly once per plan group, whatever its outcome (skipped/failed/
+/// written), so the run's provenance document always accounts for every
+/// group. `rejected_by_frame` is empty for a skipped/failed group (nothing
+/// was ever combined).
+#[allow(clippy::too_many_arguments)]
+fn push_summary_group(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    included_count: usize,
+    master_path: Option<String>,
+    rejection_low_path: Option<String>,
+    rejection_high_path: Option<String>,
+    stats: Option<GroupStats>,
+    normalization_reference_frame_id: Option<i64>,
+    rejected_by_frame: &HashMap<i64, f64>,
+) {
+    let frames = rc
+        .measured
+        .get(&group.key)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| {
+                    let rf = rejected_by_frame.get(&e.frame.frame_id).copied();
+                    summary_frame_for(e, rf)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    rc.summary.groups.push(SummaryGroup {
+        key: group.key.clone(),
+        frame_count: group.frames.len(),
+        included_count,
+        master_path,
+        rejection_low_path,
+        rejection_high_path,
+        stats,
+        normalization_reference_frame_id,
+        frames,
+    });
+}
+
+/// Mark a group `skipped` (DB row + `SummaryGroup` with no master) and
+/// return [`GroupOutcome::Skipped`] — the shared tail for "fewer than 3
+/// included frames reached Output", whether stage 3 already said so or a
+/// stage-5 registration exclusion narrowed it further since.
+fn skip_group(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    included_count: usize,
+) -> Result<GroupOutcome, RunError> {
+    let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
+        RunError::Other(format!(
+            "no stacking_run_groups row for group {}",
+            group.key
+        ))
+    })?;
+    {
+        let conn = db(&rc.ctx)?.conn();
+        update_group(
+            &conn,
+            group_id,
+            &GroupUpdate {
+                included_count: Some(included_count as i64),
+                status: Some("skipped"),
+                ..Default::default()
+            },
+        )?;
+    }
+    push_summary_group(
+        rc,
+        group,
+        included_count,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &HashMap::new(),
+    );
+    Ok(GroupOutcome::Skipped)
+}
+
+/// Mark a group `failed` (DB row + `warn!` + `SummaryGroup` with no master)
+/// and return [`GroupOutcome::Failed`] — the shared tail of every non-cancel
+/// error path in [`process_group_output`] (brief: "any other error → group
+/// `failed`, `warn!`, continue with the next group").
+fn fail_group(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    included_count: usize,
+    msg: &str,
+) -> Result<GroupOutcome, RunError> {
+    tracing::warn!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        error = %msg,
+        "group integration failed"
+    );
+    rc.warnings.push(format!("group {}: {msg}", group.key));
+    let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
+        RunError::Other(format!(
+            "no stacking_run_groups row for group {}",
+            group.key
+        ))
+    })?;
+    {
+        let conn = db(&rc.ctx)?.conn();
+        update_group(
+            &conn,
+            group_id,
+            &GroupUpdate {
+                included_count: Some(included_count as i64),
+                status: Some("failed"),
+                error: Some(msg),
+                ..Default::default()
+            },
+        )?;
+    }
+    push_summary_group(
+        rc,
+        group,
+        included_count,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &HashMap::new(),
+    );
+    Ok(GroupOutcome::Failed)
+}
+
+/// Normalize (1/1 progress, spec ruling 14 — folded into `integrate_group`
+/// itself, nothing separate to time), integrate and write the master for one
+/// group. Returns the outcome plus (normalize, integrate, output) wall time
+/// for [`stage_output`]'s own per-stage [`crate::stacking::provenance::StageTiming`]
+/// totals. `Err(RunError::Cancelled)` — from `IntegrationError::Cancelled` or
+/// a cancel noticed before this group started — is the ONLY error that
+/// propagates; everything else becomes `Ok((GroupOutcome::Failed, ..))` via
+/// [`fail_group`], per ruling 12 (a cancelled run keeps its artifacts and
+/// writes no master) vs. the brief's per-group failure policy.
+fn process_group_output(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    measure_opts: &MeasureOptions,
+    wcs: Option<&PlateSolveRecord>,
+) -> Result<(GroupOutcome, Duration, Duration, Duration), RunError> {
+    let zero = || (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+
+    let included_count = rc
+        .measured
+        .get(&group.key)
+        .map(|v| v.iter().filter(|e| e.included).count())
+        .unwrap_or(0);
+    if included_count < 3 {
+        let (n, i, o) = zero();
+        return Ok((skip_group(rc, group, included_count)?, n, i, o));
+    }
+
+    // Snapshot the included members' data — nothing below needs `rc` again
+    // until the write completes, so no borrow of it needs to survive the
+    // (potentially slow) integration call.
+    let mut members: Vec<GroupMember> = Vec::with_capacity(included_count);
+    if let Some(entries) = rc.measured.get(&group.key) {
+        for e in entries {
+            if !e.included {
+                continue;
+            }
+            let Some(calibrated) = e.calibrated.clone() else {
+                continue;
+            };
+            let Some(measurement) = e.measurement.clone() else {
+                continue;
+            };
+            let map = match &e.registration {
+                Some(RegisteredFrameOutcome::Aligned { map, .. }) => map.clone(),
+                _ => continue,
+            };
+            let weight = e.weight.clone().unwrap_or(FrameWeight {
+                channels: Vec::new(),
+                normalized: Vec::new(),
+                mean: 0.0,
+                normalized_mean: 0.0,
+                missing: None,
+            });
+            members.push(GroupMember {
+                frame_id: e.frame.frame_id,
+                calibrated,
+                map,
+                measurement,
+                weight,
+                exposure_s: e.frame.exposure_s,
+                date_obs: e.frame.date_obs.clone(),
+            });
+        }
+    }
+
+    if members.len() < 3 {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            count = members.len(),
+            "stacking group skipped: fewer than 3 registered members reached integration"
+        );
+        let (n, i, o) = zero();
+        return Ok((skip_group(rc, group, members.len())?, n, i, o));
+    }
+
+    rc.progress(
+        Stage::Normalize,
+        Some(group.key.clone()),
+        1,
+        1,
+        0,
+        0,
+        None,
+        None,
+    );
+
+    // Ruling 7: the global reference anchors normalization only when it is
+    // itself a member of this group; otherwise the group's own best-weighted
+    // included member does.
+    let reference_idx = match members
+        .iter()
+        .position(|m| Some(m.frame_id) == rc.reference_frame_id)
+    {
+        Some(idx) => idx,
+        None => {
+            let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
+            let included_mask = vec![true; members.len()];
+            let star_counts: Vec<usize> =
+                members.iter().map(|m| m.measurement.min_stars()).collect();
+            match best_by_weight(&weights, &included_mask, &star_counts) {
+                Some(idx) => idx,
+                None => {
+                    let (n, i, o) = zero();
+                    return Ok((
+                        fail_group(
+                            rc,
+                            group,
+                            members.len(),
+                            "no included frame to anchor normalization",
+                        )?,
+                        n,
+                        i,
+                        o,
+                    ));
+                }
+            }
+        }
+    };
+    let normalization_reference_frame_id = members[reference_idx].frame_id;
+
+    // Ruling 6: every group's master adopts the GLOBAL reference's geometry;
+    // the group's OWN plane count (mono vs. debayered OSC) is whatever this
+    // group's own measurements actually carry.
+    let channels = members[reference_idx].measurement.channels.len();
+    let width = rc.reference_width;
+    let height = rc.reference_height;
+
+    let stack_frames: Vec<StackFrame> = members
+        .iter()
+        .map(|m| StackFrame {
+            path: m.calibrated.clone(),
+            map: m.map.clone(),
+            measurement: m.measurement.clone(),
+            weight: m.weight.clone(),
+            exposure_s: m.exposure_s.unwrap_or(0.0),
+            date_obs: m.date_obs.clone(),
+        })
+        .collect();
+
+    // Maps memory check (carry-forward): turn maps off for THIS group with a
+    // warning rather than fail, when they would not fit the budget.
+    let mut group_integration = rc.config.integration.clone();
+    if group_integration.write_rejection_maps {
+        let maps_bytes = 3u64 * channels as u64 * width as u64 * height as u64 * 4;
+        let fits = total_ram_bytes()
+            .map(|total| maps_bytes <= total / 4)
+            .unwrap_or(true);
+        if !fits {
+            group_integration.write_rejection_maps = false;
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                "rejection maps disabled for this group: over the memory budget"
+            );
+            rc.warnings.push(format!(
+                "group {}: rejection maps disabled — would exceed the memory budget",
+                group.key
+            ));
+        }
+    }
+    let normalization_cfg = rc.config.normalization.clone();
+
+    let input = GroupInput {
+        frames: &stack_frames,
+        reference: reference_idx,
+        width,
+        height,
+        channels,
+        interpolation: rc.config.registration.interpolation,
+        clamping: rc.config.registration.clamping_threshold,
+        integration: &group_integration,
+        normalization: &normalization_cfg,
+    };
+
+    let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
+    let io: IoPolicy = {
+        let conn = db(&rc.ctx)?.conn();
+        crate::integration::io_policy::resolve(
+            &conn,
+            &rc.ctx.settings,
+            &paths,
+            rc.ctx.image_pool.current_num_threads(),
+        )?
+    };
+
+    // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`
+    // closures the engine may call from any of its own worker threads — they
+    // take no `&mut RunContext`, only cloned-out plain values plus an
+    // `AtomicUsize`/`Mutex<Instant>` for the shared "which plane, when did we
+    // last emit" state (same pattern as `api::masters::run_build`).
+    // Percent = `100 * (plane + band_fraction) / planes`: `on_plane` stamps
+    // the current plane (fired at plane start, `band_fraction = 0`);
+    // `on_band`/`on_combine` read it back and derive `band_fraction` from
+    // the engine's own `bytes_done/bytes_total` pair for that plane.
+    let current_plane = std::sync::atomic::AtomicUsize::new(0);
+    let last_tick: Mutex<Instant> =
+        Mutex::new(Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS));
+    let emitter = rc.emitter.clone();
+    let run_id = rc.run_id;
+    let set_id = rc.set_id;
+    let group_key_for_progress = group.key.clone();
+    let channels_f = channels.max(1) as f64;
+
+    let emit_integrate_tick =
+        |plane: usize, frac: f64, bytes_done: u64, bytes_total: u64, force: bool| {
+            let now = Instant::now();
+            {
+                let mut last = last_tick.lock().unwrap();
+                if !force && now.duration_since(*last) < Duration::from_millis(PROGRESS_THROTTLE_MS)
+                {
+                    return;
+                }
+                *last = now;
+            }
+            let percent = 100.0 * (plane as f64 + frac) / channels_f;
+            emit_event(
+                emitter.as_ref(),
+                STACKING_PROGRESS_EVENT,
+                &StackingProgressEvent {
+                    run_id,
+                    set_id,
+                    stage: Stage::Integrate,
+                    group_key: Some(group_key_for_progress.clone()),
+                    current: plane,
+                    total: channels,
+                    percent,
+                    bytes_done,
+                    bytes_total,
+                    frame_id: None,
+                    message: None,
+                },
+            );
+        };
+    let on_plane = |p: usize, _total: usize| {
+        current_plane.store(p, Ordering::Relaxed);
+        emit_integrate_tick(p, 0.0, 0, 0, true);
+    };
+    let on_band = |_band: usize, _bands: usize, bytes_done: u64, bytes_total: u64| {
+        let plane = current_plane.load(Ordering::Relaxed);
+        let frac = if bytes_total > 0 {
+            (bytes_done as f64 / bytes_total as f64).min(1.0)
+        } else {
+            0.0
+        };
+        emit_integrate_tick(plane, frac, bytes_done, bytes_total, false);
+    };
+    let on_combine = |_rows: usize, _rows_total: usize, bytes_done: u64, bytes_total: u64| {
+        let plane = current_plane.load(Ordering::Relaxed);
+        emit_integrate_tick(plane, 1.0, bytes_done, bytes_total, false);
+    };
+    let progress = GroupProgress {
+        on_plane: &on_plane,
+        engine: EngineProgress {
+            on_band: &on_band,
+            on_combine: &on_combine,
+        },
+    };
+
+    let integrate_start = Instant::now();
+    let cancel: &AtomicBool = &rc.cancel;
+    let pool: &rayon::ThreadPool = rc.ctx.image_pool.as_ref();
+    let output = match integrate_group(&input, measure_opts, pool, cancel, &progress, io) {
+        Ok(o) => o,
+        Err(IntegrationError::Cancelled) => return Err(RunError::Cancelled),
+        Err(e) => {
+            let outcome = fail_group(
+                rc,
+                group,
+                members.len(),
+                &format!("group integration failed: {e}"),
+            )?;
+            return Ok((
+                outcome,
+                Duration::ZERO,
+                integrate_start.elapsed(),
+                Duration::ZERO,
+            ));
+        }
+    };
+    emit_integrate_tick(channels, 0.0, 0, 0, true);
+    let integrate_dur = integrate_start.elapsed();
+
+    let output_start = Instant::now();
+
+    let group_reference_calibrated = members[reference_idx].calibrated.clone();
+    let reference_cards = match source_cards_from_file(&group_reference_calibrated) {
+        Ok(c) => c,
+        Err(e) => {
+            let outcome = fail_group(
+                rc,
+                group,
+                members.len(),
+                &format!("failed to read the group reference's header: {e}"),
+            )?;
+            return Ok((
+                outcome,
+                Duration::ZERO,
+                integrate_dur,
+                output_start.elapsed(),
+            ));
+        }
+    };
+
+    let date_obs_first = output
+        .included
+        .iter()
+        .filter_map(|&i| members[i].date_obs.as_deref())
+        .min();
+    let date_obs_last = output
+        .included
+        .iter()
+        .filter_map(|&i| members[i].date_obs.as_deref())
+        .max();
+    let included_exposures: Vec<f64> = output
+        .included
+        .iter()
+        .filter_map(|&i| members[i].exposure_s)
+        .collect();
+
+    let reference_id = group_reference_calibrated
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reference")
+        .to_string();
+    let weight_mode_str = enum_serde_name(&rc.config.measurement.weight_mode);
+    let normalization_str = format!(
+        "{}/{}",
+        enum_serde_name(&rc.config.normalization.output),
+        enum_serde_name(&rc.config.normalization.rejection)
+    );
+    let run_id_str = rc.run_id.to_string();
+
+    let cards = match build_master_light_cards(&MasterCardInputs {
+        reference_cards: &reference_cards,
+        wcs,
+        frames: output.stats.included,
+        weighted_exposure_s: output.stats.weighted_exposure_s,
+        date_obs_first,
+        date_obs_last,
+        recipe: &output.stats.recipe,
+        weight_mode: &weight_mode_str,
+        normalization: &normalization_str,
+        reference_id: &reference_id,
+        group_key: &group.key,
+        run_id: &run_id_str,
+        app_version: &rc.app_version,
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            let outcome = fail_group(
+                rc,
+                group,
+                members.len(),
+                &format!("failed to build the master header: {e}"),
+            )?;
+            return Ok((
+                outcome,
+                Duration::ZERO,
+                integrate_dur,
+                output_start.elapsed(),
+            ));
+        }
+    };
+
+    let name = master_file_name(
+        &rc.set_name,
+        group.filter.as_deref(),
+        group.instrume.as_deref(),
+        &included_exposures,
+    );
+
+    let written = {
+        let _guard = OUTPUT_WRITE_LOCK.lock().unwrap();
+        write_master_light(&rc.output_dir, &name, &output, &cards)
+    };
+    let written = match written {
+        Ok(w) => w,
+        Err(e) => {
+            let outcome = fail_group(
+                rc,
+                group,
+                members.len(),
+                &format!("failed to write the master: {e:#}"),
+            )?;
+            return Ok((
+                outcome,
+                Duration::ZERO,
+                integrate_dur,
+                output_start.elapsed(),
+            ));
+        }
+    };
+
+    let stats_json = serde_json::to_string(&output.stats)
+        .map_err(|e| RunError::Other(format!("failed to serialize group stats: {e}")))?;
+    let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
+        RunError::Other(format!(
+            "no stacking_run_groups row for group {}",
+            group.key
+        ))
+    })?;
+    let master_path_str = written.master.display().to_string();
+    let rejection_low_str = written
+        .rejection_low
+        .as_ref()
+        .map(|p| p.display().to_string());
+    let rejection_high_str = written
+        .rejection_high
+        .as_ref()
+        .map(|p| p.display().to_string());
+
+    let mut rejected_by_frame: HashMap<i64, f64> = HashMap::with_capacity(output.included.len());
+    {
+        let conn = db(&rc.ctx)?.conn();
+        update_group(
+            &conn,
+            group_id,
+            &GroupUpdate {
+                included_count: Some(output.stats.included as i64),
+                master_path: Some(&master_path_str),
+                rejection_low_path: rejection_low_str.as_deref(),
+                rejection_high_path: rejection_high_str.as_deref(),
+                stats_json: Some(&stats_json),
+                status: Some("done"),
+                ..Default::default()
+            },
+        )?;
+
+        for (k, &idx) in output.included.iter().enumerate() {
+            if let Some(frac) = output.stats.rejected_fraction_per_frame.get(k).copied() {
+                let frame_id = members[idx].frame_id;
+                set_frame_rejected_fraction(&conn, rc.run_id, frame_id, frac)?;
+                rejected_by_frame.insert(frame_id, frac);
+            }
+        }
+    }
+
+    tracing::info!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        path = %master_path_str,
+        "master written"
+    );
+
+    push_summary_group(
+        rc,
+        group,
+        output.stats.included,
+        Some(master_path_str),
+        rejection_low_str,
+        rejection_high_str,
+        Some(output.stats.clone()),
+        Some(normalization_reference_frame_id),
+        &rejected_by_frame,
+    );
+
+    let output_dur = output_start.elapsed();
+    rc.progress(
+        Stage::Output,
+        Some(group.key.clone()),
+        1,
+        1,
+        0,
+        0,
+        None,
+        None,
+    );
+
+    Ok((
+        GroupOutcome::Written,
+        Duration::ZERO,
+        integrate_dur,
+        output_dur,
+    ))
+}
+
+/// Stages 6 (normalize), 7 (integrate) and 9 (output). Per group, in
+/// `rc.plan_groups` (plan) order: [`process_group_output`] recomputes
+/// viability from `rc.measured`'s FINAL state (stage 5 can have narrowed a
+/// group below 3 included since stage 3's own check), integrates through
+/// Plan 4's `integrate_group`, and writes the master + optional rejection
+/// maps. A cancel (from `IntegrationError::Cancelled` or noticed between
+/// groups) aborts the whole run — ruling 12: a cancelled run keeps its
+/// artifacts and writes no master. Any other integration/write failure fails
+/// only that group; a run in which NO group ever wrote a master ends the
+/// whole run `failed` too — there is nothing to hand back either way. Once
+/// every group has been attempted and at least one wrote a master, the
+/// configured cleanup policy runs exactly once.
+fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
+    let cfg = rc.config.clone();
+    let measure_opts = cfg
+        .measurement
+        .measure_options(cfg.normalization.scale_estimator);
+
+    let reference_frame_id = rc
+        .reference_frame_id
+        .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
+
+    // Ruling 6: every group's master shares the GLOBAL reference's WCS —
+    // fetched once, not per group.
+    let wcs = {
+        let conn = db(&rc.ctx)?.conn();
+        get_plate_solve(&conn, reference_frame_id)?
+    };
+    if wcs.is_none() {
+        tracing::warn!(
+            run_id = rc.run_id,
+            frame_id = reference_frame_id,
+            "no plate solve on the reference frame; the master has no WCS"
+        );
+        rc.warnings
+            .push("no plate solve on the reference frame; the master has no WCS".to_string());
+    }
+
+    let groups = rc.plan_groups.clone();
+    let mut any_master = false;
+    let mut normalize_total = Duration::ZERO;
+    let mut integrate_total = Duration::ZERO;
+    let mut output_total = Duration::ZERO;
+
+    for group in &groups {
+        rc.check_cancel()?;
+        let (outcome, n, i, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
+        normalize_total += n;
+        integrate_total += i;
+        output_total += o;
+        if matches!(outcome, GroupOutcome::Written) {
+            any_master = true;
+        }
+    }
+
+    rc.timings.push(crate::stacking::provenance::StageTiming {
+        stage: Stage::Normalize,
+        duration_ms: normalize_total.as_millis() as u64,
+    });
+    rc.timings.push(crate::stacking::provenance::StageTiming {
+        stage: Stage::Integrate,
+        duration_ms: integrate_total.as_millis() as u64,
+    });
+    rc.timings.push(crate::stacking::provenance::StageTiming {
+        stage: Stage::Output,
+        duration_ms: output_total.as_millis() as u64,
+    });
+
+    if !any_master {
+        return Err(RunError::Other("no group produced a master".to_string()));
+    }
+
+    match cfg.output.cleanup {
+        CleanupPolicy::KeepAll => {}
+        CleanupPolicy::DeleteRegistered => {
+            let freed = {
+                let conn = db(&rc.ctx)?.conn();
+                cleanup_work(&conn, rc.set_id, &rc.layout, CleanupWhat::Registered)?
+            };
+            tracing::info!(run_id = rc.run_id, freed_bytes = freed, "cleanup applied");
+        }
+        CleanupPolicy::DeleteIntermediates => {
+            let freed = {
+                let conn = db(&rc.ctx)?.conn();
+                cleanup_work(&conn, rc.set_id, &rc.layout, CleanupWhat::Intermediates)?
+            };
+            tracing::info!(run_id = rc.run_id, freed_bytes = freed, "cleanup applied");
+        }
+    }
+
+    Ok(())
+}
+
 /// Build a [`RunContext`] directly from fixture data, bypassing
 /// [`start_stacking`]'s DB/plan machinery — the calibrate-stage tests below
 /// (and Task 7's own stage 3-5 tests) call [`stage_calibrate`] (or their own
@@ -2383,6 +3285,7 @@ pub(crate) fn test_context(
         rerun_from: None,
         memo: HashMemo::new(),
         hot_maps: HashMap::new(),
+        cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
         measured: HashMap::new(),
         reference_frame_id: None,
@@ -3769,5 +4672,412 @@ mod tests {
             }
             other => panic!("expected RunError::Other, got {other:?}"),
         }
+    }
+
+    // ── stages 6/7/9 (Task 8): normalize, integrate, output ────────────────
+
+    /// Every canonical stage in pipeline order, used to check the SET of
+    /// stages a full run's progress events cover, in the order they first
+    /// appear.
+    const CANONICAL_STAGE_ORDER: [&str; 7] = [
+        "calibrate",
+        "measure",
+        "reference",
+        "register",
+        "normalize",
+        "integrate",
+        "output",
+    ];
+
+    /// The distinct `stage` values of `events`, in first-appearance order —
+    /// used to check a run's progress events cover the canonical stage
+    /// sequence, and that `percent` is monotonic WITHIN each stage's own
+    /// consecutive run of events.
+    fn stage_sequence_and_monotonic(events: &[serde_json::Value]) -> Vec<String> {
+        let mut order: Vec<String> = Vec::new();
+        let mut last_percent: HashMap<String, f64> = HashMap::new();
+        for e in events {
+            let stage = e["stage"].as_str().unwrap_or("").to_string();
+            if order.last() != Some(&stage) && !order.contains(&stage) {
+                order.push(stage.clone());
+            }
+            let percent = e["percent"].as_f64().unwrap_or(0.0);
+            if let Some(&prev) = last_percent.get(&stage) {
+                assert!(
+                    percent + 1e-9 >= prev,
+                    "percent went backwards for stage {stage}: {prev} -> {percent}"
+                );
+            }
+            last_percent.insert(stage, percent);
+        }
+        order
+    }
+
+    #[test]
+    fn full_run_writes_a_master_with_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let recorder = Arc::new(Recording::new());
+        let started = start_stacking(
+            ctx.clone(),
+            recorder.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("start should succeed");
+
+        wait_for_run(&ctx, started.run_id);
+
+        let run_row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_row.status, "done", "{run_row:?}");
+
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        assert_eq!(group.status, "done", "{group:?}");
+        let master_path = group.master_path.clone().expect("master path recorded");
+        assert!(
+            Path::new(&master_path).exists(),
+            "master file missing: {master_path}"
+        );
+
+        let stats: GroupStats =
+            serde_json::from_str(group.stats_json.as_deref().expect("stats_json set")).unwrap();
+        assert_eq!(stats.frames, 4, "{stats:?}");
+
+        let header = FitsHeader::from_path(Path::new(&master_path)).unwrap();
+        assert_eq!(header.get_str("IMAGETYP").as_deref(), Some("Master Light"));
+        assert_eq!(header.get_i32("NCOMBINE"), Some(4));
+        assert_eq!(
+            header.get_str("ATH_STKI").as_deref(),
+            Some(started.run_id.to_string().as_str())
+        );
+        assert_eq!(
+            header.get_str("ATH_STKG").as_deref(),
+            Some(group.group_key.as_str())
+        );
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let run_json_path = layout.run_json(started.run_id);
+        let run_json_text = std::fs::read_to_string(&run_json_path).unwrap();
+        let _summary: RunSummary =
+            serde_json::from_str(&run_json_text).expect("runs/run-<id>.json parses");
+        let summary_json = run_row.summary_json.clone().expect("summary_json stored");
+        assert_eq!(
+            run_json_text, summary_json,
+            "runs/run-<id>.json and the DB's summary_json must be the SAME document"
+        );
+
+        let events = recorder.events(STACKING_PROGRESS_EVENT);
+        let order = stage_sequence_and_monotonic(&events);
+        assert_eq!(order, CANONICAL_STAGE_ORDER, "{order:?}");
+
+        let completes = recorder.events(STACKING_COMPLETE_EVENT);
+        assert_eq!(completes.len(), 1, "{completes:?}");
+        assert_eq!(completes[0]["success"].as_bool(), Some(true));
+        let masters = completes[0]["masters"].as_array().unwrap();
+        assert_eq!(masters.len(), 1, "{masters:?}");
+        assert_eq!(
+            masters[0]["groupKey"].as_str(),
+            Some(group.group_key.as_str())
+        );
+    }
+
+    #[test]
+    fn rerun_reuses_everything_and_only_integrates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let started1 = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("first run should succeed");
+        wait_for_run(&ctx, started1.run_id);
+        let row1 = crate::db::stacking::get_run(&fixture.conn, started1.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row1.status, "done", "{row1:?}");
+        let groups1 = crate::db::stacking::list_groups(&fixture.conn, started1.run_id).unwrap();
+        let master_path1 = groups1[0].master_path.clone().expect("first master path");
+
+        let started2 = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("second run should succeed");
+        wait_for_run(&ctx, started2.run_id);
+        let row2 = crate::db::stacking::get_run(&fixture.conn, started2.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.status, "done", "{row2:?}");
+
+        let summary2: RunSummary =
+            serde_json::from_str(row2.summary_json.as_deref().unwrap()).unwrap();
+        let mut any_frame_checked = false;
+        for group in &summary2.groups {
+            for f in &group.frames {
+                if f.included {
+                    any_frame_checked = true;
+                    assert!(f.cached_calibrated, "{f:?}");
+                    assert!(f.cached_metrics, "{f:?}");
+                    assert!(f.cached_registration, "{f:?}");
+                }
+            }
+        }
+        assert!(
+            any_frame_checked,
+            "no included frame in the second run's summary"
+        );
+
+        let groups2 = crate::db::stacking::list_groups(&fixture.conn, started2.run_id).unwrap();
+        let master_path2 = groups2[0].master_path.clone().expect("second master path");
+        assert_ne!(
+            master_path1, master_path2,
+            "a rerun must never overwrite the first master"
+        );
+        assert!(
+            master_path2.contains("_2"),
+            "expected a collision-suffixed name: {master_path2}"
+        );
+        assert!(Path::new(&master_path1).exists());
+        assert!(Path::new(&master_path2).exists());
+    }
+
+    #[test]
+    fn cancel_mid_run_keeps_artifacts_writes_no_master() {
+        /// Cancels every active stacking run for `frames_set_id` the moment
+        /// the FIRST `measure`-stage progress event fires — no need to know
+        /// the run id ahead of time (which `start_stacking` has not
+        /// returned yet at the point the run thread's own first events can
+        /// already be firing): a stacking run's cancel flag lives on its
+        /// `StackHandle` in `ctx.active_stacks`, keyed by `frames_set_id`
+        /// there too.
+        struct CancelOnFirstMeasure {
+            ctx: Arc<ServiceContext>,
+            frames_set_id: i64,
+            fired: std::sync::atomic::AtomicBool,
+            recording: Recording,
+        }
+        impl ProgressEmitter for CancelOnFirstMeasure {
+            fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+                self.recording.emit_json(event_name, payload.clone());
+                if event_name == STACKING_PROGRESS_EVENT
+                    && payload["stage"] == "measure"
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    let active = self.ctx.active_stacks.lock().unwrap();
+                    for h in active.values() {
+                        if h.frames_set_id == self.frames_set_id {
+                            h.cancel_flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let emitter = Arc::new(CancelOnFirstMeasure {
+            ctx: ctx.clone(),
+            frames_set_id: fixture.set_id,
+            fired: std::sync::atomic::AtomicBool::new(false),
+            recording: Recording::new(),
+        });
+
+        let started = start_stacking(
+            ctx.clone(),
+            emitter.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("start should succeed");
+
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "cancelled", "{row:?}");
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        assert!(
+            crate::api::sync::dir_size_bytes(&layout.calibrated_root()) > 0,
+            "calibrated artifacts from stage 1 must survive a cancel"
+        );
+
+        let output_entries: Vec<_> = std::fs::read_dir(output.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            output_entries.is_empty(),
+            "a cancelled run must write no master: {output_entries:?}"
+        );
+
+        let completes = emitter.recording.events(STACKING_COMPLETE_EVENT);
+        assert_eq!(completes.len(), 1, "{completes:?}");
+        assert_eq!(completes[0]["cancelled"].as_bool(), Some(true));
+        assert_eq!(completes[0]["success"].as_bool(), Some(false));
+        assert_eq!(completes[0]["masters"].as_array().map(|v| v.len()), Some(0));
+    }
+
+    #[test]
+    fn delete_intermediates_cleans_the_working_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.cleanup = CleanupPolicy::DeleteIntermediates;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        assert_eq!(
+            crate::api::sync::dir_size_bytes(&layout.calibrated_root()),
+            0,
+            "calibrated frames must be gone after DeleteIntermediates"
+        );
+        assert_eq!(
+            crate::api::sync::dir_size_bytes(&layout.registered_root()),
+            0,
+            "registered frames must be gone after DeleteIntermediates"
+        );
+
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        let master_path = groups[0].master_path.clone().expect("master path");
+        assert!(
+            Path::new(&master_path).exists(),
+            "cleanup must never touch the output folder"
+        );
+        let _ = output;
+    }
+
+    #[test]
+    fn maps_written_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.integration.write_rejection_maps = true;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        let group = &groups[0];
+        let low = group.rejection_low_path.clone().expect("_rejlow path set");
+        let high = group
+            .rejection_high_path
+            .clone()
+            .expect("_rejhigh path set");
+        assert!(low.ends_with("_rejlow.fits"), "{low}");
+        assert!(high.ends_with("_rejhigh.fits"), "{high}");
+        assert!(Path::new(&low).exists(), "{low}");
+        assert!(Path::new(&high).exists(), "{high}");
     }
 }

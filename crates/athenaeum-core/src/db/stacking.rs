@@ -490,6 +490,27 @@ pub fn upsert_frame_row(conn: &Connection, f: &NewFrameRow<'_>) -> Result<i64> {
     .map_err(Into::into)
 }
 
+/// Set just `rejected_fraction` on an existing `(run_id, frame_id)` row —
+/// the Output stage (Plan 5a Task 8) calls this once per frame
+/// `integrate_group` actually combined, after the row already exists from
+/// [`upsert_frame_row`] (stage 5), without re-deriving every other column a
+/// full re-upsert would otherwise require repeating. A no-op (no error) when
+/// the row does not exist — the caller (a frame `integrate_group` combined)
+/// always already has one, but this is deliberately not an assumption this
+/// function enforces.
+pub fn set_frame_rejected_fraction(
+    conn: &Connection,
+    run_id: i64,
+    frame_id: i64,
+    fraction: f64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE stacking_run_frames SET rejected_fraction = ?1 WHERE run_id = ?2 AND frame_id = ?3",
+        params![fraction, run_id, frame_id],
+    )?;
+    Ok(())
+}
+
 pub fn list_frame_rows(conn: &Connection, run_id: i64) -> Result<Vec<StackingRunFrameRow>> {
     let sql =
         format!("SELECT {FRAME_COLUMNS} FROM stacking_run_frames WHERE run_id = ?1 ORDER BY id");
