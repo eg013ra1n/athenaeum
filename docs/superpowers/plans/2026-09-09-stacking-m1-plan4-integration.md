@@ -104,7 +104,9 @@
             .map(|_| {
                 let g = rng_next(state) + rng_next(state) + rng_next(state) - 1.5;
                 let outlier = if rng_next(state) < 0.05 { 6.0 * (rng_next(state) - 0.5) } else { 0.0 };
-                (0.2 + 0.01 * g as f32 + outlier as f32).max(0.0)
+                // Never an exact zero: the weighted path skips zero-valued
+                // samples (missing coverage), the plain mean averages them.
+                (0.2 + 0.01 * g as f32 + outlier as f32).max(1e-4)
             })
             .collect()
     }
@@ -893,7 +895,7 @@ pub struct NormalizationConfig {
 
 /// spec §6.3: the user's rejection choice, resolved per group size.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "method")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "method")]
 pub enum RejectionChoice {
     Auto,
     None,
