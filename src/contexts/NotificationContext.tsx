@@ -46,6 +46,7 @@ export type NotificationKind =
   | 'registration'
   | 'masterbuild'
   | 'calibration'
+  | 'stacking'
   | 'sync'
   | 'project'
   | 'generic';

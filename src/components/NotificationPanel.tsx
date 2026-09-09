@@ -20,6 +20,7 @@ import {
   Wand2,
   RefreshCw,
   Users,
+  SquareStack,
   type LucideIcon,
 } from 'lucide-react';
 import { useNotifications, type NotificationKind } from '../contexts/NotificationContext';
@@ -39,6 +40,7 @@ const KIND_ICON: Record<NotificationKind, LucideIcon> = {
   registration: Layers,
   masterbuild: Blend,
   calibration: Wand2,
+  stacking: SquareStack,
   sync: RefreshCw,
   project: Users,
   generic: Bell,
