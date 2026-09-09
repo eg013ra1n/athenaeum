@@ -43,6 +43,9 @@ pub struct FitParams {
     pub max_iter: usize,
     pub conv_tol: f64,
     pub max_rejects: usize,
+    /// A fit whose RMS residual reaches this fraction of its amplitude
+    /// explains nothing and is dropped.
+    pub max_fit_residual: f64,
 }
 
 impl Default for FitParams {
@@ -53,6 +56,7 @@ impl Default for FitParams {
             max_iter: 100,
             conv_tol: 1e-5,
             max_rejects: 5,
+            max_fit_residual: 1.0,
         }
     }
 }
@@ -262,9 +266,10 @@ fn accept(
     // stops with the flag off after `max_rejects` unimproving steps, which is
     // where a model-mismatch minimum (a Gaussian star under any fixed-β
     // Moffat) always ends, and the submodule's own star measurement never
-    // reads it. The gates below decide; the residual cap only rejects a fit
-    // whose RMS residual reaches the amplitude, i.e. explains nothing.
-    let settled = m.fit_residual.is_finite() && m.fit_residual < 1.0;
+    // reads it. The gates below decide; the residual cap (`FitParams::
+    // max_fit_residual`) only rejects a fit whose RMS residual reaches that
+    // fraction of the amplitude, i.e. explains nothing.
+    let settled = m.fit_residual.is_finite() && m.fit_residual < p.max_fit_residual;
     if !settled || !finite || m.a <= 0.0 || m.alpha_x <= 0.0 || m.alpha_y <= 0.0 {
         return None;
     }
@@ -273,6 +278,9 @@ fn accept(
     {
         return None;
     }
+    // Unreachable in practice: the centroid gate above already bounds
+    // |x0 − cx| ≤ 2 px while inner ≥ 5.1; kept for the reference's stated
+    // rule (math reference §1.4).
     let inner = 0.85 * r;
     if (m.x0 - cx).abs() > inner || (m.y0 - cy).abs() > inner {
         return None;
@@ -425,6 +433,8 @@ pub const PSFSW_DEN: f64 = 9.0e6;
 pub const PSFSNR_NUM: f64 = 1.316e-7;
 pub const PSFSNR_DEN: f64 = 4.987e6;
 /// `N* = 2.48308·MAD(R)`: the MAD of a half-normal sample to its σ.
+// The reference's constant; the analytic half-normal value is 2.5064 — the
+// 1 % difference is deliberate parity, not an error.
 pub const N_STAR_FROM_MAD: f64 = 2.48308;
 /// Mesh cell of the large-scale background model (model scale ≈ 256 px).
 pub const BACKGROUND_MODEL_CELL_PX: usize = 128;
@@ -467,11 +477,20 @@ pub fn signal_totals(fits: &[StarFit]) -> SignalTotals {
             rejected: 0,
         };
     }
+    debug_assert!(fits.iter().all(|f| f.area > 0.0));
     let means: Vec<f64> = fits.iter().map(StarFit::mean_flux).collect();
-    let r = crate::stacking::robust::rcr(&means, RCR_LIMIT);
-    let w = crate::stacking::robust::winsorize(&means, &r.kept);
+    let non_finite = means.iter().filter(|m| !m.is_finite()).count();
+    if non_finite > 0 {
+        tracing::warn!(
+            count = non_finite,
+            "non-finite mean fluxes dropped from the PSF-signal totals"
+        );
+    }
+    let finite_means: Vec<f64> = means.iter().copied().filter(|m| m.is_finite()).collect();
+    let r = crate::stacking::robust::rcr(&finite_means, RCR_LIMIT);
+    let w = crate::stacking::robust::winsorize(&finite_means, &r.kept);
     SignalTotals {
-        tflux: kahan_sum(fits.iter().map(|f| f.signal)),
+        tflux: kahan_sum(fits.iter().map(|f| f.signal).filter(|s| s.is_finite())),
         tmean_flux: kahan_sum(w.iter().copied()),
         rejected: r.rejected,
     }
@@ -821,6 +840,18 @@ mod tests {
             (empty.tflux, empty.tmean_flux, empty.rejected),
             (0.0, 0.0, 0)
         );
+    }
+
+    #[test]
+    fn non_finite_means_are_dropped_before_the_totals() {
+        let a = fit_with(1.0);
+        let b = fit_with(2.0);
+        let mut bad = fit_with(1.0);
+        bad.signal = f64::NAN;
+        let t = signal_totals(&[a, b, bad]);
+        assert!(t.tmean_flux.is_finite());
+        assert!((t.tmean_flux - 3.0).abs() < 1e-9, "{}", t.tmean_flux);
+        assert!((t.tflux - 30.0).abs() < 1e-9, "{}", t.tflux);
     }
 
     #[test]

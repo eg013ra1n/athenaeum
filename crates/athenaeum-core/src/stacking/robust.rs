@@ -143,15 +143,65 @@ fn median_f64(v: &mut Vec<f64>) -> f64 {
     }
 }
 
-fn mean(v: &[f64]) -> f64 {
-    v.iter().sum::<f64>() / v.len() as f64
-}
-
-fn stddev(v: &[f64], mu: f64) -> f64 {
-    if v.len() < 2 {
-        return 0.0;
+/// Fill `out` with the sorted-ascending `|values[i] − median|` for every `i`
+/// in `order` (already sorted ascending by `values[i]`) and return the
+/// median. Because `order` is value-sorted, deviations grow monotonically
+/// walking outward from the median position on each side, so a two-pointer
+/// merge of the two sides — no re-sort — produces the sorted deviations in
+/// `O(order.len())`.
+fn sorted_deviations_from_median(values: &[f64], order: &[usize], out: &mut Vec<f64>) -> f64 {
+    out.clear();
+    let m = order.len();
+    let med;
+    let (mut l, mut r): (isize, isize);
+    if m % 2 == 1 {
+        let mid = m / 2;
+        med = values[order[mid]];
+        out.push(0.0);
+        l = mid as isize - 1;
+        r = mid as isize + 1;
+    } else {
+        let (lo, hi) = (m / 2 - 1, m / 2);
+        med = 0.5 * (values[order[lo]] + values[order[hi]]);
+        let d = (values[order[hi]] - med).abs();
+        out.push(d);
+        out.push(d);
+        l = lo as isize - 1;
+        r = hi as isize + 1;
     }
-    (v.iter().map(|x| (x - mu) * (x - mu)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
+    loop {
+        let dl = if l >= 0 {
+            Some((med - values[order[l as usize]]).abs())
+        } else {
+            None
+        };
+        let dr = if (r as usize) < m {
+            Some((values[order[r as usize]] - med).abs())
+        } else {
+            None
+        };
+        match (dl, dr) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    out.push(a);
+                    l -= 1;
+                } else {
+                    out.push(b);
+                    r += 1;
+                }
+            }
+            (Some(a), None) => {
+                out.push(a);
+                l -= 1;
+            }
+            (None, Some(b)) => {
+                out.push(b);
+                r += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    med
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,19 +232,19 @@ pub fn rcr(values: &[f64], limit: f64) -> RcrResult {
         };
     }
     let (mut location, mut scale) = (f64::NAN, f64::NAN);
+    let mut devs: Vec<f64> = Vec::new();
     for phase in 0..3 {
+        let mut order: Vec<usize> = (0..n).filter(|&i| kept[i]).collect();
+        order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
         loop {
-            let idx: Vec<usize> = (0..n).filter(|&i| kept[i]).collect();
-            let m = idx.len();
+            let m = order.len();
             if m < 3 {
                 break;
             }
-            let cur: Vec<f64> = idx.iter().map(|&i| values[i]).collect();
+            let imin = order[0];
+            let imax = order[m - 1];
             let (mu, sigma) = if phase < 2 {
-                let mut c = cur.clone();
-                let med = median_f64(&mut c);
-                let mut devs: Vec<f64> = cur.iter().map(|x| (x - med).abs()).collect();
-                devs.sort_by(|a, b| a.total_cmp(b));
+                let med = sorted_deviations_from_median(values, &order, &mut devs);
                 let s = if phase == 0 {
                     line_fit_deviation(&devs)
                 } else {
@@ -202,30 +252,37 @@ pub fn rcr(values: &[f64], limit: f64) -> RcrResult {
                 };
                 (med, s)
             } else {
-                let mu = mean(&cur);
-                (mu, stddev(&cur, mu))
+                let mut sum = 0.0f64;
+                for &i in &order {
+                    sum += values[i];
+                }
+                let mu = sum / m as f64;
+                let mut ss = 0.0f64;
+                for &i in &order {
+                    let d = values[i] - mu;
+                    ss += d * d;
+                }
+                let sigma = if m > 1 {
+                    (ss / (m - 1) as f64).sqrt()
+                } else {
+                    0.0
+                };
+                (mu, sigma)
             };
             location = mu;
             scale = sigma;
             if !(sigma > 0.0) {
                 break;
             }
-            let (mut imin, mut imax) = (idx[0], idx[0]);
-            for &i in &idx {
-                if values[i] < values[imin] {
-                    imin = i;
-                }
-                if values[i] > values[imax] {
-                    imax = i;
-                }
-            }
             let d_lo = m as f64 * gauss_tail((mu - values[imin]) / sigma);
             let d_hi = m as f64 * gauss_tail((values[imax] - mu) / sigma);
             if d_lo.min(d_hi) < limit {
                 if d_hi <= d_lo {
                     kept[imax] = false;
+                    order.pop();
                 } else {
                     kept[imin] = false;
+                    order.remove(0);
                 }
             } else {
                 break;
@@ -246,6 +303,11 @@ pub fn rcr(values: &[f64], limit: f64) -> RcrResult {
 /// Order is preserved; nothing is dropped. With no survivors the input is
 /// returned unchanged.
 pub fn winsorize(values: &[f64], kept: &[bool]) -> Vec<f64> {
+    debug_assert_eq!(
+        values.len(),
+        kept.len(),
+        "winsorize: values and kept must align"
+    );
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for (v, k) in values.iter().zip(kept) {
         if *k {
@@ -382,6 +444,23 @@ mod tests {
         // identical values: σ = 0, nothing rejected
         let r = rcr(&[3.0; 12], 0.5);
         assert_eq!(r.rejected, 0);
+    }
+
+    #[test]
+    fn rcr_is_identical_on_a_large_contaminated_sample() {
+        let mut v = gaussian(5000, 77);
+        v.extend(std::iter::repeat(25.0).take(300));
+        v.extend(std::iter::repeat(-20.0).take(200));
+        let r = rcr(&v, 0.5);
+        for i in 5000..5500 {
+            assert!(!r.kept[i], "outlier {i} survived");
+        }
+        let bulk_rejected = r.kept[..5000].iter().filter(|k| !**k).count();
+        assert!(
+            bulk_rejected as f64 / 5000.0 <= 0.02,
+            "{bulk_rejected} of 5000"
+        );
+        assert_eq!(r.rejected, 500 + bulk_rejected);
     }
 
     #[test]

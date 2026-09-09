@@ -279,6 +279,24 @@ pub fn output_pair(
     frame: LocationScale,
     mode: OutputNormalization,
 ) -> NormalizationPair {
+    let needs_scale = matches!(
+        mode,
+        OutputNormalization::AdditiveWithScaling | OutputNormalization::MultiplicativeWithScaling
+    );
+    let needs_location = matches!(
+        mode,
+        OutputNormalization::Multiplicative | OutputNormalization::MultiplicativeWithScaling
+    );
+    let scale_unusable = !(reference.scale > 0.0) || !reference.scale.is_finite();
+    let location_unusable = !(reference.location > 0.0) || !reference.location.is_finite();
+    if (needs_scale && scale_unusable) || (needs_location && location_unusable) {
+        tracing::warn!(
+            location = reference.location,
+            scale = reference.scale,
+            "reference statistics unusable; identity normalization"
+        );
+        return NormalizationPair::IDENTITY;
+    }
     let (m0, s0, mi, si) = (
         reference.location,
         reference.scale,
@@ -496,6 +514,18 @@ mod tests {
         assert_eq!(
             output_pair(r, zero, OutputNormalization::AdditiveWithScaling).scale,
             1.0
+        );
+        assert_eq!(
+            output_pair(zero, f, OutputNormalization::AdditiveWithScaling),
+            NormalizationPair::IDENTITY
+        );
+        assert_eq!(
+            output_pair(zero, f, OutputNormalization::Multiplicative),
+            NormalizationPair::IDENTITY
+        );
+        assert_eq!(
+            output_pair(zero, f, OutputNormalization::Additive).offset,
+            -0.15
         );
     }
 

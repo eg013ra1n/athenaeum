@@ -26,14 +26,13 @@ use crate::integration::IntegrationError;
 pub const ADU_SCALE: f32 = 65535.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct MeasureOptions {
     pub psf_model: PsfModel,
     /// Detection cap (spec §9.2 `maxStars`).
     pub max_stars: usize,
     pub scale_estimator: ScaleEstimator,
-    pub detection_sigma: f32,
-    /// Detections below this aperture SNR are not fitted.
+    /// The sensitivity dial — the detector itself is threshold-free.
     pub min_snr: f32,
 }
 
@@ -43,23 +42,23 @@ impl Default for MeasureOptions {
             psf_model: PsfModel::Auto,
             max_stars: 24576,
             scale_estimator: ScaleEstimator::Bwmv,
-            detection_sigma: 5.0,
             min_snr: 5.0,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum NoiseSource {
+    #[default]
     Mrs,
     /// MRS was unavailable; `noise` is `N*`.
     BackgroundResidual,
 }
 
 /// One channel's measurement, in native `[0, 1]` units.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ChannelMeasurement {
     pub stars_detected: usize,
     pub stars_fitted: usize,
@@ -68,6 +67,8 @@ pub struct ChannelMeasurement {
     pub eccentricity: f64,
     pub tflux: f64,
     pub tmean_flux: f64,
+    /// Mean fluxes RCR flagged in the PSF-signal totals (spec §1.1).
+    pub mean_flux_rejected: usize,
     pub m_star: f64,
     pub n_star: f64,
     pub noise: f64,
@@ -143,7 +144,6 @@ pub fn measure_plane(
 
     let mut analyzer = ImageAnalyzer::new()
         .with_max_stars(opts.max_stars.max(8))
-        .with_detection_sigma(opts.detection_sigma)
         .with_centroid_refine(false);
     if let Some(p) = pool {
         analyzer = analyzer.with_thread_pool(Arc::clone(p));
@@ -176,7 +176,21 @@ pub fn measure_plane(
     };
     let totals = psf_signal::signal_totals(&outcome.fits);
     let (fwhm_px, eccentricity) = psf_signal::frame_shape(&outcome.fits).unwrap_or((0.0, 0.0));
-    let (m_star, n_star) = psf_signal::background_residual(&scaled, w, h).unwrap_or((0.0, 0.0));
+    let bg = match pool {
+        Some(p) => p.install(|| psf_signal::background_residual(&scaled, w, h)),
+        None => psf_signal::background_residual(&scaled, w, h),
+    };
+    let (m_star, n_star) = match bg {
+        Some(v) => v,
+        None => {
+            warn!(
+                width = w,
+                height = h,
+                "large-scale background model unavailable; M* and N* are zero"
+            );
+            (0.0, 0.0)
+        }
+    };
     let (noise_adu, noise_source) = match psf_signal::noise_mrs(&scaled, w, h) {
         Some(n) => (n as f64, NoiseSource::Mrs),
         None => {
@@ -191,6 +205,10 @@ pub fn measure_plane(
     let sample = stats::stratified_sample(data, w, h);
     let clipped = stats::clip_sample(&sample, CLIP_LO, CLIP_HI);
     let (median, mad, median_mean_dev) = if clipped.is_empty() {
+        warn!(
+            samples = sample.len(),
+            "no in-range samples after clipping; the plane may not be in [0, 1]"
+        );
         (0.0, 0.0, 0.0)
     } else {
         let m = stats::median_of(&clipped);
@@ -223,6 +241,7 @@ pub fn measure_plane(
         eccentricity,
         tflux: totals.tflux / s,
         tmean_flux: totals.tmean_flux / s,
+        mean_flux_rejected: totals.rejected,
         m_star: m_star / s,
         n_star: n_star / s,
         noise,
@@ -265,6 +284,7 @@ pub fn measure_frame(
         }
         let data = reader.read_plane(plane)?;
         let t = Instant::now();
+        let _span = tracing::debug_span!("measure_plane", path = %path.display(), plane).entered();
         let m = measure_plane(&data, w, h, opts, pool);
         debug!(
             path = %path.display(),
@@ -508,5 +528,13 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"psfModel\":\"auto\"") && json.contains("\"maxStars\":24576"));
         assert!(json.contains("\"scaleEstimator\":\"bwmv\"") && json.contains("\"minSnr\":5.0"));
+        assert!(!json.contains("\"detectionSigma\""));
+        assert_eq!(
+            serde_json::from_str::<MeasureOptions>("{}").unwrap(),
+            MeasureOptions::default()
+        );
+        let c: ChannelMeasurement = serde_json::from_str("{\"starsFitted\":3}").unwrap();
+        assert_eq!(c.stars_fitted, 3);
+        assert_eq!(c.noise_source, NoiseSource::Mrs);
     }
 }

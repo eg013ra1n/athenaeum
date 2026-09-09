@@ -23,7 +23,7 @@ pub enum WeightMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct FormulaWeights {
     pub fwhm: f64,
     pub eccentricity: f64,
@@ -164,6 +164,12 @@ pub fn compute_weights(
         .map(|i| i.measurement.channels.len())
         .max()
         .unwrap_or(0);
+    if nch > 0 && inputs.iter().any(|i| i.measurement.channels.len() != nch) {
+        tracing::warn!(
+            channels = nch,
+            "frames in one group have different channel counts; missing channels weigh zero"
+        );
+    }
     let ranges = (mode == WeightMode::Formula).then(|| formula_ranges(inputs, excluded, nch));
     let mut out: Vec<FrameWeight> = inputs
         .iter()
@@ -240,7 +246,7 @@ pub fn compute_weights(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct SelectionConfig {
     /// Frames below this fraction of the group's maximum weight are excluded.
     pub min_weight_fraction: f64,
@@ -277,7 +283,9 @@ pub fn select_frames(
             if manual_excluded.get(i).copied().unwrap_or(false) {
                 return Some("excluded manually".to_string());
             }
-            let w = &weights[i];
+            let Some(w) = weights.get(i) else {
+                return Some("no weight computed".to_string());
+            };
             if let Some(m) = &w.missing {
                 return Some(m.clone());
             }
@@ -348,6 +356,7 @@ mod tests {
                     eccentricity: ecc,
                     tflux: 1.0,
                     tmean_flux: 1.0,
+                    mean_flux_rejected: 0,
                     m_star: 1.0,
                     n_star: 1.0,
                     noise: 0.01,
@@ -565,6 +574,16 @@ mod tests {
         let r = select_frames(&inputs, &w, &[false, false], &SelectionConfig::default());
         assert_eq!(r[0], None);
         assert_eq!(r[1].as_deref(), Some("no exposure time"));
+        assert_eq!(
+            select_frames(
+                &inputs,
+                &w[..1],
+                &[false, false],
+                &SelectionConfig::default()
+            )[1]
+            .as_deref(),
+            Some("no weight computed")
+        );
     }
 
     #[test]
@@ -582,6 +601,17 @@ mod tests {
             "\"none\""
         );
         assert_eq!(WeightMode::default(), WeightMode::PsfSignalWeight);
+        assert_eq!(
+            serde_json::from_str::<FormulaWeights>("{}").unwrap(),
+            FormulaWeights::default()
+        );
+        assert_eq!(
+            serde_json::from_str::<SelectionConfig>("{\"maxFwhmPx\":3.5}").unwrap(),
+            SelectionConfig {
+                max_fwhm_px: Some(3.5),
+                ..Default::default()
+            }
+        );
         let f = serde_json::to_string(&FormulaWeights::default()).unwrap();
         assert!(
             f.contains("\"fwhm\":15.0")
