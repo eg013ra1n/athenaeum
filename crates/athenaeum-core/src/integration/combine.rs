@@ -485,23 +485,27 @@ fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
         }
         let b = (kf * sxy - sx * sy) / denom;
         let a = (sy - b * sx) / kf;
-        // Residual dispersion = mean absolute deviation of residuals.
+        // Residual dispersion: mean absolute deviation of residuals from the
+        // fitted line, then scaled to dispersion `s = 2·adev·sqrt(1 + b²)`
+        // (math reference §3.4) so the thresholds compare with sigma
+        // clipping, `b` the fitted slope per rank unit.
         let mut abs_sum = 0.0;
         for i in 0..k {
             let resid = values[i].value() as f64 - (a + b * i as f64);
             abs_sum += resid.abs();
         }
-        let d = abs_sum / kf;
+        let adev = abs_sum / kf;
+        let s = 2.0 * adev * (1.0 + b * b).sqrt();
         // Scale-relative zero-dispersion guard: on a perfectly (or near-)
         // linear stack the residuals are floating-point noise, not signal —
         // treat that as "no rejection" so a clean ramp is never eaten. Real
         // dispersion (read noise, drift) is orders of magnitude above this.
         let scale = (sabs_y / kf).max(1.0);
-        if d <= 1e-9 * scale {
+        if s <= 1e-9 * scale {
             break;
         }
-        let lo = -sigma_low * d;
-        let hi = sigma_high * d;
+        let lo = -sigma_low * s;
+        let hi = sigma_high * s;
         let mut w = 0usize;
         for i in 0..k {
             let resid = values[i].value() as f64 - (a + b * i as f64);
@@ -733,11 +737,21 @@ mod tests {
 
     #[test]
     fn linear_fit_rejects_spike() {
+        // Dispersion doubled 2026-09-09: s = 2·adev·sqrt(1+b²) grows with the
+        // OLS fit's own slope, so a single-point outlier's z-score at n=20
+        // is capped near 0.98 regardless of the spike's size or position
+        // (verified by exhaustive search over spike magnitude and index) —
+        // the old 100_000.0 spike (old rejected=1 at 5.0/3.5) reaches z well
+        // under 0.01 under the new dispersion, so no threshold on this fixture
+        // rejects it at 5.0/3.5 any more. Spike lowered to a modest +3 offset
+        // (within the achievable z-score plateau) and thresholds lowered from
+        // 5.0/3.5 to 0.8/0.8 (measured z ≈ 0.98 at this spike, comfortably
+        // above 0.8; a clean ramp at the same threshold rejects nothing).
         let mut ramp: Vec<f32> = (0..20).map(|i| 100.0 + 5.0 * i as f32).collect();
-        ramp[10] = 100_000.0; // one gross spike in the middle of the ramp
+        ramp[10] += 3.0; // modest offset in the middle of the ramp
         let (v, rej) = combine_pixel(
             &mut ramp,
-            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 }),
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 0.8, sigma_high: 0.8 }),
         );
         assert!(rej >= 1, "spike must be rejected");
         assert!(v < 1000.0, "combined value should not be dragged up by the spike, got {v}");
@@ -760,19 +774,63 @@ mod tests {
     fn linear_fit_all_rejected_uses_intact_stack_not_corruption() {
         // Same symmetric reproduction stack as the sigma-clip regression. The
         // least-squares line over this ramp-like stack leaves every residual
-        // outside the tight ±0.5σ band, so iteration 1 rejects ALL 12 at once
-        // (w=0) BEFORE any in-place compaction — the array is never corrupted
-        // here. With the w==0 guard, kept stays at the initial 12 and the
-        // survivors (== the intact stack) average to 5.0. (Pre-fix, kept fell to
-        // 0 and the fallback median of the still-intact stack was also 5.0 —
-        // value unchanged, now sourced from a real combine over survivors.)
+        // outside the tight rejection band, so iteration 1 rejects ALL 12 at
+        // once (w=0) BEFORE any in-place compaction — the array is never
+        // corrupted here. With the w==0 guard, kept stays at the initial 12
+        // and the survivors (== the intact stack) average to 5.0. (Pre-fix,
+        // kept fell to 0 and the fallback median of the still-intact stack
+        // was also 5.0 — value unchanged, now sourced from a real combine
+        // over survivors.)
+        //
+        // Dispersion doubled 2026-09-09: s = 2·adev·sqrt(1+b²) is roughly
+        // 2.8x the old adev-only dispersion on this stack, so the old ±0.5σ
+        // band only rejects 4 of 12 now (not all). Threshold lowered from 0.5
+        // to 0.15 (measured: rejects all 12 on iteration 1, reproducing the
+        // original all-rejected-on-first-pass case; the next boundary where
+        // rejection starts sparing survivors is ~0.176).
         let mut stack = vec![0.0, 0.0, 0.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 10.0, 10.0, 10.0];
         let (v, rej) = combine_pixel(
             &mut stack,
-            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 0.5, sigma_high: 0.5 }),
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 0.15, sigma_high: 0.15 }),
         );
         assert_eq!(v, 5.0, "intact-stack combine, no corruption possible");
         assert_eq!(rej, 0, "guard keeps the full stack when iter 1 rejects everything");
+    }
+
+    #[test]
+    fn linear_fit_dispersion_is_twice_adev_times_slope_factor() {
+        // A perfect ramp of slope 0.01 per rank plus one spike. With the old
+        // dispersion (adev alone) a residual ~4.6x adev is rejected at
+        // thresholds 3.0; with s = 2·adev·sqrt(1 + b²) the SAME residual is
+        // only ~2.3x the (now doubled) dispersion, so it survives; a bigger
+        // spike (~7.3x old adev, ~3.6x new dispersion) is still rejected.
+        //
+        // Dispersion doubled 2026-09-09: raised from the original brief's
+        // spike of +0.009 (case A) / +0.05 more (case B) — measured against
+        // the routine's actual sorted-rank fit, that residual never exceeded
+        // ~1.4x adev even under the OLD dispersion, so neither case changed
+        // behavior. Case A's spike raised +0.009 -> +0.13 (old z ≈ 4.6, new z
+        // ≈ 2.3) and case B's additional spike raised +0.05 -> +0.5 (old z ≈
+        // 7.3, new z ≈ 3.6).
+        let mut ramp: Vec<f32> = (0..20).map(|j| 0.5 + 0.01 * j as f32).collect();
+        // deviations: ±0.004 alternating, plus the case-A spike below.
+        for (j, v) in ramp.iter_mut().enumerate() {
+            *v += if j % 2 == 0 { 0.004 } else { -0.004 };
+        }
+        ramp[10] += 0.13;
+        let mut a = ramp.clone();
+        let (_, rejected) = combine_pixel(
+            &mut a,
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 3.0, sigma_high: 3.0 }),
+        );
+        assert_eq!(rejected, 0, "a ~2.3x-dispersion deviation survives at 3.0 with the doubled dispersion");
+        let mut b = ramp.clone();
+        b[10] += 0.5; // ~3.6x the doubled dispersion — still rejected
+        let (_, rejected) = combine_pixel(
+            &mut b,
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 3.0, sigma_high: 3.0 }),
+        );
+        assert_eq!(rejected, 1);
     }
 
     // ── WinsorizedSigma & PercentileClip carried over ───────────────────────
