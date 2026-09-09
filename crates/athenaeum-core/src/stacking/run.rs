@@ -2393,6 +2393,10 @@ static OUTPUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// needs, plus `frame_id` (`StackFrame` itself has no identity field).
 struct GroupMember {
     frame_id: i64,
+    /// The catalog `files.filename` (fix round 1, item 3) — `ATH_STKF`
+    /// names the SOURCE frame, not the calibrated artifact, and this needs
+    /// no `c_`/`_d` stripping at all (unlike `calibrated`'s own name).
+    filename: String,
     calibrated: PathBuf,
     map: PixelMap,
     measurement: FrameMeasurement,
@@ -2422,11 +2426,15 @@ enum GroupOutcome {
 /// `::normalization` want the SAME strings the config itself round-trips as
 /// (`"psfSignalWeight"`, `"scaleZeroOffset"`, …), not a hand-written mirror
 /// that could drift from the enum's own `#[serde(rename_all = "camelCase")]`.
-fn enum_serde_name<T: Serialize>(v: &T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|j| j.as_str().map(str::to_string))
-        .unwrap_or_default()
+/// Fix round 1, item 10: propagates instead of silently falling back to an
+/// empty string — a mis-serialized enum belongs in the run's own failure
+/// text, never a blank `ATH_STKW`/`ATH_STKO` card value.
+fn enum_serde_name<T: Serialize>(v: &T) -> Result<String, RunError> {
+    let value = serde_json::to_value(v)
+        .map_err(|e| RunError::Other(format!("failed to serialize enum value: {e}")))?;
+    value.as_str().map(str::to_string).ok_or_else(|| {
+        RunError::Other(format!("enum value did not serialize to a string: {value}"))
+    })
 }
 
 /// Build one [`SummaryFrame`] from a frame's whole stage 3-5 outcome plus,
@@ -2633,12 +2641,77 @@ fn fail_group(
     Ok(GroupOutcome::Failed)
 }
 
+/// One `Integrate`-stage progress tick, throttled by `last_tick`. Percent =
+/// `100 * (plane + frac) / channels`. A free function (not a closure
+/// borrowing `RunContext`) so `on_plane`/`on_band`/`on_combine` — `Sync`
+/// closures the engine may call from any of its own worker threads — can
+/// call it with only cloned-out plain values, and so it is directly
+/// unit-testable on its own (see `emit_integrate_ticks_never_race_percent_backwards`
+/// below).
+///
+/// Fix round 1, item 1: the throttle guard (`last_tick.lock()`) stays held
+/// THROUGH the emit, not dropped before it. Dropping it first let two
+/// concurrent callers both pass the throttle check, both release the lock,
+/// and then race `emit_event` itself with no ordering relationship to which
+/// one's check-and-update ran first — a later/lower-percent tick could
+/// reach the emitter after an earlier/higher one, sending `percent`
+/// backwards inside a plane, the exact contract `stage_sequence_and_monotonic`
+/// checks. Holding the guard through the emit makes "acquired the lock
+/// first" and "emitted first" the SAME thing — a caller cannot even start
+/// its own check until the previous caller's entire tick (check, update,
+/// compute, emit) is done, so two ticks can never interleave or land out of
+/// the order their callers entered this function. Emitting under the lock
+/// is cheap (a channel send / IPC call); a slow emitter only slows the
+/// engine's own callbacks, the same tradeoff `OUTPUT_WRITE_LOCK` makes for
+/// the master write.
+#[allow(clippy::too_many_arguments)]
+fn emit_integrate_tick(
+    last_tick: &Mutex<Instant>,
+    emitter: &dyn ProgressEmitter,
+    run_id: i64,
+    set_id: i64,
+    group_key: &str,
+    channels: usize,
+    plane: usize,
+    frac: f64,
+    bytes_done: u64,
+    bytes_total: u64,
+    force: bool,
+) {
+    let now = Instant::now();
+    let mut last = last_tick.lock().unwrap_or_else(|e| e.into_inner());
+    if !force && now.duration_since(*last) < Duration::from_millis(PROGRESS_THROTTLE_MS) {
+        return;
+    }
+    *last = now;
+    let percent = 100.0 * (plane as f64 + frac) / channels.max(1) as f64;
+    emit_event(
+        emitter,
+        STACKING_PROGRESS_EVENT,
+        &StackingProgressEvent {
+            run_id,
+            set_id,
+            stage: Stage::Integrate,
+            group_key: Some(group_key.to_string()),
+            current: plane,
+            total: channels,
+            percent,
+            bytes_done,
+            bytes_total,
+            frame_id: None,
+            message: None,
+        },
+    );
+}
+
 /// Normalize (1/1 progress, spec ruling 14 — folded into `integrate_group`
-/// itself, nothing separate to time), integrate and write the master for one
-/// group. Returns the outcome plus (normalize, integrate, output) wall time
-/// for [`stage_output`]'s own per-stage [`crate::stacking::provenance::StageTiming`]
-/// totals. `Err(RunError::Cancelled)` — from `IntegrationError::Cancelled` or
-/// a cancel noticed before this group started — is the ONLY error that
+/// itself, nothing separate to time or wall-clock — fix round 1, item 6:
+/// no `StageTiming` entry for it, only the progress event), integrate and
+/// write the master for one group. Returns the outcome plus (integrate,
+/// output) wall time for [`stage_output`]'s own per-stage
+/// [`crate::stacking::provenance::StageTiming`] totals.
+/// `Err(RunError::Cancelled)` — from `IntegrationError::Cancelled` or a
+/// cancel noticed before this group started — is the ONLY error that
 /// propagates; everything else becomes `Ok((GroupOutcome::Failed, ..))` via
 /// [`fail_group`], per ruling 12 (a cancelled run keeps its artifacts and
 /// writes no master) vs. the brief's per-group failure policy.
@@ -2647,8 +2720,8 @@ fn process_group_output(
     group: &IntegrationGroup,
     measure_opts: &MeasureOptions,
     wcs: Option<&PlateSolveRecord>,
-) -> Result<(GroupOutcome, Duration, Duration, Duration), RunError> {
-    let zero = || (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+) -> Result<(GroupOutcome, Duration, Duration), RunError> {
+    let zero = || (Duration::ZERO, Duration::ZERO);
 
     let included_count = rc
         .measured
@@ -2656,8 +2729,8 @@ fn process_group_output(
         .map(|v| v.iter().filter(|e| e.included).count())
         .unwrap_or(0);
     if included_count < 3 {
-        let (n, i, o) = zero();
-        return Ok((skip_group(rc, group, included_count)?, n, i, o));
+        let (i, o) = zero();
+        return Ok((skip_group(rc, group, included_count)?, i, o));
     }
 
     // Snapshot the included members' data — nothing below needs `rc` again
@@ -2688,6 +2761,7 @@ fn process_group_output(
             });
             members.push(GroupMember {
                 frame_id: e.frame.frame_id,
+                filename: e.frame.filename.clone(),
                 calibrated,
                 map,
                 measurement,
@@ -2705,8 +2779,8 @@ fn process_group_output(
             count = members.len(),
             "stacking group skipped: fewer than 3 registered members reached integration"
         );
-        let (n, i, o) = zero();
-        return Ok((skip_group(rc, group, members.len())?, n, i, o));
+        let (i, o) = zero();
+        return Ok((skip_group(rc, group, members.len())?, i, o));
     }
 
     rc.progress(
@@ -2736,7 +2810,7 @@ fn process_group_output(
             match best_by_weight(&weights, &included_mask, &star_counts) {
                 Some(idx) => idx,
                 None => {
-                    let (n, i, o) = zero();
+                    let (i, o) = zero();
                     return Ok((
                         fail_group(
                             rc,
@@ -2744,7 +2818,6 @@ fn process_group_output(
                             members.len(),
                             "no included frame to anchor normalization",
                         )?,
-                        n,
                         i,
                         o,
                     ));
@@ -2778,9 +2851,12 @@ fn process_group_output(
     let mut group_integration = rc.config.integration.clone();
     if group_integration.write_rejection_maps {
         let maps_bytes = 3u64 * channels as u64 * width as u64 * height as u64 * 4;
+        // Fix round 1, item 5: unknown RAM is treated as NOT fitting
+        // (conservative — the same reading `admission`'s own "unknown → 1"
+        // fallback takes), not as fitting.
         let fits = total_ram_bytes()
             .map(|total| maps_bytes <= total / 4)
-            .unwrap_or(true);
+            .unwrap_or(false);
         if !fits {
             group_integration.write_rejection_maps = false;
             tracing::warn!(
@@ -2835,41 +2911,22 @@ fn process_group_output(
     let run_id = rc.run_id;
     let set_id = rc.set_id;
     let group_key_for_progress = group.key.clone();
-    let channels_f = channels.max(1) as f64;
 
-    let emit_integrate_tick =
-        |plane: usize, frac: f64, bytes_done: u64, bytes_total: u64, force: bool| {
-            let now = Instant::now();
-            {
-                let mut last = last_tick.lock().unwrap();
-                if !force && now.duration_since(*last) < Duration::from_millis(PROGRESS_THROTTLE_MS)
-                {
-                    return;
-                }
-                *last = now;
-            }
-            let percent = 100.0 * (plane as f64 + frac) / channels_f;
-            emit_event(
-                emitter.as_ref(),
-                STACKING_PROGRESS_EVENT,
-                &StackingProgressEvent {
-                    run_id,
-                    set_id,
-                    stage: Stage::Integrate,
-                    group_key: Some(group_key_for_progress.clone()),
-                    current: plane,
-                    total: channels,
-                    percent,
-                    bytes_done,
-                    bytes_total,
-                    frame_id: None,
-                    message: None,
-                },
-            );
-        };
     let on_plane = |p: usize, _total: usize| {
         current_plane.store(p, Ordering::Relaxed);
-        emit_integrate_tick(p, 0.0, 0, 0, true);
+        emit_integrate_tick(
+            &last_tick,
+            emitter.as_ref(),
+            run_id,
+            set_id,
+            &group_key_for_progress,
+            channels,
+            p,
+            0.0,
+            0,
+            0,
+            true,
+        );
     };
     let on_band = |_band: usize, _bands: usize, bytes_done: u64, bytes_total: u64| {
         let plane = current_plane.load(Ordering::Relaxed);
@@ -2878,11 +2935,35 @@ fn process_group_output(
         } else {
             0.0
         };
-        emit_integrate_tick(plane, frac, bytes_done, bytes_total, false);
+        emit_integrate_tick(
+            &last_tick,
+            emitter.as_ref(),
+            run_id,
+            set_id,
+            &group_key_for_progress,
+            channels,
+            plane,
+            frac,
+            bytes_done,
+            bytes_total,
+            false,
+        );
     };
     let on_combine = |_rows: usize, _rows_total: usize, bytes_done: u64, bytes_total: u64| {
         let plane = current_plane.load(Ordering::Relaxed);
-        emit_integrate_tick(plane, 1.0, bytes_done, bytes_total, false);
+        emit_integrate_tick(
+            &last_tick,
+            emitter.as_ref(),
+            run_id,
+            set_id,
+            &group_key_for_progress,
+            channels,
+            plane,
+            1.0,
+            bytes_done,
+            bytes_total,
+            false,
+        );
     };
     let progress = GroupProgress {
         on_plane: &on_plane,
@@ -2905,15 +2986,22 @@ fn process_group_output(
                 members.len(),
                 &format!("group integration failed: {e}"),
             )?;
-            return Ok((
-                outcome,
-                Duration::ZERO,
-                integrate_start.elapsed(),
-                Duration::ZERO,
-            ));
+            return Ok((outcome, integrate_start.elapsed(), Duration::ZERO));
         }
     };
-    emit_integrate_tick(channels, 0.0, 0, 0, true);
+    emit_integrate_tick(
+        &last_tick,
+        emitter.as_ref(),
+        run_id,
+        set_id,
+        &group_key_for_progress,
+        channels,
+        channels,
+        0.0,
+        0,
+        0,
+        true,
+    );
     let integrate_dur = integrate_start.elapsed();
 
     let output_start = Instant::now();
@@ -2928,12 +3016,7 @@ fn process_group_output(
                 members.len(),
                 &format!("failed to read the group reference's header: {e}"),
             )?;
-            return Ok((
-                outcome,
-                Duration::ZERO,
-                integrate_dur,
-                output_start.elapsed(),
-            ));
+            return Ok((outcome, integrate_dur, output_start.elapsed()));
         }
     };
 
@@ -2950,19 +3033,25 @@ fn process_group_output(
     let included_exposures: Vec<f64> = output
         .included
         .iter()
-        .filter_map(|&i| members[i].exposure_s)
+        .map(|&i| members[i].exposure_s.unwrap_or(0.0))
         .collect();
 
-    let reference_id = group_reference_calibrated
+    // Fix round 1, item 3: `ATH_STKF` names the SOURCE frame, not the
+    // calibrated artifact — Checkpoint B's own master reads
+    // `ATH_STKF = '2025-09-14_02-19-02__-9.90_180.00s_0019'`, the raw
+    // `files.filename` stem, never `c_`/`_d`-stripped (the calibrated
+    // file's own stem needed stripping in the probe only because the probe
+    // had no `GroupFrame.filename` to read directly).
+    let reference_id = Path::new(&members[reference_idx].filename)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("reference")
         .to_string();
-    let weight_mode_str = enum_serde_name(&rc.config.measurement.weight_mode);
+    let weight_mode_str = enum_serde_name(&rc.config.measurement.weight_mode)?;
     let normalization_str = format!(
         "{}/{}",
-        enum_serde_name(&rc.config.normalization.output),
-        enum_serde_name(&rc.config.normalization.rejection)
+        enum_serde_name(&rc.config.normalization.output)?,
+        enum_serde_name(&rc.config.normalization.rejection)?
     );
     let run_id_str = rc.run_id.to_string();
 
@@ -2989,12 +3078,7 @@ fn process_group_output(
                 members.len(),
                 &format!("failed to build the master header: {e}"),
             )?;
-            return Ok((
-                outcome,
-                Duration::ZERO,
-                integrate_dur,
-                output_start.elapsed(),
-            ));
+            return Ok((outcome, integrate_dur, output_start.elapsed()));
         }
     };
 
@@ -3006,7 +3090,20 @@ fn process_group_output(
     );
 
     let written = {
-        let _guard = OUTPUT_WRITE_LOCK.lock().unwrap();
+        // Fix round 1, item 2: `unwrap_or_else(|e| e.into_inner())`, not
+        // `.unwrap()` — this is a process-wide `static`, so one panic
+        // inside a PRIOR `write_master_light` call (any group, any run)
+        // would otherwise poison it for the rest of the process's life,
+        // failing every later master write with no write ever attempted.
+        // Safe to recover: the guarded section only claims a name
+        // (`resolve_collision`) and writes through `write_fits_f32`, which
+        // already writes to a sibling temp file and atomically renames it
+        // into place (`fits_writer::writer::write_fits_f32`) — a panic mid-write
+        // leaves an orphaned `*.fits.tmp.<pid>.<seq>` file, never a partial
+        // file AT the resolved name itself, so a later `resolve_collision`
+        // call still sees that name correctly free and reuses it; there is
+        // no partial state under this lock for a later writer to misread.
+        let _guard = OUTPUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         write_master_light(&rc.output_dir, &name, &output, &cards)
     };
     let written = match written {
@@ -3018,12 +3115,7 @@ fn process_group_output(
                 members.len(),
                 &format!("failed to write the master: {e:#}"),
             )?;
-            return Ok((
-                outcome,
-                Duration::ZERO,
-                integrate_dur,
-                output_start.elapsed(),
-            ));
+            return Ok((outcome, integrate_dur, output_start.elapsed()));
         }
     };
 
@@ -3102,12 +3194,7 @@ fn process_group_output(
         None,
     );
 
-    Ok((
-        GroupOutcome::Written,
-        Duration::ZERO,
-        integrate_dur,
-        output_dur,
-    ))
+    Ok((GroupOutcome::Written, integrate_dur, output_dur))
 }
 
 /// Stages 6 (normalize), 7 (integrate) and 9 (output). Per group, in
@@ -3150,14 +3237,12 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
 
     let groups = rc.plan_groups.clone();
     let mut any_master = false;
-    let mut normalize_total = Duration::ZERO;
     let mut integrate_total = Duration::ZERO;
     let mut output_total = Duration::ZERO;
 
     for group in &groups {
         rc.check_cancel()?;
-        let (outcome, n, i, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
-        normalize_total += n;
+        let (outcome, i, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
         integrate_total += i;
         output_total += o;
         if matches!(outcome, GroupOutcome::Written) {
@@ -3165,10 +3250,10 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         }
     }
 
-    rc.timings.push(crate::stacking::provenance::StageTiming {
-        stage: Stage::Normalize,
-        duration_ms: normalize_total.as_millis() as u64,
-    });
+    // Fix round 1, item 6: no `StageTiming` entry for `Normalize` —
+    // normalization runs inside `integrate_group` itself, so there is
+    // nothing separate to time and the entry was always `duration_ms: 0`;
+    // the `Normalize` progress event (1/1 per group) stays.
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Integrate,
         duration_ms: integrate_total.as_millis() as u64,
@@ -4691,26 +4776,162 @@ mod tests {
 
     /// The distinct `stage` values of `events`, in first-appearance order —
     /// used to check a run's progress events cover the canonical stage
-    /// sequence, and that `percent` is monotonic WITHIN each stage's own
-    /// consecutive run of events.
+    /// sequence, and that `percent` is monotonic WITHIN each `(stage,
+    /// groupKey)` pair's own consecutive run of events (fix round 1, item 7:
+    /// NOT keyed on `stage` alone — `Normalize`/`Integrate`/`Output` each
+    /// reset to 0% per group, so a multi-group run legitimately sees percent
+    /// "go backwards" moving from one group's 100% to the next group's 0%
+    /// within the same stage; a per-frame stage like `register` carries a
+    /// `groupKey` too but its `current`/`total` are cumulative across every
+    /// group, so keying on the pair is still correct there — it just never
+    /// changes group_key mid-climb).
     fn stage_sequence_and_monotonic(events: &[serde_json::Value]) -> Vec<String> {
         let mut order: Vec<String> = Vec::new();
-        let mut last_percent: HashMap<String, f64> = HashMap::new();
+        let mut last_percent: HashMap<(String, String), f64> = HashMap::new();
         for e in events {
             let stage = e["stage"].as_str().unwrap_or("").to_string();
-            if order.last() != Some(&stage) && !order.contains(&stage) {
+            if !order.contains(&stage) {
                 order.push(stage.clone());
             }
+            let group_key = e["groupKey"].as_str().unwrap_or("").to_string();
             let percent = e["percent"].as_f64().unwrap_or(0.0);
-            if let Some(&prev) = last_percent.get(&stage) {
+            let key = (stage.clone(), group_key.clone());
+            if let Some(&prev) = last_percent.get(&key) {
                 assert!(
                     percent + 1e-9 >= prev,
-                    "percent went backwards for stage {stage}: {prev} -> {percent}"
+                    "percent went backwards for stage {stage} group {group_key}: {prev} -> {percent}"
                 );
             }
-            last_percent.insert(stage, percent);
+            last_percent.insert(key, percent);
         }
         order
+    }
+
+    #[test]
+    fn emit_integrate_ticks_never_race_percent_backwards() {
+        // Fix round 1, item 1: drives the REAL `emit_integrate_tick` (not a
+        // reimplementation) from two genuine `std::thread::scope` threads,
+        // both hitting the SAME `last_tick` mutex.
+        //
+        // What this test does NOT do, and why: two threads freely pulling
+        // interleaved values from a shared counter with no coordination
+        // beyond the mutex — tried first — is flaky even against the FIXED
+        // code (confirmed empirically, ~1 in 10 runs, and reproducibly
+        // whenever the OS lets one thread run for a while before the other
+        // is scheduled at all). That is not a gap in this fix: a value a
+        // thread already holds (e.g. `bytes_read_so_far`) is computed
+        // BEFORE `on_band`/`on_combine` ever calls into
+        // `emit_integrate_tick`, and no lock discipline INSIDE this
+        // function can bound how long that caller sits on it before it is
+        // next scheduled — "global monotonic order under arbitrary
+        // scheduling" was never something a mutex around the emit could
+        // promise, and asserting it is what made the free-race version
+        // flaky rather than a faithful regression test.
+        //
+        // What the fix DOES guarantee, and what this deterministically
+        // verifies instead: the whole check-throttle → update → compute →
+        // emit sequence is now one indivisible unit under `last_tick` — a
+        // caller that reaches `.lock()` cannot have its event overtaken by
+        // another caller's, because the other caller cannot even ENTER its
+        // own critical section until the first's is completely done
+        // (before the fix, the guard was dropped after the throttle
+        // check, so two callers could both pass it, both drop the lock,
+        // and then race `emit_event` itself with no ordering relationship
+        // to which one checked first). A shared `turn` counter hands each
+        // value to the thread whose parity matches it, but — this matters —
+        // `turn` only ADVANCES after that thread's own `emit_integrate_tick`
+        // call has fully returned, never before it and never via a
+        // compare-exchange claimed ahead of the call (also tried: claiming
+        // `turn` with a `compare_exchange` immediately before calling let
+        // the two threads' calls run concurrently again, since nothing then
+        // stopped the second thread from claiming ITS turn and racing its
+        // own call against the first's still-in-flight one — it failed the
+        // same way the free-race version did). With the advance strictly
+        // AFTER the call, the expected sequence is well-defined and
+        // non-decreasing by construction; the assertion below is only
+        // meaningful because two REAL threads and the REAL mutex are what
+        // deliver it to the recorder, not a wrapper that reorders on the
+        // test's behalf.
+        struct ThreadPercentRecorder {
+            events: Mutex<Vec<f64>>,
+        }
+        impl ProgressEmitter for ThreadPercentRecorder {
+            fn emit_json(&self, _event_name: &str, payload: serde_json::Value) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(payload["percent"].as_f64().unwrap_or(f64::NAN));
+            }
+        }
+
+        let last_tick: Mutex<Instant> =
+            Mutex::new(Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS));
+        let recorder = ThreadPercentRecorder {
+            events: Mutex::new(Vec::new()),
+        };
+        let turn = std::sync::atomic::AtomicU64::new(0);
+        const TOTAL: u64 = 400;
+        const CHANNELS: usize = 1;
+
+        let worker = |thread_id: u64| {
+            loop {
+                // Take the next value only when it is genuinely this
+                // thread's turn (even values to thread 0, odd to thread 1)
+                // — both threads spin on the SAME shared `turn` counter, so
+                // this still exercises real cross-thread synchronization,
+                // not a single-threaded loop wearing a `std::thread::scope`
+                // costume. Critically, `turn` only advances AFTER this
+                // thread's own `emit_integrate_tick` call returns (not
+                // before it, and not via a compare-exchange claimed ahead
+                // of the call) — advancing it any earlier reopens exactly
+                // the race being tested for: the other thread would then be
+                // free to claim its own turn and call `emit_integrate_tick`
+                // concurrently with this one, which is genuinely racy (this
+                // was tried and DID fail: v+1 claimed via `compare_exchange`
+                // before the call let the two threads' calls interleave,
+                // occasionally delivering v+1 to the recorder before v).
+                let v = turn.load(Ordering::SeqCst);
+                if v >= TOTAL {
+                    return;
+                }
+                if v % 2 != thread_id {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                emit_integrate_tick(
+                    &last_tick,
+                    &recorder,
+                    1,
+                    1,
+                    "g",
+                    CHANNELS,
+                    0,
+                    v as f64 / TOTAL as f64,
+                    v,
+                    TOTAL,
+                    true, // force: every value must reach the recorder, or
+                          // a throttle-skipped tick could hide a real
+                          // ordering violation.
+                );
+                turn.store(v + 1, Ordering::SeqCst);
+            }
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| worker(0));
+            scope.spawn(|| worker(1));
+        });
+
+        let events = recorder.events.into_inner().unwrap();
+        assert_eq!(events.len(), TOTAL as usize, "{events:?}");
+        let mut last = -1.0f64;
+        for &percent in &events {
+            assert!(
+                percent + 1e-9 >= last,
+                "percent went backwards: {last} -> {percent}"
+            );
+            last = percent;
+        }
     }
 
     #[test]
@@ -4772,6 +4993,24 @@ mod tests {
         assert_eq!(
             header.get_str("ATH_STKG").as_deref(),
             Some(group.group_key.as_str())
+        );
+        // Fix round 1, item 3: `ATH_STKF` names the SOURCE frame (the
+        // catalog `files.filename` stem, "f<i>" for `seed_star_group`'s
+        // fixture lights) — never the calibrated artifact's own on-disk
+        // name (which would need `c_`/`_d` stripping the source name never
+        // does).
+        let reference_frame_id = run_row
+            .reference_frame_id
+            .expect("reference frame recorded");
+        let reference_index = light_ids
+            .iter()
+            .position(|&id| id == reference_frame_id)
+            .expect("reference frame is one of the fixture's own lights");
+        let expected_stem = format!("f{reference_index}");
+        assert_eq!(
+            header.get_str("ATH_STKF").as_deref(),
+            Some(expected_stem.as_str()),
+            "ATH_STKF must be the fixture light's own stem"
         );
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -4875,7 +5114,7 @@ mod tests {
             "a rerun must never overwrite the first master"
         );
         assert!(
-            master_path2.contains("_2"),
+            master_path2.ends_with("_2.fits"),
             "expected a collision-suffixed name: {master_path2}"
         );
         assert!(Path::new(&master_path1).exists());
@@ -4993,6 +5232,12 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.output.cleanup = CleanupPolicy::DeleteIntermediates;
+        // Fix round 1, item 8: without this, `registered_root()` never has
+        // any content to begin with (`write_registered_frames` defaults
+        // off), so the assertion that cleanup emptied it would pass
+        // trivially even if `CleanupWhat::Intermediates` never touched that
+        // subtree at all.
+        cfg.registration.write_registered_frames = true;
 
         let started = start_stacking(
             ctx.clone(),
