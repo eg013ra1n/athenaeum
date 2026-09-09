@@ -810,6 +810,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].included);
         assert_eq!(rows[0].reg_status.as_deref(), Some("failed"));
+        assert!(
+            rows[0].weight_channels_json.is_none(),
+            "DO UPDATE must clear a column that became NULL"
+        );
         update_group(
             &c,
             g,
