@@ -111,6 +111,65 @@ impl Polynomial2D {
         }
         Some(p)
     }
+
+    /// Joint weighted least squares of an affine correction
+    /// `(a0 + a1·u + a2·v, b0 + b1·u + b2·v)` and the degree-`2..=order`
+    /// terms over the same samples. A residual field whose linear part the
+    /// linear model absorbed only in projection cannot be recovered by
+    /// alternating the two fits (a linear and a cubic term are ~0.9
+    /// correlated on a finite field, so alternation converges at ~0.85 per
+    /// round); one joint solve is exact. Returns the affine coefficients
+    /// `[a0, a1, a2, b0, b1, b2]` (pixel displacements per normalized unit)
+    /// and the polynomial. Needs at least `terms + 5` samples.
+    pub fn fit_with_affine(
+        order: u8,
+        samples: &[((f64, f64), (f64, f64))],
+        weights: Option<&[f64]>,
+    ) -> Option<([f64; 6], Polynomial2D)> {
+        if !(2..=4).contains(&order) {
+            return None;
+        }
+        let terms = term_exponents(order);
+        let n = 3 + terms.len();
+        if samples.len() < n + 2 {
+            return None;
+        }
+        let mut ata = vec![vec![0f64; n]; n];
+        let mut atx = vec![0f64; n];
+        let mut aty = vec![0f64; n];
+        let mut row = vec![0f64; n];
+        for (s, ((u, v), (du, dv))) in samples.iter().enumerate() {
+            let w = weights.map(|w| w[s]).unwrap_or(1.0);
+            row[0] = 1.0;
+            row[1] = *u;
+            row[2] = *v;
+            for (k, (i, j)) in terms.iter().enumerate() {
+                row[3 + k] = u.powi(*i as i32) * v.powi(*j as i32);
+            }
+            for a in 0..n {
+                for b in 0..n {
+                    ata[a][b] += w * row[a] * row[b];
+                }
+                atx[a] += w * row[a] * du;
+                aty[a] += w * row[a] * dv;
+            }
+        }
+        let cx = solve_dense(&ata, &atx)?;
+        let cy = solve_dense(&ata, &aty)?;
+        let affine = [cx[0], cx[1], cx[2], cy[0], cy[1], cy[2]];
+        if affine.iter().any(|c| !c.is_finite()) {
+            return None;
+        }
+        let p = Polynomial2D {
+            order,
+            ax: cx[3..].to_vec(),
+            ay: cy[3..].to_vec(),
+        };
+        if !p.is_well_formed() {
+            return None;
+        }
+        Some((affine, p))
+    }
 }
 
 /// Gauss–Jordan with partial pivoting; `None` on a singular system.
@@ -148,6 +207,16 @@ fn solve_dense(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
         }
     }
     Some(m.iter().map(|row| row[n]).collect())
+}
+
+fn mat_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
 }
 
 /// Forward and inverse polynomial corrections around a linear model.
@@ -225,6 +294,55 @@ impl Distortion {
             forward,
             inverse,
         })
+    }
+
+    /// [`Distortion::fit`] with the forward residual's affine part folded
+    /// into the linear model: the affine correction `p′ = p + a0 + A·norm(p)`
+    /// is `p′ = (I + A/scale)·p + (a0 − A·c/scale)`, so `L′ = M·L`; both
+    /// polynomial directions are then fitted around `L′`. The kind label is
+    /// kept although a similarity may become a general affine.
+    pub fn fit_joint(
+        order: u8,
+        linear: &Linear,
+        pairs: &[Pair],
+        weights: Option<&[f64]>,
+        center: (f64, f64),
+        scale: f64,
+    ) -> Option<(Linear, Distortion)> {
+        if !(scale > 0.0) {
+            return None;
+        }
+        linear.inverse()?;
+        let norm = |x: f64, y: f64| ((x - center.0) / scale, (y - center.1) / scale);
+        let fwd_samples: Vec<_> = pairs
+            .iter()
+            .map(|((x, y), (u, v))| {
+                let (px, py) = linear.apply(*x, *y);
+                (norm(px, py), (u - px, v - py))
+            })
+            .collect();
+        let (a, _) = Polynomial2D::fit_with_affine(order, &fwd_samples, weights)?;
+        let (cx, cy) = center;
+        let m = [
+            [
+                1.0 + a[1] / scale,
+                a[2] / scale,
+                a[0] - (a[1] * cx + a[2] * cy) / scale,
+            ],
+            [
+                a[4] / scale,
+                1.0 + a[5] / scale,
+                a[3] - (a[4] * cx + a[5] * cy) / scale,
+            ],
+            [0.0, 0.0, 1.0],
+        ];
+        let refined = Linear {
+            kind: linear.kind,
+            m: mat_mul(&m, &linear.m),
+        };
+        refined.inverse()?;
+        let distortion = Distortion::fit(order, &refined, pairs, weights, center, scale)?;
+        Some((refined, distortion))
     }
 }
 
@@ -327,5 +445,91 @@ mod tests {
         let linear = Linear::identity();
         let pairs: Vec<Pair> = vec![((0.0, 0.0), (0.0, 0.0)); 20];
         assert!(Distortion::fit(2, &linear, &pairs, None, (0.0, 0.0), f64::NAN).is_none());
+    }
+
+    #[test]
+    fn fit_with_affine_recovers_linear_and_cubic_terms_jointly() {
+        let pts = grid(1000.0, 800.0, 40.0);
+        let samples: Vec<((f64, f64), (f64, f64))> = pts
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = ((x - 500.0) / 500.0, (y - 400.0) / 500.0);
+                (
+                    (u, v),
+                    (
+                        0.1 + 0.2 * u - 0.3 * v + 0.5 * u * u * u,
+                        -0.05 + 0.1 * v + 0.25 * u * v * v,
+                    ),
+                )
+            })
+            .collect();
+        let (a, p) = Polynomial2D::fit_with_affine(3, &samples, None).unwrap();
+        for (got, want) in a.iter().zip([0.1, 0.2, -0.3, -0.05, 0.0, 0.1]) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        let terms = term_exponents(3);
+        let k_u3 = terms.iter().position(|t| *t == (3, 0)).unwrap();
+        let k_uv2 = terms.iter().position(|t| *t == (1, 2)).unwrap();
+        assert!((p.ax[k_u3] - 0.5).abs() < 1e-9 && (p.ay[k_uv2] - 0.25).abs() < 1e-9);
+        assert!(p
+            .ax
+            .iter()
+            .enumerate()
+            .all(|(k, c)| k == k_u3 || c.abs() < 1e-9));
+    }
+
+    #[test]
+    fn fit_joint_absorbs_a_barrel_the_projected_linear_model_left_behind() {
+        let (cx, cy, k) = (500.0, 400.0, 8e-9);
+        let truth = Linear::from_flat(
+            LinearKind::Similarity,
+            [
+                0.9998477, -0.0174524, 4.0, 0.0174524, 0.9998477, -3.0, 0.0, 0.0, 1.0,
+            ],
+        );
+        let pairs: Vec<Pair> = grid(1000.0, 800.0, 25.0)
+            .into_iter()
+            .map(|s| {
+                let (x, y) = truth.apply(s.0, s.1);
+                (s, barrel(x, y, cx, cy, k))
+            })
+            .collect();
+        // The least-squares linear model absorbs the barrel's linear projection.
+        let projected =
+            crate::geometry::linear::fit_linear(LinearKind::Homography, &pairs, None).unwrap();
+        let (refined, d) =
+            Distortion::fit_joint(3, &projected, &pairs, None, (cx, cy), 500.0).unwrap();
+        let map = PixelMap::with_distortion(refined, d).unwrap();
+        let mut worst = 0.0f64;
+        for &(s, r) in &pairs {
+            let (fx, fy) = map.forward(s.0, s.1);
+            worst = worst.max(((fx - r.0).powi(2) + (fy - r.1).powi(2)).sqrt());
+            let (bx, by) = map.inverse(r.0, r.1);
+            // The inverse polynomial has no linear terms and the inverse of a
+            // cubic field is not a cubic: a few milli-pixels on a 1 px barrel
+            // is its second-order residual, far below anything the resampler
+            // can resolve.
+            assert!(
+                (bx - s.0).abs() < 1e-2 && (by - s.1).abs() < 1e-2,
+                "inverse {bx} {by} vs {s:?}"
+            );
+        }
+        assert!(worst < 1e-3, "forward residual {worst}");
+        let (plain, _) = (
+            Distortion::fit(3, &projected, &pairs, None, (cx, cy), 500.0).unwrap(),
+            0,
+        );
+        let plain_map = PixelMap::with_distortion(projected, plain).unwrap();
+        let plain_worst = pairs
+            .iter()
+            .map(|&(s, r)| {
+                let (fx, fy) = plain_map.forward(s.0, s.1);
+                ((fx - r.0).powi(2) + (fy - r.1).powi(2)).sqrt()
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            plain_worst > 0.1,
+            "the un-balanced fit must leave the linear residual: {plain_worst}"
+        );
     }
 }
