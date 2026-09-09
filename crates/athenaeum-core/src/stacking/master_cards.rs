@@ -29,8 +29,11 @@ pub struct MasterCardInputs<'a> {
     pub wcs: Option<&'a PlateSolveRecord>,
     pub frames: usize,
     pub weighted_exposure_s: f64,
-    /// Earliest and latest `DATE-OBS` among the included frames (ISO text as stored).
+    /// Earliest DATE-OBS among the included frames; when None the
+    /// reference's own DATE-OBS card is kept.
     pub date_obs_first: Option<&'a str>,
+    /// Latest DATE-OBS among the included frames (ISO text as stored);
+    /// `DATE-END` is written only when this is Some.
     pub date_obs_last: Option<&'a str>,
     pub recipe: &'a str,        // IntegrationRecipe::describe()
     pub weight_mode: &'a str,   // the WeightMode serde name
@@ -58,7 +61,11 @@ pub fn build_master_light_cards(
             .reference_cards
             .iter()
             .filter(|c| REGISTERED_COPY_THROUGH.contains(&c.keyword.as_str()))
-            .filter(|c| c.keyword != "EXPTIME" && c.keyword != "DATE-OBS")
+            // EXPTIME is always replaced below (the weighted total is always
+            // known); DATE-OBS is replaced only when the group has one of
+            // its own — otherwise the reference's own card is kept.
+            .filter(|c| c.keyword != "EXPTIME")
+            .filter(|c| inputs.date_obs_first.is_none() || c.keyword != "DATE-OBS")
             .cloned(),
     );
 
@@ -94,31 +101,43 @@ pub fn build_master_light_cards(
             .with_comment("frames combined"),
     );
     cards.push(
-        Card::new("ATH_STKR", CardValue::Str(inputs.recipe.to_string()))?
-            .with_comment("combination | rejection"),
-    );
-    cards.push(
         Card::new("ATH_STKW", CardValue::Str(inputs.weight_mode.to_string()))?
             .with_comment("weight mode"),
     );
-    cards.push(
-        Card::new("ATH_STKO", CardValue::Str(inputs.normalization.to_string()))?
-            .with_comment("output/rejection normalization"),
-    );
-    cards.push(
-        Card::new("ATH_STKF", CardValue::Str(inputs.reference_id.to_string()))?
-            .with_comment("reference frame"),
-    );
-    cards.push(
-        Card::new("ATH_STKG", CardValue::Str(inputs.group_key.to_string()))?
-            .with_comment("group key"),
-    );
+    // Variable-length values: no card comment — value + comment must fit one
+    // 80-byte record and format_card errors otherwise (the same rule
+    // register/writer.rs applies to ATH_REGT). ATH_STKG looks bounded
+    // (`<instrume>__<mono|osc>__<filter>__bin<n>__<w>x<h>[__<exp>s]`) but the
+    // sanitized INSTRUME/FILTER strings inside it are caller text, not fixed
+    // width, so it belongs here too.
+    cards.push(Card::new(
+        "ATH_STKR",
+        CardValue::Str(inputs.recipe.to_string()),
+    )?);
+    cards.push(Card::new(
+        "ATH_STKO",
+        CardValue::Str(inputs.normalization.to_string()),
+    )?);
+    cards.push(Card::new(
+        "ATH_STKF",
+        CardValue::Str(inputs.reference_id.to_string()),
+    )?);
+    cards.push(Card::new(
+        "ATH_STKG",
+        CardValue::Str(inputs.group_key.to_string()),
+    )?);
     cards.push(
         Card::new("ATH_STKI", CardValue::Str(inputs.run_id.to_string()))?
             .with_comment("stacking run"),
     );
 
     Ok(cards)
+}
+
+/// Trim, then treat a blank result as absent — a `Some("  ")` filter/instrume
+/// must fall back to the default just like `None` does.
+fn blank(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn fmt_exposure_number(x: f64) -> String {
@@ -132,16 +151,20 @@ fn fmt_exposure_number(x: f64) -> String {
 /// §9.5: `<set slug>_<filter>_<instrume>_<n>x<exp>s.fits` when every exposure
 /// is within ±0.5 s of the first, else `<set slug>_<filter>_<instrume>_<n>f_<total>s.fits`;
 /// every part sanitized; `exp`/`total` printed as integers when whole, else
-/// one decimal.
+/// one decimal. "Equal" means every exposure within ±0.5 s of the FIRST
+/// one — order-dependent by design (the first frame anchors the name).
 pub fn master_file_name(
     set_name: &str,
     filter: Option<&str>,
     instrume: Option<&str>,
     exposures_s: &[f64],
 ) -> String {
-    let slug = sanitize_for_filename(set_name);
-    let filter = sanitize_for_filename(filter.unwrap_or("NoFilter"));
-    let instrume = sanitize_for_filename(instrume.unwrap_or("unknown"));
+    let mut slug = sanitize_for_filename(set_name);
+    if slug.is_empty() {
+        slug = "set".to_string();
+    }
+    let filter = sanitize_for_filename(blank(filter).unwrap_or("NoFilter"));
+    let instrume = sanitize_for_filename(blank(instrume).unwrap_or("unknown"));
     let n = exposures_s.len();
     let e0 = exposures_s.first().copied().unwrap_or(0.0);
     let equal = exposures_s.iter().all(|&e| (e - e0).abs() <= 0.5);
@@ -187,6 +210,11 @@ fn rejection_map_cards(label: &str, master_cards: &[Card]) -> Result<Vec<Card>, 
 /// written. Never overwrites: `resolve_collision` on the master path, the
 /// map names derived from the resolved stem (so a collision-suffixed master
 /// still names its own maps, not a sibling's).
+/// Not atomic as a set: the master lands before the maps, so a failed map
+/// write leaves the master on disk with no map (re-running never overwrites
+/// it — resolve_collision suffixes the retry). Two runs writing into one
+/// folder concurrently can resolve the same free name (resolve_collision is
+/// check-then-write); the orchestrator serializes group writes.
 pub fn write_master_light(
     dir: &Path,
     file_name: &str,
@@ -342,6 +370,18 @@ mod tests {
             master_file_name("a/b:c", Some("L"), Some("cam"), &[0.5, 0.5]),
             "a_b_c_L_cam_2x0.5s.fits"
         );
+        assert_eq!(
+            master_file_name("M 31", Some("  "), Some(""), &[60.0, 60.0]),
+            "M_31_NoFilter_unknown_2x60s.fits"
+        );
+        assert_eq!(
+            master_file_name("...", Some("L"), Some("cam"), &[60.0]),
+            "set_L_cam_1x60s.fits"
+        );
+        assert_eq!(
+            master_file_name("M 31", Some("Ha"), Some("cam"), &[300.0, 300.4, 300.4]),
+            "M_31_Ha_cam_3x300s.fits"
+        );
     }
 
     #[test]
@@ -420,6 +460,129 @@ mod tests {
         // exactly one of each — the reference's EXPTIME/DATE-OBS were replaced, not duplicated
         assert_eq!(cards.iter().filter(|c| c.keyword == "EXPTIME").count(), 1);
         assert_eq!(cards.iter().filter(|c| c.keyword == "DATE-OBS").count(), 1);
+
+        // Every card must format into 80-byte records — the provenance
+        // values are caller strings and a comment would overflow them.
+        for c in &cards {
+            crate::fits_writer::card::format_card(c)
+                .unwrap_or_else(|e| panic!("{}: {e}", c.keyword));
+        }
+
+        // A long, real-world reference id (150 chars: a full source path)
+        // and a normalization value that alone would overflow ATH_STKO's
+        // old comment (`multiplicativeWithScaling/scaleZeroOffset`, 41
+        // chars) must still format — ATH_STKF goes through the CONTINUE
+        // chain and reads back whole.
+        let long_reference_id = "file:/Volumes/BigMac/Users/astrobureau/Pictures/Calibration Test/LDN1272-WBPP/LDN1272-ATH/LDN 1272/camera_atr2600m/lights/c_2025-10-18_02-02-02__-9.90_180.00s_0073.fits";
+        let long_cards = build_master_light_cards(&MasterCardInputs {
+            reference_cards: &reference_cards,
+            wcs: Some(&solve),
+            frames: 208,
+            weighted_exposure_s: 36000.0,
+            date_obs_first: Some("2025-09-14T00:56:00"),
+            date_obs_last: Some("2025-10-19T05:25:52"),
+            recipe: "Average | Linear fit clip (5.0/3.5)",
+            weight_mode: "psfSignalWeight",
+            normalization: "multiplicativeWithScaling/scaleZeroOffset",
+            reference_id: long_reference_id,
+            group_key: "zwoasi2600mcduo__osc__NoFilter__bin1__6248x4176__180s",
+            run_id: "run-7",
+            app_version: "0.5.7",
+        })
+        .unwrap();
+        for c in &long_cards {
+            crate::fits_writer::card::format_card(c)
+                .unwrap_or_else(|e| panic!("{}: {e}", c.keyword));
+        }
+        let long_kw = |k: &str| {
+            long_cards
+                .iter()
+                .find(|c| c.keyword == k)
+                .map(|c| c.value.clone().unwrap())
+        };
+        assert_eq!(
+            long_kw("ATH_STKF"),
+            Some(CardValue::Str(long_reference_id.to_string()))
+        );
+    }
+
+    #[test]
+    fn date_obs_falls_back_to_the_reference_card_when_the_group_has_none() {
+        let reference_cards = vec![
+            Card::new("EXPTIME", CardValue::Real(180.0)).unwrap(),
+            Card::new("DATE-OBS", CardValue::Str("2025-10-18T02:02:02".into())).unwrap(),
+        ];
+        let cards = build_master_light_cards(&MasterCardInputs {
+            reference_cards: &reference_cards,
+            wcs: None,
+            frames: 5,
+            weighted_exposure_s: 900.0,
+            date_obs_first: None,
+            date_obs_last: None,
+            recipe: "Average | Percentile clip (0.2/0.1)",
+            weight_mode: "psfSignalWeight",
+            normalization: "additiveWithScaling/scaleZeroOffset",
+            reference_id: "frame:1",
+            group_key: "cam__mono__NoFilter__bin1__100x100",
+            run_id: "run-1",
+            app_version: "0.5.7",
+        })
+        .unwrap();
+        let kw = |k: &str| {
+            cards
+                .iter()
+                .find(|c| c.keyword == k)
+                .map(|c| c.value.clone().unwrap())
+        };
+        assert_eq!(
+            kw("DATE-OBS"),
+            Some(CardValue::Str("2025-10-18T02:02:02".into()))
+        );
+        assert_eq!(kw("DATE-END"), None);
+        assert_eq!(cards.iter().filter(|c| c.keyword == "DATE-OBS").count(), 1);
+    }
+
+    #[test]
+    fn master_cards_without_a_solve_carry_no_wcs() {
+        let reference_cards = vec![
+            Card::new("EXPTIME", CardValue::Real(180.0)).unwrap(),
+            Card::new("INSTRUME", CardValue::Str("cam".into())).unwrap(),
+            Card::new("OBJECT", CardValue::Str("LDN 1272".into())).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
+            Card::new("DATE-OBS", CardValue::Str("2025-10-18T02:02:02".into())).unwrap(),
+            Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+        ];
+        let cards = build_master_light_cards(&MasterCardInputs {
+            reference_cards: &reference_cards,
+            wcs: None,
+            frames: 208,
+            weighted_exposure_s: 36000.0,
+            date_obs_first: Some("2025-09-14T00:56:00"),
+            date_obs_last: Some("2025-10-19T05:25:52"),
+            recipe: "Average | Linear fit clip (5.0/3.5)",
+            weight_mode: "psfSignalWeight",
+            normalization: "additiveWithScaling/scaleZeroOffset",
+            reference_id: "frame:73",
+            group_key: "atr2600m__mono__NoFilter__bin1__6224x4168",
+            run_id: "run-7",
+            app_version: "0.5.7",
+        })
+        .unwrap();
+        let forbidden_prefixes = ["CTYPE", "CRPIX", "CRVAL", "CD", "A_", "PLTSOLVD"];
+        for c in &cards {
+            assert!(
+                !forbidden_prefixes.iter().any(|p| c.keyword.starts_with(p)),
+                "unexpected WCS card {}",
+                c.keyword
+            );
+        }
+        assert_eq!(
+            cards
+                .iter()
+                .find(|c| c.keyword == "ATH_STK")
+                .map(|c| c.value.clone().unwrap()),
+            Some(CardValue::Logical(true))
+        );
     }
 
     #[test]
