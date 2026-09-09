@@ -23,6 +23,7 @@ async page => {
     route.fulfill({
       contentType: 'application/javascript',
       body: `
+    window.__failures=[{frameId:102,filename:'timed-out.fits',path:'/fixture/timed-out.fits',status:'failed',code:'TIMEOUT',error:'Plate solve exceeded the 60 second per-frame time limit',attemptedAt:'2026-09-08T12:00:00Z'}];
     window.__calls=[]; window.__listeners={}; window.__catalog=true;
     window.__emit=(name,payload)=>(window.__listeners[name]||[]).forEach(cb=>cb(payload));
     const sets=[['Orion',false,false],['Andromeda',false,false],['Rosette',true,false],['Archived',true,true]].map(([name,is_custom,is_archived],i)=>({frames_set:{id:i+1,name,is_custom,is_archived, objctra:'05 35 00',objctdec:'-05 23 00',date_obs_start:'2026-01-01',date_obs_end:'2026-01-02',total_exp_time:3600},member_count:2}));
@@ -35,12 +36,14 @@ async page => {
         if(command==='get_setting')return settings[args.key]??args.defaultValue;
         if(command==='set_setting'){settings[args.key]=args.value;return;}
         if(command==='get_excluded_frames_count')return 0;
+        if(command==='get_plate_solve_attempts')return window.__failures.filter(r=>!args.frameIds.length||args.frameIds.includes(r.frameId));
+        if(command==='get_files_with_frames_by_ids')return args.frameIds.map(id=>({file:{id,filename:'frame-'+id+'.fits',path:'/fixture/frame-'+id+'.fits'},frame:{id,imagetyp:'Light'}}));
         if(command==='get_catalog_status')return [{installed:window.__catalog}];
         if(command==='get_object_plate_solve_frame_ids'){
           if(window.__resolveError)throw Error('Fixture resolution failure');
           return window.__empty?[]:args.framesSetIds.flatMap(id=>id===1?[101,102]:id===2?[102,103]:[104]);
         }
-        if(command==='plate_solve_batch')return new Promise(resolve=>{window.__finish=()=>{window.__emit('plate-solve-complete',{solved:1,failed:1,total:args.frameIds.length,total_time_ms:50});resolve();}});
+        if(command==='plate_solve_batch'){ if(window.__webImmediate){ window.__finish=()=>window.__emit('plate-solve-complete',{solved:1,failed:1,total:args.frameIds.length,totalTimeMs:50,cancelled:true,notProcessed:1});return; } return new Promise(resolve=>{window.__finish=()=>{window.__emit('plate-solve-complete',{solved:1,failed:1,total:args.frameIds.length,totalTimeMs:50});resolve();}}); }
         if(command==='cancel_plate_solve'){window.__finish();return;}
         return null;
       }

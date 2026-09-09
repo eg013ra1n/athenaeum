@@ -1,3 +1,4 @@
+import { PlateSolveLiveDetails } from './PlateSolveLiveDetails';
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle, Loader2, ScanSearch, XCircle } from 'lucide-react';
 import { usePlateSolveProgressContext } from '../../contexts/PlateSolveProgressContext';
@@ -50,7 +51,10 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   const isActive = myBatch != null && !myBatch.isComplete;
   const isCancelling = myBatch?.isCancelling ?? false;
   const progress = myBatch?.progress ?? null;
-  const currentFrameId = myBatch?.currentFrameId ?? null;
+  const currentFrameId =
+    [...(myBatch?.frameStatuses.entries() ?? [])].find(
+      ([, status]) => status.kind === 'solving',
+    )?.[0] ?? null;
   const completedSummary = myBatch?.isComplete ? myBatch.summary : null;
   const completedError = myBatch?.isComplete ? myBatch.errorMessage : null;
   const frameStatuses = myBatch?.frameStatuses ?? new Map();
@@ -86,13 +90,6 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
 
   // Show numeric frame id while solving; parents can enrich later.
   const currentLabel = currentFrameId != null ? `Frame #${currentFrameId}` : null;
-
-  const solvedCount = Array.from(frameStatuses.values()).filter(
-    (s) => s.kind === 'solved',
-  ).length;
-  const failedCount = Array.from(frameStatuses.values()).filter(
-    (s) => s.kind === 'failed',
-  ).length;
 
   // Per-frame failure reasons, surfaced as a list on completion. `code` lets
   // us style a gate-rejected solve ("REJECTED_LOW_CONFIDENCE") differently from
@@ -194,22 +191,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
             />
           </div>
 
-          {(solvedCount > 0 || failedCount > 0) && (
-            <div className="flex items-center gap-4 text-xs text-content-muted">
-              {solvedCount > 0 && (
-                <span className="flex items-center gap-1 text-success">
-                  <CheckCircle size={12} />
-                  {solvedCount} solved
-                </span>
-              )}
-              {failedCount > 0 && (
-                <span className="flex items-center gap-1 text-error">
-                  <XCircle size={12} />
-                  {failedCount} failed
-                </span>
-              )}
-            </div>
-          )}
+          {myBatch && <PlateSolveLiveDetails batch={myBatch} />}
         </div>
       )}
 
@@ -241,17 +223,22 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
                   : 'text-warning'
               }`}
             >
-              {completedError ? 'Plate solve could not start' : 'Batch solve complete'}
+              {completedError
+                ? 'Plate solve could not start'
+                : completedSummary.cancelled
+                  ? 'Batch solve cancelled'
+                  : 'Batch solve complete'}
             </p>
             {completedError ? (
-              <p className="text-content-muted text-xs mt-0.5 break-words">
-                {completedError}
-              </p>
+              <p className="text-content-muted text-xs mt-0.5 break-words">{completedError}</p>
             ) : (
               <p className="text-content-muted text-xs mt-0.5">
                 {completedSummary.solved} solved, {completedSummary.failed} failed out of{' '}
-                {completedSummary.total} frames &mdash;{' '}
-                {(completedSummary.total_time_ms / 1000).toFixed(1)}s total
+                {completedSummary.total} frames
+                {completedSummary.not_processed
+                  ? `, ${completedSummary.not_processed} not processed`
+                  : ''}{' '}
+                &mdash; {(completedSummary.total_time_ms / 1000).toFixed(1)}s total
               </p>
             )}
           </div>

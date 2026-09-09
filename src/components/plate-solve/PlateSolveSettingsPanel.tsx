@@ -19,6 +19,7 @@ const DEFAULT_CONFIG: PlateSolveConfig = {
   base_verification_tolerance_arcsec: 8.0,
   autofind_tolerance_deg: 0.5,
   batch_concurrency: 0,
+  frame_timeout_seconds: 60,
   blind_gate_enabled: true,
   blind_rms_max_px_mult: 2.5,
   blind_min_inlier_ratio: 0.04,
@@ -553,6 +554,34 @@ export function PlateSolveSettingsPanel() {
             </p>
           </div>
 
+          <div>
+            <label
+              htmlFor="solve-time-limit"
+              className="block text-sm font-medium text-content-secondary mb-1"
+            >
+              Per-frame time limit (seconds)
+            </label>
+            <input
+              id="solve-time-limit"
+              type="number"
+              min={0}
+              max={3600}
+              step={1}
+              value={config.frame_timeout_seconds}
+              onChange={e =>
+                setField(
+                  'frame_timeout_seconds',
+                  Math.max(0, Math.min(3600, parseInt(e.target.value, 10) || 0)),
+                )
+              }
+              className="w-full px-3 py-2 bg-surface border border-border rounded text-content"
+            />
+            <p className="mt-1 text-xs text-content-muted">
+              Default 60 seconds. Includes fallback searches; timed-out frames are marked failed and
+              the batch continues. 0 disables the limit. Stops at the next solver checkpoint, so
+              reading a file or an individual operation may run slightly longer.
+            </p>
+          </div>
           {/* Batch Concurrency */}
           <div>
             <label className="block text-sm font-medium text-content-secondary mb-1">

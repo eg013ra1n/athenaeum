@@ -403,6 +403,7 @@ pub fn run() {
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,
             commands::reset_plate_solve_config,
+            commands::get_plate_solve_attempts,
             commands::plate_solve_batch,
             commands::cancel_plate_solve,
             commands::autofind_objects_from_coordinates,

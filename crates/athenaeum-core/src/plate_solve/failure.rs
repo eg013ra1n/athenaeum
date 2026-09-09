@@ -22,6 +22,18 @@ pub struct SolveFailureInfo {
 /// the structured [`solvemyastro::SolveFailure`] when present; otherwise falls
 /// back to the error's own message.
 pub fn describe_solve_failure(err: &anyhow::Error) -> SolveFailureInfo {
+    if let Some(interrupted) = err.downcast_ref::<super::budget::Interrupted>() {
+        return SolveFailureInfo {
+            code: Some(
+                match interrupted {
+                    super::budget::Interrupted::Timeout(_) => "TIMEOUT",
+                    super::budget::Interrupted::Cancelled => "CANCELLED",
+                }
+                .into(),
+            ),
+            message: interrupted.to_string(),
+        };
+    }
     if let Some(f) = err.downcast_ref::<SolveFailure>() {
         let message = match &f.class {
             FailureClass::VerifyGap { best, required } => format!(

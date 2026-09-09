@@ -1,3 +1,4 @@
+import { PlateSolveLiveDetails } from './plate-solve/PlateSolveLiveDetails';
 import { Crosshair } from 'lucide-react';
 import { usePlateSolveProgressContext } from '../contexts/PlateSolveProgressContext';
 import { useSmoothedPercent } from '../hooks/useSmoothedPercent';
@@ -11,24 +12,32 @@ export function PlateSolveQueueIndicator({ collapsed }: PlateSolveQueueIndicator
   const { currentBatch, queueLength, hasActiveBatches, cancelAll } = usePlateSolveProgressContext();
 
   const progress = currentBatch?.progress;
-  const realPercent = progress && progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
+  const realPercent =
+    progress && progress.total > 0 ? (progress.current / progress.total) * 100 : 0;
   const total = progress?.total ?? 0;
   const percent = useSmoothedPercent(realPercent, total);
   const label = currentBatch?.label || 'Plate solve';
 
   return (
-    <QueueIndicator
-      collapsed={collapsed}
-      icon={Crosshair}
-      active={hasActiveBatches}
-      label={label}
-      percent={percent}
-      current={progress?.current}
-      total={progress?.total}
-      queueLength={queueLength}
-      cancelTitle="Cancel plate solve"
-      onCancelAll={cancelAll}
-      barTransition="linear"
-    />
+    <>
+      <QueueIndicator
+        collapsed={collapsed}
+        icon={Crosshair}
+        active={hasActiveBatches}
+        label={label}
+        percent={percent}
+        current={progress?.current}
+        total={progress?.total}
+        queueLength={queueLength}
+        cancelTitle="Cancel plate solve"
+        onCancelAll={cancelAll}
+        barTransition="linear"
+      />
+      {!collapsed && currentBatch && !currentBatch.isComplete && (
+        <div className="px-3 pb-3">
+          <PlateSolveLiveDetails batch={currentBatch} />
+        </div>
+      )}
+    </>
   );
 }

@@ -38,6 +38,10 @@ pub struct PlateSolveConfig {
     /// shares the global rayon pool for intra-frame star detection.
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: u32,
+    /// Per-frame elapsed time budget in seconds, including fallback attempts.
+    /// Zero disables the cooperative deadline; default 60 seconds.
+    #[serde(default = "default_frame_timeout_seconds")]
+    pub frame_timeout_seconds: u32,
     /// Apply the stricter acceptance gate before persisting a solve (defends
     /// against catalog-corruption false positives writing WCS/focal length
     /// back with override=1). Default: true.
@@ -119,6 +123,9 @@ fn default_base_verification_tolerance_arcsec() -> f64 {
 fn default_autofind_tolerance_deg() -> f64 {
     0.5
 }
+fn default_frame_timeout_seconds() -> u32 {
+    60
+}
 fn default_batch_concurrency() -> u32 {
     0
 }
@@ -163,6 +170,7 @@ impl Default for PlateSolveConfig {
             base_verification_tolerance_arcsec: default_base_verification_tolerance_arcsec(),
             autofind_tolerance_deg: default_autofind_tolerance_deg(),
             batch_concurrency: default_batch_concurrency(),
+            frame_timeout_seconds: default_frame_timeout_seconds(),
             blind_gate_enabled: default_blind_gate_enabled(),
             blind_rms_max_px_mult: default_blind_rms_max_px_mult(),
             blind_min_inlier_ratio: default_blind_min_inlier_ratio(),
@@ -217,6 +225,10 @@ fn migrate_config(config: &mut PlateSolveConfig) {
 
 /// Save the plate solve config to the database.
 pub fn save_config(conn: &Connection, config: &PlateSolveConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.frame_timeout_seconds <= 3600,
+        "Per-frame time limit must be 0–3600 seconds"
+    );
     let json = serde_json::to_string(config)?;
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
@@ -228,6 +240,27 @@ pub fn save_config(conn: &Connection, config: &PlateSolveConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_setting_migrates_and_round_trips() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES ('plate_solve.config','{}')",
+            [],
+        )
+        .unwrap();
+        let mut cfg = load_config(&conn);
+        assert_eq!(cfg.frame_timeout_seconds, 60);
+        for seconds in [0, 45, 3600] {
+            cfg.frame_timeout_seconds = seconds;
+            save_config(&conn, &cfg).unwrap();
+            assert_eq!(load_config(&conn).frame_timeout_seconds, seconds);
+        }
+        cfg.frame_timeout_seconds = 3601;
+        assert!(save_config(&conn, &cfg).is_err());
+        assert_eq!(load_config(&conn).frame_timeout_seconds, 3600);
+    }
 
     #[test]
     fn legacy_config_json_loads_ignoring_removed_keys() {
@@ -278,5 +311,31 @@ mod tests {
             20,
             "non-stale floors must be preserved"
         );
+    }
+}
+
+/// Resolve worker count without changing saved settings. Sequential retry batches
+/// use one worker; each frame still receives the normal timeout and cancel token.
+pub fn batch_workers(configured: u32, sequential: bool, cores: usize) -> usize {
+    if sequential {
+        1
+    } else if configured == 0 {
+        (cores / 3).clamp(2, 8)
+    } else {
+        (configured as usize).clamp(1, 16)
+    }
+}
+
+#[cfg(test)]
+mod batch_worker_tests {
+    #[test]
+    fn sequential_overrides_auto_and_manual_without_affecting_normal_batches() {
+        use super::batch_workers;
+        for configured in [0, 1, 4, 16, 99] {
+            assert_eq!(batch_workers(configured, true, 12), 1);
+        }
+        assert_eq!(batch_workers(0, false, 12), 4);
+        assert_eq!(batch_workers(0, false, 1), 2);
+        assert_eq!(batch_workers(99, false, 12), 16);
     }
 }

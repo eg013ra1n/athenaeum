@@ -63,7 +63,7 @@ async page => {
   await page.getByText('Preparing...', { exact: true }).waitFor();
   await page.evaluate(() =>
     window.__emit('plate-solve-progress', {
-      frame_id: 101,
+      frameId: 101,
       current: 1,
       total: 3,
       status: 'solving',
@@ -72,7 +72,7 @@ async page => {
   await page.getByText('Solving Frame #101', { exact: true }).waitFor();
   await page.evaluate(() =>
     window.__emit('plate-solve-progress', {
-      frame_id: 102,
+      frameId: 102,
       current: 2,
       total: 3,
       status: 'failed',

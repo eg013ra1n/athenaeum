@@ -1,3 +1,5 @@
+import { ObjectFileLocations } from './ObjectFileLocations';
+import { FailedSolvesReview } from './plate-solve/FailedSolvesReview';
 import { useRef, useState } from 'react';
 import { ScanSearch } from 'lucide-react';
 import { api } from '../api';
@@ -26,6 +28,7 @@ export function ObjectPlateSolveToolbar({
   onClear,
   onSolveComplete,
 }: Props) {
+  const [showFailures, setShowFailures] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const preparingRef = useRef(false);
   const panelRef = useRef<PlateSolveBatchPanelHandle>(null);
@@ -70,6 +73,8 @@ export function ObjectPlateSolveToolbar({
 
   return (
     <div className="mb-4 space-y-2">
+      {showFailures && <FailedSolvesReview onClose={() => setShowFailures(false)} />}
+      {selectedIds.length > 0 && <ObjectFileLocations ids={selectedIds} />}
       <ToolbarContainer>
         <ToolbarButton disabled={disabled || !visibleCount} onClick={onSelectAll}>
           Select All ({visibleCount})
@@ -85,6 +90,7 @@ export function ObjectPlateSolveToolbar({
         >
           {preparing ? 'Preparing frames…' : `Plate Solve Selected (${selectedIds.length})`}
         </ToolbarButton>
+        <ToolbarButton onClick={() => setShowFailures(true)}>Failed solves</ToolbarButton>
         <span className="text-xs text-content-muted self-center">
           {selectedIds.length} selected · Select All applies to this tab and current filters
         </span>
