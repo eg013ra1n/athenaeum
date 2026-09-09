@@ -83,7 +83,7 @@
 
 **Interfaces:**
 - Consumes: `IntegrationRecipe`, `Rejection`, `Combination`, the four `reject_*` routines, `sort_asc`, `median_sorted`, `mean` (all in this file).
-- Produces: `pub trait Sample`, `pub fn combine_pixel_weighted(work: &mut [(f32, u16)], out_values: &[f32], weights: &[f32], recipe: IntegrationRecipe, mask: &mut [u64]) -> (f32, usize)`, `pub fn mask_words(n: usize) -> usize`, `pub fn mask_get(mask: &[u64], i: usize) -> bool`, `pub fn mask_clear(mask: &mut [u64])`, `pub fn mask_set(mask: &mut [u64], i: usize)`.
+- Produces: `pub trait Sample`, `pub fn combine_pixel_weighted(work: &mut [(f32, u16)], out_values: &[f32], weights: &[f32], recipe: IntegrationRecipe, mask: &mut [u64], scratch: &mut Vec<f32>) -> (f32, usize)` (the `scratch` parameter was added by the Task 1 fix round — a caller-hoisted survivor-value buffer so the median path allocates nothing per pixel), `pub fn mask_words(n: usize) -> usize`, `pub fn mask_get(mask: &[u64], i: usize) -> bool`, `pub fn mask_clear(mask: &mut [u64])`, `pub fn mask_set(mask: &mut [u64], i: usize)`.
 
 - [ ] **Step 1: Read the file end to end** (`combine.rs`, ~860 lines) — the four routines compact survivors into `values[..kept]` in place and report whether the prefix is sorted; `combine_pixel` combines the prefix. Note every place a value is compared, sorted, summed or clamped.
 
@@ -725,6 +725,9 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                 let mut work: Vec<(f32, u16)> = Vec::with_capacity(n);
                 let mut out_vals = vec![0f32; n];
                 let mut mask = vec![0u64; words];
+                // The combiner's survivor-value scratch (Task 1 fix round):
+                // one per row worker, never allocated per pixel.
+                let mut scratch: Vec<f32> = Vec::with_capacity(n);
                 for (x, out_px) in out_row.iter_mut().enumerate() {
                     work.clear();
                     combine::mask_clear(&mut mask);
@@ -772,6 +775,7 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                             params.weights,
                             recipe,
                             &mut mask,
+                            &mut scratch,
                         );
                         *out_px = val;
                         if rej_count > 0 {
