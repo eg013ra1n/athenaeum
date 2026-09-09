@@ -214,3 +214,6 @@ mod tests {
         assert!(policy2.check(Path::new(r"\\?\C:\data\x.fits")).is_ok());
     }
 }
+
+pub mod folder_counts;
+pub use folder_counts::*;

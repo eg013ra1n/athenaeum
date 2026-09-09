@@ -1,6 +1,12 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+export type FrameTypeCounts = { total: number, lights: number, darks: number, flats: number, bias: number, darkFlats: number, masters: number, unknown: number, };
+
+export type FolderTypeRow = { path: string, counts: FrameTypeCounts, };
+
+export type FolderTypeBreakdown = { direct: FrameTypeCounts, recursive: FrameTypeCounts, children: Array<FolderTypeRow>, };
+
 export type FileFormat = "FITS" | "XISF";
 
 export type ImageType = "Light" | "Dark" | "Flat" | "Bias" | "DarkFlat" | "MasterLight" | "MasterDark" | "MasterFlat" | "MasterBias" | "MasterDarkFlat";

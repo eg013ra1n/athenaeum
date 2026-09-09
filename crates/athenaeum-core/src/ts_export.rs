@@ -65,6 +65,9 @@ fn js_safe_ints(ts: String) -> String {
 pub fn generated_files() -> Vec<(&'static str, String)> {
     vec![
         ("models.ts", js_safe_ints(format!("{HEADER}{}", decls![
+            crate::api::folder_counts::FrameTypeCounts,
+            crate::api::folder_counts::FolderTypeRow,
+            crate::api::folder_counts::FolderTypeBreakdown,
             crate::models::FileFormat,
             crate::models::ImageType,
             crate::models::File,

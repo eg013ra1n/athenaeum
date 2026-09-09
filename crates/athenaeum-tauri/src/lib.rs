@@ -259,6 +259,7 @@ pub fn run() {
             commands::start_scan_with_progress,
             commands::cancel_scan,
             commands::get_files,
+            commands::get_folder_type_breakdown,
             commands::get_files_by_directory,
             commands::get_frames_with_missing_metadata,
             commands::bulk_update_frame_metadata,
