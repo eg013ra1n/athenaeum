@@ -156,11 +156,12 @@ fn pick_dir(
     }
 }
 
-/// The two folders after validation: normalized, created, writable, and
-/// checked against each other. `warnings` carries stacking-worded
-/// scan-root-overlap sentences (see [`OverlapRule::Warn`] and
-/// [`overlap_sentence`]) — non-fatal for stacking folders, unlike the
-/// transfer folders `validate_transfer_dir` was written for.
+/// The two folders after validation: normalized, writable, and checked
+/// against each other. `warnings` carries either stacking-worded
+/// scan-root-overlap sentences ([`ValidateMode::Save`], see
+/// [`OverlapRule::Warn`] and [`overlap_sentence`]) or "does not exist yet"
+/// sentences ([`ValidateMode::Plan`], see [`ValidateMode`]'s own doc) —
+/// non-fatal for stacking folders either way.
 #[derive(Debug, Clone)]
 pub struct ValidatedDirs {
     pub working: PathBuf,
@@ -168,8 +169,46 @@ pub struct ValidatedDirs {
     pub warnings: Vec<String>,
 }
 
-/// Validate (and create) the working and output folders for a stacking run.
-/// Each goes through [`crate::api::sync::validate_transfer_dir`] with
+/// [`validate_dirs`]'s side-effect switch (final fix wave item 5):
+/// `get_stacking_plan` calls [`build_plan`](crate::stacking::plan::build_plan)
+/// on every debounced Stacking-tab config edit — the plan must read the
+/// folders, never write to them. `Save` keeps the original (pre-wave)
+/// behaviour: it creates both folders and writes/removes the
+/// `.athenaeum-write-test` probe (via [`crate::api::sync::validate_transfer_dir`]),
+/// and is used by `set_stacking_paths` (an explicit user save) and
+/// `start_stacking` (once, immediately before the run thread spawns —
+/// creating the folders the run is about to write into). `Plan` performs NO
+/// filesystem WRITE at all: it still validates the sandbox `PathPolicy` and
+/// the two folder-pair rules (must differ; working may not sit inside
+/// output), but a folder's existence/writability becomes a `read_dir`/
+/// `metadata` probe rather than a creation — reported as a WARNING when the
+/// folder does not exist yet (normal for a set that has never run: "it will
+/// be created when the run starts") or the `folders` blocker when it exists
+/// but this process cannot write to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidateMode {
+    Plan,
+    Save,
+}
+
+/// Validate the working and output folders for a stacking run, per `mode`
+/// (see [`ValidateMode`] for exactly what each mode does and does not
+/// touch on disk).
+pub fn validate_dirs(
+    conn: &Connection,
+    policy: &PathPolicy,
+    working: &str,
+    output: &str,
+    mode: ValidateMode,
+) -> Result<ValidatedDirs, ApiError> {
+    match mode {
+        ValidateMode::Save => validate_dirs_save(conn, policy, working, output),
+        ValidateMode::Plan => validate_dirs_plan(policy, working, output),
+    }
+}
+
+/// [`ValidateMode::Save`]'s body — unchanged from before this wave: each
+/// folder goes through [`crate::api::sync::validate_transfer_dir`] with
 /// [`OverlapRule::Warn`] — a stacking folder overlapping a monitored scan
 /// root is worth flagging (the scanner would try to ingest intermediate/
 /// output FITS as if they were new frames — except every file this pipeline
@@ -187,7 +226,7 @@ pub struct ValidatedDirs {
 /// the two rules above it: a folder validated is a folder that must exist by
 /// the time this function returns `Ok`, but a rejected save must not litter
 /// the filesystem with a folder the operator will never get to use.
-pub fn validate_dirs(
+fn validate_dirs_save(
     conn: &Connection,
     policy: &PathPolicy,
     working: &str,
@@ -242,6 +281,86 @@ pub fn validate_dirs(
         output: output_path,
         warnings,
     })
+}
+
+/// [`ValidateMode::Plan`]'s body — NO filesystem write, ever (no
+/// `create_dir_all`, no probe file): only a `PathPolicy` check, the two
+/// folder-pair rules, and a read-only existence/writability probe per
+/// folder. See [`ValidateMode`]'s own doc for the full contract.
+fn validate_dirs_plan(
+    policy: &PathPolicy,
+    working: &str,
+    output: &str,
+) -> Result<ValidatedDirs, ApiError> {
+    let working_path = plan_checked_path(policy, working, "Stacking working folder")?;
+    let output_path = plan_checked_path(policy, output, "Stacking output folder")?;
+
+    if working_path == output_path {
+        return Err(ApiError::Invalid(
+            "working and output folders must differ".into(),
+        ));
+    }
+    if working_path.starts_with(&output_path) {
+        return Err(ApiError::Invalid(
+            "the working folder may not sit inside the output folder".into(),
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    check_dir_writable_or_warn("Stacking working folder", &working_path, &mut warnings)?;
+    check_dir_writable_or_warn("Stacking output folder", &output_path, &mut warnings)?;
+
+    Ok(ValidatedDirs {
+        working: working_path,
+        output: output_path,
+        warnings,
+    })
+}
+
+/// Absolute-path + [`PathPolicy`] check ONLY — [`ValidateMode::Plan`]'s
+/// lexical-only pre-check, mirroring `validate_transfer_dir`'s own
+/// pre-`create_dir_all` check (a Plan-mode folder may not exist yet, so it
+/// cannot be `canonicalize`d the way `Save` mode's authoritative,
+/// post-creation check does).
+fn plan_checked_path(policy: &PathPolicy, raw: &str, label: &str) -> Result<PathBuf, ApiError> {
+    let trimmed = raw.trim();
+    let candidate = Path::new(trimmed);
+    if trimmed.is_empty() || !candidate.is_absolute() {
+        return Err(ApiError::Invalid(format!(
+            "{label}: enter an absolute path"
+        )));
+    }
+    let normalized = crate::api::scan_roots::normalize_path(candidate);
+    policy.check(&normalized)?;
+    Ok(normalized)
+}
+
+/// [`ValidateMode::Plan`]'s per-folder probe: a folder that does not exist
+/// yet is a WARNING, never a blocker — normal for a set that has never run.
+/// An existing folder this process cannot write to (`fs::metadata` reports
+/// it read-only, or `fs::read_dir` itself fails) is the `folders` BLOCKER,
+/// surfaced as `Err` — `build_plan` turns any `validate_dirs` error into
+/// that one blocker.
+fn check_dir_writable_or_warn(
+    label: &str,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(), ApiError> {
+    if !path.exists() {
+        warnings.push(format!(
+            "{label} does not exist yet — it will be created when the run starts"
+        ));
+        return Ok(());
+    }
+    let readonly = std::fs::metadata(path)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false);
+    if readonly || std::fs::read_dir(path).is_err() {
+        return Err(ApiError::Invalid(format!(
+            "{label}: folder is not writable"
+        )));
+    }
+    Ok(())
 }
 
 /// Word a stacking-specific scan-root-overlap warning from the overlapping
@@ -461,7 +580,7 @@ pub fn cleanup_work(
     tracing::debug!(
         frame_set_id = frames_set_id,
         count = dirs.len(),
-        bytes = freed,
+        freed_bytes = freed,
         "stacking work cleaned up"
     );
 
@@ -556,8 +675,14 @@ mod tests {
 
         // Equal folders: rejected.
         let same = tmp.path().join("same");
-        let err =
-            validate_dirs(&c, &policy, same.to_str().unwrap(), same.to_str().unwrap()).unwrap_err();
+        let err = validate_dirs(
+            &c,
+            &policy,
+            same.to_str().unwrap(),
+            same.to_str().unwrap(),
+            ValidateMode::Save,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ApiError::Invalid(ref m) if m.contains("must differ")),
             "{err:?}"
@@ -571,6 +696,7 @@ mod tests {
             &policy,
             working_inside.to_str().unwrap(),
             output.to_str().unwrap(),
+            ValidateMode::Save,
         )
         .unwrap_err();
         assert!(
@@ -589,6 +715,7 @@ mod tests {
             &policy,
             working.to_str().unwrap(),
             output.to_str().unwrap(),
+            ValidateMode::Save,
         )
         .unwrap();
         assert!(validated.working.is_dir());
@@ -626,11 +753,159 @@ mod tests {
             &policy,
             working.to_str().unwrap(),
             output.to_str().unwrap(),
+            ValidateMode::Save,
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
         assert!(!working.exists(), "the folder this call created is removed");
         assert!(!output.exists(), "the folder this call created is removed");
+    }
+
+    /// Final fix wave item 5: `Plan` mode creates nothing on disk and
+    /// reports each non-existent folder as a warning, never a blocker;
+    /// `Save` mode (unchanged) creates both.
+    #[test]
+    fn validate_dirs_plan_creates_nothing_and_warns() {
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PathPolicy::AllowAll;
+
+        let working = tmp.path().join("plan-working");
+        let output = tmp.path().join("plan-output");
+        assert!(!working.exists());
+        assert!(!output.exists());
+
+        let validated = validate_dirs(
+            &c,
+            &policy,
+            working.to_str().unwrap(),
+            output.to_str().unwrap(),
+            ValidateMode::Plan,
+        )
+        .unwrap();
+        assert!(!working.exists(), "Plan mode must create nothing");
+        assert!(!output.exists(), "Plan mode must create nothing");
+        assert_eq!(validated.warnings.len(), 2, "{:?}", validated.warnings);
+        assert!(
+            validated.warnings[0].contains("does not exist yet")
+                && validated.warnings[0].contains("Stacking working folder"),
+            "{:?}",
+            validated.warnings
+        );
+        assert!(
+            validated.warnings[1].contains("does not exist yet")
+                && validated.warnings[1].contains("Stacking output folder"),
+            "{:?}",
+            validated.warnings
+        );
+
+        // `Save` mode, same two paths: both get created, no "does not exist
+        // yet" warnings.
+        let validated = validate_dirs(
+            &c,
+            &policy,
+            working.to_str().unwrap(),
+            output.to_str().unwrap(),
+            ValidateMode::Save,
+        )
+        .unwrap();
+        assert!(working.is_dir());
+        assert!(output.is_dir());
+        assert!(validated.warnings.is_empty(), "{:?}", validated.warnings);
+    }
+
+    /// Final fix wave item 5: `Plan` mode still enforces the sandbox policy
+    /// and the two folder-pair rules, without ever touching disk.
+    #[test]
+    fn validate_dirs_plan_enforces_policy_and_pair_rules() {
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Outside the sandbox: rejected, nothing created.
+        let allowed = tmp.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![allowed.clone()]);
+        let outside_working = tmp.path().join("outside-working");
+        let outside_output = tmp.path().join("outside-output");
+        let err = validate_dirs(
+            &c,
+            &policy,
+            outside_working.to_str().unwrap(),
+            outside_output.to_str().unwrap(),
+            ValidateMode::Plan,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_) | ApiError::Forbidden(_)));
+        assert!(!outside_working.exists());
+        assert!(!outside_output.exists());
+
+        // Equal folders: rejected.
+        let policy = PathPolicy::AllowAll;
+        let same = tmp.path().join("plan-same");
+        let err = validate_dirs(
+            &c,
+            &policy,
+            same.to_str().unwrap(),
+            same.to_str().unwrap(),
+            ValidateMode::Plan,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m.contains("must differ")),
+            "{err:?}"
+        );
+
+        // Working inside output: rejected.
+        let output = tmp.path().join("plan-output-2");
+        let working_inside = output.join("scratch");
+        let err = validate_dirs(
+            &c,
+            &policy,
+            working_inside.to_str().unwrap(),
+            output.to_str().unwrap(),
+            ValidateMode::Plan,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m.contains("may not sit inside")),
+            "{err:?}"
+        );
+    }
+
+    /// Final fix wave item 5: `Plan` mode reports an EXISTING, unwritable
+    /// folder as the `folders` blocker (an `Err`, same as every other
+    /// `validate_dirs` failure) rather than a warning.
+    #[cfg(unix)]
+    #[test]
+    fn validate_dirs_plan_blocks_on_an_unwritable_existing_folder() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = PathPolicy::AllowAll;
+
+        let working = tmp.path().join("readonly-working");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::set_permissions(&working, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let output = tmp.path().join("plan-output-3");
+
+        let result = validate_dirs(
+            &c,
+            &policy,
+            working.to_str().unwrap(),
+            output.to_str().unwrap(),
+            ValidateMode::Plan,
+        );
+
+        // Always restore permissions before asserting/unwinding, so the
+        // tempdir can still be cleaned up even if an assertion below panics.
+        std::fs::set_permissions(&working, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m.contains("not writable")),
+            "{err:?}"
+        );
     }
 
     // ── free_bytes ───────────────────────────────────────────────────────

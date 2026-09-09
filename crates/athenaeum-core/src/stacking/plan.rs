@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::lights::{check_mode_ready, compute_export_readiness, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
-use crate::db::stacking::{active_run_for_set, find_artifact, get_set_config, StackingArtifactRow};
+use crate::db::stacking::{
+    active_run_for_set, find_artifact, get_set_config, list_frame_rows, list_runs,
+    StackingArtifactRow,
+};
 use crate::export::models::ExportMode;
 use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
 use crate::registration::db::{
@@ -533,59 +536,62 @@ pub(crate) fn registration_row_is_fresh(
         && row.config_hash.as_deref() == Some(expected_hash)
 }
 
-/// Register-stage staleness (spec §9.3, gate step's `stale_stages`).
+/// Register-stage staleness (spec §9.3, gate step's `stale_stages`) — final
+/// fix wave item 3: staleness follows the LATEST RUN's own included frames,
+/// in BOTH reference modes, rather than re-deriving "which frames matter"
+/// from the current group membership.
 ///
-/// `Auto` reference mode cannot pre-verify a `config_hash` — the reference
-/// itself is only decided once a run actually weighs the frames — so it
-/// uses a looser reusability rule: every non-excluded frame must already
-/// have a `registration_results` row whose `source_kind` is `"calibrated"`
-/// (a v2-pipeline row, not a leftover from the old registration service).
+/// The old rule demanded a fresh `registration_results` row for every
+/// non-manually-excluded frame in `Manual` mode — but a run only ever
+/// registers the frames stage 3 (measure & select) actually kept in a
+/// viable group, so a single selection-dropped frame (weight below the
+/// floor, a group that fell under 3 included) left `Register` stale
+/// forever, even immediately after a successful run. `Auto` mode's old rule
+/// (any row with `source_kind == "calibrated"`, ignoring which reference
+/// the run actually chose) went the other way: it read "fresh" even when
+/// the run's own chosen reference had since changed.
 ///
-/// `Manual` reusability additionally requires the row's `reference_frame_id`
-/// to equal the plan's OWN reference, an `aligned`/`aligned_flipped`/
-/// `reference` status, and a `config_hash` matching
-/// [`registration_hash_for`] computed from the CURRENT stage-1 hashes of
-/// both the reference and the frame — so a reference whose calibration
-/// changed (or a frame whose own calibration did) makes registration stale
-/// even though the row itself is untouched.
-///
-/// The reference's own hash is resolved ONLY in `Manual` mode with
-/// `reference.on_disk` already `true` — never unconditionally. A manual set
-/// with no reference chosen yet, or one whose reference file is already
-/// known missing (the `reference` gate blocker reported it), is stale by
-/// construction without a second resolution attempt (and its own `warn!`)
-/// over a frame the plan already knows is unusable.
+/// No previous run at all ([`list_runs`] empty) is stale by construction —
+/// there is nothing to compare against. Otherwise: the frames to check are
+/// the latest run's `stacking_run_frames` rows with `included = true` (a
+/// frame the run itself excluded needs no registration row at all to read
+/// as not stale — it was never going to be registered by that run either).
+/// The reference to check against is the plan's OWN manual reference
+/// (`reference.frame_id`, already gated on `reference.on_disk`) in `Manual`
+/// mode, or the latest run's OWN recorded `reference_frame_id` in `Auto`
+/// mode (`None` there — a run that recorded no reference — is stale). Each
+/// included frame then needs a `registration_results` row passing
+/// [`registration_row_is_fresh`] against the CURRENT stage-1 hashes of both
+/// the reference and the frame — the SAME predicate `run.rs`'s stage 5
+/// uses, so the plan and the run it precedes can never disagree about what
+/// "fresh" means. A reference change (manual re-pick, or an auto run
+/// choosing a different frame than last time) is caught the same way: the
+/// stored row's own `reference_frame_id` no longer matches.
 fn compute_register_stale(
     conn: &Connection,
     cfg: &StackingConfig,
     frames_set_id: i64,
     groups: &[IntegrationGroup],
-    excluded: &HashSet<i64>,
     reference: &PlanReference,
     memo: &mut HashMemo,
 ) -> Result<bool, ApiError> {
-    let rows = get_registration_for_frame_set(conn, frames_set_id)?;
-    let by_frame: HashMap<i64, &RegistrationRecord> =
-        rows.iter().map(|r| (r.frame_id, r)).collect();
-
-    let included_frames: Vec<&GroupFrame> = groups
-        .iter()
-        .flat_map(|g| g.frames.iter())
-        .filter(|f| !excluded.contains(&f.frame_id))
-        .collect();
-
-    if reference.mode == ReferenceMode::Auto {
-        return Ok(included_frames
-            .iter()
-            .any(|f| match by_frame.get(&f.frame_id) {
-                None => true,
-                Some(row) => row.source_kind.as_deref() != Some("calibrated"),
-            }));
-    }
-
-    let (Some(reference_frame_id), true) = (reference.frame_id, reference.on_disk) else {
+    let Some(last_run) = list_runs(conn, frames_set_id, 1)?.into_iter().next() else {
         return Ok(true);
     };
+
+    let reference_frame_id = match reference.mode {
+        ReferenceMode::Manual => {
+            let (Some(id), true) = (reference.frame_id, reference.on_disk) else {
+                return Ok(true);
+            };
+            id
+        }
+        ReferenceMode::Auto => match last_run.reference_frame_id {
+            Some(id) => id,
+            None => return Ok(true),
+        },
+    };
+
     let Some(reference_group_frame) = find_group_frame(groups, reference_frame_id) else {
         return Ok(true);
     };
@@ -593,8 +599,18 @@ fn compute_register_stale(
         return Ok(true);
     };
 
-    for f in &included_frames {
-        let Some(row) = by_frame.get(&f.frame_id) else {
+    let rows = get_registration_for_frame_set(conn, frames_set_id)?;
+    let by_frame: HashMap<i64, &RegistrationRecord> =
+        rows.iter().map(|r| (r.frame_id, r)).collect();
+
+    let included_frame_ids: Vec<i64> = list_frame_rows(conn, last_run.id)?
+        .into_iter()
+        .filter(|f| f.included)
+        .map(|f| f.frame_id)
+        .collect();
+
+    for frame_id in included_frame_ids {
+        let Some(f) = find_group_frame(groups, frame_id) else {
             return Ok(true);
         };
         let Some(frame_calib_hash) = memo.calibration_hash(conn, cfg, f) else {
@@ -606,6 +622,9 @@ fn compute_register_stale(
             &reference_calib_hash,
             &frame_calib_hash,
         );
+        let Some(row) = by_frame.get(&frame_id) else {
+            return Ok(true);
+        };
         if !registration_row_is_fresh(row, reference_frame_id, &expected) {
             return Ok(true);
         }
@@ -669,7 +688,7 @@ pub fn build_plan(
     let mut output_dir: Option<String> = None;
     match (resolved_dirs.working, resolved_dirs.output) {
         (Some(working), Some(output)) => {
-            match paths::validate_dirs(conn, policy, &working, &output) {
+            match paths::validate_dirs(conn, policy, &working, &output, paths::ValidateMode::Plan) {
                 Ok(validated) => {
                     warnings.extend(validated.warnings);
                     working_dir = Some(validated.working.to_string_lossy().into_owned());
@@ -823,15 +842,8 @@ pub fn build_plan(
         });
     }
 
-    let register_stale = compute_register_stale(
-        conn,
-        &cfg,
-        frames_set_id,
-        &groups,
-        &excluded_set,
-        &reference,
-        &mut memo,
-    )?;
+    let register_stale =
+        compute_register_stale(conn, &cfg, frames_set_id, &groups, &reference, &mut memo)?;
 
     let mut stale_stages = Vec::new();
     if calibrate_stale {
@@ -1244,14 +1256,84 @@ mod tests {
         assert_eq!(plan2.groups[0].calibrated_cached, 0);
     }
 
+    /// Seed a `stacking_runs` row (a stand-in for "a previous run already
+    /// happened") plus one `stacking_run_groups` row and one
+    /// `stacking_run_frames` row per `frame_ids` entry, ALL `included =
+    /// true` — [`compute_register_stale`]'s "follow the last run" rule
+    /// (final fix wave item 3) reads exactly these rows. Returns the run id.
+    fn seed_run_frame_rows(
+        conn: &Connection,
+        frames_set_id: i64,
+        reference_frame_id: Option<i64>,
+        reference_mode: &str,
+        frame_ids: &[i64],
+    ) -> i64 {
+        let run_id = crate::db::stacking::insert_run(
+            conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id,
+                reference_mode,
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        let group_id = crate::db::stacking::insert_group(
+            conn,
+            &crate::db::stacking::NewGroup {
+                run_id,
+                group_key: "g",
+                instrume: None,
+                color_mode: "mono",
+                filter: None,
+                binning: Some(1),
+                width: Some(1),
+                height: Some(1),
+                exposure: None,
+                frame_count: frame_ids.len() as i64,
+                included_count: frame_ids.len() as i64,
+            },
+        )
+        .unwrap();
+        for &frame_id in frame_ids {
+            crate::db::stacking::upsert_frame_row(
+                conn,
+                &crate::db::stacking::NewFrameRow {
+                    run_id,
+                    group_id,
+                    frame_id,
+                    included: true,
+                    exclusion_reason: None,
+                    weight: None,
+                    weight_channels_json: None,
+                    metrics_json: None,
+                    reg_status: None,
+                    reg_model: None,
+                    reg_rms_px: None,
+                    reg_inliers: None,
+                    reg_inlier_ratio: None,
+                    reg_flipped: None,
+                    rejected_fraction: None,
+                },
+            )
+            .unwrap();
+        }
+        run_id
+    }
+
     /// The fresh path, end to end: every frame gets a matching `calibrated`
     /// artifact (real file, recorded size), a matching `metrics` artifact,
-    /// and (manual reference mode) a matching `registration_results` row —
-    /// `stale_stages` comes back empty and both cache counters read the
-    /// group's full frame count. Then one non-reference frame's
-    /// registration row is flipped to a hash that no longer matches, and
-    /// ONLY `Register` goes stale — Calibrate/Measure are untouched by a
-    /// change that is registration-only.
+    /// a previous run whose `stacking_run_frames` rows include all three
+    /// frames, and (manual reference mode) a matching `registration_results`
+    /// row — `stale_stages` comes back empty and both cache counters read
+    /// the group's full frame count (test scenario (a) of final fix wave
+    /// item 3, manual mode). Then one non-reference frame's registration row
+    /// is flipped to a hash that no longer matches, and ONLY `Register` goes
+    /// stale — Calibrate/Measure are untouched by a change that is
+    /// registration-only (scenario (b)).
     #[test]
     fn fresh_artifacts_and_registration_leave_nothing_stale() {
         let f = test_fixtures::frame_set("LDN 1272");
@@ -1336,6 +1418,11 @@ mod tests {
             .unwrap();
         }
 
+        // A previous run that registered all three frames (the new rule's
+        // "which frames matter" source, instead of the current group
+        // membership).
+        seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "manual", &ids);
+
         let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
         for gf in &groups[0].frames {
             let frame_hash = calib_hashes.get(&gf.frame_id).unwrap();
@@ -1404,6 +1491,243 @@ mod tests {
             vec![Stage::Register],
             "{:?}",
             plan2.stale_stages
+        );
+    }
+
+    /// Final fix wave item 3, scenario (c): a frame the LATEST RUN itself
+    /// excluded (`stacking_run_frames.included = false`, e.g. dropped by
+    /// stage-3 selection) needs no registration row at all to leave
+    /// Register not stale — only the frames the run actually kept matter.
+    #[test]
+    fn register_stale_ignores_a_frame_the_run_excluded() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        // Run: ids[0]/ids[1] included, ids[2] excluded by the run itself
+        // (e.g. dropped below the weight floor at stage 3).
+        let run_id = crate::db::stacking::insert_run(
+            &f.conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: f.set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: Some(ids[0]),
+                reference_mode: "manual",
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        let group_id = crate::db::stacking::insert_group(
+            &f.conn,
+            &crate::db::stacking::NewGroup {
+                run_id,
+                group_key: "g",
+                instrume: None,
+                color_mode: "mono",
+                filter: None,
+                binning: Some(1),
+                width: Some(1),
+                height: Some(1),
+                exposure: None,
+                frame_count: 3,
+                included_count: 2,
+            },
+        )
+        .unwrap();
+        for (i, &frame_id) in ids.iter().enumerate() {
+            crate::db::stacking::upsert_frame_row(
+                &f.conn,
+                &crate::db::stacking::NewFrameRow {
+                    run_id,
+                    group_id,
+                    frame_id,
+                    included: i != 2,
+                    exclusion_reason: if i == 2 {
+                        Some("below the weight floor")
+                    } else {
+                        None
+                    },
+                    weight: None,
+                    weight_channels_json: None,
+                    metrics_json: None,
+                    reg_status: None,
+                    reg_model: None,
+                    reg_rms_px: None,
+                    reg_inliers: None,
+                    reg_inlier_ratio: None,
+                    reg_flipped: None,
+                    rejected_fraction: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // Registration rows for the two INCLUDED frames only — none at all
+        // for ids[2], the run-excluded one.
+        let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
+        for &frame_id in &ids[..2] {
+            let frame_hash = calib_hashes.get(&frame_id).unwrap();
+            let expected = registration_hash_for(&cfg, ids[0], &reference_hash, frame_hash);
+            let is_reference = frame_id == ids[0];
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id,
+                reference_frame_id: ids[0],
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Register),
+            "a frame the run itself excluded must not force Register stale: {:?}",
+            plan.stale_stages
+        );
+    }
+
+    /// Final fix wave item 3, scenarios (a) and (e) in Auto mode: with a
+    /// previous run's OWN recorded `reference_frame_id` and matching
+    /// registration rows, Register is not stale (a); a SECOND run choosing a
+    /// DIFFERENT reference than the first, without the registration rows
+    /// ever being updated to match, makes Register stale again (e) — even
+    /// though every row's own `config_hash` still matches its own (now
+    /// wrong) `reference_frame_id`.
+    #[test]
+    fn register_stale_auto_mode_follows_the_runs_own_reference() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let cfg = StackingConfig::default();
+        assert_eq!(
+            cfg.reference.mode,
+            ReferenceMode::Auto,
+            "the default is Auto"
+        );
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "auto", &ids);
+
+        let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
+        for &frame_id in &ids {
+            let frame_hash = calib_hashes.get(&frame_id).unwrap();
+            let expected = registration_hash_for(&cfg, ids[0], &reference_hash, frame_hash);
+            let is_reference = frame_id == ids[0];
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id,
+                reference_frame_id: ids[0],
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Register),
+            "{:?}",
+            plan.stale_stages
+        );
+
+        // A second run recorded a DIFFERENT reference — the registration
+        // rows still point at the OLD one.
+        seed_run_frame_rows(&f.conn, f.set_id, Some(ids[1]), "auto", &ids);
+
+        let plan2 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            plan2.stale_stages.contains(&Stage::Register),
+            "a reference change the registration rows don't reflect must be stale: {:?}",
+            plan2.stale_stages
+        );
+    }
+
+    /// Final fix wave item 3, scenario (d): with no previous run at all,
+    /// Register is always stale — nothing to compare against, regardless of
+    /// reference mode.
+    #[test]
+    fn register_stale_with_no_previous_run() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            plan.stale_stages.contains(&Stage::Register),
+            "{:?}",
+            plan.stale_stages
         );
     }
 

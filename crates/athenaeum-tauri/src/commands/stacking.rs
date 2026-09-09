@@ -48,7 +48,12 @@ pub async fn get_stacking_plan(
 /// `get_stacking_plan`/`set_stacking_paths` use (desktop's `AllowAll`) — a
 /// config-supplied `paths.workingDir`/`paths.outputDir` override is a
 /// caller-controlled path, so plan and start must agree on what the host
-/// allows.
+/// allows. Final fix wave, item 2: `api::start_stacking` runs the full
+/// `build_plan` (per-frame hashing, master-flat reads on cardless flats) plus
+/// one `insert_group` per group before it ever spawns the run thread — under
+/// `spawn_blocking` (same reasoning as `get_stacking_plan`) so that work
+/// stays off the async executor rather than blocking every other in-flight
+/// command on this Tokio worker thread.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn start_stacking(
@@ -58,16 +63,21 @@ pub async fn start_stacking(
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, String> {
+    let ctx = state.ctx.clone();
     let emitter = Arc::new(TauriProgressEmitter(app_handle));
-    api::start_stacking(
-        state.ctx.clone(),
-        emitter,
-        &POLICY,
-        env!("CARGO_PKG_VERSION").to_string(),
-        set_id,
-        config,
-        rerun_from,
-    )
+    tokio::task::spawn_blocking(move || {
+        api::start_stacking(
+            ctx,
+            emitter,
+            &POLICY,
+            env!("CARGO_PKG_VERSION").to_string(),
+            set_id,
+            config,
+            rerun_from,
+        )
+    })
+    .await
+    .map_err(|e| format!("Start task panicked: {e}"))?
     .map_err(|e| e.to_string())
 }
 

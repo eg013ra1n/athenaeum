@@ -147,25 +147,41 @@ pub async fn get_stacking_plan(
 /// `state.allowed_paths`'s policy — the SAME one `get_stacking_plan`/
 /// `set_stacking_paths` use — since a config-supplied
 /// `paths.workingDir`/`paths.outputDir` override is a caller-controlled
-/// path, not necessarily an already-stored settings one.
+/// path, not necessarily an already-stored settings one. Final fix wave,
+/// item 2: `api::start_stacking` runs the full `build_plan` (per-frame
+/// hashing, master-flat reads on cardless flats) plus one `insert_group` per
+/// group before it ever spawns the run thread — under `spawn_blocking` (same
+/// reasoning as `get_stacking_plan`) so that work stays off the async
+/// executor.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_stacking(
     State(state): State<WebAppState>,
     Json(args): Json<StartStackingArgs>,
 ) -> Result<Json<StartedStacking>, (StatusCode, String)> {
     let policy = allowed_roots_policy(&state.allowed_paths);
+    let ctx = state.ctx.clone();
     let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::start_stacking(
-        state.ctx.clone(),
-        emitter,
-        &policy,
-        env!("CARGO_PKG_VERSION").to_string(),
-        args.set_id,
-        args.config,
-        args.rerun_from,
-    )
-    .map(Json)
-    .map_err(api_err)
+    let result = tokio::task::spawn_blocking(move || {
+        api::start_stacking(
+            ctx,
+            emitter,
+            &policy,
+            env!("CARGO_PKG_VERSION").to_string(),
+            args.set_id,
+            args.config,
+            args.rerun_from,
+        )
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Start task panicked: {}", e),
+        )
+    })?
+    .map_err(api_err)?;
+
+    Ok(Json(result))
 }
 
 /// POST /api/cancel_stacking

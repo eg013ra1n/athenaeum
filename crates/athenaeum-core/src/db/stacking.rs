@@ -365,6 +365,24 @@ pub fn active_run_for_set(conn: &Connection, frames_set_id: i64) -> Result<Optio
         .optional()?)
 }
 
+/// Every run row still `planning`/`running` for ANY frame set, oldest first
+/// — the healing sweep's own input (final fix wave item 1): a row left in
+/// one of these two statuses by a killed/crashed process, since neither is
+/// ever reached again except by the run thread itself. `(id, frames_set_id)`
+/// only — the caller needs nothing else to decide whether a live
+/// `active_stacks` handle still covers it.
+pub fn list_unfinished_runs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, frames_set_id FROM stacking_runs
+         WHERE status IN ('planning', 'running')
+         ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------
 // Groups
 // ---------------------------------------------------------------------
@@ -870,6 +888,49 @@ mod tests {
         assert!(r.finished_at.is_some());
         assert_eq!(active_run_for_set(&c, set).unwrap(), None);
         assert_eq!(list_runs(&c, set, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_unfinished_runs_reports_only_planning_and_running() {
+        let c = conn();
+        let set = seed_set(&c);
+
+        let new_run = |status: &str| {
+            let run = insert_run(
+                &c,
+                &NewRun {
+                    frames_set_id: set,
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: "/w",
+                    output_dir: "/o",
+                },
+            )
+            .unwrap();
+            if status != "planning" {
+                set_run_status(&c, run, status).unwrap();
+            }
+            run
+        };
+
+        let planning_run = new_run("planning");
+        let running_run = new_run("running");
+        let done_run = new_run("done");
+        let failed_run = new_run("failed");
+
+        let unfinished: Vec<i64> = list_unfinished_runs(&c)
+            .unwrap()
+            .into_iter()
+            .map(|(id, frames_set_id)| {
+                assert_eq!(frames_set_id, set);
+                id
+            })
+            .collect();
+        assert_eq!(unfinished, vec![planning_run, running_run]);
+        assert!(!unfinished.contains(&done_run));
+        assert!(!unfinished.contains(&failed_run));
     }
 
     #[test]

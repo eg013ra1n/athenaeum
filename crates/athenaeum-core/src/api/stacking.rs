@@ -30,7 +30,8 @@ use crate::settings::{keys, SettingsManager};
 use crate::stacking::config::{resolve_config, PathsConfig, StackingConfig};
 use crate::stacking::groups::set_slug;
 use crate::stacking::paths::{
-    cleanup_work, resolve_dirs, validate_dirs, work_usage, CleanupWhat, WorkUsage, WorkingLayout,
+    cleanup_work, resolve_dirs, validate_dirs, work_usage, CleanupWhat, ValidateMode, WorkUsage,
+    WorkingLayout,
 };
 use crate::stacking::plan::{
     build_plan, frame_set_name, read_global_config_json, StackingPlan, Stage,
@@ -104,6 +105,10 @@ pub fn get_stacking_plan(
 ) -> Result<StackingPlan, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
+    // Critical fix, item 1: heal any row a crashed/killed process left
+    // `planning`/`running` — otherwise `active_run_id` below would read a
+    // stuck row as still active forever.
+    run::heal_interrupted_runs(ctx, &conn)?;
     build_plan(&conn, &ctx.settings, policy, set_id, config)
 }
 
@@ -151,6 +156,10 @@ pub fn get_stacking_runs(
 ) -> Result<Vec<StackingRunSummary>, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
+    // Critical fix, item 1: heal any interrupted row before listing — a run
+    // history the user reads should never show a `running` row that is
+    // actually dead.
+    run::heal_interrupted_runs(ctx, &conn)?;
     let runs = list_runs(&conn, set_id, limit.unwrap_or(20))?;
     let mut out = Vec::with_capacity(runs.len());
     for run_row in runs {
@@ -173,6 +182,9 @@ pub fn get_stacking_runs(
 pub fn get_stacking_run(ctx: &ServiceContext, run_id: i64) -> Result<StackingRunDetail, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
+    // Critical fix, item 1: heal any interrupted row first — this run itself
+    // might be the stuck one.
+    run::heal_interrupted_runs(ctx, &conn)?;
     let run_row = get_run(&conn, run_id)?
         .ok_or_else(|| ApiError::NotFound(format!("stacking run {run_id} not found")))?;
     let groups = list_groups(&conn, run_id)?;
@@ -368,7 +380,7 @@ pub fn set_stacking_paths(
 
         let (working_path, output_path) = match (working, output) {
             (Some(w), Some(o)) => {
-                let validated = validate_dirs(&conn, policy, w, o)?;
+                let validated = validate_dirs(&conn, policy, w, o, ValidateMode::Save)?;
                 for warning in &validated.warnings {
                     tracing::warn!(warning, "stacking folders: scan-root overlap");
                 }
@@ -485,6 +497,11 @@ pub fn cleanup_stacking_work(
 ) -> Result<u64, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
+
+    // Critical fix, item 1: heal any interrupted row first — a row a crashed
+    // process left `running` with no live handle must not refuse cleanup
+    // forever.
+    run::heal_interrupted_runs(ctx, &conn)?;
 
     if let Some(run_id) = active_run_for_set(&conn, set_id)? {
         return Err(ApiError::Conflict(format!(
@@ -767,7 +784,13 @@ mod tests {
 
     /// Fix round 1, item 7: no active run ⇒ `cleanup_stacking_work` reads
     /// the SAME `stacking_runs` row a real `active_run_for_set` query would
-    /// (`status IN ('planning', 'running')`) and refuses.
+    /// (`status IN ('planning', 'running')`) and refuses. Final fix wave
+    /// item 1: a `running` row alone is no longer enough to prove that — the
+    /// new healing sweep would otherwise finish an orphaned `running` row to
+    /// `failed` before this check ever runs, so the test also registers a
+    /// live `active_stacks` handle (the same thing `start_stacking` itself
+    /// would have done) to prove this really is a run the healer must leave
+    /// alone, not a crashed one.
     #[test]
     fn cleanup_conflicts_while_a_run_is_active() {
         let (_tmp, ctx) = test_ctx();
@@ -809,10 +832,173 @@ mod tests {
             crate::db::stacking::set_run_status(&conn, run_id, "running").unwrap();
             run_id
         };
+        ctx.active_stacks.lock().unwrap().insert(
+            run_id,
+            crate::services::StackHandle {
+                cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                frames_set_id: set_id,
+            },
+        );
 
         let err = cleanup_stacking_work(&ctx, set_id, CleanupWhat::All).unwrap_err();
         assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
         let _ = run_id;
+    }
+
+    /// Final fix wave item 1: a `running` row with NO live `active_stacks`
+    /// handle (a crashed process's leftover) is healed to `failed` by
+    /// `get_stacking_plan` — `plan.active_run_id` reads `None`, and the plan
+    /// itself has no `active_run_id`-derived blocker, so `start_stacking`
+    /// (which builds the SAME plan first) proceeds rather than refusing with
+    /// `Conflict` forever.
+    #[test]
+    fn interrupted_run_is_healed_by_get_stacking_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids) = seed_ready_fixture(&db_path, "Test Set");
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let stuck_run_id = crate::db::stacking::insert_run(
+            &fixture.conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: fixture.set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        crate::db::stacking::set_run_status(&fixture.conn, stuck_run_id, "running").unwrap();
+        // No `active_stacks` handle registered — exactly a crashed process's
+        // leftover.
+
+        let plan = get_stacking_plan(&ctx, &PathPolicy::AllowAll, fixture.set_id, None).unwrap();
+        assert_eq!(plan.active_run_id, None, "the stuck row must be healed");
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("start_stacking must proceed once the stuck row is healed");
+        assert_ne!(started.run_id, stuck_run_id);
+
+        let healed = crate::db::stacking::get_run(&fixture.conn, stuck_run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(healed.status, "failed");
+        assert_eq!(healed.error.as_deref(), Some("interrupted by a restart"));
+
+        // Let the freshly started run finish (whatever its outcome) so its
+        // background thread does not outlive the test — same 30s-capped
+        // poll `run.rs`'s own `wait_for_run` test helper uses.
+        let wait_start = std::time::Instant::now();
+        loop {
+            if !ctx
+                .active_stacks
+                .lock()
+                .unwrap()
+                .contains_key(&started.run_id)
+            {
+                break;
+            }
+            assert!(
+                wait_start.elapsed() < std::time::Duration::from_secs(30),
+                "stacking run {} did not finish within 30s",
+                started.run_id
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Final fix wave item 1: a `running` row WITH a live `active_stacks`
+    /// handle is left alone by the healer — `start_stacking` for the SAME
+    /// set still refuses with `Conflict`, exactly as before this wave.
+    #[test]
+    fn live_run_is_not_healed_and_still_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids) = seed_ready_fixture(&db_path, "Test Set");
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let run_id = crate::db::stacking::insert_run(
+            &fixture.conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: fixture.set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        crate::db::stacking::set_run_status(&fixture.conn, run_id, "running").unwrap();
+        ctx.active_stacks.lock().unwrap().insert(
+            run_id,
+            crate::services::StackHandle {
+                cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                frames_set_id: fixture.set_id,
+            },
+        );
+
+        let plan = get_stacking_plan(&ctx, &PathPolicy::AllowAll, fixture.set_id, None).unwrap();
+        assert_eq!(plan.active_run_id, Some(run_id), "a live run is left alone");
+
+        let err = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+
+        let row = crate::db::stacking::get_run(&fixture.conn, run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "running", "a live run's row must be untouched");
     }
 
     /// Fix round 1, item 7: no working folder (global unset, no set

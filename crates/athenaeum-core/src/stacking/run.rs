@@ -343,6 +343,66 @@ fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     Ok((meta.len() as i64, modified_at))
 }
 
+/// Heal every `stacking_runs` row a crashed or killed process left
+/// `planning`/`running` forever (final fix wave, Critical item 1): such a
+/// row has no live cancel handle in [`ServiceContext::active_stacks`] (that
+/// map is process-memory only — a restart always starts it empty), so
+/// [`start_stacking`]'s own "already active" check and
+/// [`crate::api::stacking::cleanup_stacking_work`]'s `Conflict` guard would
+/// otherwise refuse forever with no command able to clear the row. Finishes
+/// each stuck row as `"failed"` (no summary JSON — the run's own thread is
+/// long gone, there is nothing to snapshot) with
+/// `error = "interrupted by a restart"`, one `warn!` per row.
+///
+/// Deliberately entry-point-driven, not host-startup-driven (unlike
+/// [`crate::api::sync_prepare::heal_interrupted_preparations`], which the
+/// two hosts call once at boot): a stuck stacking run only ever matters to a
+/// caller about to read or act on its frame set, and every such caller
+/// already goes through one of the five `api::stacking` handlers this is
+/// wired into (`get_stacking_plan`, `start_stacking`, `get_stacking_runs`,
+/// `get_stacking_run`, `cleanup_stacking_work`) — a sixth process-wide wire-up
+/// would heal rows nobody is about to look at, for no benefit over healing
+/// on demand.
+///
+/// A row WITH a live handle (the normal case — this process's own run still
+/// actually running) is left alone: `active` is checked before anything is
+/// touched, and only ids missing from it are ever finished.
+pub(crate) fn heal_interrupted_runs(
+    ctx: &ServiceContext,
+    conn: &rusqlite::Connection,
+) -> Result<usize, ApiError> {
+    let unfinished = crate::db::stacking::list_unfinished_runs(conn)?;
+    if unfinished.is_empty() {
+        return Ok(0);
+    }
+
+    let stuck: Vec<(i64, i64)> = {
+        let active = ctx.active_stacks.lock().unwrap();
+        unfinished
+            .into_iter()
+            .filter(|(run_id, _)| !active.contains_key(run_id))
+            .collect()
+    };
+
+    let mut healed = 0usize;
+    for (run_id, frames_set_id) in stuck {
+        tracing::warn!(
+            run_id,
+            frames_set_id,
+            "stacking run interrupted by a restart"
+        );
+        finish_run(
+            conn,
+            run_id,
+            "failed",
+            None,
+            Some("interrupted by a restart"),
+        )?;
+        healed += 1;
+    }
+    Ok(healed)
+}
+
 /// Start a stacking run for `frames_set_id`: build the plan, refuse on the
 /// first blocker or an already-active run, insert the run + its group rows,
 /// register a cancel handle, and spawn the dedicated thread. Returns as soon
@@ -359,6 +419,12 @@ pub fn start_stacking(
 ) -> Result<StartedStacking, ApiError> {
     let db_handle = db(&ctx)?;
     let conn = db_handle.conn();
+
+    // Critical fix, item 1: heal any row a crashed/killed process left
+    // `planning`/`running` BEFORE the plan's own `active_run_id` read below —
+    // otherwise a stuck row from a previous process would read as "already
+    // active" forever, with no command able to clear it.
+    heal_interrupted_runs(&ctx, &conn)?;
 
     let plan = build_plan(&conn, &ctx.settings, policy, frames_set_id, config)?;
 
@@ -383,6 +449,24 @@ pub fn start_stacking(
     let output_dir_str = plan.output_dir.clone().ok_or_else(|| {
         ApiError::Internal("stacking plan reported no blockers but no output folder".to_string())
     })?;
+
+    // Final fix wave, item 5: the plan itself validates in `ValidateMode::Plan`
+    // — no filesystem write, since `build_plan` above runs on every debounced
+    // config edit, not just a real start. A run that is actually about to
+    // write into these folders needs them to exist, so `start_stacking` is
+    // the ONE place that calls `ValidateMode::Save` — creating both folders
+    // (and probing them writable) right before the thread spawns. From here
+    // on, `working_dir`/`output_dir_str` are Save mode's own canonicalized,
+    // post-creation paths, not the plan's lexical ones.
+    let validated_dirs = crate::stacking::paths::validate_dirs(
+        &conn,
+        policy,
+        &working_dir,
+        &output_dir_str,
+        crate::stacking::paths::ValidateMode::Save,
+    )?;
+    let working_dir = validated_dirs.working.to_string_lossy().into_owned();
+    let output_dir_str = validated_dirs.output.to_string_lossy().into_owned();
 
     let plan_groups = group_frames(&conn, frames_set_id, &plan.config.grouping)?;
 
