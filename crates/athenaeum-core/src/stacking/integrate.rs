@@ -25,7 +25,7 @@ use crate::integration::stats::{
 use crate::integration::IntegrationError;
 use crate::resample::Interpolation;
 use crate::stacking::measure::{measure_plane, FrameMeasurement, MeasureOptions};
-use crate::stacking::weights::FrameWeight;
+use crate::stacking::weights::{best_by_weight, FrameWeight};
 
 /// spec §9.2 `integration:`; every field defaulted, camelCase on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,11 +67,16 @@ impl Default for IntegrationConfig {
 pub struct NormalizationConfig {
     pub output: OutputNormalization,
     pub rejection: RejectionNormalization,
+    /// Informational at this layer: the estimator that produced the
+    /// stage-3 location/scale is `MeasureOptions::scale_estimator` — the
+    /// orchestrator (Plan 5) keeps the two equal.
     pub scale_estimator: ScaleEstimator,
 }
 
 /// spec §6.3: the user's rejection choice, resolved to a concrete
 /// [`Rejection`] once the group size is known.
+/// camelCase on the wire; the resolved `Rejection` persisted in master recipes
+/// stays snake_case — the two JSON shapes are not interchangeable.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(
     rename_all = "camelCase",
@@ -198,7 +203,7 @@ pub struct GroupStats {
     /// every plane — the same range-plus-algorithm rejection the group
     /// fractions above count, just narrowed to one frame instead of the
     /// whole group.
-    pub rejected_per_frame: Vec<f64>,
+    pub rejected_fraction_per_frame: Vec<f64>,
     /// MRS noise of the master per plane, native `[0, 1]` units.
     /// `measure_plane` already reports `ChannelMeasurement.noise` in native
     /// units (it divides the ADU-scaled MRS estimate back down by
@@ -332,6 +337,21 @@ pub fn integrate_group(
     }
     let included_count = included.len();
 
+    // A frame whose own weight vector doesn't match the group's channel
+    // count silently weighs zero on the missing planes (see the per-plane
+    // loop below) — worth a warn per frame, once, not once per plane.
+    for &i in &included {
+        let f = &frames[i];
+        if f.weight.normalized.len() != input.channels {
+            warn!(
+                path = %f.path.display(),
+                weight_channels = f.weight.normalized.len(),
+                channels = input.channels,
+                "weight channel count differs from the group; missing channels weigh zero"
+            );
+        }
+    }
+
     let recipe = IntegrationRecipe {
         combination: input.integration.combination,
         rejection: input.integration.rejection.resolve(included_count),
@@ -339,18 +359,13 @@ pub fn integrate_group(
     info!(frames = included_count, recipe = %recipe.describe(), "group integration started");
 
     // The included frame with the highest normalized-mean weight (spec
-    // §4.4's "best sub"), fixed once for the whole group —
-    // `normalized_mean` already averages over planes, so this is a
-    // frame-level choice, not a per-plane one.
-    let best_idx = included
-        .iter()
-        .copied()
-        .max_by(|&a, &b| {
-            frames[a]
-                .weight
-                .normalized_mean
-                .total_cmp(&frames[b].weight.normalized_mean)
-        })
+    // §4.4's "best sub"), fixed once for the whole group — `best_by_weight`
+    // is the same helper Plan 2's selection stage uses, restricted here to
+    // the frames this group actually kept.
+    let weight_snapshot: Vec<FrameWeight> = frames.iter().map(|f| f.weight.clone()).collect();
+    let included_mask: Vec<bool> = (0..frames.len()).map(|i| included.contains(&i)).collect();
+    let star_counts: Vec<usize> = frames.iter().map(|f| f.measurement.min_stars()).collect();
+    let best_idx = best_by_weight(&weight_snapshot, &included_mask, &star_counts)
         .expect("included has at least 3 frames");
 
     let plane_pixels = input.width * input.height;
@@ -385,6 +400,7 @@ pub fn integrate_group(
 
     for p in 0..input.channels {
         if cancel.load(Ordering::Relaxed) {
+            warn!(plane = p, "group integration cancelled");
             return Err(IntegrationError::Cancelled);
         }
         let plane_start = Instant::now();
@@ -429,8 +445,10 @@ pub fn integrate_group(
             range_high: input.integration.range_high.map(|v| v as f32),
             rejection_maps: input.integration.write_rejection_maps,
         };
-        // `EngineProgress` holds two `&dyn Fn` references (Copy); rebuilt
-        // per plane since we only have `&GroupProgress`, not an owned one.
+        // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
+        // fields are — so it must be rebuilt (not read) from
+        // `progress.engine` each plane, since we only hold
+        // `&GroupProgress`, not an owned one.
         let engine_progress = EngineProgress {
             on_band: progress.engine.on_band,
             on_combine: progress.engine.on_combine,
@@ -443,10 +461,18 @@ pub fn integrate_group(
 
         data.extend_from_slice(&out.base.data);
         if let Some(acc) = rejection_low.as_mut() {
-            acc.extend_from_slice(out.rejection_low.as_deref().unwrap_or(&[]));
+            acc.extend_from_slice(
+                out.rejection_low
+                    .as_deref()
+                    .expect("engine returns maps when rejection_maps is set"),
+            );
         }
         if let Some(acc) = rejection_high.as_mut() {
-            acc.extend_from_slice(out.rejection_high.as_deref().unwrap_or(&[]));
+            acc.extend_from_slice(
+                out.rejection_high
+                    .as_deref()
+                    .expect("engine returns maps when rejection_maps is set"),
+            );
         }
 
         rejected_low_total += out.rejected_low;
@@ -502,7 +528,7 @@ pub fn integrate_group(
         );
     }
 
-    let rejected_per_frame: Vec<f64> = (0..included_count)
+    let rejected_fraction_per_frame: Vec<f64> = (0..included_count)
         .map(|k| {
             let s = per_frame_samples[k];
             if s == 0 {
@@ -545,7 +571,7 @@ pub fn integrate_group(
             recipe: recipe.describe(),
             rejected_low_fraction,
             rejected_high_fraction,
-            rejected_per_frame,
+            rejected_fraction_per_frame,
             master_noise,
             master_location,
             master_scale,
@@ -925,7 +951,11 @@ mod tests {
                     .map(|&(x, y, a)| (x + dx, y + dy, a * scale))
                     .collect();
                 let mut data = gaussian_field(FW, FH, &shifted, SIGMA, BG * scale as f32);
-                add_noise(&mut data, NOISE, seed);
+                // The brighter frame's noise scales with its level too — a
+                // frame that is "twice the level" is twice the level end to
+                // end, which is what actually exercises the
+                // AdditiveWithScaling pair's scale term below.
+                add_noise(&mut data, NOISE * scale as f32, seed);
                 let path = dir.path().join(name);
                 write_fits_f32(&path, FW, FH, 1, &data, &[]).unwrap();
                 let map = if dx == 0.0 && dy == 0.0 {
@@ -1010,13 +1040,21 @@ mod tests {
         assert_eq!(out.included, vec![0, 1, 2]);
         assert_eq!((out.width, out.height, out.channels), (FW, FH, 1));
 
-        // A corner far from every star: must land within 1% of the
-        // reference's own background after frame 2's output pair maps it
-        // back down.
-        let bg_out = out.data[5 * FW + 5];
+        // A 38×38 star-free patch: ~1400 pixels bring σ of the mean to ≈
+        // 4e-5, twenty times inside the 1% bound; a single pixel's σ (≈
+        // 1.7e-3) was half the bound.
+        let mut patch_sum = 0.0f64;
+        let mut patch_n = 0usize;
+        for y in 2..40 {
+            for x in 2..40 {
+                patch_sum += out.data[y * FW + x] as f64;
+                patch_n += 1;
+            }
+        }
+        let patch_mean = patch_sum / patch_n as f64;
         assert!(
-            (bg_out as f64 - BG as f64).abs() < 0.01 * BG as f64,
-            "background {bg_out} vs {BG}"
+            (patch_mean - BG as f64).abs() < 0.01 * BG as f64,
+            "background {patch_mean} vs {BG}"
         );
 
         // Measured centroid error tops out around 0.054 px on this fixture
@@ -1042,6 +1080,31 @@ mod tests {
             "snr_gain {}",
             out.stats.snr_gain[0]
         );
+        // `psf_snr` is already TFlux²/σ_N² (PSFSNR_NUM·TFlux² over
+        // PSFSNR_DEN·σ_N² — see `psf_signal::psf_snr`), so for N
+        // near-equally-weighted, near-equal-noise frames the natural
+        // ceiling on `snr_gain` is N itself (noise variance drops by N,
+        // and gain is a ratio of variances), not √N — measured 3.14 on
+        // this fixture (weights 1.0/0.8/0.6, effective N ≈ 2.9), just
+        // over the N=3 ceiling from the master's own fit noise. The
+        // sanity check is against an unbounded/runaway gain, not a tight
+        // theoretical bound.
+        assert!(
+            out.stats.snr_gain[0] < 3.5,
+            "gain {} — a 3-frame stack cannot run away past its own frame count",
+            out.stats.snr_gain[0]
+        );
+
+        // Frame 2 is genuinely twice the level (signal AND noise), so the
+        // AdditiveWithScaling pair that maps it back onto the reference
+        // must actually use a scale term near 0.5, not fall back to
+        // identity — measured 0.50 on this fixture.
+        let pair = output_pair(
+            frames[0].measurement.channels[0].location_scale(),
+            frames[2].measurement.channels[0].location_scale(),
+            OutputNormalization::AdditiveWithScaling,
+        );
+        assert!((pair.scale - 0.5).abs() < 0.1, "scale term {}", pair.scale);
 
         let expect_weighted =
             exposures[0] * weights[0] + exposures[1] * weights[1] + exposures[2] * weights[2];
