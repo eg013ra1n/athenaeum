@@ -61,7 +61,14 @@ function withoutPaths(config: StackingConfig): Omit<StackingConfig, 'paths'> {
  * and the board/inspector layout. Task 3 fills the inspector; Task 4 adds
  * the Frames table and Results panel.
  */
-export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
+// `frameSetName` is part of the props contract FrameSetDetail.tsx passes
+// (matching every sibling tab's signature) but, fix round 1 item 6, is not
+// rendered as a `title` on the tab's root — a `title` on a page-sized `div`
+// pops a native tooltip over the ENTIRE tab on any hover, not just the
+// header. Nothing else in this tab needs the set name (FrameSetDetail's own
+// header above the tab bar already shows it), so it is simply not
+// destructured here.
+export function StackingTab({ framesSetId }: StackingTabProps) {
   const navigate = useNavigate();
   const { notify } = useNotifications();
   const { progress, lastOutcome, startRun, cancelRun, isRunning } = useStackingContext();
@@ -81,12 +88,32 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
   const runOutcome = lastOutcome.get(framesSetId);
   const running = isRunning(framesSetId) || plan?.activeRunId != null;
 
+  // `refetchPlan` is called from four overlapping triggers (the mount
+  // effect below calls the endpoint directly, not through here; but the
+  // `library-updated` listener, the 300 ms debounce, and the outcome effect
+  // all go through this one function) — an older response can resolve
+  // after a newer one already landed, and after navigating to a different
+  // frame set (`StackingTab` carries no `key` tied to `framesSetId`, so a
+  // reused instance is possible) a stale response for the PREVIOUS set can
+  // still be in flight. `planSeqRef` drops a response that is no longer the
+  // latest call; `framesSetIdRef` (always current, unlike the `framesSetId`
+  // this closure captured at creation) drops one whose set has since
+  // changed (fix round 1, Important #2).
+  const planSeqRef = useRef(0);
+  const framesSetIdRef = useRef(framesSetId);
+  useEffect(() => { framesSetIdRef.current = framesSetId; }, [framesSetId]);
+
   const refetchPlan = useCallback(async (configOverride?: StackingConfig) => {
+    const seq = ++planSeqRef.current;
+    const forSetId = framesSetId;
     try {
       const p = await api.invoke<StackingPlan>('get_stacking_plan', {
-        setId: framesSetId,
+        setId: forSetId,
         config: configOverride,
       });
+      if (seq !== planSeqRef.current || forSetId !== framesSetIdRef.current) {
+        return null; // superseded by a later call, or the set changed
+      }
       setPlan(p);
       return p;
     } catch (err) {
@@ -204,6 +231,36 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
     writeSelectedStage(stage);
   }, []);
 
+  // Both toolbar dropdowns (preset selector, Re-run from) close on an
+  // outside click or Escape (fix round 1, Minor #8 — named for the Re-run
+  // menu specifically, applied to both since they share the exact same
+  // open/close pattern in this same file).
+  const presetMenuRef = useRef<HTMLDivElement>(null);
+  const rerunMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!presetMenuOpen && !rerunMenuOpen) return;
+    const handlePointerDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (presetMenuOpen && presetMenuRef.current && !presetMenuRef.current.contains(target)) {
+        setPresetMenuOpen(false);
+      }
+      if (rerunMenuOpen && rerunMenuRef.current && !rerunMenuRef.current.contains(target)) {
+        setRerunMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      setPresetMenuOpen(false);
+      setRerunMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [presetMenuOpen, rerunMenuOpen]);
+
   // Preset selector (plan Ruling 1): the label is computed, never stored —
   // comparing the draft (minus its per-set folder override) against each
   // built-in preset via canonical JSON.
@@ -224,54 +281,65 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
     setPresetMenuOpen(false);
   }, [presets]);
 
-  const handleRun = useCallback(async () => {
-    if (!plan || plan.blockers.length > 0 || running || starting) return;
+  // `starting` bridges the click-to-run gap. `startRun`'s invoke does not
+  // resolve until the backend has synchronously built the WHOLE plan
+  // (gate + per-frame hashing) and spawned the run thread (see
+  // `routes/stacking.rs`'s doc comment on `start_stacking`) — clearing
+  // `starting` the instant that promise resolves (the old behavior) left a
+  // real gap, between the invoke resolving and the run's first
+  // `stacking-progress` event actually landing, where BOTH `starting` and
+  // `running` (`isRunning`, which only becomes true once a progress event
+  // arrives) read false — re-enabling the Run button and allowing a
+  // double-start (fix round 1, Minor #5). `starting` now stays true until
+  // either a progress event or an outcome for the SPECIFIC run just started
+  // arrives (tracked by `startingRunIdRef`, not just "any progress/outcome
+  // for this set", since `lastOutcome` never clears and would otherwise
+  // read as "already finished" the instant a NEW run starts).
+  const startingRunIdRef = useRef<number | null>(null);
+
+  const beginStarting = useCallback(async (invoke: () => Promise<number>) => {
     setStarting(true);
     try {
-      await startRun(framesSetId, draftConfig ?? undefined);
-    } catch (err) {
-      console.error('[StackingTab] start_stacking failed:', err);
-      notify({
-        title: 'Failed to start stacking',
-        detail: String(err),
-        kind: 'stacking',
-        hasErrors: true,
-        tone: 'warning',
-      });
-    } finally {
+      startingRunIdRef.current = await invoke();
+    } catch {
+      // `useStackingRuns`'s `startRun` already logs + notifies before
+      // rethrowing (fix round 1, Minor #4) — nothing left to do here but
+      // stop showing "starting".
+      startingRunIdRef.current = null;
       setStarting(false);
     }
-  }, [plan, running, starting, startRun, framesSetId, draftConfig, notify]);
+  }, []);
+
+  useEffect(() => {
+    if (!starting) return;
+    const waitingFor = startingRunIdRef.current;
+    if (waitingFor == null) return; // still awaiting `startRun`'s invoke itself
+    if (runProgress?.runId === waitingFor || runOutcome?.runId === waitingFor) {
+      startingRunIdRef.current = null;
+      setStarting(false);
+    }
+  }, [starting, runProgress, runOutcome]);
+
+  const handleRun = useCallback(() => {
+    if (!plan || plan.blockers.length > 0 || running || starting) return;
+    void beginStarting(() => startRun(framesSetId, draftConfig ?? undefined));
+  }, [plan, running, starting, beginStarting, startRun, framesSetId, draftConfig]);
 
   const handleCancel = useCallback(async () => {
     const runId = runProgress?.runId ?? plan?.activeRunId ?? null;
     if (runId == null) return;
     try {
       await cancelRun(runId);
-    } catch (err) {
-      console.error('[StackingTab] cancel_stacking failed:', err);
+    } catch {
+      // `useStackingRuns`'s `cancelRun` already logs + notifies.
     }
   }, [runProgress, plan, cancelRun]);
 
-  const handleRerunFrom = useCallback(async (stage: Stage) => {
+  const handleRerunFrom = useCallback((stage: Stage) => {
     setRerunMenuOpen(false);
     if (running || starting) return;
-    setStarting(true);
-    try {
-      await startRun(framesSetId, draftConfig ?? undefined, stage);
-    } catch (err) {
-      console.error('[StackingTab] rerun start_stacking failed:', err);
-      notify({
-        title: 'Failed to start stacking',
-        detail: String(err),
-        kind: 'stacking',
-        hasErrors: true,
-        tone: 'warning',
-      });
-    } finally {
-      setStarting(false);
-    }
-  }, [running, starting, startRun, framesSetId, draftConfig, notify]);
+    void beginStarting(() => startRun(framesSetId, draftConfig ?? undefined, stage));
+  }, [running, starting, beginStarting, startRun, framesSetId, draftConfig]);
 
   // Measure panel's own "Re-measure" button (spec: rerunFrom: 'measure').
   // Independent disabled logic from the toolbar's "Re-run from" menu, which
@@ -282,12 +350,22 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
     void handleRerunFrom('measure');
   }, [handleRerunFrom]);
 
+  // `FrameSetDetail.tsx`'s searchParams effect only highlights a Coverage
+  // row when BOTH `highlightSet` and `kind` are present and `kind` parses
+  // as `'flat' | 'dark' | 'bias'` — `&kind=` was missing (fix round 1,
+  // Minor #7). `StackingPlan.readiness` (`ExportReadiness`) carries no
+  // set→kind map the way `ExportTab.tsx`'s own `summary`-derived
+  // `setKindMap` does, so the real kind of the first set without a master
+  // can't be resolved here without a second fetch — `'dark'` is exactly
+  // ExportTab's OWN fallback (`setKindMap.get(setId) ?? 'dark'`) for a set
+  // its map doesn't know either, so this matches its behavior rather than
+  // inventing a new default.
   const handleCoverageClick = useCallback(() => {
     const setId = plan && plan.readiness.rawSetsWithoutMaster > 0
       ? plan.readiness.rawSetIdsWithoutMaster[0]
       : undefined;
     if (setId !== undefined) {
-      navigate(`?tab=calibration&highlightSet=${setId}`, { replace: true });
+      navigate(`?tab=calibration&highlightSet=${setId}&kind=dark`, { replace: true });
     } else {
       navigate('?tab=calibration', { replace: true });
     }
@@ -317,11 +395,11 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
 
   return (
-    <div className="space-y-3" title={frameSetName}>
+    <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-surface-elevated rounded-lg px-4 py-3">
         <div className="flex flex-wrap items-center gap-4 text-sm text-content-secondary">
-          <div className="relative">
+          <div className="relative" ref={presetMenuRef}>
             <button
               type="button"
               onClick={() => setPresetMenuOpen((v) => !v)}
@@ -385,7 +463,7 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
             </button>
           )}
 
-          <div className="relative">
+          <div className="relative" ref={rerunMenuRef}>
             <button
               type="button"
               onClick={() => setRerunMenuOpen((v) => !v)}

@@ -154,21 +154,53 @@ export function useStackingRuns() {
     };
   }, [notify]);
 
+  // Fix round 1, Minor #4: catch + log + notify + rethrow here (not just at
+  // each call site) so every caller — including Task 3's Measure-panel
+  // "Re-measure" button, which calls `startRun` through `StackingTab`'s
+  // `handleRerunFrom` with no error handling of its own — gets a console
+  // trace and a user-visible notification on a failed start/cancel for
+  // free. Callers still see the rejection (for their own local state
+  // cleanup, e.g. clearing an optimistic "starting" flag) but must not
+  // ALSO notify — that would double the toast.
   const startRun = useCallback(
     async (setId: number, config?: StackingConfig, rerunFrom?: Stage): Promise<number> => {
-      const result = await api.invoke<StartedStacking>('start_stacking', {
-        setId,
-        config,
-        rerunFrom,
-      });
-      return result.runId;
+      try {
+        const result = await api.invoke<StartedStacking>('start_stacking', {
+          setId,
+          config,
+          rerunFrom,
+        });
+        return result.runId;
+      } catch (err) {
+        console.error('[useStackingRuns] start_stacking failed:', err);
+        notify({
+          title: 'Failed to start stacking',
+          detail: String(err),
+          kind: 'stacking',
+          hasErrors: true,
+          tone: 'warning',
+        });
+        throw err;
+      }
     },
-    [],
+    [notify],
   );
 
   const cancelRun = useCallback(async (runId: number): Promise<void> => {
-    await api.invoke('cancel_stacking', { runId });
-  }, []);
+    try {
+      await api.invoke('cancel_stacking', { runId });
+    } catch (err) {
+      console.error('[useStackingRuns] cancel_stacking failed:', err);
+      notify({
+        title: 'Failed to cancel stacking',
+        detail: String(err),
+        kind: 'stacking',
+        hasErrors: true,
+        tone: 'warning',
+      });
+      throw err;
+    }
+  }, [notify]);
 
   const isRunning = useCallback((setId: number): boolean => progress.has(setId), [progress]);
 

@@ -66,43 +66,54 @@ function StateGlyph({ state }: { state: RowState }) {
 }
 
 /** One row of the pipeline board (`PipelineBoard.tsx`). Presentational only —
- *  all state derives from `stageSummary.ts`'s pure `stageSummary`/`rowState`. */
-export function StageRow({ index, label, state, summary, progress, selected, onSelect, toggle }: StageRowProps) {
+ *  all state derives from `stageSummary.ts`'s pure `stageSummary`/`rowState`.
+ *
+ *  Markup note (fix round 1, Important #3): the optional toggle is a real
+ *  `<label><input type="checkbox">` pair, which is invalid HTML nested
+ *  inside a `<button>` (Firefox/Safari suppress the control). The row is a
+ *  plain `<div>`; the row-select action is its own `<button>` covering only
+ *  the glyph/index/label/summary — the toggle and the state chip are
+ *  siblings outside it, not descendants. */
+export function StageRow({ index, stage, label, state, summary, progress, selected, onSelect, toggle }: StageRowProps) {
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors ${
+    <div
+      data-stage={stage}
+      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
         selected ? 'bg-surface-hover' : 'hover:bg-surface-hover/50'
       }`}
     >
-      <StateGlyph state={state} />
-      <span className="w-5 shrink-0 text-xs text-content-muted tabular-nums">{index}</span>
-      <span className="w-40 shrink-0 text-sm font-medium text-content truncate">{label}</span>
+      <button
+        type="button"
+        onClick={onSelect}
+        className="flex-1 min-w-0 flex items-center gap-3 text-left"
+      >
+        <StateGlyph state={state} />
+        <span className="w-5 shrink-0 text-xs text-content-muted tabular-nums">{index}</span>
+        <span className="w-40 shrink-0 text-sm font-medium text-content truncate">{label}</span>
 
-      <span className="flex-1 min-w-0 text-xs text-content-muted truncate">
-        {state === 'running' && progress ? (
-          <span className="flex items-center gap-2">
-            <span className="flex-1 h-1.5 rounded-full bg-surface overflow-hidden max-w-[120px]">
-              <span
-                className="block h-full bg-accent"
-                style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }}
-              />
+        <span className="flex-1 min-w-0 text-xs text-content-muted truncate">
+          {state === 'running' && progress ? (
+            <span className="flex items-center gap-2">
+              <span className="flex-1 h-1.5 rounded-full bg-surface overflow-hidden max-w-[120px]">
+                <span
+                  className="block h-full bg-accent"
+                  style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }}
+                />
+              </span>
+              <span className="tabular-nums">
+                {progress.current} / {progress.total} · {Math.round(progress.percent)}%
+              </span>
+              {progress.groupKey && <span className="truncate">{progress.groupKey}</span>}
             </span>
-            <span className="tabular-nums">
-              {progress.current} / {progress.total} · {Math.round(progress.percent)}%
-            </span>
-            {progress.groupKey && <span className="truncate">{progress.groupKey}</span>}
-          </span>
-        ) : (
-          summary
-        )}
-      </span>
+          ) : (
+            summary
+          )}
+        </span>
+      </button>
 
       {toggle && (
         <label
           className="flex items-center gap-1.5 text-xs text-content-muted shrink-0"
-          onClick={(e) => e.stopPropagation()}
           title={toggle.note}
         >
           {toggle.label && <span>{toggle.label}</span>}
@@ -120,6 +131,6 @@ export function StageRow({ index, label, state, summary, progress, selected, onS
       <span className={`w-16 shrink-0 text-right text-xs font-medium ${STATE_CLASSES[state]}`}>
         {STATE_LABEL[state]}
       </span>
-    </button>
+    </div>
   );
 }

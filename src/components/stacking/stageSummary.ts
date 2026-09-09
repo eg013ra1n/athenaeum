@@ -237,9 +237,29 @@ function isBlockedBy(stage: BoardStage, blockers: readonly PlanBlocker[], config
 }
 
 /**
- * The board row's current state. Order of precedence: the stage's own
- * "off" check, staleness, blockers, live run progress, the last run's
- * outcome, and finally the `ready` default.
+ * The board row's current state.
+ *
+ * Precedence (fix round 1, Critical #1 — `progress` must outrank `stale`):
+ *
+ * | # | check      | when it applies                                        |
+ * | - | ---------- | ------------------------------------------------------- |
+ * | 0 | off        | `debayer` with no OSC group / `drizzle` disabled — an    |
+ * |   |            | unconditional early return; neither is a real member of |
+ * |   |            | `STAGES`/never runs, so nothing below may override it.   |
+ * | 1 | progress   | a run is live right now — `running`/`done`/`queued` from |
+ * |   |            | its own stage index is the only authoritative signal.    |
+ * | 2 | blockers   | no live run; the plan says this stage can't proceed.     |
+ * | 3 | stale      | no live run, not blocked; a cached artifact is out of    |
+ * |   |            | date and a re-run would redo this stage.                 |
+ * | 4 | outcome    | no live run; the last finished run's coarse pass/fail/   |
+ * |   |            | cancel (Task 4 refines this with per-group status).       |
+ * | 5 | ready      | nothing else applies.                                     |
+ *
+ * `progress` must be checked BEFORE `blockers`/`stale`: the backend's
+ * `staleStages` only ever names the per-frame stages (calibrate/measure/
+ * register — `plan.rs`'s Gate 6 note), and the tab never re-plans mid-run,
+ * so with the old order those three rows rendered "Stale" — and suppressed
+ * their own live progress bar — for the whole run.
  */
 export function rowState(
   stage: BoardStage,
@@ -248,23 +268,20 @@ export function rowState(
   outcome: RunOutcome | undefined,
   config: StackingConfig,
 ): RowState {
-  // Debayer is display-only — it mirrors `calibrate`'s own state for sets
-  // that actually have an OSC group, and is `off` otherwise.
+  // 0. Debayer is display-only — it mirrors `calibrate`'s own state for
+  // sets that actually have an OSC group, and is `off` otherwise.
   if (stage === 'debayer') {
     const hasOsc = plan?.groups.some((g) => g.colorMode === 'osc') ?? false;
     if (!hasOsc) return 'off';
     return rowState('calibrate', plan, progress, outcome, config);
   }
 
-  // Drizzle is the only stage whose toggle turns the row fully off. Local
+  // 0. Drizzle is the only stage whose toggle turns the row fully off. Local
   // normalization stays `ready` (labelled "global") when its toggle is off
   // — LN is the optional PART of the `normalize` stage, not the whole row.
   if (stage === 'drizzle' && !config.drizzle.enabled) return 'off';
 
-  if (plan?.staleStages.includes(stage)) return 'stale';
-
-  if (plan && isBlockedBy(stage, plan.blockers, config)) return 'blocked';
-
+  // 1. Live progress outranks everything below it.
   if (progress) {
     const mine = STAGES.indexOf(stage);
     const cur = STAGES.indexOf(progress.stage);
@@ -272,7 +289,13 @@ export function rowState(
     return mine < cur ? 'done' : 'queued';
   }
 
-  // Coarse, run-wide fallback — Task 4's per-group/per-frame status (from
+  // 2. Blockers.
+  if (plan && isBlockedBy(stage, plan.blockers, config)) return 'blocked';
+
+  // 3. Staleness.
+  if (plan?.staleStages.includes(stage)) return 'stale';
+
+  // 4. Coarse, run-wide fallback — Task 4's per-group/per-frame status (from
   // `get_stacking_run`) will replace this with a real per-stage read.
   if (outcome) {
     if (outcome.success) return 'done';
@@ -280,6 +303,7 @@ export function rowState(
     return 'failed';
   }
 
+  // 5. Default.
   return 'ready';
 }
 
