@@ -352,8 +352,11 @@ semantics (math reference §3.4) is handled deliberately, because the same
 functions build calibration masters and their output is fingerprint-pinned:
 
 - `linearFitClip` adopts the reference dispersion
-  `s = 2·adev·sqrt(1 + b²)` in M1 — otherwise the Auto thresholds 5.0/3.5
+  `s = 2·adev` in M1 — otherwise the Auto thresholds 5.0/3.5
   would reject about twice as hard as the WBPP run they are copied from.
+  The reference's slope term sqrt(1 + b²) is omitted: it is inert on [0, 1]
+  input and dimensionally wrong on the ADU-scale stacks the master builder
+  feeds (it silenced the rejection there); M4's robust line fit revisits it.
   Master builds never select linear fit automatically (their Auto is
   Winsorized / percentile / median), so only a master built with an explicit
   linear-fit recipe changes; that test pin is re-measured in the same task.

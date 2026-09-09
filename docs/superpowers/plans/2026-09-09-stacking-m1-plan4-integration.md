@@ -38,6 +38,21 @@
 14. **The external log's timestamps are UTC, file mtimes local (+3 h)**: the masters of run `20260908121336` are the `_(1)` files (`masterLight_…mono_(1).xisf` 16:49 local = 13:49 UTC in the log).
 15. **`MRS_LAYER0_GAIN` is renamed `MRS_LAYER1_GAIN`** (Plan 2 carry-forward: the estimator's doc says layer 1) in the same task that first cites it in a checkpoint number.
 
+## Rulings made during execution (2026-09-09)
+
+- **Task 2 — linear-fit dispersion is `2·adev`, not `2·adev·sqrt(1 + b²)`.**
+  The reviewer showed the slope term is dimensionally valid only on [0, 1]
+  input: the master builder feeds `combine_pixel` native ADU, where the
+  sorted-rank slope is O(1)…O(10³) and the term inflated the dispersion
+  up to three orders of magnitude — an explicitly chosen linear-fit master
+  recipe rejected nothing. On [0, 1] stacks the term is inert (factor
+  1.000001 at `b ≈ 1e-3`), so dropping it keeps parity where it matters
+  and restores the master path; an ADU-scale pin test guards it. The
+  OLS-vs-robust-MAD line fit (about one order of magnitude of z margin,
+  the +5σ single-outlier band at n = 20) is an M4 item and does not block
+  Checkpoint B (n = 208 rejects a 2–3 % population identically to the old
+  formula).
+
 ## Carry-forwards taken up here (from Plans 1–3)
 
 - Plan 1: `read_rows_with_scratch` gets its consumer — `RegisteredSource` workers reuse a byte scratch and an f32 window buffer per worker (Task 3). The warp runs on the caller's rayon context (the injected pool installs it); the "global pool vs injected pool" note is closed by running `warp_rows` inside `pool.install` in the engine (it already is: `read_band_with_progress` is called from the engine thread and its workers are the source's own; no change). Worker panics inside `read_band_with_progress`'s scoped workers propagate as a panic to the build thread's `catch_unwind` (masters) — Plan 5's stacking job uses the same thread pattern; noted, not changed.

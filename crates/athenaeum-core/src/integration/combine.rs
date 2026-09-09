@@ -507,23 +507,27 @@ fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
         }
         let b = (kf * sxy - sx * sy) / denom;
         let a = (sy - b * sx) / kf;
-        // Residual dispersion: mean absolute deviation of residuals from the
-        // fitted line, then scaled to dispersion `s = 2·adev·sqrt(1 + b²)`
-        // (math reference §3.4) so the thresholds compare with sigma
-        // clipping, `b` the fitted slope per rank unit.
+        // Dispersion `s = 2·adev` (`adev` = mean absolute deviation of the residuals
+        // from the fitted line): doubled so the thresholds compare with sigma
+        // clipping (spec §6.3, math reference §3.4). The reference's additional
+        // slope term `sqrt(1 + b²)` is omitted — it is inert on [0, 1] input
+        // (`b ≈ 1e-3` per rank on real stacks) and dimensionally wrong on the
+        // ADU-scale stacks the master builder feeds, where it inflated `s` by up
+        // to three orders of magnitude and silenced the rejection; M4's robust
+        // minimum-absolute-deviation fit revisits it.
         let mut abs_sum = 0.0;
         for i in 0..k {
             let resid = values[i].value() as f64 - (a + b * i as f64);
             abs_sum += resid.abs();
         }
         let adev = abs_sum / kf;
-        let s = 2.0 * adev * (1.0 + b * b).sqrt();
+        let s = 2.0 * adev;
         // Scale-relative zero-dispersion guard: on a perfectly (or near-)
         // linear stack the residuals are floating-point noise, not signal —
         // treat that as "no rejection" so a clean ramp is never eaten. Real
         // dispersion (read noise, drift) is orders of magnitude above this.
         let scale = (sabs_y / kf).max(1.0);
-        if s <= 1e-9 * scale {
+        if adev <= 1e-9 * scale {
             break;
         }
         let lo = -sigma_low * s;
@@ -759,24 +763,22 @@ mod tests {
 
     #[test]
     fn linear_fit_rejects_spike() {
-        // Dispersion doubled 2026-09-09: s = 2·adev·sqrt(1+b²) grows with the
-        // OLS fit's own slope, so a single-point outlier's z-score at n=20
-        // is capped near 0.98 regardless of the spike's size or position
-        // (verified by exhaustive search over spike magnitude and index) —
-        // the old 100_000.0 spike (old rejected=1 at 5.0/3.5) reaches z well
-        // under 0.01 under the new dispersion, so no threshold on this fixture
-        // rejects it at 5.0/3.5 any more. Spike lowered to a modest +3 offset
-        // (within the achievable z-score plateau) and thresholds lowered from
-        // 5.0/3.5 to 0.8/0.8 (measured z ≈ 0.98 at this spike, comfortably
-        // above 0.8; a clean ramp at the same threshold rejects nothing).
-        let mut ramp: Vec<f32> = (0..20).map(|i| 100.0 + 5.0 * i as f32).collect();
-        ramp[10] += 3.0; // modest offset in the middle of the ramp
+        // Native [0,1] scale (what a calibrated light stack carries): 20 samples
+        // around 0.20, ±0.002 jitter on a 1e-4/rank ramp, one hot frame at +0.30.
+        // Dispersion doubled 2026-09-09: measured z 7.294 (old adev) → 3.647
+        // (2·adev), still over sigma_high 3.5. The old fixture (100 + 5·i ramp,
+        // spike 100_000) had a value/rank slope no real stack can produce; it is
+        // retired, not re-thresholded.
+        let mut ramp: Vec<f32> = (0..20)
+            .map(|i| 0.20 + 0.0001 * i as f32 + if i % 2 == 0 { 0.002 } else { -0.002 })
+            .collect();
+        ramp[10] += 0.30;
         let (v, rej) = combine_pixel(
             &mut ramp,
-            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 0.8, sigma_high: 0.8 }),
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 }),
         );
         assert!(rej >= 1, "spike must be rejected");
-        assert!(v < 1000.0, "combined value should not be dragged up by the spike, got {v}");
+        assert!(v < 0.21, "combined value should not be dragged up by the spike, got {v}");
     }
 
     #[test]
@@ -804,12 +806,13 @@ mod tests {
         // was also 5.0 — value unchanged, now sourced from a real combine
         // over survivors.)
         //
-        // Dispersion doubled 2026-09-09: s = 2·adev·sqrt(1+b²) is roughly
-        // 2.8x the old adev-only dispersion on this stack, so the old ±0.5σ
-        // band only rejects 4 of 12 now (not all). Threshold lowered from 0.5
-        // to 0.15 (measured: rejects all 12 on iteration 1, reproducing the
-        // original all-rejected-on-first-pass case; the next boundary where
-        // rejection starts sparing survivors is ~0.176).
+        // Dispersion doubled 2026-09-09: s = 2·adev is 2x the old adev-only
+        // dispersion on this stack, so the old ±0.5σ band no longer rejects
+        // everything. Threshold lowered from 0.5 to 0.15 (measured: rejects
+        // all 12 on iteration 1, reproducing the original
+        // all-rejected-on-first-pass case; the boundary where rejection
+        // starts sparing survivors, under this s = 2·adev formula, is
+        // ≈ 0.2807 — 0.15 keeps a comfortable margin below it).
         let mut stack = vec![0.0, 0.0, 0.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 10.0, 10.0, 10.0];
         let (v, rej) = combine_pixel(
             &mut stack,
@@ -820,20 +823,22 @@ mod tests {
     }
 
     #[test]
-    fn linear_fit_dispersion_is_twice_adev_times_slope_factor() {
+    fn linear_fit_dispersion_is_twice_adev() {
         // A perfect ramp of slope 0.01 per rank plus one spike. With the old
         // dispersion (adev alone) a residual ~4.6x adev is rejected at
-        // thresholds 3.0; with s = 2·adev·sqrt(1 + b²) the SAME residual is
-        // only ~2.3x the (now doubled) dispersion, so it survives; a bigger
-        // spike (~7.3x old adev, ~3.6x new dispersion) is still rejected.
+        // thresholds 3.0; with s = 2·adev the SAME residual is only ~2.3x the
+        // (now doubled) dispersion, so it survives; a bigger spike (~7.3x old
+        // adev, ~3.6x new dispersion) is still rejected.
         //
         // Dispersion doubled 2026-09-09: raised from the original brief's
         // spike of +0.009 (case A) / +0.05 more (case B) — measured against
         // the routine's actual sorted-rank fit, that residual never exceeded
         // ~1.4x adev even under the OLD dispersion, so neither case changed
-        // behavior. Case A's spike raised +0.009 -> +0.13 (old z ≈ 4.6, new z
-        // ≈ 2.3) and case B's additional spike raised +0.05 -> +0.5 (old z ≈
-        // 7.3, new z ≈ 3.6).
+        // behavior. Case A's spike raised +0.009 -> +0.13 (old z ≈ 4.605, new
+        // z ≈ 2.302) and case B's additional spike raised +0.05 -> +0.5 (old
+        // z ≈ 7.277, new z ≈ 3.638). The fitted slope `b` is tiny on this
+        // fixture, so these z values are unchanged from the (now-dropped)
+        // `sqrt(1 + b²)` slope-term formula.
         let mut ramp: Vec<f32> = (0..20).map(|j| 0.5 + 0.01 * j as f32).collect();
         // deviations: ±0.004 alternating, plus the case-A spike below.
         for (j, v) in ramp.iter_mut().enumerate() {
@@ -853,6 +858,25 @@ mod tests {
             IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 3.0, sigma_high: 3.0 }),
         );
         assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn linear_fit_rejects_a_cosmic_ray_on_an_adu_scale_dark_column() {
+        // A 20-frame dark column in native ADU: pedestal 500, read noise ±5
+        // alternating, one +400 ADU cosmic ray. Under a slope-scaled dispersion
+        // the sorted-rank slope (≈ 6 ADU/rank) inflated s six-fold and nothing
+        // was rejected; with s = 2·adev the ray goes at 5.0/3.5 (measured z
+        // ≈ 3.658, over sigma_high 3.5).
+        let mut col: Vec<f32> = (0..20)
+            .map(|i| 500.0 + if i % 2 == 0 { 5.0 } else { -5.0 } + 0.3 * i as f32)
+            .collect();
+        col[7] += 400.0;
+        let (v, rej) = combine_pixel(
+            &mut col,
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 }),
+        );
+        assert_eq!(rej, 1, "the cosmic ray");
+        assert!(v < 510.0, "{v}");
     }
 
     // ── WinsorizedSigma & PercentileClip carried over ───────────────────────
