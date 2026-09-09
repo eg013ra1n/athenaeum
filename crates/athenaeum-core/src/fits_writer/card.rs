@@ -16,8 +16,7 @@ pub enum FitsWriteError {
     BadChannels(usize),
     BadDimensions(String),
     MissingValue(String),
-    /// A source FITS file was not the simple single-HDU shape the byte-level
-    /// stamper (`stamp::stamp_extra_card`) requires (e.g. no END card).
+    /// Input the writer cannot represent (a malformed header block, an unparsable SIP table).
     Malformed(String),
     Io(std::io::Error),
 }
@@ -34,7 +33,7 @@ impl std::fmt::Display for FitsWriteError {
             Self::BadChannels(c) => write!(f, "channels must be 1 or 3, got {c}"),
             Self::BadDimensions(m) => write!(f, "bad image dimensions: {m}"),
             Self::MissingValue(k) => write!(f, "card has neither value nor text: {k}"),
-            Self::Malformed(m) => write!(f, "malformed FITS for stamping: {m}"),
+            Self::Malformed(m) => write!(f, "malformed FITS input: {m}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }
