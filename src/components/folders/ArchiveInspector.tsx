@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Archive as ArchiveIcon, Star, ExternalLink } from 'lucide-react';
+import { Archive as ArchiveIcon, Star } from 'lucide-react';
 import { listArchiveZips } from '../../api/archive';
-import { revealItemInDir } from '../../api/desktop';
-import { isTauri } from '../../utils/platform';
+import { FileLocationActions } from '../FileLocationActions';
 import { Stat, Section } from './MonitoredInspector';
 import { basename, formatBytes } from './format';
 import type { ArchiveRoot, ArchivedFrameSetSummary, ArchiveZip } from '../../types/helpers';
@@ -58,10 +57,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
           </div>
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate" title={root.path}>{root.path}</span>
-            {isTauri && (
-              <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
-                title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
-            )}
+            <FileLocationActions compact directories paths={[root.path]} />
           </div>
         </div>
       </div>
@@ -96,10 +92,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
                         <span className="font-mono text-content-muted truncate flex-1">{z.filename}</span>
                         <span className="text-content-muted whitespace-nowrap">{formatBytes(z.size_bytes)}</span>
                         {!z.exists && <span className="text-error whitespace-nowrap">missing</span>}
-                        {isTauri && z.exists && (
-                          <button onClick={() => revealItemInDir(z.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
-                            title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded text-content-muted hover:text-accent transition"><ExternalLink size={11} /></button>
-                        )}
+                        <FileLocationActions compact paths={[z.path]} />
                       </li>
                     ))}
                   </ul>

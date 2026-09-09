@@ -1,8 +1,10 @@
+import { FileLocationActions } from '../FileLocationActions';
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Camera, Aperture, ChevronDown, ChevronRight, ChevronsDownUp } from 'lucide-react';
 import type { MergedCameraFilterNode } from './utils';
 
 interface MergedCameraFilterTreeProps {
+  locationPathsByKey?: Map<string, string[]>;
   nodes: MergedCameraFilterNode[];
   /** Checked filter keys (multi-select) */
   checkedKeys: Set<string>;
@@ -50,14 +52,23 @@ function StyledCheckbox({
         focus:ring-1 focus:ring-accent focus:ring-offset-0
       "
       title={title}
-      onClick={(e) => e.stopPropagation()}
+      onClick={e => e.stopPropagation()}
     />
   );
 }
 
-export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '', checkedLabel, filterSnrMap, footer }: MergedCameraFilterTreeProps) {
+export function MergedCameraFilterTree({
+  nodes,
+  checkedKeys,
+  onCheckedChange,
+  className = '',
+  checkedLabel,
+  filterSnrMap,
+  footer,
+  locationPathsByKey,
+}: MergedCameraFilterTreeProps) {
   const [expandedCameras, setExpandedCameras] = useState<Set<string>>(
-    () => new Set(nodes.map(n => n.camera))
+    () => new Set(nodes.map(n => n.camera)),
   );
 
   // Re-expand all when nodes change
@@ -197,6 +208,13 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
                     {cam.totalFrameCount}
                   </span>
                 </button>
+                {locationPathsByKey && (
+                  <FileLocationActions
+                    compact
+                    label="Camera file locations"
+                    paths={cam.filters.flatMap(f => locationPathsByKey.get(f.key) ?? [])}
+                  />
+                )}
               </div>
 
               {/* Filter level (with indent guide) */}
@@ -239,6 +257,13 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
                             {filter.frameCount}
                           </span>
                         </button>
+                        {locationPathsByKey && (
+                          <FileLocationActions
+                            compact
+                            label="Filter file locations"
+                            paths={locationPathsByKey.get(filter.key) ?? []}
+                          />
+                        )}
                       </div>
                     );
                   })}

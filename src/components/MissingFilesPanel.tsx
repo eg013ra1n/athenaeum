@@ -1,3 +1,4 @@
+import { FileLocationActions } from './FileLocationActions';
 import { useState } from 'react';
 import { api } from '../api';
 import { pickFile } from '../api/desktop';
@@ -133,7 +134,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   const handleLocate = async (file: MissingFileRecord) => {
     try {
       const selected = await pickFile({
-        title: `Locate ${file.filename}`,
+        title: `Locate ${file.filename}<FileLocationActions compact paths={[file.path]} />`,
         filters: [
           // GTK file-dialog filters are case-sensitive globs — a '.FITS' file
           // is invisible on Linux unless the uppercase form is listed too.
@@ -245,19 +246,17 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                     />
                   </td>
                   <td className="p-2">
-                    <div className="font-mono text-xs text-content-secondary truncate max-w-xs" title={file.path}>
+                    <div
+                      className="font-mono text-xs text-content-secondary truncate max-w-xs"
+                      title={file.path}
+                    >
                       {file.filename}
+                      <FileLocationActions compact paths={[file.path]} />
                     </div>
                   </td>
-                  <td className="p-2 text-content-muted">
-                    {file.object || '-'}
-                  </td>
-                  <td className="p-2 text-content-muted">
-                    {formatSize(file.size)}
-                  </td>
-                  <td className="p-2 text-content-muted">
-                    {formatDate(file.detected_at)}
-                  </td>
+                  <td className="p-2 text-content-muted">{file.object || '-'}</td>
+                  <td className="p-2 text-content-muted">{formatSize(file.size)}</td>
+                  <td className="p-2 text-content-muted">{formatDate(file.detected_at)}</td>
                   <td className="p-2">
                     <div className="flex items-center gap-1 justify-end">
                       {isTauri && (
@@ -301,16 +300,22 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
           <details className="group">
             <summary className="flex items-center gap-2 p-3 cursor-pointer text-content-muted hover:text-content-secondary">
               <EyeOff size={14} />
-              <span className="text-sm">{ignoredFiles.length} ignored file{ignoredFiles.length !== 1 ? 's' : ''}</span>
+              <span className="text-sm">
+                {ignoredFiles.length} ignored file{ignoredFiles.length !== 1 ? 's' : ''}
+              </span>
             </summary>
             <div className="max-h-32 overflow-y-auto border-t border-border/30">
-              {ignoredFiles.map((file) => (
+              {ignoredFiles.map(file => (
                 <div
                   key={file.file_id}
                   className="flex items-center justify-between p-2 px-3 hover:bg-surface-elevated/30 text-sm"
                 >
-                  <span className="font-mono text-xs text-content-muted truncate flex-1" title={file.path}>
+                  <span
+                    className="font-mono text-xs text-content-muted truncate flex-1"
+                    title={file.path}
+                  >
                     {file.filename}
+                    <FileLocationActions compact paths={[file.path]} />
                   </span>
                   <button
                     onClick={() => handleUnignore(file.file_id)}

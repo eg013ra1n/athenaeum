@@ -1,6 +1,5 @@
-import { AlertTriangle, CheckCircle2, ExternalLink, RefreshCw } from 'lucide-react';
-import { revealItemInDir } from '../../api/desktop';
-import { isTauri } from '../../utils/platform';
+import { AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
+import { FileLocationActions } from '../FileLocationActions';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { SwitchRow } from './SwitchRow';
 import { RecheckButton } from './RecheckButton';
@@ -73,10 +72,7 @@ export function RoleInspector(props: RoleInspectorProps) {
           </div>
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate">{dir}</span>
-            {isTauri && !offline && (
-              <button onClick={() => revealItemInDir(dir).catch((e) => console.error('[RoleInspector] reveal failed:', e))}
-                title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
-            )}
+            <FileLocationActions compact directories paths={[dir]} />
           </div>
         </div>
         {root && !offline && (

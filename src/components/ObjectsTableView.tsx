@@ -1,3 +1,4 @@
+import { ObjectFileLocations } from './ObjectFileLocations';
 import { useState, useMemo } from 'react';
 import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw, Archive } from 'lucide-react';
 import type { FramesSetWithCount } from '../types/helpers';
@@ -263,6 +264,7 @@ export function ObjectsTableView({
                 {/* Actions */}
                 <td className="px-2 py-1.5">
                   <div className="flex items-center justify-center gap-1">
+                    <ObjectFileLocations ids={[frames_set.id!]} compact />
                     <button
                       onClick={(e) => { e.stopPropagation(); onStartEditing(frames_set.id!, frames_set.name); }}
                       className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"

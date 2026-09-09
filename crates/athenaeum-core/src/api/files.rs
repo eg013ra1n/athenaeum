@@ -1455,3 +1455,42 @@ mod verify_pair_tests {
         assert_eq!(stored_hash(&conn, 2), None);
     }
 }
+
+/// Check that a catalog location is reachable before asking the OS to reveal it.
+/// Metadata only: this never opens file contents or changes the catalog.
+#[tracing::instrument(skip_all, err)]
+pub fn is_existing_directory(path: String, policy: &PathPolicy) -> Result<bool, ApiError> {
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| ApiError::NotFound(format!("Cannot access {}: {}", path, error)))?;
+    policy.check(&canonical)?;
+    std::fs::metadata(&canonical)
+        .map(|metadata| metadata.is_dir())
+        .map_err(|error| ApiError::Internal(format!("Cannot inspect {}: {}", path, error)))
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    #[test]
+    fn locations_check_files_folders_missing_and_policy_without_changing_data() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("synthetic.fits");
+        std::fs::write(&file, b"synthetic fixture").unwrap();
+        assert!(
+            !is_existing_directory(file.to_string_lossy().into(), &PathPolicy::AllowAll).unwrap()
+        );
+        assert!(
+            is_existing_directory(root.path().to_string_lossy().into(), &PathPolicy::AllowAll)
+                .unwrap()
+        );
+        assert!(is_existing_directory(
+            root.path().join("missing").to_string_lossy().into(),
+            &PathPolicy::AllowAll
+        )
+        .is_err());
+        let forbidden = PathPolicy::AllowedRoots(vec![root.path().join("other")]);
+        assert!(is_existing_directory(file.to_string_lossy().into(), &forbidden).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"synthetic fixture");
+    }
+}
