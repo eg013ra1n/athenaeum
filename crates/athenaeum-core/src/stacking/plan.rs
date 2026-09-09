@@ -508,6 +508,28 @@ fn find_group_frame<'a>(groups: &'a [IntegrationGroup], frame_id: i64) -> Option
         .find(|f| f.frame_id == frame_id)
 }
 
+/// The `registration_results` reuse predicate itself (ruling 10): a row is
+/// reusable against a given reference/expected-hash pair iff its
+/// `reference_frame_id` matches, its `status` is `aligned` /
+/// `aligned_flipped` / `reference`, and its `config_hash` equals the
+/// expected one. Shared by [`compute_register_stale`] (the plan's own
+/// whole-build staleness check, below) and `run.rs`'s stage 5 (Task 7's
+/// per-frame reuse decision) — the plan and the run it precedes must never
+/// disagree about what "fresh" means, so both call this SAME function
+/// rather than each re-deriving the three-part check.
+pub(crate) fn registration_row_is_fresh(
+    row: &RegistrationRecord,
+    reference_frame_id: i64,
+    expected_hash: &str,
+) -> bool {
+    row.reference_frame_id == reference_frame_id
+        && matches!(
+            row.status.as_str(),
+            "aligned" | "aligned_flipped" | "reference"
+        )
+        && row.config_hash.as_deref() == Some(expected_hash)
+}
+
 /// Register-stage staleness (spec §9.3, gate step's `stale_stages`).
 ///
 /// `Auto` reference mode cannot pre-verify a `config_hash` — the reference
@@ -581,13 +603,7 @@ fn compute_register_stale(
             &reference_calib_hash,
             &frame_calib_hash,
         );
-        let reusable = row.reference_frame_id == reference_frame_id
-            && matches!(
-                row.status.as_str(),
-                "aligned" | "aligned_flipped" | "reference"
-            )
-            && row.config_hash.as_deref() == Some(expected.as_str());
-        if !reusable {
+        if !registration_row_is_fresh(row, reference_frame_id, &expected) {
             return Ok(true);
         }
     }

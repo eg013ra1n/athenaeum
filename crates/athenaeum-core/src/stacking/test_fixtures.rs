@@ -124,6 +124,46 @@ pub(crate) fn add_light(f: &Fixture, spec: &LightSpec<'_>) -> (i64, PathBuf) {
         (0, spec.date_obs.to_string())
     };
 
+    let frame_id = insert_light_row(f, spec, &path, &filename, size, &modified_at);
+    (frame_id, path)
+}
+
+/// As [`add_light`], but the raw 16-bit FITS carries a CALLER-chosen star
+/// field (`stars`, raw ADU `(x, y, peak)`) and background instead of
+/// [`write_light_fits`]'s fixed 3-star pattern, with optional Gaussian noise
+/// (`noise_sigma` raw ADU, `0.0` = none, reproducible via `noise_seed`).
+/// Always writes a real file (`spec.write_file` is not read). Plan 5a Task 7
+/// needs this for its measure/reference/register tests: the SAME field
+/// shifted by a known integer offset across frames (so registration finds
+/// real inlier matches), or an empty field (nothing to detect, for the
+/// low-weight and registration-failure cases).
+pub(crate) fn add_light_with_field(
+    f: &Fixture,
+    spec: &LightSpec<'_>,
+    stars: &[(f64, f64, f64)],
+    background: f32,
+    noise_sigma: f32,
+    noise_seed: u64,
+) -> (i64, PathBuf) {
+    let filename = format!("{}.fits", spec.stem);
+    let path = f.dir.path().join(&filename);
+    write_light_fits_field(&path, spec, stars, background, noise_sigma, noise_seed);
+    let (size, modified_at) = file_identity(&path);
+    let frame_id = insert_light_row(f, spec, &path, &filename, size, &modified_at);
+    (frame_id, path)
+}
+
+/// The `files`/`frames`/`session_members` rows shared by [`add_light`] and
+/// [`add_light_with_field`] — everything BUT the pixel data itself, which
+/// each caller writes its own way before calling this. Returns `frame_id`.
+fn insert_light_row(
+    f: &Fixture,
+    spec: &LightSpec<'_>,
+    path: &Path,
+    filename: &str,
+    size: i64,
+    modified_at: &str,
+) -> i64 {
     f.conn
         .execute(
             "INSERT INTO files (path, filename, size, modified_at, format)
@@ -160,7 +200,7 @@ pub(crate) fn add_light(f: &Fixture, spec: &LightSpec<'_>) -> (i64, PathBuf) {
         )
         .unwrap();
 
-    (frame_id, path)
+    frame_id
 }
 
 /// A built master dark (constant 100 ADU) + a built master flat (constant
@@ -282,7 +322,24 @@ fn write_light_fits(path: &Path, spec: &LightSpec<'_>) {
         (w as f64 * 0.62, h as f64 * 0.55, 14000.0),
         (w as f64 * 0.45, h as f64 * 0.72, 2500.0),
     ];
-    let plane = gaussian_field(w, h, &stars, 1.6, 500.0);
+    write_light_fits_field(path, spec, &stars, 500.0, 0.0, 0);
+}
+
+/// [`write_light_fits`]'s body, generalized over the star field/background/
+/// noise (see [`add_light_with_field`]).
+fn write_light_fits_field(
+    path: &Path,
+    spec: &LightSpec<'_>,
+    stars: &[(f64, f64, f64)],
+    background: f32,
+    noise_sigma: f32,
+    noise_seed: u64,
+) {
+    let (w, h) = (spec.width, spec.height);
+    let mut plane = gaussian_field(w, h, stars, 1.6, background);
+    if noise_sigma > 0.0 {
+        crate::test_support::add_noise(&mut plane, noise_sigma, noise_seed);
+    }
     // Encode as unsigned 16-bit via the standard BZERO=32768 offset: stored
     // signed value = physical value - 32768.
     let data: Vec<i16> = plane
