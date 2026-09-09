@@ -107,11 +107,15 @@ fn apply3(m: &[[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
 
 /// Max corner/centre disagreement between our reference→subject inverse
 /// and the sidecar matrix, under one row-order hypothesis: `flip` mirrors
-/// y (`y' = H − 1 − y`) on both sides before the sidecar's origin shift.
+/// y (`y' = H − 1 − y`) on both sides. The matrix applies directly to our
+/// pixel-centre coordinates: shifting by its `AlignmentOrigin` (0.5) on
+/// both sides adds exactly |M·½ − ½| — 1.41 px under a 180° rotation,
+/// 0.10 px under 8°, nothing under identity — which is what every rotated
+/// subject showed until the shift was dropped. The attribute is still
+/// parsed and reported.
 fn corner_delta(
     map: &PixelMap,
     theirs: &[[f64; 3]; 3],
-    origin: (f64, f64),
     ref_wh: (usize, usize),
     sub_h: usize,
     flip: bool,
@@ -132,8 +136,7 @@ fn corner_delta(
         } else {
             (y, oy)
         };
-        let (px, py) = apply3(theirs, x + origin.0, ty + origin.1);
-        let (px, py) = (px - origin.0, py - origin.1);
+        let (px, py) = apply3(theirs, x, ty);
         worst = worst.max(((px - ox).powi(2) + (py - oy_t).powi(2)).sqrt());
     }
     worst
@@ -146,7 +149,6 @@ fn corner_delta(
 fn star_delta(
     map: &PixelMap,
     theirs: &[[f64; 3]; 3],
-    origin: (f64, f64),
     stars: &[Star],
     sub_wh: (usize, usize),
 ) -> serde_json::Value {
@@ -156,8 +158,7 @@ fn star_delta(
         .iter()
         .filter_map(|s| {
             let (ox, oy) = map.inverse(s.x, s.y);
-            let (px, py) = apply3(theirs, s.x + origin.0, s.y + origin.1);
-            let (px, py) = (px - origin.0, py - origin.1);
+            let (px, py) = apply3(theirs, s.x, s.y);
             (inside(ox, oy) && inside(px, py))
                 .then(|| ((px - ox).powi(2) + (py - oy).powi(2)).sqrt())
         })
@@ -263,7 +264,6 @@ fn main() {
                 let plain = corner_delta(
                     &a.map,
                     &theirs,
-                    origin,
                     (reference.width, reference.height),
                     reg.height,
                     false,
@@ -271,7 +271,6 @@ fn main() {
                 let flipped = corner_delta(
                     &a.map,
                     &theirs,
-                    origin,
                     (reference.width, reference.height),
                     reg.height,
                     true,
@@ -286,7 +285,7 @@ fn main() {
                     "theirScale": (sx * sy).sqrt(),
                     "theirRotationDeg": theirs[1][0].atan2(theirs[0][0]).to_degrees(),
                     "cornerDeltaPx": { "sameRowOrder": plain, "flippedRowOrder": flipped },
-                    "starDeltaPx": star_delta(&a.map, &theirs, origin, &reference.stars, (reg.width, reg.height)),
+                    "starDeltaPx": star_delta(&a.map, &theirs, &reference.stars, (reg.width, reg.height)),
                 });
             }
             Err(e) => out["xdrz"] = serde_json::json!({ "error": e }),

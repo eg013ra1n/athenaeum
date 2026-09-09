@@ -91,10 +91,11 @@ pub struct Alignment {
     pub model: LinearKind,
     pub distortion_order: Option<u8>,
     pub seed_matches: usize,
-    /// Correspondences the seed produced.
+    /// Correspondences in the final pairing (the seed's, or the re-paired set).
     pub pairs: usize,
-    /// Pairs added by the re-pairing pass through the refit model (0 when
-    /// the seed already paired the field).
+    /// Growth of the correspondence count from the re-pairing pass through
+    /// the refit model (0 when the seed already paired the field, or when
+    /// the pass was not taken).
     pub repaired: usize,
     /// Refit inliers.
     pub inliers: usize,
@@ -206,15 +207,16 @@ fn residual_stats(map: &PixelMap, pairs: &[Pair]) -> (f64, f64, (f64, f64)) {
     (rms, var.sqrt(), (px, py))
 }
 
-/// Correspondences through `model`: every subject star's nearest reference
-/// star within `radius`, with the pair's combined centroid σ
-/// (`√(σ_s² + σ_r²)` per axis) when both stars carry one.
+/// One set of correspondences with the per-pair centroid σ.
 struct Pairing {
     pairs: Vec<Pair>,
     sigmas: Vec<(f64, f64)>,
     all_sigmas: bool,
 }
 
+/// Correspondences through `model`: every subject star's nearest reference
+/// star within `radius`, with the pair's combined centroid σ
+/// (`√(σ_s² + σ_r²)` per axis) when both stars carry one.
 fn pair_through(
     model: &Linear,
     subject: &[Star],
@@ -248,8 +250,10 @@ fn pair_through(
 }
 
 /// Steps 3–4: RANSAC on the model resolved from the pair count, then the
-/// σ-weighted refit with `auto` re-resolved from the inlier count (it can
-/// only step down).
+/// σ-weighted refit with `auto` re-resolved from the inlier count (within
+/// one call it can only step down; a later call on a larger pairing may
+/// resolve higher — `kind`, `ransac` and `refit` are replaced together, so
+/// the shipped model is the one the refit was fitted with).
 fn ransac_and_refit(
     pairing: &Pairing,
     cfg: &RegistrationConfig,
@@ -832,6 +836,21 @@ mod tests {
         assert!(
             off.pairs.len() < exact.pairs.len() / 3,
             "off {} exact {}",
+            off.pairs.len(),
+            exact.pairs.len()
+        );
+        // The mechanism itself, independent of how good the quad seed is: a
+        // refit on the off-model's origin-clustered pairs recovers the field.
+        let sim = RegistrationConfig {
+            model: ModelChoice::Similarity,
+            ..Default::default()
+        };
+        let (_, refit_off, _) = ransac_and_refit(&off, &sim, (w as usize, h as usize)).unwrap();
+        let recovered = pair_through(&refit_off.linear, &subject, &reference, &tree, radius);
+        assert!(
+            recovered.pairs.len() as f64 >= 0.98 * exact.pairs.len() as f64,
+            "recovered {} off {} exact {}",
+            recovered.pairs.len(),
             off.pairs.len(),
             exact.pairs.len()
         );

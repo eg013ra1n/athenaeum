@@ -89,16 +89,21 @@ pub fn register_frame(
     );
     let duration_ms = start.elapsed().as_millis() as u64;
     match &outcome {
-        Ok(a) => debug!(
-            path = %subject.display(),
-            detections = stars.len(),
-            inliers = a.inliers,
-            rms_px = a.rms_px,
-            model = %model_name(a.model, a.distortion_order),
-            flipped = a.flipped,
-            duration_ms,
-            "frame registered"
-        ),
+        Ok(a) => {
+            debug!(
+                path = %subject.display(),
+                detections = stars.len(),
+                inliers = a.inliers,
+                rms_px = a.rms_px,
+                model = %model_name(a.model, a.distortion_order),
+                flipped = a.flipped,
+                duration_ms,
+                "frame registered"
+            );
+            for note in &a.warnings {
+                warn!(path = %subject.display(), note = %note, "registration warning");
+            }
+        }
         Err(e) => {
             warn!(path = %subject.display(), detections = stars.len(), error = %e, duration_ms, "frame registration failed")
         }
