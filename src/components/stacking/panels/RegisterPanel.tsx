@@ -54,6 +54,7 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
             <option key={v} value={v}>{modelLabel(v)}</option>
           ))}
         </select>
+        <p className="mt-1 text-[11px] text-content-muted">default {modelLabel(defaults.registration.model)}</p>
       </div>
 
       <div>
@@ -68,6 +69,9 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
             <option key={v} value={v}>{distortionLabel(v)}</option>
           ))}
         </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {distortionLabel(defaults.registration.distortion)}
+        </p>
       </div>
 
       <div>
@@ -82,6 +86,9 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
             <option key={v} value={v}>{interpolationLabel(v)}</option>
           ))}
         </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {interpolationLabel(defaults.registration.interpolation)}
+        </p>
       </div>
 
       <NumericField
@@ -177,6 +184,7 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
               rightValue={r.detection.maxEccentricity}
               onRightCommit={(n) => patchDetection({ maxEccentricity: n })}
               min={0}
+              rightMax={1}
               step={0.01}
               disabled={disabled}
               help={`defaults ${defaults.registration.detection.minSnr} / ${defaults.registration.detection.maxEccentricity}`}

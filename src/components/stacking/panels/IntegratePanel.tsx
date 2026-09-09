@@ -2,7 +2,7 @@
 // per-variant parameters, the Auto rule note, min weight, range low/high,
 // write-rejection-maps.
 
-import { NullableNumericField, NumericField } from '../NumericField';
+import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
 import { ParamPair } from '../ParamPair';
 import { combinationLabel } from '../stageSummary';
 import type { Combination, RejectionChoice, StackingConfig } from '../../../types/stacking';
@@ -77,6 +77,9 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
             <option key={v} value={v}>{combinationLabel(v)}</option>
           ))}
         </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {combinationLabel(defaults.integration.combination)}
+        </p>
       </div>
 
       <div>
@@ -92,7 +95,8 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
           ))}
         </select>
         <p className="mt-1 text-[11px] text-content-muted">
-          Auto resolves per group: n &lt; 8 percentile 0.2/0.1 · 8–19 Winsorized 4.0/3.0 · ≥ 20 linear fit 5.0/3.5.
+          default {METHOD_LABEL[defaults.integration.rejection.method]} — resolves per group: n &lt; 8 percentile
+          0.2/0.1 · 8–19 Winsorized 4.0/3.0 · ≥ 20 linear fit 5.0/3.5.
         </p>
       </div>
 
@@ -161,23 +165,28 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
         help={`default ${defaults.integration.minWeight}`}
       />
 
-      <NumericField
+      {/* `rangeLow` is `number | null` in the contract, same as `rangeHigh` —
+          the Default preset happens to leave it `Some(0.0)` rather than
+          `None`, but the field must still be able to represent `null` (fix
+          round 1, Minor #6), not silently coerce it to 0 on every commit. */}
+      <NullableNumericField
         label="Range low"
-        value={i.rangeLow ?? 0}
+        value={i.rangeLow}
+        presetDefaultValue={defaults.integration.rangeLow}
         onCommit={(n) => patch({ rangeLow: n })}
         step={0.01}
         disabled={disabled}
-        help={`default ${defaults.integration.rangeLow ?? 0} — reject raw ≤ this value`}
+        help={nullableDefaultHelp(defaults.integration.rangeLow, 'reject raw ≤ this value')}
       />
 
       <NullableNumericField
         label="Range high"
         value={i.rangeHigh}
-        seedValue={0.98}
+        presetDefaultValue={defaults.integration.rangeHigh}
         onCommit={(n) => patch({ rangeHigh: n })}
         step={0.01}
         disabled={disabled}
-        help="off by default — reject raw ≥ this value once turned on"
+        help={nullableDefaultHelp(defaults.integration.rangeHigh, 'reject raw ≥ this value once turned on')}
       />
 
       <label className="flex items-center gap-2 cursor-pointer">

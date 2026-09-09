@@ -3,7 +3,7 @@
 // four selection filters and the Re-measure action.
 
 import { RefreshCw } from 'lucide-react';
-import { NullableNumericField, NumericField } from '../NumericField';
+import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
 import { psfModelLabel, weightModeLabel } from '../stageSummary';
 import type { PsfModel, StackingConfig, WeightMode } from '../../../types/stacking';
 
@@ -21,22 +21,27 @@ const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
 
 /** A formula-weight slider — a plain `<input type="range">`, always a valid
  *  number on every change, so it needs none of `NumericField`'s partial-edit
- *  discipline. */
+ *  discipline. `defaultValue` (fix round 1, Minor #5) is the field's actual
+ *  `presetDefault` number, never a hard-coded literal in this file. */
 function WeightSlider({
   label,
   value,
+  defaultValue,
   onCommit,
   disabled,
 }: {
   label: string;
   value: number;
+  defaultValue: number;
   onCommit: (n: number) => void;
   disabled?: boolean;
 }) {
   return (
     <div>
       <div className="flex items-center justify-between text-xs text-content-secondary">
-        <span>{label}</span>
+        <span>
+          {label} <span className="text-content-muted">(default {defaultValue})</span>
+        </span>
         <span className="tabular-nums text-content-muted">{value.toFixed(0)}</span>
       </div>
       <input
@@ -99,6 +104,9 @@ export function MeasurePanel({
             </option>
           ))}
         </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {weightModeLabel(defaults.measurement.weightMode)}
+        </p>
       </div>
 
       {m.weightMode === 'keyword' && (
@@ -120,18 +128,38 @@ export function MeasurePanel({
       {m.weightMode === 'formula' && (
         <div className="space-y-2 pt-1">
           <h4 className="text-xs font-medium text-content-secondary">Formula weights</h4>
-          <WeightSlider label="FWHM" value={m.formula.fwhm} onCommit={(n) => patchFormula({ fwhm: n })} disabled={disabled} />
+          <WeightSlider
+            label="FWHM"
+            value={m.formula.fwhm}
+            defaultValue={defaults.measurement.formula.fwhm}
+            onCommit={(n) => patchFormula({ fwhm: n })}
+            disabled={disabled}
+          />
           <WeightSlider
             label="Eccentricity"
             value={m.formula.eccentricity}
+            defaultValue={defaults.measurement.formula.eccentricity}
             onCommit={(n) => patchFormula({ eccentricity: n })}
             disabled={disabled}
           />
-          <WeightSlider label="SNR" value={m.formula.snr} onCommit={(n) => patchFormula({ snr: n })} disabled={disabled} />
-          <WeightSlider label="Stars" value={m.formula.stars} onCommit={(n) => patchFormula({ stars: n })} disabled={disabled} />
+          <WeightSlider
+            label="SNR"
+            value={m.formula.snr}
+            defaultValue={defaults.measurement.formula.snr}
+            onCommit={(n) => patchFormula({ snr: n })}
+            disabled={disabled}
+          />
+          <WeightSlider
+            label="Stars"
+            value={m.formula.stars}
+            defaultValue={defaults.measurement.formula.stars}
+            onCommit={(n) => patchFormula({ stars: n })}
+            disabled={disabled}
+          />
           <WeightSlider
             label="Pedestal"
             value={m.formula.pedestal}
+            defaultValue={defaults.measurement.formula.pedestal}
             onCommit={(n) => patchFormula({ pedestal: n })}
             disabled={disabled}
           />
@@ -152,6 +180,9 @@ export function MeasurePanel({
             </option>
           ))}
         </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {psfModelLabel(defaults.measurement.psfModel)}
+        </p>
       </div>
 
       <NumericField
@@ -179,33 +210,33 @@ export function MeasurePanel({
         <NullableNumericField
           label="Max FWHM (px)"
           value={sel.maxFwhmPx}
-          seedValue={8}
+          presetDefaultValue={defaults.selection.maxFwhmPx}
           onCommit={(n) => patchSelection({ maxFwhmPx: n })}
           min={0}
           step={0.1}
           disabled={disabled}
-          help="off by default — every frame passes regardless of FWHM"
+          help={nullableDefaultHelp(defaults.selection.maxFwhmPx, 'every frame passes regardless of FWHM')}
         />
         <NullableNumericField
           label="Max eccentricity"
           value={sel.maxEccentricity}
-          seedValue={0.6}
+          presetDefaultValue={defaults.selection.maxEccentricity}
           onCommit={(n) => patchSelection({ maxEccentricity: n })}
           min={0}
           max={1}
           step={0.01}
           disabled={disabled}
-          help="off by default — every frame passes regardless of eccentricity"
+          help={nullableDefaultHelp(defaults.selection.maxEccentricity, 'every frame passes regardless of eccentricity')}
         />
         <NullableNumericField
           label="Min stars"
           value={sel.minStars}
-          seedValue={20}
+          presetDefaultValue={defaults.selection.minStars}
           onCommit={(n) => patchSelection({ minStars: n === null ? null : Math.round(n) })}
           min={0}
           step={1}
           disabled={disabled}
-          help="off by default — every frame passes regardless of star count"
+          help={nullableDefaultHelp(defaults.selection.minStars, 'every frame passes regardless of star count')}
         />
         <label className="flex items-center gap-2 cursor-pointer">
           <input

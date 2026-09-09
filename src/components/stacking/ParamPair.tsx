@@ -11,9 +11,19 @@ export interface ParamPairProps {
   rightLabel: string;
   rightValue: number;
   onRightCommit: (n: number) => void;
+  /** Shared bounds/step for both fields. A field's own `left*`/`right*`
+   *  override (below) takes precedence when given — e.g. the Register
+   *  panel's detection pair shares `min={0}` but only `maxEccentricity`
+   *  (the right field) has an upper bound (fix round 1, Minor #7). */
   min?: number;
   max?: number;
   step?: number;
+  leftMin?: number;
+  leftMax?: number;
+  leftStep?: number;
+  rightMin?: number;
+  rightMax?: number;
+  rightStep?: number;
   help?: string;
   disabled?: boolean;
 }
@@ -28,6 +38,12 @@ export function ParamPair({
   min,
   max,
   step,
+  leftMin,
+  leftMax,
+  leftStep,
+  rightMin,
+  rightMax,
+  rightStep,
   help,
   disabled,
 }: ParamPairProps) {
@@ -38,18 +54,18 @@ export function ParamPair({
           label={leftLabel}
           value={leftValue}
           onCommit={onLeftCommit}
-          min={min}
-          max={max}
-          step={step}
+          min={leftMin ?? min}
+          max={leftMax ?? max}
+          step={leftStep ?? step}
           disabled={disabled}
         />
         <NumericField
           label={rightLabel}
           value={rightValue}
           onCommit={onRightCommit}
-          min={min}
-          max={max}
-          step={step}
+          min={rightMin ?? min}
+          max={rightMax ?? max}
+          step={rightStep ?? step}
           disabled={disabled}
         />
       </div>

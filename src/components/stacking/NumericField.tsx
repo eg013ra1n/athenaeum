@@ -21,6 +21,16 @@ function clampNumber(n: number, min?: number, max?: number): number {
   return v;
 }
 
+/** Help text for a nullable numeric field, derived from its `presetDefault`
+ *  value — never a hard-coded phrase (fix round 1, Minor #5): the preset's
+ *  `null` reads "off by default", a concrete number reads "default N". Every
+ *  panel with a nullable field has `presetDefault` available and should read
+ *  the field's actual default off it, rather than assuming it is off. */
+export function nullableDefaultHelp(defaultValue: number | null, suffix?: string): string {
+  const base = defaultValue === null ? 'off by default' : `default ${defaultValue}`;
+  return suffix ? `${base} — ${suffix}` : base;
+}
+
 export interface NumericFieldProps {
   label: string;
   value: number;
@@ -79,10 +89,13 @@ export function NumericField({ label, value, onCommit, min, max, step, help, dis
 export interface NullableNumericFieldProps {
   label: string;
   value: number | null;
-  /** Seeded when the "off" toggle turns the field on — a reasonable starting
-   *  point, not a stored default (the field has none: it is `null`/off by
-   *  default in every built-in preset). */
-  seedValue: number;
+  /** The field's actual preset-default value (`presetDefault`'s own field —
+   *  every built-in preset currently leaves these `null`, but this is read
+   *  off the real preset, not invented). Re-enabling the field seeds from
+   *  (in order): the last value the user had it at, this preset default, or
+   *  `0` only as the last resort when neither exists (fix round 1, Minor #4
+   *  — never a hard-coded domain-specific seed like "8 px" or "0.6"). */
+  presetDefaultValue: number | null;
   onCommit: (n: number | null) => void;
   min?: number;
   max?: number;
@@ -92,12 +105,13 @@ export interface NullableNumericFieldProps {
 }
 
 /** A nullable numeric field with an explicit on/off toggle — `maxFwhmPx`,
- *  `maxEccentricity`, `minStars`, `integration.rangeHigh` all default to
- *  `null` ("off") and stay off until the user turns them on. */
+ *  `maxEccentricity`, `minStars`, `integration.rangeHigh`/`rangeLow` all
+ *  default to `null` ("off") in the M1 presets and stay off until the user
+ *  turns them on. */
 export function NullableNumericField({
   label,
   value,
-  seedValue,
+  presetDefaultValue,
   onCommit,
   min,
   max,
@@ -106,6 +120,23 @@ export function NullableNumericField({
   disabled,
 }: NullableNumericFieldProps) {
   const on = value !== null;
+
+  // The last value the user had this field at while it was on, so
+  // re-enabling after toggling off restores it instead of guessing again
+  // (fix round 1, Minor #4).
+  const lastValueRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (value !== null) lastValueRef.current = value;
+  }, [value]);
+
+  const handleToggle = (checked: boolean) => {
+    if (!checked) {
+      onCommit(null);
+      return;
+    }
+    onCommit(lastValueRef.current ?? presetDefaultValue ?? 0);
+  };
+
   return (
     <div>
       <div className="flex items-center justify-between gap-2">
@@ -115,7 +146,7 @@ export function NullableNumericField({
             type="checkbox"
             checked={on}
             disabled={disabled}
-            onChange={(e) => onCommit(e.target.checked ? seedValue : null)}
+            onChange={(e) => handleToggle(e.target.checked)}
             className="w-3.5 h-3.5 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
           />
           {on ? 'On' : 'Off'}

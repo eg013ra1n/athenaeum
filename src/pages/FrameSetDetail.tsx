@@ -947,7 +947,15 @@ export default function FrameSetDetail() {
               referenceFrameId={referenceFrameId ?? null}
             />
           ) : activeTab === 'stacking' ? (
+            // Fix round 1 (Task 3, Critical #2), belt-and-braces: `StackingTab`
+            // guards its own draft/persist state against a set switch
+            // internally (`draftForSetRef`), but a fresh mount per set is the
+            // simplest guarantee that a stale draft can never even momentarily
+            // exist under the new id. `ExportTab` below is NOT similarly keyed
+            // — verified, not matched here on purpose, since only `StackingTab`
+            // materializes a per-set override row a stale write could corrupt.
             <StackingTab
+              key={id}
               framesSetId={parseInt(id!)}
               frameSetName={detail?.frames_set?.name ?? undefined}
             />

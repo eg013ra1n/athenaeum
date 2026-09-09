@@ -103,6 +103,26 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
   const framesSetIdRef = useRef(framesSetId);
   useEffect(() => { framesSetIdRef.current = framesSetId; }, [framesSetId]);
 
+  // Fix round 1 (Critical #1/#2, Important #3): which set `draftConfig`
+  // belongs to, and whether its most recent change was USER-originated
+  // (an inspector edit / preset apply / toggle) as opposed to the load
+  // effect's own seed/reset. `dirtyRef` is set ONLY by `setUserConfig`
+  // below — never by the load effect — and cleared only once a write for
+  // it is actually sent (by the persist effect's timer, or by the flush
+  // effect on a set switch/unmount), not merely scheduled, so a pending
+  // edit survives long enough to be flushed instead of silently lost.
+  const dirtyRef = useRef(false);
+  const draftForSetRef = useRef<number | null>(null);
+
+  /** The only way `draftConfig` should change as a result of a USER action.
+   *  The load effect calls `setDraftConfig` directly (bypassing this) so it
+   *  can never mark the draft dirty — visiting a set with no stored
+   *  override must never materialize one (Critical #1). */
+  const setUserConfig = useCallback<typeof setDraftConfig>((value) => {
+    dirtyRef.current = true;
+    setDraftConfig(value);
+  }, []);
+
   const refetchPlan = useCallback(async (configOverride?: StackingConfig) => {
     const seq = ++planSeqRef.current;
     const forSetId = framesSetId;
@@ -123,25 +143,47 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
   }, [framesSetId]);
 
   // Mount / frame-set-change: load the set's config, then the plan built
-  // from it.
+  // from it. Fix round 1, Critical #2: `draftConfig`/`excludedFrameIds` are
+  // reset to null/[] FIRST (synchronously, before the async fetch even
+  // starts) so nothing on screen — and nothing the persist effect could act
+  // on — still points at the PREVIOUS set while this fetch is in flight;
+  // `draftForSetRef` is set only once the config response actually lands,
+  // guarded by this effect's own `cancelled` flag (a fresh effect run for a
+  // newer `framesSetId` already flips the older run's `cancelled` to `true`
+  // before its `await` can resume — the standard React guard, sufficient
+  // here since only this one effect ever calls `get_stacking_config`).
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setLoadError(null);
+    setDraftConfig(null);
+    setExcludedFrameIds([]);
     (async () => {
       try {
         const cfg = await api.invoke<StackingSetConfig>('get_stacking_config', { setId: framesSetId });
         if (cancelled) return;
         setDraftConfig(cfg.config);
         setExcludedFrameIds(cfg.excludedFrameIds);
+        draftForSetRef.current = framesSetId;
         const presetsResult = await api.invoke<StackingPresets>('get_stacking_presets', {});
         if (cancelled) return;
         setPresets(presetsResult);
+        // This plan fetch is one of four call sites that can write `plan`
+        // (the other three go through `refetchPlan`) — guarded by the same
+        // `planSeqRef`/`framesSetIdRef` those share, so whichever response
+        // is actually the most recent wins regardless of which code path
+        // issued it (a `library-updated` event or the outcome effect can
+        // race against this very fetch).
+        const seq = ++planSeqRef.current;
+        const forSetId = framesSetId;
         const p = await api.invoke<StackingPlan>('get_stacking_plan', {
-          setId: framesSetId,
+          setId: forSetId,
           config: cfg.config,
         });
         if (cancelled) return;
+        if (seq !== planSeqRef.current || forSetId !== framesSetIdRef.current) {
+          return; // superseded by a later refetchPlan/mount call
+        }
         setPlan(p);
       } catch (err) {
         console.error('[StackingTab] failed to load stacking config/plan:', err);
@@ -188,43 +230,74 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
     void refetchPlan(draftConfigRef.current ?? undefined);
   }, [lastOutcomeRunId, refetchPlan]);
 
+  // The most recent user-originated write still waiting to go out — set by
+  // the persist effect below when it schedules the 500 ms timer, read by
+  // both that timer and the flush effect (Important #3), cleared by
+  // whichever of them actually sends it.
+  const pendingWriteRef = useRef<{ setId: number; config: StackingConfig; excludedFrameIds: number[] } | null>(null);
+
+  const sendPendingWrite = useCallback((notifyOnFailure: boolean) => {
+    const payload = pendingWriteRef.current;
+    if (!payload) return;
+    dirtyRef.current = false;
+    pendingWriteRef.current = null;
+    api.invoke('set_stacking_config', payload).catch((err) => {
+      console.error('[StackingTab] set_stacking_config failed:', err);
+      if (notifyOnFailure) {
+        notify({
+          tone: 'warning',
+          kind: 'stacking',
+          toast: true,
+          title: 'Stacking settings not saved',
+          detail: String(err),
+        });
+      }
+    });
+  }, [notify]);
+
   // Persist (debounced) whenever the draft config or the excluded-frame list
-  // changes — skip the very first assignment (the mount effect's own seed).
+  // changes. Fix round 1, Critical #1: writes only when `dirtyRef.current`
+  // is true — the load effect's own seed/reset never sets it, so opening
+  // the tab on a set with no stored override can never materialize one.
+  // Critical #2: also skipped when `draftForSetRef` still names a
+  // DIFFERENT set than the current `framesSetId` — the one-commit window
+  // between a set switch and the new set's load effect resetting the
+  // draft, where this effect would otherwise still see the OLD set's
+  // draftConfig alongside the NEW framesSetId and write the wrong set.
   // Submit state, never a re-read (spec §11.2): a failed write logs and
   // warns but never rolls the draft back or re-fetches.
-  const skipFirstPersistEffect = useRef(true);
   useEffect(() => {
-    if (skipFirstPersistEffect.current) {
-      skipFirstPersistEffect.current = false;
-      return;
-    }
     if (!draftConfig) return;
-    const t = setTimeout(() => {
-      api
-        .invoke('set_stacking_config', { setId: framesSetId, config: draftConfig, excludedFrameIds })
-        .catch((err) => {
-          console.error('[StackingTab] set_stacking_config failed:', err);
-          notify({
-            tone: 'warning',
-            kind: 'stacking',
-            toast: true,
-            title: 'Stacking settings not saved',
-            detail: String(err),
-          });
-        });
-    }, 500);
+    if (!dirtyRef.current) return;
+    if (draftForSetRef.current !== framesSetId) return;
+    pendingWriteRef.current = { setId: framesSetId, config: draftConfig, excludedFrameIds };
+    const t = setTimeout(() => sendPendingWrite(true), 500);
     return () => clearTimeout(t);
-  }, [draftConfig, excludedFrameIds, framesSetId, notify]);
+  }, [draftConfig, excludedFrameIds, framesSetId, sendPendingWrite]);
+
+  // Flush instead of cancel (Important #3): a set switch or unmount must
+  // not silently drop an edit the 500 ms timer above hadn't reached yet.
+  // This effect's own cleanup — which fires exactly when `framesSetId` is
+  // about to change, or on true unmount — sends whatever the persist
+  // effect last scheduled, fire-and-forget (no `notify`; the tab the user
+  // is leaving isn't the place to toast a failure).
+  useEffect(() => {
+    return () => {
+      if (dirtyRef.current && pendingWriteRef.current) {
+        sendPendingWrite(false);
+      }
+    };
+  }, [framesSetId, sendPendingWrite]);
 
   const handleConfigChange = useCallback((next: StackingConfig) => {
-    setDraftConfig(next);
-  }, []);
+    setUserConfig(next);
+  }, [setUserConfig]);
 
   const handleToggleWriteRegisteredFrames = useCallback((checked: boolean) => {
-    setDraftConfig((prev) =>
+    setUserConfig((prev) =>
       prev ? { ...prev, registration: { ...prev.registration, writeRegisteredFrames: checked } } : prev,
     );
-  }, []);
+  }, [setUserConfig]);
 
   const handleSelectStage = useCallback((stage: BoardStage) => {
     setSelectedStage(stage);
@@ -274,12 +347,12 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
   }, [draftConfig, presets]);
 
   const applyPreset = useCallback((preset: StackingPreset) => {
-    setDraftConfig((prev) => {
+    setUserConfig((prev) => {
       if (!presets || !prev) return prev;
       return { ...presets[preset], paths: prev.paths };
     });
     setPresetMenuOpen(false);
-  }, [presets]);
+  }, [presets, setUserConfig]);
 
   // `starting` bridges the click-to-run gap. `startRun`'s invoke does not
   // resolve until the backend has synchronously built the WHOLE plan
@@ -390,6 +463,11 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
 
   const rerunOptions = Array.from(new Set<Stage>([...plan.staleStages, 'integrate']));
   const rerunDisabled = plan.staleStages.length === 0 || running || starting;
+  // Fix round 1, Minor #8: the preset selector edits the config the same
+  // way every inspector panel does, so it is disabled while a run is
+  // active for the same reason those panels are (`StageInspector`'s own
+  // `disabled` prop below).
+  const presetSelectorDisabled = running || starting;
   const runDisabled = plan.blockers.length > 0 || running || starting;
   const runTooltip = plan.blockers.length > 0 ? plan.blockers[0].message : undefined;
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
@@ -403,12 +481,17 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
             <button
               type="button"
               onClick={() => setPresetMenuOpen((v) => !v)}
-              className="flex items-center gap-1 font-medium text-content hover:text-content-secondary transition-colors"
+              disabled={presetSelectorDisabled}
+              className={`flex items-center gap-1 font-medium transition-colors ${
+                presetSelectorDisabled
+                  ? 'text-content-muted cursor-not-allowed'
+                  : 'text-content hover:text-content-secondary'
+              }`}
             >
               {presetLabel}
               <ChevronDown size={14} />
             </button>
-            {presetMenuOpen && (
+            {presetMenuOpen && !presetSelectorDisabled && (
               <div className="absolute left-0 mt-1 w-40 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
                 {(Object.keys(PRESET_LABEL) as StackingPreset[]).map((p) => (
                   <button
