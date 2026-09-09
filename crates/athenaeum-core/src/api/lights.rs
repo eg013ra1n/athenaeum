@@ -405,13 +405,29 @@ pub(crate) fn compute_export_readiness(
 /// Whether raw calibration set `raw_set_id` (already known to have no built
 /// master — a `raw_set_ids_without_master` entry) can be built by the
 /// stacking pipeline's stage 0.5 right now. `Ok(None)` = buildable; `Ok(Some(reason))`
-/// names why not, in priority order: too few members, then archived, then
-/// plain missing — matching [`crate::api::masters::check_rebuild_source_ready`]'s
-/// own archived-vs-missing distinction for a rebuild's source set.
+/// names why not, in priority order: no calibration library folder
+/// configured (fix round 1, item 1 — checked FIRST, since nothing below is
+/// worth checking if there is nowhere to write the result), then too few
+/// members, then archived, then plain missing — matching
+/// [`crate::api::masters::check_rebuild_source_ready`]'s own
+/// archived-vs-missing distinction for a rebuild's source set.
+///
+/// The library-folder check mirrors what `run_build`'s `BuildTarget::New`
+/// arm would eventually discover on its own — but only at WRITE time, after
+/// the whole banded integration of every raw sub-frame. Checking it here,
+/// before the plan ever lists the set as buildable, is what keeps a
+/// missing/unmounted library folder from being discovered by burning a full
+/// integration pass first (fix round 1, item 1's whole point — see
+/// `crate::api::masters::build_master_inline`'s own pre-check for the other
+/// half of this fix).
 fn classify_raw_set_buildability(
     conn: &Connection,
     raw_set_id: i64,
 ) -> Result<Option<String>, ApiError> {
+    if crate::api::masters::library_dir_or_err(conn).is_err() {
+        return Ok(Some("no calibration library folder configured".to_string()));
+    }
+
     let frame_count: i64 = conn.query_row(
         "SELECT frame_count FROM calibration_set WHERE id = ?1",
         [raw_set_id],
@@ -1061,6 +1077,14 @@ mod tests {
         seed_light(&conn, 2, session);
         seed_masters(&conn);
         let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &library_dir.to_string_lossy(),
+        )
+        .unwrap();
 
         let buildable = seed_raw_set_real_files(&conn, tmp.path(), 300, "Dark", 3);
         add_link(&conn, 1, buildable, "Dark");
@@ -1092,6 +1116,43 @@ mod tests {
             r.raw_sets_unbuildable[0].1.contains("1 of 3"),
             "{:?}",
             r.raw_sets_unbuildable
+        );
+    }
+
+    /// Fix round 1, item 1: a raw set that is otherwise perfectly buildable
+    /// (enough frames, all on disk) is still `raw_sets_unbuildable` when NO
+    /// calibration library folder is configured at all — without this, stage
+    /// 0.5 would integrate every raw sub-frame and only then fail at write
+    /// time (`run_build`'s own `library_dir_or_err` call, deep inside
+    /// `BuildTarget::New`'s write-target resolution).
+    #[test]
+    fn raw_set_unbuildable_without_a_library_folder_configured() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately NO `CALIBRATION_LIBRARY_DIR` setting and no
+        // `calibration_library` scan root — the "never configured" shape.
+
+        let raw = seed_raw_set_real_files(&conn, tmp.path(), 300, "Dark", 3);
+        add_link(&conn, 1, raw, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(
+            r.raw_sets_buildable.is_empty(),
+            "{:?}",
+            r.raw_sets_buildable
+        );
+        assert_eq!(
+            r.raw_sets_unbuildable.len(),
+            1,
+            "{:?}",
+            r.raw_sets_unbuildable
+        );
+        assert_eq!(r.raw_sets_unbuildable[0].0, raw);
+        assert_eq!(
+            r.raw_sets_unbuildable[0].1,
+            "no calibration library folder configured"
         );
     }
 

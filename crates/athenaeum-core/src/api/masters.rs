@@ -1971,16 +1971,58 @@ pub(crate) fn resolve_rebuild_target(
     ))
 }
 
+/// RAII guard for [`build_master_inline`]'s `active_master_builds` entry
+/// (fix round 1, item 4): held for the whole call so a concurrent manual
+/// (re)build of the SAME source set is refused (`start_master_build`'s own
+/// conflict check reads this same map) instead of racing on one target
+/// path. Removed on every exit — a normal return, a `?`-propagated error, or
+/// a panic (`Drop` runs during unwind, same guarantee [`ClaimGuard`] relies
+/// on above).
+struct ActiveBuildGuard<'a> {
+    ctx: &'a ServiceContext,
+    set_id: i64,
+}
+
+impl Drop for ActiveBuildGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx
+            .active_master_builds
+            .lock()
+            .unwrap()
+            .remove(&self.set_id);
+    }
+}
+
 /// Stage 0.5 (spec §2 row 0.5, owner requirement 2026-09-09): the validation
 /// `start_master_build`/`rebuild_master` do, PLUS a fresh Auto recipe
 /// resolution, run entirely on the STACKING RUN's own thread —
 /// `admission: Admission::Inherited` (the run's own `ComputeJobKind::Stacking`
 /// permit already covers this call — see [`Admission`]'s doc). No spawned
-/// thread, no `active_master_builds` handle (the stacking run's own cancel
-/// handle, `RunContext::cancel`, already covers cancellation for the whole
-/// pipeline including this stage), no `master-build-complete` event (the
-/// stacking run's own `stacking-progress`/`stacking-complete` events carry
-/// the outcome instead — see `stacking::run::stage_masters`).
+/// thread, no `master-build-complete` event (the stacking run's own
+/// `stacking-progress`/`stacking-complete` events carry the outcome instead
+/// — see `stacking::run::stage_masters`).
+///
+/// Fix round 1, item 4: DOES register `set_id` in `active_master_builds` for
+/// the duration of the call ([`ActiveBuildGuard`]) — at
+/// `compute.max_concurrent > 1` a manual (re)build of the same source set
+/// could otherwise start WHILE the stacking run is also building it,
+/// racing on one target path (a `New` build's claimed filename, or a
+/// `Rebuild`'s atomic replace of the same existing file). A conflict here
+/// fails only this one master with an honest "already in progress" message
+/// — `stage_masters` folds it into the same `RunError::Other` any other
+/// build failure produces, so the whole run still fails loudly rather than
+/// silently racing.
+///
+/// Fix round 1, item 1: for `BuildTarget::New`, checks the calibration
+/// library folder is actually configured BEFORE calling `run_build` —
+/// `run_build` itself only discovers a missing folder at write time, after
+/// the whole banded integration of every raw sub-frame; on an install with
+/// no library folder configured (or an unmounted one) that would burn a
+/// full integration pass just to fail. The plan gate's own
+/// `raw_sets_unbuildable` classification (`api::lights::classify_raw_set_buildability`)
+/// already keeps this from happening in the normal path — this check is the
+/// backstop for a folder that was removed/unmounted between the plan build
+/// and the run actually reaching this item.
 ///
 /// `run_build` may still emit `master-build-progress` for this call — its
 /// per-band/per-combine callbacks are unconditional, so a build driven this
@@ -2001,6 +2043,28 @@ pub(crate) fn build_master_inline(
     target: BuildTarget,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(i64, Option<String>), BuildStepError> {
+    {
+        let mut active = ctx.active_master_builds.lock().unwrap();
+        if active.contains_key(&set_id) {
+            return Err(BuildStepError::Other(format!(
+                "a master build is already in progress for calibration set {set_id}"
+            )));
+        }
+        active.insert(
+            set_id,
+            MasterBuildHandle {
+                cancel_flag: cancel.clone(),
+            },
+        );
+    }
+    let _guard = ActiveBuildGuard { ctx, set_id };
+
+    if matches!(target, BuildTarget::New) {
+        let db_handle = db(ctx)?;
+        let conn = db_handle.conn();
+        library_dir_or_err(&conn)?;
+    }
+
     let recipe = MasterRecipe {
         combine: None,
         synthetic_bias: None,
@@ -4639,10 +4703,16 @@ mod tests {
     /// occupying the one slot — simulating the stacking run's own
     /// `ComputeJobKind::Stacking` permit, already held before stage 0.5 ever
     /// calls `build_master_inline`. If `Admission::Inherited` ever regressed
-    /// into calling `ComputeQueue::acquire` again, this single-threaded test
-    /// would deadlock (the holder's permit is never released — it is held for
-    /// the test's entire body): `run_build(.., Admission::Inherited)` must
-    /// complete and return `Ok` without ever touching the queue.
+    /// into calling `ComputeQueue::acquire` again, it would deadlock behind
+    /// the holder's permit (never released — held for the whole test).
+    ///
+    /// Fix round 1, item 7: the build runs on a HELPER thread with a bounded
+    /// `recv_timeout` on the result channel, rather than calling `run_build`
+    /// directly on the test thread — a regression here must fail this test
+    /// with a named assertion, not hang the whole `cargo test` process
+    /// (which held the queue's holder permit for the WHOLE original
+    /// single-threaded version's body; a deadlocked `run_build` call there
+    /// would never return control to the test harness at all).
     #[test]
     fn admission_inherited_never_acquires() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4673,24 +4743,160 @@ mod tests {
             )
             .expect("the test's own permit must be admitted immediately (nothing else queued)");
 
-        let recipe = MasterRecipe {
-            combine: Some(IntegrationRecipe::median(Rejection::None)),
-            synthetic_bias: None,
-            archive_after: false,
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_thread = ctx.clone();
+        std::thread::spawn(move || {
+            let recipe = MasterRecipe {
+                combine: Some(IntegrationRecipe::median(Rejection::None)),
+                synthetic_bias: None,
+                archive_after: false,
+            };
+            let result = run_build(
+                &ctx_thread,
+                &crate::events::NullEmitter,
+                "0.5.1-test",
+                set_id,
+                &recipe,
+                &Arc::new(AtomicBool::new(false)),
+                BuildTarget::New,
+                Admission::Inherited,
+            );
+            // The receiver may already be gone if the test itself timed out
+            // and panicked first — a dropped-receiver send error is not
+            // this thread's problem to report.
+            let _ = tx.send(result.is_ok());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(ok) => assert!(
+                ok,
+                "an Inherited build must never block behind the caller's own already-held permit"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "Admission::Inherited build did not finish within 5s — it likely tried to \
+                 re-acquire the ComputeQueue and deadlocked behind the test's own held permit"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the build thread ended without sending a result (it must have panicked)")
+            }
+        }
+    }
+
+    /// Fix round 1, item 4: a concurrent manual (re)build of the SAME source
+    /// set must be refused, not raced — with a handle already registered in
+    /// `active_master_builds` for `set_id` (simulating a manual build already
+    /// in flight), `build_master_inline` returns the conflict immediately,
+    /// before any pixel work, and leaves the library folder untouched.
+    #[test]
+    fn build_master_inline_refuses_a_set_already_building() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            seed_buildable_dark_set(&conn, &src, 3)
         };
-        let result = run_build(
+
+        let ctx = build_test_ctx(database);
+        ctx.active_master_builds.lock().unwrap().insert(
+            set_id,
+            MasterBuildHandle {
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        let result = build_master_inline(
             &ctx,
             &crate::events::NullEmitter,
             "0.5.1-test",
             set_id,
-            &recipe,
-            &Arc::new(AtomicBool::new(false)),
             BuildTarget::New,
-            Admission::Inherited,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        match result.expect_err("a set already building must be refused") {
+            BuildStepError::Other(msg) => {
+                assert!(
+                    msg.contains("already in progress"),
+                    "unexpected message: {msg}"
+                );
+            }
+            BuildStepError::Cancelled => panic!("expected Other(conflict), got Cancelled"),
+        }
+        assert!(
+            std::fs::read_dir(&library_dir).unwrap().next().is_none(),
+            "no master file should have been written — the conflict must be caught before any pixel work"
+        );
+    }
+
+    /// Fix round 1, item 1(b): `build_master_inline` with `BuildTarget::New`
+    /// checks the calibration library folder BEFORE calling `run_build` — on
+    /// an install with none configured, the call returns the error
+    /// immediately rather than integrating every raw sub-frame first and
+    /// only then failing at write time.
+    #[test]
+    fn build_master_inline_checks_library_folder_before_integrating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Deliberately NO `CALIBRATION_LIBRARY_DIR` setting.
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let set_id = {
+            let conn = database.conn();
+            seed_buildable_dark_set(&conn, &src, 3)
+        };
+
+        let ctx = build_test_ctx(database);
+        let started = std::time::Instant::now();
+        let result = build_master_inline(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            BuildTarget::New,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "no library folder configured must be refused"
         );
         assert!(
-            result.is_ok(),
-            "an Inherited build must never block behind the caller's own already-held permit: {result:?}"
+            elapsed < std::time::Duration::from_secs(1),
+            "the check must reject before integrating (took {elapsed:?})"
+        );
+        // No pixel work ran at all — the source directory still holds
+        // exactly the 3 raw sub-frames the fixture wrote, nothing more (a
+        // real integration reads them but never writes back into `src`; this
+        // is the cheap, direct proxy for "no integration ran" the library-dir
+        // check is supposed to guarantee).
+        assert_eq!(
+            std::fs::read_dir(&src).unwrap().count(),
+            3,
+            "the raw source directory must be untouched"
+        );
+        // Nothing was ever registered as a master for this set — the
+        // conflict/guard logic released the handle on this early exit, and
+        // (with no library folder at all) there is nowhere a file could
+        // have been written to.
+        assert!(
+            ctx.active_master_builds
+                .lock()
+                .unwrap()
+                .get(&set_id)
+                .is_none(),
+            "the ActiveBuildGuard must release the handle on this early exit"
         );
     }
 

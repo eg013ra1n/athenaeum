@@ -292,17 +292,20 @@ fn seed_registered_master(
     value: f32,
     ath_fnrm: Option<f64>,
 ) -> i64 {
-    const MIN_MASTER_FRAMES: usize = 3;
+    // Fix round 1, item 6: the real constant, not a re-declared local one —
+    // a change to the production floor must not silently desync from the
+    // fixture that exercises it.
+    let min_master_frames = crate::api::masters::MIN_MASTER_FRAMES;
 
     f.conn
         .execute(
             "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
              VALUES (?1, '2025-01-01', 0, ?2)",
-            params![raw_imagetyp, MIN_MASTER_FRAMES as i64],
+            params![raw_imagetyp, min_master_frames],
         )
         .unwrap();
     let source_set_id = f.conn.last_insert_rowid();
-    for i in 0..MIN_MASTER_FRAMES {
+    for i in 0..min_master_frames as usize {
         let frame_id = write_raw_subframe(f, raw_imagetyp, width, height, value, i, source_set_id);
         f.conn
             .execute(
@@ -352,16 +355,17 @@ pub(crate) fn add_raw_linked_dark(
     width: usize,
     height: usize,
 ) -> i64 {
-    const MIN_MASTER_FRAMES: usize = 3;
+    // Fix round 1, item 6: the real constant, not a re-declared local one.
+    let min_master_frames = crate::api::masters::MIN_MASTER_FRAMES;
     f.conn
         .execute(
             "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
              VALUES ('Dark', '2025-01-01', 0, ?1)",
-            [MIN_MASTER_FRAMES as i64],
+            [min_master_frames],
         )
         .unwrap();
     let set_id = f.conn.last_insert_rowid();
-    for i in 0..MIN_MASTER_FRAMES {
+    for i in 0..min_master_frames as usize {
         let frame_id = write_raw_subframe(f, "Dark", width, height, 100.0, i, set_id);
         f.conn
             .execute(

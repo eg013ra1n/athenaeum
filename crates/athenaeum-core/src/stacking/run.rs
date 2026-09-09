@@ -909,18 +909,30 @@ fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
     let total = items.len();
 
+    // Fix round 1, item 3: the opener — forced (`current == 0` bypasses
+    // `RunContext::progress`'s throttle unconditionally), so this stage
+    // visibly starts even if the run's own `last_emit` timestamp (set at
+    // `RunContext` construction) is still inside the 300ms throttle window
+    // by the time `stage_masters` gets to run.
+    rc.progress(Stage::Masters, None, 0, total, 0, 0, None, None);
+
     for (i, item) in items.iter().enumerate() {
         rc.check_cancel()?;
         // Emitted BEFORE the build starts, naming the master about to be
-        // built/rebuilt — a multi-minute integration otherwise leaves the
+        // built/rebuilt, at the COUNT OF ITEMS ALREADY DONE (0-based `i`,
+        // never `total`) — a multi-minute integration otherwise leaves the
         // Stacking tab showing the previous item's label for the whole
         // duration (research §8's "a multi-minute operation that logs
         // nothing is indistinguishable from a hung one", same reasoning
-        // `api::masters::log_build_started` was added for).
+        // `api::masters::log_build_started` was added for). Fix round 1,
+        // item 3: using `i` rather than `i + 1` here is what keeps the row
+        // from ever reading `N/N` while the LAST master is still
+        // integrating — that misleading tick only fires once, explicitly,
+        // after the loop below.
         rc.progress(
             Stage::Masters,
             None,
-            i + 1,
+            i,
             total,
             0,
             0,
@@ -972,11 +984,24 @@ fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
             }
         };
 
+        // Fix round 1, item 2: a missing file row after a build that itself
+        // reported success would be a silent data-integrity gap — never
+        // swallow it, even though the run itself does not fail over it (the
+        // pixels ARE on disk and registered; only this summary path is
+        // empty).
         let path = {
             let conn = db(&rc.ctx)?.conn();
-            crate::api::masters::master_file_path(&conn, master_set_id)?
-                .map(|(_, p)| p)
-                .unwrap_or_default()
+            match crate::api::masters::master_file_path(&conn, master_set_id)? {
+                Some((_, p)) => p,
+                None => {
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        set_id = master_set_id,
+                        "master file row missing after build"
+                    );
+                    String::new()
+                }
+            }
         };
 
         let duration_ms = item_start.elapsed().as_millis() as u64;
@@ -996,6 +1021,12 @@ fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
             duration_ms,
         });
     }
+
+    // Fix round 1, item 3: the closer — forced (`current == total`), emitted
+    // only AFTER every item's build has actually finished, so the stage's
+    // true completion is never lost even if an intermediate per-item tick
+    // above was swallowed by the throttle.
+    rc.progress(Stage::Masters, None, total, total, 0, 0, None, None);
 
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Masters,

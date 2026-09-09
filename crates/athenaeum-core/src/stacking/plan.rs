@@ -714,17 +714,26 @@ fn calibration_set_imagetyp_and_count(
 /// `"<imagetyp> · set <id>"` if the row can't be read — shouldn't happen,
 /// since `set_id` came from the readiness split moments ago, but a label is
 /// never worth failing the whole plan over.
-fn calibration_set_label(conn: &Connection, set_id: i64, imagetyp: &str) -> String {
+///
+/// Fix round 1, item 5: propagates a real SQL error (via `?` on `.optional()`
+/// — `rusqlite::Error::QueryReturnedNoRows` still collapses to `Ok(None)`,
+/// exactly as before; any OTHER error, e.g. a poisoned/broken connection,
+/// now surfaces instead of being silently treated the same as "no row" and
+/// papered over with the fallback label.
+fn calibration_set_label(
+    conn: &Connection,
+    set_id: i64,
+    imagetyp: &str,
+) -> Result<String, ApiError> {
     let row: Option<(Option<f64>, Option<f64>, Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT exptime, ccd_temp, instrume, filter FROM calibration_set WHERE id = ?1",
             [set_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
-        .optional()
-        .unwrap_or(None);
+        .optional()?;
     let Some((exptime, ccd_temp, instrume, filter)) = row else {
-        return format!("{imagetyp} · set {set_id}");
+        return Ok(format!("{imagetyp} · set {set_id}"));
     };
     let mut parts = vec![imagetyp.to_string()];
     if imagetyp == "Flat" {
@@ -741,7 +750,7 @@ fn calibration_set_label(conn: &Connection, set_id: i64, imagetyp: &str) -> Stri
     if let Some(i) = instrume {
         parts.push(i);
     }
-    parts.join(" ")
+    Ok(parts.join(" "))
 }
 
 /// Stage 0.5's work list (spec §2 row 0.5): every buildable raw set
@@ -767,7 +776,13 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
     for &raw_set_id in &readiness.raw_sets_buildable {
         match calibration_set_imagetyp_and_count(conn, raw_set_id) {
             Ok((imagetyp, frame_count)) => {
-                let label = calibration_set_label(conn, raw_set_id, &imagetyp);
+                let label = match calibration_set_label(conn, raw_set_id, &imagetyp) {
+                    Ok(label) => label,
+                    Err(error) => {
+                        tracing::warn!(raw_set_id, %error, "stacking: could not read calibration set label; dropped from masters_to_build");
+                        continue;
+                    }
+                };
                 items.push(PlanMaster {
                     set_id: raw_set_id,
                     kind: MasterWork::Build,
@@ -796,7 +811,13 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
         };
         match calibration_set_imagetyp_and_count(conn, source_set_id) {
             Ok((imagetyp, frame_count)) => {
-                let label = calibration_set_label(conn, source_set_id, &imagetyp);
+                let label = match calibration_set_label(conn, source_set_id, &imagetyp) {
+                    Ok(label) => label,
+                    Err(error) => {
+                        tracing::warn!(master_set_id, source_set_id, %error, "stacking: could not read calibration set label; dropped from masters_to_build");
+                        continue;
+                    }
+                };
                 items.push(PlanMaster {
                     set_id: master_set_id,
                     kind: MasterWork::Rebuild,
@@ -1256,6 +1277,8 @@ mod tests {
 
         let working = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
+        let library_dir = f.dir.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
         crate::db::set_setting(
             &f.conn,
             keys::STACKING_WORKING_DIR,
@@ -1266,6 +1289,12 @@ mod tests {
             &f.conn,
             keys::STACKING_OUTPUT_DIR,
             output.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &library_dir.to_string_lossy(),
         )
         .unwrap();
 
@@ -1287,6 +1316,78 @@ mod tests {
         assert_eq!(plan.masters_to_build[0].kind, MasterWork::Build);
         assert_eq!(plan.masters_to_build[0].imagetyp, "Dark");
         assert_eq!(plan.masters_to_build[0].frame_count, 3);
+    }
+
+    /// Fix round 1, item 1: with NO calibration library folder configured at
+    /// all, an otherwise-buildable raw set is `raw_sets_unbuildable`
+    /// (`api::lights::raw_set_unbuildable_without_a_library_folder_configured`
+    /// pins the readiness side of this) — the plan gate therefore carries the
+    /// `masters` blocker instead of listing the set as planned work.
+    #[test]
+    fn plan_blocks_a_buildable_raw_set_without_a_library_folder_configured() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_raw_linked_dark(&f, &ids, 64, 48);
+        // Deliberately no `CALIBRATION_LIBRARY_DIR` setting.
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(
+            plan.masters_to_build.is_empty(),
+            "{:?}",
+            plan.masters_to_build
+        );
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|b| b.code == "masters")
+            .expect("masters blocker");
+        assert!(
+            blocker
+                .message
+                .contains("no calibration library folder configured"),
+            "{:?}",
+            blocker
+        );
+    }
+
+    /// Fix round 1, item 5: pins the label format `calibration_set_label`
+    /// actually produces for a real row (not the `"<imagetyp> · set <id>"`
+    /// fallback, which only the "no row" branch takes).
+    #[test]
+    fn calibration_set_label_pins_the_format() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (imagetyp, date, exptime, ccd_temp, instrume, frame_count)
+                 VALUES ('Dark', '2025-01-01', 180.0, -10.0, 'ATR2600M', 3)",
+                [],
+            )
+            .unwrap();
+        let set_id = f.conn.last_insert_rowid();
+
+        let label = calibration_set_label(&f.conn, set_id, "Dark").unwrap();
+        assert_eq!(label, "Dark 180s -10°C ATR2600M");
     }
 
     /// A built master whose FILE is missing but whose `master_provenance`
