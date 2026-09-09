@@ -315,6 +315,7 @@ fn main() {
                     interpolation: args.cfg.interpolation,
                     clamping: args.cfg.clamping_threshold,
                     rms_px: a.rms_px,
+                    reference_roworder: None,
                 },
             )?;
             write_registered_frame(

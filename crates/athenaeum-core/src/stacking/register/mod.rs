@@ -35,7 +35,9 @@ pub enum DistortionChoice {
     Polynomial3,
     Polynomial4,
     /// Order 3 for a subject whose geometry differs from the reference's,
-    /// when the refit keeps at least `align::AUTO_DISTORTION_MIN_INLIERS`.
+    /// when the refit keeps at least `align::AUTO_DISTORTION_MIN_INLIERS`
+    /// inliers whose overlap and regularity indices both reach
+    /// `align::AUTO_DISTORTION_MIN_OVERLAP` / `align::AUTO_DISTORTION_MIN_REGULARITY`.
     Auto,
 }
 

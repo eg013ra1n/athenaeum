@@ -13,6 +13,11 @@ use crate::stacking::measure::ADU_SCALE;
 /// `peak + background` reaches it has a flat top and no usable centroid.
 pub const SATURATION: f32 = 0.95;
 
+/// Calibrated frames are in [0, 1]; a plane whose finite maximum exceeds
+/// this was never scaled down (a float32 source keeps ADU) and every star
+/// would fail the saturation cut after the `ADU_SCALE` multiply.
+pub const NATIVE_UNITS_MAX: f32 = 1.5;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Star {
     pub x: f64,
@@ -61,6 +66,17 @@ pub fn detect_stars(
 ) -> Vec<Star> {
     if w < 8 || h < 8 || lum.len() < w * h {
         return Vec::new();
+    }
+    let max = lum
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(0.0f32, f32::max);
+    if max > NATIVE_UNITS_MAX {
+        tracing::warn!(
+            max,
+            "plane exceeds native units; the saturation cut will drop every star"
+        );
     }
     let scaled: Vec<f32> = lum.iter().map(|v| v * ADU_SCALE).collect();
     let mut analyzer = ImageAnalyzer::new()

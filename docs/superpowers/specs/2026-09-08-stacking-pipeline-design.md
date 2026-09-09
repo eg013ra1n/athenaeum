@@ -135,7 +135,7 @@ configurable). For RGB frames detection runs on the luminance
 | `similarity` | 4 | same rig, few stars (auto below 12 inliers) |
 | `affine` | 6 | auto for 12–29 inliers; the legacy `registration_results` shape |
 | `homography` | 8 | **default**; normalized DLT (Hartley); flips are a negative determinant, nothing special |
-| `polynomial2..4` | + (order+1)(order+2)−6 per axis, per direction | fitted on the residuals of the linear model; forward and inverse fitted independently (the plate solver's SIP convention); auto-enabled for cross-camera groups (different `INSTRUME` or geometry than the reference) with ≥ 200 inliers whose inliers are consistent (overlap index ≥ 0.6 — inlier hull over the matched pairs' hull) and cover the frame (regularity index ≥ 0.6 — fraction of a 4×4 grid holding an inlier); an explicit order is always honoured |
+| `polynomial2..4` | + (order+1)(order+2)−6 per axis, per direction | fitted on the residuals of the linear model; forward and inverse fitted independently (the plate solver's SIP convention); auto-enabled for a subject whose geometry differs from the reference's (the `INSTRUME` half of the cross-camera rule waits for the orchestrator to pass it — Plan 5) with ≥ 200 inliers whose inliers are consistent (overlap index ≥ 0.6 — inlier hull over the matched pairs' hull) and cover the frame (regularity index ≥ 0.6 — fraction of a 4×4 grid holding an inlier); an explicit order is always honoured |
 | `tps` (M4) | ≤ 4000 nodes | regularized thin-plate spline, smoothing λ, node pruning by surface simplification, outlier removal |
 
 `model: auto` resolves per frame as above; the resolved model is recorded.

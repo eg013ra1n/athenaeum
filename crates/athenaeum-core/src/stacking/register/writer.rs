@@ -18,9 +18,11 @@ use crate::resample::{warp_rows, Interpolation, Plane};
 
 /// Source cards a registered frame keeps: acquisition and target metadata
 /// only. The pixel grid is the reference's, so the subject's WCS is wrong
-/// for it, and the frame is resampled, so it has no CFA. `ROWORDER` stays:
-/// it is orientation, not CFA, and a registered frame from a `TOP-DOWN`
-/// subject would otherwise render flipped.
+/// for it, and the frame is resampled, so it has no CFA.
+/// `ROWORDER` stays: it is orientation, not CFA. The registered array is the
+/// reference's grid, so within one camera group the subject's card is the
+/// reference's too; for a cross-camera group the caller stamps the
+/// reference's value through `RegisteredCards::reference_roworder`.
 pub const REGISTERED_COPY_THROUGH: &[&str] = &[
     "EXPTIME", "GAIN", "OFFSET", "EGAIN", "XBINNING", "YBINNING", "XPIXSZ", "YPIXSZ", "CCD-TEMP",
     "SET-TEMP", "INSTRUME", "TELESCOP", "FOCALLEN", "APTDIA", "FILTER", "DATE-OBS", "OBJECT",
@@ -36,6 +38,9 @@ pub struct RegisteredCards<'a> {
     pub interpolation: Interpolation,
     pub clamping: f32,
     pub rms_px: f64,
+    /// `ROWORDER` of the reference frame; when set it replaces the subject's
+    /// card (the registered array is the reference's grid).
+    pub reference_roworder: Option<&'a str>,
 }
 
 /// The copy-through cards of a FITS file, read from its own header (no
@@ -61,6 +66,13 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
         .filter(|c| REGISTERED_COPY_THROUGH.contains(&c.keyword.as_str()))
         .cloned()
         .collect();
+    if let Some(order) = reg.reference_roworder {
+        cards.retain(|c| c.keyword != "ROWORDER");
+        cards.push(
+            Card::new("ROWORDER", CardValue::Str(order.into()))?
+                .with_comment("row order of the reference grid"),
+        );
+    }
     let kernel = serde_json::to_value(reg.interpolation)?
         .as_str()
         .unwrap_or("")
@@ -189,6 +201,7 @@ mod tests {
             interpolation: Interpolation::BicubicBSpline,
             clamping: 0.3,
             rms_px: 0.42,
+            reference_roworder: None,
         };
         let cards = build_registered_cards(&source, &reg).unwrap();
         let out = dir.path().join("registered").join("r_sub.fits");
@@ -234,6 +247,29 @@ mod tests {
         assert_eq!(header.get_f64("EXPTIME"), Some(180.0));
         assert_eq!(header.get_str("ROWORDER").as_deref(), Some("TOP-DOWN"));
         assert!(header.get_str("CRVAL1").is_none() && header.get_str("BAYERPAT").is_none());
+    }
+
+    #[test]
+    fn reference_roworder_replaces_the_subject_card() {
+        let source = vec![
+            Card::new("EXPTIME", CardValue::Real(180.0)).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
+        ];
+        let json = PixelMap::linear(Linear::identity()).unwrap().to_json();
+        let reg = RegisteredCards {
+            reference_name: "c_ref",
+            model: "similarity",
+            transform_json: &json,
+            interpolation: Interpolation::BicubicBSpline,
+            clamping: 0.3,
+            rms_px: 0.42,
+            reference_roworder: Some("BOTTOM-UP"),
+        };
+        let cards = build_registered_cards(&source, &reg).unwrap();
+        let orders: Vec<&Card> = cards.iter().filter(|c| c.keyword == "ROWORDER").collect();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].value, Some(CardValue::Str("BOTTOM-UP".into())));
+        assert!(cards.iter().any(|c| c.keyword == "EXPTIME"));
     }
 
     #[test]

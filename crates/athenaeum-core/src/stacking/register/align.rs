@@ -44,7 +44,11 @@ pub const CLIP_SIGMA: f64 = 3.0;
 pub const DISTORTION_ROUNDS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub enum AlignError {
     TooFewStars { subject: usize, reference: usize },
     NoSeed { matches: usize },
@@ -492,6 +496,18 @@ mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
 
+    #[test]
+    fn align_error_serializes_camel_case_fields() {
+        let e = AlignError::RmsTooHigh {
+            rms_px: 1.5,
+            max_rms_px: 1.0,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"kind":"rmsTooHigh","rmsPx":1.5,"maxRmsPx":1.0}"#);
+        let back: AlignError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
     fn field(seed: u64, n: usize, w: f64, h: f64) -> Vec<Star> {
         let mut rng = SplitMix64(seed);
         (0..n)
@@ -854,7 +870,9 @@ mod tests {
             off.pairs.len(),
             exact.pairs.len()
         );
-        // End to end, whatever the seed's accuracy, the final pairing is complete.
+        // End to end. On this benign scene the quad seed already pairs the
+        // field (`repaired` measured 0), so this only guards completeness;
+        // the mechanism proof is the check above.
         let a = align(
             &subject,
             &reference,

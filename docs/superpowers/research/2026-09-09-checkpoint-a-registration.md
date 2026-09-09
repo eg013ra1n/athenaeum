@@ -112,7 +112,7 @@ The scale/rotation columns are decompositions of two different parameterizations
 
 ## 6. Verdict against the spec §13 targets
 
-The §13 targets — translation ≤ 0.05 px, rotation ≤ 0.001°, scale ≤ 1e-4 against the sidecar — are field-wide star-position bounds of 0.05 px (translation), 0.05 px at the field edge (0.001° × 3000 px) and 0.3 px at the edge (1e-4 × 3000 px); the star-level delta over the whole field tests all three at once.
+The plan's Task 7 targets — translation ≤ 0.05 px, rotation ≤ 0.001°, scale ≤ 1e-4 against the sidecar (spec §13 itself names only the RMS target) — are field-wide star-position bounds of 0.05 px (translation), 0.05 px at the field edge (0.001° × 3000 px) and 0.3 px at the edge (1e-4 × 3000 px); the star-level delta over the whole field tests all three at once.
 
 | Target | Result |
 | ------ | ------ |

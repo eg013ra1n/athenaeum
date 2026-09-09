@@ -367,9 +367,7 @@ mod tests {
     }
 
     /// Seed frame set 1 with LIGHT frames 1 and 2, for the FKs that
-    /// `registration_results` rows require. Extracted from
-    /// `upsert_and_get_round_trip`'s original setup so every test that needs
-    /// the same shape shares one definition.
+    /// `registration_results` rows require.
     fn seed_set_and_frames(conn: &Connection) {
         seed_frame(conn, 1, 1, "LIGHT");
         seed_frame(conn, 2, 2, "LIGHT");
