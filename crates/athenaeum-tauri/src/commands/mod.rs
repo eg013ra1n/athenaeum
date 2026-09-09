@@ -84,3 +84,6 @@ pub use masters::*;
 pub use sync::*;
 pub use account::*;
 pub use collab::*;
+
+pub mod equipment;
+pub use equipment::*;

@@ -298,6 +298,13 @@ pub fn run() {
             commands::recalculate_frame_set_nights,
             commands::get_frame_set_merge_log,
             commands::get_equipment_cameras,
+            commands::get_equipment_profiles,
+            commands::save_equipment_profile,
+            commands::delete_equipment_profile,
+            commands::get_equipment_evidence,
+            commands::confirm_equipment_match,
+            commands::clear_equipment_match,
+
             commands::get_dark_library,
             commands::has_dark_library,
             commands::get_master_dark_library,

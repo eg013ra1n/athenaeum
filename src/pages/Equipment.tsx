@@ -1,3 +1,4 @@
+import { EquipmentProfilesPanel } from '../components/equipment/EquipmentProfilesPanel';
 import { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from '../api';
@@ -85,15 +86,15 @@ export default function Equipment() {
         <HistoryNav />
         <h2 className="text-2xl font-bold">
           Equipment Library
-          <span className="text-sm font-normal text-content-muted ml-3">Browse instruments with captured frames and calibration library management</span>
+          <span className="text-sm font-normal text-content-muted ml-3">
+            Browse instruments with captured frames and calibration library management
+          </span>
         </h2>
       </div>
 
-      {loading && (
-        <div className="text-center py-12 text-content-muted">
-          Loading equipment...
-        </div>
-      )}
+      <EquipmentProfilesPanel cameras={cameras.map(camera => camera.instrume)} />
+
+      {loading && <div className="text-center py-12 text-content-muted">Loading equipment...</div>}
 
       {error && (
         <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">

@@ -1,3 +1,4 @@
+pub mod equipment;
 use axum::{
     Router,
     extract::State,
@@ -132,6 +133,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
         // Calibration
         .route("/api/get_equipment_cameras", post(calibration::get_equipment_cameras))
+        .route("/api/get_equipment_profiles", post(equipment::get_equipment_profiles))
+        .route("/api/save_equipment_profile", post(equipment::save_equipment_profile))
+        .route("/api/delete_equipment_profile", post(equipment::delete_equipment_profile))
+        .route("/api/get_equipment_evidence", post(equipment::get_equipment_evidence))
+        .route("/api/confirm_equipment_match", post(equipment::confirm_equipment_match))
+        .route("/api/clear_equipment_match", post(equipment::clear_equipment_match))
+
         .route("/api/get_dark_library", post(calibration::get_dark_library))
         .route("/api/has_dark_library", post(calibration::has_dark_library))
         .route("/api/get_master_dark_library", post(calibration::get_master_dark_library))
