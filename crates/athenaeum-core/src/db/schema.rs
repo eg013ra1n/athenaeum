@@ -1156,6 +1156,123 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Stacking pipeline (M1 Plan 5a) — one row per stacking run, its
+    // per-group results, its per-frame decisions, cross-run cached
+    // artifacts, and the per-frame-set persisted configuration. See
+    // docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md §9.1.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_runs (
+            id INTEGER PRIMARY KEY,
+            frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            config_json TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            reference_frame_id INTEGER,
+            reference_mode TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
+            output_dir TEXT NOT NULL,
+            summary_json TEXT,
+            error TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_run_groups (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+            group_key TEXT NOT NULL,
+            instrume TEXT,
+            color_mode TEXT NOT NULL,
+            filter TEXT,
+            binning INTEGER,
+            width INTEGER,
+            height INTEGER,
+            exposure REAL,
+            frame_count INTEGER NOT NULL,
+            included_count INTEGER NOT NULL,
+            master_path TEXT,
+            drizzle_path TEXT,
+            rejection_low_path TEXT,
+            rejection_high_path TEXT,
+            stats_json TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            UNIQUE(run_id, group_key)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_run_frames (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES stacking_run_groups(id) ON DELETE CASCADE,
+            frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+            included INTEGER NOT NULL,
+            exclusion_reason TEXT,
+            weight REAL,
+            weight_channels_json TEXT,
+            metrics_json TEXT,
+            reg_status TEXT,
+            reg_model TEXT,
+            reg_rms_px REAL,
+            reg_inliers INTEGER,
+            reg_inlier_ratio REAL,
+            reg_flipped INTEGER,
+            rejected_fraction REAL,
+            UNIQUE(run_id, frame_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_artifacts (
+            id INTEGER PRIMARY KEY,
+            frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
+            frame_id INTEGER REFERENCES frames(id) ON DELETE CASCADE,
+            group_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            path TEXT,
+            config_hash TEXT NOT NULL,
+            size INTEGER,
+            modified_at TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_set_config (
+            frames_set_id INTEGER PRIMARY KEY REFERENCES frames_set(id) ON DELETE CASCADE,
+            config_json TEXT NOT NULL,
+            excluded_frame_ids_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    for stmt in [
+        "CREATE INDEX IF NOT EXISTS idx_stacking_runs_set ON stacking_runs(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_groups_run ON stacking_run_groups(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_run ON stacking_run_frames(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_frame ON stacking_run_frames(frame_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_set ON stacking_artifacts(frames_set_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS stacking_artifacts_key
+           ON stacking_artifacts(frames_set_id, group_key, kind, COALESCE(frame_id, 0))",
+        // Not in the spec's §9.1 index list — added so the FK child columns
+        // introduced above don't trip `every_foreign_key_child_column_is_indexed`
+        // (a parent-row delete would otherwise full-scan these tables; see that
+        // test's own doc comment for the cost this avoids). Same reasoning as
+        // the existing `idx_frame_set_reference_set` on that table's own
+        // `INTEGER PRIMARY KEY` FK column: being the rowid alias does not put
+        // it in `PRAGMA index_list`, so the invariant still needs an explicit
+        // index on `stacking_set_config.frames_set_id`.
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_group ON stacking_run_frames(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_frame ON stacking_artifacts(frame_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_set_config_set ON stacking_set_config(frames_set_id)",
+    ] {
+        conn.execute(stmt, [])?;
+    }
+
     // A5: keep `calibration_set_to_frames.source_id` consistent. The
     // `calibration_set_id` column has a FK with ON DELETE CASCADE, but
     // `source_id` does not — when a calibration_set is deleted, any sub-cal

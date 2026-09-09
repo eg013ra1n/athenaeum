@@ -566,7 +566,7 @@ export type LoggingConfig = { level: string, modules: { [key in string]: string 
 
 export type LoggingConfigResponse = { config: LoggingConfig, envOverrideActive: boolean, };
 
-export type ComputeJobKind = "analysis" | "master_build" | "light_calibration" | "content_index";
+export type ComputeJobKind = "analysis" | "master_build" | "light_calibration" | "content_index" | "stacking";
 
 export type ComputeJobState = "queued" | "running";
 

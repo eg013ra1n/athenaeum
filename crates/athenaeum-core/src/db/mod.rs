@@ -12,6 +12,7 @@ pub mod master_provenance;
 pub mod master_unregister;
 pub mod collab;
 pub mod collab_exchange;
+pub mod stacking;
 
 pub use schema::*;
 pub use operations::*;

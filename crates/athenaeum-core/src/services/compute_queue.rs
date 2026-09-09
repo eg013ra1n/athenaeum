@@ -50,6 +50,10 @@ pub enum ComputeJobKind {
     /// it can't fight a master build for the disk, and so the sidebar card and
     /// its cancel button come for free.
     ContentIndex,
+    /// A stacking run (M1 Plan 5a) — calibration/registration/integration for
+    /// one frame set. Heavy CPU work, so it rides the same admission queue as
+    /// analysis and master builds rather than fighting them for the rayon pool.
+    Stacking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
