@@ -440,9 +440,9 @@ pub const N_STAR_FROM_MAD: f64 = 2.48308;
 pub const BACKGROUND_MODEL_CELL_PX: usize = 128;
 pub const MRS_LAYERS: usize = 4;
 /// Gaussian noise-propagation factor of the first B3-spline à-trous layer
-/// (math reference §2.1): the estimator measures layer-1 coefficients, which
+/// (math reference §2.1): the estimator reports layer-1 coefficients, which
 /// carry this fraction of the pixel noise σ.
-pub const MRS_LAYER0_GAIN: f32 = 0.8907;
+pub const MRS_LAYER1_GAIN: f32 = 0.8907;
 /// Chauvenet's criterion, the rejection limit for the mean-flux vector.
 pub const RCR_LIMIT: f64 = 0.5;
 
@@ -521,6 +521,15 @@ pub fn frame_shape(fits: &[StarFit]) -> Option<(f64, f64)> {
 /// `R = {L − v : v ≠ 0, v < L}` over the stratified sample;
 /// `M* = median(R)`, `N* = 2.48308·MAD(R)`. `None` below 100 residuals.
 pub fn background_residual(data: &[f32], w: usize, h: usize) -> Option<(f64, f64)> {
+    if data.len() != w * h {
+        tracing::warn!(
+            len = data.len(),
+            width = w,
+            height = h,
+            "background residual: plane length does not match the geometry"
+        );
+        return None;
+    }
     let bg = astroimage::analysis::background::estimate_background_mesh(
         data,
         w,
@@ -547,11 +556,11 @@ pub fn background_residual(data: &[f32], w: usize, h: usize) -> Option<(f64, f64
 /// absolute floor tuned for 16-bit ADU data, so callers feed it ADU-scaled
 /// values (`measure::ADU_SCALE`); `None` when the result sits on that
 /// floor (a constant or near-constant plane). The raw estimate is divided by
-/// `MRS_LAYER0_GAIN` to recover σ from the first layer's coefficients (§2.2).
+/// `MRS_LAYER1_GAIN` to recover σ from the first layer's coefficients (§2.2).
 pub fn noise_mrs(data: &[f32], w: usize, h: usize) -> Option<f32> {
     let raw = astroimage::analysis::background::estimate_noise_mrs(data, w, h, MRS_LAYERS);
     if raw.is_finite() && raw > 0.002 {
-        Some(raw / MRS_LAYER0_GAIN)
+        Some(raw / MRS_LAYER1_GAIN)
     } else {
         None
     }
@@ -885,6 +894,13 @@ mod tests {
         assert!((m - 0.006745).abs() < 0.15 * 0.006745, "M* {m}");
         assert!((n - 0.01).abs() < 0.10 * 0.01, "N* {n}");
         assert!(background_residual(&[0.5; 64], 8, 8).is_none());
+    }
+
+    #[test]
+    fn background_residual_refuses_a_length_mismatch() {
+        // `data.len()` (63) disagrees with `w * h` (64) — a public fn must
+        // not index out of bounds on a caller's bad geometry.
+        assert!(background_residual(&[0.5; 63], 8, 8).is_none());
     }
 
     #[test]

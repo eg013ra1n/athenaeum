@@ -166,6 +166,10 @@ required-features = ["render", "solver"]
 name = "register_probe"
 required-features = ["render", "solver"]
 
+[[example]]
+name = "integrate_probe"
+required-features = ["render", "solver"]
+
 [dev-dependencies]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }

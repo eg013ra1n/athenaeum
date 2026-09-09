@@ -131,6 +131,19 @@ impl FrameMeasurement {
     }
 }
 
+/// Which detector seeds a plane's PSF fits (spec §4.1 uses `Fast`; the
+/// Checkpoint B probe's `--seeds full` cross-checks against the slower,
+/// two-pass detector to see whether the choice moves the measurement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSource {
+    /// `ImageAnalyzer::detect_fast_data` — the single-pass detector
+    /// `measure_plane` has used since Plan 2.
+    Fast,
+    /// `ImageAnalyzer::analyze_data` — the full two-pass detect+measure
+    /// pipeline; its per-star metrics become the seeds instead.
+    Full,
+}
+
 /// Measure one plane. Detection, fitting, the background model and MRS run
 /// on an ADU-scaled copy; the sample statistics run on the native data.
 pub fn measure_plane(
@@ -140,29 +153,68 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> ChannelMeasurement {
+    measure_plane_with_seeds(data, w, h, opts, pool, SeedSource::Fast)
+}
+
+/// As `measure_plane`, but the seeds handed to the PSF fitter come from the
+/// chosen detector instead of always `detect_fast_data`.
+pub fn measure_plane_with_seeds(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    seed_source: SeedSource,
+) -> ChannelMeasurement {
     let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
 
-    let mut analyzer = ImageAnalyzer::new()
-        .with_max_stars(opts.max_stars.max(8))
-        .with_centroid_refine(false);
-    if let Some(p) = pool {
-        analyzer = analyzer.with_thread_pool(Arc::clone(p));
-    }
-    let seeds: Vec<Seed> = match analyzer.detect_fast_data(&scaled, w, h, 1) {
-        Ok(r) => r
-            .stars
-            .iter()
-            .filter(|s| s.snr >= opts.min_snr && s.peak > 0.0)
-            .map(|s| Seed {
-                x: s.x as f64,
-                y: s.y as f64,
-                peak: s.peak as f64,
-                flux: s.flux as f64,
-            })
-            .collect(),
-        Err(e) => {
-            warn!(error = %e, "star detection failed; the plane measures as starless");
-            Vec::new()
+    let seeds: Vec<Seed> = match seed_source {
+        SeedSource::Fast => {
+            let mut analyzer = ImageAnalyzer::new()
+                .with_max_stars(opts.max_stars.max(8))
+                .with_centroid_refine(false);
+            if let Some(p) = pool {
+                analyzer = analyzer.with_thread_pool(Arc::clone(p));
+            }
+            match analyzer.detect_fast_data(&scaled, w, h, 1) {
+                Ok(r) => r
+                    .stars
+                    .iter()
+                    .filter(|s| s.snr >= opts.min_snr && s.peak > 0.0)
+                    .map(|s| Seed {
+                        x: s.x as f64,
+                        y: s.y as f64,
+                        peak: s.peak as f64,
+                        flux: s.flux as f64,
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, "star detection failed; the plane measures as starless");
+                    Vec::new()
+                }
+            }
+        }
+        SeedSource::Full => {
+            let mut analyzer = ImageAnalyzer::new().with_max_stars(opts.max_stars);
+            if let Some(p) = pool {
+                analyzer = analyzer.with_thread_pool(Arc::clone(p));
+            }
+            match analyzer.analyze_data(&scaled, w, h, 1) {
+                Ok(r) => r
+                    .stars
+                    .iter()
+                    .map(|s| Seed {
+                        x: s.x as f64,
+                        y: s.y as f64,
+                        peak: s.peak as f64,
+                        flux: s.flux as f64,
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, "full analysis failed; the plane measures as starless");
+                    Vec::new()
+                }
+            }
         }
     };
     let stars_detected = seeds.len();
@@ -274,6 +326,17 @@ pub fn measure_frame(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<FrameMeasurement, IntegrationError> {
+    measure_frame_with_seeds(path, opts, pool, cancel, SeedSource::Fast)
+}
+
+/// As `measure_frame`, but every plane is seeded via `measure_plane_with_seeds`.
+pub fn measure_frame_with_seeds(
+    path: &Path,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+    seed_source: SeedSource,
+) -> Result<FrameMeasurement, IntegrationError> {
     let start = Instant::now();
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
@@ -285,7 +348,7 @@ pub fn measure_frame(
         let data = reader.read_plane(plane)?;
         let t = Instant::now();
         let _span = tracing::debug_span!("measure_plane", path = %path.display(), plane).entered();
-        let m = measure_plane(&data, w, h, opts, pool);
+        let m = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
         debug!(
             path = %path.display(),
             plane,
@@ -377,6 +440,16 @@ mod tests {
         assert!(c.noise_scale_low > 0.0 && c.noise_scale_high > 0.0);
         assert!(m.duration_ms < 60_000);
         assert_eq!(m.min_stars(), c.stars_fitted);
+    }
+
+    #[test]
+    fn seed_source_fast_is_bit_identical_to_measure_plane() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let a = measure_plane(&data, w, h, &opts, None);
+        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
+        assert_eq!(a, b);
+        assert!(a.stars_fitted > 0, "fixture should fit stars: {a:?}");
     }
 
     #[test]
