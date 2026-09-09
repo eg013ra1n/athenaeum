@@ -6,9 +6,12 @@
 //! v2: detection, quad-seeded RANSAC alignment, distortion, QA, the
 //! registered-frame writer). Plan 4 adds `integrate` (the group driver:
 //! configuration, the Auto rejection rule, per-frame normalization and
-//! weights, weighted banded integration per plane).
+//! weights, weighted banded integration per plane) and `master_cards` (the
+//! master-light header, §9.5 file naming, and the master/rejection-map
+//! writers).
 
 pub mod integrate;
+pub mod master_cards;
 pub mod measure;
 pub mod psf_signal;
 pub mod register;

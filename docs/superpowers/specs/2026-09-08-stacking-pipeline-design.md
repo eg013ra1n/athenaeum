@@ -380,14 +380,14 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
 - Master: float32 FITS, 1 or 3 planes (`write_fits_f32`), path
   `<output>/<master name>` (§9.5). Header: copy-through cards from the
   reference frame (object, instrument, filter, dates, Bayer-free, `ROWORDER`),
-  `IMAGETYP = 'MASTER LIGHT'`, `NCOMBINE`, `EXPTIME` = weighted total,
+  `IMAGETYP = 'Master Light'`, `NCOMBINE`, `EXPTIME` = weighted total,
   `DATE-OBS`/`DATE-END` = earliest/latest, the **WCS** of the reference
   frame's plate solve rewritten by the new WCS card writer (CRPIX unchanged —
   the master is in reference geometry; SIP cards when the solve has them),
   and the provenance cards `ATH_STK = 1`, `ATH_STKV` (format version),
   `ATH_STKN` (frames), `ATH_STKR` (recipe string), `ATH_STKW` (weight mode),
   `ATH_STKO` (normalization), `ATH_STKF` (reference frame uuid), `ATH_STKG`
-  (group key), `ATH_STKID` (run id).
+  (group key), `ATH_STKI` (run id; FITS keywords are eight characters).
 - Rejection maps: `<master stem>_rejlow.fits` / `_rejhigh.fits` (optional).
 - **Scanner rule**: a file carrying `ATH_STK` or `ATH_REG` is an Athenaeum
   artifact and is never cataloged, the same one-rule skip as
