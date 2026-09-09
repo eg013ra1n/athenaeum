@@ -848,3 +848,13 @@ pub async fn get_frame_set_merge_log(
     crate::auto_merge::log_ops::get_log_entries(&conn, frames_set_id, limit)
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_effective_exposure_frame_ids(
+    frame_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    athenaeum_core::exposure_versions::get_effective_frame_ids(&state.ctx, frame_ids)
+        .map_err(|e| e.to_string())
+}

@@ -258,14 +258,27 @@ export function useRectangleSelection(
             const pixel = coordinateTransform.skyToPixel(c.ra, c.dec);
             if (!pixel) continue;
             const [px, py] = pixel;
-            if (px >= pixelRect.x1 && px <= pixelRect.x2 &&
-                py >= pixelRect.y1 && py <= pixelRect.y2) {
+            if (
+              px >= pixelRect.x1 &&
+              px <= pixelRect.x2 &&
+              py >= pixelRect.y1 &&
+              py <= pixelRect.y2
+            ) {
               verified.push({ id: c.id, exposure: c.exposure });
             }
           }
-          console.log(`🎯 Verified ${verified.length} frames in pixel rectangle (from ${candidates.count} candidates)`);
+          console.log(
+            `🎯 Verified ${verified.length} frames in pixel rectangle (from ${candidates.count} candidates)`,
+          );
 
-          const totalExposure = verified.reduce((sum, f) => sum + f.exposure, 0);
+          const exposureIds = new Set(
+            await api.invoke<number[]>('get_effective_exposure_frame_ids', {
+              frameIds: verified.map(f => f.id),
+            }),
+          );
+          const totalExposure = verified
+            .filter(f => exposureIds.has(f.id))
+            .reduce((sum, f) => sum + Math.max(0, f.exposure), 0);
           const result: SelectionResult = {
             frameIds: verified.map(f => f.id),
             count: verified.length,

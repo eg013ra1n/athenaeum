@@ -11,6 +11,12 @@ import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useMapViewState } from '../hooks/useMapViewState';
 import { SelectionDialog } from '../components/SelectionDialog';
+import { SkyFieldPanel } from '../components/SkyFieldPanel';
+import { DssBackground } from '../components/DssBackground';
+import { useSkyBackground } from '../hooks/useSkyBackground';
+import { SkyFieldControls } from '../components/SkyFieldControls';
+import { useSkyFieldMetric } from '../hooks/useSkyFieldMetric';
+import { getFieldStyle } from '../utils/skyFieldStyle';
 import { DateRangeFilter, DateParts, toISODateRange } from '../components/DateRangeFilter';
 import '../styles/celestial-overrides.css';
 
@@ -70,6 +76,8 @@ export default function SkyChart() {
   const [error, setError] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [selectedTarget, setSelectedTarget] = useState<string>('');
+  const [inspectedLocation, setInspectedLocation] = useState<ImagingLocation | null>(null);
+  const inspectLocationRef = useRef<((location: ImagingLocation) => void) | null>(null);
 
   // Selection state
   const [drawingMode, setDrawingMode] = useState<DrawingMode>('none');
@@ -107,6 +115,15 @@ export default function SkyChart() {
   const rectangleSelection = useRectangleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const { getViewState, saveViewState } = useMapViewState('skychart_view_state');
 
+  const { metric: fieldMetric, changeMetric, busy: fieldMetricBusy } = useSkyFieldMetric();
+  const fieldMetricRef = useRef(fieldMetric);
+  useEffect(() => {
+    fieldMetricRef.current = fieldMetric;
+  }, [fieldMetric]);
+
+  const { background, changeBackground, busy: backgroundBusy } = useSkyBackground();
+  const [hipsReady, setHipsReady] = useState(false);
+
   const navigate = useNavigate();
   const navigationType = useNavigationType();
 
@@ -141,6 +158,20 @@ export default function SkyChart() {
       return true;
     });
   }, [locations, dateFrom, dateTo]);
+
+  useEffect(() => {
+    setInspectedLocation(current =>
+      current && filteredLocations.includes(current) ? current : null,
+    );
+  }, [filteredLocations]);
+
+  useEffect(() => {
+    inspectLocationRef.current = drawingMode === 'none' ? setInspectedLocation : null;
+    if (drawingMode !== 'none') setInspectedLocation(null);
+    return () => {
+      inspectLocationRef.current = null;
+    };
+  }, [drawingMode]);
 
   // Fetch imaging locations from backend.
   // T1-7 — guard setState against unmount (page can be left within ms of
@@ -219,7 +250,7 @@ export default function SkyChart() {
 
   // Projection scaling helper — reads canvas buffer dimensions directly
   const getCanvasScaling = useCallback(() => {
-    const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
+    const canvas = document.querySelector('#celestial-map > canvas') as HTMLCanvasElement;
     if (!canvas) return { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
 
     const displayRect = canvas.getBoundingClientRect();
@@ -580,16 +611,6 @@ export default function SkyChart() {
     const fourPointedStar = 'M0,-10 L2,-2 L10,0 L2,2 L0,10 L-2,2 L-10,0 L-2,-2 Z';
     const sparkle = 'M0,-6 L1,-1 L6,0 L1,1 L0,6 L-1,1 L-6,0 L-1,-1 Z';
 
-    const getMarkerColor = (locationType: string, isCustom: boolean): string => {
-      if (locationType === 'cluster') return '#22c55e';
-      return isCustom ? '#ef4444' : '#3b82f6';
-    };
-
-    const getMarkerStroke = (locationType: string, isCustom: boolean): string => {
-      if (locationType === 'cluster') return '#16a34a';
-      return isCustom ? '#dc2626' : '#2563eb';
-    };
-
     const getMarkerPath = (locationType: string): string => {
       return locationType === 'cluster' ? sparkle : fourPointedStar;
     };
@@ -601,12 +622,11 @@ export default function SkyChart() {
       isFinite(loc.ra) && isFinite(loc.dec)
     );
 
-    if (validLocs.length === 0) return;
-
-    const features = validLocs.map(loc => ({
+    const features = validLocs.map((loc, locationIndex) => ({
       type: 'Feature',
       id: loc.id,
       properties: {
+        locationIndex,
         name: loc.objectName || 'Unknown',
         objectName: loc.objectName,
         frameCount: loc.frameCount,
@@ -684,8 +704,8 @@ export default function SkyChart() {
           const fovW = d.properties.fovWidth;
           const fovH = d.properties.fovHeight;
 
-          const markerColor = getMarkerColor(d.properties.locationType, d.properties.isCustom);
-          const markerStroke = getMarkerStroke(d.properties.locationType, d.properties.isCustom);
+          const fieldStyle = getFieldStyle(fieldMetricRef.current, d.properties);
+          g.attr('class', `fov-box ${fieldStyle.className}`);
           const markerPath = getMarkerPath(d.properties.locationType);
 
           if (hasFov) {
@@ -719,26 +739,24 @@ export default function SkyChart() {
             // Create retained geometry regardless of the initial projection.
             // Visibility is recalculated below on every redraw.
             initializeSkyFootprint(g, corners);
-            // Keep the existing palette while making geometry recoverable.
-            g.select('.fov-rect').style('fill', markerColor).style('stroke', markerColor);
 
             // Object-name label — hidden by default, positioned + shown by
             // the placement pass in the redraw callback. The pill bg + text
             // are kept in a sibling group so we can move both together with
             // a single transform attribute. The whole label is also a
-            // click target when the box has a frame set, so users can
+            // click target for field inspection, so users can
             // click the readable name instead of hunting for the border.
             const labelG = g.append('g')
               .attr('class', 'fov-label')
-              .style('pointer-events', d.properties.frameSetId ? 'visiblePainted' : 'none')
-              .style('cursor', d.properties.frameSetId ? 'pointer' : 'default')
+              .style('pointer-events', 'visiblePainted')
+              .style('cursor', 'pointer')
               .style('display', 'none');
             labelG.append('rect')
               .attr('class', 'fov-label-bg')
               .attr('rx', 3)
               .attr('ry', 3)
               .style('fill', 'rgba(0,0,0,0.7)')
-              .style('stroke', markerColor)
+              .style('stroke', 'currentColor')
               .style('stroke-width', '1px');
             labelG.append('text')
               .attr('class', 'fov-label-text')
@@ -756,21 +774,39 @@ export default function SkyChart() {
               g.append('path')
                 .attr('d', markerPath)
                 .attr('transform', `translate(${scaledX},${scaledY})`)
-                .style('fill', markerColor)
-                .style('stroke', markerStroke)
+                .style('fill', 'currentColor')
+                .style('stroke', 'currentColor')
                 .style('stroke-width', '2px')
                 .style('pointer-events', 'visiblePainted')
-                .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
+                .style('cursor', 'pointer');
             }
           }
 
           const isVisible = window.Celestial.clip(d.geometry.coordinates);
           g.style('display', isVisible ? null : 'none');
 
-          // Double-click handler navigates to the object detail page.
-          // (Single click is intentionally unused — avoids accidental
-          // navigation when the user is just panning / zooming over a
-          // dense cluster of FOV boxes.) Uses refs so the callback keeps
+          // Inspect on a click, but ignore a drag ending on the same field.
+          // d3 v3 exposes the native event through d3.event.
+          let pointerStart: [number, number] | null = null;
+          g.on('mousedown', function () {
+            const event = d3.event as MouseEvent;
+            pointerStart = [event.clientX, event.clientY];
+          });
+          g.on('click', function () {
+            const event = d3.event as MouseEvent;
+            const start = pointerStart;
+            pointerStart = null;
+            if (
+              event.defaultPrevented ||
+              (start && Math.hypot(event.clientX - start[0], event.clientY - start[1]) > 5)
+            )
+              return;
+            event.stopPropagation();
+            inspectLocationRef.current?.(validLocs[d.properties.locationIndex]);
+          });
+
+          // Double-click still navigates directly to the object detail page.
+          // Uses refs so the callback keeps
           // working across the lifetime of the map without forcing this
           // useCallback to re-run on every navigate identity change.
           //
@@ -798,47 +834,54 @@ export default function SkyChart() {
           // where d3-celestial's zoom handler is bound. d3 v3 passes the
           // bound datum to .on() callbacks (NOT the native event), so the
           // real WheelEvent comes from `d3.event`.
-          g.on('wheel', function() {
-            const evt = d3 && d3.event as WheelEvent | undefined;
-            const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement | null;
+          g.on('wheel', function () {
+            const evt = d3 && (d3.event as WheelEvent | undefined);
+            const canvas = document.querySelector(
+              '#celestial-map > canvas',
+            ) as HTMLCanvasElement | null;
             if (!canvas || !evt) return;
             evt.preventDefault();
             evt.stopPropagation();
-            canvas.dispatchEvent(new WheelEvent('wheel', {
-              bubbles: true,
-              cancelable: true,
-              deltaX: evt.deltaX,
-              deltaY: evt.deltaY,
-              deltaZ: evt.deltaZ,
-              deltaMode: evt.deltaMode,
-              clientX: evt.clientX,
-              clientY: evt.clientY,
-              ctrlKey: evt.ctrlKey,
-              shiftKey: evt.shiftKey,
-              altKey: evt.altKey,
-              metaKey: evt.metaKey,
-            }));
+            canvas.dispatchEvent(
+              new WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                deltaX: evt.deltaX,
+                deltaY: evt.deltaY,
+                deltaZ: evt.deltaZ,
+                deltaMode: evt.deltaMode,
+                clientX: evt.clientX,
+                clientY: evt.clientY,
+                ctrlKey: evt.ctrlKey,
+                shiftKey: evt.shiftKey,
+                altKey: evt.altKey,
+                metaKey: evt.metaKey,
+              }),
+            );
           });
 
           // Tooltip
-          g.append('title')
-            .text(function() {
-              const totalHours = (d.properties.totalExposure / 3600).toFixed(2);
-              let typeLabel = '[Unorganized]';
-              if (d.properties.locationType === 'frameset') {
-                typeLabel = d.properties.isCustom ? '[Custom Frame Set]' : '[Auto Frame Set]';
-              }
-              const cameras = d.properties.cameras ? `\nCameras: ${d.properties.cameras}` : '';
-              const focalLengths = d.properties.focalLengths ? `\nFocal Lengths: ${d.properties.focalLengths}mm` : '';
-              const dates = d.properties.dateRange && d.properties.dateRange[0] && d.properties.dateRange[1]
+          g.append('title').text(function () {
+            const totalHours = (d.properties.totalExposure / 3600).toFixed(2);
+            let typeLabel = '[Unorganized]';
+            if (d.properties.locationType === 'frameset') {
+              typeLabel = d.properties.isCustom ? '[Custom Frame Set]' : '[Auto Frame Set]';
+            }
+            const cameras = d.properties.cameras ? `\nCameras: ${d.properties.cameras}` : '';
+            const focalLengths = d.properties.focalLengths
+              ? `\nFocal Lengths: ${d.properties.focalLengths}mm`
+              : '';
+            const dates =
+              d.properties.dateRange && d.properties.dateRange[0] && d.properties.dateRange[1]
                 ? `\nDates: ${d.properties.dateRange[0].split('T')[0]} to ${d.properties.dateRange[1].split('T')[0]}`
                 : '';
-              const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
-              const displayName = d.properties.name && d.properties.name !== 'Unknown'
+            const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
+            const displayName =
+              d.properties.name && d.properties.name !== 'Unknown'
                 ? d.properties.name
                 : '[No Name]';
-              return `${typeLabel} ${displayName}\nFrames: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
-            });
+            return `${typeLabel} ${displayName}\nExposures: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
+          });
         });
     };
 
@@ -1051,10 +1094,13 @@ export default function SkyChart() {
 
   // Add markers when locations are loaded
   useEffect(() => {
-    if (mapReady && filteredLocations.length > 0 && !loading) {
+    if (mapReady && !loading) {
       addImagingMarkers(filteredLocations);
+      // Marker creation hides labels until the projection's placement pass.
+      // Run it now so a color/filter change does not require a pan to show names.
+      window.Celestial.redraw();
     }
-  }, [filteredLocations, mapReady, loading, addImagingMarkers]);
+  }, [filteredLocations, mapReady, loading, addImagingMarkers, fieldMetric]);
 
   // Target centering handler
   const handleTargetCenter = useCallback((targetId: string) => {
@@ -1165,6 +1211,7 @@ export default function SkyChart() {
         event.preventDefault();
         setDrawingMode('none');
       }
+      if (event.key === 'Escape') setInspectedLocation(null);
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -1255,8 +1302,12 @@ export default function SkyChart() {
                 value: String(val)
               }).catch(console.error);
             }}
-            disabled={!mapReady}
-            title="Limiting magnitude for stars on the chart"
+            disabled={!mapReady || background === 'dss-color'}
+            title={
+              background === 'dss-color'
+                ? 'Star density applies to the original chart; DSS shows the survey stars.'
+                : 'Limiting magnitude for stars on the chart'
+            }
             className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
           >
             <option value="4" title="Stars to magnitude ~4">Stars: Few (mag 4)</option>
@@ -1276,13 +1327,35 @@ export default function SkyChart() {
         </div>
       </div>
 
+      <SkyFieldControls
+        metric={fieldMetric}
+        disabled={!mapReady || fieldMetricBusy}
+        onMetricChange={changeMetric}
+        background={background}
+        backgroundBusy={!mapReady || backgroundBusy}
+        onBackgroundChange={changeBackground}
+      />
+
       {/* Sky Map — always rendered so it can initialize immediately */}
       <div
         id="celestial-map"
+        data-hips-visible={background === 'dss-color' && hipsReady}
         ref={containerRef}
         className="flex-1 w-full overflow-hidden relative"
         style={{ minHeight: 0 }}
       >
+        <DssBackground
+          enabled={background === 'dss-color'}
+          mapReady={mapReady}
+          onReady={setHipsReady}
+        />
+        {inspectedLocation && !error && (
+          <SkyFieldPanel
+            location={inspectedLocation}
+            onClose={() => setInspectedLocation(null)}
+            onOpenObject={frameSetId => navigate(`/objects/${frameSetId}`)}
+          />
+        )}
         {/* Overlays for loading / error / empty states */}
         {error && (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-surface bg-opacity-90">

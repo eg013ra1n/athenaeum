@@ -844,11 +844,24 @@ pub async fn get_frame_set_merge_log(
 ) -> Result<Json<Vec<athenaeum_core::models::MergeLogEntry>>, (StatusCode, String)> {
     let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
-    let entries = athenaeum_core::auto_merge::log_ops::get_log_entries(
-        &conn,
-        args.frames_set_id,
-        args.limit,
-    )
-    .map_err(db_err)?;
+    let entries =
+        athenaeum_core::auto_merge::log_ops::get_log_entries(&conn, args.frames_set_id, args.limit)
+            .map_err(db_err)?;
     Ok(Json(entries))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureIdsArgs {
+    pub frame_ids: Vec<i64>,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_effective_exposure_frame_ids(
+    State(state): State<WebAppState>,
+    Json(args): Json<ExposureIdsArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    athenaeum_core::exposure_versions::get_effective_frame_ids(&state.ctx, args.frame_ids)
+        .map(Json)
+        .map_err(db_err)
 }

@@ -112,6 +112,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Frame sets
         .route("/api/auto_generate_frame_sets", post(frame_sets::auto_generate_frame_sets))
         .route("/api/get_frames_sets", post(frame_sets::get_frames_sets))
+        .route("/api/get_effective_exposure_frame_ids", post(frame_sets::get_effective_exposure_frame_ids))
         .route("/api/get_frame_set_detail", post(frame_sets::get_frame_set_detail))
         .route("/api/delete_frames_set", post(frame_sets::delete_frames_set))
         .route("/api/delete_auto_generated_frame_sets", post(frame_sets::delete_auto_generated_frame_sets))
