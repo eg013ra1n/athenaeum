@@ -879,47 +879,54 @@ export default function SkyChart() {
           // where d3-celestial's zoom handler is bound. d3 v3 passes the
           // bound datum to .on() callbacks (NOT the native event), so the
           // real WheelEvent comes from `d3.event`.
-          g.on('wheel', function() {
-            const evt = d3 && d3.event as WheelEvent | undefined;
-            const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement | null;
+          g.on('wheel', function () {
+            const evt = d3 && (d3.event as WheelEvent | undefined);
+            const canvas = document.querySelector(
+              '#celestial-map canvas',
+            ) as HTMLCanvasElement | null;
             if (!canvas || !evt) return;
             evt.preventDefault();
             evt.stopPropagation();
-            canvas.dispatchEvent(new WheelEvent('wheel', {
-              bubbles: true,
-              cancelable: true,
-              deltaX: evt.deltaX,
-              deltaY: evt.deltaY,
-              deltaZ: evt.deltaZ,
-              deltaMode: evt.deltaMode,
-              clientX: evt.clientX,
-              clientY: evt.clientY,
-              ctrlKey: evt.ctrlKey,
-              shiftKey: evt.shiftKey,
-              altKey: evt.altKey,
-              metaKey: evt.metaKey,
-            }));
+            canvas.dispatchEvent(
+              new WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                deltaX: evt.deltaX,
+                deltaY: evt.deltaY,
+                deltaZ: evt.deltaZ,
+                deltaMode: evt.deltaMode,
+                clientX: evt.clientX,
+                clientY: evt.clientY,
+                ctrlKey: evt.ctrlKey,
+                shiftKey: evt.shiftKey,
+                altKey: evt.altKey,
+                metaKey: evt.metaKey,
+              }),
+            );
           });
 
           // Tooltip
-          g.append('title')
-            .text(function() {
-              const totalHours = (d.properties.totalExposure / 3600).toFixed(2);
-              let typeLabel = '[Unorganized]';
-              if (d.properties.locationType === 'frameset') {
-                typeLabel = d.properties.isCustom ? '[Custom Frame Set]' : '[Auto Frame Set]';
-              }
-              const cameras = d.properties.cameras ? `\nCameras: ${d.properties.cameras}` : '';
-              const focalLengths = d.properties.focalLengths ? `\nFocal Lengths: ${d.properties.focalLengths}mm` : '';
-              const dates = d.properties.dateRange && d.properties.dateRange[0] && d.properties.dateRange[1]
+          g.append('title').text(function () {
+            const totalHours = (d.properties.totalExposure / 3600).toFixed(2);
+            let typeLabel = '[Unorganized]';
+            if (d.properties.locationType === 'frameset') {
+              typeLabel = d.properties.isCustom ? '[Custom Frame Set]' : '[Auto Frame Set]';
+            }
+            const cameras = d.properties.cameras ? `\nCameras: ${d.properties.cameras}` : '';
+            const focalLengths = d.properties.focalLengths
+              ? `\nFocal Lengths: ${d.properties.focalLengths}mm`
+              : '';
+            const dates =
+              d.properties.dateRange && d.properties.dateRange[0] && d.properties.dateRange[1]
                 ? `\nDates: ${d.properties.dateRange[0].split('T')[0]} to ${d.properties.dateRange[1].split('T')[0]}`
                 : '';
-              const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
-              const displayName = d.properties.name && d.properties.name !== 'Unknown'
+            const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
+            const displayName =
+              d.properties.name && d.properties.name !== 'Unknown'
                 ? d.properties.name
                 : '[No Name]';
-              return `${typeLabel} ${displayName}\nFrames: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
-            });
+            return `${typeLabel} ${displayName}\nExposures: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
+          });
         });
     };
 

@@ -84,10 +84,8 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
             AVG(SIN(fr.rotation * 3.14159265358979 / 180.0)) as avg_sin_rot,
             AVG(COS(fr.rotation * 3.14159265358979 / 180.0)) as avg_cos_rot
         FROM frames_set fs
-        JOIN imaging_nights ino ON ino.frames_set_id = fs.id
-        JOIN sessions s ON s.imaging_night_id = ino.id
-        JOIN session_members sm ON sm.session_id = s.id
-        JOIN frames fr ON fr.id = sm.frame_id
+        JOIN exposure_members em ON em.frames_set_id = fs.id
+        JOIN frames fr ON fr.id = em.frame_id
         WHERE fr.ra IS NOT NULL
           AND fr.dec IS NOT NULL
           AND fr.imagetyp = 'Light'
@@ -121,6 +119,7 @@ pub fn get_imaging_locations(conn: &Connection) -> Result<Vec<ImagingLocation>> 
             AVG(SIN(fr.rotation * 3.14159265358979 / 180.0)) as avg_sin_rot,
             AVG(COS(fr.rotation * 3.14159265358979 / 180.0)) as avg_cos_rot
         FROM frames fr
+        JOIN unorganized_exposure_frames ef ON ef.frame_id=fr.id
         WHERE fr.ra IS NOT NULL
           AND fr.dec IS NOT NULL
           AND fr.imagetyp = 'Light'
@@ -299,7 +298,10 @@ pub fn query_frames_in_bounds(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("{}", e))?;
 
-    let total_exposure: f64 = candidates.iter().map(|c| c.exposure).sum();
+    let total_exposure = crate::exposure_versions::exposure_seconds(
+        conn,
+        &candidates.iter().map(|c| c.id).collect::<Vec<_>>(),
+    )?;
     let count = candidates.len();
 
     tracing::debug!(count, ra_wrap_around, "frames in bounds queried");

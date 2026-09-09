@@ -848,3 +848,63 @@ pub async fn get_frame_set_merge_log(
     crate::auto_merge::log_ops::get_log_entries(&conn, frames_set_id, limit)
         .map_err(|e| e.to_string())
 }
+
+/// Resolve eligible frames without starting a second solver outside the shared queue.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_object_plate_solve_frame_ids(
+    frames_set_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    athenaeum_core::api::frame_sets::get_object_plate_solve_frame_ids(&state.ctx, frames_set_ids)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_exposure_version_review(
+    frames_set_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::exposure_versions::VersionReview, String> {
+    athenaeum_core::exposure_versions::get_review(&state.ctx, frames_set_ids)
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn confirm_exposure_version_link(
+    left_id: i64,
+    right_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    athenaeum_core::exposure_versions::confirm_link(&state.ctx, left_id, right_id)
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn unlink_exposure_version(
+    frame_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    athenaeum_core::exposure_versions::unlink_version(&state.ctx, frame_id)
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_processing_stage(
+    frame_id: i64,
+    stage: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    athenaeum_core::exposure_versions::set_stage(&state.ctx, frame_id, stage)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_effective_exposure_frame_ids(
+    frame_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    athenaeum_core::exposure_versions::get_effective_frame_ids(&state.ctx, frame_ids)
+        .map_err(|e| e.to_string())
+}

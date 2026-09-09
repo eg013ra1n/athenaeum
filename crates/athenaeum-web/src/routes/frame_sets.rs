@@ -852,3 +852,86 @@ pub async fn get_frame_set_merge_log(
     .map_err(db_err)?;
     Ok(Json(entries))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectPlateSolveArgs {
+    pub frames_set_ids: Vec<i64>,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_object_plate_solve_frame_ids(
+    State(state): State<WebAppState>,
+    Json(args): Json<ObjectPlateSolveArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    athenaeum_core::api::frame_sets::get_object_plate_solve_frame_ids(
+        &state.ctx,
+        args.frames_set_ids,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionLinkArgs {
+    pub left_id: i64,
+    pub right_id: i64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionFrameArgs {
+    pub frame_id: i64,
+    pub stage: Option<String>,
+}
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_exposure_version_review(
+    State(state): State<WebAppState>,
+    Json(args): Json<ObjectPlateSolveArgs>,
+) -> Result<Json<athenaeum_core::exposure_versions::VersionReview>, (StatusCode, String)> {
+    athenaeum_core::exposure_versions::get_review(&state.ctx, args.frames_set_ids)
+        .map(Json)
+        .map_err(db_err)
+}
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn confirm_exposure_version_link(
+    State(state): State<WebAppState>,
+    Json(args): Json<VersionLinkArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    athenaeum_core::exposure_versions::confirm_link(&state.ctx, args.left_id, args.right_id)
+        .map(Json)
+        .map_err(db_err)
+}
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn unlink_exposure_version(
+    State(state): State<WebAppState>,
+    Json(args): Json<VersionFrameArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    athenaeum_core::exposure_versions::unlink_version(&state.ctx, args.frame_id)
+        .map(Json)
+        .map_err(db_err)
+}
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_processing_stage(
+    State(state): State<WebAppState>,
+    Json(args): Json<VersionFrameArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    athenaeum_core::exposure_versions::set_stage(&state.ctx, args.frame_id, args.stage)
+        .map(Json)
+        .map_err(db_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureIdsArgs {
+    pub frame_ids: Vec<i64>,
+}
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_effective_exposure_frame_ids(
+    State(state): State<WebAppState>,
+    Json(args): Json<ExposureIdsArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    athenaeum_core::exposure_versions::get_effective_frame_ids(&state.ctx, args.frame_ids)
+        .map(Json)
+        .map_err(db_err)
+}

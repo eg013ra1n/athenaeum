@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useRef } from 'react';
 import { FolderOpen, AlertTriangle, Star } from 'lucide-react';
+import { useEffectiveExposures } from '../../hooks/useEffectiveExposures';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
@@ -118,25 +119,38 @@ export function LightsAnalysisTable({
   onSetReference,
   settingReference,
 }: LightsAnalysisTableProps) {
+  const effectiveIds = useEffectiveExposures(
+    frames.map(f => f.frame_id),
+    JSON.stringify(frames.map(f => [f.exptime, f.date_obs, f.camera, f.filter])),
+  );
+  const exposureTotal =
+    effectiveIds === null
+      ? null
+      : frames
+          .filter(f => effectiveIds.has(f.frame_id))
+          .reduce((sum, f) => sum + Math.max(0, f.exptime ?? 0), 0);
   const navigate = useNavigate();
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
-      setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc');
+      setSortDirection(prev => (prev === 'asc' ? 'desc' : 'asc'));
     } else {
       setSortField(field);
       setSortDirection('asc');
     }
   };
 
-  const handleReveal = useCallback((e: React.MouseEvent, path: string) => {
-    e.stopPropagation();
-    navigate('/files', {
-      state: { reveal: { path, token: Date.now() } },
-    });
-  }, [navigate]);
+  const handleReveal = useCallback(
+    (e: React.MouseEvent, path: string) => {
+      e.stopPropagation();
+      navigate('/files', {
+        state: { reveal: { path, token: Date.now() } },
+      });
+    },
+    [navigate],
+  );
 
   // Range-select anchor: the frame last clicked without Shift. Kept as an id and
   // resolved against the current sort order at click time, so a re-sort between
@@ -179,9 +193,6 @@ export function LightsAnalysisTable({
     const sumA = (fn: (a: FrameAnalysis) => number) =>
       analyzed.reduce((acc, f) => acc + fn(analysisData.get(f.frame_id)!), 0);
 
-    const framesWithExp = analyzed.filter(f => f.exptime != null);
-    const exptime = framesWithExp.reduce((acc, f) => acc + f.exptime!, 0);
-
     const withBeta = analyzed.filter(f => analysisData.get(f.frame_id)!.median_beta != null);
     const betaAvg = withBeta.length > 0
       ? withBeta.reduce((acc, f) => acc + (analysisData.get(f.frame_id)!.median_beta ?? 0), 0) / withBeta.length
@@ -189,7 +200,6 @@ export function LightsAnalysisTable({
 
     return {
       count: n,
-      exptime,
       stars: sumA(a => a.stars_detected) / n,
       fwhm: sumA(a => a.median_fwhm) / n,
       eccentricity: sumA(a => a.median_eccentricity) / n,
@@ -272,31 +282,42 @@ export function LightsAnalysisTable({
   // Plain click toggles one row; Shift+click selects (or clears) every row
   // between the anchor and the clicked row in the displayed order, the way the
   // file browser and the blink viewer do.
-  const handleRowSelect = useCallback((frameId: number, e: React.MouseEvent) => {
-    const next = new Set(selectedFrameIds);
-    const anchorIdx = anchorFrameIdRef.current != null
-      ? sortedFrames.findIndex(f => f.frame_id === anchorFrameIdRef.current)
-      : -1;
-    const clickedIdx = sortedFrames.findIndex(f => f.frame_id === frameId);
-    if (e.shiftKey && anchorIdx >= 0 && clickedIdx >= 0) {
-      const lo = Math.min(anchorIdx, clickedIdx);
-      const hi = Math.max(anchorIdx, clickedIdx);
-      // The clicked row decides the direction: selecting if it was unselected.
-      const selecting = !next.has(frameId);
-      for (let i = lo; i <= hi; i++) {
-        if (selecting) next.add(sortedFrames[i].frame_id);
-        else next.delete(sortedFrames[i].frame_id);
+  const handleRowSelect = useCallback(
+    (frameId: number, e: React.MouseEvent) => {
+      const next = new Set(selectedFrameIds);
+      const anchorIdx =
+        anchorFrameIdRef.current != null
+          ? sortedFrames.findIndex(f => f.frame_id === anchorFrameIdRef.current)
+          : -1;
+      const clickedIdx = sortedFrames.findIndex(f => f.frame_id === frameId);
+      if (e.shiftKey && anchorIdx >= 0 && clickedIdx >= 0) {
+        const lo = Math.min(anchorIdx, clickedIdx);
+        const hi = Math.max(anchorIdx, clickedIdx);
+        // The clicked row decides the direction: selecting if it was unselected.
+        const selecting = !next.has(frameId);
+        for (let i = lo; i <= hi; i++) {
+          if (selecting) next.add(sortedFrames[i].frame_id);
+          else next.delete(sortedFrames[i].frame_id);
+        }
+      } else {
+        if (next.has(frameId)) next.delete(frameId);
+        else next.add(frameId);
+        anchorFrameIdRef.current = frameId;
       }
-    } else {
-      if (next.has(frameId)) next.delete(frameId);
-      else next.add(frameId);
-      anchorFrameIdRef.current = frameId;
-    }
-    onSelectionChange(next);
-  }, [selectedFrameIds, sortedFrames, onSelectionChange]);
+      onSelectionChange(next);
+    },
+    [selectedFrameIds, sortedFrames, onSelectionChange],
+  );
 
   return (
     <div>
+      <p className="text-xs text-content-muted py-2">
+        {frames.length} files ·{' '}
+        {effectiveIds === null
+          ? 'Exposure count unavailable'
+          : `${effectiveIds.size} exposures after confirmed links`}
+        . Integration counts exposures once; quality averages describe the analyzed files.
+      </p>
       <table className="w-full" role="table">
         <thead className="bg-surface sticky top-0 z-10">
           <tr>
@@ -305,70 +326,191 @@ export function LightsAnalysisTable({
               <input
                 type="checkbox"
                 checked={allSelected}
-                ref={el => { if (el) el.indeterminate = someSelected; }}
+                ref={el => {
+                  if (el) el.indeterminate = someSelected;
+                }}
                 onChange={toggleAll}
                 className="rounded border-border text-accent focus:ring-accent cursor-pointer"
               />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-left">
-              <SortableHeader field="date" label="Date/Time" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} align="left" />
+              <SortableHeader
+                field="date"
+                label="Date/Time"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                align="left"
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center">
-              <SortableHeader field="camera" label="Camera" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader
+                field="camera"
+                label="Camera"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center">
-              <SortableHeader field="filter" label="Filter" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader
+                field="filter"
+                label="Filter"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center">
-              <SortableHeader field="focallen" label="FL" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader
+                field="focallen"
+                label="FL"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+              />
             </th>
             {/* Exposure group — gold tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-warning/10">
-              <SortableHeader field="exptime" label="Exposure" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? formatTotalExposure(averages.exptime) : undefined} />
+              <SortableHeader
+                field="exptime"
+                label="Exposure"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={exposureTotal === null ? 'Unavailable' : formatTotalExposure(exposureTotal)}
+              />
             </th>
             {/* Image Quality group — frost blue tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-              <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.stars.toFixed(0) : undefined} />
+              <SortableHeader
+                field="stars"
+                label="Stars"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.stars.toFixed(0) : undefined}
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? (plateScale ? (averages.fwhm * plateScale).toFixed(2) : averages.fwhm.toFixed(2)) : undefined} unit={plateScale ? '"' : 'px'} />
+              <SortableHeader
+                field="fwhm"
+                label="FWHM"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={
+                  averages
+                    ? plateScale
+                      ? (averages.fwhm * plateScale).toFixed(2)
+                      : averages.fwhm.toFixed(2)
+                    : undefined
+                }
+                unit={plateScale ? '"' : 'px'}
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-              <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.eccentricity.toFixed(3) : undefined} />
+              <SortableHeader
+                field="eccentricity"
+                label="Eccentricity"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.eccentricity.toFixed(3) : undefined}
+              />
             </th>
             {/* Signal group — green tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.median_snr.toFixed(1) : undefined} />
+              <SortableHeader
+                field="median_snr"
+                label="SNR"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.median_snr.toFixed(1) : undefined}
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="frame_snr" label="Frame SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.frame_snr.toFixed(1) : undefined} unit="dB" />
+              <SortableHeader
+                field="frame_snr"
+                label="Frame SNR"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.frame_snr.toFixed(1) : undefined}
+                unit="dB"
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} unit="ADU" />
+              <SortableHeader
+                field="psf_signal"
+                label="PSF Signal"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.psf_signal.toFixed(1) : undefined}
+                unit="ADU"
+              />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_weight.toFixed(1) : undefined} />
+              <SortableHeader
+                field="snr_weight"
+                label="SNR Weight"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.snr_weight.toFixed(1) : undefined}
+              />
             </th>
             {/* Tracking group — orange tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10">
-              <SortableHeader field="trail" label="Trail R²" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.trail.toFixed(3) : undefined} />
+              <SortableHeader
+                field="trail"
+                label="Trail R²"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+                avg={averages ? averages.trail.toFixed(3) : undefined}
+              />
             </th>
             {/* Beta column — only shown when Moffat data exists */}
             {hasBeta && (
               <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-                <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
+                <SortableHeader
+                  field="beta"
+                  label={`Moffat \u03B2`}
+                  currentSort={sortField}
+                  currentDirection={sortDirection}
+                  onSort={handleSort}
+                  avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined}
+                />
               </th>
             )}
             <th scope="col" className="w-16 px-1.5 py-1.5 text-center">
-              <SortableHeader field="wcs" label="WCS" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader
+                field="wcs"
+                label="WCS"
+                currentSort={sortField}
+                currentDirection={sortDirection}
+                onSort={handleSort}
+              />
             </th>
             {onSetReference && (
               <th scope="col" className="w-16 px-1.5 py-1.5 text-center">
-                <SortableHeader field="reference" label="Reference" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+                <SortableHeader
+                  field="reference"
+                  label="Reference"
+                  currentSort={sortField}
+                  currentDirection={sortDirection}
+                  onSort={handleSort}
+                />
               </th>
             )}
             {!hideLocateColumn && (
-              <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+              <th
+                scope="col"
+                className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary"
+              >
                 Locate
               </th>
             )}

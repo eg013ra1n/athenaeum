@@ -81,6 +81,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
         // Files
         .route("/api/get_files", post(files::get_files))
+        .route("/api/is_existing_directory", post(files::is_existing_directory))
         .route("/api/get_files_by_directory", post(files::get_files_by_directory))
         .route("/api/get_directory_contents", post(files::get_directory_contents))
         .route("/api/get_camera_directories", post(files::get_camera_directories))
@@ -111,7 +112,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_blink_threads", post(settings::set_blink_threads))
         // Frame sets
         .route("/api/auto_generate_frame_sets", post(frame_sets::auto_generate_frame_sets))
+        .route("/api/get_exposure_version_review", post(frame_sets::get_exposure_version_review))
+        .route("/api/get_effective_exposure_frame_ids", post(frame_sets::get_effective_exposure_frame_ids))
+        .route("/api/confirm_exposure_version_link", post(frame_sets::confirm_exposure_version_link))
+        .route("/api/unlink_exposure_version", post(frame_sets::unlink_exposure_version))
+        .route("/api/set_processing_stage", post(frame_sets::set_processing_stage))
         .route("/api/get_frames_sets", post(frame_sets::get_frames_sets))
+        .route("/api/get_object_plate_solve_frame_ids", post(frame_sets::get_object_plate_solve_frame_ids))
         .route("/api/get_frame_set_detail", post(frame_sets::get_frame_set_detail))
         .route("/api/delete_frames_set", post(frame_sets::delete_frames_set))
         .route("/api/delete_auto_generated_frame_sets", post(frame_sets::delete_auto_generated_frame_sets))

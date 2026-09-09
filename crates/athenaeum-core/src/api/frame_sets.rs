@@ -15,6 +15,40 @@ use crate::services::ServiceContext;
 use crate::sessions::RederiveSummary;
 use rusqlite::{Connection, OptionalExtension};
 
+/// Resolve selected object membership to unique LIGHT frame IDs for the existing
+/// solver queue. Coordinates and previous solve results do not restrict eligibility:
+/// this action also repairs inaccurate WCS. Known-missing files are excluded; files
+/// disappearing after this snapshot are reported by the solver per frame.
+pub fn get_object_plate_solve_frame_ids(
+    ctx: &ServiceContext,
+    frames_set_ids: Vec<i64>,
+) -> Result<Vec<i64>> {
+    let db = ctx
+        .db
+        .get()
+        .ok_or_else(|| anyhow!("Database not initialized"))?;
+    object_plate_solve_frame_ids(&db.conn(), &frames_set_ids)
+}
+
+fn object_plate_solve_frame_ids(conn: &Connection, frames_set_ids: &[i64]) -> Result<Vec<i64>> {
+    // One JSON parameter avoids SQLite's variable limit for Select All.
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT f.id FROM session_members sm
+         JOIN sessions s ON s.id = sm.session_id
+         JOIN imaging_nights n ON n.id = s.imaging_night_id
+         JOIN frames f ON f.id = sm.frame_id
+         JOIN files fi ON fi.id = f.file_id
+         WHERE n.frames_set_id IN (SELECT value FROM json_each(?1))
+           AND UPPER(f.imagetyp) = 'LIGHT'
+           AND NOT EXISTS (SELECT 1 FROM missing_files m WHERE m.file_id = fi.id AND m.status = 'missing')
+         ORDER BY f.id"
+    )?;
+    let ids = stmt
+        .query_map([serde_json::to_string(frames_set_ids)?], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
 /// `is_custom` of a frame set, or an error naming the id when there is no
 /// such set.
 fn frame_set_is_custom(conn: &Connection, frames_set_id: i64) -> Result<bool> {
@@ -314,6 +348,43 @@ mod tests {
         let night_id = db::create_imaging_night(conn, set_id, start, end).unwrap();
         let session_id = db::create_session(conn, night_id, "CamA", ids.len() as i32, None).unwrap();
         db::insert_session_members(conn, session_id, ids).unwrap();
+    }
+
+    #[test]
+    fn object_plate_solve_resolves_distinct_lights_including_existing_coordinates() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = ctx.db.get().unwrap().conn();
+        for id in 1..=5 {
+            seed_light_at(&conn, id, "2026-01-01T20:00:00");
+        }
+        // Frame/file identity must not be confused, and coordinates must not
+        // exclude a frame that the user wants to solve again.
+        conn.execute(
+            "UPDATE frames SET id = 101, ra = 83.0, dec = -5.0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE frames SET imagetyp = 'Dark' WHERE id = 3", [])
+            .unwrap();
+        seed_set_with_night(&conn, 10, "2026-01-01", "2026-01-02", &[101, 2, 3, 4]);
+        seed_set_with_night(&conn, 20, "2026-01-01", "2026-01-02", &[101, 2]);
+        seed_set_with_night(&conn, 30, "2026-01-01", "2026-01-02", &[5]);
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, '/t')", [])
+            .unwrap();
+        conn.execute("INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at) VALUES (4, 1, '2026-01-01', '2026-01-01')", []).unwrap();
+        assert_eq!(
+            object_plate_solve_frame_ids(&conn, &[20, 10, 10, 999]).unwrap(),
+            vec![2, 101]
+        );
+        assert!(object_plate_solve_frame_ids(&conn, &[]).unwrap().is_empty());
+        assert!(object_plate_solve_frame_ids(&conn, &[999])
+            .unwrap()
+            .is_empty());
+        // Select All must not hit SQLite's bound-variable limit.
+        assert_eq!(
+            object_plate_solve_frame_ids(&conn, &vec![10; 40_000]).unwrap(),
+            vec![2, 101]
+        );
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
