@@ -61,7 +61,8 @@ fingerprint test).
 
 | # | Stage | Input → output | Reused when |
 | ---- | ---- | ---- | ---- |
-| 0 | Plan | set + config → groups, gate blockers, disk estimate | never (cheap, pure DB) |
+| 0 | Plan | set + config → groups, gate blockers, disk estimate, the masters the run will build | never (cheap, pure DB) |
+| 0.5 | Masters | (owner requirement 2026-09-09) every linked raw calibration set without a built master is built, and every built master whose file is missing from disk is rebuilt from its provenance, inside the run, in dependency order (bias/darkflat → dark → flat), through the master library's own builder under the run's queue permit; the plan lists them (`mastersToBuild`) instead of blocking; a set that cannot be built (raw frames not on disk, no provenance) stays a blocker with the export wording | a built master whose file is on disk |
 | 1 | Calibrate | raw light + linked masters → `calibrated/<group>/c_<stem>.fits` (mono: 1 plane; OSC: VNG-debayered, 3 planes) | artifact row exists, spec hash matches, file present |
 | 2 | Debayer | folded into stage 1 for OSC groups (the generator debayers before writing); shown as its own row, whose status and progress mirror stage 1 for the OSC groups, so the user sees it | with stage 1 |
 | 3 | Measure & select | calibrated frame → metrics, weight, included/excluded | metrics cached for (artifact, measurement config hash) |
@@ -82,10 +83,16 @@ normalization; users who want HDR-separate masters turn the split on.
 
 **Gate** (stage 0, the one gate for the Run button and for `start_stacking`):
 
-- `check_mode_ready(calibratedLights)` from the export gate, unchanged: every
-  linked calibration set is a built master, every light has at least one link,
-  every master file is on disk. Blockers keep the export wording and the
-  `→ Coverage` deep link.
+- `check_mode_ready(calibratedLights)` from the export gate, **reinterpreted
+  since 2026-09-09 (owner requirement — the pipeline builds its own
+  masters):** every light has at least one link (else the `links` blocker,
+  export wording, `→ Coverage`); a linked raw calibration set without a
+  built master becomes planned work (`mastersToBuild`, kind `build`) when
+  its frames are on disk, and a blocker (`masters`, "restore from archive
+  first" / "N raw frames missing") when they are not; a built master whose
+  file is missing becomes planned work (kind `rebuild`) when its
+  `master_provenance` row exists and its source frames are on disk, and the
+  `masterFiles` blocker otherwise. Stage 0.5 executes the list.
 - The reference frame (manual or auto) is on disk.
 - Working and output folders validate (§9.4) and free space ≥ the estimate.
 - At least 3 included frames in at least one group.
@@ -644,8 +651,9 @@ stacking-complete { runId, setId, success, cancelled, error: string|null,
                     warnings: string[], masters: [{ groupKey, path, drizzlePath: string|null }] }
 ```
 
-`stage` ∈ `calibrate | measure | reference | register | normalize | integrate
-| drizzle | output`. Web mirrors via `SseProgressEmitter`. The frontend
+`stage` ∈ `masters | calibrate | measure | reference | register | normalize |
+integrate | drizzle | output` (`masters` since 2026-09-09, stage 0.5). Web
+mirrors via `SseProgressEmitter`. The frontend
 listens with the cancelled-flag pattern and notifies once per run
 (`kind: 'stacking'`, `dedupeKey: 'stack-<runId>'`).
 

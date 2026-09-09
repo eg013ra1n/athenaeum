@@ -210,6 +210,41 @@ Presets: the toolbar selector lists Default / Fast preview / Maximum quality / C
 
 ---
 
+### Task 8: Stage 0.5 — the run builds or rebuilds its own masters (owner requirement 2026-09-09; executes after Task 5, before Tasks 6–7)
+
+**Why:** the owner's rule — "the pipeline should build the calibration masters itself when they are missing" — and the honest acceptance run: on this machine the catalog links 11 built masters whose files are gone from `/Volumes/bigbase3/Calibration/` while their `master_provenance` rows and source frames exist. Spec §2 (stage 0.5 + the reinterpreted gate) and §10.2 (`stage` gains `masters`) were amended in the same commit as this task's text.
+
+**Files:**
+- Modify: `crates/athenaeum-core/src/api/masters.rs` (admission parameter on `run_build`), `crates/athenaeum-core/src/api/lights.rs` (readiness gains the buildable/rebuildable split), `crates/athenaeum-core/src/stacking/plan.rs` (`Stage::Masters`, `PlanMaster`, `StackingPlan.masters_to_build`, the gate), `crates/athenaeum-core/src/stacking/run.rs` (stage 0.5), `crates/athenaeum-core/src/stacking/provenance.rs` (`RunSummary.masters_built`), `ts_export.rs` + regenerated `src/types/stacking.ts`, `src/components/stacking/stageSummary.ts` + `PipelineBoard.tsx` (row `0 · Masters`), `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md` (fields if new)
+
+**Interfaces:**
+
+```rust
+// api/masters.rs
+pub(crate) enum Admission { Acquire /* today's behaviour: run_build takes its own ComputeQueue permit */, Inherited /* the caller already holds a permit — never acquire */ }
+// run_build(.., admission: Admission) — start_master_build/rebuild_master pass Acquire; the stacking run passes Inherited
+pub(crate) fn build_master_inline(ctx: &ServiceContext, emitter: &dyn ProgressEmitter, app_version: &str, set_id: i64, target: BuildTarget, cancel: &AtomicBool) -> Result<(i64 /* master set id */, Option<String> /* warning */), BuildStepError>;
+    // = validate + resolve_recipe (Auto) + run_build(.., Inherited) + register/rebuild, NO thread, NO handle in active_master_builds (the stacking handle owns cancel), NO master-build-complete event (the stacking progress carries it)
+// api/lights.rs — ExportReadiness gains: raw_sets_buildable: Vec<i64>, raw_sets_unbuildable: Vec<(i64, String /* reason */)>, masters_rebuildable: Vec<i64 /* master set id */>, masters_unrebuildable: Vec<(i64, String)>
+//   buildable = every frame of the raw set on disk (files.path exists) and ≥ MIN_MASTER_FRAMES; rebuildable = master_provenance row + check_rebuild_source_ready Ok
+// plan.rs
+pub enum Stage { Masters, Calibrate, … }                 // first; TS union gains "masters" first
+#[derive(…TS)] pub struct PlanMaster { pub set_id: i64, pub kind: MasterWork /* Build | Rebuild */, pub imagetyp: String, pub frame_count: i64, pub label: String /* e.g. "Dark 180 s −10 °C ATR2600M" from the set's own naming helper */ }
+pub struct StackingPlan { …, pub masters_to_build: Vec<PlanMaster>, … }
+//   gate: `links` blocker as before; `masters` blocker ONLY for raw_sets_unbuildable (message "Build masters first — N sets cannot be built: <first reason>"); `masterFiles` blocker ONLY for masters_unrebuildable; buildable/rebuildable sets → masters_to_build sorted by type_build_rank then id
+// run.rs — stage 0.5 `stage_masters`: for each PlanMaster in order → progress { stage: Masters, current, total, message: label } → build_master_inline; a failure is RunError::Other("master build failed for set <id>: <e>") (the run cannot calibrate without it); cancel between builds; the stage-1 hash inputs (resolved master paths + their size/mtime) naturally see the new files, so calibrated artifacts of a rebuilt master are stale — by design
+// provenance.rs — RunSummary.masters_built: Vec<{ set_id, kind, master_set_id, path, duration_ms }>
+```
+
+Frontend: `BoardStage` gains `'masters'` as row `0 · Masters` (state `off` when `plan.mastersToBuild` is empty and no blocker, `ready` with the summary "N to build, M to rebuild" otherwise; `running` from the events); `stageSummary('masters', config)` lists the plan's masters (this row's summary is the one exception to "pure function of the config" — it takes the plan; document it).
+
+- [ ] **Step 1: Failing tests** — `api/masters.rs`: `run_build` with `Admission::Inherited` never calls `compute_queue.acquire` (a queue with `max_concurrent 1` held by the test's own permit does not block the build); `api/lights.rs`: readiness splits a raw set with all frames on disk (buildable) from one with a missing frame (unbuildable, reason names the count), and a built master with a missing file + provenance (rebuildable) from one without provenance (unrebuildable); `plan.rs`: a fixture with a raw linked set → `masters_to_build == [Build]`, no `masters` blocker; a master with a missing file + provenance → `[Rebuild]`, no `masterFiles` blocker; no provenance → the blocker; `run.rs`: the Task 6/7 fixture with its masters DELETED from disk (provenance rows added by the fixture — extend `add_master_dark_and_flat` to write `master_provenance` rows the way `register_master` does) → a full run rebuilds both masters into the library paths, then calibrates and finishes `done`; progress shows `masters 2/2` before `calibrate`; the summary lists two `masters_built`.
+- [ ] **Step 2:** implement → PASS; regenerate `stacking.ts`; the board row; `npx tsc --noEmit`, `npm run build`.
+- [ ] **Step 3: Gates** — `cargo test -p athenaeum-core --lib api::masters`, `api::lights`, `stacking`, `api::stacking`; `cargo test -p athenaeum-web`; workspace + headless checks; `ts_contract`; tsc; build.
+- [ ] **Step 4: Commit** `feat(stacking): the run builds or rebuilds missing masters (stage 0.5) — plan lists them, gate blocks only what cannot be built`.
+
+**Ruling 11 (added 2026-09-09):** the acceptance run (Task 7) starts with the masters folder as it is — empty — and the run's stage 0.5 rebuilds the 11 masters; that is the honest demonstration the owner asked for. Manual rebuilding through the masters API is the fallback only if this task fails to land.
+
 ## Self-review (done while writing)
 
 **Spec coverage.** §11 structure, components, prefs, hook/context, notifications, Settings section, removal list (Tasks 2–6); §10.1 retirement (Task 6) and the presets addition (Task 1, ruling 1); §10.2 events consumed with the cancelled-flag pattern (Task 2); §9.4 folder picking (Tasks 3, 5; scope check Task 1); §12 web parity (the smokes run on the web build); §13 acceptance (Task 7); §14 items 12–14 (Tasks 2–7). Not here by design: M2/M3 panels are rendered disabled; a frontend test runner (ruling 5); master thumbnails (M4).
