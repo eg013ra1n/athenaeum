@@ -103,4 +103,3 @@ test('desktop preflight prevents reveal on missing paths and opening files as fo
   await folder.openPath('/night');
   assert.deepEqual(folder.calls.at(-1), ['open', '/night']);
 });
-

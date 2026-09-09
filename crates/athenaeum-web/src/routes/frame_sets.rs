@@ -852,3 +852,22 @@ pub async fn get_frame_set_merge_log(
     .map_err(db_err)?;
     Ok(Json(entries))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectPlateSolveArgs {
+    pub frames_set_ids: Vec<i64>,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_object_plate_solve_frame_ids(
+    State(state): State<WebAppState>,
+    Json(args): Json<ObjectPlateSolveArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    athenaeum_core::api::frame_sets::get_object_plate_solve_frame_ids(
+        &state.ctx,
+        args.frames_set_ids,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}

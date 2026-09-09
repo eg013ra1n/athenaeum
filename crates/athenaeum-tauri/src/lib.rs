@@ -285,6 +285,7 @@ pub fn run() {
             commands::get_blink_threads_max,
             commands::auto_generate_frame_sets,
             commands::get_frames_sets,
+            commands::get_object_plate_solve_frame_ids,
             commands::delete_frames_set,
             commands::delete_auto_generated_frame_sets,
             commands::rename_frames_set,

@@ -9,6 +9,8 @@ type SortDirection = 'asc' | 'desc';
 
 interface ObjectsTableViewProps {
   frameSets: FramesSetWithCount[];
+  selectedIds: number[];
+  onToggleSelection: (id: number) => void;
   activeTab: ObjectsTab;
   isMergeMode: boolean;
   isDragging: boolean;
@@ -29,6 +31,8 @@ interface ObjectsTableViewProps {
 
 export function ObjectsTableView({
   frameSets,
+  selectedIds,
+  onToggleSelection,
   activeTab,
   isMergeMode,
   isDragging,
@@ -119,6 +123,7 @@ export function ObjectsTableView({
       <table className="w-full text-sm">
         <thead className="bg-surface">
           <tr>
+            <th className="px-2 py-1.5 text-xs text-content-muted">Select</th>
             <th className={headerClass} onClick={() => handleSort('name')}>
               Name <SortIcon field="name" />
             </th>
@@ -168,30 +173,48 @@ export function ObjectsTableView({
                   hover:bg-surface-hover/50 transition-colors
                 `}
               >
+                <td className="px-2 py-1.5" onMouseDown={e => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.includes(frames_set.id!)}
+                    disabled={isMergeMode}
+                    onChange={() => onToggleSelection(frames_set.id!)}
+                    aria-label={`Select ${frames_set.name || 'Untitled'} (object ${frames_set.id})`}
+                    className="accent-accent"
+                  />
+                </td>
                 {/* Name */}
-                <td className={`px-2 py-1.5 border-l-4 ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`}>
+                <td
+                  className={`px-2 py-1.5 border-l-4 ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`}
+                >
                   {editingSetId === frames_set.id ? (
                     <div className="flex items-center gap-1">
                       <input
                         type="text"
                         value={editingName}
-                        onChange={(e) => onEditingNameChange(e.target.value)}
-                        onKeyDown={(e) => {
+                        onChange={e => onEditingNameChange(e.target.value)}
+                        onKeyDown={e => {
                           if (e.key === 'Enter') onSaveRename(frames_set.id!);
                           else if (e.key === 'Escape') onCancelEditing();
                         }}
                         className="flex-1 px-1.5 py-0.5 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent text-sm"
                         autoFocus
-                        onClick={(e) => e.stopPropagation()}
+                        onClick={e => e.stopPropagation()}
                       />
                       <button
-                        onClick={(e) => { e.stopPropagation(); onSaveRename(frames_set.id!); }}
+                        onClick={e => {
+                          e.stopPropagation();
+                          onSaveRename(frames_set.id!);
+                        }}
                         className="p-0.5 text-success hover:text-success/80"
                       >
                         <Check size={13} />
                       </button>
                       <button
-                        onClick={(e) => { e.stopPropagation(); onCancelEditing(); }}
+                        onClick={e => {
+                          e.stopPropagation();
+                          onCancelEditing();
+                        }}
                         className="p-0.5 text-error hover:text-error/80"
                       >
                         <X size={13} />
