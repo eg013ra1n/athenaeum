@@ -6,6 +6,7 @@
 //! the run orchestration. Coordinates are 0-based pixel centres;
 //! `PixelMap::forward` maps subject → reference.
 
+pub mod align;
 pub mod detect;
 
 use serde::{Deserialize, Serialize};
