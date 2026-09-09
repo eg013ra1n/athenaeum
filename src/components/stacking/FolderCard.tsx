@@ -18,6 +18,19 @@ export interface FolderCardProps {
 }
 
 export function FolderCard({ title, hint, setting, onChoose, onReset, error, busy }: FolderCardProps) {
+  // `setting.default` is a real fallback path for Transfers' own folders,
+  // but the Stacking global-folder cards (Settings → Stacking) have no
+  // further fallback beyond themselves — the backend always reports
+  // `default: ""` there (`api::stacking::get_stacking_paths`). Task 5 fix
+  // round 1, Minor #3: an overridden folder with nothing to fall back to
+  // reads "no default" rather than the broken-looking "Default: " with
+  // nothing after the colon.
+  const defaultText = setting.configured
+    ? setting.default
+      ? `Default: ${setting.default}`
+      : 'no default'
+    : 'Default location';
+
   return (
     <div className="rounded-lg border border-border bg-surface p-3">
       <div className="flex items-center justify-between gap-3">
@@ -32,7 +45,7 @@ export function FolderCard({ title, hint, setting, onChoose, onReset, error, bus
         {setting.effective}
       </p>
       <p className="mt-1 text-[11px] text-content-muted">
-        {setting.configured ? `Default: ${setting.default}` : 'Default location'} · {hint}
+        {defaultText} · {hint}
       </p>
       {error && <p className="mt-1 text-[11px] text-error">{error}</p>}
       <div className="mt-2 flex items-center gap-2">

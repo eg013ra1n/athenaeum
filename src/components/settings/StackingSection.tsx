@@ -29,6 +29,27 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Which card a `set_stacking_paths` error belongs under. Task 5 fix round
+ *  1, Important #1: error routing is prefix-only by default — the pair-rule
+ *  messages ("working and output folders must differ", "the working folder
+ *  may not sit inside the output folder") and any other non-prefixed
+ *  message carry no folder name at all, so before this fix they always fell
+ *  through to the "not working-prefixed → output" branch regardless of
+ *  which card the user actually touched. Now: a message that explicitly
+ *  names ONE folder (`"Stacking working/output folder: …"`,
+ *  `crates/athenaeum-core/src/api/sync.rs::validate_transfer_dir`) always
+ *  routes there — that is the more specific, more correct answer whichever
+ *  card was clicked; anything else (the pair-rule messages, or any
+ *  unprefixed message) routes to whichever card the user actually touched. */
+function routeFolderError(
+  msg: string,
+  touched: 'working' | 'output',
+): { working: string | null; output: string | null } {
+  if (msg.startsWith('Stacking working folder')) return { working: msg, output: null };
+  if (msg.startsWith('Stacking output folder')) return { working: null, output: msg };
+  return touched === 'working' ? { working: msg, output: null } : { working: null, output: msg };
+}
+
 // The nine board stages (Task 3's `StageInspector` switch) — the `masters`
 // stage does not exist yet (Task 8 adds it). Same order as `StackingTab`'s
 // own `STAGE_LABEL`/board.
@@ -195,8 +216,14 @@ export default function StackingSection() {
     // stays `null`/`null` here, unlike `StackingTab`'s draft) — every
     // built-in preset already carries `paths: null/null` itself
     // (`preset()` starts from `StackingConfig::default()`), so applying one
-    // verbatim is correct.
-    setUserConfig(presets[preset]);
+    // verbatim is correct. Fix round 1, Minor #5: `presets[preset]` is the
+    // SAME object every time this is called (`presets` state, fetched
+    // once) — assigning it straight to `config` would alias it, so a later
+    // in-place mutation of the draft (none of this file's own code does
+    // that, but every panel's `onChange` receives whatever object `config`
+    // currently is) could corrupt the built-in preset a second "apply"
+    // would read from. Clone before it becomes the draft.
+    setUserConfig(structuredClone(presets[preset]));
   }, [presets, setUserConfig]);
 
   const handleResetClick = useCallback(() => {
@@ -241,12 +268,30 @@ export default function StackingSection() {
   // below always resends both, resolving `undefined` (not touched) to the
   // current `configured` value — the exact pattern `TransfersSection.tsx`'s
   // own `applyPaths` already uses for the identical full-replace contract on
-  // `set_transfer_paths`.
+  // `set_transfer_paths`. `touched` names which CARD the caller is acting
+  // on (Task 5 fix round 1, Important #1) — used only for error routing
+  // (`routeFolderError` above), never for the request payload itself, since
+  // both folders always travel together regardless of which one changed.
   const applyPaths = useCallback(async (
+    touched: 'working' | 'output',
     working: string | null | undefined,
     output: string | null | undefined,
   ) => {
-    if (!paths) return;
+    if (!paths) {
+      // Fix round 1, Minor #4: a silent return here (the folders haven't
+      // loaded yet, or `refreshPaths` failed) used to drop the user's
+      // action on the floor with no trace — log and warn like every other
+      // failure path in this file, never swallow.
+      console.error('[StackingSection] applyPaths called before paths loaded');
+      notify({
+        tone: 'warning',
+        kind: 'stacking',
+        toast: true,
+        title: 'Stacking folder not saved',
+        detail: 'The current folders have not finished loading — try again in a moment.',
+      });
+      return;
+    }
     setSavingPaths(true);
     setPathError({ working: null, output: null });
     try {
@@ -257,27 +302,21 @@ export default function StackingSection() {
       setPaths(next);
     } catch (err) {
       console.error('[StackingSection] set_stacking_paths failed:', err);
-      const msg = errMsg(err);
-      setPathError(
-        msg.startsWith('Stacking working folder')
-          ? { working: msg, output: null }
-          : { working: null, output: msg },
-      );
+      setPathError(routeFolderError(errMsg(err), touched));
     } finally {
       setSavingPaths(false);
     }
-  }, [paths]);
+  }, [paths, notify]);
 
   const choose = useCallback(async (which: 'working' | 'output') => {
     if (isTauri) {
       try {
         const picked = await pickDirectory();
         if (!picked) return;
-        await applyPaths(which === 'working' ? picked : undefined, which === 'output' ? picked : undefined);
+        await applyPaths(which, which === 'working' ? picked : undefined, which === 'output' ? picked : undefined);
       } catch (err) {
         console.error('[StackingSection] folder picker failed:', err);
-        const msg = errMsg(err);
-        setPathError(which === 'working' ? { working: msg, output: null } : { working: null, output: msg });
+        setPathError(routeFolderError(errMsg(err), which));
       }
     } else {
       setBrowsing(which);
@@ -385,6 +424,9 @@ export default function StackingSection() {
       {/* Default folders: what a frame set with no override falls back to. */}
       <div>
         <h4 className="text-sm font-medium text-content-secondary mb-2">Default folders</h4>
+        <p className="text-xs text-content-muted mb-2">
+          Both folders are saved together — an unavailable folder on the other card fails the save.
+        </p>
         <div className="space-y-3">
           {paths && (
             <>
@@ -393,7 +435,7 @@ export default function StackingSection() {
                 hint="Where a stacking run stages registered/intermediate frames, unless a frame set overrides it."
                 setting={paths.working}
                 onChoose={() => choose('working')}
-                onReset={() => applyPaths(null, undefined)}
+                onReset={() => applyPaths('working', null, undefined)}
                 error={pathError.working}
                 busy={savingPaths}
               />
@@ -402,7 +444,7 @@ export default function StackingSection() {
                 hint="Where a stacking run writes its master(s), unless a frame set overrides it."
                 setting={paths.output}
                 onChoose={() => choose('output')}
-                onReset={() => applyPaths(undefined, null)}
+                onReset={() => applyPaths('output', undefined, null)}
                 error={pathError.output}
                 busy={savingPaths}
               />
@@ -434,7 +476,7 @@ export default function StackingSection() {
             console.error('[StackingSection] folder selected with no target — dropping', path);
             return;
           }
-          void applyPaths(which === 'working' ? path : undefined, which === 'output' ? path : undefined);
+          void applyPaths(which, which === 'working' ? path : undefined, which === 'output' ? path : undefined);
         }}
         onClose={() => setBrowsing(null)}
       />
