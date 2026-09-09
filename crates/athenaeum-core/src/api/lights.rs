@@ -329,49 +329,37 @@ pub(crate) fn compute_export_readiness(
     // touched here — its pre-calibration master is not read again by anyone,
     // which keeps `missing_master_files` meaning exactly "files the next
     // calibration or rebuild would read".
-    let initial_missing: Vec<(PathBuf, i64)> = missing_masters
-        .iter()
-        .map(|(p, &id)| (p.clone(), id))
-        .collect();
-    for (_, master_set_id) in &initial_missing {
-        let imagetyp: String = conn.query_row(
-            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
-            params![master_set_id],
-            |r| r.get(0),
-        )?;
-        if imagetyp != "MasterFlat" {
-            continue;
-        }
-        let Some(prov) = crate::db::master_provenance::get(conn, *master_set_id).map_err(|e| {
-            ApiError::Internal(format!("read master provenance {master_set_id}: {e:#}"))
-        })?
-        else {
-            continue;
-        };
-        let Some(source_set_id) = prov.source_set_id else {
-            continue;
-        };
-        let source_exptime: Option<f64> = conn.query_row(
-            "SELECT exptime FROM calibration_set WHERE id = ?1",
-            params![source_set_id],
-            |r| r.get(0),
-        )?;
-        let sel =
-            crate::api::masters::select_flat_precal(conn, source_set_id, source_exptime, None)?;
-        if let crate::api::masters::PrecalChoice::Master {
-            set_id: precal_set_id,
-            path: precal_path,
-            ..
-        } = sel.choice
-        {
-            let precal_path = PathBuf::from(precal_path);
-            let already_known = missing_masters.contains_key(&precal_path);
-            if !already_known && std::fs::metadata(&precal_path).is_err() {
+    //
+    // Fix round 1: only the SET IDS need to survive the loop below (the
+    // path is only ever used to key `missing_masters`, which is already
+    // owned) — collecting `PathBuf`s here just to bind them as `_` in the
+    // loop was dead cloning.
+    let initial_missing_ids: Vec<i64> = missing_masters.values().copied().collect();
+    for master_set_id in initial_missing_ids {
+        // Fix round 1 (Important finding): a broken row anywhere in this
+        // resolution (a master shell with no `calibration_set_frames`
+        // member, for instance — `select_flat_precal`'s own path lookup then
+        // returns `QueryReturnedNoRows`) must not fail the whole readiness
+        // call; the rebuildability loop right below already degrades this
+        // way, so this pass must too. Degrade to a warning and move on — the
+        // flat itself stays the only listed missing master.
+        match precal_master_for_missing_flat(conn, master_set_id) {
+            Ok(Some((precal_path, precal_set_id))) => {
+                if !missing_masters.contains_key(&precal_path) {
+                    tracing::warn!(
+                        path = %precal_path.display(),
+                        "pre-calibration master file missing on disk"
+                    );
+                    missing_masters.insert(precal_path, precal_set_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
                 tracing::warn!(
-                    path = %precal_path.display(),
-                    "pre-calibration master file missing on disk"
+                    master_set_id,
+                    %error,
+                    "stacking: could not resolve a missing flat master's pre-calibration master; listing the flat only"
                 );
-                missing_masters.insert(precal_path, precal_set_id);
             }
         }
     }
@@ -552,6 +540,63 @@ fn classify_master_rebuildability(
     match crate::api::masters::check_rebuild_source_ready(conn, source_set_id) {
         Ok(()) => Ok(None),
         Err(e) => Ok(Some(e.to_string())),
+    }
+}
+
+/// Task 8b fix round 1: the per-master body of the transitive precal pass,
+/// factored out so `compute_export_readiness`'s loop can catch a broken row
+/// (a master shell with no `calibration_set_frames` member, for instance)
+/// and degrade to a warning instead of failing the whole readiness call —
+/// mirroring [`classify_master_rebuildability`]'s own `Result` shape one
+/// call site below.
+///
+/// `Ok(None)`: `master_set_id` isn't a `MasterFlat`, has no
+/// `master_provenance` row (or one with no `source_set_id`), or its
+/// [`crate::api::masters::select_flat_precal`] choice isn't a built master,
+/// or that master's file is already on disk — nothing to add. `Ok(Some((path,
+/// set_id)))`: the pre-calibration master `select_flat_precal` would pick is
+/// ALSO missing from disk. `Err`: a DB read failed partway through — the
+/// caller's to degrade, never propagated further.
+fn precal_master_for_missing_flat(
+    conn: &Connection,
+    master_set_id: i64,
+) -> Result<Option<(PathBuf, i64)>, ApiError> {
+    let imagetyp: String = conn.query_row(
+        "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+        params![master_set_id],
+        |r| r.get(0),
+    )?;
+    if imagetyp != "MasterFlat" {
+        return Ok(None);
+    }
+    let Some(prov) = crate::db::master_provenance::get(conn, master_set_id).map_err(|e| {
+        ApiError::Internal(format!("read master provenance {master_set_id}: {e:#}"))
+    })?
+    else {
+        return Ok(None);
+    };
+    let Some(source_set_id) = prov.source_set_id else {
+        return Ok(None);
+    };
+    let source_exptime: Option<f64> = conn.query_row(
+        "SELECT exptime FROM calibration_set WHERE id = ?1",
+        params![source_set_id],
+        |r| r.get(0),
+    )?;
+    let sel = crate::api::masters::select_flat_precal(conn, source_set_id, source_exptime, None)?;
+    let crate::api::masters::PrecalChoice::Master {
+        set_id: precal_set_id,
+        path: precal_path,
+        ..
+    } = sel.choice
+    else {
+        return Ok(None);
+    };
+    let precal_path = PathBuf::from(precal_path);
+    if std::fs::metadata(&precal_path).is_err() {
+        Ok(Some((precal_path, precal_set_id)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -1552,6 +1597,64 @@ mod tests {
             vec![(502, "no provenance".to_string())],
             "{:?}",
             r.masters_unrebuildable
+        );
+    }
+
+    /// Task 8b fix round 1 (Important finding): a broken row somewhere in
+    /// the transitive precal lookup — here, a master set with no
+    /// `calibration_set_frames` row at all, so `select_flat_precal`'s own
+    /// (un-`optional()`) path lookup returns `QueryReturnedNoRows` — must
+    /// degrade to a warning, never fail `compute_export_readiness` outright
+    /// (the Export tab and the plan gate would otherwise hard-error instead
+    /// of showing a blocker). The flat itself stays the only listed missing
+    /// master.
+    #[test]
+    fn missing_flat_master_with_broken_precal_link_still_lists_the_flat() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let flat_path = tmp.path().join("master_flat_500.fits");
+        seed_master_with_file(&conn, 500, "MasterFlat", &flat_path);
+        let flat_source = seed_raw_set_real_files(&conn, tmp.path(), 501, "Flat", 3);
+        conn.execute(
+            "UPDATE calibration_set SET exptime = 2.0 WHERE id = ?1",
+            [flat_source],
+        )
+        .unwrap();
+        crate::db::master_provenance::insert(
+            &conn,
+            &crate::db::master_provenance::MasterProvenance {
+                master_set_id: 500,
+                source_set_id: Some(flat_source),
+                recipe_json: "{}".to_string(),
+                member_frame_uuids: "[]".to_string(),
+                member_hash: "hash".to_string(),
+                created_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        add_link(&conn, 1, 500, "Flat");
+
+        // A master shell — `calibration_set` row only, NO `files`/`frames`/
+        // `calibration_set_frames` behind it — so `select_flat_precal`'s
+        // path lookup for it has nothing to find.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library, exptime)
+             VALUES (502, 'MasterDark', '2026-09-09', 1, 2.0)",
+            [],
+        )
+        .unwrap();
+        add_set_link(&conn, flat_source, 502, "Dark");
+
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.missing_master_files, 1, "{r:?}");
+        assert_eq!(
+            r.masters_rebuildable,
+            vec![500],
+            "{:?}",
+            r.masters_rebuildable
         );
     }
 

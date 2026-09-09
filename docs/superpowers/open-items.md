@@ -203,6 +203,14 @@ extends this subsection.
 - **Owed:** the owner's click-through of the Stacking tab itself (currently
   dev-only behind `STACKING_ENABLED`) — board/inspector/frames/results,
   Settings → Stacking, and the frame-set page showing no Registration tab.
+- **Follow-up (not a bug, Task 8b fix round 1):** Stage 0.5's
+  pre-calibration listing is a plan-time choice: when a raw flat set links a
+  RAW DarkFlat sub-cal set, `select_flat_precal` skips it at plan time and
+  names the Dark master, but the run builds that darkflat master first (it
+  is in `raw_sets_without_master`) and the flat's rebuild then prefers it —
+  a Dark listed that way is rebuilt without being read (harmless), or, if
+  unrebuildable, blocks a run that would not have read it. Fix when it
+  bites: re-resolve after the darkflat builds, or list both.
 
 ### Lights + calibration sets export lands raw originals, not built masters (2026-09-08)
 
