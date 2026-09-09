@@ -186,6 +186,9 @@ fn stddev<T: Sample>(v: &[T], m: f64) -> f64 {
 }
 
 fn sort_asc<T: Sample>(v: &mut [T]) {
+    // Stable by contract: the weighted path's summation order follows this
+    // ordering; sort_unstable_by would permute tied (value, index) pairs and
+    // change the f64 summation order.
     v.sort_by(|a, b| a.value().partial_cmp(&b.value()).unwrap_or(std::cmp::Ordering::Equal));
 }
 
@@ -268,22 +271,41 @@ pub fn mask_get(mask: &[u64], i: usize) -> bool {
 /// Every survivor's bit is set in `mask` (the caller clears it first) and
 /// the rejected count is returned. All rejected → the median of every
 /// `out_values` present in `work`, no bit set.
+///
+/// Contracts: `out_values` and `weights` are indexed by the FRAME index that
+/// rides in `work` (`n_frames` entries each — an index beyond them panics);
+/// `mask` holds `mask_words(n_frames)` words — sized by the frame count, not
+/// by `work.len()`, which is the subset with usable samples — and must be
+/// cleared by the caller before every call (a stale bit is a phantom
+/// survivor nothing detects); `scratch` is reused across calls and never
+/// read. A survivor's bit is set whether or not the sample contributed to
+/// the average (a zero-valued or zero-weighted survivor is masked as a
+/// survivor but skipped by the mean) — rejection maps count rejections, not
+/// contributions.
 pub fn combine_pixel_weighted(
     work: &mut [(f32, u16)],
     out_values: &[f32],
     weights: &[f32],
     recipe: IntegrationRecipe,
     mask: &mut [u64],
+    scratch: &mut Vec<f32>,
 ) -> (f32, usize) {
+    debug_assert_eq!(out_values.len(), weights.len());
+    debug_assert!(work.iter().all(|&(_, i)| (i as usize) < out_values.len()));
+    debug_assert!(
+        mask.iter().all(|&w| w == 0),
+        "combine_pixel_weighted: mask must be cleared per pixel"
+    );
     let n = work.len();
     if n == 0 {
         return (0.0, 0);
     }
     let (kept, _sorted) = apply_rejection(work, recipe.rejection);
     if kept == 0 {
-        let mut all: Vec<f32> = work.iter().map(|&(_, i)| out_values[i as usize]).collect();
-        sort_asc(&mut all);
-        return (median_sorted(&all), n);
+        scratch.clear();
+        scratch.extend(work.iter().map(|&(_, i)| out_values[i as usize]));
+        sort_asc(scratch);
+        return (median_sorted(scratch), n);
     }
     for &(_, i) in &work[..kept] {
         mask_set(mask, i as usize);
@@ -305,16 +327,16 @@ pub fn combine_pixel_weighted(
             } else {
                 // Every survivor was a zero-valued or zero-weighted sample:
                 // the plain mean of the survivors, as the unweighted path.
-                let mut vals: Vec<f32> =
-                    work[..kept].iter().map(|&(_, i)| out_values[i as usize]).collect();
-                mean(&mut vals)
+                scratch.clear();
+                scratch.extend(work[..kept].iter().map(|&(_, i)| out_values[i as usize]));
+                mean(scratch)
             }
         }
         Combination::Median => {
-            let mut vals: Vec<f32> =
-                work[..kept].iter().map(|&(_, i)| out_values[i as usize]).collect();
-            sort_asc(&mut vals);
-            median_sorted(&vals)
+            scratch.clear();
+            scratch.extend(work[..kept].iter().map(|&(_, i)| out_values[i as usize]));
+            sort_asc(scratch);
+            median_sorted(scratch)
         }
     };
     (value, n - kept)
@@ -1064,6 +1086,7 @@ mod tests {
             IntegrationRecipe::median(Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 }),
         ];
         let mut state = 0x5EED_1234u64;
+        let mut scratch = Vec::new();
         for (k, recipe) in recipes.iter().enumerate() {
             for trial in 0..300 {
                 let n = 3 + (trial % 30);
@@ -1074,8 +1097,14 @@ mod tests {
                     stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
                 let weights = vec![1.0f32; n];
                 let mut mask = vec![0u64; mask_words(n)];
-                let (v_w, rej_w) =
-                    combine_pixel_weighted(&mut work, &stack, &weights, *recipe, &mut mask);
+                let (v_w, rej_w) = combine_pixel_weighted(
+                    &mut work,
+                    &stack,
+                    &weights,
+                    *recipe,
+                    &mut mask,
+                    &mut scratch,
+                );
                 assert_eq!(
                     v_plain.to_bits(),
                     v_w.to_bits(),
@@ -1101,6 +1130,7 @@ mod tests {
             &weights,
             IntegrationRecipe::average(Rejection::None),
             &mut mask,
+            &mut Vec::new(),
         );
         assert_eq!(rej, 0);
         assert!((v - (3.0 * 1.0 + 1.0 * 2.0) / 4.0).abs() < 1e-6, "{v}");
@@ -1119,6 +1149,7 @@ mod tests {
             &weights,
             IntegrationRecipe::median(Rejection::SigmaClip { sigma_low: 1.5, sigma_high: 1.5 }),
             &mut mask,
+            &mut Vec::new(),
         );
         assert_eq!(rej, 1, "the 0.90 outlier");
         assert!(!mask_get(&mask, 4) && (0..4).all(|i| mask_get(&mask, i)));
@@ -1139,6 +1170,7 @@ mod tests {
             &weights,
             IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 2.0, sigma_high: 1.0 }),
             &mut mask,
+            &mut Vec::new(),
         );
         assert_eq!(rejected, 1);
         assert!(!mask_get(&mask, 2));
@@ -1147,10 +1179,12 @@ mod tests {
 
     #[test]
     fn all_rejected_falls_back_to_the_median_of_the_output_values() {
-        // PercentileClip with zero thresholds rejects everything but the median.
-        let stack = [0.2f32, 0.3, 0.4];
+        // PercentileClip with zero thresholds on an even-length stack: the
+        // median falls between two elements, so every sample deviates and
+        // the rejection empties the stack (kept == 0).
+        let stack = [0.2f32, 0.3, 0.4, 0.5];
         let mut work: Vec<(f32, u16)> = stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
-        let weights = [1.0f32; 3];
+        let weights = [1.0f32; 4];
         let mut mask = vec![0u64; 1];
         let mut plain = stack.to_vec();
         let (v_plain, r_plain) = combine_pixel(
@@ -1163,8 +1197,11 @@ mod tests {
             &weights,
             IntegrationRecipe::average(Rejection::PercentileClip { low: 0.0, high: 0.0 }),
             &mut mask,
+            &mut Vec::new(),
         );
         assert_eq!((v.to_bits(), r), (v_plain.to_bits(), r_plain));
+        assert_eq!(r, 4, "every sample rejected");
+        assert!(mask.iter().all(|&w| w == 0), "no survivor bit on the all-rejected fallback");
     }
 
     #[test]
