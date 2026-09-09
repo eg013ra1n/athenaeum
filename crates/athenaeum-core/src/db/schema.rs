@@ -1119,6 +1119,28 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Registration v2 (stacking spec §9.1): the transform model, its JSON,
+    // the quality figures and the config hash — added to the existing table
+    // through the guarded pattern so old catalogs keep their rows.
+    for (col, ddl) in [
+        ("model", "model TEXT"),
+        ("transform_json", "transform_json TEXT"),
+        ("inlier_ratio", "inlier_ratio REAL"),
+        ("peak_error_px", "peak_error_px REAL"),
+        ("scale", "scale REAL"),
+        ("rotation_deg", "rotation_deg REAL"),
+        ("flipped", "flipped INTEGER NOT NULL DEFAULT 0"),
+        ("config_hash", "config_hash TEXT"),
+        ("source_kind", "source_kind TEXT"),
+    ] {
+        if !column_exists(conn, "registration_results", col)? {
+            conn.execute(
+                &format!("ALTER TABLE registration_results ADD COLUMN {ddl}"),
+                [],
+            )?;
+        }
+    }
+
     // User-chosen reference frame for registration, keyed per frame set.
     // One row per frame set; INSERT OR REPLACE on every update.
     // Both FKs have ON DELETE CASCADE so stale rows are auto-removed when a

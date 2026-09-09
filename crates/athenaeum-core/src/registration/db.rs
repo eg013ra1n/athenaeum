@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// All WCS and affine fields are `Option<f64>` because the reference row
 /// stores identity/solved values while failed rows may have `NULL` affine
 /// columns.
-#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistrationRecord {
     pub id: Option<i64>,
@@ -52,6 +52,25 @@ pub struct RegistrationRecord {
 
     pub compute_time_ms: i64,
     pub registered_at: String,
+
+    // ── Registration v2 (stacking spec §9.1) ──────────────────────────
+    /// Resolved model: the linear kind's serde name, `+polynomial<o>` when a
+    /// distortion was fitted. `None` on rows written by the old service.
+    pub model: Option<String>,
+    /// `PixelMap::to_json()` verbatim (spec §9.1).
+    pub transform_json: Option<String>,
+    pub inlier_ratio: Option<f64>,
+    /// Larger of the two per-axis peak residuals, px.
+    pub peak_error_px: Option<f64>,
+    pub scale: Option<f64>,
+    pub rotation_deg: Option<f64>,
+    /// The linear part has a negative determinant (a meridian flip).
+    pub flipped: bool,
+    /// Hash of the registration config + reference identity that produced
+    /// this row (spec §9.3).
+    pub config_hash: Option<String>,
+    /// `"calibrated"` for v2 rows; `None` for rows of the old service.
+    pub source_kind: Option<String>,
 }
 
 // ── write helpers ─────────────────────────────────────────────────────────────
@@ -67,7 +86,9 @@ pub fn upsert_registration(conn: &Connection, rec: &RegistrationRecord) -> Resul
             affine_a1, affine_b1, affine_c1,
             affine_a2, affine_b2, affine_c2,
             matched_stars, rms_residual_px, rms_residual_arcsec,
-            status, error, compute_time_ms, registered_at
+            status, error, compute_time_ms, registered_at,
+            model, transform_json, inlier_ratio, peak_error_px,
+            scale, rotation_deg, flipped, config_hash, source_kind
         ) VALUES (
             ?1, ?2, ?3, ?4,
             ?5, ?6, ?7, ?8,
@@ -75,7 +96,9 @@ pub fn upsert_registration(conn: &Connection, rec: &RegistrationRecord) -> Resul
             ?13, ?14, ?15,
             ?16, ?17, ?18,
             ?19, ?20, ?21,
-            ?22, ?23, ?24, ?25
+            ?22, ?23, ?24, ?25,
+            ?26, ?27, ?28, ?29,
+            ?30, ?31, ?32, ?33, ?34
         )",
         rusqlite::params![
             rec.frames_set_id,
@@ -103,6 +126,15 @@ pub fn upsert_registration(conn: &Connection, rec: &RegistrationRecord) -> Resul
             rec.error,
             rec.compute_time_ms,
             rec.registered_at,
+            rec.model,
+            rec.transform_json,
+            rec.inlier_ratio,
+            rec.peak_error_px,
+            rec.scale,
+            rec.rotation_deg,
+            rec.flipped as i64,
+            rec.config_hash,
+            rec.source_kind,
         ],
     )
     .context("Failed to upsert registration_results row")?;
@@ -124,7 +156,9 @@ pub fn get_registration_for_frame_set(
                     affine_a1, affine_b1, affine_c1,
                     affine_a2, affine_b2, affine_c2,
                     matched_stars, rms_residual_px, rms_residual_arcsec,
-                    status, error, compute_time_ms, registered_at
+                    status, error, compute_time_ms, registered_at,
+                    model, transform_json, inlier_ratio, peak_error_px,
+                    scale, rotation_deg, flipped, config_hash, source_kind
              FROM registration_results
              WHERE frames_set_id = ?1
              ORDER BY frame_id",
@@ -160,6 +194,15 @@ pub fn get_registration_for_frame_set(
                 error: row.get(23)?,
                 compute_time_ms: row.get(24)?,
                 registered_at: row.get(25)?,
+                model: row.get(26)?,
+                transform_json: row.get(27)?,
+                inlier_ratio: row.get(28)?,
+                peak_error_px: row.get(29)?,
+                scale: row.get(30)?,
+                rotation_deg: row.get(31)?,
+                flipped: row.get::<_, i64>(32)? != 0,
+                config_hash: row.get(33)?,
+                source_kind: row.get(34)?,
             })
         })
         .context("Failed to query registration_results")?;
@@ -323,6 +366,16 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed frame set 1 with LIGHT frames 1 and 2, for the FKs that
+    /// `registration_results` rows require. Extracted from
+    /// `upsert_and_get_round_trip`'s original setup so every test that needs
+    /// the same shape shares one definition.
+    fn seed_set_and_frames(conn: &Connection) {
+        seed_frame(conn, 1, 1, "LIGHT");
+        seed_frame(conn, 2, 2, "LIGHT");
+        seed_frames_set(conn, 1);
+    }
+
     fn seed_session_member(conn: &Connection, fs_id: i64, frame_id: i64) {
         conn.execute(
             "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
@@ -376,6 +429,7 @@ mod tests {
             error: None,
             compute_time_ms: 120,
             registered_at: "2026-01-01 00:00:00".to_string(),
+            ..Default::default()
         }
     }
 
@@ -611,5 +665,75 @@ mod tests {
         set_frame_set_reference(&conn, 10, 1).unwrap();
         let err = set_frame_set_reference(&conn, 10, 2);
         assert!(err.is_err(), "expected error for Dark frame as reference");
+    }
+
+    // ── registration v2 columns (stacking spec §9.1) ─────────────────────────
+
+    #[test]
+    fn v2_columns_round_trip_and_default_for_old_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Same seed rows as upsert_and_get_round_trip.
+        seed_set_and_frames(&conn);
+        let rec = RegistrationRecord {
+            frames_set_id: 1,
+            frame_id: 2,
+            reference_frame_id: 1,
+            matched_stars: 120,
+            rms_residual_px: 0.31,
+            status: "aligned".into(),
+            compute_time_ms: 42,
+            registered_at: "2026-09-09T00:00:00Z".into(),
+            model: Some("homography+polynomial3".into()),
+            transform_json: Some("{\"linear\":{}}".into()),
+            inlier_ratio: Some(0.91),
+            peak_error_px: Some(0.8),
+            scale: Some(1.0002),
+            rotation_deg: Some(-0.37),
+            flipped: true,
+            config_hash: Some("abc123".into()),
+            source_kind: Some("calibrated".into()),
+            ..Default::default()
+        };
+        upsert_registration(&conn, &rec).unwrap();
+        // An old-style row: none of the v2 columns set.
+        let legacy = RegistrationRecord {
+            frames_set_id: 1,
+            frame_id: 1,
+            reference_frame_id: 1,
+            is_reference: true,
+            status: "reference".into(),
+            registered_at: "2026-09-09T00:00:00Z".into(),
+            ..Default::default()
+        };
+        upsert_registration(&conn, &legacy).unwrap();
+        let rows = get_registration_for_frame_set(&conn, 1).unwrap();
+        assert_eq!(rows.len(), 2);
+        let (r1, r2) = (&rows[0], &rows[1]); // ordered by frame_id
+        assert!(r1.is_reference && r1.model.is_none() && !r1.flipped);
+        assert_eq!(r2.model.as_deref(), Some("homography+polynomial3"));
+        assert_eq!(r2.transform_json.as_deref(), Some("{\"linear\":{}}"));
+        assert_eq!(r2.inlier_ratio, Some(0.91));
+        assert_eq!(r2.peak_error_px, Some(0.8));
+        assert_eq!(r2.scale, Some(1.0002));
+        assert_eq!(r2.rotation_deg, Some(-0.37));
+        assert!(r2.flipped);
+        assert_eq!(r2.config_hash.as_deref(), Some("abc123"));
+        assert_eq!(r2.source_kind.as_deref(), Some("calibrated"));
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('registration_results') WHERE name IN ('model','transform_json','inlier_ratio','peak_error_px','scale','rotation_deg','flipped','config_hash','source_kind')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 9);
     }
 }

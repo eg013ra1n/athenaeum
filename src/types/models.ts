@@ -530,7 +530,33 @@ status: string,
 /**
  * Error message for failed rows.
  */
-error: string | null, computeTimeMs: number, registeredAt: string, };
+error: string | null, computeTimeMs: number, registeredAt: string, 
+/**
+ * Resolved model: the linear kind's serde name, `+polynomial<o>` when a
+ * distortion was fitted. `None` on rows written by the old service.
+ */
+model: string | null, 
+/**
+ * `PixelMap::to_json()` verbatim (spec §9.1).
+ */
+transformJson: string | null, inlierRatio: number | null, 
+/**
+ * Larger of the two per-axis peak residuals, px.
+ */
+peakErrorPx: number | null, scale: number | null, rotationDeg: number | null, 
+/**
+ * The linear part has a negative determinant (a meridian flip).
+ */
+flipped: boolean, 
+/**
+ * Hash of the registration config + reference identity that produced
+ * this row (spec §9.3).
+ */
+configHash: string | null, 
+/**
+ * `"calibrated"` for v2 rows; `None` for rows of the old service.
+ */
+sourceKind: string | null, };
 
 export type StackingPrepProgressEvent = { frameId: number, current: number, total: number, status: string, matchedStars: number | null, rmsPx: number | null, error: string | null, filename: string | null, };
 

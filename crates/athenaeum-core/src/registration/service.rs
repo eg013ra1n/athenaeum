@@ -347,6 +347,7 @@ pub fn register_frame_set(
                     error: None,
                     compute_time_ms: elapsed_ms,
                     registered_at: registered_at.clone(),
+                    ..Default::default()
                 };
                 upsert_registration(conn, &rec)?;
 
@@ -438,6 +439,7 @@ pub fn register_frame_set(
                 error: None,
                 compute_time_ms: 0,
                 registered_at: registered_at.clone(),
+                ..Default::default()
             },
         )?;
         let _ = m; // silence unused warning
@@ -520,6 +522,7 @@ pub fn register_frame_set(
                     error: None,
                     compute_time_ms: elapsed_ms,
                     registered_at: registered_at.clone(),
+                    ..Default::default()
                 };
                 upsert_registration(conn, &rec)?;
                 aligned += 1;
@@ -575,6 +578,7 @@ pub fn register_frame_set(
                     error: Some(e.to_string()),
                     compute_time_ms: elapsed_ms,
                     registered_at: registered_at.clone(),
+                    ..Default::default()
                 };
                 upsert_registration(conn, &rec)?;
                 failed += 1;
@@ -1137,6 +1141,7 @@ mod tests {
             error: None,
             compute_time_ms: 0,
             registered_at: "2026-01-01 00:00:00".to_string(),
+            ..Default::default()
         };
         upsert_registration(&conn, &rec).unwrap();
 
