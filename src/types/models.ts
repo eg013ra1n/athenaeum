@@ -1,6 +1,16 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+export type Classification = { stage: string, steps: Array<string>, evidence: Array<string>, confidence: string, sourceId: string | null, sourceName: string | null, };
+
+export type ProcessingAssessment = { label: string, candidateStage: string | null, confidence: string, evidence: Array<string>, };
+
+export type VersionRecord = { assessment: ProcessingAssessment, frameId: number, filename: string, path: string, dateObs: string | null, camera: string | null, exposureSeconds: number | null, filter: string | null, width: number | null, height: number | null, classification: Classification, exposureId: string | null, manualStage: boolean, };
+
+export type VersionSuggestion = { leftId: number, rightId: number, confidence: string, evidence: Array<string>, };
+
+export type VersionReview = { versions: Array<VersionRecord>, suggestions: Array<VersionSuggestion>, suggestionCount: number, exposureCount: number, exposureSeconds: number, };
+
 export type FileFormat = "FITS" | "XISF";
 
 export type ImageType = "Light" | "Dark" | "Flat" | "Bias" | "DarkFlat" | "MasterLight" | "MasterDark" | "MasterFlat" | "MasterBias" | "MasterDarkFlat";

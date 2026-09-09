@@ -19,6 +19,7 @@ export default defineConfig(async () => ({
   // Tauri loads JS from local filesystem, so large bundles are fine
   build: {
     chunkSizeWarningLimit: 1000,
+    rolldownOptions: { input: { app: 'index.html', hips: 'hips.html' } },
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

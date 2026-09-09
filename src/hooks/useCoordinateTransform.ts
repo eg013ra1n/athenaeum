@@ -52,7 +52,7 @@ export interface CoordinateTransformAPI {
  * This works for any projection type without needing to know the aspect ratio.
  */
 function getCanvasScaling(): { scaleX: number; scaleY: number } {
-  const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
+  const canvas = document.querySelector('#celestial-map > canvas') as HTMLCanvasElement;
   if (!canvas) {
     return { scaleX: 1, scaleY: 1 };
   }

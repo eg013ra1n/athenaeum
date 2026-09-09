@@ -10,6 +10,7 @@ export default {
         antiqua: ['"Book Antiqua"', 'Palatino', '"Palatino Linotype"', 'serif'],
       },
       colors: {
+        'on-accent': '#2e3440',
         // Polar Night (backgrounds)
         surface: {
           DEFAULT: '#2e3440', // nord0 - base background

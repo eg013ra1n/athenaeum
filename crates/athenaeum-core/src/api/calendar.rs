@@ -80,6 +80,7 @@ pub fn get_calendar_month_data(
             JOIN sessions s ON s.id = sm.session_id
             JOIN imaging_nights ino ON ino.id = s.imaging_night_id
             JOIN frames_set fs ON fs.id = ino.frames_set_id
+            JOIN exposure_members em ON em.frames_set_id=fs.id AND em.frame_id=fr.id
             WHERE fr.imagetyp = 'Light'
               AND DATE(ino.start_time, '-12 hours') >= ?1
               AND DATE(ino.start_time, '-12 hours') < ?2
@@ -173,6 +174,7 @@ pub fn get_calendar_month_data(
                 MIN(fr.date_obs) as first_obs,
                 MAX(fr.date_obs) as last_obs
             FROM frames fr
+            JOIN unorganized_exposure_frames ef ON ef.frame_id=fr.id
             WHERE fr.imagetyp = 'Light'
               AND DATE(fr.date_obs, '-12 hours') >= ?1
               AND DATE(fr.date_obs, '-12 hours') < ?2
@@ -266,6 +268,26 @@ pub fn get_calendar_month_data(
         event.total_frame_count += unorganized_group.frame_count;
         event.total_exposure_seconds += unorganized_group.total_exposure_seconds;
         event.unorganized_groups.push(unorganized_group);
+    }
+
+    // Objects can overlap. Daily/monthly totals describe observations, so reduce
+    // the union of available files instead of summing overlapping object cards.
+    let mut day_ids: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT DISTINCT DATE(COALESCE(n.start_time,f.date_obs),'-12 hours'), f.id
+        FROM frames f LEFT JOIN session_members sm ON sm.frame_id=f.id
+        LEFT JOIN sessions s ON s.id=sm.session_id LEFT JOIN imaging_nights n ON n.id=s.imaging_night_id
+        WHERE f.imagetyp='Light' AND DATE(COALESCE(n.start_time,f.date_obs),'-12 hours')>=?1
+          AND DATE(COALESCE(n.start_time,f.date_obs),'-12 hours')<?2")?;
+    for row in stmt.query_map(rusqlite::params![start_date, end_date], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (date, id) = row?;
+        day_ids.entry(date).or_default().push(id);
+    }
+    for (date, event) in &mut events_by_date {
+        let ids = day_ids.get(date).map(Vec::as_slice).unwrap_or(&[]);
+        event.total_frame_count = crate::exposure_versions::effective_ids(conn, ids)?.len() as i32;
+        event.total_exposure_seconds = crate::exposure_versions::exposure_seconds(conn, ids)?;
     }
 
     // Convert HashMap to sorted Vec

@@ -33,3 +33,17 @@
   padding: 0 !important;
   pointer-events: none !important;
 }
+
+/* Keep Celestial's invisible canvas as the input surface in HiPS mode.
+   Field/selection SVG overlays stay above it and retain their hit testing. */
+#celestial-map > canvas {
+  position: relative;
+  z-index: 1;
+}
+#celestial-map[data-hips-visible="true"] > canvas {
+  opacity: 0;
+}
+#celestial-map > iframe { z-index: 0; }
+#celestial-map > svg.imaging-markers-overlay { z-index: 2; }
+
+#celestial-zoomin, #celestial-zoomout { z-index: 3; }

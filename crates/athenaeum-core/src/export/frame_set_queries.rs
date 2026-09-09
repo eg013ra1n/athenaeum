@@ -29,7 +29,7 @@ pub struct ExportableFrameSet {
 pub fn get_exportable_frame_sets(conn: &Connection) -> Result<Vec<ExportableFrameSet>> {
     let mut stmt = conn
         .prepare(
-            "SELECT fs.id, fs.name, fs.total_exp_time,
+            "SELECT fs.id, fs.name, (SELECT SUM(f.exptime) FROM exposure_members em JOIN frames f ON f.id=em.frame_id WHERE em.frames_set_id=fs.id),
                     (SELECT COUNT(*) FROM session_members sm
                      JOIN sessions s ON sm.session_id = s.id
                      JOIN imaging_nights i ON s.imaging_night_id = i.id
