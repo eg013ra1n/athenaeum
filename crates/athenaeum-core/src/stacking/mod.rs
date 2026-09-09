@@ -19,7 +19,12 @@
 //! probes, a run's byte-footprint estimate, and working-folder cleanup),
 //! and `plan` (spec §2/§9.3/§9.4: `StackingPlan` — the groups, gate
 //! blockers and stale-stage report a run would face — plus the three
-//! per-stage config-hash helpers Tasks 6-7 reuse verbatim).
+//! per-stage config-hash helpers Tasks 6-7 reuse verbatim). Plan 5a Task 6
+//! adds `provenance` (spec §9.1: `RunSummary` — `summary_json` and
+//! `runs/run-<id>.json` are the same document) and `run` (the run thread:
+//! queue admission, `stacking-progress`/`stacking-complete` events, and
+//! stage 1 — calibrate, with artifact reuse; Tasks 7-8 add the rest of the
+//! pipeline to the same file).
 
 pub mod config;
 pub mod groups;
@@ -28,9 +33,11 @@ pub mod master_cards;
 pub mod measure;
 pub mod paths;
 pub mod plan;
+pub mod provenance;
 pub mod psf_signal;
 pub mod register;
 pub mod robust;
+pub mod run;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod weights;

@@ -240,13 +240,17 @@ pub(crate) fn calibration_hash_for(
 /// (once for its own `calibrated`/`metrics` freshness, again as the
 /// [`compute_register_stale`] reference) is resolved — and, on failure,
 /// warned about — exactly once.
-struct HashMemo {
+///
+/// `pub(crate)`: Task 6's run holds ONE of these for its whole calibrate
+/// stage (the same "one `DivisorCache`, memoized per frame" contract this
+/// doc describes for a `build_plan` call), via [`Self::calibration_hash_checked`].
+pub(crate) struct HashMemo {
     divisors: DivisorCache,
     by_frame: HashMap<i64, Option<String>>,
 }
 
 impl HashMemo {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         HashMemo {
             divisors: DivisorCache::new(),
             by_frame: HashMap::new(),
@@ -278,6 +282,44 @@ impl HashMemo {
         };
         self.by_frame.insert(frame.frame_id, result.clone());
         result
+    }
+
+    /// [`Self::calibration_hash`]'s Result-returning counterpart, for a
+    /// caller that needs the real failure text instead of the plan's
+    /// collapse-to-`None` (Task 6's calibrate stage: a resolution failure
+    /// here becomes the frame's exclusion reason, exactly like a pixel-phase
+    /// failure). Shares the same memo and the same one
+    /// [`calibration_hash_for`] call per successfully-resolved frame: a hit
+    /// against a remembered success returns `Ok` without recomputing; a miss
+    /// OR a hit against a remembered FAILURE (`None` — the text itself was
+    /// never kept) calls `calibration_hash_for` fresh and returns its
+    /// `Result` directly, so the caller sees the actual error.
+    pub(crate) fn calibration_hash_checked(
+        &mut self,
+        conn: &Connection,
+        cfg: &StackingConfig,
+        frame: &GroupFrame,
+    ) -> Result<String, ApiError> {
+        if let Some(cached) = self.by_frame.get(&frame.frame_id).and_then(|o| o.as_ref()) {
+            return Ok(cached.clone());
+        }
+        let result = calibration_hash_for(conn, cfg, frame, &mut self.divisors);
+        self.by_frame
+            .insert(frame.frame_id, result.as_ref().ok().cloned());
+        result
+    }
+
+    /// The memo's own [`DivisorCache`], for a caller (Task 6's calibrate
+    /// stage) that needs to call [`resolve_generation_cached`] a SECOND time
+    /// itself — once to build the stage-1 hash (via
+    /// [`Self::calibration_hash_checked`] above), once more to get the
+    /// actual [`crate::export::GenerationSpec`] to execute. Sharing this
+    /// cache across both calls is the whole point of holding one `HashMemo`
+    /// per run: a flat's divisor is still resolved at most once per (flat,
+    /// mosaic phase) pair even though the run touches it via two different
+    /// call sites.
+    pub(crate) fn divisors_mut(&mut self) -> &mut DivisorCache {
+        &mut self.divisors
     }
 }
 
@@ -321,7 +363,12 @@ pub(crate) fn registration_hash_for(
 /// alone". A `metrics` artifact has no equivalent disk check: it may be
 /// `payload_json`-only with no file to verify (see the `Measure` staleness
 /// check in [`build_plan`], which compares only the hash).
-fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
+///
+/// `pub(crate)`: `run.rs`'s calibrate stage (Task 6) calls this SAME rule to
+/// decide whether an existing `calibrated` artifact can be reused instead of
+/// regenerated — the plan and the run it precedes must never disagree about
+/// what "fresh" means.
+pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
     artifact.config_hash == current_hash
         && artifact
             .path

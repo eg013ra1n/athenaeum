@@ -62,6 +62,14 @@ pub struct MasterBuildHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+/// Handle to track an active stacking run (M1 Plan 5a Task 6), keyed by
+/// `stacking_runs.id`. `frames_set_id` lets `cancel_stacking` and any future
+/// "is this set already running" check answer without a DB read.
+pub struct StackHandle {
+    pub cancel_flag: Arc<AtomicBool>,
+    pub frames_set_id: i64,
+}
+
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
 pub struct ServiceContext {
     pub db: OnceLock<Database>,
@@ -80,6 +88,11 @@ pub struct ServiceContext {
     /// Active master-build operations (Task 12), keyed by SOURCE calibration
     /// set id. Only one build per source set at a time.
     pub active_master_builds: Arc<Mutex<HashMap<i64, MasterBuildHandle>>>,
+    /// Active stacking runs (M1 Plan 5a), keyed by `stacking_runs.id`. Gated
+    /// to match `stacking`'s own home (`all(render, solver)`) — the module
+    /// does not exist at all in a headless build.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    pub active_stacks: Arc<Mutex<HashMap<i64, StackHandle>>>,
     /// Lazy-loaded deep-sky object catalog, used to auto-label plate-solve
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
     /// Gated to match `DsoCatalog`'s home in the render+solver plate_solve module.
@@ -149,6 +162,8 @@ impl ServiceContext {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            active_stacks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "render", feature = "solver"))]
             dso_catalog: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]

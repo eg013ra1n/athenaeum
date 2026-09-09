@@ -41,6 +41,19 @@ pub(crate) struct Fixture {
 /// A frame set + one imaging night + one session, ready for `add_light`.
 pub(crate) fn frame_set(name: &str) -> Fixture {
     let conn = Connection::open_in_memory().expect("open in-memory fixture catalog");
+    frame_set_with_conn(conn, name)
+}
+
+/// Same as [`frame_set`], but against an ALREADY-OPEN connection instead of
+/// a fresh in-memory one. Used by `stacking::run`'s tests (Plan 5a Task 6):
+/// a run goes through a real `ServiceContext`'s pooled `Database`, which can
+/// only see rows committed to an on-disk file — not the private in-memory
+/// connection [`frame_set`] opens for `plan.rs`/`groups.rs`'s lighter,
+/// catalog-only tests. Pass a `Connection` opened on the SAME path the
+/// `ServiceContext`'s `Database` was constructed with, and every
+/// `add_light`/`add_master_dark_and_flat` row becomes visible through
+/// `ctx.db`'s own pooled connections too.
+pub(crate) fn frame_set_with_conn(conn: Connection, name: &str) -> Fixture {
     init_db(&conn).expect("init fixture schema");
 
     conn.execute("INSERT INTO frames_set (name) VALUES (?1)", params![name])

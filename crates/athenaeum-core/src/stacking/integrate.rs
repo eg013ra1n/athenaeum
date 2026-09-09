@@ -216,7 +216,15 @@ pub struct GroupInput<'a> {
     pub normalization: &'a NormalizationConfig,
 }
 
-#[derive(Debug)]
+// `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
+// ts_export registration work (spec plan, "GroupStats (integrate.rs — derive
+// TS)"): Plan 5a Task 6's `stacking::provenance::SummaryGroup.stats` is
+// `Option<GroupStats>`, and `RunSummary` (the run's `summary_json` /
+// `runs/run-<id>.json` document) must serialize as a whole — the derive is a
+// compile-time necessity now, not a design choice made early. Task 9 still
+// owns registering the type into `ts_export.rs`'s `stacking.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
 pub struct GroupStats {
     /// The group's total frame count, before the min-weight drop.
     pub frames: usize,

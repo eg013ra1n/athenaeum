@@ -1,0 +1,139 @@
+//! The stacking run's provenance document (spec §9.1's `summary_json` /
+//! `runs/run-<id>.json` — the SAME document: one copy is written to the
+//! `stacking_runs.summary_json` column, the other to disk under the working
+//! layout's `runs/` subtree; see `run.rs::run_thread`, the single place that
+//! writes both). Every field a completed (or failed/cancelled) run is
+//! willing to answer about itself: what it was asked to do
+//! (`config`/`config_hash`), what it resolved (`reference`/`measurement`),
+//! what each group produced (`groups`/[`SummaryGroup`]/[`SummaryFrame`]), how
+//! long each stage took (`stages`), and anything worth a human's attention
+//! (`warnings`/`error`).
+//!
+//! Plan 5a Task 6 only runs stage 1 (calibrate): `groups` stays empty and
+//! `reference`/`measurement` carry only what the plan gate already knew
+//! (`Auto` mode's actual frame, every per-frame metric) until Tasks 7-8 land
+//! stages 3-9 and fill the rest in on the SAME [`RunSummary`] `run.rs`'s
+//! `RunContext` builds up over the pipeline's lifetime.
+
+use serde::{Deserialize, Serialize};
+
+use crate::integration::stats::ScaleEstimator;
+use crate::stacking::config::{ReferenceMode, StackingConfig};
+use crate::stacking::integrate::GroupStats;
+use crate::stacking::plan::Stage;
+
+/// One stage's wall-clock cost, in the order it ran
+/// (`run.rs`'s `RunContext::timings`).
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct StageTiming {
+    pub stage: Stage,
+    pub duration_ms: u64,
+}
+
+/// The run's resolved reference frame. A `Manual` run knows this before the
+/// pipeline even starts (the plan gate already resolved and validated it);
+/// `Auto` mode fills `frame_id`/`filename`/`weight` in once stage 4 (Task 7)
+/// picks the best-weighted frame of the largest group. `weight` stays `None`
+/// until stage 3 has measured it, in either mode.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryReference {
+    pub frame_id: Option<i64>,
+    pub filename: Option<String>,
+    pub mode: ReferenceMode,
+    pub weight: Option<f64>,
+}
+
+/// What stage 3 (measurement, Task 7) used, recorded once at the top of the
+/// summary — a run-wide choice, not a per-frame one. `seed_source` is always
+/// `"fast"` in M1 (the fast detector path is the pipeline's only seed
+/// source; ruling 13's carry-forward — the probe never recorded it, this
+/// summary does). `scale_estimator` mirrors `cfg.normalization.scale_estimator`,
+/// which [`crate::stacking::config::MeasurementConfig::measure_options`]
+/// keeps in lockstep with the measurement stage's own estimator, so this
+/// field is knowable from the config alone, before stage 3 ever runs.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryMeasurement {
+    pub seed_source: String,
+    pub scale_estimator: ScaleEstimator,
+}
+
+/// One frame's whole story across the pipeline. Task 6's calibrate stage
+/// fills `frame_id`/`filename`/`included`/`exclusion_reason`/
+/// `calibrated_path`/`cached_calibrated`; Tasks 7-8 fill the rest (weights,
+/// PSF/registration metrics, `rejected_fraction`) as their stages run. Every
+/// `SummaryGroup.frames` entry is built once, at Output time (Task 8) —
+/// there is no partial per-stage version of this struct on disk or in the DB
+/// before then (see the module doc).
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryFrame {
+    pub frame_id: i64,
+    pub filename: String,
+    pub included: bool,
+    pub exclusion_reason: Option<String>,
+    pub weight: Option<f64>,
+    pub weight_channels: Vec<f64>,
+    pub fwhm_px: Option<f64>,
+    pub eccentricity: Option<f64>,
+    pub stars: Option<usize>,
+    pub psf_signal_weight: Option<f64>,
+    pub psf_snr: Option<f64>,
+    pub noise: Option<f64>,
+    pub reg_status: Option<String>,
+    pub reg_model: Option<String>,
+    pub reg_rms_px: Option<f64>,
+    pub reg_inliers: Option<usize>,
+    pub reg_inlier_ratio: Option<f64>,
+    pub reg_flipped: Option<bool>,
+    pub rejected_fraction: Option<f64>,
+    pub calibrated_path: Option<String>,
+    pub cached_calibrated: bool,
+    pub cached_metrics: bool,
+    pub cached_registration: bool,
+}
+
+/// One integration group's whole result. `stats`/`master_path`/rejection
+/// paths/`frames` stay `None`/empty until Task 8's Output stage writes the
+/// group's master — see the module doc.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryGroup {
+    pub key: String,
+    pub frame_count: usize,
+    pub included_count: usize,
+    pub master_path: Option<String>,
+    pub rejection_low_path: Option<String>,
+    pub rejection_high_path: Option<String>,
+    pub stats: Option<GroupStats>,
+    pub normalization_reference_frame_id: Option<i64>,
+    pub frames: Vec<SummaryFrame>,
+}
+
+/// The whole run, as `stacking_runs.summary_json` AND `runs/run-<id>.json` —
+/// deliberately the same Rust type for both, so there is only ever one shape
+/// to keep in sync. Built up progressively on `run.rs`'s
+/// `RunContext::summary` over the pipeline's lifetime; `status`/
+/// `finished_at`/`warnings`/`stages`/`error` are finalized by
+/// `run_thread` right before this is serialized to both destinations.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub run_id: i64,
+    pub set_id: i64,
+    pub set_name: String,
+    pub app_version: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub config: StackingConfig,
+    pub config_hash: String,
+    pub reference: SummaryReference,
+    pub measurement: SummaryMeasurement,
+    pub groups: Vec<SummaryGroup>,
+    pub stages: Vec<StageTiming>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
