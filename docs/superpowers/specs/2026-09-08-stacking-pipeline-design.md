@@ -605,6 +605,10 @@ are reported by the cleanup action, never deleted silently.
   …_drizzle<s>x.fits, …_rejlow.fits, …_rejhigh.fits, …_drizzle<s>x_weight.fits
 ```
 
+When two frames of a group share a source file name, each of them gets
+`_f<frame id>` before the extension (`c_<stem>_f<id>.fits`), so a capture
+counter that restarts on another night can never overwrite a sibling.
+
 Slugs use the calibration library's sanitizer. A name collision in the output
 folder gets `_2`, `_3`… (never overwrite; the run's rows point at the file
 actually written).

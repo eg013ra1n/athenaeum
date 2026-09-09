@@ -333,54 +333,59 @@ fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
 pub fn start_stacking(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
+    policy: &PathPolicy,
     app_version: String,
     frames_set_id: i64,
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, ApiError> {
-    let (run_id, rc) = {
-        let db_handle = db(&ctx)?;
-        let conn = db_handle.conn();
+    let db_handle = db(&ctx)?;
+    let conn = db_handle.conn();
 
-        let plan = build_plan(
-            &conn,
-            &ctx.settings,
-            &PathPolicy::AllowAll,
-            frames_set_id,
-            config,
-        )?;
+    let plan = build_plan(&conn, &ctx.settings, policy, frames_set_id, config)?;
 
-        if let Some(blocker) = plan.blockers.first() {
-            return Err(ApiError::Invalid(blocker.message.clone()));
-        }
-        // `build_plan` already reads this (spec §9.4 gate) — reuse it rather
-        // than a second `active_run_for_set` query. Benign TOCTOU: two
-        // concurrent `start_stacking` calls for the SAME set, racing between
-        // this read and the `insert_run` below, could both pass — accepted,
-        // same tradeoff `calibration_library::check_library_root_uniqueness`
-        // documents for the analogous "designate library root" race.
-        if let Some(active_id) = plan.active_run_id {
+    if let Some(blocker) = plan.blockers.first() {
+        return Err(ApiError::Invalid(blocker.message.clone()));
+    }
+    // Advisory only (fix round 1, item 3): catches a row left `planning`/
+    // `running` by a crashed process. The REAL guard against a same-process
+    // double start is the `active_stacks` lock below — this read can still
+    // race against another `start_stacking` call reaching that lock first
+    // (both could pass this check), and that is fine: the lock is what
+    // actually serializes the run-row insert and the handle registration.
+    if let Some(active_id) = plan.active_run_id {
+        return Err(ApiError::Conflict(format!(
+            "a stacking run (id {active_id}) is already active for frame set {frames_set_id}"
+        )));
+    }
+
+    let working_dir = plan.working_dir.clone().ok_or_else(|| {
+        ApiError::Internal("stacking plan reported no blockers but no working folder".to_string())
+    })?;
+    let output_dir_str = plan.output_dir.clone().ok_or_else(|| {
+        ApiError::Internal("stacking plan reported no blockers but no output folder".to_string())
+    })?;
+
+    let plan_groups = group_frames(&conn, frames_set_id, &plan.config.grouping)?;
+
+    let config_json = serde_json::to_string(&plan.config)
+        .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
+
+    // Fix round 1, item 3: the "already running" check AND the run-row
+    // insert + handle registration happen under ONE `active_stacks` lock —
+    // lock; scan for a handle already covering this set → `Conflict`;
+    // `insert_run` (a short insert) while still holding the lock; insert
+    // the handle; unlock. Two concurrent `start_stacking` calls for the
+    // SAME set can never both pass: whichever reaches the lock second sees
+    // the first's handle before it can insert its own run row.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let run_id = {
+        let mut active = ctx.active_stacks.lock().unwrap();
+        if active.values().any(|h| h.frames_set_id == frames_set_id) {
             return Err(ApiError::Conflict(format!(
-                "a stacking run (id {active_id}) is already active for frame set {frames_set_id}"
+                "a stacking run is already active for frame set {frames_set_id}"
             )));
         }
-
-        let working_dir = plan.working_dir.clone().ok_or_else(|| {
-            ApiError::Internal(
-                "stacking plan reported no blockers but no working folder".to_string(),
-            )
-        })?;
-        let output_dir_str = plan.output_dir.clone().ok_or_else(|| {
-            ApiError::Internal(
-                "stacking plan reported no blockers but no output folder".to_string(),
-            )
-        })?;
-
-        let plan_groups = group_frames(&conn, frames_set_id, &plan.config.grouping)?;
-
-        let config_json = serde_json::to_string(&plan.config)
-            .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
-
         let run_id = insert_run(
             &conn,
             &NewRun {
@@ -393,119 +398,112 @@ pub fn start_stacking(
                 output_dir: &output_dir_str,
             },
         )?;
-
-        let started_at = get_run(&conn, run_id)?
-            .map(|r| r.started_at)
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-
-        let included_by_key: HashMap<&str, usize> = plan
-            .groups
-            .iter()
-            .map(|g| (g.key.as_str(), g.included_count))
-            .collect();
-
-        let mut group_ids: HashMap<String, i64> = HashMap::with_capacity(plan_groups.len());
-        for g in &plan_groups {
-            let included_count = included_by_key
-                .get(g.key.as_str())
-                .copied()
-                .unwrap_or(g.frames.len());
-            let group_id = insert_group(
-                &conn,
-                &NewGroup {
-                    run_id,
-                    group_key: &g.key,
-                    instrume: g.instrume.as_deref(),
-                    color_mode: color_mode_wire(g.color_mode),
-                    filter: g.filter.as_deref(),
-                    binning: Some(g.binning),
-                    width: Some(g.width),
-                    height: Some(g.height),
-                    exposure: g.exposure_s,
-                    frame_count: g.frames.len() as i64,
-                    included_count: included_count as i64,
-                },
-            )?;
-            group_ids.insert(g.key.clone(), group_id);
-        }
-
-        let set_slug_str = set_slug(&plan.set_name);
-        let layout = WorkingLayout::new(Path::new(&working_dir), &set_slug_str);
-        let output_dir = PathBuf::from(&output_dir_str);
-
-        let summary = RunSummary {
-            run_id,
-            set_id: frames_set_id,
-            set_name: plan.set_name.clone(),
-            app_version: app_version.clone(),
-            started_at,
-            finished_at: None,
-            status: "planning".to_string(),
-            config: plan.config.clone(),
-            config_hash: plan.config_hash.clone(),
-            reference: SummaryReference {
-                frame_id: plan.reference.frame_id,
-                filename: plan.reference.filename.clone(),
-                mode: plan.reference.mode,
-                weight: None,
-            },
-            measurement: SummaryMeasurement {
-                seed_source: "fast".to_string(),
-                scale_estimator: plan.config.normalization.scale_estimator,
-            },
-            groups: Vec::new(),
-            stages: Vec::new(),
-            warnings: Vec::new(),
-            error: None,
-        };
-
-        let cancel = Arc::new(AtomicBool::new(false));
-
-        let rc = RunContext {
-            ctx: ctx.clone(),
-            emitter: emitter.clone(),
-            run_id,
-            set_id: frames_set_id,
-            set_name: plan.set_name,
-            config: plan.config,
-            hash: plan.config_hash,
-            plan_groups,
-            excluded: plan.excluded_frame_ids,
-            group_ids,
-            layout,
-            output_dir,
-            cancel,
-            app_version,
-            warnings: Vec::new(),
-            timings: Vec::new(),
-            summary,
-            last_emit: Instant::now(),
-            rerun_from,
-            memo: HashMemo::new(),
-            hot_maps: HashMap::new(),
-            runtime_exclusions: Vec::new(),
-            measured: HashMap::new(),
-            reference_frame_id: None,
-            reference_calibrated: None,
-            reference_width: 0,
-            reference_height: 0,
-            #[cfg(test)]
-            fail_after_stage: None,
-        };
-
-        (run_id, rc)
-    };
-
-    {
-        let mut active = ctx.active_stacks.lock().unwrap();
         active.insert(
             run_id,
             StackHandle {
-                cancel_flag: rc.cancel.clone(),
+                cancel_flag: cancel.clone(),
                 frames_set_id,
             },
         );
+        run_id
+    };
+
+    let started_at = get_run(&conn, run_id)?
+        .map(|r| r.started_at)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    let included_by_key: HashMap<&str, usize> = plan
+        .groups
+        .iter()
+        .map(|g| (g.key.as_str(), g.included_count))
+        .collect();
+
+    let mut group_ids: HashMap<String, i64> = HashMap::with_capacity(plan_groups.len());
+    for g in &plan_groups {
+        let included_count = included_by_key
+            .get(g.key.as_str())
+            .copied()
+            .unwrap_or(g.frames.len());
+        let group_id = insert_group(
+            &conn,
+            &NewGroup {
+                run_id,
+                group_key: &g.key,
+                instrume: g.instrume.as_deref(),
+                color_mode: color_mode_wire(g.color_mode),
+                filter: g.filter.as_deref(),
+                binning: Some(g.binning),
+                width: Some(g.width),
+                height: Some(g.height),
+                exposure: g.exposure_s,
+                frame_count: g.frames.len() as i64,
+                included_count: included_count as i64,
+            },
+        )?;
+        group_ids.insert(g.key.clone(), group_id);
     }
+
+    let set_slug_str = set_slug(&plan.set_name);
+    let layout = WorkingLayout::new(Path::new(&working_dir), &set_slug_str);
+    let output_dir = PathBuf::from(&output_dir_str);
+
+    let summary = RunSummary {
+        run_id,
+        set_id: frames_set_id,
+        set_name: plan.set_name.clone(),
+        app_version: app_version.clone(),
+        started_at,
+        finished_at: None,
+        status: "planning".to_string(),
+        config: plan.config.clone(),
+        config_hash: plan.config_hash.clone(),
+        reference: SummaryReference {
+            frame_id: plan.reference.frame_id,
+            filename: plan.reference.filename.clone(),
+            mode: plan.reference.mode,
+            weight: None,
+        },
+        measurement: SummaryMeasurement {
+            seed_source: "fast".to_string(),
+            scale_estimator: plan.config.normalization.scale_estimator,
+        },
+        groups: Vec::new(),
+        stages: Vec::new(),
+        warnings: Vec::new(),
+        error: None,
+    };
+
+    let rc = RunContext {
+        ctx: ctx.clone(),
+        emitter: emitter.clone(),
+        run_id,
+        set_id: frames_set_id,
+        set_name: plan.set_name,
+        config: plan.config,
+        hash: plan.config_hash,
+        plan_groups,
+        excluded: plan.excluded_frame_ids,
+        group_ids,
+        layout,
+        output_dir,
+        cancel,
+        app_version,
+        warnings: Vec::new(),
+        timings: Vec::new(),
+        summary,
+        last_emit: Instant::now(),
+        rerun_from,
+        memo: HashMemo::new(),
+        hot_maps: HashMap::new(),
+        runtime_exclusions: Vec::new(),
+        measured: HashMap::new(),
+        reference_frame_id: None,
+        reference_calibrated: None,
+        reference_width: 0,
+        reference_height: 0,
+        #[cfg(test)]
+        fail_after_stage: None,
+    };
 
     let spawn_result = std::thread::Builder::new()
         .name(format!("stacking-run-{run_id}"))
@@ -552,10 +550,16 @@ pub fn cancel_stacking(ctx: &ServiceContext, run_id: i64) -> Result<(), ApiError
 }
 
 /// Runs on the dedicated `stacking-run-{run_id}` thread. The single exit
-/// path for the whole run: handle removal, `finish_run`, the provenance
+/// path for the whole run: `finish_run`, handle removal, the provenance
 /// snapshot, the terminal log lines, and `stacking-complete` ALWAYS happen
 /// here, exactly once, regardless of how [`run_pipeline`] ended (including a
-/// panic inside it).
+/// panic inside it). Fix round 1, item 4: `finish_run` runs BEFORE the
+/// handle is removed from `active_stacks` — a `cancel_stacking` call that
+/// lands in between sees the row already terminal (never `NotFound` while
+/// the row still reads `running`); its flag-set is simply never read by
+/// anything afterward, which is harmless. The old order (handle removed
+/// first) could show a run nowhere in `active_stacks` while its DB row
+/// still said `running`, which is the confusing state this avoids.
 fn run_thread(mut rc: RunContext) {
     let run_id = rc.run_id;
     let set_id = rc.set_id;
@@ -575,8 +579,6 @@ fn run_thread(mut rc: RunContext) {
                 Err(RunError::Other(msg))
             }
         };
-
-    rc.ctx.active_stacks.lock().unwrap().remove(&run_id);
 
     let (status, success, cancelled, error): (&str, bool, bool, Option<String>) = match &result {
         Ok(()) => ("done", true, false, None),
@@ -622,6 +624,8 @@ fn run_thread(mut rc: RunContext) {
             tracing::warn!(run_id, error = %e, "failed to persist stacking run completion: database unavailable");
         }
     }
+
+    rc.ctx.active_stacks.lock().unwrap().remove(&run_id);
 
     if let Some(json) = &summary_json {
         if let Err(e) = std::fs::create_dir_all(rc.layout.runs_dir()) {
@@ -748,12 +752,58 @@ fn calibrate_bytes_total(groups: &[IntegrationGroup], excluded: &HashSet<i64>) -
 /// One frame's stage-1 outcome (private to [`stage_calibrate`]).
 enum CalibrateOutcome {
     /// An existing `calibrated` artifact was fresh; nothing was written.
-    Reused,
+    /// `bytes` is the reused file's own recorded size (fix round 1, item 5:
+    /// a fully-reused stage must report `N/N` progress bytes, not `0/N`).
+    Reused { bytes: u64 },
     /// A fresh `calibrated` file was written; `bytes` is its size.
     Generated { bytes: u64 },
     /// Calibration failed for this frame; `reason` is
     /// [`RunContext::runtime_exclusions`]'s text.
     Excluded { reason: String },
+}
+
+/// The collision-safe calibrated-file STEM for one frame of a group (fix
+/// round 1, Critical): the plain, extension-free source stem
+/// (`Path::file_stem` of `frame.filename`) when it is unique within the
+/// group; `<stem>_f<frame_id>` for EVERY frame that shares that stem with
+/// another member of the group (all of them, not just the later ones) —
+/// deterministic and order-independent, since it depends only on group
+/// membership, never on iteration order.
+///
+/// Why this exists: `layout.calibrated_dir(key).join(spec.output_filename(&frame.filename))`
+/// used to collide whenever two frames of one group shared a source
+/// basename (a capture program restarting its file counter on a different
+/// night is routine) — the second write silently clobbered the first, both
+/// artifact rows pointed at one file of identical size, and `is_fresh` then
+/// kept the FIRST frame's now-wrong row "fresh" forever, so a later stage
+/// used the second frame's pixels twice and lost the first one silently.
+///
+/// Callers append the generator's own `_d` debayer marker via
+/// `GenerationSpec::output_filename` — never insert it here, so the marker
+/// always stays LAST in the filename (`c_<stem>_f<id>_d.fits`, never
+/// `c_<stem>_d_f<id>.fits`). Task 7's registered-frame writer
+/// ([`write_registered_artifact`]/[`registered_file_name`]) calls this SAME
+/// function for its own `r_<stem>[_d].fits` naming, so the two stay
+/// consistent by construction rather than by one parsing the other's
+/// output.
+pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame) -> String {
+    fn stem_of(f: &GroupFrame) -> &str {
+        Path::new(&f.filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&f.filename)
+    }
+    let this_stem = stem_of(frame);
+    let collisions = group
+        .frames
+        .iter()
+        .filter(|f| stem_of(f) == this_stem)
+        .count();
+    if collisions > 1 {
+        format!("{this_stem}_f{}", frame.frame_id)
+    } else {
+        this_stem.to_string()
+    }
 }
 
 /// Stage 1 (calibrate) for one frame (spec §9.3, decision 4).
@@ -771,10 +821,11 @@ enum CalibrateOutcome {
 fn calibrate_one_frame(
     rc: &mut RunContext,
     cfg: &StackingConfig,
-    group_key: &str,
+    group: &IntegrationGroup,
     frame: &GroupFrame,
     scratch: &Path,
 ) -> Result<CalibrateOutcome, RunError> {
+    let group_key: &str = group.key.as_str();
     let hash = {
         let conn = db(&rc.ctx)?.conn();
         match rc.memo.calibration_hash_checked(&conn, cfg, frame) {
@@ -800,7 +851,9 @@ fn calibrate_one_frame(
         };
         if let Some(row) = &existing {
             if is_fresh(row, &hash) {
-                return Ok(CalibrateOutcome::Reused);
+                return Ok(CalibrateOutcome::Reused {
+                    bytes: row.size.unwrap_or(0) as u64,
+                });
             }
         }
     }
@@ -824,10 +877,11 @@ fn calibrate_one_frame(
         }
     };
 
+    let stem = calibrated_file_stem(group, frame);
     let out = rc
         .layout
         .calibrated_dir(group_key)
-        .join(spec.output_filename(&frame.filename));
+        .join(spec.output_filename(&format!("{stem}.fits")));
 
     let generated = execute_generation(
         &spec,
@@ -932,9 +986,8 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
             }
             rc.check_cancel()?;
 
-            match calibrate_one_frame(rc, &cfg, &group.key, frame, &scratch)? {
-                CalibrateOutcome::Reused => {}
-                CalibrateOutcome::Generated { bytes } => {
+            match calibrate_one_frame(rc, &cfg, group, frame, &scratch)? {
+                CalibrateOutcome::Reused { bytes } | CalibrateOutcome::Generated { bytes } => {
                     bytes_done += bytes;
                 }
                 CalibrateOutcome::Excluded { reason } => {
@@ -1908,7 +1961,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
                         }
                         if cfg.registration.write_registered_frames {
                             if let Err(e) =
-                                write_registered_artifact(rc, &group.key, frame, &map, &rec, &cfg)
+                                write_registered_artifact(rc, group, frame, &map, &rec, &cfg)
                             {
                                 tracing::warn!(
                                     run_id = rc.run_id,
@@ -1997,12 +2050,13 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
 /// (`write_registered_frames` defaults off).
 fn write_registered_artifact(
     rc: &mut RunContext,
-    group_key: &str,
+    group: &IntegrationGroup,
     frame: &GroupFrame,
     map: &PixelMap,
     rec: &RegistrationRecord,
     cfg: &StackingConfig,
 ) -> anyhow::Result<()> {
+    let group_key: &str = group.key.as_str();
     let calibrated = rc
         .measured
         .get(group_key)
@@ -2014,7 +2068,12 @@ fn write_registered_artifact(
 
     let out_dir = rc.layout.registered_dir(group_key);
     std::fs::create_dir_all(&out_dir)?;
-    let out = out_dir.join(registered_file_name(&calibrated));
+    // Fix round 1: route the registered name through the SAME
+    // `calibrated_file_stem` stage 1 used, rather than recovering it by
+    // trimming a leading "c_" off the calibrated file's own name — the two
+    // stay consistent by construction, not by one parsing the other.
+    let stem = calibrated_file_stem(group, frame);
+    let out = out_dir.join(registered_file_name(&stem, &calibrated));
 
     let reference_name = rc
         .reference_calibrated
@@ -2069,14 +2128,24 @@ fn write_registered_artifact(
     Ok(())
 }
 
-/// `r_<stem>.fits` for a calibrated file's own stem, matching
-/// `register_probe.rs`'s own convention (trim a leading `c_`).
-fn registered_file_name(calibrated: &Path) -> String {
-    let stem = calibrated
+/// `r_<stem>[_d].fits` for the SAME collision-safe `stem`
+/// [`calibrated_file_stem`] gave the calibrated file (fix round 1: the two
+/// naming schemes must agree by construction). The debayer `_d` marker is
+/// not part of `stem` (it is the generator's own suffix, decided when the
+/// calibrated file was written) — recovered here from whether the
+/// calibrated file's own on-disk name ends in `_d`, matching
+/// `register_probe.rs`'s own convention of keeping that marker on the
+/// registered output too.
+fn registered_file_name(stem: &str, calibrated: &Path) -> String {
+    let debayered = calibrated
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("frame");
-    format!("r_{}.fits", stem.trim_start_matches("c_"))
+        .is_some_and(|s| s.ends_with("_d"));
+    if debayered {
+        format!("r_{stem}_d.fits")
+    } else {
+        format!("r_{stem}.fits")
+    }
 }
 
 /// One `stacking_run_frames` row per frame of every group, included or not
@@ -2398,6 +2467,7 @@ mod tests {
         let err = start_stacking(
             ctx.clone(),
             Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
             "test".to_string(),
             empty_fixture.set_id,
             None,
@@ -2407,14 +2477,24 @@ mod tests {
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
         drop(empty_fixture);
 
-        // A ready fixture (masters + folders), on the SAME catalog: start
-        // twice — the second is a Conflict.
+        // A ready fixture (masters + folders), on the SAME catalog. Fix
+        // round 1, item 6: hold the queue's one slot so the first run
+        // parks in `acquire` — start twice → the second is a Conflict
+        // deterministically, with no race against the first run's own
+        // completion (same technique as `cancel_before_admission_finishes_cancelled`).
         let (fixture, light_ids, _working, _output) = seed_ready(&db_path, SET_NAME);
         let _ = &light_ids;
+
+        let hold_flag = Arc::new(AtomicBool::new(false));
+        let (hold_permit, _hold_job) = ctx
+            .compute_queue
+            .acquire(ComputeJobKind::Analysis, "hold", hold_flag)
+            .unwrap();
 
         let started = start_stacking(
             ctx.clone(),
             Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
             "test".to_string(),
             fixture.set_id,
             None,
@@ -2425,6 +2505,7 @@ mod tests {
         let second = start_stacking(
             ctx.clone(),
             Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
             "test".to_string(),
             fixture.set_id,
             None,
@@ -2432,6 +2513,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(second, ApiError::Conflict(_)), "{second:?}");
+
+        cancel_stacking(&ctx, started.run_id).unwrap();
+        drop(hold_permit);
 
         wait_for_run(&ctx, started.run_id);
     }
@@ -2456,6 +2540,7 @@ mod tests {
         let started = start_stacking(
             ctx.clone(),
             recorder.clone(),
+            &PathPolicy::AllowAll,
             "test".to_string(),
             fixture.set_id,
             None,
@@ -2695,6 +2780,137 @@ mod tests {
                 "frame {id} must regenerate under rerun_from Calibrate"
             );
         }
+    }
+
+    /// Fix round 1, Critical: two frames of one group sharing a source
+    /// basename (a capture counter restarted on another night) must not
+    /// collide on one calibrated output — every colliding frame gets
+    /// `_f<frame_id>` inserted before the extension, and a frame whose name
+    /// is unique in the group keeps the plain `c_<stem>.fits` name.
+    #[test]
+    fn calibrate_outputs_disambiguate_same_basename_within_a_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        let fixture_conn = rusqlite::Connection::open(&db_path).unwrap();
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+
+        // Two lights sharing the SAME source basename ("dup.fits") — a
+        // capture counter that restarted on a different night, so the two
+        // physical files live in DIFFERENT directories (`files.path` is
+        // UNIQUE, so they can't share a path even though they share a
+        // name). `add_light` gives the first one a real file; the second
+        // is a manual copy into a sibling directory with the same
+        // filename, inserted the same way `add_light`'s own `insert_light_row`
+        // would (this test's file scope is `run.rs` only — the fixture
+        // builder itself is untouched).
+        let (dup_a, path_a) =
+            test_fixtures::add_light(&fixture, &light_spec("dup", THREE_TIMES[0]));
+
+        let night2_dir = fixture.dir.path().join("night2");
+        std::fs::create_dir_all(&night2_dir).unwrap();
+        let path_b = night2_dir.join("dup.fits");
+        std::fs::copy(&path_a, &path_b).unwrap();
+        let meta_b = std::fs::metadata(&path_b).unwrap();
+        let modified_b =
+            chrono::DateTime::<chrono::Utc>::from(meta_b.modified().unwrap()).to_rfc3339();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) \
+                 VALUES (?1, 'dup.fits', ?2, ?3, 'FITS')",
+                rusqlite::params![path_b.to_string_lossy(), meta_b.len() as i64, modified_b],
+            )
+            .unwrap();
+        let file_id_b = fixture.conn.last_insert_rowid();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO frames (file_id, instrume, filter, xbinning, naxis1, naxis2, \
+                 exptime, date_obs, imagetyp) VALUES (?1, 'cam', NULL, 1, 64, 48, 60.0, ?2, 'Light')",
+                rusqlite::params![file_id_b, THREE_TIMES[1]],
+            )
+            .unwrap();
+        let dup_b = fixture.conn.last_insert_rowid();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![fixture.session_id, dup_b],
+            )
+            .unwrap();
+
+        let (uniq, _) = test_fixtures::add_light(&fixture, &light_spec("uniq", THREE_TIMES[2]));
+        let light_ids = vec![dup_a, dup_b, uniq];
+        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
+        let group_key = plan_groups[0].key.clone();
+
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout.clone(),
+            output_dir,
+            HashMap::new(),
+        );
+        stage_calibrate(&mut rc).unwrap();
+
+        let artifacts =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
+                .unwrap();
+        assert_eq!(artifacts.len(), 3, "{artifacts:?}");
+
+        let path_of = |frame_id: i64| -> String {
+            artifacts
+                .iter()
+                .find(|a| a.frame_id == Some(frame_id))
+                .unwrap_or_else(|| panic!("no artifact row for frame {frame_id}"))
+                .path
+                .clone()
+                .unwrap()
+        };
+        let path_a = path_of(dup_a);
+        let path_b = path_of(dup_b);
+        let path_uniq = path_of(uniq);
+
+        assert_ne!(
+            path_a, path_b,
+            "colliding frames must get two DISTINCT calibrated files"
+        );
+        assert!(
+            path_a.contains(&format!("_f{dup_a}")),
+            "colliding frame {dup_a} must carry the disambiguating suffix: {path_a}"
+        );
+        assert!(
+            path_b.contains(&format!("_f{dup_b}")),
+            "colliding frame {dup_b} must carry the disambiguating suffix: {path_b}"
+        );
+        assert!(
+            !path_uniq.contains("_f"),
+            "a frame with a unique source name keeps the plain name: {path_uniq}"
+        );
+
+        let calibrated_dir = layout.calibrated_dir(&group_key);
+        let files_on_disk = std::fs::read_dir(&calibrated_dir).unwrap().count();
+        assert_eq!(
+            files_on_disk, 3,
+            "three distinct files on disk — neither collision overwrote the other"
+        );
     }
 
     // ── stages 3-5 (Task 7): measure & select, reference, register ─────────
