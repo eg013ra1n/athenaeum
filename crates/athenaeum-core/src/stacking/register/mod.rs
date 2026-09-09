@@ -9,6 +9,7 @@
 pub mod align;
 pub mod detect;
 pub mod frame;
+pub mod writer;
 
 use serde::{Deserialize, Serialize};
 

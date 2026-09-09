@@ -128,7 +128,7 @@ fn resolve_type(
 /// preserved as `Integer`/`Real` so copied-through WCS/optics cards keep their
 /// type; everything else becomes a string. A keyword `fits_writer` rejects
 /// (>8 chars, reserved) is dropped rather than erroring the whole frame.
-fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
+pub(crate) fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
     let cv = if let Ok(i) = value.parse::<i64>() {
         CardValue::Integer(i)
     } else if let Ok(f) = value.parse::<f64>() {

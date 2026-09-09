@@ -444,6 +444,17 @@ fn process_file(
             );
             return Ok(None);
         }
+
+        // Stacking artifacts (registered frames, masters — stacking spec §3.7,
+        // §6.4) are recognized the same way and never cataloged.
+        if keys.contains_key("ATH_REG") || keys.contains_key("ATH_STK") {
+            tracing::debug!(
+                root_id,
+                path = %current_path,
+                "stacking artifact (ATH_REG/ATH_STK) — never cataloged"
+            );
+            return Ok(None);
+        }
     }
 
     // Check for moved files using the header fingerprint
@@ -1604,6 +1615,20 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 "calibrated artifact (CALSTAT+ATH_CSRC) — never cataloged"
             );
             continue;
+        }
+
+        // Stacking artifacts (registered frames, masters — stacking spec §3.7,
+        // §6.4) are recognized the same way and never cataloged.
+        if let Some(ref header) = file_result.header {
+            let keys = parse_stored_header_keys(file_result.file.format.clone(), header);
+            if keys.contains_key("ATH_REG") || keys.contains_key("ATH_STK") {
+                tracing::debug!(
+                    root_id,
+                    path = %file_result.file.path,
+                    "stacking artifact (ATH_REG/ATH_STK) — never cataloged"
+                );
+                continue;
+            }
         }
 
         // Check for moved files (same fingerprint at different path)
@@ -3151,6 +3176,46 @@ mod calibrated_light_scan_tests {
                 headers_total, 0,
                 "parallel={parallel}: artifact banked a header blob"
             );
+        }
+    }
+
+    /// Stacking artifacts (registered frames, masters — stacking spec §3.7,
+    /// §6.4) are recognized the same way and never cataloged: a file carrying
+    /// `ATH_REG` or `ATH_STK` is skipped outright, through both scan entry
+    /// points, exactly like a calibrated-LIGHT artifact.
+    #[test]
+    fn scan_never_catalogs_a_stacking_artifact() {
+        for marker in ["ATH_REG", "ATH_STK"] {
+            for parallel in [false, true] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("r_sub.fits");
+                let cards = vec![
+                    Card::new(marker, CardValue::Logical(true)).unwrap(),
+                    Card::new("IMAGETYP", CardValue::Str("LIGHT".into())).unwrap(),
+                ];
+                write_fits_f32(&path, 16, 16, 1, &vec![0.1; 256], &cards).unwrap();
+                let path_str = path.to_str().unwrap().to_string();
+
+                let conn = fresh_db(root.path(), 1);
+                let result = run_scan(parallel, root.path(), &conn, 1);
+                assert!(
+                    result.errors.is_empty(),
+                    "marker={marker} parallel={parallel}: {:?}",
+                    result.errors
+                );
+                assert_eq!(
+                    files_count(&conn, &path_str),
+                    0,
+                    "marker={marker} parallel={parallel}: no files row"
+                );
+                let files_total: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(
+                    files_total, 0,
+                    "marker={marker} parallel={parallel}: artifact contributed no files row"
+                );
+            }
         }
     }
 
