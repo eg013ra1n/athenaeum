@@ -28,9 +28,15 @@ pub const AUTO_AFFINE_MIN: usize = 12;
 /// `distortion: auto` needs this many refit inliers (spec §3.3).
 pub const AUTO_DISTORTION_MIN_INLIERS: usize = 200;
 /// `distortion: auto` also requires the inliers' convex hull to cover this
-/// fraction of the pair hull (the RANSAC overlap index): on a 15 %-overlap
-/// subject a cubic fitted on one corner extrapolated 180 px at the others.
+/// fraction of the matched pairs' hull (the RANSAC overlap index — a
+/// consistency check on the matching: 0.35 on a subject whose few true
+/// pairs sat in a corner of many false ones) …
 pub const AUTO_DISTORTION_MIN_OVERLAP: f64 = 0.6;
+/// … and the inliers to occupy this fraction of a 4×4 grid over the frame
+/// (the RANSAC regularity index): a polynomial fitted on one corner says
+/// nothing about the rest of the frame — on the real data the low-coverage
+/// OSC subject scores 0.5, the well-covered ones 0.69–1.0.
+pub const AUTO_DISTORTION_MIN_REGULARITY: f64 = 0.6;
 /// Refit clipping (spec §3.2 step 4).
 pub const CLIP_SIGMA: f64 = 3.0;
 /// Joint fits: the second round's affine correction is ≈ identity and
@@ -127,11 +133,18 @@ pub fn resolve_model(choice: ModelChoice, n: usize) -> LinearKind {
 }
 
 /// The order `distortion: auto` resolves to: 3 for a cross-geometry subject
-/// with enough, well-spread inliers; `None` keeps the linear model.
-pub fn auto_distortion_order(cross_geometry: bool, inliers: usize, overlap: f64) -> Option<u8> {
+/// with enough inliers that are consistent (`overlap`) and spread over the
+/// frame (`regularity`); `None` keeps the linear model.
+pub fn auto_distortion_order(
+    cross_geometry: bool,
+    inliers: usize,
+    overlap: f64,
+    regularity: f64,
+) -> Option<u8> {
     (cross_geometry
         && inliers >= AUTO_DISTORTION_MIN_INLIERS
-        && overlap >= AUTO_DISTORTION_MIN_OVERLAP)
+        && overlap >= AUTO_DISTORTION_MIN_OVERLAP
+        && regularity >= AUTO_DISTORTION_MIN_REGULARITY)
         .then_some(3)
 }
 
@@ -365,15 +378,15 @@ pub fn align(
     let cross_geometry = subject_geometry != reference_geometry;
     let wanted = match cfg.distortion {
         DistortionChoice::Auto => {
+            let (overlap, regularity) = (ransac.quality.overlap, ransac.quality.regularity);
             let order =
-                auto_distortion_order(cross_geometry, refit.inliers.len(), ransac.quality.overlap);
+                auto_distortion_order(cross_geometry, refit.inliers.len(), overlap, regularity);
             if order.is_none()
                 && cross_geometry
                 && refit.inliers.len() >= AUTO_DISTORTION_MIN_INLIERS
             {
                 warnings.push(format!(
-                    "auto distortion skipped: overlap {:.3} below {AUTO_DISTORTION_MIN_OVERLAP}; linear model kept",
-                    ransac.quality.overlap
+                    "auto distortion skipped: overlap {overlap:.3} (min {AUTO_DISTORTION_MIN_OVERLAP}), regularity {regularity:.3} (min {AUTO_DISTORTION_MIN_REGULARITY}); linear model kept"
                 ));
             }
             order
@@ -765,25 +778,30 @@ mod tests {
     }
 
     #[test]
-    fn auto_distortion_needs_cross_geometry_enough_inliers_and_overlap() {
-        assert_eq!(auto_distortion_order(true, 200, 0.6), Some(3));
+    fn auto_distortion_needs_cross_geometry_enough_inliers_overlap_and_coverage() {
+        assert_eq!(auto_distortion_order(true, 200, 0.6, 0.6), Some(3));
         assert_eq!(
-            auto_distortion_order(false, 500, 1.0),
+            auto_distortion_order(false, 500, 1.0, 1.0),
             None,
             "same geometry"
         );
         assert_eq!(
-            auto_distortion_order(true, 199, 1.0),
+            auto_distortion_order(true, 199, 1.0, 1.0),
             None,
             "too few inliers"
         );
         assert_eq!(
-            auto_distortion_order(true, 500, 0.59),
+            auto_distortion_order(true, 500, 0.59, 1.0),
             None,
-            "inliers on one side"
+            "inconsistent matching"
         );
         assert_eq!(
-            auto_distortion_order(true, 500, f64::NAN),
+            auto_distortion_order(true, 500, 1.0, 0.5),
+            None,
+            "inliers in one corner"
+        );
+        assert_eq!(
+            auto_distortion_order(true, 500, f64::NAN, 1.0),
             None,
             "no quality"
         );

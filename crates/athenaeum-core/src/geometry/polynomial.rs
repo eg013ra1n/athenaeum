@@ -219,15 +219,15 @@ fn mat_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     out
 }
 
+/// Fraction of each side's extent added to a fitted domain on both ends.
+pub const DOMAIN_MARGIN: f64 = 0.1;
+
 /// Forward and inverse polynomial corrections around a linear model.
 ///
 /// Forward: `ref = p + F(norm(p))`, `p = L(sub)`.
 /// Inverse: `sub = L⁻¹(ref + I(norm(ref)))`.
 /// `norm(x, y) = ((x − cx)/scale, (y − cy)/scale)`; the polynomials return
 /// displacements in pixels.
-/// Fraction of each side's extent added to a fitted domain on both ends.
-pub const DOMAIN_MARGIN: f64 = 0.1;
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Distortion {
@@ -276,7 +276,7 @@ impl Distortion {
     fn clamp(&self, u: f64, v: f64) -> (f64, f64) {
         match self.domain {
             None => (u, v),
-            Some(d) => (u.clamp(d[0], d[2]), v.clamp(d[1], d[3])),
+            Some(d) => (u.max(d[0]).min(d[2]), v.max(d[1]).min(d[3])),
         }
     }
 
@@ -631,6 +631,10 @@ mod tests {
         let far = d.inverse_displacement(-20000.0, -20000.0);
         let corner = d.inverse_displacement(cx + dom[0] * scale, cy + dom[1] * scale);
         assert!((far.0 - corner.0).abs() < 1e-12 && (far.1 - corner.1).abs() < 1e-12);
+        // The forward direction clamps the same way, through the map.
+        let ffar = d.forward_displacement(-20000.0, -20000.0);
+        let fcorner = d.forward_displacement(cx + dom[0] * scale, cy + dom[1] * scale);
+        assert!((ffar.0 - fcorner.0).abs() < 1e-12 && (ffar.1 - fcorner.1).abs() < 1e-12);
         // … which is a bounded, sub-5 px displacement for this barrel …
         assert!((far.0.powi(2) + far.1.powi(2)).sqrt() < 5.0, "{far:?}");
         // … whereas the unbounded cubic runs away.
@@ -641,6 +645,8 @@ mod tests {
         // Inside the fitted region the clamp is the identity: the barrel test's
         // accuracy still holds on every sample.
         let map = PixelMap::with_distortion(linear, d.clone()).unwrap();
+        let (fx, fy) = map.forward(-20000.0, -20000.0);
+        assert!((fx - (-20000.0 + ffar.0)).abs() < 1e-9 && (fy - (-20000.0 + ffar.1)).abs() < 1e-9);
         for ((x, y), (u, v)) in &pairs {
             let (bx, by) = map.inverse(*u, *v);
             assert!(((bx - x).powi(2) + (by - y).powi(2)).sqrt() < 0.01);

@@ -160,12 +160,15 @@ per-frame `delta_RMS`. Results go to
   `inverse_displacement`; a `transform_json` without `domain` stays valid
   and unbounded — and (2) `distortion: auto` additionally requires the
   RANSAC overlap index ≥ 0.6 (`AUTO_DISTORTION_MIN_OVERLAP`, a warning
-  names the skip). (3) Corner deltas against the sidecar measure
-  extrapolation and the ±0.5 origin convention under 180° rotations, so the
-  probe reports `starDeltaPx` (median/p95/max over reference stars both
-  maps place inside the subject) as the Checkpoint A metric. (4) The probe's
-  `--compare` normalizes an ADU-scale comparison image by 65535, fills the
-  warp buffer with 0 and matches under the same row order only; any
+  names the skip) and the regularity index ≥ 0.6
+  (`AUTO_DISTORTION_MIN_REGULARITY`) — the overlap index is matching
+  consistency, regularity is field coverage, and after Task 9's re-pairing
+  only the latter separates a corner-fitted cubic. (3) Corner deltas
+  against the sidecar measure extrapolation and the ±0.5 origin convention
+  under 180° rotations, so the probe reports `starDeltaPx` (median/p95/max
+  over reference stars both maps place inside the subject) as the
+  Checkpoint A metric. (4) The probe's `--compare` normalizes an ADU-scale
+  comparison image by 65535 and matches under the same row order only; any
   sidecar/write/compare error exits 1. (5) `ROWORDER` copies through to
   registered frames (orientation, not CFA). (6) The example no longer names
   the external stacker.
