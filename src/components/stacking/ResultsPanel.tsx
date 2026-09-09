@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronDown, Copy, Check, FolderOpen, Loader2, SquareStack, Trash2 } from 'lucide-react';
 import { api } from '../../api';
-import { openPath } from '../../api/desktop';
+import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useStackingContext } from '../../contexts/StackingContext';
@@ -26,20 +26,47 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/** Type guard for a parsed `GroupStats` (fix round 1, Important #7) —
+ *  checks exactly the fields the card below reads, so a shape that doesn't
+ *  actually support those reads is rejected here rather than trusted via
+ *  `as GroupStats` and blowing up (or silently rendering `undefined`) at
+ *  render time. */
+function isGroupStats(x: unknown): x is GroupStats {
+  if (!x || typeof x !== 'object') return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o.rejectedLowFraction === 'number' &&
+    typeof o.rejectedHighFraction === 'number' &&
+    Array.isArray(o.masterNoise) &&
+    Array.isArray(o.snrGain)
+  );
+}
+
 function parseGroupStats(raw: string | null): GroupStats | null {
   if (!raw) return null;
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as GroupStats;
+    parsed = JSON.parse(raw);
   } catch (err) {
     console.error('[ResultsPanel] failed to parse group stats_json:', err);
     return null;
   }
+  if (!isGroupStats(parsed)) {
+    console.error('[ResultsPanel] group stats_json failed shape validation:', parsed);
+    return null;
+  }
+  return parsed;
 }
 
-/** Reveal on desktop (`openPath` — spec: a no-op on the web build); on the
+/** Reveal on desktop (`revealItemInDir` — a no-op on the web build); on the
  *  web build show the full path with a copy-to-clipboard button instead,
  *  branching on the exact `isTauri` check `src/api/desktop.ts` itself
- *  documents (Plan 5b Task 4, Decisions item 5). */
+ *  documents. Fix round 1, Minor #5: `revealItemInDir` (opens the item's
+ *  PARENT folder and highlights it), not `openPath` (opens the file/folder
+ *  itself) — the same function every other "reveal in file manager" call
+ *  site in the app already uses (`RoleInspector.tsx`,
+ *  `DualPaneFileBrowser.tsx`, `MonitoredInspector.tsx`,
+ *  `ArchiveInspector.tsx`). */
 function RevealOrPath({ path }: { path: string | null }) {
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
@@ -50,7 +77,7 @@ function RevealOrPath({ path }: { path: string | null }) {
     return (
       <button
         type="button"
-        onClick={() => void openPath(path).catch((e) => console.error('[ResultsPanel] openPath failed:', e))}
+        onClick={() => void revealItemInDir(path).catch((e) => console.error('[ResultsPanel] revealItemInDir failed:', e))}
         className="flex items-center gap-1 text-xs text-content-secondary hover:text-accent transition-colors"
       >
         <FolderOpen size={12} /> Reveal
@@ -107,9 +134,6 @@ function RevealOrPath({ path }: { path: string | null }) {
 
 function MasterCard({ group }: { group: StackingRunGroupRow }) {
   const stats = parseGroupStats(group.statsJson);
-  const rejectedPct = stats ? (stats.rejectedLowFraction + stats.rejectedHighFraction) * 100 : null;
-  const noise = stats && stats.masterNoise.length > 0 ? stats.masterNoise[0] : null;
-  const gain = stats && stats.snrGain.length > 0 ? stats.snrGain[0] : null;
 
   return (
     <div className="bg-surface rounded-lg border border-border p-3 space-y-2 min-w-0">
@@ -123,15 +147,22 @@ function MasterCard({ group }: { group: StackingRunGroupRow }) {
         </div>
       </div>
 
-      <p className="text-xs text-content-secondary tabular-nums">
-        {group.includedCount} frames
-        {rejectedPct != null ? ` · ${rejectedPct.toFixed(3)}% rejected` : ''}
-      </p>
-      <p className="text-xs text-content-secondary tabular-nums">
-        {noise != null ? `noise ${noise.toExponential(3)}` : 'noise —'}
-        {' · '}
-        {gain != null ? `SNR gain ${gain.toFixed(2)}×` : 'SNR gain —'}
-      </p>
+      <p className="text-xs text-content-secondary tabular-nums">{group.includedCount} frames</p>
+
+      {/* Fix round 1, Important #7: omit the stats line entirely when
+       *  `statsJson` is absent or fails shape validation — no "—"
+       *  placeholders standing in for numbers that were never computed
+       *  (a group whose stats stage hasn't run yet, or an imported/corrupt
+       *  row) rather than a real zero. */}
+      {stats && (
+        <p className="text-xs text-content-secondary tabular-nums">
+          {((stats.rejectedLowFraction + stats.rejectedHighFraction) * 100).toFixed(3)}% rejected
+          {' · '}
+          {stats.masterNoise.length > 0 ? `noise ${stats.masterNoise[0].toExponential(3)}` : 'noise —'}
+          {' · '}
+          {stats.snrGain.length > 0 ? `SNR gain ${stats.snrGain[0].toFixed(2)}×` : 'SNR gain —'}
+        </p>
+      )}
 
       {group.status === 'failed' && group.error && (
         <p className="text-xs text-error">{group.error}</p>
@@ -168,6 +199,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   const [runDetail, setRunDetail] = useState<StackingRunDetail | null>(null);
   const [usage, setUsage] = useState<WorkUsage | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
   const [provenanceOpen, setProvenanceOpen] = useState(false);
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState(false);
   const [cleaning, setCleaning] = useState(false);
@@ -236,8 +268,13 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
     try {
       const u = await api.invoke<WorkUsage>('get_stacking_work_usage', { setId });
       setUsage(u);
+      setUsageError(null);
     } catch (err) {
       console.error('[ResultsPanel] get_stacking_work_usage failed:', err);
+      // Fix round 1, Minor #6: a fetch failure must not leave the line
+      // reading "loading…" forever — that's indistinguishable from a slow
+      // request still in flight.
+      setUsageError(String(err));
     }
   }, [setId]);
   useEffect(() => { void fetchUsage(); }, [fetchUsage, lastOutcomeRunId]);
@@ -252,6 +289,14 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
         kind: 'stacking',
         tone: 'success',
       });
+      // Fix round 1, Important #1: `cleanup_stacking_work` deletes the
+      // artifact rows `build_plan` derives `calibratedCached`/
+      // `metricsCached`/`staleStages` from — without this, the board keeps
+      // showing them as cached and "Re-run from" keeps offering stale
+      // stages after a successful cleanup. `StackingTab` already listens
+      // for this event (the same one a finished master build or another
+      // completed run dispatches).
+      window.dispatchEvent(new Event('library-updated'));
       await fetchUsage();
     } catch (err) {
       console.error('[ResultsPanel] cleanup_stacking_work failed:', err);
@@ -348,7 +393,9 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
         <p className="text-xs text-content-muted">
           {usage
             ? `Working folder: ${formatBytes(usage.totalBytes)} total — ${formatBytes(usage.calibratedBytes)} calibrated · ${formatBytes(usage.registeredBytes)} registered · ${formatBytes(usage.lnBytes)} local-norm · ${formatBytes(usage.runsBytes)} run archives`
-            : 'Working folder usage: loading…'}
+            : usageError
+              ? 'Working folder usage: unavailable'
+              : 'Working folder usage: loading…'}
         </p>
         <button
           type="button"

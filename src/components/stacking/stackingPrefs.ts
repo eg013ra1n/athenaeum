@@ -111,7 +111,10 @@ const STACKING_SELECTED_RUN_KEY_PREFIX = 'athenaeum.stacking.selectedRun.';
 export function readSelectedRunId(setId: number): number | null {
   try {
     const raw = localStorage.getItem(`${STACKING_SELECTED_RUN_KEY_PREFIX}${setId}`);
-    if (raw === null) return null;
+    // Fix round 1, Minor #9: `Number('')` is `0`, not `NaN` — an empty
+    // string must be rejected explicitly before it silently reads back as
+    // a real (and almost certainly wrong) run id.
+    if (raw === null || raw === '') return null;
     const n = Number(raw);
     return Number.isFinite(n) ? n : null;
   } catch (err) {

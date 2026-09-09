@@ -133,6 +133,18 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const dirtyRef = useRef(false);
   const draftForSetRef = useRef<number | null>(null);
 
+  // Fix round 1, Minor #4: whether the currently-pending write includes an
+  // EXCLUSION change — set only by `setUserExcludedFrameIds`, cleared only
+  // once the write carrying it is actually dispatched (same "clear at send
+  // time, not schedule time" discipline as `dirtyRef` itself). `build_plan`
+  // reads `excluded_frame_ids` from the STORED row, never a client override
+  // (`crates/athenaeum-core/src/stacking/plan.rs`), so only a write that
+  // changed the excluded-id list needs the post-write `refetchPlan` below —
+  // a pure config edit is already re-planned by the 300 ms draft-change
+  // effect using a client override, and re-planning it again after the
+  // persist lands would just be a redundant round trip.
+  const exclusionDirtyRef = useRef(false);
+
   /** The only way `draftConfig` should change as a result of a USER action.
    *  The load effect calls `setDraftConfig` directly (bypassing this) so it
    *  can never mark the draft dirty — visiting a set with no stored
@@ -149,6 +161,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
    *  `handleToggleExcludeFrame` below, goes through here. */
   const setUserExcludedFrameIds = useCallback<typeof setExcludedFrameIds>((value) => {
     dirtyRef.current = true;
+    exclusionDirtyRef.current = true;
     setExcludedFrameIds(value);
   }, []);
 
@@ -291,6 +304,8 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     const payload = pendingWriteRef.current;
     if (!payload) return;
     dirtyRef.current = false;
+    const shouldRefetchPlan = exclusionDirtyRef.current;
+    exclusionDirtyRef.current = false;
     pendingWriteRef.current = null;
     api.invoke('set_stacking_config', payload)
       .then(() => {
@@ -300,9 +315,13 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
         // config edit alone already re-plans via the 300 ms draft-change
         // effect using a client override, but the Frames table's include
         // checkbox only ever changes `excludedFrameIds`, which that effect
-        // does not watch. Re-plan once the write that actually changed the
-        // stored row has landed (Task 4 brief, Decisions item 2).
-        void refetchPlan(payload.config);
+        // does not watch. Re-plan only when THIS write actually changed the
+        // excluded-id list (fix round 1, Minor #4) — a pure config write
+        // skips this, since the draft effect already covers it and a
+        // second refetch here would just be a redundant round trip.
+        if (shouldRefetchPlan) {
+          void refetchPlan(payload.config);
+        }
       })
       .catch((err) => {
         console.error('[StackingTab] set_stacking_config failed:', err);
@@ -730,6 +749,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
         onToggleExclude={handleToggleExcludeFrame}
         collapsed={framesCollapsed}
         onToggleCollapsed={handleToggleFramesCollapsed}
+        disabled={running}
       />
 
       <ResultsPanel
