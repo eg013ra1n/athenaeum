@@ -10,17 +10,31 @@ import type {
   StackingPlan,
   StackingPreset,
   StackingPresets,
+  StackingRunDetail,
   StackingSetConfig,
 } from '../../types/stacking';
 import { PipelineBoard } from './PipelineBoard';
 import { GroupsTable } from './GroupsTable';
 import { StageInspector } from './StageInspector';
+import { FramesTable, type LightFrameRef } from './FramesTable';
+import { ResultsPanel } from './ResultsPanel';
 import { stableStringify, type BoardStage } from './stageSummary';
-import { readSelectedStage, writeSelectedStage } from './stackingPrefs';
+import {
+  readSelectedStage,
+  writeSelectedStage,
+  readFramesCollapsed,
+  writeFramesCollapsed,
+} from './stackingPrefs';
 
 export interface StackingTabProps {
   framesSetId: number;
   frameSetName?: string;
+  /** The set's LIGHT frames (Task 4, Decisions item 3) — `FrameSetDetail.tsx`
+   *  derives this from its own `detail.nights` tree, the same source every
+   *  other tab on this page reads. Used by the Frames table both before any
+   *  run exists (the only frame list available) and after one, as the
+   *  filename fallback for a row a run's summary hasn't reached yet. */
+  lightFrames: LightFrameRef[];
 }
 
 const STAGE_LABEL: Record<BoardStage, string> = {
@@ -68,7 +82,7 @@ function withoutPaths(config: StackingConfig): Omit<StackingConfig, 'paths'> {
 // header. Nothing else in this tab needs the set name (FrameSetDetail's own
 // header above the tab bar already shows it), so it is simply not
 // destructured here.
-export function StackingTab({ framesSetId }: StackingTabProps) {
+export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const navigate = useNavigate();
   const { notify } = useNotifications();
   const { progress, lastOutcome, startRun, cancelRun, isRunning } = useStackingContext();
@@ -83,6 +97,12 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
   const [starting, setStarting] = useState(false);
   const [rerunMenuOpen, setRerunMenuOpen] = useState(false);
   const [presetMenuOpen, setPresetMenuOpen] = useState(false);
+  const [framesCollapsed, setFramesCollapsed] = useState<boolean>(readFramesCollapsed);
+  // Lifted up from `ResultsPanel` (a sibling of `FramesTable`, not its
+  // parent) so the Frames table can join its rows against the Results
+  // panel's currently-selected run without either component reaching into
+  // the other directly.
+  const [selectedRunDetail, setSelectedRunDetail] = useState<StackingRunDetail | null>(null);
 
   const runProgress = progress.get(framesSetId);
   const runOutcome = lastOutcome.get(framesSetId);
@@ -121,6 +141,30 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
   const setUserConfig = useCallback<typeof setDraftConfig>((value) => {
     dirtyRef.current = true;
     setDraftConfig(value);
+  }, []);
+
+  /** The exclusion-list analogue of `setUserConfig` above — Ruling 7's ONE
+   *  frame-level write. The load effect calls `setExcludedFrameIds`
+   *  directly (bypassing this), so opening a set never marks the draft
+   *  dirty on its own; only the Frames table's include checkbox, through
+   *  `handleToggleExcludeFrame` below, goes through here. */
+  const setUserExcludedFrameIds = useCallback<typeof setExcludedFrameIds>((value) => {
+    dirtyRef.current = true;
+    setExcludedFrameIds(value);
+  }, []);
+
+  const handleToggleExcludeFrame = useCallback((frameId: number) => {
+    setUserExcludedFrameIds((prev) =>
+      prev.includes(frameId) ? prev.filter((id) => id !== frameId) : [...prev, frameId],
+    );
+  }, [setUserExcludedFrameIds]);
+
+  const handleToggleFramesCollapsed = useCallback(() => {
+    setFramesCollapsed((prev) => {
+      const next = !prev;
+      writeFramesCollapsed(next);
+      return next;
+    });
   }, []);
 
   const refetchPlan = useCallback(async (configOverride?: StackingConfig) => {
@@ -241,19 +285,31 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
     if (!payload) return;
     dirtyRef.current = false;
     pendingWriteRef.current = null;
-    api.invoke('set_stacking_config', payload).catch((err) => {
-      console.error('[StackingTab] set_stacking_config failed:', err);
-      if (notifyOnFailure) {
-        notify({
-          tone: 'warning',
-          kind: 'stacking',
-          toast: true,
-          title: 'Stacking settings not saved',
-          detail: String(err),
-        });
-      }
-    });
-  }, [notify]);
+    api.invoke('set_stacking_config', payload)
+      .then(() => {
+        // `build_plan` computes `includedCount` (and everything else the
+        // excluded-frame list affects) from the STORED row, never a client
+        // override (`crates/athenaeum-core/src/stacking/plan.rs`) — a
+        // config edit alone already re-plans via the 300 ms draft-change
+        // effect using a client override, but the Frames table's include
+        // checkbox only ever changes `excludedFrameIds`, which that effect
+        // does not watch. Re-plan once the write that actually changed the
+        // stored row has landed (Task 4 brief, Decisions item 2).
+        void refetchPlan(payload.config);
+      })
+      .catch((err) => {
+        console.error('[StackingTab] set_stacking_config failed:', err);
+        if (notifyOnFailure) {
+          notify({
+            tone: 'warning',
+            kind: 'stacking',
+            toast: true,
+            title: 'Stacking settings not saved',
+            detail: String(err),
+          });
+        }
+      });
+  }, [notify, refetchPlan]);
 
   // Persist (debounced) whenever the draft config or the excluded-frame list
   // changes. Fix round 1, Critical #1: writes only when `dirtyRef.current`
@@ -639,6 +695,24 @@ export function StackingTab({ framesSetId }: StackingTabProps) {
           />
         </div>
       </div>
+
+      {/* Frames + Results — full width, below the board/inspector split
+       *  (the Frames table's nine columns need the room; the Results
+       *  panel's master cards read better at full width too). */}
+      <FramesTable
+        lightFrames={lightFrames}
+        runDetail={selectedRunDetail}
+        excludedFrameIds={excludedFrameIds}
+        onToggleExclude={handleToggleExcludeFrame}
+        collapsed={framesCollapsed}
+        onToggleCollapsed={handleToggleFramesCollapsed}
+      />
+
+      <ResultsPanel
+        setId={framesSetId}
+        running={running}
+        onSelectedRunDetailChange={setSelectedRunDetail}
+      />
     </div>
   );
 }

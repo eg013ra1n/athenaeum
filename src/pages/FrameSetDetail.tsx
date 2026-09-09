@@ -393,6 +393,30 @@ export default function FrameSetDetail() {
     return map.size > 0 ? map : undefined;
   }, [calibrationHierarchy, analysisData, blackholedFileIds]);
 
+  // Stacking tab (Plan 5b Task 4, Decisions item 3): the set's LIGHT frames,
+  // read straight off `detail.nights` — the same tree every other tab on
+  // this page ultimately derives its frame lists from — rather than a
+  // second fetch. Same imagetyp+format filter `handleBlink` above already
+  // uses (a stacking run only ever reads FITS/XISF light frames).
+  const stackingLightFrames = useMemo(() => {
+    if (!detail) return [];
+    const out: { frameId: number; filename: string }[] = [];
+    for (const night of detail.nights) {
+      for (const session of night.sessions) {
+        for (const fw of session.frames) {
+          if (
+            fw.frame?.imagetyp === 'Light' &&
+            fw.frame.id != null &&
+            (fw.file.format === 'FITS' || fw.file.format === 'XISF')
+          ) {
+            out.push({ frameId: fw.frame.id, filename: fw.file.filename });
+          }
+        }
+      }
+    }
+    return out;
+  }, [detail]);
+
   // Load data on mount and when navigating back
   useEffect(() => {
     loadData();
@@ -958,6 +982,7 @@ export default function FrameSetDetail() {
               key={id}
               framesSetId={parseInt(id!)}
               frameSetName={detail?.frames_set?.name ?? undefined}
+              lightFrames={stackingLightFrames}
             />
           ) : activeTab === 'export' ? (
             <ExportTab
