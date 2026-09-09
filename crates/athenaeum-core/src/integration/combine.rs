@@ -16,6 +16,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A stack element the rejection routines can order and read: the plain
+/// sample for master builds, a `(value, frame index)` pair for the
+/// stacking engine, which needs to know WHICH frames survived.
+pub trait Sample: Copy {
+    fn value(self) -> f32;
+}
+
+impl Sample for f32 {
+    #[inline]
+    fn value(self) -> f32 {
+        self
+    }
+}
+
+impl Sample for (f32, u16) {
+    #[inline]
+    fn value(self) -> f32 {
+        self.0
+    }
+}
+
 /// Fixed upper bound on the rejection refit loop (spec §1) so an adversarial
 /// pixel stack can never spin unbounded on this hot path.
 const MAX_REJECTION_ITERS: usize = 20;
@@ -126,37 +147,37 @@ impl Rejection {
 
 // ── Numeric helpers ─────────────────────────────────────────────────────────
 
-fn mean_f64(v: &[f32]) -> f64 {
+fn mean_f64<T: Sample>(v: &[T]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64
+    v.iter().map(|s| s.value() as f64).sum::<f64>() / v.len() as f64
 }
 
-fn mean(v: &[f32]) -> f32 {
+fn mean<T: Sample>(v: &[T]) -> f32 {
     mean_f64(v) as f32
 }
 
-fn median_sorted(v: &[f32]) -> f32 {
+fn median_sorted<T: Sample>(v: &[T]) -> f32 {
     let n = v.len();
     if n == 0 {
         return 0.0;
     }
     if n % 2 == 1 {
-        v[n / 2]
+        v[n / 2].value()
     } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
+        (v[n / 2 - 1].value() + v[n / 2].value()) / 2.0
     }
 }
 
-fn stddev(v: &[f32], m: f64) -> f64 {
+fn stddev<T: Sample>(v: &[T], m: f64) -> f64 {
     if v.len() < 2 {
         return 0.0;
     }
     let var = v
         .iter()
-        .map(|&x| {
-            let d = x as f64 - m;
+        .map(|s| {
+            let d = s.value() as f64 - m;
             d * d
         })
         .sum::<f64>()
@@ -164,8 +185,8 @@ fn stddev(v: &[f32], m: f64) -> f64 {
     var.sqrt()
 }
 
-fn sort_asc(v: &mut [f32]) {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+fn sort_asc<T: Sample>(v: &mut [T]) {
+    v.sort_by(|a, b| a.value().partial_cmp(&b.value()).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -210,9 +231,98 @@ pub fn combine_pixel(values: &mut [f32], recipe: IntegrationRecipe) -> (f32, usi
     (val, n - kept)
 }
 
+// ── Survivor masks ───────────────────────────────────────────────────────────
+
+/// Words a survivor mask needs for `n` frames.
+#[inline]
+pub fn mask_words(n: usize) -> usize {
+    n.div_ceil(64)
+}
+
+#[inline]
+pub fn mask_clear(mask: &mut [u64]) {
+    mask.iter_mut().for_each(|w| *w = 0);
+}
+
+#[inline]
+pub fn mask_set(mask: &mut [u64], i: usize) {
+    mask[i / 64] |= 1u64 << (i % 64);
+}
+
+#[inline]
+pub fn mask_get(mask: &[u64], i: usize) -> bool {
+    mask[i / 64] & (1u64 << (i % 64)) != 0
+}
+
+/// Weighted combination of one pixel column (spec §6.2, math reference §3.2
+/// steps 3, 5, 6).
+///
+/// `work[k] = (rejection-normalized value, frame index)` for every frame
+/// with a usable sample (the caller has already dropped missing and
+/// range-rejected samples); it is reordered in place. `out_values[i]` is
+/// frame `i`'s OUTPUT-normalized value and `weights[i]` its weight, both
+/// indexed by frame — only the indices present in `work` are read. The
+/// rejection runs on `work`; the result is the weighted mean of the
+/// survivors' `out_values` (samples with `out_values == 0` or `weight <= 0`
+/// are skipped, math reference §3.6) or their median (weights ignored).
+/// Every survivor's bit is set in `mask` (the caller clears it first) and
+/// the rejected count is returned. All rejected → the median of every
+/// `out_values` present in `work`, no bit set.
+pub fn combine_pixel_weighted(
+    work: &mut [(f32, u16)],
+    out_values: &[f32],
+    weights: &[f32],
+    recipe: IntegrationRecipe,
+    mask: &mut [u64],
+) -> (f32, usize) {
+    let n = work.len();
+    if n == 0 {
+        return (0.0, 0);
+    }
+    let (kept, _sorted) = apply_rejection(work, recipe.rejection);
+    if kept == 0 {
+        let mut all: Vec<f32> = work.iter().map(|&(_, i)| out_values[i as usize]).collect();
+        sort_asc(&mut all);
+        return (median_sorted(&all), n);
+    }
+    for &(_, i) in &work[..kept] {
+        mask_set(mask, i as usize);
+    }
+    let value = match recipe.combination {
+        Combination::Average => {
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for &(_, i) in &work[..kept] {
+                let x = out_values[i as usize];
+                let w = weights[i as usize];
+                if x != 0.0 && w > 0.0 {
+                    num += x as f64 * w as f64;
+                    den += w as f64;
+                }
+            }
+            if den > 0.0 {
+                (num / den) as f32
+            } else {
+                // Every survivor was a zero-valued or zero-weighted sample:
+                // the plain mean of the survivors, as the unweighted path.
+                let mut vals: Vec<f32> =
+                    work[..kept].iter().map(|&(_, i)| out_values[i as usize]).collect();
+                mean(&mut vals)
+            }
+        }
+        Combination::Median => {
+            let mut vals: Vec<f32> =
+                work[..kept].iter().map(|&(_, i)| out_values[i as usize]).collect();
+            sort_asc(&mut vals);
+            median_sorted(&vals)
+        }
+    };
+    (value, n - kept)
+}
+
 /// Runs the chosen rejection algorithm in place, returning
 /// `(surviving_count, prefix_is_sorted_ascending)`.
-fn apply_rejection(values: &mut [f32], rejection: Rejection) -> (usize, bool) {
+fn apply_rejection<T: Sample>(values: &mut [T], rejection: Rejection) -> (usize, bool) {
     let n = values.len();
     match rejection {
         Rejection::None => (n, false),
@@ -231,7 +341,7 @@ fn apply_rejection(values: &mut [f32], rejection: Rejection) -> (usize, bool) {
 
 // ── Rejection algorithms (in place, allocation-free except winsorized) ──────
 
-fn reject_percentile(values: &mut [f32], low: f64, high: f64) -> (usize, bool) {
+fn reject_percentile<T: Sample>(values: &mut [T], low: f64, high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
         return (n, false);
@@ -246,7 +356,7 @@ fn reject_percentile(values: &mut [f32], low: f64, high: f64) -> (usize, bool) {
     // sorted (w <= r throughout, so the write never clobbers an unread slot).
     let mut w = 0usize;
     for r in 0..n {
-        let xf = values[r] as f64;
+        let xf = values[r].value() as f64;
         let dev = (xf - m) / m.abs();
         let reject = (dev < 0.0 && -dev > low) || (dev > 0.0 && dev > high);
         if !reject {
@@ -257,7 +367,7 @@ fn reject_percentile(values: &mut [f32], low: f64, high: f64) -> (usize, bool) {
     (w, true)
 }
 
-fn reject_sigma_clip(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
+fn reject_sigma_clip<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
         return (n, false);
@@ -274,7 +384,7 @@ fn reject_sigma_clip(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
         let hi = m + sigma_high * s;
         let mut w = 0usize;
         for r in 0..kept {
-            let xf = values[r] as f64;
+            let xf = values[r].value() as f64;
             if xf >= lo && xf <= hi {
                 values[w] = values[r];
                 w += 1;
@@ -300,7 +410,7 @@ fn reject_sigma_clip(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
     (kept, false)
 }
 
-fn reject_winsorized(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
+fn reject_winsorized<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
         return (n, false);
@@ -310,7 +420,7 @@ fn reject_winsorized(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
     //    the working copy at m±1.5σ, recompute, repeat to 0.5% change. This
     //    block is byte-identical to the legacy `WinsorizedSigmaClip` estimator
     //    so Average+WinsorizedSigma reproduces the old master exactly.
-    let mut work: Vec<f64> = values.iter().map(|&x| x as f64).collect();
+    let mut work: Vec<f64> = values.iter().map(|s| s.value() as f64).collect();
     let mut m = work.iter().sum::<f64>() / n as f64;
     let mut s = stddev(values, m);
     for _ in 0..10 {
@@ -336,7 +446,7 @@ fn reject_winsorized(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
     let (lo, hi) = (m - sigma_low * s, m + sigma_high * s);
     let mut w = 0usize;
     for r in 0..n {
-        let xf = values[r] as f64;
+        let xf = values[r].value() as f64;
         if xf >= lo && xf <= hi {
             values[w] = values[r];
             w += 1;
@@ -345,7 +455,7 @@ fn reject_winsorized(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
     (w, true)
 }
 
-fn reject_linear_fit(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
+fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
         return (n, false);
@@ -362,7 +472,7 @@ fn reject_linear_fit(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
         let (mut sx, mut sy, mut sxx, mut sxy, mut sabs_y) = (0.0, 0.0, 0.0, 0.0, 0.0);
         for i in 0..k {
             let x = i as f64;
-            let y = values[i] as f64;
+            let y = values[i].value() as f64;
             sx += x;
             sy += y;
             sxx += x * x;
@@ -378,7 +488,7 @@ fn reject_linear_fit(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
         // Residual dispersion = mean absolute deviation of residuals.
         let mut abs_sum = 0.0;
         for i in 0..k {
-            let resid = values[i] as f64 - (a + b * i as f64);
+            let resid = values[i].value() as f64 - (a + b * i as f64);
             abs_sum += resid.abs();
         }
         let d = abs_sum / kf;
@@ -394,7 +504,7 @@ fn reject_linear_fit(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
         let hi = sigma_high * d;
         let mut w = 0usize;
         for i in 0..k {
-            let resid = values[i] as f64 - (a + b * i as f64);
+            let resid = values[i].value() as f64 - (a + b * i as f64);
             if resid >= lo && resid <= hi {
                 values[w] = values[i];
                 w += 1;
@@ -858,5 +968,157 @@ mod tests {
 
         // Unparseable → raw passthrough (nothing lost).
         assert_eq!(describe_recipe_json("not json at all"), "not json at all");
+    }
+
+    // ── Weighted combiner (generic Sample) ──────────────────────────────────
+
+    /// SplitMix64, so the pin needs no dependency.
+    fn rng_next(state: &mut u64) -> f64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn random_stack(state: &mut u64, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                let g = rng_next(state) + rng_next(state) + rng_next(state) - 1.5;
+                let outlier =
+                    if rng_next(state) < 0.05 { 6.0 * (rng_next(state) - 0.5) } else { 0.0 };
+                // Never an exact zero: the weighted path skips zero-valued
+                // samples (missing coverage), the plain mean averages them.
+                (0.2 + 0.01 * g as f32 + outlier as f32).max(1e-4)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn weighted_combiner_with_unit_weights_is_bit_identical_to_combine_pixel() {
+        let recipes = [
+            IntegrationRecipe::average(Rejection::None),
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.2, high: 0.1 }),
+            IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 4.0, sigma_high: 3.0 }),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 }),
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 }),
+            IntegrationRecipe::median(Rejection::SigmaClip { sigma_low: 3.0, sigma_high: 3.0 }),
+            IntegrationRecipe::median(Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 }),
+        ];
+        let mut state = 0x5EED_1234u64;
+        for (k, recipe) in recipes.iter().enumerate() {
+            for trial in 0..300 {
+                let n = 3 + (trial % 30);
+                let stack = random_stack(&mut state, n);
+                let mut plain = stack.clone();
+                let (v_plain, rej_plain) = combine_pixel(&mut plain, *recipe);
+                let mut work: Vec<(f32, u16)> =
+                    stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
+                let weights = vec![1.0f32; n];
+                let mut mask = vec![0u64; mask_words(n)];
+                let (v_w, rej_w) =
+                    combine_pixel_weighted(&mut work, &stack, &weights, *recipe, &mut mask);
+                assert_eq!(
+                    v_plain.to_bits(),
+                    v_w.to_bits(),
+                    "recipe {k} trial {trial}: {v_plain} vs {v_w}"
+                );
+                assert_eq!(rej_plain, rej_w, "recipe {k} trial {trial}");
+                let survivors = (0..n).filter(|&i| mask_get(&mask, i)).count();
+                assert_eq!(survivors, n - rej_w, "recipe {k} trial {trial}");
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_average_weights_survivors_and_skips_zero_and_unweighted_samples() {
+        // frames: 0 → 1.0 (w 3), 1 → 2.0 (w 1), 2 → 0.0 (w 1, missing coverage), 3 → 4.0 (w 0)
+        let stack = [1.0f32, 2.0, 0.0, 4.0];
+        let mut work: Vec<(f32, u16)> = stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
+        let weights = [3.0f32, 1.0, 1.0, 0.0];
+        let mut mask = vec![0u64; 1];
+        let (v, rej) = combine_pixel_weighted(
+            &mut work,
+            &stack,
+            &weights,
+            IntegrationRecipe::average(Rejection::None),
+            &mut mask,
+        );
+        assert_eq!(rej, 0);
+        assert!((v - (3.0 * 1.0 + 1.0 * 2.0) / 4.0).abs() < 1e-6, "{v}");
+        assert!((0..4).all(|i| mask_get(&mask, i)));
+    }
+
+    #[test]
+    fn weighted_median_ignores_weights_and_mask_names_the_survivors() {
+        let stack = [0.10f32, 0.11, 0.12, 0.13, 0.90];
+        let mut work: Vec<(f32, u16)> = stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
+        let weights = [1.0f32, 100.0, 1.0, 1.0, 1.0];
+        let mut mask = vec![0u64; 1];
+        let (v, rej) = combine_pixel_weighted(
+            &mut work,
+            &stack,
+            &weights,
+            IntegrationRecipe::median(Rejection::SigmaClip { sigma_low: 1.5, sigma_high: 1.5 }),
+            &mut mask,
+        );
+        assert_eq!(rej, 1, "the 0.90 outlier");
+        assert!(!mask_get(&mask, 4) && (0..4).all(|i| mask_get(&mask, i)));
+        assert!((v - 0.115).abs() < 1e-6, "median of the four survivors: {v}");
+    }
+
+    #[test]
+    fn rejection_normalized_values_decide_survival_but_output_values_are_averaged() {
+        // Rejection copy says frame 2 is an outlier; its output value is ordinary.
+        let rej = [1.0f32, 1.0, 9.0, 1.0, 1.0];
+        let out = [0.5f32, 0.5, 0.5, 0.5, 0.5];
+        let mut work: Vec<(f32, u16)> = rej.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
+        let weights = [1.0f32; 5];
+        let mut mask = vec![0u64; 1];
+        let (v, rejected) = combine_pixel_weighted(
+            &mut work,
+            &out,
+            &weights,
+            IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 2.0, sigma_high: 1.0 }),
+            &mut mask,
+        );
+        assert_eq!(rejected, 1);
+        assert!(!mask_get(&mask, 2));
+        assert_eq!(v, 0.5);
+    }
+
+    #[test]
+    fn all_rejected_falls_back_to_the_median_of_the_output_values() {
+        // PercentileClip with zero thresholds rejects everything but the median.
+        let stack = [0.2f32, 0.3, 0.4];
+        let mut work: Vec<(f32, u16)> = stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
+        let weights = [1.0f32; 3];
+        let mut mask = vec![0u64; 1];
+        let mut plain = stack.to_vec();
+        let (v_plain, r_plain) = combine_pixel(
+            &mut plain,
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.0, high: 0.0 }),
+        );
+        let (v, r) = combine_pixel_weighted(
+            &mut work,
+            &stack,
+            &weights,
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.0, high: 0.0 }),
+            &mut mask,
+        );
+        assert_eq!((v.to_bits(), r), (v_plain.to_bits(), r_plain));
+    }
+
+    #[test]
+    fn mask_helpers_cover_word_boundaries() {
+        let mut m = vec![0u64; mask_words(130)];
+        assert_eq!(m.len(), 3);
+        for i in [0usize, 63, 64, 127, 128, 129] {
+            mask_set(&mut m, i);
+        }
+        assert!(mask_get(&m, 0) && mask_get(&m, 63) && mask_get(&m, 64) && mask_get(&m, 129));
+        assert!(!mask_get(&m, 1) && !mask_get(&m, 65));
+        mask_clear(&mut m);
+        assert!(m.iter().all(|&w| w == 0));
     }
 }
