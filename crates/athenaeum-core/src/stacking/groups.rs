@@ -70,6 +70,10 @@ pub struct IntegrationGroup {
 /// substitutes the grouping-specific fallbacks (`"unknown"` / `"NoFilter"`)
 /// on top of that, since the archive feature's own fallback token
 /// (`"Unknown"`) is a different literal.
+///
+/// This is the sanitizing half of key construction; [`compose_key`] is the
+/// formatting half, shared with `group_frames`, which already has its
+/// tokens (computed once, at bucketing time) and must not re-sanitize.
 pub fn group_key(
     instrume: Option<&str>,
     color: ColorMode,
@@ -80,12 +84,29 @@ pub fn group_key(
     exposure_s: Option<f64>,
 ) -> String {
     let cam = sanitized_or(instrume, "unknown");
+    let filt = sanitized_or(filter, "NoFilter");
+    compose_key(&cam, color, &filt, binning, w, h, exposure_s)
+}
+
+/// Format the group-key string from ALREADY-sanitized tokens — the one
+/// formatting authority both [`group_key`] (sanitizes raw catalog values
+/// itself) and `group_frames` (sanitizes once per member at bucketing time,
+/// then reuses ITS OWN bucket's token here) go through, so a group's key can
+/// never disagree with the token its own bucket was built from.
+fn compose_key(
+    instrume_token: &str,
+    color: ColorMode,
+    filter_token: &str,
+    binning: i64,
+    w: i64,
+    h: i64,
+    exposure_s: Option<f64>,
+) -> String {
     let color_tok = match color {
         ColorMode::Mono => "mono",
         ColorMode::Osc => "osc",
     };
-    let filt = sanitized_or(filter, "NoFilter");
-    let mut key = format!("{cam}__{color_tok}__{filt}__bin{binning}__{w}x{h}");
+    let mut key = format!("{instrume_token}__{color_tok}__{filter_token}__bin{binning}__{w}x{h}");
     if let Some(exp) = exposure_s {
         key.push_str(&format!("__{exp:.0}s"));
     }
@@ -108,6 +129,20 @@ fn sanitized_or(value: Option<&str>, fallback: &str) -> String {
         }
         None => fallback.to_string(),
     }
+}
+
+/// Trim a possibly-absent catalog value, collapsing an empty/whitespace-only
+/// string to `None` — the "honest raw label" a group carries in
+/// `IntegrationGroup.instrume`/`filter` (`'Ha'`, not the sanitized token
+/// `sanitized_or` computes for the KEY). Deliberately not the same helper as
+/// `sanitized_or`: this one must not sanitize, only tidy whitespace, so two
+/// members whose raw values merely differ in case or punctuation still show
+/// their own spelling rather than a shared one.
+fn trimmed_or_none(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Sluggify a frame set's name for use in stacking working/output paths.
@@ -241,53 +276,91 @@ fn cluster_indices(
         .collect()
 }
 
+/// One bucket: every LIGHT member sharing a (sanitized-token) camera /
+/// colour / filter / binning / geometry combination, plus one representative
+/// "honest" raw label per axis (`instrume_raw`/`filter_raw`, trimmed but
+/// NOT sanitized) — the first member's own spelling wins, since the SQL
+/// pulls members in `(date_obs, id)` order and that's as good a tie-break as
+/// any for a value that, by construction, every member of the bucket agrees
+/// on ONLY after sanitizing.
+#[derive(Default)]
+struct Bucket {
+    instrume_raw: Option<String>,
+    filter_raw: Option<String>,
+    members: Vec<LightMember>,
+}
+
 /// Every integration group in a frame set (spec §2): the LIGHT membership,
 /// bucketed by camera / colour mode / filter / binning / geometry and,
 /// optionally, exposure, then sorted by frame count desc, total exposure
 /// desc, key — so the largest, most-representative group always leads.
+///
+/// Bucketing keys on the SAME sanitized tokens [`group_key`] emits (computed
+/// once per member here, then reused via [`compose_key`] when a group is
+/// built), not on the raw `frames.instrume`/`frames.filter` values — those
+/// can disagree between rows that must still be one group (`NULL` vs `''`
+/// vs `'Ha '` vs `'Ha'`; a trailing-space camera name from an XISF header,
+/// which stores keyword values verbatim, or user-typed metadata). Bucketing
+/// on the raw value would silently split one logical group into several,
+/// each getting the SAME final key string once `group_key` sanitized it —
+/// two `IntegrationGroup`s colliding on one `stacking_run_groups(run_id,
+/// group_key)` row and on one output path. Keying on the token instead makes
+/// "one key ⇔ one group" true by construction.
 pub fn group_frames(
     conn: &Connection,
     frames_set_id: i64,
     cfg: &GroupingConfig,
 ) -> Result<Vec<IntegrationGroup>> {
     let members = load_group_members(conn, frames_set_id)?;
+    let total_frames = members.len();
 
     // Bucketed by a plain tuple rather than a dedicated struct: `ColorMode`
     // deliberately does not derive `Hash` (it is a wire type, not a map key
     // elsewhere), so the colour axis rides along as a `bool` (`true` = OSC)
-    // instead of pulling that derive in just for this.
-    type BucketKey = (Option<String>, bool, Option<String>, i64, i64, i64);
-    let mut buckets: HashMap<BucketKey, Vec<LightMember>> = HashMap::new();
+    // instead of pulling that derive in just for this. `instrume`/`filter`
+    // are the SANITIZED tokens (never `None` — `sanitized_or` always
+    // resolves to a concrete string, its own fallback included), so two
+    // members can only land in different buckets when `group_key` would
+    // actually emit different keys for them.
+    type BucketKey = (String, bool, String, i64, i64, i64);
+    let mut buckets: HashMap<BucketKey, Bucket> = HashMap::new();
     for m in members {
         let is_osc = color_mode_of(&m.bayerpat) == ColorMode::Osc;
+        let instrume_token = sanitized_or(m.instrume.as_deref(), "unknown");
+        let filter_token = sanitized_or(m.filter.as_deref(), "NoFilter");
         let key: BucketKey = (
-            m.instrume.clone(),
+            instrume_token,
             is_osc,
-            m.filter.clone(),
+            filter_token,
             m.xbinning.unwrap_or(1),
             m.naxis1.unwrap_or(0),
             m.naxis2.unwrap_or(0),
         );
-        buckets.entry(key).or_default().push(m);
+        let bucket = buckets.entry(key).or_insert_with(|| Bucket {
+            instrume_raw: trimmed_or_none(m.instrume.as_deref()),
+            filter_raw: trimmed_or_none(m.filter.as_deref()),
+            members: Vec::new(),
+        });
+        bucket.members.push(m);
     }
 
     let mut groups = Vec::new();
-    for ((instrume, is_osc, filter, binning, width, height), bucket_members) in buckets {
+    for ((instrume_token, is_osc, filter_token, binning, width, height), bucket) in buckets {
         let color = if is_osc {
             ColorMode::Osc
         } else {
             ColorMode::Mono
         };
-        for (label, idxs) in cluster_indices(&bucket_members, cfg) {
+        for (label, idxs) in cluster_indices(&bucket.members, cfg) {
             let frames: Vec<GroupFrame> = idxs
                 .iter()
-                .map(|&i| to_group_frame(&bucket_members[i]))
+                .map(|&i| to_group_frame(&bucket.members[i]))
                 .collect();
             let total_exposure_s = frames.iter().map(|f| f.exposure_s.unwrap_or(0.0)).sum();
-            let key = group_key(
-                instrume.as_deref(),
+            let key = compose_key(
+                &instrume_token,
                 color,
-                filter.as_deref(),
+                &filter_token,
                 binning,
                 width,
                 height,
@@ -295,9 +368,9 @@ pub fn group_frames(
             );
             groups.push(IntegrationGroup {
                 key,
-                instrume: instrume.clone(),
+                instrume: bucket.instrume_raw.clone(),
                 color_mode: color,
-                filter: filter.clone(),
+                filter: bucket.filter_raw.clone(),
                 binning,
                 width,
                 height,
@@ -319,6 +392,13 @@ pub fn group_frames(
             })
             .then_with(|| a.key.cmp(&b.key))
     });
+
+    tracing::debug!(
+        frame_set_id = frames_set_id,
+        count = groups.len(),
+        frames = total_frames,
+        "integration groups built"
+    );
 
     Ok(groups)
 }
@@ -446,5 +526,76 @@ mod tests {
     fn set_slug_sanitizes() {
         assert_eq!(set_slug("LDN 1272"), sanitize_for_filename("LDN 1272"));
         assert_eq!(set_slug("   "), "set");
+    }
+
+    /// Fix round 1: `NULL`/`''`/`'Ha '`/`'Ha'` are four distinct raw values
+    /// but only two sanitized tokens (`NoFilter`, `Ha`) — bucketing on the
+    /// raw value used to produce four groups sharing two colliding keys.
+    #[test]
+    fn filter_spellings_collapse_to_one_group() {
+        let f = test_fixtures::frame_set("s");
+        let filters: [Option<&str>; 4] = [None, Some(""), Some("Ha "), Some("Ha")];
+        for (i, filt) in filters.iter().enumerate() {
+            test_fixtures::add_light(
+                &f,
+                &LightSpec {
+                    stem: &format!("f{i}"),
+                    instrume: "cam",
+                    filter: *filt,
+                    binning: 1,
+                    width: 8,
+                    height: 8,
+                    exptime: 60.0,
+                    date_obs: "2025-01-01T00:00:00",
+                    bayerpat: None,
+                    write_file: false,
+                },
+            );
+        }
+        let g = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(g.len(), 2, "one group for NoFilter, one for Ha — not four");
+        let no_filter = g
+            .iter()
+            .find(|x| x.key == "cam__mono__NoFilter__bin1__8x8")
+            .expect("NULL and '' collapse into the NoFilter group");
+        assert_eq!(no_filter.frames.len(), 2);
+        let ha = g
+            .iter()
+            .find(|x| x.key == "cam__mono__Ha__bin1__8x8")
+            .expect("'Ha ' and 'Ha' collapse into the Ha group");
+        assert_eq!(ha.frames.len(), 2);
+        assert_ne!(no_filter.key, ha.key);
+    }
+
+    /// Same collision, on the camera axis: a trailing space (the XISF path
+    /// stores keyword values verbatim; so does user-typed metadata) must not
+    /// split one camera into two groups.
+    #[test]
+    fn instrume_spellings_collapse() {
+        let f = test_fixtures::frame_set("s");
+        for (i, instrume) in ["ZWO ASI2600MC Duo", "ZWO ASI2600MC Duo "]
+            .iter()
+            .enumerate()
+        {
+            test_fixtures::add_light(
+                &f,
+                &LightSpec {
+                    stem: &format!("f{i}"),
+                    instrume,
+                    filter: None,
+                    binning: 1,
+                    width: 8,
+                    height: 8,
+                    exptime: 60.0,
+                    date_obs: "2025-01-01T00:00:00",
+                    bayerpat: None,
+                    write_file: false,
+                },
+            );
+        }
+        let g = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].frames.len(), 2);
+        assert_eq!(g[0].key, "ZWO_ASI2600MC_Duo__mono__NoFilter__bin1__8x8");
     }
 }

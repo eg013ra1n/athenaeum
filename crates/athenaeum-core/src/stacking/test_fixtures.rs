@@ -99,15 +99,23 @@ pub(crate) fn add_light(f: &Fixture, spec: &LightSpec<'_>) -> (i64, PathBuf) {
     let filename = format!("{}.fits", spec.stem);
     let path = f.dir.path().join(&filename);
 
-    if spec.write_file {
+    // Honest identity when a file actually exists on disk (Task 6's artifact
+    // hashes and the catalog-vs-disk `disk_matches_row` contract read these
+    // columns); the pre-existing placeholder (`size = 0`, `modified_at` = the
+    // spec's own `date_obs`) otherwise, since there is nothing on disk to
+    // stat.
+    let (size, modified_at) = if spec.write_file {
         write_light_fits(&path, spec);
-    }
+        file_identity(&path)
+    } else {
+        (0, spec.date_obs.to_string())
+    };
 
     f.conn
         .execute(
             "INSERT INTO files (path, filename, size, modified_at, format)
-             VALUES (?1, ?2, 0, ?3, 'FITS')",
-            params![path.to_string_lossy(), filename, spec.date_obs],
+             VALUES (?1, ?2, ?3, ?4, 'FITS')",
+            params![path.to_string_lossy(), filename, size, modified_at],
         )
         .unwrap();
     let file_id = f.conn.last_insert_rowid();
@@ -192,12 +200,13 @@ fn seed_master(
         cards.push(Card::new("ATH_FNRM", CardValue::Real(n)).unwrap());
     }
     write_fits_f32(&path, width, height, 1, &data, &cards).expect("write fixture master FITS");
+    let (size, modified_at) = file_identity(&path);
 
     f.conn
         .execute(
             "INSERT INTO files (path, filename, size, modified_at, format)
-             VALUES (?1, ?2, 0, '2025-01-01T00:00:00Z', 'FITS')",
-            params![path.to_string_lossy(), filename],
+             VALUES (?1, ?2, ?3, ?4, 'FITS')",
+            params![path.to_string_lossy(), filename, size, modified_at],
         )
         .unwrap();
     let file_id = f.conn.last_insert_rowid();
@@ -218,6 +227,22 @@ fn seed_master(
         .unwrap();
 
     set_id
+}
+
+/// Real on-disk `(size, modified_at)` for a just-written file, in the same
+/// shape the scanner stores: `size` = byte length, `modified_at` =
+/// `chrono::DateTime::<Utc>::from(metadata.modified()).to_rfc3339()` — the
+/// scanner's own `modified_dt.to_rfc3339()` (`scanner/mod.rs`, `modified_dt
+/// = chrono::DateTime::<Utc>::from(metadata.modified()?)`). Task 6's
+/// artifact hashes and the catalog-vs-disk `disk_matches_row` contract
+/// (`db::bank_strong_hash`) both compare against these two columns, so a
+/// fixture that fakes them would pass generation today and silently stop
+/// meaning anything the moment either of those checks the fixture.
+fn file_identity(path: &Path) -> (i64, String) {
+    let meta = std::fs::metadata(path).expect("fixture file exists after writing");
+    let modified = meta.modified().expect("fixture filesystem supports mtime");
+    let modified_at = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
+    (meta.len() as i64, modified_at)
 }
 
 fn link_calibration(conn: &Connection, frame_id: i64, set_id: i64, cal_type: &str) {
@@ -342,6 +367,7 @@ fn write_fits_i16(path: &Path, width: usize, height: usize, data: &[i16], cards:
 
 // ── Fixture self-test ────────────────────────────────────────────────────
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::export::{resolve_generation, CalibratedLightOptions};
@@ -350,14 +376,19 @@ mod tests {
     /// generator; this pins that the shape it seeds is already enough for
     /// `resolve_generation` (catalog phase — master resolution, source
     /// cards, CFA geometry, flat-norm divisor) to succeed, so a later task's
-    /// failure means ITS code, not a fixture gap.
+    /// failure means ITS code, not a fixture gap. Also pins the
+    /// mono-vs-OSC debayer decision `resolve_generation` makes
+    /// (`opts.debayer_osc && resolved.cfa_geometry.is_some()`, default
+    /// options): a mono light must not debayer, an OSC light with a
+    /// catalog-recognized Bayer pattern must — the second group Task 6/8
+    /// actually runs the VNG path on.
     #[test]
     fn fixture_light_resolves_a_calibration_plan() {
         let f = frame_set("Fixture Self-Test");
-        let (frame_id, _path) = add_light(
+        let (mono_id, _mono_path) = add_light(
             &f,
             &LightSpec {
-                stem: "light_0",
+                stem: "light_mono",
                 instrume: "TestCam",
                 filter: Some("L"),
                 binning: 1,
@@ -369,18 +400,53 @@ mod tests {
                 write_file: true,
             },
         );
-        add_master_dark_and_flat(&f, &[frame_id], 32, 24);
+        let (osc_id, _osc_path) = add_light(
+            &f,
+            &LightSpec {
+                stem: "light_osc",
+                instrume: "TestCam",
+                filter: None,
+                binning: 1,
+                width: 32,
+                height: 24,
+                exptime: 60.0,
+                date_obs: "2025-01-01T00:01:00",
+                bayerpat: Some("RGGB"),
+                write_file: true,
+            },
+        );
+        add_master_dark_and_flat(&f, &[mono_id, osc_id], 32, 24);
 
         let scratch = f.dir.path().join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
-        let spec = resolve_generation(
+
+        let mono_spec = resolve_generation(
             &f.conn,
-            frame_id,
+            mono_id,
             &CalibratedLightOptions::default(),
             &scratch,
         )
-        .expect("fixture light must resolve a calibration plan");
-        assert!(spec.inputs.dark_path.is_some(), "dark master must resolve");
-        assert!(spec.inputs.flat_path.is_some(), "flat master must resolve");
+        .expect("mono fixture light must resolve a calibration plan");
+        assert!(
+            mono_spec.inputs.dark_path.is_some(),
+            "dark master must resolve"
+        );
+        assert!(
+            mono_spec.inputs.flat_path.is_some(),
+            "flat master must resolve"
+        );
+        assert!(!mono_spec.debayer, "mono light must not debayer");
+
+        let osc_spec = resolve_generation(
+            &f.conn,
+            osc_id,
+            &CalibratedLightOptions::default(),
+            &scratch,
+        )
+        .expect("OSC fixture light must resolve a calibration plan");
+        assert!(
+            osc_spec.debayer,
+            "OSC light with a resolvable Bayer pattern must debayer"
+        );
     }
 }
