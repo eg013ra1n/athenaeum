@@ -1001,7 +1001,7 @@ fn main() {
         &included_exposures,
     );
 
-    let reference_cards = match source_cards_from_file(&args.reference) {
+    let reference_cards = match source_cards_from_file(&processed[reference_index].path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[integrate_probe] reading reference cards failed: {e}");
