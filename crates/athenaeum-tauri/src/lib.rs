@@ -297,6 +297,10 @@ pub fn run() {
             commands::recalculate_frame_set_nights,
             commands::get_frame_set_merge_log,
             commands::get_equipment_cameras,
+            commands::get_observing_progress,
+            commands::save_observing_goal,
+            commands::delete_observing_goal,
+
             commands::get_dark_library,
             commands::has_dark_library,
             commands::get_master_dark_library,

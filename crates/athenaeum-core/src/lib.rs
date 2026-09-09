@@ -68,3 +68,7 @@ pub mod sync;
 // App account layer (Stage II, task B4): hub client, the shared iroh device
 // identity, OS-keychain token store. Ungated — no render/solver deps.
 pub mod account;
+
+pub mod exposure_versions;
+
+pub mod observing_goals;

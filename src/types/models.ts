@@ -1,6 +1,16 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+export type Classification = { stage: string, steps: Array<string>, evidence: Array<string>, confidence: string, sourceId: string | null, sourceName: string | null, };
+
+export type ProcessingAssessment = { label: string, candidateStage: string | null, confidence: string, evidence: Array<string>, };
+
+export type VersionRecord = { assessment: ProcessingAssessment, frameId: number, filename: string, path: string, dateObs: string | null, camera: string | null, exposureSeconds: number | null, filter: string | null, width: number | null, height: number | null, classification: Classification, exposureId: string | null, manualStage: boolean, };
+
+export type VersionSuggestion = { leftId: number, rightId: number, confidence: string, evidence: Array<string>, };
+
+export type VersionReview = { versions: Array<VersionRecord>, suggestions: Array<VersionSuggestion>, suggestionCount: number, exposureCount: number, exposureSeconds: number, };
+
 export type FileFormat = "FITS" | "XISF";
 
 export type ImageType = "Light" | "Dark" | "Flat" | "Bias" | "DarkFlat" | "MasterLight" | "MasterDark" | "MasterFlat" | "MasterBias" | "MasterDarkFlat";
@@ -149,6 +159,10 @@ export type ImagingNightWithSessions = { imaging_night: ImagingNight, sessions: 
 export type FrameSetDetail = { frames_set: FramesSet, nights: Array<ImagingNightWithSessions>, };
 
 export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
+
+export type ObservingGoal = { frameSetId: number, filter: string, revision: number, targetSeconds: number, requireAnalysis: boolean, maxFwhmPx: number | null, maxEccentricity: number | null, rejectTrailed: boolean, };
+
+export type ObservingProgress = { filter: string, goal: ObservingGoal | null, accepted: number, rejected: number, unknown: number, acceptedSeconds: number, };
 
 export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, 
 /**

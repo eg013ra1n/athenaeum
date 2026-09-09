@@ -1,3 +1,4 @@
+pub mod observing_goals;
 use axum::{
     Router,
     extract::State,
@@ -131,6 +132,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
         // Calibration
         .route("/api/get_equipment_cameras", post(calibration::get_equipment_cameras))
+        .route("/api/get_observing_progress", post(observing_goals::get_observing_progress))
+        .route("/api/save_observing_goal", post(observing_goals::save_observing_goal))
+        .route("/api/delete_observing_goal", post(observing_goals::delete_observing_goal))
+
         .route("/api/get_dark_library", post(calibration::get_dark_library))
         .route("/api/has_dark_library", post(calibration::has_dark_library))
         .route("/api/get_master_dark_library", post(calibration::get_master_dark_library))

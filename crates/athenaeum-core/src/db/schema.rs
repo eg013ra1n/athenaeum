@@ -2269,6 +2269,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         conn.execute(stmt, [])?;
     }
 
+    crate::exposure_versions::init_schema(conn)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+
     // One-time data repairs (settings-flag gated). Best-effort by design: a
     // repair failure must not brick catalog init — the error is logged here
     // and the flag stays unstamped so the next start retries.
@@ -2276,6 +2279,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         tracing::error!(error = ?e, "cfa back-fill repair failed");
     }
 
+    crate::observing_goals::storage::init_schema(conn)?;
     Ok(())
 }
 

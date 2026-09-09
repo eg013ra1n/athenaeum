@@ -65,6 +65,11 @@ fn js_safe_ints(ts: String) -> String {
 pub fn generated_files() -> Vec<(&'static str, String)> {
     vec![
         ("models.ts", js_safe_ints(format!("{HEADER}{}", decls![
+            crate::exposure_versions::Classification,
+            crate::exposure_versions::ProcessingAssessment,
+            crate::exposure_versions::VersionRecord,
+            crate::exposure_versions::VersionSuggestion,
+            crate::exposure_versions::VersionReview,
             crate::models::FileFormat,
             crate::models::ImageType,
             crate::models::File,
@@ -91,6 +96,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::ImagingNightWithSessions,
             crate::models::FrameSetDetail,
             crate::models::CameraStats,
+            crate::observing_goals::models::ObservingGoal,
+            crate::observing_goals::models::ObservingProgress,
             crate::models::CalibrationSetDetail,
             crate::models::RelinkResult,
             crate::models::OrphanedFile,
