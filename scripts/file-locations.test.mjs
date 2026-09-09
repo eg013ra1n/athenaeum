@@ -3,10 +3,6 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
-import { createRequire } from 'node:module';
-import React from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
-const require = createRequire(import.meta.url);
 
 function compile(file) {
   return ts.transpileModule(readFileSync(new URL(file, import.meta.url), 'utf8'), {
