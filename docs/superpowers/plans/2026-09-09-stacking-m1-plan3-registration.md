@@ -117,6 +117,45 @@ per-frame `delta_RMS`. Results go to
     `TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract` and
     committed — the only frontend file this plan touches, and only as a
     generated artifact.
+13. **No `detection.sigma`.** Plan 2's final review found the fast
+    detector never reads a detection sigma (its adaptive ladder targets
+    `maxStars`; `minSnr` is the real sensitivity dial), and Plan 2 removed
+    the knob from `MeasureOptions`. The same detector serves registration,
+    so `DetectionConfig` carries only `minSnr` and `maxEccentricity`, and
+    Task 6 amends spec §9.2 to drop `sigma: 5.0` from the `registration.
+    detection` block. A config field that does nothing is the class of
+    silent failure the project forbids.
+
+## Carry-forwards from Plan 2's final review (for this plan's author and the next ones)
+
+Recorded here because the Plan 2 ledger is deleted with its workspace.
+
+- **This plan:** none beyond ruling 13; `stacking::measure::ADU_SCALE` is
+  reused by `detect.rs`; the registration warns must carry the frame
+  identity (they do — every `debug!`/`warn!` in `frame.rs` has `path`).
+- **Plan 4 (combiner v2 + engine):** `read_rows_with_scratch` has no
+  consumer yet — the banded engine is meant to use it (do not re-invent);
+  `winsorize`'s "no survivors" guard keys on `lo.is_finite()` (a genuine
+  ±∞ survivor mis-fires); `MRS_LAYER0_GAIN` is named "layer 0" where the
+  estimator says layer 1 — rename before citing it; `background_residual`
+  has no `data.len() == w·h` precondition.
+- **Plan 5 (orchestration, tables, commands, UI):** `stars_detected` on
+  `ChannelMeasurement` is the post-`minSnr` seed count — decide the name
+  before it reaches `metrics_json` and the Frames table; `measure_plane`'s
+  transient memory is ≈ 8× the plane (the ADU copy plus the mesh maps and
+  the MRS layers) — a `ComputeQueue` sizing constraint, never measure
+  planes concurrently; cancel is checked between planes only — cancel
+  between frames and say so in the UI; `select_frames`'s `missing` is
+  computed per channel (a zero-channel frame never gets "no exposure
+  time"); `{:.2}` rounds a 0.125 threshold to "0.13" in the reason string;
+  `measure_probe` maps an unknown model token to `Auto` silently; a
+  coverage sweep before the acceptance run: PlaneReader never-shrunk
+  scratch, `noise_scale_factors` two-pass loop, `BWMV_TO_SIGMA`, RCR NaN
+  inputs and `n == 3`, `frame_shape`'s 1e-6 floor, the `Some(pool)` branch
+  of `measure_plane`, `weights` empty/all-zero/all-excluded inputs.
+- **Checkpoint B watch items:** `moment_ellipse` seeds from the whole
+  stamp (crowded fields may lose stars); `aperture` clips at the image
+  border for fitted centres up to 2 px off the stamp centre.
 
 ## Global Constraints
 
@@ -380,7 +419,7 @@ mod tests {
         assert_eq!(d.ransac_max_iterations, 2000);
         assert_eq!(d.max_rms_px, 2.0);
         assert!(!d.fail_on_max_rms && !d.write_registered_frames);
-        assert_eq!((d.detection.sigma, d.detection.min_snr, d.detection.max_eccentricity), (5.0, 10.0, 0.8));
+        assert_eq!((d.detection.min_snr, d.detection.max_eccentricity), (10.0, 0.8));
     }
 
     #[test]
@@ -396,16 +435,17 @@ mod tests {
             "\"ransacMaxIterations\":2000",
             "\"maxRmsPx\":2.0",
             "\"failOnMaxRms\":false",
-            "\"detection\":{\"sigma\":5.0,\"minSnr\":10.0,\"maxEccentricity\":0.8}",
+            "\"detection\":{\"minSnr\":10.0,\"maxEccentricity\":0.8}",
             "\"writeRegisteredFrames\":false",
         ] {
             assert!(json.contains(needle), "{needle} missing in {json}");
         }
+        assert!(!json.contains("sigma"), "no detection sigma: the detector is threshold-free");
         let partial: RegistrationConfig = serde_json::from_str("{\"model\":\"homography\",\"distortion\":\"polynomial3\",\"detection\":{\"minSnr\":7.5}}").unwrap();
         assert_eq!(partial.model, ModelChoice::Homography);
         assert_eq!(partial.distortion, DistortionChoice::Polynomial3);
         assert_eq!(partial.detection.min_snr, 7.5);
-        assert_eq!(partial.detection.sigma, 5.0);
+        assert_eq!(partial.detection.max_eccentricity, 0.8);
         assert_eq!(partial.max_stars, 2000);
         let empty: RegistrationConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, RegistrationConfig::default());
@@ -539,17 +579,19 @@ impl DistortionChoice {
     }
 }
 
+/// Detection cuts. There is no detection sigma: the fast detector's
+/// adaptive ladder is threshold-free (it targets `maxStars`), so `minSnr`
+/// is the sensitivity dial.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DetectionConfig {
-    pub sigma: f32,
     pub min_snr: f32,
     pub max_eccentricity: f32,
 }
 
 impl Default for DetectionConfig {
     fn default() -> Self {
-        DetectionConfig { sigma: 5.0, min_snr: 10.0, max_eccentricity: 0.8 }
+        DetectionConfig { min_snr: 10.0, max_eccentricity: 0.8 }
     }
 }
 
@@ -661,7 +703,6 @@ pub fn detect_stars(
     let scaled: Vec<f32> = lum.iter().map(|v| v * ADU_SCALE).collect();
     let mut analyzer = ImageAnalyzer::new()
         .with_max_stars((max_stars + max_stars / 4).max(8))
-        .with_detection_sigma(cfg.sigma)
         .with_centroid_refine(true);
     if let Some(p) = pool {
         analyzer = analyzer.with_thread_pool(Arc::clone(p));
@@ -1777,7 +1818,7 @@ pub fn write_registered_frame(
 }
 ```
 
-If `warp_rows`'s `map` parameter is `&dyn InverseMap`, pass `map` as-is (`PixelMap` implements `InverseMap`; a `&PixelMap` coerces). If `FitsWriteError`/`IntegrationError` do not convert into `anyhow::Error` through `?`, wrap with `.map_err(anyhow::Error::from)` — both implement `std::error::Error`.
+`warp_rows` takes `map: &dyn InverseMap` and `PixelMap` implements `InverseMap`, so `map` coerces as written. `FitsWriteError` and `IntegrationError` both implement `std::error::Error`, so `?`/`.with_context` convert them into `anyhow::Error`.
 
 Scanner (both sites), right after the closing brace of `if let Some(identity) = calibrated_light_identity(&keys) { … }`:
 
@@ -1829,6 +1870,7 @@ required-features = ["render", "solver"]
 **Dictionary extension (stacking registration, `stacking::register`, 2026-09-09):** `detections` (usize; registration stars found on a frame, on the `"reference stars detected"` and `"frame registered"` debugs and the `"frame registration failed"` warn), `model` (string; the resolved registration model, e.g. `homography+polynomial3`, on `"frame registered"`), `flipped` (bool; the linear part has a negative determinant — reuses the registration domain's existing name on `"frame registered"`). Reuses `path`, `inliers`, `rms_px` (the solve domain's names, same meaning: refit inliers and the RMS through the final map), `error` and `duration_ms`.
 ```
 
+- Modify: `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md` §9.2 — in the `registration:` block change `detection: { sigma: 5.0, minSnr: 10, maxEccentricity: 0.8 }` to `detection: { minSnr: 10, maxEccentricity: 0.8 }` (ruling 13); and in §3.1 replace the sentence beginning "`detect_fast` with Moffat centroid refinement" with: "`detect_fast` with Moffat centroid refinement (~0.05 px on well-sampled stars), per-star σ from the fit; the detector is threshold-free (its adaptive ladder targets `maxStars`), so there is no detection sigma."
 - Modify: `CLAUDE.md` — append one sentence to the end of the **Module Map** paragraph that begins `**\`athenaeum-core\` (\`crates/athenaeum-core/src/\`)**` (after its final period): ` The stacking pipeline (spec \`docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md\`) lives in \`stacking/\` — \`measure\`/\`weights\` (frame quality, Plan 2), \`register\` (registration v2, Plan 3); dev probes \`examples/measure_probe.rs\` and \`examples/register_probe.rs\`.`
 
 **Interfaces:**
@@ -2092,7 +2134,7 @@ fn main() {
 }
 ```
 
-If `warp_rows` takes `&dyn InverseMap`, pass `&a.map`; if `PixelMap`'s fields `linear`/`linear_inv` are not public, use `a.map.to_json()` for the `linear`/`linearInv` output instead. If `astroimage::PixelData` / `ImageConverter` are not re-exported at the crate root, use their module paths (`astroimage::types::PixelData`, `astroimage::converter::ImageConverter` — check `rustafits/src/lib.rs`).
+Facts the example relies on (verified while writing this plan): `warp_rows` takes `map: &dyn InverseMap`, so `&a.map` coerces; `PixelMap`'s `linear`/`linear_inv` fields and `Linear::m` are public; `astroimage` re-exports `ImageConverter` and `PixelData` at its crate root (`rustafits/src/lib.rs`).
 
 - [ ] **Step 2: Build and smoke it on synthetic data**
 
