@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::lights::{check_mode_ready, compute_export_readiness, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
-use crate::db::stacking::{active_run_for_set, find_artifact, get_set_config};
+use crate::db::stacking::{active_run_for_set, find_artifact, get_set_config, StackingArtifactRow};
 use crate::export::models::ExportMode;
-use crate::export::{resolve_generation, resolved_master_paths};
+use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
 use crate::registration::db::{
     get_frame_set_reference, get_registration_for_frame_set, RegistrationRecord,
 };
@@ -153,9 +153,11 @@ pub struct StackingPlan {
 /// Format one resolved master file's identity for stage-1 hashing:
 /// `"<path>|<size>|<modified_at>"`. A metadata read failure (the master went
 /// missing between the readiness check and this one) is logged and folded
-/// into the string as `"<path>|missing"` rather than propagated — the
-/// missing-master-files blocker already reports this state; the hash just
-/// needs to keep changing while it persists.
+/// into the string as `"<path>|missing"` rather than propagated. That token
+/// is a CONSTANT, not a changing one — it keeps the hash *defined* (so a
+/// caller can still store/compare it) rather than panicking or aborting the
+/// whole plan; it is the `masterFiles` blocker, not this string, that does
+/// the actual refusing while the file stays gone.
 fn master_identity(path: &Path) -> String {
     match std::fs::metadata(path) {
         Ok(meta) => {
@@ -180,20 +182,36 @@ fn master_identity(path: &Path) -> String {
 /// `calibration_subtree(cfg)` + the identity of every resolved master path
 /// this frame would actually apply ([`resolved_master_paths`]) + the light's
 /// own `files` identity. Resolves the frame's calibration plan
-/// (`export::resolve_generation`) to learn which masters apply — the same
-/// resolution the calibrate stage itself performs — using the process temp
-/// directory as the flat-norm-divisor scratch space (the same fallback
+/// (`export::resolve_generation_cached`) to learn which masters apply — the
+/// same resolution the calibrate stage itself performs — using the process
+/// temp directory as the flat-norm-divisor scratch space (the same fallback
 /// `api::export`/`api::sync_prepare` use when no run-specific scratch
 /// directory is available; only read when a master flat carries no usable
 /// `ATH_FNRM`/`ATH_FNR*` card, so the common case touches no scratch file at
 /// all).
+///
+/// `divisors` is the caller's [`DivisorCache`] — a build resolves every
+/// frame in a frame set, and a set overwhelmingly shares one flat per group,
+/// so a fresh cache per call (the original round's mistake) re-reads that
+/// whole flat plane once per frame instead of once per (flat, mosaic phase)
+/// pair. **Callers within this module never call this directly — go through
+/// [`HashMemo::calibration_hash`]**, which also memoizes the RESULT per
+/// frame for the life of one [`build_plan`] call; this function itself does
+/// no memoization of its own.
 pub(crate) fn calibration_hash_for(
     conn: &Connection,
     cfg: &StackingConfig,
     frame: &GroupFrame,
-) -> anyhow::Result<String> {
+    divisors: &mut DivisorCache,
+) -> Result<String, ApiError> {
     let scratch_dir = std::env::temp_dir();
-    let spec = resolve_generation(conn, frame.frame_id, &cfg.calibration, &scratch_dir)?;
+    let spec = resolve_generation_cached(
+        conn,
+        frame.frame_id,
+        &cfg.calibration,
+        &scratch_dir,
+        divisors,
+    )?;
 
     let mut specs = HashMap::with_capacity(1);
     specs.insert(frame.frame_id, spec);
@@ -215,26 +233,51 @@ pub(crate) fn calibration_hash_for(
     ))
 }
 
-/// [`calibration_hash_for`], but a resolution failure (no calibration linked
-/// or resolvable, a source file gone) is logged and folded to `None` instead
-/// of propagated — the plan treats "can't tell" the same as "stale" rather
-/// than failing to build at all over a frame the masters/links blocker
-/// already reports.
-fn calibration_hash_or_warn(
-    conn: &Connection,
-    cfg: &StackingConfig,
-    frame: &GroupFrame,
-) -> Option<String> {
-    match calibration_hash_for(conn, cfg, frame) {
-        Ok(hash) => Some(hash),
-        Err(error) => {
-            tracing::warn!(
-                frame_id = frame.frame_id,
-                %error,
-                "stacking: could not resolve stage-1 hash; treating as stale"
-            );
-            None
+/// One [`build_plan`] call's memo: a single [`DivisorCache`] shared by every
+/// frame this build resolves, plus the per-frame stage-1 hash result itself
+/// (`None` on a resolution failure — no calibration linked or resolvable, a
+/// source file gone), so a frame whose hash is needed twice in one build
+/// (once for its own `calibrated`/`metrics` freshness, again as the
+/// [`compute_register_stale`] reference) is resolved — and, on failure,
+/// warned about — exactly once.
+struct HashMemo {
+    divisors: DivisorCache,
+    by_frame: HashMap<i64, Option<String>>,
+}
+
+impl HashMemo {
+    fn new() -> Self {
+        HashMemo {
+            divisors: DivisorCache::new(),
+            by_frame: HashMap::new(),
         }
+    }
+
+    /// This frame's current stage-1 hash, memoized. The plan treats "can't
+    /// tell" the same as "stale" rather than failing the whole build over a
+    /// frame the masters/links blocker already reports as unresolvable.
+    fn calibration_hash(
+        &mut self,
+        conn: &Connection,
+        cfg: &StackingConfig,
+        frame: &GroupFrame,
+    ) -> Option<String> {
+        if let Some(cached) = self.by_frame.get(&frame.frame_id) {
+            return cached.clone();
+        }
+        let result = match calibration_hash_for(conn, cfg, frame, &mut self.divisors) {
+            Ok(hash) => Some(hash),
+            Err(error) => {
+                tracing::warn!(
+                    frame_id = frame.frame_id,
+                    %error,
+                    "stacking: could not resolve stage-1 hash; treating as stale"
+                );
+                None
+            }
+        };
+        self.by_frame.insert(frame.frame_id, result.clone());
+        result
     }
 }
 
@@ -266,6 +309,25 @@ pub(crate) fn registration_hash_for(
         ],
         &[],
     )
+}
+
+/// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
+/// only when ALL of these hold — its `config_hash` equals the frame's
+/// CURRENT stage-1 hash, its `path` is `Some`, its `size` is `Some`, AND a
+/// live `std::fs::metadata` read of that path reports exactly that size. A
+/// row missing `path`/`size` (an artifact recorded before the pixel phase
+/// ever wrote anything, or one some other kind stores without a path) is
+/// NEVER assumed fresh — "we don't know" is "stale", not "trust the hash
+/// alone". A `metrics` artifact has no equivalent disk check: it may be
+/// `payload_json`-only with no file to verify (see the `Measure` staleness
+/// check in [`build_plan`], which compares only the hash).
+fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bool {
+    artifact.config_hash == current_hash
+        && artifact
+            .path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .is_some_and(|meta| Some(meta.len() as i64) == artifact.size)
 }
 
 // ── build_plan ──────────────────────────────────────────────────────────────
@@ -414,6 +476,13 @@ fn find_group_frame<'a>(groups: &'a [IntegrationGroup], frame_id: i64) -> Option
 /// both the reference and the frame — so a reference whose calibration
 /// changed (or a frame whose own calibration did) makes registration stale
 /// even though the row itself is untouched.
+///
+/// The reference's own hash is resolved ONLY in `Manual` mode with
+/// `reference.on_disk` already `true` — never unconditionally. A manual set
+/// with no reference chosen yet, or one whose reference file is already
+/// known missing (the `reference` gate blocker reported it), is stale by
+/// construction without a second resolution attempt (and its own `warn!`)
+/// over a frame the plan already knows is unusable.
 fn compute_register_stale(
     conn: &Connection,
     cfg: &StackingConfig,
@@ -421,6 +490,7 @@ fn compute_register_stale(
     groups: &[IntegrationGroup],
     excluded: &HashSet<i64>,
     reference: &PlanReference,
+    memo: &mut HashMemo,
 ) -> Result<bool, ApiError> {
     let rows = get_registration_for_frame_set(conn, frames_set_id)?;
     let by_frame: HashMap<i64, &RegistrationRecord> =
@@ -441,14 +511,13 @@ fn compute_register_stale(
             }));
     }
 
-    let Some(reference_frame_id) = reference.frame_id else {
+    let (Some(reference_frame_id), true) = (reference.frame_id, reference.on_disk) else {
         return Ok(true);
     };
     let Some(reference_group_frame) = find_group_frame(groups, reference_frame_id) else {
         return Ok(true);
     };
-    let Some(reference_calib_hash) = calibration_hash_or_warn(conn, cfg, reference_group_frame)
-    else {
+    let Some(reference_calib_hash) = memo.calibration_hash(conn, cfg, reference_group_frame) else {
         return Ok(true);
     };
 
@@ -456,7 +525,7 @@ fn compute_register_stale(
         let Some(row) = by_frame.get(&f.frame_id) else {
             return Ok(true);
         };
-        let Some(frame_calib_hash) = calibration_hash_or_warn(conn, cfg, f) else {
+        let Some(frame_calib_hash) = memo.calibration_hash(conn, cfg, f) else {
             return Ok(true);
         };
         let expected = registration_hash_for(
@@ -524,6 +593,8 @@ pub fn build_plan(
     // Gate 2: reference.
     let reference = resolve_reference(conn, frames_set_id, &cfg, &mut blockers)?;
 
+    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+
     // Gate 3: folders — also resolves free space and the estimate's probe
     // target.
     let resolved_dirs = paths::resolve_dirs(conn, settings, &cfg.paths);
@@ -566,8 +637,19 @@ pub fn build_plan(
         }
     }
 
+    // The estimate counts only IN-SCOPE frames — a manually excluded frame
+    // is never calibrated/registered/integrated, so it must not inflate the
+    // footprint a run would actually leave behind.
+    let estimate_groups: Vec<IntegrationGroup> = groups
+        .iter()
+        .map(|g| {
+            let mut g = g.clone();
+            g.frames.retain(|f| !excluded_set.contains(&f.frame_id));
+            g
+        })
+        .collect();
     let estimate_bytes = paths::estimate_bytes(&EstimateInputs {
-        groups: &groups,
+        groups: &estimate_groups,
         write_registered: cfg.registration.write_registered_frames,
         write_maps: cfg.integration.write_rejection_maps,
     });
@@ -587,8 +669,12 @@ pub fn build_plan(
     }
 
     // Per-group plan rows, plus stage-1/stage-3 staleness (gate 5's input and
-    // the `stale_stages` output share this one pass over every frame).
-    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+    // the `stale_stages` output share this one pass over every frame). One
+    // `HashMemo` for the whole build: it owns the one `DivisorCache` a build
+    // resolves every frame through, and memoizes each frame's own stage-1
+    // hash so this loop and `compute_register_stale` below never resolve
+    // the same frame twice.
+    let mut memo = HashMemo::new();
     let mut plan_groups = Vec::with_capacity(groups.len());
     let mut calibrate_stale = false;
     let mut measure_stale = false;
@@ -616,20 +702,13 @@ pub fn build_plan(
             // stages, and resolving it would error on a frame the
             // masters/links blocker already reports as unresolvable.
             let current_calib_hash = if calib_artifact.is_some() || metrics_artifact.is_some() {
-                calibration_hash_or_warn(conn, &cfg, f)
+                memo.calibration_hash(conn, &cfg, f)
             } else {
                 None
             };
 
             let calib_fresh = match (&calib_artifact, &current_calib_hash) {
-                (Some(row), Some(hash)) => {
-                    row.config_hash == *hash
-                        && row
-                            .path
-                            .as_deref()
-                            .and_then(|p| std::fs::metadata(p).ok())
-                            .is_some_and(|meta| Some(meta.len() as i64) == row.size)
-                }
+                (Some(row), Some(hash)) => is_fresh(row, hash),
                 _ => false,
             };
             if calib_fresh {
@@ -685,6 +764,7 @@ pub fn build_plan(
         &groups,
         &excluded_set,
         &reference,
+        &mut memo,
     )?;
 
     let mut stale_stages = Vec::new();
@@ -770,6 +850,23 @@ mod tests {
             write_file: false,
         }
     }
+
+    /// [`light_spec`], but with a real on-disk FITS — needed whenever a test
+    /// actually resolves a frame's calibration plan (`calibration_hash_for`,
+    /// which every fresh-path test below drives directly or through
+    /// `build_plan`) or needs a `reference.on_disk == true` reference frame.
+    fn light_spec_written<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
+        LightSpec {
+            write_file: true,
+            ..light_spec(stem, date_obs)
+        }
+    }
+
+    const THREE_TIMES: [&str; 3] = [
+        "2025-01-01T00:00:00",
+        "2025-01-01T00:05:00",
+        "2025-01-01T00:10:00",
+    ];
 
     #[test]
     fn plan_blocks_without_masters() {
@@ -919,13 +1016,23 @@ mod tests {
             let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
             ids.push(id);
         }
+        let settings = SettingsManager::new();
+        let plan_all =
+            build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert_eq!(plan_all.included_count, 4);
+
         set_set_config(&f.conn, f.set_id, "{}", &[ids[0]]).unwrap();
 
-        let settings = SettingsManager::new();
         let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
 
         assert_eq!(plan.included_count, 3);
         assert_eq!(plan.excluded_frame_ids, vec![ids[0]]);
+        assert!(
+            plan.estimate_bytes < plan_all.estimate_bytes,
+            "the estimate must count only in-scope frames: {} vs {}",
+            plan.estimate_bytes,
+            plan_all.estimate_bytes
+        );
     }
 
     #[test]
@@ -977,5 +1084,308 @@ mod tests {
         ] {
             assert_eq!(s.as_str(), name);
         }
+    }
+
+    /// The artifact reuse contract (`is_fresh`, fix round 1 item 3): a
+    /// `calibrated` row with the CURRENT hash but no `path`/`size` is never
+    /// assumed fresh, and neither is one whose `path`/`size` no longer
+    /// describe a real file on disk.
+    #[test]
+    fn artifact_without_path_or_size_is_stale() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let cfg = StackingConfig::default();
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1);
+        let group_key = groups[0].key.clone();
+        let frame = groups[0].frames[0].clone();
+
+        let mut divisors = DivisorCache::new();
+        let hash = calibration_hash_for(&f.conn, &cfg, &frame, &mut divisors).unwrap();
+
+        // `path: None` — the hash matches, but there is no file to trust.
+        crate::db::stacking::upsert_artifact(
+            &f.conn,
+            &crate::db::stacking::NewArtifact {
+                frames_set_id: f.set_id,
+                frame_id: Some(frame.frame_id),
+                group_key: &group_key,
+                kind: "calibrated",
+                path: None,
+                config_hash: &hash,
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            plan.stale_stages.contains(&Stage::Calibrate),
+            "{:?}",
+            plan.stale_stages
+        );
+        assert_eq!(plan.groups[0].calibrated_cached, 0);
+
+        // A real file at `path`, but the recorded `size` disagrees with it.
+        let path = f.dir.path().join("mismatch.fits");
+        std::fs::write(&path, [0u8; 5]).unwrap();
+        crate::db::stacking::upsert_artifact(
+            &f.conn,
+            &crate::db::stacking::NewArtifact {
+                frames_set_id: f.set_id,
+                frame_id: Some(frame.frame_id),
+                group_key: &group_key,
+                kind: "calibrated",
+                path: Some(path.to_str().unwrap()),
+                config_hash: &hash,
+                size: Some(999),
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        let plan2 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            plan2.stale_stages.contains(&Stage::Calibrate),
+            "{:?}",
+            plan2.stale_stages
+        );
+        assert_eq!(plan2.groups[0].calibrated_cached, 0);
+    }
+
+    /// The fresh path, end to end: every frame gets a matching `calibrated`
+    /// artifact (real file, recorded size), a matching `metrics` artifact,
+    /// and (manual reference mode) a matching `registration_results` row —
+    /// `stale_stages` comes back empty and both cache counters read the
+    /// group's full frame count. Then one non-reference frame's
+    /// registration row is flipped to a hash that no longer matches, and
+    /// ONLY `Register` goes stale — Calibrate/Measure are untouched by a
+    /// change that is registration-only.
+    #[test]
+    fn fresh_artifacts_and_registration_leave_nothing_stale() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+        let group_key = groups[0].key.clone();
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        for gf in &groups[0].frames {
+            let hash = calib_hashes.get(&gf.frame_id).unwrap().clone();
+
+            let cal_path = f
+                .dir
+                .path()
+                .join(format!("calibrated_{}.fits", gf.frame_id));
+            std::fs::write(&cal_path, [0u8]).unwrap();
+            let size = std::fs::metadata(&cal_path).unwrap().len() as i64;
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "calibrated",
+                    path: Some(cal_path.to_str().unwrap()),
+                    config_hash: &hash,
+                    size: Some(size),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+
+            let metrics_hash = measurement_hash_for(&cfg, &hash);
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &metrics_hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+        }
+
+        let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
+        for gf in &groups[0].frames {
+            let frame_hash = calib_hashes.get(&gf.frame_id).unwrap();
+            let expected = registration_hash_for(&cfg, ids[0], &reference_hash, frame_hash);
+            let is_reference = gf.frame_id == ids[0];
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id: gf.frame_id,
+                reference_frame_id: ids[0],
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(plan.stale_stages.is_empty(), "{:?}", plan.stale_stages);
+        assert_eq!(plan.groups[0].calibrated_cached, plan.groups[0].frame_count);
+        assert_eq!(plan.groups[0].metrics_cached, plan.groups[0].frame_count);
+
+        // Flip one non-reference frame's registration row to a hash that no
+        // longer matches — only Register should go stale.
+        let flipped_frame = groups[0]
+            .frames
+            .iter()
+            .find(|gf| gf.frame_id != ids[0])
+            .expect("a non-reference frame exists");
+        let bad = RegistrationRecord {
+            frames_set_id: f.set_id,
+            frame_id: flipped_frame.frame_id,
+            reference_frame_id: ids[0],
+            is_reference: false,
+            status: "aligned".to_string(),
+            compute_time_ms: 0,
+            registered_at: "2025-01-01T00:00:00Z".to_string(),
+            config_hash: Some("stale-hash".to_string()),
+            source_kind: Some("calibrated".to_string()),
+            ..RegistrationRecord::default()
+        };
+        crate::registration::db::upsert_registration(&f.conn, &bad).unwrap();
+
+        let plan2 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+        assert_eq!(
+            plan2.stale_stages,
+            vec![Stage::Register],
+            "{:?}",
+            plan2.stale_stages
+        );
+    }
+
+    /// Blocker order is stable and matches the gate order exactly (fix
+    /// round 1 item 7): no calibration links (masters/links) fires first,
+    /// then both folder sentences (in `working`, `output` order), then
+    /// `frames` (fewer than 3 included), then both `unsupported` toggles —
+    /// `reference`/`space` never appear here (Auto mode; free space is
+    /// never probed once the folders themselves are blocked).
+    #[test]
+    fn blocker_order_is_stable() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"]
+            .iter()
+            .enumerate()
+        {
+            test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+        }
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+        cfg.drizzle.enabled = true;
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+
+        let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec![
+                "links",
+                "folders",
+                "folders",
+                "frames",
+                "unsupported",
+                "unsupported"
+            ],
+            "{:?}",
+            plan.blockers
+        );
+        assert_eq!(plan.blockers[1].message, "Choose a working folder");
+        assert_eq!(plan.blockers[2].message, "Choose an output folder");
     }
 }
