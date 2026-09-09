@@ -190,9 +190,11 @@ review; what is missing is a human running the flow on real data.
 ### Stacking M1 — the Stacking tab (2026-09-10)
 
 M1 Plan 5b (the Stacking tab, Settings → Stacking, retirement of the
-plate-solve-era registration flow). Code-complete with green gates; nothing
-verified by hand yet. Filled in as each task lands — Task 7 (acceptance run)
-extends this subsection.
+plate-solve-era registration flow). Acceptance run passed on the real LDN 1272
+catalog on 2026-09-10 — note `docs/superpowers/research/2026-09-09-m1-acceptance-run.md`
+(the run rebuilt its own ten calibration masters from an empty library, and its
+masters are bit-identical to Checkpoint B's; one attributed miss: measurement
+time on a 16 GB machine). The tab is enabled for every build since that run.
 
 - **Release-note line owed:** `browse_directories` now answers `400 Bad
   Request` to an unknown `scope` instead of silently falling through to the
@@ -200,9 +202,41 @@ extends this subsection.
   — every known caller already passes `"scan"`/`"export"`/`"stacking"`, so
   this is not expected to be user-visible, but the behavior change itself
   needs a line at the next tag.
-- **Owed:** the owner's click-through of the Stacking tab itself (currently
-  dev-only behind `STACKING_ENABLED`) — board/inspector/frames/results,
-  Settings → Stacking, and the frame-set page showing no Registration tab.
+- **Owed:** the owner's own click-through of the Stacking tab on the desktop
+  build — board/inspector/frames/results, Settings → Stacking, the frame-set
+  page showing no Registration tab — and specifically the **narrow-layout
+  check** (disclosure, toolbar wrap, table overflow at ≈ 900 px), which the
+  acceptance harness could not take (its browser window ignored resizes).
+- **Owed:** one stacking run on Windows and one on Linux (the web build) — the
+  acceptance run was macOS only; the folder validator, `statvfs` free space and
+  the fan-out's RAM probe are the platform-specific parts.
+- **Release-note lines owed** (drafted in the acceptance note §10): the
+  Stacking tab itself, "the run builds the masters it needs", Settings →
+  Stacking, the retired dev-only registration preview.
+- **Follow-up (web host, found by the acceptance run):** opening Settings →
+  General wedged the web server — `api::account::build_status` →
+  `TokenStore::load` → `SecKeychainFindGenericPassword` blocked in a mach
+  call to `securityd` (a macOS Keychain access prompt for an unsigned binary)
+  and every other request queued behind it. The account status must not block
+  the runtime: `spawn_blocking` around the keychain read and no shared lock
+  held across it.
+- **Follow-up (M4 performance):** the measurement fan-out admits
+  `clamp(RAM/4 ÷ working set, 1, cores)` frames and the working set is
+  8 planes × W × H × 4 B — on a 16 GB machine that is one OSC frame at a
+  time (10.4 min for 368 frames vs the 5 min target). Measurement needs far
+  fewer than eight full planes resident; recompute the working set from what
+  the measurement actually holds.
+- **Minor UI (fix wave of Plan 5b):** Integrate summary "min weight 0.01" for
+  0.005; master labels with 0-decimal exposures ("Flat 0s"); the Integrate
+  row's "N / M · P %" pairing a per-group count with the current group's band
+  percentage; the main pane scrolled horizontally after the provenance modal
+  (frames table wider than the pane); a cancelled run's board showing every
+  stage as "Skipped" (Calibrate had completed from cache, Measure was
+  interrupted); "—" in the frames table's Group column before any run.
+- **Dev-workflow note:** the Vite dev server cannot call a separately running
+  web API (no CORS layer, no proxy) — for a same-origin dev run build the
+  frontend with `NODE_ENV=development VITE_TARGET=web npx vite build --outDir <dir>`
+  and serve it with `ATHENAEUM_STATIC_DIR=<dir>`.
 - **Follow-up (not a bug, Task 8b fix round 1):** Stage 0.5's
   pre-calibration listing is a plan-time choice: when a raw flat set links a
   RAW DarkFlat sub-cal set, `select_flat_precal` skips it at plan time and
