@@ -175,10 +175,10 @@ pub(crate) struct RunContext {
     /// every stage, never calibrated/measured/registered/integrated.
     pub(crate) excluded: Vec<i64>,
     /// `group_key -> stacking_run_groups.id`, populated by [`start_stacking`]
-    /// right after [`insert_run`] so every later stage (Tasks 7-8:
-    /// `upsert_frame_row`'s `group_id`, `update_group`) has the row id
-    /// without a second DB round-trip. Not read by Task 6's own stage.
-    #[allow(dead_code)]
+    /// right after [`insert_run`] so every later stage (`upsert_frame_row`'s
+    /// `group_id`, `update_group`) has the row id without a second DB
+    /// round-trip. Read by stages 3 and 5 (Task 7's `stage_measure`/
+    /// `write_frame_rows`).
     pub(crate) group_ids: HashMap<String, i64>,
     pub(crate) layout: WorkingLayout,
     /// The run's output folder (masters land here — Task 8's Output stage).
@@ -1112,14 +1112,17 @@ fn admission(working_set_bytes: u64) -> usize {
     n.clamp(1, cores as u64) as usize
 }
 
-/// Fan `items` out across `admission` worker threads pulling from one
-/// shared FIFO queue (`std::thread::scope`), `cancel` checked before each
-/// item is pulled — never mid-item, since only the item's own function (a
-/// caller that needs per-item cancellation captures its OWN `&AtomicBool`
-/// into `f`) can decide that. Results land at their item's ORIGINAL index
-/// in `items`; an index whose item was never started because `cancel`
-/// fired first is `None` — callers check `cancel` once, right after this
-/// returns, rather than inspecting every entry for that case.
+/// Fan `items` out across `min(admission, items.len()).max(1)` worker
+/// threads pulling from one shared FIFO queue (`std::thread::scope`) —
+/// never more workers than there is work, and always at least one so a
+/// non-empty `items` makes progress even when `admission` itself is 0.
+/// `cancel` checked before each item is pulled — never mid-item, since
+/// only the item's own function (a caller that needs per-item
+/// cancellation captures its OWN `&AtomicBool` into `f`) can decide that.
+/// Results land at their item's ORIGINAL index in `items`; an index whose
+/// item was never started because `cancel` fired first is `None` —
+/// callers check `cancel` once, right after this returns, rather than
+/// inspecting every entry for that case.
 fn fan_out<T, R, F>(
     items: Vec<T>,
     admission: usize,
@@ -1139,7 +1142,7 @@ where
     let results: Mutex<Vec<Option<Result<R, String>>>> = Mutex::new((0..n).map(|_| None).collect());
 
     std::thread::scope(|scope| {
-        for _ in 0..admission.max(1) {
+        for _ in 0..admission.min(n).max(1) {
             scope.spawn(|| loop {
                 if cancel.load(Ordering::SeqCst) {
                     return;
@@ -1251,24 +1254,42 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 continue;
             };
 
-            let planes = PlaneReader::open(&calibrated_path)
-                .map(|r| r.channels())
-                .unwrap_or(0);
-            if planes == 0 {
-                let reason = "calibrated frame has no planes".to_string();
-                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
-                entries.push(MeasuredFrame {
-                    frame: frame.clone(),
-                    calibrated: Some(calibrated_path),
-                    planes: 0,
-                    measurement: None,
-                    weight: None,
-                    included: false,
-                    reason: Some(reason),
-                    registration: None,
-                });
-                continue;
-            }
+            let planes = match PlaneReader::open(&calibrated_path) {
+                Ok(r) => Ok(r.channels()),
+                Err(e) => Err(format!("calibrated frame unreadable: {e}")),
+            };
+            let planes = match planes {
+                Ok(p) if p > 0 => p,
+                Ok(_) => {
+                    let reason = "calibrated frame has no planes".to_string();
+                    rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                    entries.push(MeasuredFrame {
+                        frame: frame.clone(),
+                        calibrated: Some(calibrated_path),
+                        planes: 0,
+                        measurement: None,
+                        weight: None,
+                        included: false,
+                        reason: Some(reason),
+                        registration: None,
+                    });
+                    continue;
+                }
+                Err(reason) => {
+                    rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                    entries.push(MeasuredFrame {
+                        frame: frame.clone(),
+                        calibrated: Some(calibrated_path),
+                        planes: 0,
+                        measurement: None,
+                        weight: None,
+                        included: false,
+                        reason: Some(reason),
+                        registration: None,
+                    });
+                    continue;
+                }
+            };
             max_planes = max_planes.max(planes);
 
             entries.push(MeasuredFrame {
@@ -1482,6 +1503,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     run_id = rc.run_id,
                     frame_id = entries[idx].frame.frame_id,
                     weight = weights[i].normalized_mean,
+                    included = entries[idx].included,
                     "frame measured"
                 );
             }
@@ -1500,7 +1522,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 tracing::warn!(
                     run_id = rc.run_id,
                     group_key = %group.key,
-                    included = included_count,
+                    count = included_count,
                     "stacking group skipped: fewer than 3 included frames"
                 );
                 rc.warnings.push(format!(
@@ -1585,17 +1607,66 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
             let row =
                 row.ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
             let frame_id = row.reference_frame_id;
-            let entry = rc
-                .measured
-                .values()
-                .flat_map(|v| v.iter())
-                .find(|e| e.frame.frame_id == frame_id)
-                .ok_or_else(|| {
-                    RunError::Other("reference frame is not part of any group".to_string())
-                })?;
-            let calibrated = entry.calibrated.clone().ok_or_else(|| {
-                RunError::Other("reference frame was excluded before measurement".to_string())
+
+            let location = rc.measured.iter().find_map(|(key, v)| {
+                v.iter()
+                    .position(|e| e.frame.frame_id == frame_id)
+                    .map(|idx| (key.clone(), idx))
+            });
+            let (group_key, idx) = location.ok_or_else(|| {
+                RunError::Other("reference frame is not part of any group".to_string())
             })?;
+
+            // Fix round 1, item 1: a manual reference excluded in stage 1
+            // (calibration failed) or by the user's own manual exclusion
+            // list — both leave `calibrated: None` — is a hard failure:
+            // the plan gate cannot see a stage-1 failure, so the run says
+            // so loudly instead of silently substituting a different
+            // reference. Any OTHER exclusion (measurement failure, or a
+            // stage-3 selection filter — weight floor, maxFwhm, …) still
+            // has a calibrated file, and the manual reference is forced
+            // included regardless, per the same ruling — otherwise it
+            // becomes the run's reference (`rc.reference_frame_id` below)
+            // while stage 5's own `included`-filtered snapshot skips it
+            // entirely, leaving it with no identity row, a `skipped` frame
+            // row, and every later run stale forever
+            // (`plan.rs::compute_register_stale`).
+            let calibrated_missing = rc.measured[&group_key][idx].calibrated.is_none();
+            if calibrated_missing {
+                let reason = rc.measured[&group_key][idx]
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "excluded".to_string());
+                return Err(RunError::Other(format!(
+                    "the manual reference frame is excluded: {reason}"
+                )));
+            }
+
+            let already_included = rc.measured[&group_key][idx].included;
+            if !already_included {
+                let reason = rc.measured[&group_key][idx]
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "excluded".to_string());
+                let entries_mut = rc.measured.get_mut(&group_key).expect("checked above");
+                entries_mut[idx].included = true;
+                entries_mut[idx].reason = None;
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id,
+                    note = %reason,
+                    "manual reference kept despite selection"
+                );
+                rc.warnings.push(format!(
+                    "manual reference frame {frame_id} kept despite selection: {reason}"
+                ));
+            }
+
+            let entry = &rc.measured[&group_key][idx];
+            let calibrated = entry
+                .calibrated
+                .clone()
+                .expect("checked above: calibrated is Some");
             (
                 frame_id,
                 entry.frame.filename.clone(),
@@ -2057,11 +2128,11 @@ fn write_registered_artifact(
     cfg: &StackingConfig,
 ) -> anyhow::Result<()> {
     let group_key: &str = group.key.as_str();
-    let calibrated = rc
+    let (calibrated, planes) = rc
         .measured
         .get(group_key)
         .and_then(|v| v.iter().find(|e| e.frame.frame_id == frame.frame_id))
-        .and_then(|e| e.calibrated.clone())
+        .and_then(|e| e.calibrated.clone().map(|c| (c, e.planes)))
         .ok_or_else(|| {
             anyhow::anyhow!("no calibrated path recorded for frame {}", frame.frame_id)
         })?;
@@ -2071,9 +2142,14 @@ fn write_registered_artifact(
     // Fix round 1: route the registered name through the SAME
     // `calibrated_file_stem` stage 1 used, rather than recovering it by
     // trimming a leading "c_" off the calibrated file's own name — the two
-    // stay consistent by construction, not by one parsing the other.
+    // stay consistent by construction, not by one parsing the other. The
+    // debayer marker is likewise explicit (`planes == 3`, already known
+    // from this same frame's own measured entry) rather than inferred by
+    // checking whether the calibrated file's OWN name ends in "_d" — a
+    // source light whose own filename happens to end in "_d" (e.g.
+    // "vega_d.fits", mono) made that heuristic misfire.
     let stem = calibrated_file_stem(group, frame);
-    let out = out_dir.join(registered_file_name(&stem, &calibrated));
+    let out = out_dir.join(registered_file_name(&stem, planes == 3));
 
     let reference_name = rc
         .reference_calibrated
@@ -2130,17 +2206,15 @@ fn write_registered_artifact(
 
 /// `r_<stem>[_d].fits` for the SAME collision-safe `stem`
 /// [`calibrated_file_stem`] gave the calibrated file (fix round 1: the two
-/// naming schemes must agree by construction). The debayer `_d` marker is
-/// not part of `stem` (it is the generator's own suffix, decided when the
-/// calibrated file was written) — recovered here from whether the
-/// calibrated file's own on-disk name ends in `_d`, matching
-/// `register_probe.rs`'s own convention of keeping that marker on the
-/// registered output too.
-fn registered_file_name(stem: &str, calibrated: &Path) -> String {
-    let debayered = calibrated
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.ends_with("_d"));
+/// naming schemes must agree by construction). `debayered` is the caller's
+/// own known fact (`MeasuredFrame::planes == 3`) — NOT inferred by
+/// checking whether the calibrated file's own on-disk name ends in `_d`
+/// (fix round 1's addendum: a SOURCE light whose own filename already ends
+/// in `_d`, e.g. a mono `vega_d.fits`, made that heuristic misfire —
+/// `c_vega_d.fits` "looks" debayered by name alone even though it is not).
+/// Matches `register_probe.rs`'s own convention of keeping the marker on
+/// the registered output too.
+fn registered_file_name(stem: &str, debayered: bool) -> String {
     if debayered {
         format!("r_{stem}_d.fits")
     } else {
@@ -2155,6 +2229,11 @@ fn write_frame_rows(rc: &mut RunContext) -> Result<(), RunError> {
     let conn = db(&rc.ctx)?.conn();
     for group in &rc.plan_groups {
         let Some(&group_id) = rc.group_ids.get(&group.key) else {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                "frame rows skipped: unknown group"
+            );
             continue;
         };
         let Some(entries) = rc.measured.get(&group.key) else {
@@ -3082,6 +3161,17 @@ mod tests {
     }
 
     #[test]
+    fn registered_file_name_does_not_misdetect_a_source_name_ending_in_d() {
+        // Fix round 1 addendum: a mono source light named "vega_d" must not
+        // be mistaken for a debayered output just because its own stem
+        // happens to end in "_d" — `debayered` is now an explicit fact the
+        // caller passes (`MeasuredFrame::planes == 3`), never inferred from
+        // the calibrated file's own name.
+        assert_eq!(registered_file_name("vega_d", false), "r_vega_d.fits");
+        assert_eq!(registered_file_name("vega_d", true), "r_vega_d_d.fits");
+    }
+
+    #[test]
     fn measure_reuses_metrics_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
@@ -3387,6 +3477,30 @@ mod tests {
             "a fresh registration row must not be rewritten"
         );
 
+        // Every frame's OWN registration outcome on the second pass is a
+        // reuse (`cached: true`) — not merely a DB row that happens to
+        // look the same, but a run that provably never called
+        // `register_frame`/`identity_registration` again.
+        for entries in rc2.measured.values() {
+            for entry in entries {
+                match &entry.registration {
+                    Some(RegisteredFrameOutcome::Aligned { cached, .. }) => {
+                        assert!(
+                            *cached,
+                            "frame {} was re-registered on the second pass",
+                            entry.frame.frame_id
+                        );
+                    }
+                    Some(RegisteredFrameOutcome::Failed(msg)) => {
+                        panic!("frame {} failed registration: {msg}", entry.frame.frame_id);
+                    }
+                    None => {
+                        panic!("frame {} has no registration outcome", entry.frame.frame_id);
+                    }
+                }
+            }
+        }
+
         // Third pass, `max_stars` changed: the registration config hash
         // changes for every frame, so every row must re-register (asserted
         // via the hash, not `registered_at` — a fast, all-in-memory test
@@ -3501,6 +3615,158 @@ mod tests {
         let err = result_b.expect_err("run must fail when registration failures are not excluded");
         match err {
             RunError::Other(msg) => assert!(msg.contains("registration failed"), "{msg}"),
+            other => panic!("expected RunError::Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_reference_excluded_by_selection_is_forced_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+
+        // A 5th, pure-noise frame — selection excludes it by weight. It is
+        // then chosen as the MANUAL reference: the run must keep it
+        // included regardless (fix round 1, item 1).
+        let noise_date = date_obs_at(4);
+        let noise_spec = star_light_spec("noise", &noise_date);
+        let (noise_id, _path) =
+            test_fixtures::add_light_with_field(&fixture, &noise_spec, &[], 600.0, 30.0, 999);
+
+        let mut all_ids = light_ids.clone();
+        all_ids.push(noise_id);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &all_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, noise_id)
+            .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+
+        assert_eq!(rc.reference_frame_id, Some(noise_id));
+
+        let rows = get_registration_for_frame_set(&fixture.conn, fixture.set_id).unwrap();
+        let noise_row = rows
+            .iter()
+            .find(|r| r.frame_id == noise_id)
+            .expect("the manual reference has a registration_results row");
+        assert!(noise_row.is_reference);
+        assert_eq!(noise_row.status, "reference");
+
+        let frame_rows = crate::db::stacking::list_frame_rows(&fixture.conn, rc.run_id).unwrap();
+        let noise_frame_row = frame_rows
+            .iter()
+            .find(|r| r.frame_id == noise_id)
+            .expect("the manual reference has a stacking_run_frames row");
+        assert!(noise_frame_row.included, "{noise_frame_row:?}");
+        assert_eq!(noise_frame_row.reg_status.as_deref(), Some("reference"));
+
+        assert_eq!(
+            rc.warnings
+                .iter()
+                .filter(|w| w.contains("kept despite selection"))
+                .count(),
+            1,
+            "{:?}",
+            rc.warnings
+        );
+    }
+
+    #[test]
+    fn manual_reference_in_the_exclusion_list_fails_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            light_ids[0],
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        // The reference frame is ALSO in the run's own manual exclusion
+        // list — the plan gate cannot see this (it only checks the raw
+        // file is on disk), so the run itself must refuse loudly.
+        rc.excluded = vec![light_ids[0]];
+
+        let err = run_stages_for_test(&mut rc, Stage::Register)
+            .expect_err("a manually-excluded reference frame must fail the run");
+        match err {
+            RunError::Other(msg) => {
+                assert!(
+                    msg.contains("the manual reference frame is excluded"),
+                    "{msg}"
+                );
+            }
             other => panic!("expected RunError::Other, got {other:?}"),
         }
     }
