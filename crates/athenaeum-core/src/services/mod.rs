@@ -16,8 +16,9 @@ use crate::settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
-// RwLock is used only by the solver-gated cache fields below.
-#[cfg(feature = "solver")]
+// RwLock is used only by the `dso_catalog` field below, so it carries that
+// field's render+solver gate (a `solver`-only build has no RwLock user).
+#[cfg(all(feature = "render", feature = "solver"))]
 use std::sync::RwLock;
 
 /// Handle to track an active scan operation.
