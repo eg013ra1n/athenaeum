@@ -187,6 +187,23 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M1 — the Stacking tab (2026-09-10)
+
+M1 Plan 5b (the Stacking tab, Settings → Stacking, retirement of the
+plate-solve-era registration flow). Code-complete with green gates; nothing
+verified by hand yet. Filled in as each task lands — Task 7 (acceptance run)
+extends this subsection.
+
+- **Release-note line owed:** `browse_directories` now answers `400 Bad
+  Request` to an unknown `scope` instead of silently falling through to the
+  scan roots (task 6 fix round 1, `crates/athenaeum-web/src/routes/files.rs`)
+  — every known caller already passes `"scan"`/`"export"`/`"stacking"`, so
+  this is not expected to be user-visible, but the behavior change itself
+  needs a line at the next tag.
+- **Owed:** the owner's click-through of the Stacking tab itself (currently
+  dev-only behind `STACKING_ENABLED`) — board/inspector/frames/results,
+  Settings → Stacking, and the frame-set page showing no Registration tab.
+
 ### Lights + calibration sets export lands raw originals, not built masters (2026-09-08)
 
 Owner report: the "Lights + calibration sets" mode exported Athenaeum-built

@@ -78,8 +78,6 @@ pub fn run() {
                     active_master_builds: Arc::new(Mutex::new(HashMap::new())),
                     active_stacks: Arc::new(Mutex::new(HashMap::new())),
                     dso_catalog: Arc::new(std::sync::RwLock::new(None)),
-                    star_cache: Arc::new(std::sync::RwLock::new(None)),
-                    bright_cache: Arc::new(std::sync::RwLock::new(None)),
                     image_pool: Arc::new(
                         rayon::ThreadPoolBuilder::new()
                             .num_threads(max_threads)

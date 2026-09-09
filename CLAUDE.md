@@ -495,7 +495,8 @@ names a foreign-scale group as a blocker instead of registration silently
 dropping its frames).
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
-plan,run,provenance,measure,weights,register,integrate,master_cards}.rs`,
+plan,run,provenance,measure,weights,psf_signal,robust,integrate,
+master_cards}.rs`, `stacking/register/{mod,detect,align,frame,writer}.rs`,
 `crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
 fits_writer/wcs.rs`; dev probes `examples/{measure,register,integrate}_probe.rs`.
 Frontend: `src/components/stacking/` (above),

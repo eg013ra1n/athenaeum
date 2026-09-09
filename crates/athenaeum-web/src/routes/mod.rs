@@ -497,8 +497,6 @@ pub(crate) mod tests {
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             active_stacks: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
-            star_cache: Arc::new(RwLock::new(None)),
-            bright_cache: Arc::new(RwLock::new(None)),
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             // Spawns one real worker thread (see operation_queue.rs — there
             // is no lighter-weight constructor); matches that module's own

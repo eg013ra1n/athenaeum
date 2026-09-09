@@ -91,20 +91,6 @@ pub struct ServiceContext {
     /// Gated to match `DsoCatalog`'s home in the render+solver plate_solve module.
     #[cfg(all(feature = "render", feature = "solver"))]
     pub dso_catalog: Arc<RwLock<Option<Arc<DsoCatalog>>>>,
-    /// Lazy-opened solvemyastro star-cache (`stars.smac`). Loaded on first
-    /// solve attempt and shared read-only across all worker threads.
-    /// `None` until the cache file is located (opens from the `smac_gaia`
-    /// subdir of the app-data catalogs dir). If the file is absent the solve
-    /// command returns an actionable error.
-    #[cfg(feature = "solver")]
-    pub star_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
-    /// Optional bright sub-catalog (G<16 hybrid floor + density top-up;
-    /// built via `solvemyastro build-bright-cache`). When present, the
-    /// plate-solve hot path uses it for fast quad matching with
-    /// auto-fallback to `star_cache`. `None` if no bright cache is
-    /// available — production runs on the deep cache alone.
-    #[cfg(feature = "solver")]
-    pub bright_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
     /// Single serialized worker queue shared by ZIP archive + file ops.
     /// Created at startup; lives for the process lifetime.
@@ -158,10 +144,6 @@ impl ServiceContext {
             active_stacks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "render", feature = "solver"))]
             dso_catalog: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "solver")]
-            star_cache: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "solver")]
-            bright_cache: Arc::new(RwLock::new(None)),
             image_pool: Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(1)

@@ -314,10 +314,6 @@ mod tests {
             active_stacks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "render", feature = "solver"))]
             dso_catalog: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "solver")]
-            star_cache: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "solver")]
-            bright_cache: Arc::new(RwLock::new(None)),
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),

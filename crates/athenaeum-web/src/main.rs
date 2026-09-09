@@ -197,8 +197,6 @@ async fn main() {
         active_master_builds: Arc::new(Mutex::new(HashMap::new())),
         active_stacks: Arc::new(Mutex::new(HashMap::new())),
         dso_catalog: Arc::new(std::sync::RwLock::new(None)),
-        star_cache: Arc::new(std::sync::RwLock::new(None)),
-        bright_cache: Arc::new(std::sync::RwLock::new(None)),
         image_pool: Arc::new(image_pool),
         operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
         compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),

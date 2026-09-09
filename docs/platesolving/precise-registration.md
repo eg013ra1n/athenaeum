@@ -1,5 +1,13 @@
 # Precise WCS & Image Registration (Stacking Preparation)
 
+> **Superseded 2026-09-10.** The plate-solve-based registration flow this
+> document describes (the `register_frame_set` trio, `stacking-prep-*`
+> events, `StackingPrepTab`, `registration::service`) was retired by the
+> stacking program; registration now lives in `stacking/register/*` and runs
+> inside a stacking run
+> (`docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md` §3,
+> CLAUDE.md → Stacking). Kept for history.
+
 How Athenaeum produces a **high-precision WCS** and uses it to **register a
 frame set's light frames to a common reference** for stacking. This is an
 **opt-in** path layered on top of the normal (fast) plate solver — the fast
