@@ -1,13 +1,22 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Play, Square, ChevronDown, FolderOpen, AlertTriangle, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
-import type { Stage, StackingConfig, StackingPlan, StackingSetConfig } from '../../types/stacking';
+import type {
+  Stage,
+  StackingConfig,
+  StackingPlan,
+  StackingPreset,
+  StackingPresets,
+  StackingSetConfig,
+} from '../../types/stacking';
 import { PipelineBoard } from './PipelineBoard';
 import { GroupsTable } from './GroupsTable';
-import type { BoardStage } from './stageSummary';
+import { StageInspector } from './StageInspector';
+import { stableStringify, type BoardStage } from './stageSummary';
+import { readSelectedStage, writeSelectedStage } from './stackingPrefs';
 
 export interface StackingTabProps {
   framesSetId: number;
@@ -26,8 +35,23 @@ const STAGE_LABEL: Record<BoardStage, string> = {
   output: 'Output',
 };
 
+const PRESET_LABEL: Record<StackingPreset, string> = {
+  default: 'Default',
+  fastPreview: 'Fast preview',
+  maximumQuality: 'Maximum quality',
+};
+
 function formatGB(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
+/** Every field except `paths` — the preset comparison (and `applyPreset`)
+ *  ignore the per-set folder override, which is never part of what makes a
+ *  config "Default"/"Fast preview"/"Maximum quality" (plan 5b Task 3
+ *  "Decisions" item 3). */
+function withoutPaths(config: StackingConfig): Omit<StackingConfig, 'paths'> {
+  const { paths: _paths, ...rest } = config;
+  return rest;
 }
 
 /**
@@ -43,12 +67,15 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
   const { progress, lastOutcome, startRun, cancelRun, isRunning } = useStackingContext();
 
   const [draftConfig, setDraftConfig] = useState<StackingConfig | null>(null);
+  const [excludedFrameIds, setExcludedFrameIds] = useState<number[]>([]);
+  const [presets, setPresets] = useState<StackingPresets | null>(null);
   const [plan, setPlan] = useState<StackingPlan | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [selectedStage, setSelectedStage] = useState<BoardStage>('calibrate');
+  const [selectedStage, setSelectedStage] = useState<BoardStage>(readSelectedStage);
   const [starting, setStarting] = useState(false);
   const [rerunMenuOpen, setRerunMenuOpen] = useState(false);
+  const [presetMenuOpen, setPresetMenuOpen] = useState(false);
 
   const runProgress = progress.get(framesSetId);
   const runOutcome = lastOutcome.get(framesSetId);
@@ -79,6 +106,10 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
         const cfg = await api.invoke<StackingSetConfig>('get_stacking_config', { setId: framesSetId });
         if (cancelled) return;
         setDraftConfig(cfg.config);
+        setExcludedFrameIds(cfg.excludedFrameIds);
+        const presetsResult = await api.invoke<StackingPresets>('get_stacking_presets', {});
+        if (cancelled) return;
+        setPresets(presetsResult);
         const p = await api.invoke<StackingPlan>('get_stacking_plan', {
           setId: framesSetId,
           config: cfg.config,
@@ -130,11 +161,68 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
     void refetchPlan(draftConfigRef.current ?? undefined);
   }, [lastOutcomeRunId, refetchPlan]);
 
+  // Persist (debounced) whenever the draft config or the excluded-frame list
+  // changes — skip the very first assignment (the mount effect's own seed).
+  // Submit state, never a re-read (spec §11.2): a failed write logs and
+  // warns but never rolls the draft back or re-fetches.
+  const skipFirstPersistEffect = useRef(true);
+  useEffect(() => {
+    if (skipFirstPersistEffect.current) {
+      skipFirstPersistEffect.current = false;
+      return;
+    }
+    if (!draftConfig) return;
+    const t = setTimeout(() => {
+      api
+        .invoke('set_stacking_config', { setId: framesSetId, config: draftConfig, excludedFrameIds })
+        .catch((err) => {
+          console.error('[StackingTab] set_stacking_config failed:', err);
+          notify({
+            tone: 'warning',
+            kind: 'stacking',
+            toast: true,
+            title: 'Stacking settings not saved',
+            detail: String(err),
+          });
+        });
+    }, 500);
+    return () => clearTimeout(t);
+  }, [draftConfig, excludedFrameIds, framesSetId, notify]);
+
+  const handleConfigChange = useCallback((next: StackingConfig) => {
+    setDraftConfig(next);
+  }, []);
+
   const handleToggleWriteRegisteredFrames = useCallback((checked: boolean) => {
     setDraftConfig((prev) =>
       prev ? { ...prev, registration: { ...prev.registration, writeRegisteredFrames: checked } } : prev,
     );
   }, []);
+
+  const handleSelectStage = useCallback((stage: BoardStage) => {
+    setSelectedStage(stage);
+    writeSelectedStage(stage);
+  }, []);
+
+  // Preset selector (plan Ruling 1): the label is computed, never stored —
+  // comparing the draft (minus its per-set folder override) against each
+  // built-in preset via canonical JSON.
+  const presetLabel = useMemo<string>(() => {
+    if (!draftConfig || !presets) return 'Custom';
+    const draftKey = stableStringify(withoutPaths(draftConfig));
+    if (draftKey === stableStringify(withoutPaths(presets.default))) return 'Default';
+    if (draftKey === stableStringify(withoutPaths(presets.fastPreview))) return 'Fast preview';
+    if (draftKey === stableStringify(withoutPaths(presets.maximumQuality))) return 'Maximum quality';
+    return 'Custom';
+  }, [draftConfig, presets]);
+
+  const applyPreset = useCallback((preset: StackingPreset) => {
+    setDraftConfig((prev) => {
+      if (!presets || !prev) return prev;
+      return { ...presets[preset], paths: prev.paths };
+    });
+    setPresetMenuOpen(false);
+  }, [presets]);
 
   const handleRun = useCallback(async () => {
     if (!plan || plan.blockers.length > 0 || running || starting) return;
@@ -185,6 +273,15 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
     }
   }, [running, starting, startRun, framesSetId, draftConfig, notify]);
 
+  // Measure panel's own "Re-measure" button (spec: rerunFrom: 'measure').
+  // Independent disabled logic from the toolbar's "Re-run from" menu, which
+  // gates on staleness — this one gates on the plan's blockers directly,
+  // per the brief.
+  const remeasureDisabled = running || starting || (plan?.blockers.length ?? 0) > 0;
+  const handleRemeasure = useCallback(() => {
+    void handleRerunFrom('measure');
+  }, [handleRerunFrom]);
+
   const handleCoverageClick = useCallback(() => {
     const setId = plan && plan.readiness.rawSetsWithoutMaster > 0
       ? plan.readiness.rawSetIdsWithoutMaster[0]
@@ -205,7 +302,7 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
     );
   }
 
-  if (loadError || !plan || !draftConfig) {
+  if (loadError || !plan || !draftConfig || !presets) {
     return (
       <div className="text-center py-12 text-content-muted">
         <p>Failed to load the stacking plan{loadError ? `: ${loadError}` : '.'}</p>
@@ -224,7 +321,30 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-surface-elevated rounded-lg px-4 py-3">
         <div className="flex flex-wrap items-center gap-4 text-sm text-content-secondary">
-          <span className="font-medium text-content">Default</span>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setPresetMenuOpen((v) => !v)}
+              className="flex items-center gap-1 font-medium text-content hover:text-content-secondary transition-colors"
+            >
+              {presetLabel}
+              <ChevronDown size={14} />
+            </button>
+            {presetMenuOpen && (
+              <div className="absolute left-0 mt-1 w-40 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
+                {(Object.keys(PRESET_LABEL) as StackingPreset[]).map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => applyPreset(p)}
+                    className="w-full text-left px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover"
+                  >
+                    {PRESET_LABEL[p]}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <span className="flex items-center gap-1.5">
             <FolderOpen size={14} className="text-content-muted" />
             {plan.workingDir ?? 'Choose a working folder'}
@@ -336,7 +456,7 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
             progress={runProgress}
             outcome={runOutcome}
             selectedStage={selectedStage}
-            onSelectStage={setSelectedStage}
+            onSelectStage={handleSelectStage}
             onToggleWriteRegisteredFrames={handleToggleWriteRegisteredFrames}
           />
           <div className="bg-surface-elevated rounded-lg p-3">
@@ -346,10 +466,16 @@ export function StackingTab({ framesSetId, frameSetName }: StackingTabProps) {
         </div>
 
         <div className="lg:w-[38%] min-w-0">
-          {/* Task 3 fills this in with `StageInspector`. */}
-          <div className="bg-surface-elevated rounded-lg p-4 h-full">
-            <p className="text-sm text-content-muted">{STAGE_LABEL[selectedStage]}</p>
-          </div>
+          <StageInspector
+            stage={selectedStage}
+            config={draftConfig}
+            onChange={handleConfigChange}
+            plan={plan}
+            disabled={running || starting}
+            presetDefault={presets.default}
+            onRemeasure={handleRemeasure}
+            remeasureDisabled={remeasureDisabled}
+          />
         </div>
       </div>
     </div>

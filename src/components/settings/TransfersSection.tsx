@@ -11,15 +11,15 @@
 // on mount: the folders must be configurable before this machine is paired.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, FolderOpen, Loader2, RotateCcw, Save, Trash2 } from 'lucide-react';
+import { Loader2, Save, Trash2 } from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { FolderBrowserModal } from '../FolderBrowserModal';
+import { FolderCard } from '../stacking/FolderCard';
 import { formatBytes } from '../transfers/presentation';
 import { useNotifications } from '../../contexts/NotificationContext';
 import type {
-  PathSetting,
   TransferCleanup,
   TransferPaths,
   TransferStorage,
@@ -65,65 +65,6 @@ function receivesToInput(raw: string): string {
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n)) return DEFAULT_RECEIVES;
   return String(Math.min(MAX_RECEIVES, Math.max(MIN_RECEIVES, n)));
-}
-
-/** One folder card: effective path, default hint, Choose… / Use default, restart badge. */
-function FolderCard({
-  title,
-  hint,
-  setting,
-  onChoose,
-  onReset,
-  error,
-  busy,
-}: {
-  title: string;
-  hint: string;
-  setting: PathSetting;
-  onChoose: () => void;
-  onReset: () => void;
-  error: string | null;
-  busy: boolean;
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-surface p-3">
-      <div className="flex items-center justify-between gap-3">
-        <h4 className="text-sm font-medium text-content-secondary">{title}</h4>
-        {setting.restartRequired && (
-          <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-warning/15 text-warning">
-            <AlertTriangle size={11} /> Restart Athenaeum to apply
-          </span>
-        )}
-      </div>
-      <p className="mt-1 font-mono text-xs text-content break-all" title={setting.effective}>
-        {setting.effective}
-      </p>
-      <p className="mt-1 text-[11px] text-content-muted">
-        {setting.configured ? `Default: ${setting.default}` : 'Default location'} · {hint}
-      </p>
-      {error && <p className="mt-1 text-[11px] text-error">{error}</p>}
-      <div className="mt-2 flex items-center gap-2">
-        <button
-          type="button"
-          onClick={onChoose}
-          disabled={busy}
-          className="inline-flex items-center gap-1 rounded border border-border bg-surface-elevated px-2 py-1 text-xs text-content hover:bg-surface disabled:opacity-50"
-        >
-          <FolderOpen size={12} /> Choose…
-        </button>
-        {setting.configured && (
-          <button
-            type="button"
-            onClick={onReset}
-            disabled={busy}
-            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-content-muted hover:text-content disabled:opacity-50"
-          >
-            <RotateCcw size={12} /> Use default
-          </button>
-        )}
-      </div>
-    </div>
-  );
 }
 
 export default function TransfersSection() {

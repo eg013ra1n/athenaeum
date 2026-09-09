@@ -17,8 +17,10 @@ interface FolderBrowserModalProps {
   isOpen: boolean;
   onSelect: (path: string) => void;
   onClose: () => void;
-  /** `"scan"` (default) browses scan roots; `"export"` browses the export directory. */
-  scope?: 'scan' | 'export';
+  /** `"scan"` (default) browses scan roots; `"export"` browses the export
+   *  directory; `"stacking"` browses the same roots as `"scan"` (the Stacking
+   *  tab's Output panel folder picker, plan 5b Task 1/3, plan Ruling 6). */
+  scope?: 'scan' | 'export' | 'stacking';
 }
 
 export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({

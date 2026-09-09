@@ -53,7 +53,7 @@ export type RowState =
 
 // ── Label maps ──────────────────────────────────────────────────────────
 
-function modelLabel(v: ModelChoice): string {
+export function modelLabel(v: ModelChoice): string {
   switch (v) {
     case 'auto': return 'Auto';
     case 'similarity': return 'Similarity';
@@ -62,7 +62,7 @@ function modelLabel(v: ModelChoice): string {
   }
 }
 
-function distortionLabel(v: DistortionChoice): string {
+export function distortionLabel(v: DistortionChoice): string {
   switch (v) {
     case 'off': return 'off';
     case 'polynomial2': return 'polynomial-2';
@@ -72,7 +72,7 @@ function distortionLabel(v: DistortionChoice): string {
   }
 }
 
-function interpolationLabel(v: Interpolation): string {
+export function interpolationLabel(v: Interpolation): string {
   switch (v) {
     case 'nearest': return 'nearest';
     case 'bilinear': return 'bilinear';
@@ -84,7 +84,7 @@ function interpolationLabel(v: Interpolation): string {
   }
 }
 
-function weightModeLabel(v: WeightMode): string {
+export function weightModeLabel(v: WeightMode): string {
   switch (v) {
     case 'psfSignalWeight': return 'PSF signal';
     case 'psfSnr': return 'PSF SNR';
@@ -96,21 +96,21 @@ function weightModeLabel(v: WeightMode): string {
   }
 }
 
-function psfModelLabel(v: PsfModel): string {
+export function psfModelLabel(v: PsfModel): string {
   switch (v) {
     case 'auto': return 'Auto';
     case 'moffat4': return 'Moffat-4';
   }
 }
 
-function flatNormModeLabel(v: FlatNormMode): string {
+export function flatNormModeLabel(v: FlatNormMode): string {
   switch (v) {
     case 'centralThird': return 'central third';
     case 'pixinsightTrimmed': return 'trimmed';
   }
 }
 
-function outputNormLabel(v: OutputNormalization): string {
+export function outputNormLabel(v: OutputNormalization): string {
   switch (v) {
     case 'none': return 'none';
     case 'additive': return 'additive';
@@ -120,7 +120,7 @@ function outputNormLabel(v: OutputNormalization): string {
   }
 }
 
-function rejectionNormLabel(v: RejectionNormalization): string {
+export function rejectionNormLabel(v: RejectionNormalization): string {
   switch (v) {
     case 'none': return 'none';
     case 'scaleZeroOffset': return 'scale-zero-offset';
@@ -129,14 +129,14 @@ function rejectionNormLabel(v: RejectionNormalization): string {
   }
 }
 
-function combinationLabel(v: Combination): string {
+export function combinationLabel(v: Combination): string {
   switch (v) {
     case 'average': return 'Average';
     case 'median': return 'Median';
   }
 }
 
-function rejectionLabel(v: RejectionChoice): string {
+export function rejectionLabel(v: RejectionChoice): string {
   switch (v.method) {
     case 'auto': return 'auto rejection';
     case 'none': return 'no rejection';
@@ -147,7 +147,7 @@ function rejectionLabel(v: RejectionChoice): string {
   }
 }
 
-function kernelLabel(v: DrizzleKernel): string {
+export function kernelLabel(v: DrizzleKernel): string {
   switch (v) {
     case 'square': return 'square';
     case 'circle': return 'circle';
@@ -155,7 +155,7 @@ function kernelLabel(v: DrizzleKernel): string {
   }
 }
 
-function cleanupLabel(v: StackingConfig['output']['cleanup']): string {
+export function cleanupLabel(v: StackingConfig['output']['cleanup']): string {
   switch (v) {
     case 'keepAll': return 'keep all';
     case 'deleteRegistered': return 'delete registered';
@@ -281,4 +281,29 @@ export function rowState(
   }
 
   return 'ready';
+}
+
+// ── stableStringify ─────────────────────────────────────────────────────
+
+/**
+ * Canonical `JSON.stringify` with every object's keys sorted, at every
+ * level (arrays keep their order — order is meaningful there, unlike an
+ * object's key order). Used by the inspector's preset selector (Task 3,
+ * plan Ruling 1) to compare the draft config against each built-in preset
+ * without a field-reorder producing a false "Custom" label.
+ */
+export function stableStringify(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
 }
