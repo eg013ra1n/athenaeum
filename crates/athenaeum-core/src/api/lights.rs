@@ -199,7 +199,10 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
 /// backstop. Tallying the calibrated mode from the per-frame `classify` walk
 /// instead would let the two modes report different numbers for the same frame
 /// set, and let the calibrated gate pass a tree the backstop would refuse.
-fn compute_export_readiness(conn: &Connection, set_id: i64) -> Result<ExportReadiness, ApiError> {
+pub(crate) fn compute_export_readiness(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<ExportReadiness, ApiError> {
     let members = load_light_members(conn, set_id)?;
     let total = members.len() as i64;
 

@@ -14,9 +14,12 @@
 //! hashes artifacts key off), `groups` (spec §2: integration groups from
 //! the catalog — grouping keys, the group-key string, the frame-set slug —
 //! plus, `cfg(test)`, the catalog fixture builder every later task in this
-//! plan reuses), and `paths` (spec §9.6: working/output folder resolution
+//! plan reuses), `paths` (spec §9.6: working/output folder resolution
 //! and validation, the on-disk working layout, free-space and byte-usage
-//! probes, a run's byte-footprint estimate, and working-folder cleanup).
+//! probes, a run's byte-footprint estimate, and working-folder cleanup),
+//! and `plan` (spec §2/§9.3/§9.4: `StackingPlan` — the groups, gate
+//! blockers and stale-stage report a run would face — plus the three
+//! per-stage config-hash helpers Tasks 6-7 reuse verbatim).
 
 pub mod config;
 pub mod groups;
@@ -24,6 +27,7 @@ pub mod integrate;
 pub mod master_cards;
 pub mod measure;
 pub mod paths;
+pub mod plan;
 pub mod psf_signal;
 pub mod register;
 pub mod robust;
