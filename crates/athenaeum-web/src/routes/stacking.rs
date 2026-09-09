@@ -20,7 +20,7 @@ use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
 pub use athenaeum_core::api::stacking::{
-    StackingPaths, StackingRunDetail, StackingRunSummary, StackingSetConfig,
+    StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary, StackingSetConfig,
 };
 
 // ── Request structs ───────────────────────────────────────────────────────
@@ -244,6 +244,18 @@ pub async fn set_stacking_config(
     .map_err(api_err)
 }
 
+/// POST /api/get_stacking_presets
+///
+/// The three built-in stacking presets (Default / Fast preview / Maximum
+/// quality) — pure, no DB, mirrors `get_stacking_defaults`'s "no live
+/// catalog needed" contract.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_stacking_presets(
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<StackingPresets>, (StatusCode, String)> {
+    Ok(Json(api::get_stacking_presets()))
+}
+
 /// POST /api/get_stacking_defaults
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_stacking_defaults(
@@ -350,6 +362,35 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// Plan 5b Task 1, Step 2: `POST /api/get_stacking_presets` with `{}` is
+    /// pure (no DB at all) — 200, and `fastPreview.output.cleanup` is the
+    /// `DeleteIntermediates` transform `stacking::config::preset` applies.
+    #[tokio::test]
+    async fn get_stacking_presets_route() {
+        let state = test_state(None);
+        let router = crate::routes::build_router(state, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/get_stacking_presets")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["fastPreview"]["output"]["cleanup"],
+            "deleteIntermediates"
+        );
+    }
 
     /// `POST /api/get_stacking_defaults` with `{}` is settings-only (no DB
     /// row read past `SettingsManager`'s own precedence) — 200, and the

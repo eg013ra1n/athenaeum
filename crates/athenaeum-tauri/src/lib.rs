@@ -446,6 +446,7 @@ pub fn run() {
             commands::get_stacking_run,
             commands::get_stacking_config,
             commands::set_stacking_config,
+            commands::get_stacking_presets,
             commands::get_stacking_defaults,
             commands::set_stacking_defaults,
             commands::reset_stacking_defaults,

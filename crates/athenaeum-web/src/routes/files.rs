@@ -252,7 +252,9 @@ pub async fn get_files_with_frames_by_ids(
 #[derive(serde::Deserialize)]
 pub struct BrowseDirectoriesArgs {
     pub path: Option<String>,
-    /// `"scan"` (default) validates against `allowed_paths`;
+    /// `"scan"` (default) and `"stacking"` both validate against
+    /// `allowed_paths` — the Stacking tab's web folder picker reuses the
+    /// Transfers picker's roots verbatim (M1 Plan 5b, plan ruling 6);
     /// `"export"` validates against the configured export directory.
     pub scope: Option<String>,
 }
@@ -262,8 +264,9 @@ pub struct BrowseDirectoriesArgs {
 /// Returns subdirectories of the given path. If path is empty or omitted,
 /// returns the root entries for the requested scope.
 ///
-/// `scope = "scan"` (default): validates against `state.allowed_paths`.
-/// `scope = "export"`: validates against the configured export directory.
+/// `scope = "scan"` (default) / `"stacking"`: validates against
+/// `state.allowed_paths`. `scope = "export"`: validates against the
+/// configured export directory.
 ///
 /// Scope-to-root-paths resolution stays here (not in `api::files`) because
 /// it depends on `WebAppState::allowed_paths` / `WebAppState::export_dir`,
@@ -280,7 +283,11 @@ pub async fn browse_directories(
             Some(ref dir) => vec![dir.clone()],
             None => return Err((StatusCode::BAD_REQUEST, "No export directory configured".to_string())),
         },
-        _ => state.allowed_paths.clone(),
+        // "stacking" (M1 Plan 5b, plan ruling 6): the Stacking tab's own
+        // folder picker resolves against the same roots as "scan" (and the
+        // Transfers picker, which also passes "scan") — kept as an explicit
+        // arm rather than only relying on the catch-all below.
+        "scan" | "stacking" | _ => state.allowed_paths.clone(),
     };
 
     api::browse_directories(args.path, &root_paths).map(Json).map_err(api_err)

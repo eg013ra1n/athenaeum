@@ -17,7 +17,7 @@ use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
 
 pub use athenaeum_core::api::stacking::{
-    StackingPaths, StackingRunDetail, StackingRunSummary, StackingSetConfig,
+    StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary, StackingSetConfig,
 };
 
 /// Desktop has no path sandbox — every stacking folder handler uses
@@ -131,6 +131,15 @@ pub async fn set_stacking_config(
 ) -> Result<(), String> {
     api::set_stacking_config(&state.ctx, set_id, config, excluded_frame_ids)
         .map_err(|e| e.to_string())
+}
+
+/// The three built-in stacking presets (Default / Fast preview / Maximum
+/// quality) the Stacking tab's preset selector compares the current config
+/// against. Pure — no `ServiceContext`, no DB.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_stacking_presets() -> Result<StackingPresets, String> {
+    Ok(api::get_stacking_presets())
 }
 
 /// The global stacking defaults.

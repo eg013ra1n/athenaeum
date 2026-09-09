@@ -27,7 +27,9 @@ use crate::db::stacking::{
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 use crate::settings::{keys, SettingsManager};
-use crate::stacking::config::{resolve_config, PathsConfig, StackingConfig};
+use crate::stacking::config::{
+    preset, resolve_config, PathsConfig, StackingConfig, StackingPreset,
+};
 use crate::stacking::groups::set_slug;
 use crate::stacking::paths::{
     cleanup_work, resolve_dirs, validate_dirs, work_usage, CleanupWhat, ValidateMode, WorkUsage,
@@ -89,6 +91,19 @@ pub struct StackingSetConfig {
 pub struct StackingPaths {
     pub working: PathSetting,
     pub output: PathSetting,
+}
+
+/// The three built-in stacking presets (spec §9.2; plan Plan 5b ruling 1),
+/// keyed by stable field names rather than a
+/// [`std::collections::BTreeMap`] — `ts-rs` maps a `BTreeMap<K, V>` to an
+/// ambiguous `{ [key in K]?: V }`/`Record<K, V>` shape; a small wire struct
+/// avoids that entirely.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct StackingPresets {
+    pub default: StackingConfig,
+    pub fast_preview: StackingConfig,
+    pub maximum_quality: StackingConfig,
 }
 
 // ── Plan / run lifecycle ─────────────────────────────────────────────────
@@ -286,6 +301,18 @@ pub fn set_stacking_config(
         .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
     set_set_config(&conn, set_id, &json, &excluded_frame_ids)?;
     Ok(())
+}
+
+/// The three built-in stacking presets (spec §9.2), resolved straight from
+/// [`crate::stacking::config::preset`] — pure, no [`ServiceContext`], so the
+/// Stacking tab's preset selector never re-implements the transforms (plan
+/// Plan 5b ruling 1).
+pub fn get_stacking_presets() -> StackingPresets {
+    StackingPresets {
+        default: preset(StackingPreset::Default),
+        fast_preview: preset(StackingPreset::FastPreview),
+        maximum_quality: preset(StackingPreset::MaximumQuality),
+    }
 }
 
 /// The global stacking defaults (the config a NEW frame set with no
@@ -576,6 +603,27 @@ mod tests {
         }
         test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, 64, 48);
         (fixture, light_ids)
+    }
+
+    /// Plan 5b Task 1, Step 1: `get_stacking_presets` must be a thin mirror
+    /// of `stacking::config::preset` — every field equals the corresponding
+    /// `preset(..)` call, and the wire shape uses the stable field names
+    /// (`fastPreview`, not a `BTreeMap`'s ambiguous key encoding).
+    #[test]
+    fn presets_match_the_config_module() {
+        let presets = get_stacking_presets();
+        assert_eq!(presets.default, preset(StackingPreset::Default));
+        assert_eq!(presets.fast_preview, preset(StackingPreset::FastPreview));
+        assert_eq!(
+            presets.maximum_quality,
+            preset(StackingPreset::MaximumQuality)
+        );
+
+        let json = serde_json::to_string(&presets).unwrap();
+        assert!(
+            json.contains("\"fastPreview\":{\"version\":1"),
+            "unexpected JSON shape: {json}"
+        );
     }
 
     #[test]

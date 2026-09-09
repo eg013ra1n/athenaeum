@@ -147,6 +147,8 @@ export type StackingConfig = { version: number, grouping: GroupingConfig, calibr
 
 export type StackingPreset = "default" | "fastPreview" | "maximumQuality";
 
+export type StackingPresets = { default: StackingConfig, fastPreview: StackingConfig, maximumQuality: StackingConfig, };
+
 export type ColorMode = "mono" | "osc";
 
 export type Stage = "calibrate" | "measure" | "reference" | "register" | "normalize" | "integrate" | "drizzle" | "output";

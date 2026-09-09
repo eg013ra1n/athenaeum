@@ -236,6 +236,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_stacking_run", post(stacking::get_stacking_run))
         .route("/api/get_stacking_config", post(stacking::get_stacking_config))
         .route("/api/set_stacking_config", post(stacking::set_stacking_config))
+        .route("/api/get_stacking_presets", post(stacking::get_stacking_presets))
         .route("/api/get_stacking_defaults", post(stacking::get_stacking_defaults))
         .route("/api/set_stacking_defaults", post(stacking::set_stacking_defaults))
         .route("/api/reset_stacking_defaults", post(stacking::reset_stacking_defaults))
