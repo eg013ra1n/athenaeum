@@ -126,6 +126,31 @@ per-frame `delta_RMS`. Results go to
     detection` block. A config field that does nothing is the class of
     silent failure the project forbids.
 
+## Rulings made during execution (2026-09-09; the code in git is the record, the task text below is historical)
+
+- **Task 2 — detector fluxes depend on `maxStars`.** The adaptive
+  detector's threshold, hence every star's aperture flux, follows the
+  requested cap (≈ 1 % between two caps), so the truncation test compares
+  the 10-star run to the full run by star identity (0.5 px), not by flux.
+  Consequence for Plan 5: every frame of a group must be detected with the
+  same `maxStars` (already true — it is group configuration).
+- **Task 3 — joint distortion fit (supersedes ruling 4's single
+  `Distortion::fit`).** Plan 1's polynomial carries degree ≥ 2 terms only,
+  and the least-squares linear model absorbs a barrel term's linear
+  projection, leaving a degree-1 residual the polynomial cannot represent
+  (measured 0.146 px on a 1 px barrel); alternating the two fits converges
+  at 0.883 per round (the linear↔cubic correlation on a finite field), so
+  it was replaced by `Polynomial2D::fit_with_affine` + `Distortion::fit_joint`
+  in `geometry/polynomial.rs` (one joint least squares, the affine part
+  folded into the linear matrix `L′ = M·L`, both polynomial directions
+  fitted around `L′`; the kind label is kept although a similarity may
+  become a general affine) and `align::fit_distortion` calls it twice
+  (`DISTORTION_ROUNDS = 2`). Result: polynomial-3 RMS 1.9e-5 px on the
+  fixture. The linear-only assertion is `> 0.12` (0.164 measured — a
+  homography absorbs part of a radial term), and the new `fit_joint` test
+  bounds the inverse at 1e-2 px (0.0044 measured: the inverse polynomial
+  has no linear terms and the inverse of a cubic is not a cubic).
+
 ## Carry-forwards from Plan 2's final review (for this plan's author and the next ones)
 
 Recorded here because the Plan 2 ledger is deleted with its workspace.
