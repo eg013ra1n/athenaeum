@@ -100,8 +100,9 @@ WCS card boundary).
 
 ### 3.1 Detection
 
-`detect_fast` with Moffat centroid refinement (~0.05 px on well-sampled
-stars), per-star σ from the fit. Cuts: saturation (peak ≥ `upperLimit` of the
+`detect_fast` with Moffat centroid refinement (~0.05 px on well-sampled stars),
+per-star σ from the fit; the detector is threshold-free (its adaptive ladder
+targets `maxStars`), so there is no detection sigma. Cuts: saturation (peak ≥ `upperLimit` of the
 plane's range), eccentricity > 0.8 (the existing `select` rule, moments-based),
 SNR < `minSnr` (10). Keep the **2000 brightest** by flux (`maxStars`,
 configurable). For RGB frames detection runs on the luminance
@@ -528,7 +529,7 @@ reference:     { mode: "auto" }
 registration:  { model: "auto", distortion: "off", interpolation: "bicubicBSpline",
                  clampingThreshold: 0.30, maxStars: 2000, ransacTolerancePx: 1.9,
                  ransacMaxIterations: 2000, maxRmsPx: 2.0, failOnMaxRms: false,
-                 detection: { sigma: 5.0, minSnr: 10, maxEccentricity: 0.8 },
+                 detection: { minSnr: 10, maxEccentricity: 0.8 },
                  writeRegisteredFrames: false }
 normalization: { output: "additiveWithScaling", rejection: "scaleZeroOffset",
                  scaleEstimator: "bwmv",

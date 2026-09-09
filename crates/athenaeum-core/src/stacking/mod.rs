@@ -2,7 +2,9 @@
 //! Plan 2 lands the measurement stage: robust rejection (`robust`), the
 //! PSF-signal estimators (`psf_signal`), per-frame measurement (`measure`)
 //! and weighting / selection (`weights`). Orchestration, configuration and
-//! persistence follow in later plans.
+//! persistence follow in later plans. Plan 3 adds `register` (registration
+//! v2: detection, quad-seeded RANSAC alignment, distortion, QA, the
+//! registered-frame writer).
 
 pub mod measure;
 pub mod psf_signal;
