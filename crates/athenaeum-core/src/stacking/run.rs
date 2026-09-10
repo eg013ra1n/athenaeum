@@ -455,6 +455,22 @@ pub(crate) fn heal_interrupted_runs(
             frames_set_id,
             "stacking run interrupted by a restart"
         );
+        // B12 (M3 final fix wave, M9): a crashed run's `rej/run-<id>` is
+        // worthless — nothing will ever finish writing it, and no future
+        // run reads a PRIOR run's bitmaps — so it is swept here too,
+        // unless the run's own config explicitly asked to keep everything.
+        // Fetched BEFORE `finish_run` below (which only ever touches
+        // `status`/`finished_at`/`summary_json`/`error`, never `config_
+        // json`/`working_dir` — order does not matter, but reads the row
+        // in its most complete state regardless).
+        if let Err(e) = remove_rej_dir_for_interrupted_run(conn, run_id, frames_set_id) {
+            tracing::warn!(
+                run_id,
+                frames_set_id,
+                error = %e,
+                "stacking run heal: failed to remove rej/run-<id>"
+            );
+        }
         finish_run(
             conn,
             run_id,
@@ -465,6 +481,52 @@ pub(crate) fn heal_interrupted_runs(
         healed += 1;
     }
     Ok(healed)
+}
+
+/// [`heal_interrupted_runs`]'s own rej-sweep for one stuck row: resolve the
+/// run's `cleanup` policy from whichever of `summary_json`/`config_json` the
+/// row carries (a stuck row normally has no `summary_json` yet — it never
+/// reached `finish_run` — so `config_json`, the frozen per-run config
+/// `start_stacking` wrote, is the usual source), and remove `rej/run-<id>`
+/// unless that policy is explicitly `KeepAll`. Unparseable/missing config on
+/// BOTH fields is treated as "unavailable, remove it" (B12's own ruling: a
+/// crashed run's bitmaps are worthless either way). Never fails the heal
+/// itself — every error here is a caller-side `warn!`, not a propagated
+/// `Err`.
+fn remove_rej_dir_for_interrupted_run(
+    conn: &rusqlite::Connection,
+    run_id: i64,
+    frames_set_id: i64,
+) -> anyhow::Result<()> {
+    let Some(row) = crate::db::stacking::get_run(conn, run_id)? else {
+        return Ok(()); // the row vanished between listing and healing — nothing to sweep
+    };
+
+    let cleanup = row
+        .summary_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<RunSummary>(s).ok())
+        .map(|s| s.config.output.cleanup)
+        .or_else(|| {
+            serde_json::from_str::<StackingConfig>(&row.config_json)
+                .ok()
+                .map(|c| c.output.cleanup)
+        });
+
+    // `None` (neither field parsed) is "unavailable" per B12's ruling —
+    // falls through to the removal below, same as any non-`KeepAll` policy.
+    if cleanup == Some(CleanupPolicy::KeepAll) {
+        return Ok(());
+    }
+
+    let set_name = crate::stacking::plan::frame_set_name(conn, frames_set_id)?;
+    let layout = WorkingLayout::new(Path::new(&row.working_dir), &set_slug(&set_name));
+    let dir = layout.rej_run_dir(run_id);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("removing {}: {e}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// RAII guard for [`start_stacking`]'s `active_stacks` handle (Plan 5b final
@@ -3994,6 +4056,22 @@ fn process_group_output(
     );
     let integrate_dur = integrate_start.elapsed();
 
+    // B3 (M3 final fix wave, I3): integration itself completed correctly —
+    // `rej_set`'s own `failure()` is only ever set by a WRITE fault the
+    // engine's band loop hit mid-integration (`RejPlaneSink::record_band`
+    // latches it and returns `Ok`, per ruling: never fail a run because
+    // drizzle-support machinery failed). Folded into `rej_set_failure` here
+    // so the SAME check below (which already handles a `create` failure)
+    // treats both the same way: drizzle skipped for this group, the master
+    // stays untouched.
+    if let Some(reason) = rej_set.as_ref().and_then(|s| s.failure()) {
+        rc.warnings.push(format!(
+            "drizzle skipped for {}: rejection bitmaps could not be written: {reason}",
+            group.key
+        ));
+        rej_set_failure = Some(reason);
+    }
+
     let output_start = Instant::now();
 
     let group_reference_calibrated = members[reference_idx].calibrated.clone();
@@ -4194,6 +4272,23 @@ fn process_group_output(
                 group_key = %group.key,
                 error = %reason,
                 "drizzle skipped for this group; the master is unaffected"
+            );
+            // B7 (M3 final fix wave, M4): drizzle was never attempted for
+            // this group — no `0/total` starting tick was ever emitted
+            // either, so without a terminal tick here the Drizzle row's
+            // last observed event is whatever the PREVIOUS group (or stage)
+            // left it at, forever. `0/0` (not `total/total` — there is no
+            // `total` to report; nothing was attempted) with the skip
+            // reason as `message` gives the row an honest, final state.
+            rc.progress(
+                Stage::Drizzle,
+                Some(group.key.clone()),
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some(format!("rejection bitmaps could not be written: {reason}")),
             );
         } else {
             // Fix round 1, Minor M6: counts as "attempted" from here —
@@ -4465,6 +4560,23 @@ fn process_group_output(
                     );
                     rc.warnings
                         .push(format!("group {}: drizzle failed: {msg}", group.key));
+                    // B7 (M3 final fix wave, M4): a forced `total/total`
+                    // terminal tick (the starting `0/total` tick already
+                    // went out above) — without it the row's last observed
+                    // event stays at whatever partial percent the failure
+                    // landed on, forever. Carries `msg` so a live listener
+                    // can show why the row completed without a
+                    // `drizzlePath`.
+                    rc.progress(
+                        Stage::Drizzle,
+                        Some(group.key.clone()),
+                        drizzle_progress_total,
+                        drizzle_progress_total,
+                        0,
+                        0,
+                        None,
+                        Some(msg),
+                    );
                 }
             }
         }
@@ -4486,7 +4598,15 @@ fn process_group_output(
         drizzle_stats,
     );
 
-    let output_dur = output_start.elapsed();
+    // B2 (M3 final fix wave, I2): `output_start` was taken BEFORE the
+    // drizzle block above, which runs entirely inside this same timer's
+    // span — without subtracting it, `StageTiming{Output}` double-counted
+    // every second of `StageTiming{Drizzle}` (on the acceptance set, ~14
+    // minutes of drizzle reported as the master-write stage's own
+    // duration). Drizzle and Output are meant to be disjoint spans (ruling
+    // R-M3-11 places Drizzle strictly between Integrate and Output); this
+    // is the correction.
+    let output_dur = output_start.elapsed().saturating_sub(drizzle_dur);
     rc.progress(
         Stage::Output,
         Some(group.key.clone()),
@@ -5225,6 +5345,14 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
                 "drizzle drop shrink {configured} out of [0.5, 1.0]; clamped to {clamped}"
             ));
             rc.config.drizzle.drop_shrink = clamped;
+            // B10 (M3 final fix wave, M7): `rc.summary.config` was captured
+            // in `start_stacking`, BEFORE this clamp ever runs — without
+            // this, the persisted `RunSummary.config` (`summary_json` /
+            // `runs/run-<id>.json`) would keep naming the PRE-clamp value
+            // forever, disagreeing with the value the run actually used
+            // (and with the drizzled master's own `ATH_DRZP` card, which is
+            // built from `rc.config.drizzle.drop_shrink` after this point).
+            rc.summary.config.drizzle.drop_shrink = clamped;
         }
     }
 
@@ -9025,6 +9153,32 @@ mod tests {
             summary.stages
         );
 
+        // B2 (M3 final fix wave, I2): Drizzle and Output must be DISJOINT
+        // spans, not the Output timer including the whole drizzle duration
+        // — checked against the run's own wall time rather than requiring
+        // `output.duration_ms < drizzle.duration_ms` (not a real relation
+        // on this fixture; only that the two never sum past the run's
+        // actual wall-clock span).
+        let drizzle_ms = summary.stages[drizzle_idx].duration_ms;
+        let output_ms = summary.stages[output_idx].duration_ms;
+        let run_started_at = chrono::DateTime::parse_from_rfc3339(&summary.started_at)
+            .expect("started_at parses as RFC3339");
+        let run_finished_at = chrono::DateTime::parse_from_rfc3339(
+            summary
+                .finished_at
+                .as_deref()
+                .expect("a completed run has finished_at"),
+        )
+        .expect("finished_at parses as RFC3339");
+        let wall_ms = (run_finished_at - run_started_at)
+            .num_milliseconds()
+            .max(0) as u64;
+        assert!(
+            output_ms + drizzle_ms <= wall_ms,
+            "output_ms={output_ms} drizzle_ms={drizzle_ms} wall_ms={wall_ms} — Output must not \
+             double-count drizzle's own duration"
+        );
+
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         assert!(
             !layout.rej_run_dir(started.run_id).exists(),
@@ -9038,6 +9192,76 @@ mod tests {
         assert_eq!(
             masters[0]["drizzlePath"].as_str(),
             Some(drizzle_path.as_str())
+        );
+    }
+
+    /// B10 (M3 final fix wave, M7): the persisted `RunSummary.config` must
+    /// record the CLAMPED `dropShrink`, not the pre-clamp value
+    /// `start_stacking` captured before `stage_output`'s own clamp ran —
+    /// otherwise the summary (and `runs/run-<id>.json`) disagree with the
+    /// value the run actually used and the drizzled master's own
+    /// `ATH_DRZP` card.
+    #[test]
+    fn drizzle_summary_config_records_the_clamped_drop_shrink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.drizzle.drop_shrink = 0.2; // out of [0.5, 1.0] — clamps to 0.5
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        assert!(
+            row.summary_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("drizzle drop shrink 0.2 out of [0.5, 1.0]; clamped to 0.5"),
+            "{:?}",
+            row.summary_json
+        );
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            summary.config.drizzle.drop_shrink, 0.5,
+            "the persisted config must record the CLAMPED value, not 0.2"
+        );
+
+        let group = &summary.groups[0];
+        let stats = group
+            .drizzle
+            .as_ref()
+            .expect("drizzle stats recorded for the group");
+        assert_eq!(
+            stats.drop_shrink, 0.5,
+            "the group's own drizzle stats already agreed with the clamp"
         );
     }
 
@@ -9364,6 +9588,280 @@ mod tests {
         assert_eq!(completes[0]["cancelled"].as_bool(), Some(true));
     }
 
+    /// B1 (M3 final fix wave, I1) run.rs composite test (b): a second group
+    /// whose members are natively LARGER than the run's reference — the
+    /// acceptance set's own shape (the OSC group's 6248x4176 native frames
+    /// registered onto a 6224x4168 reference) since the 2026-09-10 owner
+    /// decision made grouping camera-agnostic. Before the fix, `drizzle_
+    /// group`'s per-frame geometry check refused every frame in this group
+    /// outright; both groups must now drizzle, each onto the run's ONE
+    /// shared reference-sized output grid.
+    #[test]
+    fn drizzle_runs_for_a_group_whose_members_differ_in_native_geometry_from_the_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        // Group 1 — the reference's own group, at the usual fixture
+        // geometry (STAR_FIELD_WIDTH x STAR_FIELD_HEIGHT).
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, group1_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &group1_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        // Group 2 — a DIFFERENT filter (its own group key: grouping is
+        // camera/geometry-agnostic, filter still splits), a LARGER native
+        // canvas carrying the SAME star field (so registration against
+        // group 1's reference finds the same real inlier matches it
+        // already does within group 1). Its own master dark/flat pair is
+        // built at ITS OWN geometry — calibration requires a light and its
+        // masters to share geometry, independent of B1.
+        // Wider AND taller than the reference (STAR_FIELD_WIDTH x
+        // STAR_FIELD_HEIGHT = 192x144) — big enough margin around
+        // `BASE_STARS`' own extent (max x=150, max y=102) that every star
+        // stays comfortably inside both canvases.
+        let (odd_w, odd_h) = (220usize, 170usize);
+        let mut group2_ids = Vec::new();
+        for (i, (&(dx, dy), &sigma)) in shifts.iter().zip(noise.iter()).enumerate() {
+            let stars = shifted_stars(dx, dy);
+            let date_obs = date_obs_at(i);
+            let stem = format!("g{i}");
+            let spec = LightSpec {
+                filter: Some("Ha"),
+                width: odd_w,
+                height: odd_h,
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _path) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &stars,
+                600.0,
+                sigma,
+                200 + i as u64,
+            );
+            group2_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&fixture, &group2_ids, odd_w, odd_h);
+
+        // Pin the reference to group 1's own unshifted frame — deterministic,
+        // avoids depending on cross-group weight-based auto-selection.
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            group1_ids[0],
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+
+        let recorder = Arc::new(Recording::new());
+        let started = start_stacking(
+            ctx.clone(),
+            recorder.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 2, "{groups:?}");
+
+        let expected_out_w = STAR_FIELD_WIDTH * 2;
+        let expected_out_h = STAR_FIELD_HEIGHT * 2;
+        for group in &groups {
+            let drizzle_path = group.drizzle_path.clone().unwrap_or_else(|| {
+                panic!(
+                    "group {}: drizzle_path must be Some — {group:?}",
+                    group.group_key
+                )
+            });
+            assert!(
+                Path::new(&drizzle_path).exists(),
+                "group {}: {drizzle_path}",
+                group.group_key
+            );
+            let reader = PlaneReader::open(Path::new(&drizzle_path)).unwrap();
+            assert_eq!(
+                reader.width(),
+                expected_out_w,
+                "group {}: outWidth == 2*refW",
+                group.group_key
+            );
+            assert_eq!(
+                reader.height(),
+                expected_out_h,
+                "group {}: outHeight == 2*refH",
+                group.group_key
+            );
+        }
+    }
+
+    /// B3 (M3 final fix wave, I3): a `.rej` write failure mid-integration —
+    /// the WHOLE `rej/run-<id>/` tree (already created by `RejBitmapSet::
+    /// create` before `integrate_group` starts) is removed out from under
+    /// the engine on the FIRST `stage == "integrate"` `stacking-progress`
+    /// event, via a listener (same "intercept the real progress channel"
+    /// mechanism `cancel_during_drizzle_keeps_the_master_removes_rej_
+    /// leaves_drizzle_path_null` uses one stage later) — before any band's
+    /// rejection bits are written. Ruling: the group's otherwise-good
+    /// integration must not fail because of it: the master is written,
+    /// `drizzle_path` stays `NULL`, and the run's warnings name the
+    /// failure.
+    #[test]
+    fn a_rej_write_failure_mid_integration_skips_drizzle_keeps_the_master() {
+        struct DeleteRejOnFirstIntegrateTick {
+            ctx: Arc<ServiceContext>,
+            frames_set_id: i64,
+            working: std::path::PathBuf,
+            set_slug: String,
+            fired: AtomicBool,
+            recording: Recording,
+        }
+        impl ProgressEmitter for DeleteRejOnFirstIntegrateTick {
+            fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+                self.recording.emit_json(event_name, payload.clone());
+                if event_name == STACKING_PROGRESS_EVENT
+                    && payload["stage"] == "integrate"
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    let run_id = {
+                        let active = self.ctx.active_stacks.lock().unwrap();
+                        active
+                            .iter()
+                            .find(|(_, h)| h.frames_set_id == self.frames_set_id)
+                            .map(|(id, _)| *id)
+                            .expect("this run must be active")
+                    };
+                    let layout = WorkingLayout::new(&self.working, &self.set_slug);
+                    let dir = layout.rej_run_dir(run_id);
+                    std::fs::remove_dir_all(&dir)
+                        .expect("remove rej/run-<id> for the fault injection");
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.drizzle.use_rejection = true;
+        // Deterministic, non-statistical rejection (rather than relying on
+        // per-frame noise to occasionally disagree enough to trip Auto's
+        // algorithmic rejection): `BASE_STARS`' brightest peaks are
+        // 6000-14000 raw ADU, calibrated (dark-subtracted, flat-divided,
+        // then divided by the 16-bit `scale_divisor` = 65535 — the
+        // calibrated-lights export engine's own scaling, reused verbatim by
+        // the stacking Calibrate stage) down to roughly 0.09-0.21, while the
+        // ~600 ADU background lands around 0.008-0.009. `range_high = 0.05`
+        // sits between the two, so every frame's star-core pixels are
+        // RANGE-rejected identically — guaranteeing this run's `.rej`
+        // bitmaps are non-empty regardless of noise. Range rejection feeds
+        // the same `RejectionBitSink` bits algorithmic rejection does
+        // (`engine.rs`'s band loop sets `bits_row` for both).
+        cfg.integration.range_high = Some(0.05);
+
+        let emitter = Arc::new(DeleteRejOnFirstIntegrateTick {
+            ctx: ctx.clone(),
+            frames_set_id: fixture.set_id,
+            working: working.path().to_path_buf(),
+            set_slug: set_slug(SET_NAME),
+            fired: AtomicBool::new(false),
+            recording: Recording::new(),
+        });
+
+        let started = start_stacking(
+            ctx.clone(),
+            emitter.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        let master_path = group
+            .master_path
+            .clone()
+            .expect("master must survive a rej write failure");
+        assert!(Path::new(&master_path).exists(), "{master_path}");
+        assert!(group.drizzle_path.is_none(), "{group:?}");
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("rejection bitmaps could not be written")),
+            "{:?}",
+            summary.warnings
+        );
+
+        // B7 (M3 final fix wave, M4): drizzle was SKIPPED for this group
+        // (never attempted — the rej set failed before `drizzle_group` was
+        // ever called), so there is no `0/total` starting tick to complete
+        // — the terminal tick must be `0/0`, carrying the skip reason as
+        // `message`, so the Drizzle row does not stay stuck on whatever the
+        // previous stage left it at.
+        let drizzle_events: Vec<_> = emitter
+            .recording
+            .events(STACKING_PROGRESS_EVENT)
+            .into_iter()
+            .filter(|e| e["stage"] == "drizzle")
+            .collect();
+        assert!(
+            drizzle_events.iter().any(|e| {
+                e["current"].as_u64() == Some(0)
+                    && e["total"].as_u64() == Some(0)
+                    && e["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("rejection bitmaps could not be written"))
+            }),
+            "{drizzle_events:?}"
+        );
+    }
 
     /// Fix round 2, Important I3 (re-review): the round-1 version of this
     /// test dropped the fixture's LAST frame (index 3 of 4), which leaves

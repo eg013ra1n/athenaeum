@@ -44,9 +44,14 @@ pub const DRIZZLE_BAND_ROWS: usize = 512;
 /// everything [`drizzle_group`] needs to deposit it, already resolved by
 /// the caller (`stacking::run`, a later task).
 pub struct DrizzleFrame<'a> {
-    /// The calibrated frame on disk (f32, 1 or 3 planes) — the SAME
-    /// geometry as the group's reference (`DrizzleInput::width/height`);
-    /// `drizzle_group` refuses a mismatch.
+    /// The calibrated frame on disk (f32, 1 or 3 planes) — its OWN native
+    /// geometry, read from the file itself (B1, M3 final fix wave): since
+    /// the 2026-09-10 owner decision grouping is camera-agnostic, a group's
+    /// members may differ in native geometry from the run's reference (and
+    /// from each other) — `drizzle_group` only requires `channels` to
+    /// match `DrizzleInput::channels`; `map` (subject → reference) carries
+    /// every frame correctly onto the shared output grid regardless of its
+    /// own width/height.
     pub path: &'a Path,
     /// Subject → reference mapping (registration v2's `PixelMap`).
     pub map: &'a PixelMap,
@@ -71,8 +76,12 @@ pub struct DrizzleInput<'a> {
     /// Included frames only, in the engine's own order — no min-weight
     /// filtering happens here, the caller already did it.
     pub frames: &'a [DrizzleFrame<'a>],
-    /// Reference geometry (the group's un-scaled width/height/channels —
-    /// every frame in `frames` must match this exactly).
+    /// Reference geometry (the group's un-scaled width/height/channels):
+    /// the output grid is this, scaled by `scale`; the `.rej` rejection
+    /// bitmaps and the LN grids are in this geometry too. B1 (M3 final fix
+    /// wave): a frame in `frames` no longer needs to match this — only its
+    /// own `channels` must match `channels` below; its own native geometry
+    /// is read from the file (see [`DrizzleFrame::path`]'s doc).
     pub width: usize,
     pub height: usize,
     pub channels: usize,
@@ -196,20 +205,31 @@ impl From<IntegrationError> for DrizzleError {
 }
 
 /// Peak RAM [`drizzle_group`] needs — ruling R-M3-7, AMENDED by ruling
-/// R-M3-15 (fix round 1) after review found the original formula
-/// under-counted real peak by up to ~75%, omitting two allocations the
-/// driver actually makes: the weight-map planes (real peak when
-/// `write_weight_map` is on — the shipped default) and
-/// `measure_plane`'s own ADU-scaled copy of the plane it is currently
-/// measuring, alive at the same time as `data`/`weight_all`/the last
-/// `i_buf`/`w_buf`. The full accounting: the `channels` output-data planes
-/// plus the one `I`/`W` accumulator pair alive at a time
+/// R-M3-16 (was R-M3-15 through fix round 1; renumbered B5, M3 final fix
+/// wave, which folds in two more allocations the review found still
+/// unaccounted: the single-pass star detector's own working copy inside
+/// `measure_plane`'s `detect_fast_data` call — a `lum` buffer the same size
+/// as `measure_plane`'s own scaled copy, always made (mono `channels == 1`
+/// call) regardless of seed source — and one frame's `RejBitmap` held in RAM
+/// while `deposit_band` reads it (`channels * height * ceil(width / 64) * 8`
+/// bytes; at most one is ever live at a time — a fresh frame's bitmap
+/// replaces the last). Fix round 1's own amendment (originally R-M3-15)
+/// after review found the ORIGINAL formula under-counted real peak by up to
+/// ~75%, omitting two allocations the driver actually makes: the
+/// weight-map planes (real peak when `write_weight_map` is on — the shipped
+/// default) and `measure_plane`'s own ADU-scaled copy of the plane it is
+/// currently measuring, alive at the same time as `data`/`weight_all`/the
+/// last `i_buf`/`w_buf`. The full accounting: the `channels` output-data
+/// planes plus the one `I`/`W` accumulator pair alive at a time
 /// (`(channels + 2) * out_w * out_h * 4` bytes); the `channels` weight-map
 /// planes when `write_weight_map` is set (`channels * out_w * out_h * 4`);
-/// `measure_plane`'s scaled copy (`out_w * out_h * 4`); one full-resolution
-/// source plane in RAM (`width * height * 4`); and — when `ln` is set — two
-/// more reference-geometry planes for the per-frame `A`/`B` grids
-/// (`2 * width * height * 4`).
+/// `measure_plane`'s scaled copy (`out_w * out_h * 4`); the detector's own
+/// `lum` copy of that same plane (`out_w * out_h * 4`); one full-resolution
+/// source plane in RAM (`width * height * 4`); when `ln` is set, two more
+/// reference-geometry planes for the per-frame `A`/`B` grids
+/// (`2 * width * height * 4`); and, when `use_rejection` is set, one
+/// reference-geometry `RejBitmap`
+/// (`channels * height * ceil(width / 64) * 8`).
 pub fn estimate_memory_bytes(
     width: usize,
     height: usize,
@@ -217,6 +237,7 @@ pub fn estimate_memory_bytes(
     scale: u32,
     ln: bool,
     write_weight_map: bool,
+    use_rejection: bool,
 ) -> u64 {
     let out_w = width as u64 * scale as u64;
     let out_h = height as u64 * scale as u64;
@@ -225,9 +246,17 @@ pub fn estimate_memory_bytes(
         need += channels as u64 * out_w * out_h * 4;
     }
     need += out_w * out_h * 4; // measure_plane's own ADU-scaled copy
+    need += out_w * out_h * 4; // B5: detect_fast_data's own `lum` working copy
     need += width as u64 * height as u64 * 4;
     if ln {
         need += 2 * width as u64 * height as u64 * 4;
+    }
+    if use_rejection {
+        // B5: one frame's `RejBitmap` (reference geometry) held in RAM —
+        // `crate::stacking::rej`'s own on-disk body layout, mirrored here:
+        // `channels * height * words` u64 words, `words = ceil(width / 64)`.
+        let words = (width as u64).div_ceil(64);
+        need += channels as u64 * height as u64 * words * 8;
     }
     need
 }
@@ -237,17 +266,26 @@ pub fn estimate_memory_bytes(
 /// instead of a dozen loose variables.
 struct FrameDepositCtx<'a> {
     src: &'a [f32],
-    width: usize,
-    height: usize,
+    /// This FRAME's own geometry — B1 (M3 final fix wave): indexes `src`
+    /// and bounds [`band_source_window`]'s clamp. May differ from
+    /// `ref_width`/`ref_height` below (a group's members are not required
+    /// to match the run's reference geometry any more).
+    src_width: usize,
+    src_height: usize,
+    /// The run's REFERENCE geometry — bounds the `.rej` bitmap lookup and
+    /// indexes the LN grid, both of which are always reference-geometry
+    /// sized regardless of this frame's own `src_width`/`src_height`.
+    ref_width: usize,
+    ref_height: usize,
     map: &'a PixelMap,
     scale: u32,
     drop_shrink: f64,
     kernel: DrizzleKernel,
     kernel_table: Option<&'a geom::KernelTable>,
     rej: Option<&'a RejBitmap>,
-    /// `(a_plane, b_plane)`, each `width * height`, reference geometry —
-    /// `Some` only when this frame's LN grid is actually driving output
-    /// normalization this pass.
+    /// `(a_plane, b_plane)`, each `ref_width * ref_height`, reference
+    /// geometry — `Some` only when this frame's LN grid is actually driving
+    /// output normalization this pass.
     ln: Option<(&'a [f32], &'a [f32])>,
     pair: NormalizationPair,
     w: f32,
@@ -313,8 +351,8 @@ pub fn drizzle_group(
     let out_h = input.height * input.scale as usize;
     let plane_out_pixels = out_w * out_h;
 
-    // Ruling R-M3-7 (amended by R-M3-15, fix round 1): refused BEFORE any
-    // output-geometry allocation.
+    // Ruling R-M3-7 (amended by R-M3-16, was R-M3-15 through fix round 1):
+    // refused BEFORE any output-geometry allocation.
     let need = estimate_memory_bytes(
         input.width,
         input.height,
@@ -322,6 +360,7 @@ pub fn drizzle_group(
         input.scale,
         input.use_local_normalization,
         input.write_weight_map,
+        input.use_rejection,
     );
     let total = input
         .ram_total_bytes
@@ -407,23 +446,30 @@ pub fn drizzle_group(
 
             let read_start = Instant::now();
             let reader = PlaneReader::open(frame.path)?;
-            if reader.channels() != input.channels
-                || reader.width() != input.width
-                || reader.height() != input.height
-            {
+            // B1 (M3 final fix wave, I1): only `channels` has to match the
+            // group — a frame's own width/height is read straight off the
+            // file and carried through as its SOURCE geometry; `map`
+            // (subject → reference) is what places it correctly on the
+            // shared output grid regardless of how it compares to the
+            // reference's own size.
+            if reader.channels() != input.channels {
                 return Err(DrizzleError::BadInput(format!(
-                    "{}: geometry {}x{}x{} != group geometry {}x{}x{}",
+                    "{}: {} channel(s) != group channels {}",
                     frame.path.display(),
-                    reader.width(),
-                    reader.height(),
                     reader.channels(),
-                    input.width,
-                    input.height,
                     input.channels
                 )));
             }
+            let src_width = reader.width();
+            let src_height = reader.height();
+            if src_width == 0 || src_height == 0 {
+                return Err(DrizzleError::BadInput(format!(
+                    "{}: source geometry {src_width}x{src_height} is empty",
+                    frame.path.display()
+                )));
+            }
             let src = reader.read_plane(c)?;
-            let read_bytes = (plane_pixels * 4) as u64;
+            let read_bytes = (src_width * src_height * 4) as u64;
             plane_bytes_read += read_bytes;
             bytes_read_total += read_bytes;
             read_duration_total += read_start.elapsed();
@@ -478,8 +524,10 @@ pub fn drizzle_group(
 
             let ctx = FrameDepositCtx {
                 src: &src,
-                width: input.width,
-                height: input.height,
+                src_width,
+                src_height,
+                ref_width: input.width,
+                ref_height: input.height,
                 map: frame.map,
                 scale: input.scale,
                 drop_shrink: input.drop_shrink,
@@ -680,6 +728,18 @@ fn band_source_window(
     Some((x0, y0s, x1, y1))
 }
 
+/// "The pixel whose extent contains coordinate `v`" — `floor(v + 0.5)`,
+/// deliberately not `f64::round` (ties-away-from-zero disagrees with this at
+/// every negative half-integer: `round(-0.5) == -1` but
+/// `floor(-0.5 + 0.5) == 0`), matching `geom::map_drop`'s own documented
+/// convention. B4 (M3 final fix wave): the ONE helper both the `.rej`/LN
+/// index (which used this inline already) and the tabulated-kernel LUT
+/// deposit (which used `f64::round`, inconsistently) now share.
+#[inline]
+fn round_half_up(v: f64) -> f64 {
+    (v + 0.5).floor()
+}
+
 /// Deposits one frame's plane into one band of the `I`/`W` accumulators
 /// (rulings R-M3-1..R-M3-5): scans only the source-pixel window
 /// [`band_source_window`] bounds, and for each finite, non-zero,
@@ -706,8 +766,8 @@ fn deposit_band(
         y0,
         rows,
         ctx.scale,
-        ctx.width,
-        ctx.height,
+        ctx.src_width,
+        ctx.src_height,
         ctx.drop_shrink,
     ) else {
         return; // Minor 8: this band maps entirely off-frame — nothing to deposit.
@@ -727,7 +787,7 @@ fn deposit_band(
     let scale_sq = ctx.scale as f64 * ctx.scale as f64;
 
     for y in sy0..=sy1 {
-        let row_off = y * ctx.width;
+        let row_off = y * ctx.src_width;
         for x in sx0..=sx1 {
             let d = ctx.src[row_off + x];
             if !d.is_finite() || d == 0.0 {
@@ -741,15 +801,19 @@ fn deposit_band(
             // (ties-away-from-zero) — matches `geom::map_drop`'s own
             // documented convention (geom.rs), rather than relying on the
             // range guards below to make the two agree by construction.
-            let ix_f = (u + 0.5).floor();
-            let iy_f = (v + 0.5).floor();
+            let ix_f = round_half_up(u);
+            let iy_f = round_half_up(v);
 
             if let Some(rb) = ctx.rej {
-                // Ruling R-M3-4: out-of-range → not rejected.
+                // Ruling R-M3-4: out-of-range → not rejected. `(ix_f, iy_f)`
+                // are REFERENCE-geometry coordinates (`ctx.map.forward`
+                // maps subject → reference) — bounded by `ref_width`/
+                // `ref_height`, not this frame's own `src_width`/
+                // `src_height` (B1, M3 final fix wave).
                 let rejected = ix_f >= 0.0
                     && iy_f >= 0.0
-                    && (ix_f as usize) < ctx.width
-                    && (iy_f as usize) < ctx.height
+                    && (ix_f as usize) < ctx.ref_width
+                    && (iy_f as usize) < ctx.ref_height
                     && rb.is_rejected(ctx.plane, ix_f as usize, iy_f as usize);
                 if rejected {
                     continue;
@@ -758,10 +822,11 @@ fn deposit_band(
 
             let nd = if let Some((a_plane, b_plane)) = ctx.ln {
                 // Ruling R-M3-5: clamped (not skipped) to the reference
-                // extent.
-                let ix = (ix_f as i64).clamp(0, ctx.width as i64 - 1) as usize;
-                let iy = (iy_f as i64).clamp(0, ctx.height as i64 - 1) as usize;
-                let idx = iy * ctx.width + ix;
+                // extent — the LN grid is always reference-geometry sized
+                // (B1, M3 final fix wave).
+                let ix = (ix_f as i64).clamp(0, ctx.ref_width as i64 - 1) as usize;
+                let iy = (iy_f as i64).clamp(0, ctx.ref_height as i64 - 1) as usize;
+                let idx = iy * ctx.ref_width + ix;
                 a_plane[idx] * d + b_plane[idx]
             } else {
                 ctx.pair.apply(d)
@@ -813,8 +878,11 @@ fn deposit_band(
                         if !ox.is_finite() || !oy.is_finite() {
                             continue;
                         }
-                        let px = ox.round() as i64;
-                        let py = oy.round() as i64;
+                        // B4 (M3 final fix wave): `round_half_up`, not
+                        // `f64::round` — matches the rejection/LN index
+                        // above and `geom::map_drop`'s own convention.
+                        let px = round_half_up(ox) as i64;
+                        let py = round_half_up(oy) as i64;
                         if px < 0 || px as usize >= out_w || py < y0 as i64 || py >= y1 as i64 {
                             continue;
                         }
@@ -1420,35 +1488,45 @@ mod tests {
     // ── (i) memory ──
 
     #[test]
-    fn estimate_memory_bytes_matches_the_r_m3_15_formula() {
-        // R-M3-15 (fix round 1, amends R-M3-7): the weight-map planes and
-        // `measure_plane`'s own scaled copy are now counted too — checked
-        // across all four `(ln, write_weight_map)` combinations.
+    fn estimate_memory_bytes_matches_the_r_m3_16_formula() {
+        // R-M3-16 (B5, M3 final fix wave, was R-M3-15 through fix round 1,
+        // amends R-M3-7): the weight-map planes, `measure_plane`'s own
+        // scaled copy, the star detector's own `lum` working copy and one
+        // frame's `RejBitmap` are all counted now — checked across every
+        // `(ln, write_weight_map, use_rejection)` combination.
         let (width, height, channels, scale) = (6224usize, 4168usize, 3usize, 3u32);
         let out_w = width as u64 * scale as u64;
         let out_h = height as u64 * scale as u64;
         let base = (channels as u64 + 2) * out_w * out_h * 4;
         let weight_map = channels as u64 * out_w * out_h * 4;
         let measure_scratch = out_w * out_h * 4;
+        let detector_scratch = out_w * out_h * 4;
         let source = width as u64 * height as u64 * 4;
         let ln_planes = 2 * width as u64 * height as u64 * 4;
+        let words = (width as u64).div_ceil(64);
+        let rej_bitmap = channels as u64 * height as u64 * words * 8;
 
-        assert_eq!(
-            estimate_memory_bytes(width, height, channels, scale, true, true),
-            base + weight_map + measure_scratch + source + ln_planes
-        );
-        assert_eq!(
-            estimate_memory_bytes(width, height, channels, scale, false, false),
-            base + measure_scratch + source
-        );
-        assert_eq!(
-            estimate_memory_bytes(width, height, channels, scale, true, false),
-            base + measure_scratch + source + ln_planes
-        );
-        assert_eq!(
-            estimate_memory_bytes(width, height, channels, scale, false, true),
-            base + weight_map + measure_scratch + source
-        );
+        for &ln in &[false, true] {
+            for &wwm in &[false, true] {
+                for &rej in &[false, true] {
+                    let mut expected = base + measure_scratch + detector_scratch + source;
+                    if wwm {
+                        expected += weight_map;
+                    }
+                    if ln {
+                        expected += ln_planes;
+                    }
+                    if rej {
+                        expected += rej_bitmap;
+                    }
+                    assert_eq!(
+                        estimate_memory_bytes(width, height, channels, scale, ln, wwm, rej),
+                        expected,
+                        "ln={ln} write_weight_map={wwm} use_rejection={rej}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1640,8 +1718,10 @@ mod tests {
         let mut wb_sq = vec![0f32; out_w * out_h];
         let ctx_sq = FrameDepositCtx {
             src: &src,
-            width,
-            height,
+            src_width: width,
+            src_height: height,
+            ref_width: width,
+            ref_height: height,
             map: &map,
             scale,
             drop_shrink,
@@ -1661,8 +1741,10 @@ mod tests {
         let mut wb_c = vec![0f32; out_w * out_h];
         let ctx_c = FrameDepositCtx {
             src: &src,
-            width,
-            height,
+            src_width: width,
+            src_height: height,
+            ref_width: width,
+            ref_height: height,
             map: &map,
             scale,
             drop_shrink,
@@ -1751,6 +1833,106 @@ mod tests {
         );
         assert_eq!(
             out.stats.coverage[0], 0.0,
+            "coverage={}",
+            out.stats.coverage[0]
+        );
+    }
+
+    // ── B1 (M3 final fix wave, I1): a group whose members differ in native
+    // geometry from the reference — the acceptance set's own shape (a
+    // group's members are not required to match `DrizzleInput::width`/
+    // `height` any more). ──
+
+    #[test]
+    fn a_frame_smaller_or_larger_than_the_reference_still_drizzles_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let background = 0.25f32;
+
+        // Two frames at the reference's own geometry (W x H = 64x48).
+        let normal = uniform(W, H, background);
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &normal);
+        let p1 = write_mono(dir.path(), "f1.fits", W, H, &normal);
+
+        // The odd frame: native 70x50 — WIDER and TALLER than the
+        // reference — uniform `background` everywhere except one marker
+        // pixel at (x=5, y=10), well inside the reference's own 64x48
+        // extent, bumped to a distinct value. A stride bug that indexed
+        // this 70-wide plane with the reference's width (64) instead of its
+        // own would misread row 10 entirely (a flat-offset shift of
+        // `10 * (70 - 64) = 60` elements) — the marker would be read as
+        // `background` instead of `marker`, silently failing the level
+        // check below.
+        let (odd_w, odd_h) = (70usize, 50usize);
+        let marker = 0.9f32;
+        let (mx, my) = (5usize, 10usize);
+        let mut odd = uniform(odd_w, odd_h, background);
+        odd[my * odd_w + mx] = marker;
+        let p2 = write_mono(dir.path(), "f2.fits", odd_w, odd_h, &odd);
+
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames = [
+            frame(&p0, &map, &weight, &pair),
+            frame(&p1, &map, &weight, &pair),
+            frame(&p2, &map, &weight, &pair),
+        ];
+        let measure = MeasureOptions::default();
+        let mut input = base_input(&frames, &measure);
+        input.scale = 2;
+        input.drop_shrink = 1.0; // exact 2x2 output block per source pixel
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+
+        // "the drizzled output is (64*s)x(48*s)" — reference geometry x
+        // scale, unaffected by the odd frame's own (larger) native size.
+        assert_eq!(out.width, W * 2);
+        assert_eq!(out.height, H * 2);
+
+        // "the level is preserved where all three frames overlap" — sampled
+        // away from the marker's own output block and from the canvas
+        // edges (the usual margin, ruling out a partial-coverage border
+        // effect).
+        let out_w = W * 2;
+        for &(x, y) in &[(40usize, 20usize), (100, 60), (20, 60), (120, 10)] {
+            let v = out.data[y * out_w + x];
+            assert!(
+                (v - background).abs() < 1e-6,
+                "x={x} y={y} v={v} (expected background {background})"
+            );
+        }
+
+        // The marker: correct indexing reads it at (mx, my) in the ODD
+        // frame's plane and deposits it at output block
+        // `(2*mx, 2*my)..=(2*mx+1, 2*my+1)` (drop_shrink=1.0, scale=2 —
+        // same exact-block convention as `spread_single_pixel_lands_on_
+        // four_output_pixels`). The other two frames contribute
+        // `background` at the same spot, so the level-preserving `I/W`
+        // weighted mean is `(background + background + marker) / 3`.
+        let expected = (background as f64 * 2.0 + marker as f64) / 3.0;
+        for &(x, y) in &[
+            (2 * mx, 2 * my),
+            (2 * mx + 1, 2 * my),
+            (2 * mx, 2 * my + 1),
+            (2 * mx + 1, 2 * my + 1),
+        ] {
+            let v = out.data[y * out_w + x] as f64;
+            assert!(
+                (v - expected).abs() < 1e-4,
+                "x={x} y={y} v={v} expected={expected} \
+                 (a stride bug reading the odd frame's 70-wide plane at the \
+                 reference's width would read `background` here, not `marker`)"
+            );
+        }
+
+        // "the odd frame's out-of-reference pixels never land": the output
+        // canvas IS exactly the reference's own geometry (checked above) —
+        // there is no output pixel a source coordinate past x>=64 or y>=48
+        // could possibly land on, so this holds by construction; the
+        // coverage figure below is the observable proxy (full coverage,
+        // nothing dropped, nothing corrupted beyond the canvas).
+        assert!(
+            (out.stats.coverage[0] - 1.0).abs() < 1e-9,
             "coverage={}",
             out.stats.coverage[0]
         );

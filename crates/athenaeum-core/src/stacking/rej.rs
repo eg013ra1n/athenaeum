@@ -30,6 +30,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{ensure, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -125,6 +126,15 @@ pub struct RejBitmapSet {
     /// construction so `bytes()` never has to re-run the checked
     /// multiplication `body_len` already proved safe for this geometry.
     file_len: u64,
+    /// B3 (M3 final fix wave, I3): latched by [`RejPlaneSink::record_band`]
+    /// on the FIRST write failure (open/write, e.g. `ENOSPC`/`EACCES`/an
+    /// SMB hiccup) — a `.rej` write fault must not fail an otherwise-good
+    /// integration. Once set, every later `record_band` call for this set
+    /// becomes a no-op (`Ok(())`, nothing written) and the caller
+    /// (`stacking::run::process_group_output`) reads [`RejBitmapSet::
+    /// failure`] to skip drizzle for the group while keeping its master —
+    /// the same outcome `create` failing already produces.
+    failure: Mutex<Option<String>>,
 }
 
 /// Opens `path` for a fresh header + `set_len`'d body, refusing an existing
@@ -221,6 +231,7 @@ impl RejBitmapSet {
             channels,
             words,
             file_len: total_len,
+            failure: Mutex::new(None),
         })
     }
 
@@ -263,6 +274,35 @@ impl RejBitmapSet {
     /// Total bytes on disk across every frame's file.
     pub fn bytes(&self) -> u64 {
         self.file_len.saturating_mul(self.paths.len() as u64)
+    }
+
+    /// B3 (M3 final fix wave, I3): the FIRST write failure any
+    /// [`RejPlaneSink::record_band`] call for this set has latched, if any
+    /// — `Some` means every band this set was asked to write past the
+    /// first failure was silently skipped; the caller
+    /// (`stacking::run::process_group_output`) reads this after
+    /// integration to decide whether drizzle can trust this set's bitmaps.
+    pub fn failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Latches `error` (about `path`) as the set's failure reason, unless
+    /// one is already latched (the FIRST failure wins) — logged once at
+    /// `warn!` right here, so every caller of `record_band` gets the same
+    /// single log line regardless of which frame's write actually failed.
+    fn latch_failure(&self, path: &Path, error: &std::io::Error) {
+        let mut guard = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "rejection bitmap write failed; drizzle will be skipped for this group"
+            );
+            *guard = Some(format!("{}: {error}", path.display()));
+        }
     }
 }
 
@@ -315,6 +355,25 @@ impl RejectionBitSink for RejPlaneSink<'_> {
                 bits.len()
             )));
         }
+
+        // B3 (M3 final fix wave, I3): once a WRITE failure has latched
+        // (below), every later `record_band` call for this set — any
+        // plane, any band — becomes a no-op. A mid-run I/O fault
+        // (`ENOSPC`/`EACCES`/an SMB hiccup) is systemic, not per-band:
+        // retrying wastes time and would only repeat the same warning.
+        // This check is AFTER the geometry/shape validation above — those
+        // are caller bugs (structural, not I/O), and stay loud on every
+        // call regardless of a prior write failure.
+        if self
+            .set
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Ok(());
+        }
+
         // Row offset into THIS plane's slice of the body, in words; the
         // body is channel-major (see the module doc's layout table).
         let row_words_offset = (self.plane * self.set.height + y0) as u64 * words as u64;
@@ -334,10 +393,23 @@ impl RejectionBitSink for RejPlaneSink<'_> {
             if !frame_has_bits {
                 continue;
             }
-            let file = OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(IntegrationError::Io)?;
+            // B3: an open/write failure here latches the set's failure
+            // reason (the FIRST one wins) and returns `Ok(())` — a `.rej`
+            // write fault must not fail an otherwise-good integration
+            // (ruling: never fail a run because drizzle-support machinery
+            // failed). `RejBitmap::read`'s own length/geometry check
+            // refuses a truncated file outright, so nothing downstream can
+            // mistake a partially-written set for a complete one; the
+            // caller (`stacking::run::process_group_output`) reads
+            // `RejBitmapSet::failure` after integration and skips drizzle
+            // for the group entirely rather than trusting it.
+            let file = match OpenOptions::new().write(true).open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.set.latch_failure(path, &e);
+                    return Ok(());
+                }
+            };
             let mut frame_buf = Vec::with_capacity(rows * words * 8);
             for row in 0..rows {
                 for w in 0..words {
@@ -345,7 +417,10 @@ impl RejectionBitSink for RejPlaneSink<'_> {
                     frame_buf.extend_from_slice(&word.to_le_bytes());
                 }
             }
-            write_at(&file, byte_offset, &frame_buf).map_err(IntegrationError::Io)?;
+            if let Err(e) = write_at(&file, byte_offset, &frame_buf) {
+                self.set.latch_failure(path, &e);
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -681,5 +756,65 @@ mod tests {
         std::fs::set_permissions(&path0, perms).unwrap();
 
         result.expect("a frame with no bits in the band must never be opened for writing");
+    }
+
+    /// B3 (M3 final fix wave, I3): a `.rej` write failure (here: the file
+    /// this call would need to open was removed out from under it, an
+    /// ENOENT stand-in for ENOSPC/EACCES/an SMB hiccup) must not fail
+    /// `record_band` — it latches [`RejBitmapSet::failure`], returns
+    /// `Ok(())`, and every LATER call for the same set (any plane, any
+    /// band) becomes a no-op — proven here by writing bits for a DIFFERENT,
+    /// still-present frame on a second call and checking its file stayed
+    /// untouched.
+    #[cfg(unix)]
+    #[test]
+    fn record_band_latches_a_write_failure_and_skips_later_bands() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = RejBitmapSet::create(
+            dir.path(),
+            &["a".to_string(), "b".to_string()],
+            16,
+            8,
+            1,
+        )
+        .unwrap();
+        let words = words_per_row(16);
+        let n = 2usize;
+        let rows = 4usize;
+
+        assert!(set.failure().is_none(), "no failure latched yet");
+
+        // Remove frame "a"'s file so opening it for write fails — and set a
+        // bit for it so `record_band` actually attempts that write.
+        std::fs::remove_file(set.path(0)).unwrap();
+        let mut bits = vec![0u64; rows * n * words];
+        bits[(0 * n) * words] |= 1; // frame 0 ("a") has a bit, row 0
+
+        let sink = set.plane_sink(0);
+        let result = sink.record_band(0, rows, &bits);
+        assert!(
+            result.is_ok(),
+            "a write failure must not fail record_band: {result:?}"
+        );
+        let failure = set.failure();
+        assert!(failure.is_some(), "the failure must be latched");
+        assert!(
+            failure.unwrap().contains(&set.path(0).display().to_string()),
+            "the latched reason should name the file that failed"
+        );
+
+        // A later call, for a DIFFERENT band, with bits for frame 1 ("b")
+        // whose file IS present and writable, must still be skipped
+        // entirely — proven by frame "b"'s file staying all-zero.
+        let mut bits2 = vec![0u64; rows * n * words];
+        bits2[(0 * n + 1) * words] |= 1; // frame 1 ("b") has a bit, row 0
+        let result2 = sink.record_band(4, rows, &bits2);
+        assert!(result2.is_ok(), "{result2:?}");
+
+        let bm = RejBitmap::read(set.path(1), 16, 8, 1).unwrap();
+        assert!(
+            !bm.is_rejected(0, 0, 4),
+            "a call after the latch must write nothing, even for an untouched file"
+        );
     }
 }

@@ -396,6 +396,18 @@ pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteEr
             .with_comment("stacking header version"),
         Card::new("BUNIT", CardValue::Str("relative weight".into()))?,
     ];
+    // B11 (M3 final fix wave, M8): the weight map shares the drizzled
+    // master's output grid exactly (same `output.data`/`output.weight`
+    // dimensions, same pixel scale) — copy the SCALED WCS block
+    // `build_drizzle_cards` already stamped onto `drizzle_cards` through
+    // too, in the same order `wcs_cards` emitted it, not just the
+    // `ATH_STKI`/`ATH_STKG`/`ATH_DRZ` provenance cards below. Consistent
+    // with the rejection-map precedent (no WCS there either) is deliberate
+    // for THAT artifact; a weight map is far more likely to be loaded next
+    // to the image it belongs to.
+    for c in drizzle_cards.iter().filter(|c| is_wcs_keyword(&c.keyword)) {
+        cards.push(c.clone());
+    }
     for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ] {
         if let Some(c) = drizzle_cards.iter().find(|c| c.keyword == kw) {
             cards.push(c.clone());
@@ -1182,6 +1194,65 @@ mod tests {
             cards.iter().find(|c| c.keyword == ATH_DRZK).unwrap().value,
             Some(CardValue::Str("circle".into()))
         );
+    }
+
+    /// B11 (M3 final fix wave, M8): the weight map's own cards must carry
+    /// the SAME scaled WCS block the drizzled master's cards do — every
+    /// keyword `wcs_cards(&scaled)` emits, with the SAME value, exactly
+    /// once — not just the `ATH_STKI`/`ATH_STKG`/`ATH_DRZ` provenance trio.
+    #[test]
+    fn weight_map_cards_carries_the_same_scaled_wcs_as_the_drizzled_master() {
+        let solve = record(true);
+        let mut master_cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
+            Card::new("ATH_STKG", CardValue::Str("group-1".into())).unwrap(),
+        ];
+        master_cards.extend(wcs_cards(&solve).unwrap());
+
+        let scaled = crate::fits_writer::wcs::scale_plate_solve(&solve, 2).unwrap();
+        let drizzle_cards =
+            build_drizzle_cards(&master_cards, Some(&scaled), 2, 0.9, DrizzleKernel::Square)
+                .unwrap();
+
+        let weight_cards = weight_map_cards(&drizzle_cards).unwrap();
+
+        for c in &drizzle_cards {
+            if !is_wcs_keyword(&c.keyword) {
+                continue;
+            }
+            let matches: Vec<&Card> = weight_cards
+                .iter()
+                .filter(|w| w.keyword == c.keyword)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{}: expected exactly one card in the weight map, got {}",
+                c.keyword,
+                matches.len()
+            );
+            assert_eq!(
+                matches[0].value, c.value,
+                "{}: weight map value must match the drizzled master's",
+                c.keyword
+            );
+        }
+
+        // The provenance trio still survives too.
+        for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ] {
+            assert_eq!(
+                weight_cards.iter().filter(|c| c.keyword == kw).count(),
+                1,
+                "{kw} missing from the weight map"
+            );
+        }
+
+        // Every card must still format into 80-byte records.
+        for c in &weight_cards {
+            crate::fits_writer::card::format_card(c)
+                .unwrap_or_else(|e| panic!("{}: {e}", c.keyword));
+        }
     }
 
     #[test]

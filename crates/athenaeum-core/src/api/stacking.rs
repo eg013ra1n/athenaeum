@@ -1034,6 +1034,97 @@ mod tests {
         }
     }
 
+    /// B12 (M3 final fix wave, M9): a crashed run's `rej/run-<id>` tree is
+    /// worthless — nothing will ever finish writing it, no future run reads
+    /// a prior run's bitmaps — so [`run::heal_interrupted_runs`] sweeps it
+    /// too when it finishes a stuck row, UNLESS that run's own frozen
+    /// config (`config_json`, read back as a `StackingConfig`) explicitly
+    /// asked to keep everything.
+    #[test]
+    fn interrupted_run_heal_removes_its_rej_dir_unless_keep_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let set_name = "Test Set";
+        let (fixture, _light_ids) = seed_ready_fixture(&db_path, set_name);
+
+        let working = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(working.path(), &set_slug(set_name));
+
+        // Case 1: `cleanup != keepAll` — the rej dir must be removed.
+        let mut cfg_delete = StackingConfig::default();
+        cfg_delete.drizzle.enabled = true;
+        cfg_delete.output.cleanup = CleanupPolicy::DeleteIntermediates;
+        let config_json_delete = serde_json::to_string(&cfg_delete).unwrap();
+
+        let stuck_run_id = crate::db::stacking::insert_run(
+            &fixture.conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: fixture.set_id,
+                config_json: &config_json_delete,
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.path().to_str().unwrap(),
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        crate::db::stacking::set_run_status(&fixture.conn, stuck_run_id, "running").unwrap();
+
+        let rej_dir = layout.rej_run_dir(stuck_run_id);
+        std::fs::create_dir_all(&rej_dir).unwrap();
+        std::fs::write(rej_dir.join("leftover.rej"), b"stale").unwrap();
+        assert!(rej_dir.exists());
+
+        let healed = run::heal_interrupted_runs(&ctx, &fixture.conn).unwrap();
+        assert_eq!(healed, 1, "one stuck row healed");
+        assert!(
+            !rej_dir.exists(),
+            "a non-keepAll interrupted run's rej dir must be removed"
+        );
+        let row = crate::db::stacking::get_run(&fixture.conn, stuck_run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
+
+        // Case 2: `cleanup == keepAll` — the rej dir must survive.
+        let mut cfg_keep = StackingConfig::default();
+        cfg_keep.drizzle.enabled = true;
+        cfg_keep.output.cleanup = CleanupPolicy::KeepAll;
+        let config_json_keep = serde_json::to_string(&cfg_keep).unwrap();
+
+        let stuck_run_id2 = crate::db::stacking::insert_run(
+            &fixture.conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: fixture.set_id,
+                config_json: &config_json_keep,
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.path().to_str().unwrap(),
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        crate::db::stacking::set_run_status(&fixture.conn, stuck_run_id2, "running").unwrap();
+
+        let rej_dir2 = layout.rej_run_dir(stuck_run_id2);
+        std::fs::create_dir_all(&rej_dir2).unwrap();
+        std::fs::write(rej_dir2.join("leftover.rej"), b"stale").unwrap();
+
+        let healed2 = run::heal_interrupted_runs(&ctx, &fixture.conn).unwrap();
+        assert_eq!(healed2, 1, "one stuck row healed");
+        assert!(
+            rej_dir2.exists(),
+            "a keepAll interrupted run's rej dir must survive the heal"
+        );
+        let row2 = crate::db::stacking::get_run(&fixture.conn, stuck_run_id2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.status, "failed");
+    }
+
     /// Final fix wave item 1: a `running` row WITH a live `active_stacks`
     /// handle is left alone by the healer — `start_stacking` for the SAME
     /// set still refuses with `Conflict`, exactly as before this wave.
