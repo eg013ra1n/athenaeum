@@ -414,9 +414,10 @@ weight, or the user's pinned choice via `set_frame_set_reference`) →
 `Register` (registration v2: quad-seeded RANSAC + distortion) → `Normalize`
 (local normalization, M2 — see below; a no-op when
 `normalization.local.enabled` is off and `normalization.rejection` isn't
-`"local"`) → `Integrate` (banded, weighted, Auto rejection) → `Drizzle` (M3,
-off in M1) → `Output` (master-light header/naming/writers + WCS/SIP from the
-stored solve). `Calibrate`/`Measure`/`Register`/`Normalize` are the only
+`"local"`) → `Integrate` (banded, weighted, Auto rejection) → `Drizzle` (M3
+— see below; a no-op unless `drizzle.enabled`) → `Output` (master-light
+header/naming/writers + WCS/SIP from the stored solve).
+`Calibrate`/`Measure`/`Register`/`Normalize` are the only
 cacheable per-frame stages (`stacking_artifacts`, keyed by a per-stage
 config hash — spec §9.3; `StackingPlan.stale_stages` lists which of the
 four a fresh run would have to redo).
@@ -492,7 +493,8 @@ built-in default.
 models, PSF-flux scale with RCR, `.athln` sidecars, `NormalizePanel`'s LN
 block goes live) — SHIPPED, see below. **M3** — drizzle (exact clipping,
 forward mapping, M1's rejection bitmaps turned on, `DrizzlePanel` goes
-live). **M4** — polish: thin-plate-spline distortion, ESD/RCR/min-max/
+live) — the pipeline wiring SHIPPED (Task 5, see below); `DrizzlePanel`
+going live and the acceptance run are Task 6/7. **M4** — polish: thin-plate-spline distortion, ESD/RCR/min-max/
 large-scale rejection, Bayer drizzle, XISF output, cataloging masters,
 preset management, and **mixed pixel scales in one set** (owner requirement
 2026-09-09 — co-registered mode resamples every group into the reference
@@ -570,10 +572,49 @@ M4), not a defect in LN itself — see `docs/superpowers/open-items.md`'s
 Stacking M2 subsection for the full attribution and the owner smokes still
 owed.
 
+**M3 — drizzle** (spec §7, executed 2026-09-10): stage 7 (`Integrate`) grows
+an optional sink — when `drizzle.enabled && drizzle.useRejection`, every
+band's per-frame rejected bits are written to `rej/run-<id>/<group>/
+<stem>.rej` (`stacking::rej`, one bit per pixel per channel), sized and
+ordered to the SAME included-frame set `integrate_group` computes via the
+extracted `stacking::integrate::included_after_min_weight` rule — the run
+(`stacking::run`) creates the set before calling `integrate_group`, never
+duplicating the rule. Stage 8 (`Drizzle`) then runs per group right after
+the master is written, in the same `process_group_output` call: per plane
+it deposits every included frame's calibrated pixel onto a 1×/2×/3× output
+grid through the frame's `PixelMap`, with the run's weights and (when on)
+local normalization, skipping rejected pixels per the `.rej` bitmap.
+`I / W` where `W > 0` is level-preserving — a uniform field comes out at
+the input level for every scale/dropShrink (ruling R-M3-2, spec's
+Implementation notes). Output `<master stem>_drizzle<s>x.fits`
+(+ `..._weight.fits` when `writeWeightMap`) with the reference's WCS
+scaled and the `ATH_DRZ`/`ATH_DRZP`/`ATH_DRZK` cards
+(`stacking::master_cards`, `fits_writer::wcs::scale_plate_solve`). A
+drizzle failure (`Memory`/`Io`/`BadInput`, or any error past
+`drizzle_group` itself) NEVER fails the group — the master is already
+written and good, so the group stays `done` with `drizzle_path` `NULL`, a
+`warn!` and a run warning; only `Cancelled` propagates, as the run's own
+cancel. The `.rej` bitmaps are per-run temporaries: removed at the run's
+single exit path (`run_thread`, every outcome — success, cancel, failure,
+panic-recovery) unless `output.cleanup = keepAll`. `rerunFrom: "drizzle"`
+is clamped to `"integrate"` (`api::stacking::start_stacking`, ruling
+R-M3-9) — drizzle has no cache of its own. The plan gate's old "Drizzle
+arrives in M3" blocker is gone; the only thing gate 6 still blocks on is
+an out-of-range `scale` (`∉ {1, 2, 3}`, ruling R-M3-10); the byte-footprint
+estimate grows by the `.rej` bitmap and drizzled-output terms when drizzle
+is on. `MaximumQuality` now turns on drizzle 2× AND local normalization
+(spec §9.2) — both hidden in M1/M2 only because neither stage existed yet.
+Full ruling list: spec §7's "Implementation notes (M3)". **`DrizzlePanel`
+going live, the tab's drizzle rows/summary, and the LDN 1272 acceptance
+run (drizzled/undrizzled FWHM ratio against the external 2× drizzled
+masters) are still owed — Task 6/7 of
+`docs/superpowers/plans/2026-09-10-stacking-m3-plan-drizzle.md`.**
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,robust,integrate,
 master_cards}.rs`, `stacking/register/{mod,detect,align,frame,writer}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference}.rs`,
+`stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
 `crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
 fits_writer/wcs.rs`; dev probes
 `examples/{measure,register,integrate,ln}_probe.rs`.

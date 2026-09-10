@@ -442,6 +442,26 @@ stem>_drizzle<s>x.fits` with the WCS scaled (`CRPIX·s`, `CD/s`) and
 planes without demosaic) is M4 and needs stage 1 to also keep the calibrated
 CFA mosaic.
 
+### Implementation notes (M3)
+
+Rulings made while building the plan (`docs/superpowers/plans/2026-09-10-stacking-m3-plan-drizzle.md`), one line each:
+
+- **R-M3-1 Deposition, not gathering.** The per-pixel work is forward: map the drop's four corners, clip against the output pixels the mapped quad touches — the spec's "inverse image" text above only bounds each tile's source window.
+- **R-M3-2 Units and level.** `a` is measured in OUTPUT-pixel area units; `I += a·w·N(d)`, `W += a·w`; the result is `I / W` where `W > 0`, else `0` — no `s²` and no `dropShrink²` factor anywhere, so a uniform input field comes out at exactly the input level for every scale/dropShrink.
+- **R-M3-3 Kernels.** `square` is exact polygon clipping (Sutherland–Hodgman, shoelace area). `circle`/`gaussian` use the `kernelGridSize² = 16×16` tabulated micro-drop table: 256 sub-drops, weights normalized to sum `dropShrink²`, each deposited as a point at the output pixel containing its mapped centre — not exact clipping.
+- **R-M3-4 Rejection lookup per source pixel.** A frame's `.rej` bit is read at the rounded reference coordinate of the drop's CENTRE; a set bit skips the whole drop.
+- **R-M3-5 LN lookup per source pixel.** With local normalization and a frame that has grids, `N(d) = a·d + b` read from its grid at `(round(u), round(v))`; otherwise `N(d) = os·d + oo`, the frame's global OUTPUT pair `integrate_group` hands back.
+- **R-M3-6 Whole source plane in RAM, bands of 512 output rows.** One `PlaneReader::read_plane` per included frame per plane; bands processed in parallel, each band's source window the inverse image of its rectangle grown by `dropShrink/2 + 1` source px.
+- **R-M3-7 Memory refusal, not swapping** (amended by R-M3-15 below). Refused BEFORE any output-geometry allocation when the estimated peak exceeds half of probed total RAM (unknown total → refuse above 4 GiB) — the master is already written, the group's `drizzle_path` stays `NULL`, a run warning, the run itself is not failed.
+- **R-M3-8 `.rej` files are per-run temporaries.** Written only when `drizzle.enabled && drizzle.useRejection`; removed at the run's single exit path — success, failure or cancel — unless `output.cleanup = keepAll`; opened per write, never held open across frames.
+- **R-M3-9 Re-run.** Drizzle has no cache of its own: `rerunFrom: "drizzle"` is clamped to `integrate` (`api::stacking::start_stacking`), with a `debug!`; `stale_stages` never lists `drizzle`.
+- **R-M3-10 Ranges.** `scale ∈ {1, 2, 3}` (else the plan's `unsupported` blocker "drizzle scale must be 1, 2 or 3"); `dropShrink ∈ [0.5, 1.0]` (outside → clamped at run time with a `warn!` and a run warning). 1× drizzle is allowed (shift-and-add with sub-pixel drops).
+- **R-M3-11 Normalize timing.** Drizzle pushes its own `StageTiming` once after the group loop, between `integrate` and `output`, only when drizzle is on and at least one group wrote a master.
+- **R-M3-12 Injectable RAM total.** `DrizzleInput.ram_total_bytes: Option<u64>` — `None` probes `band_budget::total_ram_bytes()` (the run always passes `None`); tests inject a small value to exercise the refusal without a huge geometry.
+- **R-M3-13 0-based CRPIX.** `PlateSolveRecord.crpix1`/`crpix2` are 0-based (the card writer adds 1), so `scale_plate_solve` computes `crpix' = s·crpix + (s − 1)/2` (the same formula as `geom::to_output`) — the 1-based card then reads `s·CRPIX − (s − 1)/2`.
+- **R-M3-14 The sharpening test thresholds.** The drizzle-sharpens-a-star assertion compares `fwhm_drz(dropShrink=0.6)` against `fwhm_drz(dropShrink=1.0)`, both in OUTPUT pixels, on a σ = 0.7 px star (ratio < 0.985) and a σ = 0.45 px undersampled star (ratio < 0.93) — a naive cross-unit comparison (reference px vs output px) is trivially true and proves nothing.
+- **R-M3-15 The memory formula** (amends R-M3-7). `estimate_memory_bytes = (channels + 2)·out_w·out_h·4` (the output planes plus one `I`/`W` accumulator pair) `+ (write_weight_map ? channels·out_w·out_h·4 : 0)` (the weight-map planes) `+ out_w·out_h·4` (`measure_plane`'s own scaled copy) `+ width·height·4` (one full-resolution source plane) `+ (ln ? 2·width·height·4 : 0)` (two reference-geometry LN grid planes).
+
 ## 8. Execution model
 
 - **Job**: `ComputeJobKind::Stacking`, one job per run, label
