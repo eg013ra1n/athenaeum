@@ -266,7 +266,12 @@ isDefault: boolean, updatedAt: string | null, };
 
 export type StackingPaths = { working: PathSetting, output: PathSetting, };
 
-export type WorkUsage = { calibratedBytes: number, registeredBytes: number, lnBytes: number, runsBytes: number, totalBytes: number, };
+export type WorkUsage = { calibratedBytes: number, registeredBytes: number, lnBytes: number, runsBytes: number, 
+/**
+ * M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
+ * (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.
+ */
+rejBytes: number, totalBytes: number, };
 
 export type CleanupWhat = "registered" | "intermediates" | "all";
 

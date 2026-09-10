@@ -8,7 +8,7 @@ use super::banded::{BandPlanes, BandSource};
 use super::combine::{self, combine_pixel, IntegrationRecipe};
 use super::io_policy::IoPolicy;
 use super::registered_source::RegisteredSource;
-use super::source::FrameSource;
+use super::source::{FrameSource, RejectionBitSink};
 use super::stats::NormalizationPair;
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
@@ -498,6 +498,14 @@ pub struct StackParams<'a, 'f> {
     /// Apply a frame's local pair to the output sample, in place of
     /// `output[i]`, for a frame that has one.
     pub local_for_output: bool,
+    /// M3 Task 2 (spec §6.2, ruling R-M3-8): receives one band's per-frame
+    /// rejection bitmap after each band's per-pixel combine — `None` (every
+    /// caller before this field existed, and every caller that doesn't want
+    /// drizzle's survivor mask) skips the whole band-sized bit buffer and
+    /// its allocation entirely; see `integrate_stack`'s band loop for how
+    /// the `Some`/`None` cases are split so the `None` path pays no cost
+    /// for a feature it isn't using.
+    pub rejection_bits: Option<&'a (dyn RejectionBitSink + 'a)>,
 }
 
 /// `base.rejected_fraction` counts ALGORITHM rejections only, exactly like
@@ -559,6 +567,26 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     }
     if params.weights.iter().all(|wt| *wt == 0.0) {
         return Err(IntegrationError::BadInput("every weight is zero".into()));
+    }
+    // M3 Task 2: a rejection-bit sink must agree with the source on both
+    // dimensions it cares about, checked once here rather than once per
+    // band — a mismatched `frames()` would silently misindex `record_band`'s
+    // `[row][frame][word]` layout, and a mismatched `words_per_row()` would
+    // silently truncate or overrun a row's bits.
+    if let Some(sink) = params.rejection_bits {
+        if sink.frames() != n {
+            return Err(IntegrationError::BadInput(format!(
+                "rejection bit sink expects {} frames, source has {n}",
+                sink.frames()
+            )));
+        }
+        let expected_words = w.div_ceil(64);
+        if sink.words_per_row() != expected_words {
+            return Err(IntegrationError::BadInput(format!(
+                "rejection bit sink words_per_row {} != expected {expected_words} for width {w}",
+                sink.words_per_row()
+            )));
+        }
     }
     if n > u16::MAX as usize {
         return Err(IntegrationError::BadInput(format!("{n} frames exceed the 65535-frame stack limit")));
@@ -656,6 +684,10 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     let band_rows_cap = src.band_rows_for_budget(io.band_budget_bytes).min(h).max(1);
     let map_low = std::sync::Mutex::new(if maps { vec![0f32; w * h] } else { vec![0f32; band_rows_cap * w] });
     let map_high = std::sync::Mutex::new(if maps { vec![0f32; w * h] } else { vec![0f32; band_rows_cap * w] });
+    // M3 Task 2: `ceil(width / 64)`, the same value the sink itself reports
+    // via `words_per_row()` (checked equal above) — computed once here so
+    // the band closure never calls back into the sink for it.
+    let bit_words = w.div_ceil(64);
 
     let stats = band_loop(src, pool, cancel, &progress, io, &mut out, &|job, tick| {
         let BandJob { planes, out_band, y0, rows, width } = job;
@@ -688,12 +720,25 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                 .map(|&(i, factory)| (i, factory(), vec![0f32; width], vec![0f32; width]))
                 .collect()
         };
-        out_band
-            .par_chunks_mut(width)
-            .zip(low_band.par_chunks_mut(width))
-            .zip(high_band.par_chunks_mut(width))
-            .enumerate()
-            .for_each_init(init_local_state, |local_state, (row_in_band, ((out_row, low_row), high_row))| {
+        // M3 Task 2: the whole per-row body, factored out so it can be
+        // called from either of the two zip chains below (one with a 4th
+        // `band_bits` chunk, one without) without duplicating ~200 lines of
+        // per-pixel logic twice over. `bits_row` is `Some` only on the
+        // sink-present chain; every `if let Some(bits) = &mut bits_row`
+        // below is the ONLY new work this closure does relative to before
+        // this field existed — on the `None` chain those checks still run
+        // (a cheap `Option::is_none` each), but nothing is ever written
+        // anywhere the OUTPUT or the rejection accounting reads from, so
+        // the `None`-path numeric results (and the Plan 4 / M2 pins that
+        // check them) are unaffected either way. The buffer/zip/allocation
+        // itself is what stays entirely absent on the `None` chain (see the
+        // `match` below).
+        let process_row = |row_in_band: usize,
+                            out_row: &mut [f32],
+                            low_row: &mut [f32],
+                            high_row: &mut [f32],
+                            mut bits_row: Option<&mut [u64]>,
+                            local_state: &mut Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)>| {
                 // Per-worker scratch, allocated once per ROW (not per pixel):
                 // `work`/`out_vals`/`mask` feed `combine_pixel_weighted`,
                 // `scratch` is its own reused survivor-value buffer (Task 1
@@ -767,6 +812,9 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                                 if raw <= lo {
                                     low_here += 1;
                                     row_rejected[i] += 1;
+                                    if let Some(bits) = &mut bits_row {
+                                        bits[i * bit_words + x / 64] |= 1u64 << (x % 64);
+                                    }
                                     continue;
                                 }
                             }
@@ -774,6 +822,9 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                                 if raw >= hi {
                                     high_here += 1;
                                     row_rejected[i] += 1;
+                                    if let Some(bits) = &mut bits_row {
+                                        bits[i * bit_words + x / 64] |= 1u64 << (x % 64);
+                                    }
                                     continue;
                                 }
                             }
@@ -817,6 +868,9 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                                 if raw <= lo {
                                     low_here += 1;
                                     row_rejected[i] += 1;
+                                    if let Some(bits) = &mut bits_row {
+                                        bits[i * bit_words + x / 64] |= 1u64 << (x % 64);
+                                    }
                                     continue;
                                 }
                             }
@@ -824,6 +878,9 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                                 if raw >= hi {
                                     high_here += 1;
                                     row_rejected[i] += 1;
+                                    if let Some(bits) = &mut bits_row {
+                                        bits[i * bit_words + x / 64] |= 1u64 << (x % 64);
+                                    }
                                     continue;
                                 }
                             }
@@ -879,6 +936,9 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             for i in 0..n {
                                 if combine::mask_get(&present, i) && !combine::mask_get(&mask, i) {
                                     row_rejected[i] += 1;
+                                    if let Some(bits) = &mut bits_row {
+                                        bits[i * bit_words + x / 64] |= 1u64 << (x % 64);
+                                    }
                                     if rej_vals[i] < median {
                                         low_here += 1
                                     } else {
@@ -919,7 +979,42 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                     all_bad.fetch_add(row_all_bad, Ordering::Relaxed);
                 }
                 tick();
-            });
+            };
+
+        // M3 Task 2: the 4th `band_bits` chunk (and its allocation) exists
+        // ONLY on this `Some` arm — mirrors how `maps` sizes `map_low`/
+        // `map_high` above, but taken one step further: with no sink there
+        // is no per-band bit buffer at all, not even a band-sized one, so a
+        // caller that never asked for rejection bits (every Plan 4 / M2
+        // caller) pays nothing for this field's existence.
+        match params.rejection_bits {
+            Some(sink) => {
+                let mut band_bits = vec![0u64; rows * n * bit_words];
+                out_band
+                    .par_chunks_mut(width)
+                    .zip(low_band.par_chunks_mut(width))
+                    .zip(high_band.par_chunks_mut(width))
+                    .zip(band_bits.par_chunks_mut(n * bit_words))
+                    .enumerate()
+                    .for_each_init(
+                        init_local_state,
+                        |local_state, (row_in_band, (((out_row, low_row), high_row), bits_row))| {
+                            process_row(row_in_band, out_row, low_row, high_row, Some(bits_row), local_state);
+                        },
+                    );
+                sink.record_band(y0, rows, &band_bits)?;
+            }
+            None => {
+                out_band
+                    .par_chunks_mut(width)
+                    .zip(low_band.par_chunks_mut(width))
+                    .zip(high_band.par_chunks_mut(width))
+                    .enumerate()
+                    .for_each_init(init_local_state, |local_state, (row_in_band, ((out_row, low_row), high_row))| {
+                        process_row(row_in_band, out_row, low_row, high_row, None, local_state);
+                    });
+            }
+        }
         Ok(())
     })?;
 
@@ -986,6 +1081,7 @@ pub fn integrate_registered(
         local: None,
         local_for_rejection: false,
         local_for_output: false,
+        rejection_bits: None,
     };
     Ok(integrate_stack(src, &params, recipe, pool, cancel, progress, io)?.base)
 }
@@ -1748,6 +1844,7 @@ mod tests {
             local: None,
             local_for_rejection: false,
             local_for_output: false,
+            rejection_bits: None,
         };
         let progress = EngineProgress { on_band: &nop(), on_combine: &nop() };
         // sigma_high 1.0, not the brief's 2.0 (measured deviation, Task 3):
@@ -1811,6 +1908,7 @@ mod tests {
             rejection: &ident, output: &ident, weights: &[1.0; 7],
             range_low: None, range_high: None, rejection_maps: false,
             local: None, local_for_rejection: false, local_for_output: false,
+            rejection_bits: None,
         };
         let stack = integrate_stack(&src, &params, recipe, &pool(), &AtomicBool::new(false),
             EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap();
@@ -1849,6 +1947,7 @@ mod tests {
             local: None,
             local_for_rejection: false,
             local_for_output: false,
+            rejection_bits: None,
         };
         let out = integrate_stack(
             &src,
@@ -1897,6 +1996,7 @@ mod tests {
             local: None,
             local_for_rejection: false,
             local_for_output: false,
+            rejection_bits: None,
         };
         let out = integrate_stack(
             &src,
@@ -1979,6 +2079,7 @@ mod tests {
             local: Some(&local),
             local_for_rejection: false,
             local_for_output: true,
+            rejection_bits: None,
         };
         // budget: `per_row_bytes` for 2 f32 frames at width 16 is
         // 2*16*4 + 16*8 = 256; 2_000 / 256 -> 7-row bands, so 12 rows run
@@ -2052,6 +2153,7 @@ mod tests {
             local: None,
             local_for_rejection: false,
             local_for_output: false,
+            rejection_bits: None,
         };
         let out_global = integrate_stack(
             &src,
@@ -2099,6 +2201,7 @@ mod tests {
             local: Some(&local),
             local_for_rejection: true,
             local_for_output: false,
+            rejection_bits: None,
         };
         let out_local = integrate_stack(
             &src,
@@ -2144,5 +2247,123 @@ mod tests {
             "local_for_rejection leaked into the output sample: {:?} vs expected {expected}",
             out_local.base.data
         );
+    }
+
+    /// M3 Task 2: a [`RejectionBitSink`] must see exactly the (frame, pixel)
+    /// pairs the engine's own `rejected_per_frame` accounting already
+    /// counts, and its presence must not change a single OUTPUT byte —
+    /// pinned by comparing the SAME run with `rejection_bits: None` against
+    /// one with a recording sink. Sigma parameters match
+    /// `stack_path_weights_normalizes_and_counts_rejections_per_side_and_frame`
+    /// above (n=4, small-n masking analysis in that test's own comment):
+    /// `sigma_high = 1.0` reliably rejects a huge single-frame outlier that
+    /// `sigma_high >= 1.5` would mask.
+    #[test]
+    fn rejection_bit_sink_records_exactly_the_rejected_samples_and_does_not_change_the_output() {
+        struct RecordingSink {
+            frames: usize,
+            words: usize,
+            calls: std::sync::Mutex<Vec<(usize, usize, Vec<u64>)>>,
+        }
+        impl RejectionBitSink for RecordingSink {
+            fn words_per_row(&self) -> usize {
+                self.words
+            }
+            fn frames(&self) -> usize {
+                self.frames
+            }
+            fn record_band(&self, y0: usize, rows: usize, bits: &[u64]) -> Result<(), IntegrationError> {
+                self.calls.lock().unwrap().push((y0, rows, bits.to_vec()));
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let hot_idx = 3usize;
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 100.0),
+            write(dir.path(), "b.fits", w, h, |_, _| 100.0),
+            write(dir.path(), "c.fits", w, h, |_, _| 100.0),
+            write(dir.path(), "hot.fits", w, h, |x, y| {
+                if (x, y) == (7, 3) { 9000.0 } else { 100.0 }
+            }),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 4];
+        let weights = vec![1.0f32; 4];
+        let recipe = IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 3.0, sigma_high: 1.0 });
+
+        let params_none = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: false,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: None,
+        };
+        let out_none = integrate_stack(
+            &src,
+            &params_none,
+            recipe,
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        assert_eq!(
+            out_none.rejected_per_frame[hot_idx], 1,
+            "sanity: the hot pixel must actually be rejected in the no-sink baseline, got {:?}",
+            out_none.rejected_per_frame
+        );
+
+        let sink = RecordingSink { frames: 4, words: w.div_ceil(64), calls: std::sync::Mutex::new(Vec::new()) };
+        let params_sink = StackParams { rejection_bits: Some(&sink), ..params_none };
+        let out_sink = integrate_stack(
+            &src,
+            &params_sink,
+            recipe,
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+
+        // The sink's presence must not move a single OUTPUT byte.
+        assert_eq!(out_none.base.data.len(), out_sink.base.data.len());
+        for (i, (a, b)) in out_none.base.data.iter().zip(&out_sink.base.data).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "pixel {i}: {a} vs {b} — sink presence changed the output");
+        }
+        assert_eq!(out_none.rejected_per_frame, out_sink.rejected_per_frame);
+        assert_eq!((out_none.rejected_low, out_none.rejected_high), (out_sink.rejected_low, out_sink.rejected_high));
+
+        // Exactly one (frame, x, y) bit set across the whole run.
+        let words = w.div_ceil(64);
+        let mut found = Vec::new();
+        for (y0, rows, bits) in sink.calls.lock().unwrap().iter() {
+            assert_eq!(bits.len(), rows * 4 * words, "band buffer sized rows x frames x words");
+            for row_in_band in 0..*rows {
+                for frame in 0..4 {
+                    for word in 0..words {
+                        let bitset = bits[(row_in_band * 4 + frame) * words + word];
+                        if bitset == 0 {
+                            continue;
+                        }
+                        for bit in 0..64 {
+                            if bitset & (1u64 << bit) != 0 {
+                                found.push((frame, y0 + row_in_band, word * 64 + bit));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(found, vec![(hot_idx, 3, 7)], "expected exactly one bit at (frame {hot_idx}, row 3, col 7): {found:?}");
     }
 }

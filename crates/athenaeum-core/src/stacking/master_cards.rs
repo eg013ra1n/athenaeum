@@ -761,6 +761,7 @@ mod tests {
             rejection_low: Some(vec![1.0f32; plane * ch]),
             rejection_high: Some(vec![2.0f32; plane * ch]),
             included: vec![0, 1, 2],
+            output_pairs: vec![Vec::new(); ch],
             stats: dummy_stats(),
         };
 

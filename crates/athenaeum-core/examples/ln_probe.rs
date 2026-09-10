@@ -422,6 +422,7 @@ registration row for each — run stacking through Register first); found {}",
         integration: &integration_cfg,
         normalization: &normalization_cfg,
         ln: None,
+        rej: None,
     };
 
     let n = (args.frames as usize).min(stack_frames.len());

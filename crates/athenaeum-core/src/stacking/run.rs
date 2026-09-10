@@ -3482,6 +3482,10 @@ fn process_group_output(
         // `integrate_group` until the LN pass below (if any) resolves real
         // sidecars; the second `GroupInput` further down carries them.
         ln: None,
+        // M3 Task 2: this `input` only ever reaches `run_group_normalization`
+        // (the LN pass), never `integrate_group` — the real `GroupInput`
+        // further down is the one a `RejBitmapSet` (Task 5) will attach to.
+        rej: None,
     };
 
     let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
@@ -3652,6 +3656,11 @@ fn process_group_output(
         integration: &group_integration,
         normalization: &normalization_cfg,
         ln: ln_grids.as_deref(),
+        // M3 Task 2: bitmap CREATION is Task 5's job (the run thread must
+        // decide the run id / group key / stem list and open
+        // `RejBitmapSet::create` before this point) — this task only adds
+        // the plumbing `integrate_group` needs to consume one.
+        rej: None,
     };
 
     // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`

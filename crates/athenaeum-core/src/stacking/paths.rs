@@ -89,6 +89,34 @@ impl WorkingLayout {
         self.ln_dir(group_key).join(format!("{stem}.athln"))
     }
 
+    /// `root/rej` — the parent of every run's rejection-bitmap tree (M3
+    /// Task 2, spec §6.2, ruling R-M3-8). Unlike the other three `_root`
+    /// accessors above, `.rej` files are per-RUN temporaries, not cached
+    /// artifacts — the layout nests one level deeper (`run-<id>`) than
+    /// `calibrated`/`registered`/`ln` do, because a re-run must never read
+    /// a stale run's bitmaps back.
+    pub fn rej_root(&self) -> PathBuf {
+        self.root.join("rej")
+    }
+
+    /// `root/rej/run-<run_id>` — one run's whole rejection-bitmap tree,
+    /// removed at that run's single exit path unless the user asked to
+    /// keep everything.
+    pub fn rej_run_dir(&self, run_id: i64) -> PathBuf {
+        self.rej_root().join(format!("run-{run_id}"))
+    }
+
+    /// `root/rej/run-<run_id>/<group_key>` — one group's per-frame `.rej`
+    /// files for that run.
+    pub fn rej_dir(&self, run_id: i64, group_key: &str) -> PathBuf {
+        self.rej_run_dir(run_id).join(group_key)
+    }
+
+    /// `root/rej/run-<run_id>/<group_key>/<stem>.rej`.
+    pub fn rej_path(&self, run_id: i64, group_key: &str, stem: &str) -> PathBuf {
+        self.rej_dir(run_id, group_key).join(format!("{stem}.rej"))
+    }
+
     /// `root/runs` — same as [`Self::runs_root`]; kept as its own name since
     /// it predates the other three `_root` accessors and is the one other
     /// tasks (e.g. [`Self::run_json`]) already call.
@@ -500,6 +528,9 @@ pub struct WorkUsage {
     pub registered_bytes: u64,
     pub ln_bytes: u64,
     pub runs_bytes: u64,
+    /// M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
+    /// (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.
+    pub rej_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -514,12 +545,14 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
     let registered_bytes = crate::api::sync::dir_size_bytes(&layout.registered_root());
     let ln_bytes = crate::api::sync::dir_size_bytes(&layout.ln_root());
     let runs_bytes = crate::api::sync::dir_size_bytes(&layout.runs_root());
+    let rej_bytes = crate::api::sync::dir_size_bytes(&layout.rej_root());
     WorkUsage {
         calibrated_bytes,
         registered_bytes,
         ln_bytes,
         runs_bytes,
-        total_bytes: calibrated_bytes + registered_bytes + ln_bytes + runs_bytes,
+        rej_bytes,
+        total_bytes: calibrated_bytes + registered_bytes + ln_bytes + runs_bytes + rej_bytes,
     }
 }
 
@@ -553,8 +586,13 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] =
 /// each subtree, symlink-safe via [`crate::api::sync::dir_size_bytes`],
 /// before it is removed). Only ever touches directories under `layout.root`
 /// that this task's layout owns (`registered/`, `calibrated/`, `ln/`,
-/// `runs/`) — never `layout.root` itself, and never the output folder,
-/// which this function never sees a path for.
+/// `runs/`, and — M3 Task 2 — `rej/`) — never `layout.root` itself, and
+/// never the output folder, which this function never sees a path for.
+/// `rej/` holds no `stacking_artifacts` rows (bitmaps are per-run
+/// temporaries, not cached artifacts — see `stacking::rej`'s own doc), so it
+/// is added to the removed DIRECTORIES on the same levels as `calibrated`/
+/// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
+/// calls below.
 pub fn cleanup_work(
     conn: &Connection,
     frames_set_id: i64,
@@ -567,10 +605,12 @@ pub fn cleanup_work(
         CleanupWhat::Intermediates => {
             dirs.push(layout.calibrated_root());
             dirs.push(layout.ln_root());
+            dirs.push(layout.rej_root());
         }
         CleanupWhat::All => {
             dirs.push(layout.calibrated_root());
             dirs.push(layout.ln_root());
+            dirs.push(layout.rej_root());
             dirs.push(layout.runs_root());
         }
     }
@@ -1188,5 +1228,50 @@ mod tests {
         let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
         assert_eq!(freed, 1024);
         assert!(!layout.calibrated_dir("g").exists());
+    }
+
+    /// M3 Task 2, brief test (j): `rej/` bytes are counted by `work_usage`
+    /// and removed by `Intermediates`/`All`, but survive `Registered` — the
+    /// same level `calibrated/`/`ln/` sit at, not the narrower level
+    /// `registered/` alone sits at.
+    #[test]
+    fn rej_bytes_are_counted_and_only_intermediates_or_all_remove_them() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (3, 'Rej')", [])
+            .unwrap();
+        let set_id = 3;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+
+        assert_eq!(
+            layout.rej_path(7, "g", "f1"),
+            layout.root.join("rej").join("run-7").join("g").join("f1.rej")
+        );
+
+        let rej_file = layout.rej_dir(7, "g").join("f1.rej");
+        write_bytes(&rej_file, 64);
+
+        let usage = work_usage(&layout);
+        assert_eq!(usage.rej_bytes, 64);
+        assert_eq!(usage.total_bytes, 64, "the only bytes on disk are under rej/");
+
+        // Registered: rej/ survives — it sits at the same level as
+        // calibrated/ and ln/, not registered/'s narrower level.
+        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Registered).unwrap();
+        assert_eq!(freed, 0);
+        assert!(rej_file.exists(), "Registered must not remove rej/");
+
+        // Intermediates: rej/ is removed alongside calibrated/ and ln/.
+        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
+        assert_eq!(freed, 64);
+        assert!(!layout.rej_root().exists());
+        assert_eq!(work_usage(&layout).rej_bytes, 0);
+
+        // Re-seed for the All level too.
+        write_bytes(&rej_file, 128);
+        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::All).unwrap();
+        assert_eq!(freed, 128);
+        assert!(!layout.rej_root().exists());
     }
 }

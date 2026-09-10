@@ -21,14 +21,17 @@ use crate::integration::engine::{
 };
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
+use crate::integration::source::RejectionBitSink;
 use crate::integration::stats::{
-    output_pair, rejection_pair, OutputNormalization, RejectionNormalization, ScaleEstimator,
+    output_pair, rejection_pair, NormalizationPair, OutputNormalization, RejectionNormalization,
+    ScaleEstimator,
 };
 use crate::integration::IntegrationError;
 use crate::resample::Interpolation;
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::{LnFrameGrids, LnGrid};
 use crate::stacking::measure::{measure_plane, FrameMeasurement, MeasureOptions};
+use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
 /// spec §9.2 `integration:`; every field defaulted, camelCase on the wire.
@@ -237,6 +240,15 @@ pub struct GroupInput<'a> {
     /// [`integrate_planes`], which already treats `None` the same way for
     /// every M1 caller.
     pub ln: Option<&'a [Option<LnFrameGrids>]>,
+    /// M3 Task 2 (spec §6.2, ruling R-M3-8): the run's per-run rejection-
+    /// bitmap set for this group, when drizzle wants the survivor mask
+    /// (`drizzle.enabled && drizzle.useRejection`) — `stacking::run` (Task
+    /// 5) creates it (sized to the INCLUDED frame count, in engine order)
+    /// before calling `integrate_group`; `None` for every other caller,
+    /// including the LN reference builder, which never writes bitmaps.
+    /// `integrate_group` checks `rej.frames()` against the post-min-weight-
+    /// drop included count before handing it to `integrate_planes`.
+    pub rej: Option<&'a RejBitmapSet>,
 }
 
 // `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
@@ -310,6 +322,12 @@ pub struct GroupOutput {
     /// Indices into the input `frames` that were integrated (after the min-weight drop), in engine order.
     pub included: Vec<usize>,
     pub stats: GroupStats,
+    /// M3 Task 2: per plane (outer, `channels` long), per included frame
+    /// (inner, engine order — same order as `included`), the OUTPUT
+    /// normalization pair `integrate_planes` computed for it (the same
+    /// values it fed `StackParams::output`). Task 3's drizzle driver uses
+    /// this as the ruling-R-M3-5 fallback pair for a frame with no LN grid.
+    pub output_pairs: Vec<Vec<NormalizationPair>>,
 }
 
 pub struct GroupProgress<'a> {
@@ -398,8 +416,24 @@ fn local_norm_row_factory<'g>(grid: &'g LnGrid) -> impl Fn() -> Box<LocalNormRow
 /// the resulting per-frame-indices row of closures to
 /// [`crate::integration::engine::StackParams::local`] — engine.rs never
 /// depends on `LnGrid` directly (see `LocalNormRow`'s own doc for why).
-/// Returns one [`StackOutput`] per plane, in channel order — no
-/// stats/accumulation/writing: that tail is the caller's job.
+///
+/// `rej` (M3 Task 2) is `Some` when the caller wants per-frame rejection
+/// bitmaps written for this group — every M1/M2 caller and the LN reference
+/// builder pass `None`. Bound per plane via [`RejBitmapSet::plane_sink`] and
+/// handed to [`crate::integration::engine::StackParams::rejection_bits`];
+/// the caller (`integrate_group`) is responsible for checking
+/// `rej.frames() == frame_indices.len()` before calling this — a mismatch
+/// here would otherwise surface as an opaque `IntegrationError::BadInput`
+/// from deep inside `integrate_stack` instead of a clear one at the group
+/// boundary.
+///
+/// Returns one [`StackOutput`] per plane (in channel order) alongside the
+/// OUTPUT normalization pair this call resolved for every entry of
+/// `frame_indices`, per plane — the same pairs each plane fed
+/// `StackParams::output` — for the caller to fold into
+/// [`GroupOutput::output_pairs`] (Task 3's drizzle driver reads them back as
+/// its ruling-R-M3-5 fallback pair). No stats/accumulation/writing beyond
+/// that: the rest of the tail is the caller's job.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn integrate_planes<'g>(
     input: &GroupInput<'_>,
@@ -409,13 +443,14 @@ pub(crate) fn integrate_planes<'g>(
     rejection_mode: RejectionNormalization,
     local_for_output: bool,
     ln: Option<&'g [Option<LnFrameGrids>]>,
+    rej: Option<&RejBitmapSet>,
     recipe: IntegrationRecipe,
     write_maps: bool,
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
     progress: &GroupProgress<'_>,
     io: IoPolicy,
-) -> Result<Vec<StackOutput>, IntegrationError> {
+) -> Result<(Vec<StackOutput>, Vec<Vec<NormalizationPair>>), IntegrationError> {
     if weights.len() != frame_indices.len() {
         return Err(IntegrationError::BadInput(format!(
             "{} frame indices but {} weight rows",
@@ -466,6 +501,7 @@ pub(crate) fn integrate_planes<'g>(
     let n = frame_indices.len();
     let local_for_rejection = rejection_mode == RejectionNormalization::Local;
     let mut outputs = Vec::with_capacity(input.channels);
+    let mut output_pairs_out: Vec<Vec<NormalizationPair>> = Vec::with_capacity(input.channels);
 
     for p in 0..input.channels {
         if cancel.load(Ordering::Relaxed) {
@@ -522,6 +558,11 @@ pub(crate) fn integrate_planes<'g>(
             input.clamping,
         )?;
 
+        // M3 Task 2: this plane's rejection-bit sink, when the caller asked
+        // for one — an owned `Option<RejPlaneSink>` so `StackParams` can
+        // borrow a `&dyn RejectionBitSink` from it for the `integrate_stack`
+        // call just below.
+        let sink = rej.map(|r| r.plane_sink(p));
         let params = StackParams {
             rejection: &rejection_pairs,
             output: &output_pairs,
@@ -532,6 +573,7 @@ pub(crate) fn integrate_planes<'g>(
             local: ln.is_some().then_some(local_refs.as_slice()),
             local_for_rejection,
             local_for_output,
+            rejection_bits: sink.as_ref().map(|s| s as &dyn RejectionBitSink),
         };
         // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
         // fields are — so it must be rebuilt (not read) from
@@ -543,9 +585,10 @@ pub(crate) fn integrate_planes<'g>(
         };
         let out = integrate_stack(&src, &params, recipe, pool, cancel, engine_progress, io)?;
         outputs.push(out);
+        output_pairs_out.push(output_pairs);
     }
 
-    Ok(outputs)
+    Ok((outputs, output_pairs_out))
 }
 
 /// Integrates one group, plane by plane (spec §6.1–6.3): resolves the Auto
@@ -613,6 +656,21 @@ pub fn integrate_group(
         )));
     }
     let included_count = included.len();
+
+    // M3 Task 2: a rejection-bitmap set is sized (and its stems ordered) to
+    // the frames the RUN expected to be included at the time it created it
+    // (Task 5) — the min-weight drop above must not silently shift that
+    // count out from under it, or `RejPlaneSink::record_band` would write
+    // bits for a frame index that doesn't exist in `set` (or leave a
+    // trailing file no included frame ever fills).
+    if let Some(rej_set) = input.rej {
+        if rej_set.frames() != included_count {
+            return Err(IntegrationError::BadInput(format!(
+                "rejection bitmap set has {} frames, {included_count} included after the weight floor",
+                rej_set.frames()
+            )));
+        }
+    }
 
     // A frame whose own weight vector doesn't match the group's channel
     // count silently weighs zero on the missing planes (see the per-plane
@@ -690,7 +748,7 @@ pub fn integrate_group(
         })
         .collect();
 
-    let outputs = integrate_planes(
+    let (outputs, output_pairs) = integrate_planes(
         input,
         &included,
         &weights_per_frame,
@@ -704,6 +762,7 @@ pub fn integrate_group(
         // global pair either way (see `integrate_planes`'s own doc).
         input.normalization.local.enabled,
         input.ln,
+        input.rej,
         recipe,
         input.integration.write_rejection_maps,
         pool,
@@ -859,6 +918,7 @@ pub fn integrate_group(
         rejection_low,
         rejection_high,
         included,
+        output_pairs,
         stats: GroupStats {
             frames: frames.len(),
             included: included_count,
@@ -893,6 +953,7 @@ mod tests {
     use crate::geometry::{Linear, LinearKind};
     use crate::integration::storage_class::StorageClass;
     use crate::stacking::measure::{measure_frame, ChannelMeasurement};
+    use crate::stacking::rej::RejBitmap;
     use crate::test_support::{add_noise, centroid, gaussian_field};
 
     fn pool() -> rayon::ThreadPool {
@@ -1132,6 +1193,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: Some(&grids),
+            rej: None,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1200,6 +1262,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         // Frame 1's grid is built for a 10x10 reference geometry — the
         // group above declares 20x20.
@@ -1228,6 +1291,7 @@ mod tests {
             RejectionNormalization::default(),
             false,
             Some(&grids),
+            None,
             IntegrationRecipe::average(Rejection::None),
             false,
             &pool,
@@ -1320,6 +1384,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         let out = integrate_group(
             &input,
@@ -1450,6 +1515,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1593,6 +1659,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         let pool = pool();
         let planes_seen = std::sync::Mutex::new(Vec::new());
@@ -1624,5 +1691,233 @@ mod tests {
         assert_eq!(out.rejection_low.as_ref().unwrap().len(), 3 * W * H);
         assert_eq!(out.rejection_high.as_ref().unwrap().len(), 3 * W * H);
         assert_eq!(*planes_seen.lock().unwrap(), vec![(0, 3), (1, 3), (2, 3)]);
+    }
+
+    /// M3 Task 2, brief tests (g) + (h): `integrate_group` with a real
+    /// `RejBitmapSet` writes bitmaps whose total rejected-bit count matches
+    /// the engine's own raw `rejected_per_frame` (obtained from a second,
+    /// bitmap-less `integrate_planes` call on the same fixture — the sink's
+    /// presence never changes what gets rejected, engine.rs's own sink test
+    /// pins that directly), and `output_pairs` has the shape/contract
+    /// `stats::output_pair` documents: one entry per channel, one per
+    /// included frame, the reference frame's own pair `(scale 1, offset 0)`
+    /// under the default `AdditiveWithScaling` output mode.
+    #[test]
+    fn integrate_group_writes_rejection_bitmaps_matching_the_engines_rejected_count_and_output_pairs() {
+        const W: usize = 32;
+        const H: usize = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let hot_idx = 3usize;
+        let paths: Vec<_> = (0..4)
+            .map(|i| {
+                let mut d = vec![0.1f32; W * H];
+                add_noise(&mut d, 0.0005, 2000 + i as u64);
+                if i == hot_idx {
+                    d[5 * W + 7] = 0.9;
+                }
+                let p = dir.path().join(format!("f{i}.fits"));
+                write_fits_f32(&p, W, H, 1, &d, &[]).unwrap();
+                p
+            })
+            .collect();
+        let measurements: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                measure_frame(p, &MeasureOptions::default(), None, &AtomicBool::new(false)).unwrap()
+            })
+            .collect();
+        let frames: Vec<StackFrame> = paths
+            .iter()
+            .cloned()
+            .zip(measurements.iter().cloned())
+            .map(|(path, measurement)| StackFrame {
+                path,
+                map: identity_map(),
+                measurement,
+                weight: weight(1.0, 1),
+                exposure_s: 60.0,
+                date_obs: None,
+            })
+            .collect();
+
+        let mut integration = IntegrationConfig::default();
+        integration.rejection = RejectionChoice::SigmaClip { sigma_low: 3.0, sigma_high: 1.0 };
+        let normalization = NormalizationConfig::default();
+        let pool = pool();
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+        };
+
+        let input_plain = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: W,
+            height: H,
+            channels: 1,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+        };
+
+        // The engine's own raw rejected count, from a bitmap-less
+        // `integrate_planes` call directly (bypassing `integrate_group`'s
+        // `GroupStats` fractions, which don't expose raw counts).
+        let recipe = IntegrationRecipe {
+            combination: integration.combination,
+            rejection: integration.rejection.resolve(4),
+        };
+        let (raw_outputs, _) = integrate_planes(
+            &input_plain,
+            &[0, 1, 2, 3],
+            &[vec![1.0], vec![1.0], vec![1.0], vec![1.0]],
+            normalization.output,
+            normalization.rejection,
+            false,
+            None,
+            None,
+            recipe,
+            false,
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(20_000_000),
+        )
+        .unwrap();
+        let expected_rejected: u64 = raw_outputs
+            .iter()
+            .map(|o| o.rejected_per_frame.iter().sum::<u64>())
+            .sum();
+        assert!(
+            expected_rejected > 0,
+            "the hot pixel must actually be rejected for this test to be meaningful"
+        );
+
+        let rej_dir = dir.path().join("rej");
+        let stems: Vec<String> = (0..4).map(|i| format!("f{i}")).collect();
+        let set = RejBitmapSet::create(&rej_dir, &stems, W, H, 1).unwrap();
+
+        let input = GroupInput { rej: Some(&set), ..input_plain };
+        let out = integrate_group(
+            &input,
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(20_000_000),
+        )
+        .unwrap();
+        assert_eq!(out.included, vec![0, 1, 2, 3]);
+
+        // (h) output_pairs shape + the reference frame's own identity pair.
+        assert_eq!(out.output_pairs.len(), 1, "one entry per channel");
+        assert_eq!(out.output_pairs[0].len(), out.included.len());
+        let ref_pos = out.included.iter().position(|&i| i == input.reference).unwrap();
+        let ref_pair = out.output_pairs[0][ref_pos];
+        assert_eq!(
+            ref_pair.scale, 1.0,
+            "AdditiveWithScaling: the reference frame's own pair is (scale 1, offset 0)"
+        );
+        assert_eq!(ref_pair.offset, 0.0);
+
+        // (g) total bits set across every frame's bitmap equals the raw
+        // engine rejected count above.
+        let mut total_bits = 0u64;
+        for i in 0..4 {
+            let bm = RejBitmap::read(set.path(i), W, H, 1).unwrap();
+            for y in 0..H {
+                for x in 0..W {
+                    if bm.is_rejected(0, x, y) {
+                        total_bits += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(total_bits, expected_rejected);
+    }
+
+    /// M3 Task 2, brief test (i): a rejection-bitmap set sized for the
+    /// wrong frame count is refused before any pixel work runs.
+    #[test]
+    fn integrate_group_refuses_a_rej_set_with_the_wrong_frame_count() {
+        const W: usize = 24;
+        const H: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..4)
+            .map(|i| {
+                let mut d = vec![0.1f32; W * H];
+                add_noise(&mut d, 0.001, 3000 + i as u64);
+                let p = dir.path().join(format!("g{i}.fits"));
+                write_fits_f32(&p, W, H, 1, &d, &[]).unwrap();
+                p
+            })
+            .collect();
+        let measurements: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                measure_frame(p, &MeasureOptions::default(), None, &AtomicBool::new(false)).unwrap()
+            })
+            .collect();
+        let frames: Vec<StackFrame> = paths
+            .iter()
+            .cloned()
+            .zip(measurements.iter().cloned())
+            .map(|(path, measurement)| StackFrame {
+                path,
+                map: identity_map(),
+                measurement,
+                weight: weight(1.0, 1),
+                exposure_s: 60.0,
+                date_obs: None,
+            })
+            .collect();
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+
+        let rej_dir = dir.path().join("rej");
+        // Wrong frame count on purpose: 3 stems for a 4-frame, no-drop group.
+        let stems: Vec<String> = (0..3).map(|i| format!("g{i}")).collect();
+        let set = RejBitmapSet::create(&rej_dir, &stems, W, H, 1).unwrap();
+
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: W,
+            height: H,
+            channels: 1,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: Some(&set),
+        };
+        let pool = pool();
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+        };
+        let err = integrate_group(
+            &input,
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(20_000_000),
+        )
+        .unwrap_err();
+        match err {
+            IntegrationError::BadInput(msg) => {
+                assert!(msg.contains('3') && msg.contains('4'), "{msg}");
+            }
+            other => panic!("expected BadInput, got {other:?}"),
+        }
     }
 }

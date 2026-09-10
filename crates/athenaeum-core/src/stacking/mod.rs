@@ -32,7 +32,11 @@
 //! output-grid coordinate map, drop corners, forward mapping onto the
 //! scaled output grid, exact convex-quad ∩ unit-pixel clipping, and the
 //! 16×16 tabulated-kernel micro-drop table for `circle`/`gaussian`; the
-//! stage driver arrives in a later task).
+//! stage driver arrives in a later task). M3 Task 2 adds `rej` (spec §6.2,
+//! ruling R-M3-8: the on-disk `.rej` per-frame rejection-bitmap format
+//! `RejBitmapSet`/`RejBitmap`, and `RejPlaneSink` — the
+//! `integration::source::RejectionBitSink` implementation the engine's band
+//! loop now writes to when a sink is supplied).
 
 pub mod config;
 pub mod drizzle;
@@ -46,6 +50,7 @@ pub mod plan;
 pub mod provenance;
 pub mod psf_signal;
 pub mod register;
+pub mod rej;
 pub mod robust;
 pub mod run;
 #[cfg(test)]

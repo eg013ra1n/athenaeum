@@ -157,7 +157,10 @@ pub fn build_reference(
         },
     };
 
-    let outputs = integrate_planes(
+    // M3 Task 2: the LN reference never writes rejection bitmaps — `rej:
+    // None` — signature change only, this function's own behavior is
+    // unaffected.
+    let (outputs, _output_pairs) = integrate_planes(
         input,
         &frames_used,
         &weights,
@@ -168,6 +171,7 @@ pub fn build_reference(
         // whatever the group itself has configured, same reasoning as
         // `output_mode`/`rejection_mode` above.
         false,
+        None,
         None,
         recipe,
         write_maps,
@@ -405,6 +409,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -455,6 +460,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -503,6 +509,7 @@ mod tests {
             integration: &integration,
             normalization: &normalization,
             ln: None,
+            rej: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);

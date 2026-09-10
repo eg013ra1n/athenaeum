@@ -8,6 +8,28 @@ use std::sync::atomic::AtomicBool;
 use super::banded::{BandPlanes, BandSource, PlaneKind};
 use super::IntegrationError;
 
+/// Receives one band's per-frame rejection bits from `integrate_stack` (spec
+/// §6.2 "per-frame rejection bitmaps"). `bits` is laid out
+/// `[row_in_band][frame][word]` — `rows × n × words_per_row` u64 words, bit
+/// `x % 64` of word `x / 64` set when frame `frame` was PRESENT at
+/// `(x, y0 + row)` and NOT a survivor (algorithm or range rejection; a
+/// missing/non-finite sample is not a rejection). Called from the band
+/// loop's single-threaded tail, once per band, in band order.
+///
+/// Lives here, next to [`FrameSource`], rather than in `stacking::rej`
+/// (the implementer): `integration/` never depends on `stacking` (gated on
+/// the `solver` feature too — see `engine::LocalNormRow`'s own doc for the
+/// same reasoning), so the trait the engine calls through must be defined
+/// on the `integration` side of that boundary.
+pub trait RejectionBitSink: Sync {
+    /// `== ceil(width / 64)` — the source image's full width, not this
+    /// band's row count.
+    fn words_per_row(&self) -> usize;
+    /// `== n`, the frame source's own frame count.
+    fn frames(&self) -> usize;
+    fn record_band(&self, y0: usize, rows: usize, bits: &[u64]) -> Result<(), IntegrationError>;
+}
+
 pub trait FrameSource: Sync {
     fn width(&self) -> usize;
     fn height(&self) -> usize;
