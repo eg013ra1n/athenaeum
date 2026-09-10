@@ -138,6 +138,37 @@ pub fn get_stacking_plan(
 /// could refuse a sandbox-external folder with a `folders` blocker while
 /// `start_stacking` ran and wrote there anyway — plan and start must never
 /// disagree about what the host allows (spec §12).
+/// Ruling R-M3-9: drizzle has no cache of its own — the bitmaps it reads
+/// come from integration, so "re-run from drizzle" is really "re-run from
+/// integrate". `Some(Stage::Drizzle)` clamps to `Some(Stage::Integrate)`;
+/// every other value (including `None`) passes through unchanged.
+///
+/// Extracted (M3 Task 5, fix round 1, Important I2) so the clamp itself is
+/// directly unit-testable — the previous end-to-end test only proved the
+/// two `rerun_from` values behave identically, which is ALSO true today of
+/// `Some(Stage::Measure)` vs `Some(Stage::Integrate)` (every stage at or
+/// above `Integrate`'s ordinal skips `stage_forces_fresh`'s cache check —
+/// see that function's own doc), so it discriminated nothing about the
+/// clamp specifically.
+pub(crate) fn clamp_rerun_from(rerun_from: Option<Stage>) -> Option<Stage> {
+    if rerun_from == Some(Stage::Drizzle) {
+        Some(Stage::Integrate)
+    } else {
+        rerun_from
+    }
+}
+
+/// Start a stacking run for `set_id`. Delegates straight to
+/// [`crate::stacking::run::start_stacking`], forwarding `policy` unchanged.
+///
+/// Fix round 1, item 1: a caller-supplied `config` can carry its OWN
+/// `paths.workingDir`/`paths.outputDir` override (spec §9.2) — those are not
+/// necessarily the already-stored settings paths, so `policy` must be the
+/// SAME host sandbox [`get_stacking_plan`] validates against, not
+/// [`PathPolicy::AllowAll`] hard-coded here. Without this, `get_stacking_plan`
+/// could refuse a sandbox-external folder with a `folders` blocker while
+/// `start_stacking` ran and wrote there anyway — plan and start must never
+/// disagree about what the host allows (spec §12).
 pub fn start_stacking(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -147,16 +178,13 @@ pub fn start_stacking(
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, ApiError> {
-    // Ruling R-M3-9: drizzle has no cache of its own — the bitmaps it reads
-    // come from integration, so "re-run from drizzle" is really "re-run
-    // from integrate". Clamped HERE, the one place both hosts call, so the
-    // web/desktop command surface never has to know this ruling exists.
-    let rerun_from = if rerun_from == Some(Stage::Drizzle) {
+    // Clamped HERE, the one place both hosts call, so the web/desktop
+    // command surface never has to know ruling R-M3-9 exists.
+    let was_drizzle = rerun_from == Some(Stage::Drizzle);
+    let rerun_from = clamp_rerun_from(rerun_from);
+    if was_drizzle {
         tracing::debug!(set_id, "rerun from drizzle clamped to integrate");
-        Some(Stage::Integrate)
-    } else {
-        rerun_from
-    };
+    }
     run::start_stacking(
         ctx,
         emitter,
@@ -564,6 +592,31 @@ mod tests {
     use crate::events::NullEmitter;
     use crate::stacking::config::CleanupPolicy;
     use crate::stacking::test_fixtures::{self, LightSpec};
+
+    /// M3 Task 5, fix round 1, Important I2: `clamp_rerun_from` directly —
+    /// `Some(Drizzle)` is the ONE value it changes, every other value
+    /// (including `None`) passes through unchanged.
+    #[test]
+    fn clamp_rerun_from_only_rewrites_drizzle() {
+        assert_eq!(
+            clamp_rerun_from(Some(Stage::Drizzle)),
+            Some(Stage::Integrate)
+        );
+        assert_eq!(clamp_rerun_from(None), None);
+        assert_eq!(
+            clamp_rerun_from(Some(Stage::Measure)),
+            Some(Stage::Measure)
+        );
+        assert_eq!(
+            clamp_rerun_from(Some(Stage::Integrate)),
+            Some(Stage::Integrate)
+        );
+        assert_eq!(clamp_rerun_from(Some(Stage::Output)), Some(Stage::Output));
+        assert_eq!(
+            clamp_rerun_from(Some(Stage::Calibrate)),
+            Some(Stage::Calibrate)
+        );
+    }
 
     fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
         let tmp = tempfile::tempdir().unwrap();

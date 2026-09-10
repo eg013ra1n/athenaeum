@@ -494,9 +494,10 @@ models, PSF-flux scale with RCR, `.athln` sidecars, `NormalizePanel`'s LN
 block goes live) — SHIPPED, see below. **M3** — drizzle (exact clipping,
 forward mapping, M1's rejection bitmaps turned on, `DrizzlePanel` goes
 live) — the pipeline wiring SHIPPED (Task 5, see below); `DrizzlePanel`
-going live and the acceptance run are Task 6/7. **M4** — polish: thin-plate-spline distortion, ESD/RCR/min-max/
-large-scale rejection, Bayer drizzle, XISF output, cataloging masters,
-preset management, and **mixed pixel scales in one set** (owner requirement
+going live and the acceptance run are Task 6/7. **M4** — polish:
+thin-plate-spline distortion, ESD/RCR/min-max/large-scale rejection,
+Bayer drizzle, XISF output, cataloging masters, preset management, and
+**mixed pixel scales in one set** (owner requirement
 2026-09-09 — co-registered mode resamples every group into the reference
 geometry, native mode keeps a per-group reference with no cross-group
 registration). **Correction (M2 final fix wave, ruling I4):** the sentence

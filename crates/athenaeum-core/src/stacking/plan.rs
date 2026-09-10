@@ -1379,7 +1379,18 @@ pub fn build_plan(
             any_group_has_three_included = true;
         }
 
+        // Fix round 1, Minor M3: `group_anchor_geometry` (shared with
+        // `run.rs`'s own `stacking_run_groups.width`/`height` DB write,
+        // which keeps `Some(0)` — a DB column, not this struct's own "is it
+        // known" contract) reports `GroupFrame.width`/`height` verbatim,
+        // and `GroupFrame` stores an absent `NAXIS1`/`NAXIS2` as `0`
+        // (`groups.rs`'s `unwrap_or(0)`), not `None`. `PlanGroup`'s own doc
+        // promises `None` for "unknown", so `0` is mapped to `None` HERE,
+        // scoped to this one call site, rather than changing the shared
+        // helper's own (differently-contracted) DB-write behavior.
         let (anchor_width, anchor_height) = group_anchor_geometry(g);
+        let anchor_width = anchor_width.filter(|&w| w > 0);
+        let anchor_height = anchor_height.filter(|&h| h > 0);
         plan_groups.push(PlanGroup {
             key: g.key.clone(),
             instrume: g.instrume.clone(),
