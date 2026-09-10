@@ -63,7 +63,8 @@ use crate::stacking::integrate::{
 };
 use crate::stacking::ln::{
     background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
-    write_reference, BackgroundGrid, BackgroundParams, LnReference, DEFAULT_PARAMS,
+    write_reference, BackgroundGrid, BackgroundParams, LnReference, LnReferenceForDetection,
+    DEFAULT_PARAMS,
 };
 use crate::stacking::master_cards::{
     build_master_light_cards, master_file_name, write_master_light, MasterCardInputs,
@@ -72,7 +73,7 @@ use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, is_fresh, measurement_hash_for, normalization_hash_for, registration_hash_for,
-    registration_row_is_fresh, HashMemo, MasterWork, PlanMaster, Stage,
+    registration_row_is_fresh, HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -2704,63 +2705,116 @@ fn write_frame_rows(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         };
         for entry in entries {
-            let weight = entry.weight.as_ref().map(|w| w.normalized_mean);
-            let weight_channels_json = entry
-                .weight
-                .as_ref()
-                .map(|w| serde_json::to_string(&w.normalized))
-                .transpose()
-                .map_err(|e| {
-                    RunError::Other(format!("failed to serialize weight channels: {e}"))
-                })?;
-            let metrics_json = entry
-                .measurement
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| RunError::Other(format!("failed to serialize measurement: {e}")))?;
-
-            let (reg_status, reg_model, reg_rms_px, reg_inliers, reg_inlier_ratio, reg_flipped): (
-                &str,
-                Option<String>,
-                Option<f64>,
-                Option<i64>,
-                Option<f64>,
-                Option<bool>,
-            ) = match &entry.registration {
-                Some(RegisteredFrameOutcome::Aligned { record, .. }) => (
-                    record.status.as_str(),
-                    record.model.clone(),
-                    Some(record.rms_residual_px),
-                    Some(record.matched_stars),
-                    record.inlier_ratio,
-                    Some(record.flipped),
-                ),
-                Some(RegisteredFrameOutcome::Failed(_)) => ("failed", None, None, None, None, None),
-                None => ("skipped", None, None, None, None, None),
-            };
-
-            upsert_frame_row(
-                &conn,
-                &NewFrameRow {
-                    run_id: rc.run_id,
-                    group_id,
-                    frame_id: entry.frame.frame_id,
-                    included: entry.included,
-                    exclusion_reason: entry.reason.as_deref(),
-                    weight,
-                    weight_channels_json: weight_channels_json.as_deref(),
-                    metrics_json: metrics_json.as_deref(),
-                    reg_status: Some(reg_status),
-                    reg_model: reg_model.as_deref(),
-                    reg_rms_px,
-                    reg_inliers,
-                    reg_inlier_ratio,
-                    reg_flipped,
-                    rejected_fraction: None,
-                },
-            )?;
+            upsert_frame_row_for_entry(&conn, rc.run_id, group_id, entry)?;
         }
+    }
+    Ok(())
+}
+
+/// Builds and upserts one frame's `stacking_run_frames` row from its current
+/// [`MeasuredFrame`] state — the row shape [`write_frame_rows`] writes for
+/// EVERY frame at the end of stage 5, factored out (fix round 1, item 1) so
+/// a LATER stage that flips a frame's `included`/`reason` in place — stage
+/// 6's LN exclusion, via [`exclude_frame_and_persist`] — can re-persist the
+/// SAME row instead of leaving stage 5's `included = 1` stale in the DB:
+/// the frames table renders `stacking_run_frames.included` directly, so
+/// without this a frame the LN pass dropped still showed as stacked even
+/// though the master does not contain it. `rejected_fraction` is always
+/// `None` here (matching stage 5's own original write) — the ONLY writer of
+/// that column is `set_frame_rejected_fraction`, called later still, at
+/// Output time, once integration has actually run; calling this function
+/// before that point can never clobber a value that has not been written
+/// yet in THIS run (a fresh run's row never had one).
+fn upsert_frame_row_for_entry(
+    conn: &rusqlite::Connection,
+    run_id: i64,
+    group_id: i64,
+    entry: &MeasuredFrame,
+) -> Result<(), RunError> {
+    let weight = entry.weight.as_ref().map(|w| w.normalized_mean);
+    let weight_channels_json = entry
+        .weight
+        .as_ref()
+        .map(|w| serde_json::to_string(&w.normalized))
+        .transpose()
+        .map_err(|e| RunError::Other(format!("failed to serialize weight channels: {e}")))?;
+    let metrics_json = entry
+        .measurement
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| RunError::Other(format!("failed to serialize measurement: {e}")))?;
+
+    let (reg_status, reg_model, reg_rms_px, reg_inliers, reg_inlier_ratio, reg_flipped): (
+        &str,
+        Option<String>,
+        Option<f64>,
+        Option<i64>,
+        Option<f64>,
+        Option<bool>,
+    ) = match &entry.registration {
+        Some(RegisteredFrameOutcome::Aligned { record, .. }) => (
+            record.status.as_str(),
+            record.model.clone(),
+            Some(record.rms_residual_px),
+            Some(record.matched_stars),
+            record.inlier_ratio,
+            Some(record.flipped),
+        ),
+        Some(RegisteredFrameOutcome::Failed(_)) => ("failed", None, None, None, None, None),
+        None => ("skipped", None, None, None, None, None),
+    };
+
+    upsert_frame_row(
+        conn,
+        &NewFrameRow {
+            run_id,
+            group_id,
+            frame_id: entry.frame.frame_id,
+            included: entry.included,
+            exclusion_reason: entry.reason.as_deref(),
+            weight,
+            weight_channels_json: weight_channels_json.as_deref(),
+            metrics_json: metrics_json.as_deref(),
+            reg_status: Some(reg_status),
+            reg_model: reg_model.as_deref(),
+            reg_rms_px,
+            reg_inliers,
+            reg_inlier_ratio,
+            reg_flipped,
+            rejected_fraction: None,
+        },
+    )?;
+    Ok(())
+}
+
+/// Flips one frame to excluded in `rc.measured` and immediately re-persists
+/// its `stacking_run_frames` row (fix round 1, item 1) — see
+/// [`upsert_frame_row_for_entry`]'s own doc for why this can't wait: stage 5
+/// already wrote this frame's row as `included = 1` before stage 6 ever
+/// runs. A no-op (never seen in practice) if the group/frame lookups miss.
+fn exclude_frame_and_persist(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    frame_id: i64,
+    reason: String,
+) -> Result<(), RunError> {
+    if let Some(entries) = rc.measured.get_mut(&group.key) {
+        if let Some(e) = entries.iter_mut().find(|e| e.frame.frame_id == frame_id) {
+            e.included = false;
+            e.reason = Some(reason);
+        }
+    }
+    let Some(&group_id) = rc.group_ids.get(&group.key) else {
+        return Ok(());
+    };
+    let entry = rc
+        .measured
+        .get(&group.key)
+        .and_then(|entries| entries.iter().find(|e| e.frame.frame_id == frame_id));
+    if let Some(entry) = entry {
+        let conn = db(&rc.ctx)?.conn();
+        upsert_frame_row_for_entry(&conn, rc.run_id, group_id, entry)?;
     }
     Ok(())
 }
@@ -3866,15 +3920,20 @@ fn run_group_normalization(
     });
     let n = (ln_cfg.reference_frames as usize).min(ranked.len());
     if n < 3 {
+        // Fix round 1, item 10: this branch fires ONLY when the config's
+        // own `referenceFrames < 3` (a group under 3 MEMBERS never reaches
+        // this function — `process_group_output` skips it upstream), so the
+        // message must name that, not repeat "fewer than 3 included frames"
+        // (a different, already-handled condition).
         tracing::warn!(
             run_id = rc.run_id,
             group_key = %group.key,
-            included = members.len(),
-            "local normalization: fewer than 3 included frames for the LN reference; falling back to global normalization"
+            reference_frames = ln_cfg.reference_frames,
+            "local normalization off for this group: referenceFrames < 3"
         );
         rc.warnings.push(format!(
-            "group {}: local normalization needs at least 3 included frames; using global normalization",
-            group.key
+            "group {}: local normalization off — referenceFrames ({}) < 3; using global normalization",
+            group.key, ln_cfg.reference_frames
         ));
         return Ok(LnGroupOutcome {
             reference_path: None,
@@ -3893,8 +3952,10 @@ fn run_group_normalization(
         .collect();
     member_reg_hashes.sort_unstable();
     let combined_registration_hash = member_reg_hashes.join(",");
+    // Fix round 1, item 2: the reference's OWN hash has no further
+    // reference to fold in — `""` (see `normalization_hash_for`'s own doc).
     let reference_hash =
-        normalization_hash_for(&cfg, &combined_registration_hash, &reference_member_ids);
+        normalization_hash_for(&cfg, &combined_registration_hash, &reference_member_ids, "");
 
     let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Normalize);
     let reference_path_buf = rc.layout.ln_reference_path(&group.key);
@@ -3929,10 +3990,26 @@ fn run_group_normalization(
                     error = %e,
                     "failed to read the cached LN reference; rebuilding"
                 );
-                build_and_write_ln_reference(rc, group, input, n, io, &reference_hash)?
+                build_and_write_ln_reference(
+                    rc,
+                    group,
+                    input,
+                    n,
+                    io,
+                    &reference_hash,
+                    &reference_member_ids,
+                )?
             }
         },
-        None => build_and_write_ln_reference(rc, group, input, n, io, &reference_hash)?,
+        None => build_and_write_ln_reference(
+            rc,
+            group,
+            input,
+            n,
+            io,
+            &reference_hash,
+            &reference_member_ids,
+        )?,
     };
 
     let ref_params = BackgroundParams {
@@ -3944,6 +4021,35 @@ fn run_group_normalization(
         .iter()
         .map(|plane| background_grid(plane, ln_reference.width, ln_reference.height, &ref_params))
         .collect();
+
+    // Fix round 1, item 3: `BackgroundGrid`'s own documented contract — a
+    // fully invalid grid (no measurable cell anywhere) is a fallback the
+    // caller "should refuse", never trust. A broken REFERENCE background
+    // makes no frame's sidecar trustworthy, so this is a group-level
+    // ruling-R3-shaped fallback (warn + global normalization), not a
+    // per-frame failure.
+    for (p, bg) in ref_backgrounds.iter().enumerate() {
+        let total_cells = bg.gw * bg.gh;
+        if total_cells > 0 && bg.invalid_cells == total_cells {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                channel = p,
+                "local normalization off for this group: the LN reference's background model has no measurable cell"
+            );
+            rc.warnings.push(format!(
+                "group {}: local normalization off — the LN reference's background model has no measurable cell; using global normalization",
+                group.key
+            ));
+            return Ok(LnGroupOutcome {
+                reference_path: Some(reference_path_buf.display().to_string()),
+                excluded_frame_ids: Vec::new(),
+            });
+        }
+    }
+
+    // Fix round 1, item 6: computed ONCE per group, not once per frame.
+    let reference_for_detection = LnReferenceForDetection::build(&ln_reference);
 
     let group_frames_by_id: HashMap<i64, &GroupFrame> =
         group.frames.iter().map(|f| (f.frame_id, f)).collect();
@@ -3962,7 +4068,18 @@ fn run_group_normalization(
                 .to_string(),
         };
         let sidecar = rc.layout.ln_sidecar_path(&group.key, &stem);
-        let frame_hash = normalization_hash_for(&cfg, &m.registration_hash, &reference_member_ids);
+        // Fix round 1, item 2: folds in the group's OWN reference hash —
+        // re-registering or recalibrating ONE reference member rebuilds the
+        // reference (a new `B_ref`, a new scale anchor), which must
+        // invalidate every OTHER frame's sidecar too, not just that one
+        // member's (the id LIST alone is unchanged by a member's own
+        // re-registration, so it can't catch this on its own).
+        let frame_hash = normalization_hash_for(
+            &cfg,
+            &m.registration_hash,
+            &reference_member_ids,
+            &reference_hash,
+        );
         sidecar_paths.push(sidecar);
         per_member_hash.push(frame_hash.clone());
 
@@ -3985,13 +4102,24 @@ fn run_group_normalization(
                 .as_ref()
                 .and_then(|row| row.payload_json.as_deref())
                 .and_then(|s| serde_json::from_str(s).ok());
-            set_ln_summary(
-                rc,
-                &group.key,
-                m.frame_id,
-                cached_payload.map(|p| p.scale),
-                true,
-            );
+            match cached_payload {
+                Some(payload) => {
+                    set_ln_summary(rc, &group.key, m.frame_id, Some(payload.scale), true);
+                }
+                None => {
+                    // Fix round 1, item 9: a fresh-by-hash row whose
+                    // payload doesn't parse is NOT a usable cache hit — it
+                    // used to yield `cached_ln = true` with `ln_scale =
+                    // None`, a summary that claims "reused" while reporting
+                    // nothing reused. Re-normalize instead.
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        frame_id = m.frame_id,
+                        "ln artifact payload unreadable; treating as stale"
+                    );
+                    needs_normalize.push(i);
+                }
+            }
         } else {
             needs_normalize.push(i);
         }
@@ -4017,6 +4145,7 @@ fn run_group_normalization(
     let stack_frames_ref: &[StackFrame] = input.frames;
     let ref_backgrounds_ref: &[BackgroundGrid] = &ref_backgrounds;
     let ln_reference_ref: &LnReference = &ln_reference;
+    let reference_for_detection_ref: &LnReferenceForDetection = &reference_for_detection;
     let sidecar_paths_ref: &[PathBuf] = &sidecar_paths;
 
     let results = fan_out(
@@ -4026,6 +4155,7 @@ fn run_group_normalization(
         move |i: usize| {
             normalize_frame(
                 ln_reference_ref,
+                reference_for_detection_ref,
                 ref_backgrounds_ref,
                 &stack_frames_ref[i],
                 &ln_cfg,
@@ -4086,12 +4216,12 @@ fn run_group_normalization(
                 if ln_drives_output {
                     rc.runtime_exclusions.push((frame_id, msg.clone()));
                     excluded_frame_ids.push(frame_id);
-                    if let Some(entries) = rc.measured.get_mut(&group.key) {
-                        if let Some(e) = entries.iter_mut().find(|e| e.frame.frame_id == frame_id) {
-                            e.included = false;
-                            e.reason = Some(msg.clone());
-                        }
-                    }
+                    // Fix round 1, item 1: flip AND persist — `write_frame_rows`
+                    // already ran at the end of stage 5, so without this the
+                    // frame's `stacking_run_frames` row still says
+                    // `included = 1` and the frames table would render a
+                    // frame the master does not contain as stacked.
+                    exclude_frame_and_persist(rc, group, frame_id, msg.clone())?;
                     tracing::warn!(
                         run_id = rc.run_id,
                         frame_id,
@@ -4143,6 +4273,7 @@ fn build_and_write_ln_reference(
     n: usize,
     io: IoPolicy,
     reference_hash: &str,
+    reference_member_ids: &[i64],
 ) -> Result<LnReference, RunError> {
     let build_start = Instant::now();
     let included: Vec<usize> = (0..input.frames.len()).collect();
@@ -4171,6 +4302,18 @@ fn build_and_write_ln_reference(
 
     let (size, modified_at) =
         file_identity(&reference_path).map_err(|e| RunError::Other(format!("{e:#}")))?;
+    // Fix round 1, item 5: `build_plan` verifies every `ln` row's freshness
+    // WITHOUT the stage-3 weight ranking that picked this member list — it
+    // can only do that by trusting a STORED copy of exactly the two inputs
+    // `normalization_hash_for` needs beyond `cfg` and each frame's own
+    // registration hash. `reference_hash` here duplicates the artifact
+    // row's own `config_hash` column (kept in the payload too so `build_plan`
+    // needs only this one parse, never a second read of that column).
+    let reference_payload = serde_json::to_string(&LnReferencePayload {
+        reference_member_ids: reference_member_ids.to_vec(),
+        reference_hash: reference_hash.to_string(),
+    })
+    .map_err(|e| RunError::Other(format!("failed to serialize ln_reference payload: {e}")))?;
     {
         let conn = db(&rc.ctx)?.conn();
         upsert_artifact(
@@ -4184,7 +4327,7 @@ fn build_and_write_ln_reference(
                 config_hash: reference_hash,
                 size: Some(size),
                 modified_at: Some(&modified_at),
-                payload_json: None,
+                payload_json: Some(&reference_payload),
             },
         )?;
     }
@@ -6866,6 +7009,230 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
+    }
+
+    /// Fix round 1, item 2: the per-frame `ln` hash must fold in the
+    /// group's own `reference_hash`, not just the reference MEMBER ID list —
+    /// otherwise re-registering (or recalibrating) ONE reference member
+    /// rebuilds the reference (a new `B_ref`, a new scale anchor) while
+    /// every OTHER member's sidecar still reads as fresh against a
+    /// reference that no longer matches it. A direct SQL flip of
+    /// `registration_results.config_hash` would just get silently
+    /// re-derived (and reverted) by the second run's own stage 5, so this
+    /// forces a REAL registration change the established way (touch a
+    /// source file's `size` in the catalog, same technique
+    /// `calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones`
+    /// uses): recalibration cascades into a genuinely different calibration
+    /// hash for that one frame, which cascades into a genuinely different
+    /// registration hash for it. `referenceFrames` defaults to 20 (clamped
+    /// to this fixture's 4 members), so ALL FOUR are reference members —
+    /// touching any one of them is guaranteed to touch the reference.
+    #[test]
+    fn local_normalization_sidecars_all_rebuild_when_a_reference_members_registration_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+
+        let (run_id1, group_ids1) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc1 = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id1,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups,
+            layout.clone(),
+            output_dir.clone(),
+            group_ids1,
+        );
+        run_stages_for_test(&mut rc1, Stage::Register).unwrap();
+        stage_output(&mut rc1).unwrap();
+
+        // Touch light_ids[0]'s catalog `size` — forces recalibration (and,
+        // downstream, re-registration) of that ONE frame on the next run,
+        // without changing the actual pixels on disk at all.
+        fixture
+            .conn
+            .execute(
+                "UPDATE files SET size = size + 1000 WHERE id = \
+                 (SELECT file_id FROM frames WHERE id = ?1)",
+                rusqlite::params![light_ids[0]],
+            )
+            .unwrap();
+
+        let plan_groups2 = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id2, group_ids2) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups2,
+            working.path(),
+            output.path(),
+        );
+        let mut rc2 = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id2,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups2,
+            layout,
+            output_dir,
+            group_ids2,
+        );
+        run_stages_for_test(&mut rc2, Stage::Register).unwrap();
+        stage_output(&mut rc2).unwrap();
+
+        let group_summary = rc2
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+        assert_eq!(included.len(), 4, "{:?}", group_summary.frames);
+        for f in included {
+            assert!(
+                !f.cached_ln,
+                "frame {} must rebuild its sidecar once a reference member's own \
+                 registration changed: {f:?}",
+                f.frame_id
+            );
+        }
+    }
+
+    /// Fix round 1, item 4: deterministic exclusion coverage (no starless
+    /// frame needed) — pre-creating a DIRECTORY at one frame's own sidecar
+    /// path makes [`crate::stacking::ln::LnFrameGrids::write`]'s tmp-file +
+    /// atomic-rename fail outright (`rename` onto an existing directory is
+    /// never valid), so `normalize_frame` returns an error for exactly that
+    /// frame with no need to engineer a starless field. This exercises the
+    /// FULL exclusion path: `members.retain`/`pick_reference_idx`
+    /// re-derivation in `process_group_output`, the group still integrating
+    /// and writing its master from the surviving 3, `SummaryFrame.included
+    /// == false` with the reason, and (item 1) the SAME reason reaching the
+    /// frame's `stacking_run_frames` row.
+    #[test]
+    fn local_normalization_excludes_a_frame_whose_sidecar_write_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+
+        // f1's stem is plain "f1" (no basename collisions in this fixture —
+        // `calibrated_file_stem` only appends `_f<id>` when two frames
+        // share a source name).
+        let blocked_sidecar = layout.ln_sidecar_path(&group_key, "f1");
+        std::fs::create_dir_all(&blocked_sidecar).unwrap();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let blocked_frame_id = light_ids[1];
+        let group_summary = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let blocked_summary = group_summary
+            .frames
+            .iter()
+            .find(|f| f.frame_id == blocked_frame_id)
+            .expect("f1's own summary entry exists");
+        assert!(!blocked_summary.included, "{blocked_summary:?}");
+        assert!(
+            blocked_summary
+                .exclusion_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("writing .athln sidecar"),
+            "{blocked_summary:?}"
+        );
+
+        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+        assert_eq!(included.len(), 3, "{:?}", group_summary.frames);
+        assert!(group_summary.master_path.is_some(), "{group_summary:?}");
+        assert!(Path::new(group_summary.master_path.as_ref().unwrap()).exists());
+
+        // Item 1: the SAME exclusion reached the frame's own DB row, not
+        // just the in-memory summary.
+        let frame_rows = crate::db::stacking::list_frame_rows(&fixture.conn, rc.run_id).unwrap();
+        let blocked_row = frame_rows
+            .iter()
+            .find(|r| r.frame_id == blocked_frame_id)
+            .expect("f1's own stacking_run_frames row exists");
+        assert!(!blocked_row.included, "{blocked_row:?}");
+        assert!(
+            blocked_row
+                .exclusion_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("writing .athln sidecar"),
+            "{blocked_row:?}"
+        );
     }
 
     #[test]

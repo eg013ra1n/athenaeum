@@ -420,6 +420,25 @@ pub(crate) fn registration_hash_for(
     )
 }
 
+/// The group's LN reference artifact payload (fix round 1, item 5, spec
+/// §9.3): the resolved `reference_member_ids` (weight-ordered — the
+/// best-weighted `referenceFrames` included members, spec §5.2) and the
+/// reference's OWN [`normalization_hash_for`] value (redundant with the
+/// artifact row's own `config_hash` column, kept here too so [`build_plan`]
+/// needs only this one `payload_json` parse to verify every `ln` row — it
+/// never re-reads the `ln_reference` row's `config_hash` column
+/// separately). Written by `stacking::run`'s `build_and_write_ln_reference`;
+/// read by [`build_plan`] to verify per-frame `ln` rows WITHOUT the stage-3
+/// weight ranking that produced the member list in the first place — the
+/// documented residual: a weight-driven member-list change (as opposed to a
+/// config or registration change) is invisible to this DB-only check until
+/// a real run updates the stored list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LnReferencePayload {
+    pub reference_member_ids: Vec<i64>,
+    pub reference_hash: String,
+}
+
 /// Stage 6 (local normalization, M2) config-hash: `normalization_subtree`
 /// keyed on `registration_hash` — either this ONE frame's own stage-5 hash
 /// (the `ln` artifact, per frame) or a caller-combined token standing in for
@@ -429,17 +448,29 @@ pub(crate) fn registration_hash_for(
 /// group's chosen LN reference frame ids (the best-weighted `referenceFrames`
 /// included members, spec §5.2): a changed member list invalidates every
 /// frame's sidecar AND the reference itself, even when neither `cfg` nor
-/// this frame's own registration changed. No DB access here (unlike
+/// this frame's own registration changed. `reference_hash` (fix round 1,
+/// item 2) is the group's OWN LN-reference hash — empty (`""`) when
+/// computing THAT hash itself (it has no further reference to fold in),
+/// otherwise every per-frame `ln` hash folds it in too: re-registering or
+/// recalibrating ONE reference member rebuilds the reference (a new
+/// `B_ref`, a new scale anchor) and must invalidate every OTHER frame's
+/// sidecar as well, not just that one member's — folding in
+/// `reference_member_ids` alone (the SET of ids, unchanged by a member's own
+/// re-registration) could not catch that. No DB access here (unlike
 /// [`calibration_hash_for`]'s `SourceIdentity`s) — the caller has already
-/// resolved both hashes; `sources` stays empty, same convention as
+/// resolved every hash; `sources` stays empty, same convention as
 /// [`registration_hash_for`]'s own plain-string upstream.
 pub(crate) fn normalization_hash_for(
     cfg: &StackingConfig,
     registration_hash: &str,
     reference_member_ids: &[i64],
+    reference_hash: &str,
 ) -> String {
     let mut upstream: Vec<String> = vec!["register".to_string(), registration_hash.to_string()];
     upstream.extend(reference_member_ids.iter().map(|id| format!("ln_ref:{id}")));
+    if !reference_hash.is_empty() {
+        upstream.push(format!("ln_reference_hash:{reference_hash}"));
+    }
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
@@ -1105,8 +1136,38 @@ pub fn build_plan(
     let local_normalization_active = cfg.normalization.local.enabled
         || cfg.normalization.rejection == RejectionNormalization::Local;
     let mut normalize_stale = false;
+    // Fix round 1, item 5: the SAME per-frame registration hash
+    // `stacking::run`'s `GroupMember.registration_hash` reads (the STORED
+    // `registration_results.config_hash`, never recomputed here) — fetched
+    // once for the whole build, not per group/frame, same rationale as
+    // `compute_register_stale`'s own `by_frame` map below.
+    let ln_registration_by_frame: HashMap<i64, Option<String>> = if local_normalization_active {
+        get_registration_for_frame_set(conn, frames_set_id)?
+            .into_iter()
+            .map(|r| (r.frame_id, r.config_hash))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     for g in &groups {
+        // Fix round 1, item 5: the group's LN reference artifact carries the
+        // resolved `reference_member_ids` (weight-ordered) and its own
+        // `reference_hash` in `payload_json` — read once per group so every
+        // frame's `ln` row can be verified EXACTLY (`normalization_hash_for`)
+        // without this DB-plus-cheap-FS-probe gate ever needing the stage-3
+        // weight ranking that produced that member list. Residual: if a
+        // fresh run would pick a DIFFERENT top-`referenceFrames` member set
+        // (a weight change, not a config/registration one), this still
+        // reports fresh against the OLD set until a real run updates it —
+        // documented, not fixed, here (weights are pixel-phase data).
+        let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
+            find_artifact(conn, frames_set_id, &g.key, "ln_reference", None)?
+                .and_then(|row| row.payload_json)
+                .and_then(|s| serde_json::from_str::<LnReferencePayload>(&s).ok())
+        } else {
+            None
+        };
         let mut calibrated_cached = 0usize;
         let mut metrics_cached = 0usize;
         let mut ln_cached = 0usize;
@@ -1154,26 +1215,35 @@ pub fn build_plan(
                 measure_stale = true;
             }
 
-            // Stage 6 (local normalization, M2): `ln_cached`/`normalize_stale`
-            // are a PRESENCE check only — path+size on disk, no hash
-            // comparison — because the true freshness hash
-            // (`normalization_hash_for`) needs the group's chosen LN
-            // reference members, and those are picked by WEIGHT (spec §5.2),
-            // a stage-3 quantity this DB-plus-cheap-FS-probe gate never
-            // computes (unlike stage 1/3's own hashes, which only need
-            // catalog/calibration-plan data already at hand here). A frame
-            // whose `.athln` merely exists is treated as covered; a run that
-            // actually starts may still redo it if the reference member list
-            // or this frame's own registration changed since — this is a
-            // coarser signal than `calibrated_cached`/`metrics_cached`, by
-            // necessity, not an oversight.
+            // Stage 6 (local normalization, M2, fix round 1 item 5): an
+            // EXACT hash comparison, same rule `is_fresh` uses for every
+            // other per-frame artifact — `normalization_hash_for` recomputed
+            // from the group's stored reference info (above) and this
+            // frame's own stored registration hash, compared against the
+            // `ln` row's own `config_hash`. No artifact/no reference
+            // info/no registration row/an unparseable payload are all
+            // "can't verify" → stale, never assumed fresh.
             if local_normalization_active {
                 let ln_artifact =
                     find_artifact(conn, frames_set_id, &g.key, "ln", Some(f.frame_id))?;
-                let ln_present = ln_artifact
-                    .and_then(|row| row.path)
-                    .is_some_and(|p| std::fs::metadata(p).is_ok());
-                if ln_present {
+                let ln_fresh = match (&ln_reference_info, &ln_artifact) {
+                    (Some(ref_info), Some(row)) => {
+                        match ln_registration_by_frame.get(&f.frame_id).cloned().flatten() {
+                            Some(frame_registration_hash) => {
+                                let expected = normalization_hash_for(
+                                    &cfg,
+                                    &frame_registration_hash,
+                                    &ref_info.reference_member_ids,
+                                    &ref_info.reference_hash,
+                                );
+                                is_fresh(row, &expected)
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if ln_fresh {
                     ln_cached += 1;
                 } else if !is_excluded {
                     normalize_stale = true;
@@ -2450,6 +2520,230 @@ mod tests {
             "{:?}",
             plan2.stale_stages
         );
+    }
+
+    /// Fix round 1, item 5: `ln_cached`/`stale_stages`'s `Normalize` entry
+    /// must react to a REAL config change, not just artifact presence on
+    /// disk — verified via the `ln_reference` artifact's stored
+    /// `LnReferencePayload` (`reference_member_ids` + `reference_hash`),
+    /// which lets `build_plan` recompute each `ln` row's expected hash
+    /// (`normalization_hash_for`) without the stage-3 weight ranking that
+    /// picked that member list in the first place. Same fixture shape as
+    /// `fresh_artifacts_and_registration_leave_nothing_stale` (calibrated +
+    /// metrics artifacts, a previous run's frame rows, matching
+    /// registration rows for all three frames), plus hand-seeded
+    /// `ln_reference`/`ln` artifacts at the hashes the FIRST config would
+    /// produce.
+    #[test]
+    fn local_normalization_reacts_to_a_config_change() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        cfg.normalization.local.enabled = true;
+        set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+        let group_key = groups[0].key.clone();
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        for gf in &groups[0].frames {
+            let hash = calib_hashes.get(&gf.frame_id).unwrap().clone();
+
+            let cal_path = f
+                .dir
+                .path()
+                .join(format!("calibrated_{}.fits", gf.frame_id));
+            std::fs::write(&cal_path, [0u8]).unwrap();
+            let size = std::fs::metadata(&cal_path).unwrap().len() as i64;
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "calibrated",
+                    path: Some(cal_path.to_str().unwrap()),
+                    config_hash: &hash,
+                    size: Some(size),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+
+            let metrics_hash = measurement_hash_for(&cfg, &hash);
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &metrics_hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+        }
+
+        seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "manual", &ids);
+
+        let reference_calib_hash = calib_hashes.get(&ids[0]).unwrap().clone();
+        let mut registration_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let frame_hash = calib_hashes.get(&gf.frame_id).unwrap();
+            let expected = registration_hash_for(&cfg, ids[0], &reference_calib_hash, frame_hash);
+            registration_hashes.insert(gf.frame_id, expected.clone());
+            let is_reference = gf.frame_id == ids[0];
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id: gf.frame_id,
+                reference_frame_id: ids[0],
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        // The LN reference: all three frames are candidates (weight order
+        // is irrelevant here — `build_plan` never re-derives it, it trusts
+        // the stored list; that trust is exactly item 5's documented
+        // residual).
+        let reference_member_ids: Vec<i64> = ids.clone();
+        let combined = {
+            let mut hashes: Vec<&str> = reference_member_ids
+                .iter()
+                .map(|id| registration_hashes[id].as_str())
+                .collect();
+            hashes.sort_unstable();
+            hashes.join(",")
+        };
+        let reference_hash = normalization_hash_for(&cfg, &combined, &reference_member_ids, "");
+        let reference_payload = serde_json::to_string(&LnReferencePayload {
+            reference_member_ids: reference_member_ids.clone(),
+            reference_hash: reference_hash.clone(),
+        })
+        .unwrap();
+        let reference_path = f.dir.path().join("reference.fits");
+        std::fs::write(&reference_path, [0u8]).unwrap();
+        let reference_size = std::fs::metadata(&reference_path).unwrap().len() as i64;
+        crate::db::stacking::upsert_artifact(
+            &f.conn,
+            &crate::db::stacking::NewArtifact {
+                frames_set_id: f.set_id,
+                frame_id: None,
+                group_key: &group_key,
+                kind: "ln_reference",
+                path: Some(reference_path.to_str().unwrap()),
+                config_hash: &reference_hash,
+                size: Some(reference_size),
+                modified_at: None,
+                payload_json: Some(&reference_payload),
+            },
+        )
+        .unwrap();
+
+        for gf in &groups[0].frames {
+            let frame_hash = normalization_hash_for(
+                &cfg,
+                &registration_hashes[&gf.frame_id],
+                &reference_member_ids,
+                &reference_hash,
+            );
+            let sidecar_path = f.dir.path().join(format!("f{}.athln", gf.frame_id));
+            std::fs::write(&sidecar_path, [0u8]).unwrap();
+            let size = std::fs::metadata(&sidecar_path).unwrap().len() as i64;
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "ln",
+                    path: Some(sidecar_path.to_str().unwrap()),
+                    config_hash: &frame_hash,
+                    size: Some(size),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan.stale_stages
+        );
+        assert_eq!(plan.groups[0].ln_cached, 3, "{:?}", plan.groups[0]);
+
+        // A config change to `normalization.local.scale` invalidates every
+        // stored `ln` row's hash (the subtree folds the WHOLE
+        // `normalization` block in) without touching a single artifact on
+        // disk.
+        let mut cfg2 = cfg.clone();
+        cfg2.normalization.local.scale += 256;
+        let plan2 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg2),
+        )
+        .unwrap();
+        assert!(
+            plan2.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan2.stale_stages
+        );
+        assert_eq!(plan2.groups[0].ln_cached, 0, "{:?}", plan2.groups[0]);
     }
 
     /// Final fix wave item 3, scenario (c): a frame the LATEST RUN itself

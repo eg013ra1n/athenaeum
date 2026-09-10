@@ -381,11 +381,16 @@ pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
 
 /// Stage 6 (local normalization, M2) config subtree: the whole
 /// `normalization` block (global output/rejection choice AND the `local`
-/// block — a change to either invalidates a stored `.athln`/reference) plus
-/// the two measurement knobs the LN relative-scale estimator shares with
-/// stage 3 (`psfModel`, `maxStars` — the exact detection/PSF-fit budget
-/// [`crate::stacking::ln::scale::relative_scale`] uses for both the
-/// reference and target planes, per [`crate::stacking::ln::normalize_frame`]).
+/// block — a change to either invalidates a stored `.athln`/reference; this
+/// already covers the PSF model [`crate::stacking::ln::normalize_frame`]
+/// actually hands [`crate::stacking::ln::scale::relative_scale`], which is
+/// `normalization.local.psfModel`, never `measurement.psfModel`) plus
+/// `measurement.maxStars` — the ONE genuinely extra fold-in, since it is the
+/// detection/PSF-fit budget `relative_scale` uses for both planes but lives
+/// under `measurement`, not `normalization`. `measurement.psfModel` rides
+/// along too (harmless — it just widens what invalidates a sidecar — but
+/// plays no role in `relative_scale`'s own model choice; fix round 1, item
+/// 11: an earlier version of this comment claimed otherwise).
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
     serde_json::json!({
         "normalization": cfg.normalization,

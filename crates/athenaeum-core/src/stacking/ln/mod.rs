@@ -124,6 +124,72 @@ fn target_background_params(scale: u32) -> BackgroundParams {
     }
 }
 
+/// The median of ONLY the finite pixels of `plane` (fix round 1, item 7):
+/// [`median_of`]'s `total_cmp`-based sort is a genuine total order even over
+/// NaN, so it never panics — but a NaN-laden plane still SKEWS a whole-plane
+/// median computed that way, since `total_cmp` sorts every NaN to one
+/// extreme rather than treating it as absent (exactly what a warped frame's
+/// off-canvas strip is: absent data, not a real low/high value). `f64::NAN`
+/// when there is no finite pixel at all — the fully-invalid background-grid
+/// refusal upstream (fix round 1, item 3) means this is never the only
+/// signal of that case reaching a caller.
+fn median_of_finite(plane: &[f32]) -> f64 {
+    let finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return f64::NAN;
+    }
+    median_of(&finite) as f64
+}
+
+/// The reference-side inputs [`normalize_frame`] needs for star detection,
+/// computed ONCE PER GROUP (fix round 1, item 6) — not once per frame, as
+/// the very first version of this module did (`sanitized_for_detection`
+/// rebuilt the reference's own sanitized copy on every one of a group's
+/// `normalize_frame` calls, for no reason: the reference itself never
+/// changes across a group's frames). `stacking::run::run_group_normalization`
+/// builds one of these right after resolving the group's [`LnReference`],
+/// via [`Self::build`], and passes the SAME instance into every
+/// `normalize_frame` call the group's fan-out makes.
+///
+/// `sanitized_planes[p]` is channel `p`'s reference plane with any
+/// non-finite pixel replaced by `locations[p]` (fix round 1, item 6: the
+/// plane's own finite MEDIAN, not a flat `0.0` — a zero floor would drag the
+/// detector's global background/σ estimate once the non-finite region is
+/// more than a few percent of the plane; a target frame's own off-canvas
+/// strip gets the identical treatment, per-frame, for the same reason).
+/// `locations[p]` is that channel's median over finite pixels only (fix
+/// round 1, item 7 — see [`median_of_finite`]) — reused directly as
+/// [`LnGrid::location_ref`] so it, too, is computed once, not once per
+/// frame.
+pub struct LnReferenceForDetection {
+    pub sanitized_planes: Vec<Vec<f32>>,
+    pub locations: Vec<f64>,
+}
+
+impl LnReferenceForDetection {
+    pub fn build(reference: &LnReference) -> LnReferenceForDetection {
+        let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
+        let mut locations = Vec::with_capacity(reference.planes.len());
+        for plane in &reference.planes {
+            let location = median_of_finite(plane);
+            let sanitized = if plane.iter().all(|v| v.is_finite()) {
+                plane.clone()
+            } else {
+                plane
+                    .iter()
+                    .map(|&v| if v.is_finite() { v } else { location as f32 })
+                    .collect()
+            };
+            sanitized_planes.push(sanitized);
+            locations.push(location);
+        }
+        LnReferenceForDetection {
+            sanitized_planes,
+            locations,
+        }
+    }
+}
+
 /// Warps `frame` into the reference geometry (one-frame [`RegisteredSource`],
 /// whole plane per channel — a single band the height of the reference,
 /// read once through the [`FrameSource`] trait exactly like every other
@@ -155,6 +221,7 @@ fn target_background_params(scale: u32) -> BackgroundParams {
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
+    reference_for_detection: &LnReferenceForDetection,
     ref_backgrounds: &[BackgroundGrid],
     frame: &StackFrame,
     cfg: &LocalNormalizationConfig,
@@ -175,6 +242,15 @@ pub fn normalize_frame(
         return Err(LnError::Other(format!(
             "{} reference background grids for a {channels}-channel LN reference",
             ref_backgrounds.len()
+        )));
+    }
+    if reference_for_detection.sanitized_planes.len() != channels
+        || reference_for_detection.locations.len() != channels
+    {
+        return Err(LnError::Other(format!(
+            "reference-for-detection has {}/{} channels, the LN reference has {channels}",
+            reference_for_detection.sanitized_planes.len(),
+            reference_for_detection.locations.len()
         )));
     }
 
@@ -223,38 +299,51 @@ pub fn normalize_frame(
             (expected_gw, expected_gh),
             "target background grid must share the reference's own mesh"
         );
+
+        // Fix round 1, item 3: `BackgroundGrid`'s own documented contract —
+        // `invalid_cells == gw * gh` means the WHOLE plane had no measurable
+        // cell, and the (all-zero) `cells` it still returns is a fallback
+        // the caller "should refuse", never trust. Silently continuing here
+        // used to yield `B = B_ref` everywhere and a written sidecar that
+        // looks like a normal, if noisy, result.
+        let target_cell_count = target_bg.gw * target_bg.gh;
+        if target_cell_count > 0 && target_bg.invalid_cells == target_cell_count {
+            return Err(LnError::Other(
+                "background model: no measurable cell".to_string(),
+            ));
+        }
         cells_rejected_total += target_bg.invalid_cells;
 
-        // A frame's own footprint rarely covers the WHOLE reference canvas
-        // once warped (a non-zero registration shift leaves a strip outside
-        // the source frame's extent) — `RegisteredSource::fill_frame` fills
-        // exactly that strip with NaN (see its own doc: "band maps outside
-        // the source"). `background_grid` already treats non-finite pixels
-        // as "no data" and excludes them (`clean_plane`), but the detector
-        // underneath `relative_scale` is not NaN-safe — a NaN reaching its
-        // own median/HFD math violates the total order Rust's sort requires
-        // and panics. Detection only needs a place-holder value in that
-        // strip (no real star can be found there regardless), so NaN/Inf is
-        // replaced with `0.0` on a COPY used for detection only — the
-        // background model above already saw the real (NaN-marked) data.
-        fn sanitized_for_detection(plane: &[f32]) -> std::borrow::Cow<'_, [f32]> {
-            if plane.iter().all(|v| v.is_finite()) {
-                std::borrow::Cow::Borrowed(plane)
-            } else {
-                std::borrow::Cow::Owned(
-                    plane
-                        .iter()
-                        .map(|&v| if v.is_finite() { v } else { 0.0 })
-                        .collect(),
-                )
+        // Fix round 1, item 7: the median over FINITE pixels only — see
+        // `median_of_finite`'s own doc for why a NaN-laden plane still needs
+        // this even though `total_cmp`-based sorting never panics on NaN.
+        let location_tgt = median_of_finite(&target);
+
+        // Fix round 1, item 6: sanitize `target` IN PLACE for detection —
+        // everything that needed the NaN-preserving version
+        // (`background_grid`, `location_tgt`) has already read it, so
+        // there is no separate copy to allocate. A frame's own footprint
+        // rarely covers the WHOLE reference canvas once warped (a non-zero
+        // registration shift leaves a strip outside the source frame's own
+        // extent) — `RegisteredSource::fill_frame` fills exactly that strip
+        // with NaN (see its own doc: "band maps outside the source"). The
+        // detector underneath `relative_scale` is not NaN-safe — a NaN
+        // reaching its own median/HFD math violates the total order Rust's
+        // sort requires and panics — so detection needs a place-holder
+        // value in that strip regardless; the plane's own finite median
+        // (not a flat `0.0`) keeps a large strip from dragging the
+        // detector's global background/σ estimate.
+        if !target.iter().all(|v| v.is_finite()) {
+            for v in target.iter_mut() {
+                if !v.is_finite() {
+                    *v = location_tgt as f32;
+                }
             }
         }
-        let reference_for_detection = sanitized_for_detection(&reference.planes[p]);
-        let target_for_detection = sanitized_for_detection(&target);
 
         let scale_result = relative_scale(
-            &reference_for_detection,
-            &target_for_detection,
+            &reference_for_detection.sanitized_planes[p],
+            &target,
             reference.width,
             reference.height,
             cfg.psf_model,
@@ -266,6 +355,19 @@ pub fn normalize_frame(
         scales.push(scale_result.scale);
 
         let ref_bg = &ref_backgrounds[p];
+        // Fix round 1, item 8: a real length check, not just the
+        // `debug_assert_eq!` above (which only pins `target_bg`'s OWN dims
+        // against what the stride geometry implies — it says nothing about
+        // `ref_bg` matching `target_bg`, e.g. a caller-supplied `ref_backgrounds`
+        // built at a different scale). `zip` would otherwise silently
+        // truncate to the shorter of the two in release builds.
+        if ref_bg.cells.len() != target_bg.cells.len() {
+            return Err(LnError::Other(format!(
+                "background grid size mismatch: reference has {} cells, target has {}",
+                ref_bg.cells.len(),
+                target_bg.cells.len()
+            )));
+        }
         let s = scale_result.scale as f32;
         let b: Vec<f32> = ref_bg
             .cells
@@ -283,8 +385,8 @@ pub fn normalize_frame(
             a: vec![s; expected_gw * expected_gh],
             b,
             global_scale: scale_result.scale,
-            location_ref: median_of(&reference.planes[p]) as f64,
-            location_tgt: median_of(&target) as f64,
+            location_ref: reference_for_detection.locations[p],
+            location_tgt,
         });
     }
 
