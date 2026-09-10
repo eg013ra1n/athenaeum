@@ -433,7 +433,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       <div className="pt-2 border-t border-border/60 flex items-center justify-between gap-3 flex-wrap">
         <p className="text-xs text-content-muted">
           {usage
-            ? `Working folder: ${formatBytes(usage.totalBytes)} total — ${formatBytes(usage.calibratedBytes)} calibrated · ${formatBytes(usage.registeredBytes)} registered · ${formatBytes(usage.lnBytes)} local-norm · ${formatBytes(usage.runsBytes)} run archives`
+            ? `Working folder: ${formatBytes(usage.totalBytes)} total — ${formatBytes(usage.calibratedBytes)} calibrated · ${formatBytes(usage.registeredBytes)} registered · ${formatBytes(usage.lnBytes)} local-norm · ${formatBytes(usage.runsBytes)} run archives · ${formatBytes(usage.rejBytes)} rejection maps`
             : usageError
               ? 'Working folder usage: unavailable'
               : 'Working folder usage: loading…'}

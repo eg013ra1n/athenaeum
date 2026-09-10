@@ -28,11 +28,12 @@
 //! rejected (present but not a survivor) for that plane.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use tracing::{debug, warn};
 
 use crate::integration::source::RejectionBitSink;
 use crate::integration::IntegrationError;
@@ -46,8 +47,27 @@ fn words_per_row(width: usize) -> usize {
     width.div_ceil(64)
 }
 
-fn body_len(height: usize, channels: usize, words: usize) -> u64 {
-    (channels as u64) * (height as u64) * (words as u64) * 8
+/// `channels × height × words`, `checked_mul`'d at every step (fix round 1,
+/// M3) — unreachable for any real geometry (`channels ≤ 3`, `words ≲ 10^3`,
+/// `height ≲ 10^5`), and always computed from CALLER-supplied geometry,
+/// never from a file's own header, so there is no file-controlled
+/// allocation to protect either way. Still checked, not assumed.
+fn body_words(height: usize, channels: usize, words: usize) -> Result<usize> {
+    channels
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(words))
+        .with_context(|| {
+            format!("rejection bitmap body size overflow: {channels} channels x {height} rows x {words} words/row")
+        })
+}
+
+/// Body length in bytes (`body_words` × 8) — checked the same way.
+fn body_len(height: usize, channels: usize, words: usize) -> Result<u64> {
+    let n_words = body_words(height, channels, words)?;
+    n_words
+        .checked_mul(8)
+        .map(|b| b as u64)
+        .with_context(|| format!("rejection bitmap body byte size overflow: {n_words} words"))
 }
 
 /// Writes `bytes` at `offset`, looping until every byte has landed — a
@@ -101,6 +121,42 @@ pub struct RejBitmapSet {
     height: usize,
     channels: usize,
     words: usize,
+    /// One file's exact on-disk size (header + body) — cached at
+    /// construction so `bytes()` never has to re-run the checked
+    /// multiplication `body_len` already proved safe for this geometry.
+    file_len: u64,
+}
+
+/// Opens `path` for a fresh header + `set_len`'d body, refusing an existing
+/// file. Fix round 1, M1: the "already exists" text is now attached ONLY to
+/// `ErrorKind::AlreadyExists` — an `ENOSPC`/`EACCES`/permission failure
+/// reaches the caller as itself, not misreported as a collision.
+fn create_one_file(
+    path: &Path,
+    total_len: u64,
+    width: u32,
+    height: u32,
+    channels: u32,
+    words: u32,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!("{} already exists", path.display())
+            } else {
+                anyhow::Error::new(e).context(format!("create {}", path.display()))
+            }
+        })?;
+    file.write_all(REJ_MAGIC)?;
+    file.write_u32::<LittleEndian>(width)?;
+    file.write_u32::<LittleEndian>(height)?;
+    file.write_u32::<LittleEndian>(channels)?;
+    file.write_u32::<LittleEndian>(words)?;
+    file.set_len(total_len)?;
+    Ok(())
 }
 
 impl RejBitmapSet {
@@ -109,7 +165,12 @@ impl RejBitmapSet {
     /// size with the header already written — `record_band` only ever does
     /// positional writes into an already-correctly-sized file. Refuses to
     /// overwrite an existing file (never overwrite; the run id already
-    /// makes `dir` unique per run).
+    /// makes `dir` unique per run). Fix round 1, M4: a failure partway
+    /// through `stems` rolls back every file this call itself created —
+    /// harmless today (the run id makes `dir` unique per run, so a retry
+    /// never collides with a PRIOR run's files), but a retry against the
+    /// SAME call's own half-written output must not immediately trip the
+    /// "already exists" refusal on stem 0.
     pub fn create(
         dir: &Path,
         stems: &[String],
@@ -119,23 +180,39 @@ impl RejBitmapSet {
     ) -> Result<RejBitmapSet> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let words = words_per_row(width);
-        let total_len = HEADER_LEN + body_len(height, channels, words);
+        let total_len = HEADER_LEN + body_len(height, channels, words)?;
         let mut paths = Vec::with_capacity(stems.len());
         for stem in stems {
             let path = dir.join(format!("{stem}.rej"));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .with_context(|| format!("{} already exists", path.display()))?;
-            file.write_all(REJ_MAGIC)?;
-            file.write_u32::<LittleEndian>(width as u32)?;
-            file.write_u32::<LittleEndian>(height as u32)?;
-            file.write_u32::<LittleEndian>(channels as u32)?;
-            file.write_u32::<LittleEndian>(words as u32)?;
-            file.set_len(total_len)?;
-            paths.push(path);
+            match create_one_file(
+                &path,
+                total_len,
+                width as u32,
+                height as u32,
+                channels as u32,
+                words as u32,
+            ) {
+                Ok(()) => paths.push(path),
+                Err(e) => {
+                    for written in &paths {
+                        if let Err(remove_err) = std::fs::remove_file(written) {
+                            warn!(
+                                path = %written.display(),
+                                error = %remove_err,
+                                "rejection bitmap set: cleanup after a partial create failed"
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
+        debug!(
+            path = %dir.display(),
+            count = paths.len(),
+            bytes = total_len.saturating_mul(paths.len() as u64),
+            "rejection bitmap set created"
+        );
         Ok(RejBitmapSet {
             dir: dir.to_path_buf(),
             paths,
@@ -143,6 +220,7 @@ impl RejBitmapSet {
             height,
             channels,
             words,
+            file_len: total_len,
         })
     }
 
@@ -184,8 +262,7 @@ impl RejBitmapSet {
 
     /// Total bytes on disk across every frame's file.
     pub fn bytes(&self) -> u64 {
-        let per_file = HEADER_LEN + body_len(self.height, self.channels, self.words);
-        per_file * self.paths.len() as u64
+        self.file_len.saturating_mul(self.paths.len() as u64)
     }
 }
 
@@ -209,6 +286,26 @@ impl RejectionBitSink for RejPlaneSink<'_> {
     }
 
     fn record_band(&self, y0: usize, rows: usize, bits: &[u64]) -> Result<(), IntegrationError> {
+        // Fix round 1, M2: a caller mistake here (a wrong plane index, or a
+        // band that runs past the set's own height) used to become a
+        // silent EOF-extending write at the wrong offset, discovered only
+        // much later by `RejBitmap::read`'s length/geometry check — after
+        // the group's whole integration had already been paid for. Both
+        // are refused loudly, at the exact call that would have been wrong.
+        if self.plane >= self.set.channels {
+            return Err(IntegrationError::BadInput(format!(
+                "rejection band: plane {} out of range for {} channels",
+                self.plane, self.set.channels
+            )));
+        }
+        let band_end = y0.checked_add(rows);
+        if band_end.is_none_or(|end| end > self.set.height) {
+            return Err(IntegrationError::BadInput(format!(
+                "rejection band: rows {y0}..{} out of range for height {}",
+                y0 + rows,
+                self.set.height
+            )));
+        }
         let n = self.set.paths.len();
         let words = self.set.words;
         let expected = rows * n * words;
@@ -223,6 +320,20 @@ impl RejectionBitSink for RejPlaneSink<'_> {
         let row_words_offset = (self.plane * self.set.height + y0) as u64 * words as u64;
         let byte_offset = HEADER_LEN + row_words_offset * 8;
         for (frame_idx, path) in self.set.paths.iter().enumerate() {
+            // Fix round 1, M7: `create` zero-filled every byte this band
+            // could ever touch, and the engine's sequential band loop
+            // writes each `(plane, band)` region at most once per run — so
+            // a frame with NOTHING rejected in this band needs no write at
+            // all. The common case by a wide margin (a handful of
+            // rejections across a couple hundred frames), this removes
+            // nearly every open/write/close for a typical run.
+            let frame_has_bits = (0..rows).any(|row| {
+                let base = (row * n + frame_idx) * words;
+                bits[base..base + words].iter().any(|&w| w != 0)
+            });
+            if !frame_has_bits {
+                continue;
+            }
             let file = OpenOptions::new()
                 .write(true)
                 .open(path)
@@ -256,7 +367,7 @@ pub struct RejBitmap {
 impl RejBitmap {
     pub fn read(path: &Path, width: usize, height: usize, channels: usize) -> Result<RejBitmap> {
         let words = words_per_row(width);
-        let expected_len = HEADER_LEN + body_len(height, channels, words);
+        let expected_len = HEADER_LEN + body_len(height, channels, words)?;
         let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
         ensure!(
             meta.len() == expected_len,
@@ -265,7 +376,14 @@ impl RejBitmap {
             meta.len()
         );
 
-        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        // Fix round 1, I1: a bare `File` costs one `read(2)` syscall per
+        // `read_u64` call — 409k of them for a realistic 6248×4176 mono
+        // bitmap, measured at ≈130ms against ≈1ms buffered. `BufReader`
+        // turns that into a handful of syscalls (its default 8KB capacity)
+        // for the header AND the whole body, with no change to the
+        // per-word reads below.
+        let mut file =
+            BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)
             .with_context(|| format!("{}: reading magic", path.display()))?;
@@ -280,7 +398,10 @@ impl RejBitmap {
             path.display()
         );
 
-        let n_words = channels * height * words;
+        // Fix round 1, M3: checked BEFORE the allocation just below — see
+        // `body_words`'s own doc for why this is unreachable in practice
+        // but checked anyway.
+        let n_words = body_words(height, channels, words)?;
         let mut bits = vec![0u64; n_words];
         for w in bits.iter_mut() {
             *w = file
@@ -321,7 +442,7 @@ mod tests {
 
         let words = words_per_row(width);
         assert_eq!(words, 2, "ceil(100/64) == 2");
-        let expected_len = HEADER_LEN + body_len(height, channels, words);
+        let expected_len = HEADER_LEN + body_len(height, channels, words).unwrap();
         assert_eq!(expected_len, 24 + 2 * 70 * 2 * 8);
 
         for i in 0..3 {
@@ -432,5 +553,133 @@ mod tests {
         let bad_bits = vec![0u64; 3];
         let err = sink.record_band(0, 5, &bad_bits).unwrap_err();
         assert!(matches!(err, IntegrationError::BadInput(_)), "{err:?}");
+    }
+
+    /// Fix round 1, I2 (this half is engine-side; the corresponding
+    /// `integrate_group`-level check is Task 2 fix round 1's `integrate.rs`
+    /// test) — `record_band`'s OWN guard: an out-of-range plane index, or a
+    /// band that would run past the set's declared height, is refused
+    /// before any positional write happens (M2).
+    #[test]
+    fn record_band_refuses_an_out_of_range_plane_or_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = RejBitmapSet::create(dir.path(), &["a".to_string()], 32, 16, 2).unwrap();
+        let words = words_per_row(32);
+        let bits = vec![0u64; 5 * 1 * words];
+
+        let err = set.plane_sink(2).record_band(0, 5, &bits).unwrap_err();
+        assert!(matches!(err, IntegrationError::BadInput(_)), "{err:?}");
+
+        // 12 + 5 = 17 > height 16.
+        let err = set.plane_sink(0).record_band(12, 5, &bits).unwrap_err();
+        assert!(matches!(err, IntegrationError::BadInput(_)), "{err:?}");
+    }
+
+    /// Fix round 1, I1: a stronger correctness pin for the buffered read —
+    /// several bits scattered across multiple ROWS and multiple WORDS per
+    /// row (`words_per_row(200) == 4`), read back one at a time via
+    /// `is_rejected` at every pixel of a real (non-trivial) geometry. The
+    /// existing round-trip tests already exercise `BufReader` incidentally;
+    /// this one is built specifically to catch a chunk-boundary or
+    /// row/word-indexing regression in that code path.
+    #[test]
+    fn read_reassembles_a_multi_word_multi_row_body_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (width, height, channels) = (200usize, 40usize, 1usize);
+        let set =
+            RejBitmapSet::create(dir.path(), &["a".to_string()], width, height, channels).unwrap();
+        let words = words_per_row(width);
+        assert_eq!(words, 4, "ceil(200/64) == 4");
+
+        let rows = height;
+        let mut bits = vec![0u64; rows * 1 * words];
+        let set_positions: [(usize, usize); 6] =
+            [(0, 0), (10, 63), (10, 64), (20, 127), (39, 199), (5, 128)];
+        for &(y, x) in &set_positions {
+            bits[(y * 1 + 0) * words + (x / 64)] |= 1u64 << (x % 64);
+        }
+        set.plane_sink(0).record_band(0, rows, &bits).unwrap();
+
+        let bm = RejBitmap::read(set.path(0), width, height, channels).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                let expected = set_positions.contains(&(y, x));
+                assert_eq!(
+                    bm.is_rejected(0, x, y),
+                    expected,
+                    "mismatch at (x={x}, y={y})"
+                );
+            }
+        }
+    }
+
+    /// Fix round 1, M4: a failure partway through `create` rolls back every
+    /// file THIS call itself wrote — a retry against the same directory
+    /// must not trip a leftover "already exists" on a stem that call
+    /// already cleaned up.
+    #[test]
+    fn create_rolls_back_files_it_wrote_when_a_later_stem_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let stems = vec!["a".to_string(), "b".to_string()];
+        // Pre-existing "b.rej" makes create() fail on the SECOND stem,
+        // after "a.rej" has already been written by this same call.
+        std::fs::write(dir.path().join("b.rej"), b"pre-existing").unwrap();
+
+        let err = RejBitmapSet::create(dir.path(), &stems, 8, 8, 1).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("exists"), "{err}");
+        assert!(
+            !dir.path().join("a.rej").exists(),
+            "the file this call itself wrote must be rolled back on failure"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("b.rej")).unwrap(),
+            b"pre-existing",
+            "a file this call did NOT write must never be touched"
+        );
+
+        // A retry (after clearing the real collision) must succeed — stem
+        // "a" no longer trips a leftover "already exists" from the failed
+        // attempt above.
+        std::fs::remove_file(dir.path().join("b.rej")).unwrap();
+        let set = RejBitmapSet::create(dir.path(), &stems, 8, 8, 1).unwrap();
+        assert_eq!(set.frames(), 2);
+    }
+
+    /// Fix round 1, M7: a frame with NO bits set anywhere in the band must
+    /// never be opened for writing — proven, not just asserted, by making
+    /// that frame's file read-only first: `record_band` succeeding despite
+    /// that means it never tried to open it.
+    #[cfg(unix)]
+    #[test]
+    fn record_band_skips_opening_a_frames_file_when_the_band_has_no_bits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = RejBitmapSet::create(
+            dir.path(),
+            &["untouched".to_string(), "hot".to_string()],
+            16,
+            8,
+            1,
+        )
+        .unwrap();
+        let words = words_per_row(16);
+        let rows = 4usize;
+        let n = 2usize;
+        let mut bits = vec![0u64; rows * n * words];
+        // Only frame 1 ("hot") gets a bit; frame 0 ("untouched") stays all-zero.
+        bits[(0 * n + 1) * words] |= 1;
+
+        let path0 = set.path(0).to_path_buf();
+        let mut perms = std::fs::metadata(&path0).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path0, perms).unwrap();
+
+        let result = set.plane_sink(0).record_band(0, rows, &bits);
+
+        // Restore writability unconditionally so tempdir cleanup can't fail.
+        let mut perms = std::fs::metadata(&path0).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path0, perms).unwrap();
+
+        result.expect("a frame with no bits in the band must never be opened for writing");
     }
 }

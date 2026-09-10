@@ -670,6 +670,27 @@ pub fn integrate_group(
                 rej_set.frames()
             )));
         }
+        // Fix round 1, I2: the frame-count check above catches a size
+        // mismatch, but a set built for the wrong WIDTH/HEIGHT/CHANNELS
+        // (e.g. a stale set from a previous, differently-sized group) would
+        // otherwise sail through here — `RejPlaneSink::record_band`'s
+        // offset arithmetic runs past its own `set_len`'d end, `write_at`
+        // silently EXTENDS the file, and the mistake would only surface
+        // much later when `RejBitmap::read` reports a length/geometry
+        // mismatch — after the group's whole integration has already been
+        // paid for. Refused here instead, before any pixel work runs.
+        if rej_set.width() != input.width || rej_set.height() != input.height || rej_set.channels() != input.channels
+        {
+            return Err(IntegrationError::BadInput(format!(
+                "rejection bitmap set geometry {}x{}x{} != group geometry {}x{}x{}",
+                rej_set.width(),
+                rej_set.height(),
+                rej_set.channels(),
+                input.width,
+                input.height,
+                input.channels
+            )));
+        }
     }
 
     // A frame whose own weight vector doesn't match the group's channel
@@ -1916,6 +1937,29 @@ mod tests {
         match err {
             IntegrationError::BadInput(msg) => {
                 assert!(msg.contains('3') && msg.contains('4'), "{msg}");
+            }
+            other => panic!("expected BadInput, got {other:?}"),
+        }
+
+        // Fix round 1, I2: right frame count (4), wrong geometry — a stale
+        // set from a differently-sized group must be refused just as
+        // loudly, before any pixel work runs.
+        let geom_dir = dir.path().join("rej-geom");
+        let stems4: Vec<String> = (0..4).map(|i| format!("g{i}")).collect();
+        let wrong_geom_set = RejBitmapSet::create(&geom_dir, &stems4, W / 2, H, 1).unwrap();
+        let geom_input = GroupInput { rej: Some(&wrong_geom_set), ..input };
+        let err = integrate_group(
+            &geom_input,
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(20_000_000),
+        )
+        .unwrap_err();
+        match err {
+            IntegrationError::BadInput(msg) => {
+                assert!(msg.contains("geometry"), "{msg}");
             }
             other => panic!("expected BadInput, got {other:?}"),
         }

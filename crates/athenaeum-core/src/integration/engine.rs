@@ -989,6 +989,20 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         // caller) pays nothing for this field's existence.
         match params.rejection_bits {
             Some(sink) => {
+                // Fix round 1, M6: `rows * n * bit_words * 8` bytes, freshly
+                // allocated and zeroed once per band (not once per run, the
+                // way `map_low`/`map_high` above are — those get reused
+                // across bands via the outer `Mutex<Vec<_>>`; this one
+                // doesn't need to be, since it is fully consumed by
+                // `sink.record_band` before the next band starts). At 208
+                // frames, 6248px width and a ~98-row band this is ≈16 MB,
+                // reallocated ~40 times per plane — cheap next to a band's
+                // own combine, but it is peak RSS neither R-M3-7's `need`
+                // formula (drizzle's own memory refusal, Task 3) nor
+                // `stacking::paths::estimate_bytes`'s run-footprint estimate
+                // currently accounts for. Named here so whichever of those
+                // two Task 5/6 end up tightening does not have to
+                // rediscover it.
                 let mut band_bits = vec![0u64; rows * n * bit_words];
                 out_band
                     .par_chunks_mut(width)
@@ -2257,7 +2271,13 @@ mod tests {
     /// `stack_path_weights_normalizes_and_counts_rejections_per_side_and_frame`
     /// above (n=4, small-n masking analysis in that test's own comment):
     /// `sigma_high = 1.0` reliably rejects a huge single-frame outlier that
-    /// `sigma_high >= 1.5` would mask.
+    /// `sigma_high >= 1.5` would mask. Fix round 1, M5: `(w, h) = (16, 64)`
+    /// with a tiny `io(4096)` band budget (the same shape
+    /// `rejection_maps_land_on_the_right_global_rows_across_bands` above
+    /// already proves multi-bands) forces `record_band`'s `y0` argument to
+    /// be non-zero for the hot pixel's band — a bug that passed `0` instead
+    /// of the true `y0` out of the band closure would not have been caught
+    /// by the single-band shape this test used before.
     #[test]
     fn rejection_bit_sink_records_exactly_the_rejected_samples_and_does_not_change_the_output() {
         struct RecordingSink {
@@ -2279,14 +2299,15 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let (w, h) = (16usize, 8usize);
+        let (w, h) = (16usize, 64usize);
         let hot_idx = 3usize;
+        let (hot_x, hot_y) = (7usize, 40usize);
         let paths = vec![
             write(dir.path(), "a.fits", w, h, |_, _| 100.0),
             write(dir.path(), "b.fits", w, h, |_, _| 100.0),
             write(dir.path(), "c.fits", w, h, |_, _| 100.0),
             write(dir.path(), "hot.fits", w, h, |x, y| {
-                if (x, y) == (7, 3) { 9000.0 } else { 100.0 }
+                if (x, y) == (hot_x, hot_y) { 9000.0 } else { 100.0 }
             }),
         ];
         let src = BandSource::open(&paths, dir.path(), 1).unwrap();
@@ -2313,9 +2334,14 @@ mod tests {
             &pool(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &nop(), on_combine: &nop() },
-            io(1 << 20),
+            io(4096),
         )
         .unwrap();
+        assert!(
+            out_none.base.bands >= 2,
+            "expected a multi-band run, got {}",
+            out_none.base.bands
+        );
         assert_eq!(
             out_none.rejected_per_frame[hot_idx], 1,
             "sanity: the hot pixel must actually be rejected in the no-sink baseline, got {:?}",
@@ -2331,7 +2357,7 @@ mod tests {
             &pool(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &nop(), on_combine: &nop() },
-            io(1 << 20),
+            io(4096),
         )
         .unwrap();
 
@@ -2343,10 +2369,16 @@ mod tests {
         assert_eq!(out_none.rejected_per_frame, out_sink.rejected_per_frame);
         assert_eq!((out_none.rejected_low, out_none.rejected_high), (out_sink.rejected_low, out_sink.rejected_high));
 
-        // Exactly one (frame, x, y) bit set across the whole run.
+        // Exactly one (frame, x, y) bit set across the whole run, and it
+        // must have arrived on a call whose y0 is genuinely non-zero (the
+        // hot row is 40, well past the first several small bands).
         let words = w.div_ceil(64);
         let mut found = Vec::new();
+        let mut saw_nonzero_y0 = false;
         for (y0, rows, bits) in sink.calls.lock().unwrap().iter() {
+            if *y0 > 0 {
+                saw_nonzero_y0 = true;
+            }
             assert_eq!(bits.len(), rows * 4 * words, "band buffer sized rows x frames x words");
             for row_in_band in 0..*rows {
                 for frame in 0..4 {
@@ -2364,6 +2396,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(found, vec![(hot_idx, 3, 7)], "expected exactly one bit at (frame {hot_idx}, row 3, col 7): {found:?}");
+        assert!(saw_nonzero_y0, "expected at least one band with y0 > 0");
+        assert_eq!(
+            found,
+            vec![(hot_idx, hot_y, hot_x)],
+            "expected exactly one bit at (frame {hot_idx}, row {hot_y}, col {hot_x}): {found:?}"
+        );
     }
 }
