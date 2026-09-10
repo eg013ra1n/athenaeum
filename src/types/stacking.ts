@@ -131,7 +131,18 @@ export type ReferenceConfig = { mode: ReferenceMode, };
 
 export type DrizzleKernel = "square" | "circle" | "gaussian";
 
-export type DrizzleConfig = { enabled: boolean, scale: number, dropShrink: number, kernel: DrizzleKernel, useRejection: boolean, useWeights: boolean, useLocalNormalization: boolean, writeWeightMap: boolean, };
+export type DrizzleConfig = { enabled: boolean, scale: number, dropShrink: number, kernel: DrizzleKernel, useRejection: boolean, useWeights: boolean, 
+/**
+ * B8 (M3 final fix wave, M5 ruling): a no-op whenever local
+ * normalization is off for the run (`normalization.local.enabled ==
+ * false` and `normalization.rejection != "local"`) — the drizzle
+ * driver already falls back to each included frame's own global
+ * output-normalization pair per frame in that case, exactly as
+ * [`super::integrate`]'s own engine does; this toggle only has an
+ * effect when local normalization is actually driving output
+ * normalization for the group.
+ */
+useLocalNormalization: boolean, writeWeightMap: boolean, };
 
 export type OutputFormat = "fits";
 

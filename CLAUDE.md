@@ -492,9 +492,14 @@ built-in default.
 **Beyond M1** (spec §14): **M2** — local normalization (MMT background
 models, PSF-flux scale with RCR, `.athln` sidecars, `NormalizePanel`'s LN
 block goes live) — SHIPPED, see below. **M3** — drizzle (exact clipping,
-forward mapping, M1's rejection bitmaps turned on, `DrizzlePanel` goes
-live) — the pipeline wiring SHIPPED (Task 5, see below); `DrizzlePanel`
-going live and the acceptance run are Task 6/7. **M4** — polish:
+forward mapping, M1's rejection bitmaps turned on, `DrizzlePanel` live) —
+SHIPPED (Tasks 1-6, see below, plus a whole-branch final fix wave closing
+three review findings before merge: a group whose members' native geometry
+differs from the run's reference was refused outright rather than
+drizzled, the Output stage's own timing double-counted drizzle's whole
+duration, and a `.rej` write fault mid-integration failed the group
+instead of degrading to "drizzle skipped"); the LDN 1272 acceptance run is
+the remaining step. **M4** — polish:
 thin-plate-spline distortion, ESD/RCR/min-max/large-scale rejection,
 Bayer drizzle, XISF output, cataloging masters, preset management, and
 **mixed pixel scales in one set** (owner requirement
@@ -605,11 +610,28 @@ an out-of-range `scale` (`∉ {1, 2, 3}`, ruling R-M3-10); the byte-footprint
 estimate grows by the `.rej` bitmap and drizzled-output terms when drizzle
 is on. `MaximumQuality` now turns on drizzle 2× AND local normalization
 (spec §9.2) — both hidden in M1/M2 only because neither stage existed yet.
-Full ruling list: spec §7's "Implementation notes (M3)". **`DrizzlePanel`
-going live, the tab's drizzle rows/summary, and the LDN 1272 acceptance
-run (drizzled/undrizzled FWHM ratio against the external 2× drizzled
-masters) are still owed — Task 6/7 of
-`docs/superpowers/plans/2026-09-10-stacking-m3-plan-drizzle.md`.**
+Full ruling list: spec §7's "Implementation notes (M3)". `DrizzlePanel`,
+the tab's drizzle rows/summary and the board/`ResultsPanel` polish shipped
+in Task 6. A whole-branch review before Task 7's acceptance run found the driver
+conflated a frame's own SOURCE geometry with the run's REFERENCE
+geometry — `drizzle_group` refused any frame whose native size differed
+from the reference outright, which the project's own acceptance set (an
+OSC group natively 6248×4176 registered onto a 6224×4168 reference) would
+have tripped on the first run — fixed by splitting `FrameDepositCtx` into
+`src_width`/`src_height` (source-plane indexing and the band's source
+window) and `ref_width`/`ref_height` (the `.rej` bitmap lookup and the LN
+grid index, both always reference-geometry); the up-front check is now
+`channels` only. The same review closed two more: the `Output` stage
+timer used to include the whole drizzle duration (Drizzle and Output are
+meant to be disjoint spans), and a `.rej` write fault mid-integration
+(`ENOSPC`/`EACCES`/an SMB hiccup) used to fail the group outright instead
+of degrading to "drizzle skipped, master kept" the way a bitmap-set
+`create` failure already did — `RejBitmapSet` now latches its first write
+failure and every later `record_band` call for that set becomes a no-op.
+The LDN 1272 acceptance run (drizzled/undrizzled FWHM ratio against the
+external 2× drizzled masters, both the mono and the OSC group) is the
+remaining step —
+`docs/superpowers/plans/2026-09-10-stacking-m3-plan-drizzle.md`.
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,robust,integrate,

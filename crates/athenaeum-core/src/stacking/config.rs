@@ -165,6 +165,14 @@ pub struct DrizzleConfig {
     pub kernel: DrizzleKernel,
     pub use_rejection: bool,
     pub use_weights: bool,
+    /// B8 (M3 final fix wave, M5 ruling): a no-op whenever local
+    /// normalization is off for the run (`normalization.local.enabled ==
+    /// false` and `normalization.rejection != "local"`) — the drizzle
+    /// driver already falls back to each included frame's own global
+    /// output-normalization pair per frame in that case, exactly as
+    /// [`super::integrate`]'s own engine does; this toggle only has an
+    /// effect when local normalization is actually driving output
+    /// normalization for the group.
     pub use_local_normalization: bool,
     pub write_weight_map: bool,
 }

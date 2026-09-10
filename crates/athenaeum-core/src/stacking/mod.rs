@@ -31,12 +31,18 @@
 //! adds `drizzle` (spec §7, rulings R-M3-1..R-M3-3: the reference ↔
 //! output-grid coordinate map, drop corners, forward mapping onto the
 //! scaled output grid, exact convex-quad ∩ unit-pixel clipping, and the
-//! 16×16 tabulated-kernel micro-drop table for `circle`/`gaussian`; the
-//! stage driver arrives in a later task). M3 Task 2 adds `rej` (spec §6.2,
-//! ruling R-M3-8: the on-disk `.rej` per-frame rejection-bitmap format
-//! `RejBitmapSet`/`RejBitmap`, and `RejPlaneSink` — the
-//! `integration::source::RejectionBitSink` implementation the engine's band
-//! loop now writes to when a sink is supplied).
+//! 16×16 tabulated-kernel micro-drop table for `circle`/`gaussian`). M3
+//! Task 2 adds `rej` (spec §6.2, ruling R-M3-8: the on-disk `.rej`
+//! per-frame rejection-bitmap format `RejBitmapSet`/`RejBitmap`, and
+//! `RejPlaneSink` — the `integration::source::RejectionBitSink`
+//! implementation the engine's band loop now writes to when a sink is
+//! supplied). M3 Task 3 adds `drizzle`'s own stage driver
+//! (`drizzle_group`): per plane, per included frame, reads the calibrated
+//! plane once and deposits it onto the scaled output grid through the
+//! frame's own `PixelMap` — a whole-branch final fix wave item made this
+//! tolerate a frame whose native geometry differs from the run's
+//! reference (only `channels` has to match), mirroring the tolerance the
+//! integration engine's own `RegisteredSource` has always had per frame.
 
 pub mod config;
 pub mod drizzle;
