@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use tracing::info;
 
 use crate::archive::path_layout::sanitize_for_filename;
 use crate::calibration_library::paths::{fmt_num, resolve_collision};
@@ -16,12 +17,18 @@ use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::wcs::wcs_cards;
 use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
 use crate::plate_solve::storage::PlateSolveRecord;
+use crate::stacking::drizzle::{DrizzleKernel, DrizzleOutput};
 use crate::stacking::groups::ColorMode;
 use crate::stacking::integrate::GroupOutput;
 use crate::stacking::register::writer::REGISTERED_COPY_THROUGH;
 
 /// `ATH_STKV`: the master-light header format version.
 pub const ATH_STK_VERSION: i64 = 1;
+
+/// Drizzle provenance cards (spec §7, `build_drizzle_cards`).
+pub const ATH_DRZ: &str = "ATH_DRZ"; // integer scale
+pub const ATH_DRZP: &str = "ATH_DRZP"; // drop shrink (real)
+pub const ATH_DRZK: &str = "ATH_DRZK"; // kernel serde name
 
 pub struct MasterCardInputs<'a> {
     /// Copy-through cards of the REFERENCE frame (`source_cards_from_file`).
@@ -185,6 +192,92 @@ pub fn build_master_light_cards(
     Ok(cards)
 }
 
+/// Whether `keyword` is one [`wcs_cards`] can emit — used by
+/// [`build_drizzle_cards`] to strip a master's original (un-scaled) WCS
+/// block before appending the scaled one, so nothing duplicates. Beyond the
+/// fixed keywords (every card `wcs_cards` writes outside the SIP tables,
+/// plus `CDELT*`/`CROTA*` in case a copy-through header ever carries the
+/// legacy scale/rotation pair alongside the CD matrix), matches the SIP
+/// coefficient pattern `(A|B|AP|BP)_<i>_<j>` — `wcs_cards` writes one card
+/// per non-zero term, so no fixed list covers every possible table.
+pub fn is_wcs_keyword(keyword: &str) -> bool {
+    const FIXED: &[&str] = &[
+        "WCSAXES", "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2",
+        "CD2_1", "CD2_2", "CDELT1", "CDELT2", "CROTA1", "CROTA2", "CUNIT1", "CUNIT2", "RADESYS",
+        "EQUINOX", "PLTSOLVD", "A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER",
+    ];
+    FIXED.contains(&keyword) || is_sip_term_keyword(keyword)
+}
+
+/// `^(A|B|AP|BP)_\d+_\d+$` — one SIP coefficient card, any of the four
+/// tables. `AP_`/`BP_` are checked before `A_`/`B_` only for readability;
+/// `strip_prefix` already requires the full literal prefix, so the order
+/// can't cause a false match either way (`"AP_2_0"` never starts with
+/// `"A_"`).
+fn is_sip_term_keyword(keyword: &str) -> bool {
+    for prefix in ["AP_", "BP_", "A_", "B_"] {
+        let Some(rest) = keyword.strip_prefix(prefix) else {
+            continue;
+        };
+        let mut parts = rest.split('_');
+        let (Some(i), Some(j), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if is_digits(i) && is_digits(j) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The serde wire name of a [`DrizzleKernel`] variant — the value
+/// [`build_drizzle_cards`] stamps into `ATH_DRZK`. Goes through
+/// `serde_json` rather than a hand-written match so the card can never
+/// drift from the config's own wire representation.
+fn drizzle_kernel_serde_name(kernel: DrizzleKernel) -> String {
+    match serde_json::to_value(kernel) {
+        Ok(serde_json::Value::String(s)) => s,
+        other => unreachable!("DrizzleKernel serializes to a JSON string, got {other:?}"),
+    }
+}
+
+/// The master's cards with its original (un-scaled) WCS block — every card
+/// [`is_wcs_keyword`] recognizes — stripped, `wcs_cards(scaled)` appended
+/// when `scaled` is `Some` (nothing appended, i.e. no WCS at all, when
+/// `None`), then the `ATH_DRZ`/`ATH_DRZP`/`ATH_DRZK` provenance cards.
+/// `NAXIS*` are the writer's business, never cards here.
+pub fn build_drizzle_cards(
+    master_cards: &[Card],
+    scaled: Option<&PlateSolveRecord>,
+    scale: u32,
+    drop_shrink: f64,
+    kernel: DrizzleKernel,
+) -> Result<Vec<Card>, FitsWriteError> {
+    let mut cards: Vec<Card> = master_cards
+        .iter()
+        .filter(|c| !is_wcs_keyword(&c.keyword))
+        .cloned()
+        .collect();
+
+    if let Some(solve) = scaled {
+        cards.extend(wcs_cards(solve)?);
+    }
+
+    cards.push(
+        Card::new(ATH_DRZ, CardValue::Integer(scale as i64))?.with_comment("drizzle output scale"),
+    );
+    cards.push(
+        Card::new(ATH_DRZP, CardValue::Real(drop_shrink))?.with_comment("drizzle drop shrink"),
+    );
+    cards.push(
+        Card::new(ATH_DRZK, CardValue::Str(drizzle_kernel_serde_name(kernel)))?
+            .with_comment("drizzle kernel"),
+    );
+
+    Ok(cards)
+}
+
 /// Trim, then treat a blank result as absent — a `Some("  ")` filter must
 /// fall back to the default just like `None` does.
 fn blank(s: Option<&str>) -> Option<&str> {
@@ -241,6 +334,18 @@ pub fn master_file_name(
     }
 }
 
+/// `<master stem>_drizzle<s>x.fits` and `<master stem>_drizzle<s>x_weight.fits`
+/// (spec §9.5) — `master_stem` is the ALREADY collision-resolved master file
+/// stem (no extension); [`write_drizzled_master`] re-derives the weight
+/// name from its own resolved drizzle stem rather than calling this twice,
+/// so a `_2`-suffixed drizzle output still names its own weight map.
+pub fn drizzle_file_names(master_stem: &str, scale: u32) -> (String, String) {
+    (
+        format!("{master_stem}_drizzle{scale}x.fits"),
+        format!("{master_stem}_drizzle{scale}x_weight.fits"),
+    )
+}
+
 pub struct WrittenMaster {
     pub master: PathBuf,
     pub rejection_low: Option<PathBuf>,
@@ -267,6 +372,100 @@ fn rejection_map_cards(label: &str, master_cards: &[Card]) -> Result<Vec<Card>, 
         }
     }
     Ok(cards)
+}
+
+/// Header cards for the drizzle weight map (`IMAGETYP = 'Drizzle Weight'`,
+/// `ATH_STK`/`ATH_STKV`, `BUNIT = 'relative weight'`, and the drizzle
+/// output's own `ATH_STKI`/`ATH_STKG`/`ATH_DRZ` cards copied through so the
+/// map can be traced back to its run/group/scale without opening the
+/// drizzled master too) — the [`rejection_map_cards`] pattern.
+pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
+    let mut cards = vec![
+        Card::new("IMAGETYP", CardValue::Str("Drizzle Weight".into()))?,
+        Card::new("ATH_STK", CardValue::Logical(true))?
+            .with_comment("stacked by Athenaeum; never cataloged"),
+        Card::new("ATH_STKV", CardValue::Integer(ATH_STK_VERSION))?
+            .with_comment("stacking header version"),
+        Card::new("BUNIT", CardValue::Str("relative weight".into()))?,
+    ];
+    for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ] {
+        if let Some(c) = drizzle_cards.iter().find(|c| c.keyword == kw) {
+            cards.push(c.clone());
+        }
+    }
+    Ok(cards)
+}
+
+pub struct WrittenDrizzle {
+    pub drizzle: PathBuf,
+    pub weight_map: Option<PathBuf>,
+}
+
+/// Writes `output.data` (planar `channels × w × h`) as `<dir>/<drizzle
+/// name>` and, when `output.weight` is `Some`, the weight map alongside it.
+/// `resolve_collision` runs on BOTH paths: the drizzle path from
+/// [`drizzle_file_names`]'s own name, the weight-map path from a name
+/// derived off the drizzle path's RESOLVED stem (so a `_2`-suffixed
+/// drizzle output still names its own weight map, not a sibling's) — the
+/// same two-step pattern [`write_master_light`] uses for its rejection
+/// maps.
+pub fn write_drizzled_master(
+    dir: &Path,
+    master_stem: &str,
+    output: &DrizzleOutput,
+    cards: &[Card],
+) -> anyhow::Result<WrittenDrizzle> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    let (drizzle_name, _) = drizzle_file_names(master_stem, output.stats.scale);
+    let drizzle_path = resolve_collision(&dir.join(&drizzle_name));
+    write_fits_f32(
+        &drizzle_path,
+        output.width,
+        output.height,
+        output.channels,
+        &output.data,
+        cards,
+    )
+    .with_context(|| format!("writing {}", drizzle_path.display()))?;
+    info!(
+        path = %drizzle_path.display(),
+        bytes = (output.data.len() * std::mem::size_of::<f32>()) as u64,
+        "wrote drizzled master"
+    );
+
+    let weight_map = match output.weight.as_deref() {
+        Some(weight_data) => {
+            let resolved_stem = drizzle_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("drizzle")
+                .to_string();
+            let weight_path = resolve_collision(&dir.join(format!("{resolved_stem}_weight.fits")));
+            let weight_cards = weight_map_cards(cards)?;
+            write_fits_f32(
+                &weight_path,
+                output.width,
+                output.height,
+                output.channels,
+                weight_data,
+                &weight_cards,
+            )
+            .with_context(|| format!("writing {}", weight_path.display()))?;
+            info!(
+                path = %weight_path.display(),
+                bytes = (weight_data.len() * std::mem::size_of::<f32>()) as u64,
+                "wrote drizzle weight map"
+            );
+            Some(weight_path)
+        }
+        None => None,
+    };
+
+    Ok(WrittenDrizzle {
+        drizzle: drizzle_path,
+        weight_map,
+    })
 }
 
 /// Writes the master (planar `channels × w × h`) and, when present, the two
@@ -825,5 +1024,235 @@ mod tests {
         );
         assert!(first.master.exists());
         assert!(second.master.exists());
+    }
+
+    #[test]
+    fn is_wcs_keyword_matches_every_card_wcs_cards_can_emit_plus_sip_terms() {
+        for kw in [
+            "WCSAXES", "CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1",
+            "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2", "CROTA1", "CROTA2", "CUNIT1", "CUNIT2",
+            "RADESYS", "EQUINOX", "PLTSOLVD", "A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER",
+            "A_0_0", "A_2_0", "B_1_1", "AP_3_0", "BP_0_2",
+        ] {
+            assert!(is_wcs_keyword(kw), "{kw} should be a WCS keyword");
+        }
+        for kw in [
+            "OBJECT", "EXPTIME", "INSTRUME", "ATH_STK", "ATH_DRZ", "NAXIS1", "A_ORDERX", "A_1",
+            "A__1", "A_1_1_1", "AX_1_1", "A_1_x",
+        ] {
+            assert!(!is_wcs_keyword(kw), "{kw} should NOT be a WCS keyword");
+        }
+    }
+
+    #[test]
+    fn build_drizzle_cards_replaces_the_wcs_block_and_stamps_provenance() {
+        let solve = record(true);
+        let mut master_cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
+            Card::new("OBJECT", CardValue::Str("LDN 1272".into())).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
+            Card::new("ATH_STKG", CardValue::Str("group-1".into())).unwrap(),
+        ];
+        master_cards.extend(wcs_cards(&solve).unwrap());
+
+        let scaled = crate::fits_writer::wcs::scale_plate_solve(&solve, 2).unwrap();
+        let cards =
+            build_drizzle_cards(&master_cards, Some(&scaled), 2, 0.9, DrizzleKernel::Square)
+                .unwrap();
+
+        // exactly one CRPIX1 card, equal to the SCALED value
+        let crpix1: Vec<&Card> = cards.iter().filter(|c| c.keyword == "CRPIX1").collect();
+        assert_eq!(crpix1.len(), 1, "expected exactly one CRPIX1 card");
+        assert_eq!(crpix1[0].value, Some(CardValue::Real(scaled.crpix1 + 1.0)));
+
+        // no leftover ORIGINAL SIP cards: A_2_0 must be the scaled value, not the original one
+        let original_a20 = wcs_cards(&solve)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.keyword == "A_2_0")
+            .unwrap();
+        let a20 = cards.iter().find(|c| c.keyword == "A_2_0").unwrap();
+        assert_ne!(
+            a20.value, original_a20.value,
+            "A_2_0 must be the SCALED value, not a leftover of the original"
+        );
+        assert_eq!(cards.iter().filter(|c| c.keyword == "A_2_0").count(), 1);
+
+        // no keyword wcs_cards emits is duplicated
+        for kw in [
+            "CTYPE1", "CRVAL1", "CD1_1", "CUNIT1", "RADESYS", "EQUINOX", "PLTSOLVD", "A_ORDER",
+        ] {
+            assert_eq!(
+                cards.iter().filter(|c| c.keyword == kw).count(),
+                1,
+                "{kw} duplicated or missing"
+            );
+        }
+
+        // non-WCS cards survive untouched
+        assert_eq!(cards.iter().filter(|c| c.keyword == "OBJECT").count(), 1);
+        assert_eq!(cards.iter().filter(|c| c.keyword == "ATH_STKI").count(), 1);
+
+        // the three ATH_DRZ* cards, with the right values
+        assert_eq!(
+            cards.iter().find(|c| c.keyword == ATH_DRZ).unwrap().value,
+            Some(CardValue::Integer(2))
+        );
+        assert_eq!(
+            cards.iter().find(|c| c.keyword == ATH_DRZP).unwrap().value,
+            Some(CardValue::Real(0.9))
+        );
+        assert_eq!(
+            cards.iter().find(|c| c.keyword == ATH_DRZK).unwrap().value,
+            Some(CardValue::Str("square".into()))
+        );
+
+        // every card must still format into 80-byte records
+        for c in &cards {
+            crate::fits_writer::card::format_card(c)
+                .unwrap_or_else(|e| panic!("{}: {e}", c.keyword));
+        }
+    }
+
+    #[test]
+    fn build_drizzle_cards_with_no_scaled_solve_carries_no_wcs() {
+        let solve = record(true);
+        let mut master_cards =
+            vec![Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap()];
+        master_cards.extend(wcs_cards(&solve).unwrap());
+
+        let cards =
+            build_drizzle_cards(&master_cards, None, 3, 0.7, DrizzleKernel::Circle).unwrap();
+        for c in &cards {
+            assert!(
+                !is_wcs_keyword(&c.keyword),
+                "unexpected WCS card {}",
+                c.keyword
+            );
+        }
+        assert_eq!(
+            cards.iter().find(|c| c.keyword == ATH_DRZK).unwrap().value,
+            Some(CardValue::Str("circle".into()))
+        );
+    }
+
+    #[test]
+    fn drizzle_file_names_follow_the_layout_rule() {
+        assert_eq!(
+            drizzle_file_names("LDN_1272_NoFilter_mono_180s_208x", 2),
+            (
+                "LDN_1272_NoFilter_mono_180s_208x_drizzle2x.fits".to_string(),
+                "LDN_1272_NoFilter_mono_180s_208x_drizzle2x_weight.fits".to_string(),
+            )
+        );
+    }
+
+    fn dummy_drizzle_stats(
+        scale: u32,
+        channels: usize,
+        out_w: usize,
+        out_h: usize,
+    ) -> crate::stacking::drizzle::DrizzleStats {
+        crate::stacking::drizzle::DrizzleStats {
+            scale,
+            out_width: out_w,
+            out_height: out_h,
+            frames: 3,
+            kernel: DrizzleKernel::Square,
+            drop_shrink: 0.9,
+            used_weights: true,
+            used_rejection: true,
+            ln_frames: 0,
+            fwhm_px: vec![0.0; channels],
+            eccentricity: vec![0.0; channels],
+            noise: vec![0.0; channels],
+            coverage: vec![0.0; channels],
+            read_ms: 0,
+            deposit_ms: 0,
+            bytes_read: 0,
+        }
+    }
+
+    #[test]
+    fn writer_lands_drizzle_and_weight_map_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        // `write_fits_f32` only accepts 1 or 3 channels (`BadChannels`
+        // otherwise) — the same constraint `write_master_light`'s own test
+        // above exercises. 3 planes (an OSC drizzle output) stands in for
+        // the brief's "2-plane" wording, which does not fit that
+        // constraint; see the Task 4 report for this deviation.
+        let (w, h, ch) = (8usize, 6usize, 3usize);
+        let plane = w * h;
+
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
+            Card::new(ATH_DRZ, CardValue::Integer(2)).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
+            Card::new("ATH_STKG", CardValue::Str("group-1".into())).unwrap(),
+        ];
+
+        let output = DrizzleOutput {
+            width: w,
+            height: h,
+            channels: ch,
+            data: vec![0.25f32; plane * ch],
+            weight: Some(vec![0.75f32; plane * ch]),
+            stats: dummy_drizzle_stats(2, ch, w, h),
+        };
+
+        let first = write_drizzled_master(dir.path(), "master", &output, &cards).unwrap();
+        assert_eq!(
+            first.drizzle.file_name().and_then(|s| s.to_str()),
+            Some("master_drizzle2x.fits")
+        );
+        let weight = first.weight_map.clone().unwrap();
+        assert_eq!(
+            weight.file_name().and_then(|s| s.to_str()),
+            Some("master_drizzle2x_weight.fits")
+        );
+
+        let reader = crate::integration::plane_reader::PlaneReader::open(&first.drizzle).unwrap();
+        assert_eq!(reader.width(), w);
+        assert_eq!(reader.height(), h);
+        assert_eq!(reader.channels(), ch);
+
+        let weight_reader = crate::integration::plane_reader::PlaneReader::open(&weight).unwrap();
+        assert_eq!(weight_reader.width(), w);
+        assert_eq!(weight_reader.height(), h);
+        assert_eq!(weight_reader.channels(), ch);
+
+        let weight_header = FitsHeader::from_path(&weight).unwrap();
+        assert_eq!(
+            weight_header.get_str("IMAGETYP").as_deref(),
+            Some("Drizzle Weight")
+        );
+        assert_eq!(
+            weight_header.get_str("BUNIT").as_deref(),
+            Some("relative weight")
+        );
+        assert_eq!(weight_header.get_str("ATH_STKI").as_deref(), Some("run-1"));
+        assert_eq!(
+            weight_header.get_str("ATH_STKG").as_deref(),
+            Some("group-1")
+        );
+        assert_eq!(weight_header.get_i32("ATH_DRZ"), Some(2));
+
+        // Write again with the same master stem → collision-suffixed names,
+        // the weight map following the RESOLVED drizzle stem, no overwrite.
+        let second = write_drizzled_master(dir.path(), "master", &output, &cards).unwrap();
+        assert_eq!(
+            second.drizzle.file_name().and_then(|s| s.to_str()),
+            Some("master_drizzle2x_2.fits")
+        );
+        assert_eq!(
+            second
+                .weight_map
+                .unwrap()
+                .file_name()
+                .and_then(|s| s.to_str()),
+            Some("master_drizzle2x_2_weight.fits")
+        );
+        assert!(first.drizzle.exists());
+        assert!(second.drizzle.exists());
     }
 }
