@@ -117,11 +117,16 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: Dri
             />
             <span className="text-sm text-content-secondary">Use local normalization</span>
           </label>
-          {/* The toggle is kept as stored (never forced off) when LN itself
-           *  is off for this set — only its EFFECT is moot until LN is
-           *  turned on in the Normalize panel. */}
+          {/* B8 (M3 final fix wave, M5 ruling): the toggle is kept as stored
+           *  (never forced off) when LN itself is off for this set — the
+           *  driver already falls back to each frame's own global
+           *  normalization pair per frame, so the toggle has NO EFFECT
+           *  until LN is turned on in the Normalize panel; the hint says
+           *  so explicitly rather than leaving the reader to infer it. */}
           {!lnOn && (
-            <p className="mt-1 ml-6 text-[11px] text-content-muted">local normalization is off for this set</p>
+            <p className="mt-1 ml-6 text-[11px] text-content-muted">
+              no effect — local normalization is off for this set
+            </p>
           )}
         </div>
 

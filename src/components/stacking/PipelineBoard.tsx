@@ -64,7 +64,13 @@ export function PipelineBoard({
           toggle = {
             checked: config.drizzle.enabled,
             onChange: onToggleDrizzle,
-            label: 'drizzle',
+            // B13 (M3 final fix wave, M10): the row is already titled
+            // "8 · Drizzle" — "drizzle" next to its own toggle just restated
+            // the row. "enabled" says what the toggle does without
+            // repeating the row's own name (the register row's "write
+            // registered frames" is the model: it names the ACTION, not
+            // the stage).
+            label: 'enabled',
           };
         } else if (stage === 'register') {
           toggle = {
