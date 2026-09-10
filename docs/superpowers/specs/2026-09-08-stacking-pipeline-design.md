@@ -776,8 +776,9 @@ Below 1200 px the inspector drops under the board as an accordion.
 `useRegistrationProgress.ts`, `RegistrationProgressContext.tsx`,
 `RegistrationQueueIndicator.tsx`, the `REGISTRATION_ENABLED` flag and the
 `registration` tab entry in `FrameSetDetail.tsx` are gone. `STACKING_ENABLED
-= import.meta.env.DEV` stays until the M1 acceptance run passes, then is
-removed the same way.
+= import.meta.env.DEV` is also gone — enabled for every build since the
+2026-09-10 acceptance run
+(`docs/superpowers/research/2026-09-09-m1-acceptance-run.md`).
 
 ## 12. Web / Docker
 

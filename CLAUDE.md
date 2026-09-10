@@ -456,9 +456,10 @@ never re-implements the transforms), `get_stacking_defaults`,
 
 **The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
 the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →
-`PipelineBoard`/`StageRow` (the 9 stages, `stageSummary.ts` — a pure function
-shared with `StageInspector`, never reads run state) + `GroupsTable`;
-`StageInspector` + one config panel per stage
+`PipelineBoard`/`StageRow` (the board is TEN rows, `0 · Masters` … `9 ·
+Output` — nine backend stages plus the display-only Debayer row;
+`stageSummary.ts` — a pure function shared with `StageInspector`, never reads
+run state) + `GroupsTable`; `StageInspector` + one config panel per stage
 (`panels/{Masters,Calibrate,Debayer,Measure,Reference,Register,Normalize,
 Integrate,Drizzle,Output}Panel.tsx`) for configuration; `FramesTable` (manual
 exclusion is the ONE frame-level write from the tab — everything else is
@@ -466,9 +467,9 @@ read-only run output) and `ResultsPanel` + `ProvenanceModal`. **No
 `StackingQueueIndicator`**: the sidebar's existing `ComputeQueueIndicator`
 already lists every queue entry including a running stack, with cancel — a
 second widget for the same job would duplicate it (plan 5b ruling 2). The
-tab stays behind `STACKING_ENABLED = import.meta.env.DEV` (`FrameSetDetail.tsx`,
-gated only on the set having light frames) until the M1 acceptance run
-passes.
+tab is enabled for every build since the 2026-09-10 acceptance run
+(`docs/superpowers/research/2026-09-09-m1-acceptance-run.md`), gated only on
+the set having light frames.
 
 **Settings → Stacking** (`src/components/settings/StackingSection.tsx`):
 global config defaults (`get/set/reset_stacking_defaults`, the same
