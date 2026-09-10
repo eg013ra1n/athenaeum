@@ -13,14 +13,18 @@
 //! since a target frame carries its own noise/registration residual on top
 //! of the reference's).
 //!
-//! `low_clip`/`high_clip_rel` are the literal thresholds from math §4.2: a
-//! pixel below `low_clip` or above `high_clip_rel · max(plane)` is excluded
-//! before any per-cell statistic sees it (controller ruling: on a real
-//! field the maximum is a near-saturated star, so `0.85 × max` removes
-//! only near-saturation; a robust median+MAD ceiling was tried and
-//! rejected here — on a real field with no separately-saturated
-//! population to set the scale it would clip bright nebulosity out of the
-//! background model along with the stars).
+//! `low_clip`/`high_clip_rel` are the clipping thresholds of math §4.2 in
+//! the pipeline's normalized units (float32 in [0, 1], ADU / 65535): a
+//! pixel below `low_clip` or above `high_clip_rel` of FULL SCALE (1.0) is
+//! excluded before any per-cell statistic sees it. Controller ruling
+//! (2026-09-10): "0.85 relative to the maximum" is read as 0.85 of the
+//! representable maximum — near-saturation for a 16-bit camera — not of
+//! the plane's own maximum. The plane-maximum reading clips an entire
+//! flat, star-less plane (its maximum IS the background), and a robust
+//! median+MAD ceiling was tried and rejected because on a field with
+//! bright nebulosity it clips the nebula out of the background model; the
+//! full-scale reading touches neither. The per-cell deviation clipping
+//! below is what removes stars from the model.
 //!
 //! `invalid_cells` is a per-frame count for the caller (Task 5) to log as
 //! `ln_cells_rejected` — this module does not log it itself.
@@ -153,17 +157,12 @@ pub fn background_grid(
     }
 }
 
-/// The literal high clip from math §4.2: `high_clip_rel` of the plane's
-/// own maximum finite value. An allocation-free fold over `plane` (already
-/// sliced to `width * height` by the caller) — used both as the hot-pixel
-/// candidate cutoff and the global high clip below.
-fn high_clip_threshold(plane: &[f32], p: &BackgroundParams) -> f32 {
-    let max = plane
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f32::MIN, f32::max);
-    p.high_clip_rel * max
+/// The high clip of math §4.2 as ruled in the module doc: `high_clip_rel`
+/// of full scale (1.0 in the pipeline's normalized units) — an absolute
+/// near-saturation threshold, independent of the plane's content. Used
+/// both as the hot-pixel candidate cutoff and the global high clip below.
+fn high_clip_threshold(_plane: &[f32], p: &BackgroundParams) -> f32 {
+    p.high_clip_rel
 }
 
 /// Steps 1–2 of the algorithm: a hot-pixel-corrected, clipped copy of
@@ -394,7 +393,7 @@ mod tests {
     fn vertical_gradient_is_tracked_per_cell() {
         let (w, h) = (256, 256);
         let mut plane: Vec<f32> = (0..w * h).map(|i| 0.05 + (i / w) as f32 * 1e-4).collect(); // +0.0256 top to bottom
-        plane[128 * w + 128] = 0.9; // one bright star; the literal high clip must remove only this
+        plane[128 * w + 128] = 0.9; // one star: the high clip (0.85 of full scale) removes it, the gradient survives
         let g = background_grid(
             &plane,
             w,
@@ -418,7 +417,7 @@ mod tests {
         let mut plane = vec![0.10f32; w * h];
         for y in 0..40 {
             for x in 0..40 {
-                plane[y * w + x] = 0.8; // a galaxy core covering cell (0,0)
+                plane[y * w + x] = 0.95; // a saturated star core covering cell (0,0): above the 0.85 full-scale high clip
             }
         }
         let g = background_grid(
@@ -444,20 +443,16 @@ mod tests {
     /// cells came out invalid (an inverted, empty window) and got
     /// neighbour-filled instead of measured.
     ///
-    /// One bright pixel is planted for the same reason
-    /// `vertical_gradient_is_tracked_per_cell` needs one: the literal high
-    /// clip is `high_clip_rel · max(plane)`, so a perfectly flat, star-less
-    /// plane has `max == the flat value itself` and `0.85 · max < max`
-    /// would clip the ENTIRE plane, not just the trailing edge — a
-    /// synthetic-test artifact, not a real frame (which always has some
-    /// near-saturated pixel setting the scale, per the module doc). The
-    /// hot-pixel pass corrects the single spike back to the local median
-    /// before any cell sees it, same as `flat_plane_with_stars_recovers_the_flat_level`.
+    /// One bright pixel is planted so the hot-pixel pass has something to
+    /// correct on this plane too (same as
+    /// `flat_plane_with_stars_recovers_the_flat_level`); with the high clip
+    /// at 0.85 of full scale a flat plane at 0.10 is never clipped, so the
+    /// pixel is not needed to "set the scale" — it exercises the pass.
     #[test]
     fn trailing_node_overshoot_gets_a_real_window() {
         let (w, h) = (1026usize, 514usize);
         let mut plane = vec![0.10f32; w * h];
-        plane[10 * w + 10] = 0.9; // sets the frame's scale; hot-pixel-corrected back to flat
+        plane[10 * w + 10] = 0.9; // a hot pixel, corrected back to the flat level by the pass
         let g = background_grid(
             &plane,
             w,
