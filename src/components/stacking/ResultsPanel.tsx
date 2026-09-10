@@ -30,7 +30,16 @@ function basename(path: string): string {
  *  checks exactly the fields the card below reads, so a shape that doesn't
  *  actually support those reads is rejected here rather than trusted via
  *  `as GroupStats` and blowing up (or silently rendering `undefined`) at
- *  render time. */
+ *  render time.
+ *
+ *  `lnFrames` (final fix wave, A6) is checked as OPTIONAL, not required: a
+ *  `stats_json` row written by a pre-M2 run has no `lnFrames` key at all
+ *  (the field didn't exist yet), and that legacy shape must still pass —
+ *  rejecting it outright would hide every OTHER stat the card renders, not
+ *  just the LN line. `undefined` is accepted; a present-but-wrong-typed
+ *  value is not. The render below (`LN: …`) still has to read this
+ *  defensively, since the generated `GroupStats` type itself declares
+ *  `lnFrames: number` (never optional) for every CURRENT run. */
 function isGroupStats(x: unknown): x is GroupStats {
   if (!x || typeof x !== 'object') return false;
   const o = x as Record<string, unknown>;
@@ -38,7 +47,8 @@ function isGroupStats(x: unknown): x is GroupStats {
     typeof o.rejectedLowFraction === 'number' &&
     typeof o.rejectedHighFraction === 'number' &&
     Array.isArray(o.masterNoise) &&
-    Array.isArray(o.snrGain)
+    Array.isArray(o.snrGain) &&
+    (o.lnFrames === undefined || typeof o.lnFrames === 'number')
   );
 }
 
@@ -177,7 +187,10 @@ function MasterCard({ group, lnReferencePath }: { group: StackingRunGroupRow; ln
       {lnReferencePath != null && (
         <div className="pt-1 border-t border-border/40 space-y-1">
           <p className="text-xs text-content-secondary tabular-nums">
-            LN: {stats ? `${stats.lnFrames}/${group.includedCount}` : `—/${group.includedCount}`} frames
+            {/* A6: `stats.lnFrames` is absent (not just falsy-zero) on a
+             *  legacy pre-M2 `stats_json` row — render "—", never
+             *  "undefined". */}
+            LN: {typeof stats?.lnFrames === 'number' ? stats.lnFrames : '—'}/{group.includedCount} frames
           </p>
           <div className="flex items-center gap-1.5 text-xs text-content-muted">
             <span>LN reference:</span>

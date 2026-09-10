@@ -44,6 +44,18 @@ export interface NumericFieldProps {
   disabled?: boolean;
 }
 
+/**
+ * A6 (final fix wave), documenting pre-existing, shared behaviour: `onCommit`
+ * receives the CLAMPED value on every keystroke (`handleChange` clamps
+ * before calling it), but the visible `draft` string is whatever the user
+ * literally typed — unclamped — until the field loses focus, at which point
+ * `handleBlur` snaps `draft` back to `String(value)` (the last committed,
+ * already-clamped number). So typing `999` into a field capped at `100`
+ * commits `100` immediately, but the input still SHOWS `999` until blur.
+ * This is deliberate (never fight a partial edit while the user is still
+ * typing — see the file-level comment above), not a bug; every panel using
+ * this field inherits it.
+ */
 export function NumericField({ label, value, onCommit, min, max, step, help, disabled }: NumericFieldProps) {
   const [draft, setDraft] = useState(() => String(value));
   const inputRef = useRef<HTMLInputElement | null>(null);

@@ -575,10 +575,19 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     // `min-w-0`; this and the board/inspector split's own `min-w-0` below
     // are what actually let it apply.
     <div className="space-y-3 min-w-0">
-      {/* Toolbar */}
+      {/* Toolbar. Final fix wave, A4: at the acceptance run's click-through
+          (~1250 CSS px), this row overflowed the pane and the whole page
+          scrolled horizontally — `flex-wrap` on the two flex containers
+          below was already in place, but neither folder-path span could
+          actually SHRINK (a flex item's default `min-width: auto` beats
+          `truncate`), so the left group's own content forced the row wide
+          rather than wrapping. `min-w-0` on both flex containers plus
+          `min-w-0 truncate` on each path span fixes that; `shrink-0` on the
+          button group keeps Run/Cancel/Re-run intact on their own line once
+          the row does wrap. */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-surface-elevated rounded-lg px-4 py-3">
-        <div className="flex flex-wrap items-center gap-4 text-sm text-content-secondary">
-          <div className="relative" ref={presetMenuRef}>
+        <div className="flex flex-wrap items-center gap-4 min-w-0 text-sm text-content-secondary">
+          <div className="relative shrink-0" ref={presetMenuRef}>
             <button
               type="button"
               onClick={() => setPresetMenuOpen((v) => !v)}
@@ -607,20 +616,26 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
               </div>
             )}
           </div>
-          <span className="flex items-center gap-1.5">
-            <FolderOpen size={14} className="text-content-muted" />
-            {plan.workingDir ?? 'Choose a working folder'}
+          <span
+            className="flex items-center gap-1.5 min-w-0 max-w-xs truncate"
+            title={plan.workingDir ?? undefined}
+          >
+            <FolderOpen size={14} className="text-content-muted shrink-0" />
+            <span className="truncate">{plan.workingDir ?? 'Choose a working folder'}</span>
           </span>
-          <span className="flex items-center gap-1.5">
-            <FolderOpen size={14} className="text-content-muted" />
-            {plan.outputDir ?? 'Choose an output folder'}
+          <span
+            className="flex items-center gap-1.5 min-w-0 max-w-xs truncate"
+            title={plan.outputDir ?? undefined}
+          >
+            <FolderOpen size={14} className="text-content-muted shrink-0" />
+            <span className="truncate">{plan.outputDir ?? 'Choose an output folder'}</span>
           </span>
-          <span className="text-content-muted">
+          <span className="text-content-muted shrink-0">
             {freeLabel} · estimate {formatGB(plan.estimateBytes)}
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={() => void handleRun()}

@@ -46,9 +46,15 @@ export type BoardStage = Stage | 'debayer';
 /**
  * The subset of `STAGES` that actually get their own `StageTiming` entry in
  * `RunSummary.stages` (`run.rs`'s `rc.timings.push(…)` call sites) — used by
- * `rowState`'s `finishedStages` derivation (A5). `normalize` has none (spec
- * ruling 14: folded into `integrate_group` itself, only its own progress
- * event exists) and `drizzle` is M3 work, always `off` in M1 — both are
+ * `rowState`'s `finishedStages` derivation (A5). `normalize` (final fix
+ * wave, ruling R5 — reverses the earlier fix-round-1 call: the acceptance
+ * run measured local normalization as the run's single most expensive
+ * stage, so it cannot stay invisible) gets a real entry ONLY when LN was
+ * active for the run — a `normalize` timing simply being absent from
+ * `finishedStages` is already exactly what "a stage without an entry counts
+ * as done when a later stage has one" (see the `outcome` branch below)
+ * handles correctly, the same way `masters` having no timing when there is
+ * no masters work already does. `drizzle` is M3 work, always `off` in M1 —
  * mirrored onto a real member below rather than included here.
  */
 const TIMED_STAGES: readonly Stage[] = [
@@ -57,6 +63,7 @@ const TIMED_STAGES: readonly Stage[] = [
   'measure',
   'reference',
   'register',
+  'normalize',
   'integrate',
   'output',
 ];
@@ -395,18 +402,16 @@ export function rowState(
     // has a timing entry — every stage up to and including the last timed
     // one completed (a stage without an entry of its own counts as done
     // when a later stage has one: `masters` pushes no timing when there is
-    // no masters work, which is most runs), the stop row reads
-    // 'cancelled'/'failed', everything after it never ran. `normalize` has
-    // no timing of its own (folded into `integrate_group`, spec ruling 14)
-    // — mirror `integrate`'s read, same convention as `debayer` mirroring
-    // `calibrate` above. `integrate`'s timing is pushed once after the
-    // whole group loop, so a cancel inside any group's integration reads
-    // 'cancelled' on the Integrate row. When nothing finished at all and
-    // the plan has no masters work, the stop row is `calibrate` — the
-    // Masters row is 'off' (returned above) and must not absorb the stop.
+    // no masters work, which is most runs, and — final fix wave, ruling R5
+    // — `normalize` pushes no timing when LN was off for the run, the same
+    // way), the stop row reads 'cancelled'/'failed', everything after it
+    // never ran. `integrate`'s timing is pushed once after the whole group
+    // loop, so a cancel inside any group's integration reads 'cancelled' on
+    // the Integrate row. When nothing finished at all and the plan has no
+    // masters work, the stop row is `calibrate` — the Masters row is 'off'
+    // (returned above) and must not absorb the stop.
     if (finishedStages) {
-      const timedStage = stage === 'normalize' ? 'integrate' : stage;
-      const mine = TIMED_STAGES.indexOf(timedStage);
+      const mine = TIMED_STAGES.indexOf(stage);
       if (mine === -1) {
         // Not one of the timeable stages (drizzle, still 'off' in M1) —
         // fall through to the coarse read below rather than guess.
