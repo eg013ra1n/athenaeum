@@ -91,6 +91,15 @@ fn scaled_crpix(u: f64, s: f64) -> f64 {
 /// Decodes with [`parse_sip_table`] (the same helper `wcs_cards` uses), so a
 /// malformed table is the same [`FitsWriteError::Malformed`] here, never a
 /// silent linear-only result. `None` stays `None`.
+///
+/// Fix round 1 (review M2): a scaled term is checked for finiteness before
+/// re-encoding. `serde_json::to_string` does not error on `NaN`/`±inf` — it
+/// silently writes JSON `null` — and the re-encoded table would then fail
+/// `parse_sip_table` later (inside `wcs_cards`), an error that would blame
+/// the stored solve for a table Athenaeum itself just produced. A low-order
+/// term (exponent `s^1`, only reachable at `i + j == 0`) is the one branch
+/// that can overflow a legitimately finite, JSON-representable input
+/// coefficient into `±inf` after scaling.
 fn scale_sip_table_opt(
     name: &str,
     json: Option<&str>,
@@ -100,16 +109,20 @@ fn scale_sip_table_opt(
         return Ok(None);
     };
     let table = parse_sip_table(name, json)?;
-    let scaled: Vec<Vec<f64>> = table
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            row.iter()
-                .enumerate()
-                .map(|(j, &v)| v * s.powi(1 - i as i32 - j as i32))
-                .collect()
-        })
-        .collect();
+    let mut scaled: Vec<Vec<f64>> = Vec::with_capacity(table.len());
+    for (i, row) in table.iter().enumerate() {
+        let mut scaled_row = Vec::with_capacity(row.len());
+        for (j, &v) in row.iter().enumerate() {
+            let sv = v * s.powi(1 - i as i32 - j as i32);
+            if !sv.is_finite() {
+                return Err(FitsWriteError::Malformed(format!(
+                    "SIP table {name} term ({i},{j}) is not finite after drizzle scaling: {sv}"
+                )));
+            }
+            scaled_row.push(sv);
+        }
+        scaled.push(scaled_row);
+    }
     let json = serde_json::to_string(&scaled).map_err(|e| {
         FitsWriteError::Malformed(format!(
             "SIP table {name} failed to re-encode after drizzle scaling: {e}"
@@ -408,12 +421,18 @@ mod tests {
     }
 
     // Drizzle SIP tables (M3 Task 4, R-M3-13): order-2, square (order+1)x(order+1).
-    // Only A_2_0/A_1_1/A_0_2 (the order-2 terms, all sharing exponent
-    // s^(1-2)=s^-1) are asserted below — the pinned values are the brief's
-    // own worked example. B is present so `has_sip` stays satisfied by a
-    // real record but its scaled values are not separately asserted here.
-    const DRIZZLE_SIP_A: &str = "[[0.0,0.0,3.0e-6],[0.0,2.0e-6,0.0],[1.0e-6,0.0,0.0]]";
-    const DRIZZLE_SIP_B: &str = "[[0.0,0.0,-3.0e-6],[0.0,-2.0e-6,0.0],[-1.0e-6,0.0,0.0]]";
+    // Fix round 1 (review M1): the order-2 terms A_2_0/A_1_1/A_0_2 (exponent
+    // s^(1-2)=s^-1) are the brief's own worked example; A_0_0/A_0_1/A_1_0
+    // (exponents s^1/s^0/s^0 respectively) were added so every distinct
+    // exponent branch the scaling rule can take is exercised, not just the
+    // order-2 one — this codebase's solver really does fit non-zero
+    // constant/linear terms into the table (see the module doc above), so
+    // those branches are production-reachable. B is present so `has_sip`
+    // stays satisfied by a real record; its scaled values are not
+    // separately asserted (A already covers every exponent branch).
+    const DRIZZLE_SIP_A: &str = "[[4.0e-6,5.0e-6,3.0e-6],[6.0e-6,2.0e-6,0.0],[1.0e-6,0.0,0.0]]";
+    const DRIZZLE_SIP_B: &str =
+        "[[-4.0e-6,-5.0e-6,-3.0e-6],[-6.0e-6,-2.0e-6,0.0],[-1.0e-6,0.0,0.0]]";
 
     fn drizzle_record() -> PlateSolveRecord {
         PlateSolveRecord {
@@ -480,9 +499,16 @@ mod tests {
         assert_eq!(scaled.rms_residual_arcsec, solve.rms_residual_arcsec);
 
         let a = sip_table(scaled.sip_a_coeffs.as_deref().unwrap());
+        // order-2 terms: exponent s^(1-2) = s^-1
         assert!((a[2][0] - 5.0e-7).abs() < 1e-15, "A_2_0: {}", a[2][0]);
         assert!((a[1][1] - 1.0e-6).abs() < 1e-15, "A_1_1: {}", a[1][1]);
         assert!((a[0][2] - 1.5e-6).abs() < 1e-15, "A_0_2: {}", a[0][2]);
+        // Fix round 1 (review M1): the other two exponent branches.
+        // constant (i=j=0): exponent s^(1-0) = s^1 -> 4e-6 * 2 = 8e-6
+        assert!((a[0][0] - 8.0e-6).abs() < 1e-15, "A_0_0: {}", a[0][0]);
+        // linear (i+j=1): exponent s^(1-1) = s^0 = 1 -> UNCHANGED
+        assert!((a[0][1] - 5.0e-6).abs() < 1e-15, "A_0_1: {}", a[0][1]);
+        assert!((a[1][0] - 6.0e-6).abs() < 1e-15, "A_1_0: {}", a[1][0]);
 
         // s = 1 is an unchanged clone (byte-identical SIP JSON too, no
         // decode/re-encode round-trip drift).
@@ -504,13 +530,35 @@ mod tests {
         );
     }
 
-    /// Fallback per the task brief: no pixel->sky evaluator exists in this
-    /// crate, so this asserts the linear part directly — `CD'·(p' −
-    /// CRPIX') == CD·(p − CRPIX)` for three pixels, where `p'` is the
-    /// output-grid coordinate of `p` (`stacking::drizzle::geom::to_output`,
-    /// the SAME formula `scaled_crpix` duplicates above). A record with no
-    /// SIP is used since the SIP correction is not part of this identity.
+    /// Fix round 1 (review M2): a legitimately finite, JSON-representable
+    /// constant SIP term (exponent `s^1`, the one branch that can grow
+    /// rather than shrink) that overflows to `+inf` once scaled is a
+    /// `Malformed` error, never a silent `null` in the re-encoded JSON.
     #[test]
+    fn scale_plate_solve_rejects_a_sip_term_that_overflows_to_infinity() {
+        let mut solve = drizzle_record();
+        solve.sip_a_coeffs = Some("[[1.0e308,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0]]".to_string());
+        let err = scale_plate_solve(&solve, 2).unwrap_err();
+        assert!(err.to_string().contains("not finite"), "got {err}");
+    }
+
+    /// Fallback per the task brief: this asserts the linear part directly —
+    /// `CD'·(p' − CRPIX') == CD·(p − CRPIX)` for three pixels, where `p'` is
+    /// the output-grid coordinate of `p` (`stacking::drizzle::geom::
+    /// to_output`, the SAME formula `scaled_crpix` duplicates above). A
+    /// record with no SIP is used since the SIP correction is not part of
+    /// this identity — see `scaled_solve_matches_the_solvers_own_pixel_to_sky_evaluator`
+    /// below for the full (CRPIX + CD + SIP) identity via the real solver.
+    ///
+    /// Fix round 1 (review M7): gated the same way `stacking` itself is
+    /// (`fits_writer` is unconditional, so an ungated import of
+    /// `crate::stacking::…` here cannot resolve if `stacking` is ever
+    /// compiled out) — not a live gate breakage today (no headless *test*
+    /// build exists in CI; `cargo check --no-default-features` never
+    /// compiles `#[cfg(test)]` code), recorded so nobody is surprised if one
+    /// is added later.
+    #[test]
+    #[cfg(all(feature = "render", feature = "solver"))]
     fn scaled_solve_preserves_the_linear_pixel_to_sky_map() {
         use crate::stacking::drizzle::geom::to_output;
 
@@ -542,6 +590,59 @@ mod tests {
             assert!(
                 (scaled_delta.1 - orig.1).abs() < 1e-12,
                 "y: {scaled_delta:?} vs {orig:?}"
+            );
+        }
+    }
+
+    /// Fix round 1 (review M1): the full identity — CRPIX, CD **and** SIP —
+    /// through the solver's own `pixel_to_sky` evaluator
+    /// (`solvemyastro::WcsSolution`, re-exported at the crate root and
+    /// already used the same way in `plate_solve::service`), not just the
+    /// linear part `scaled_solve_preserves_the_linear_pixel_to_sky_map`
+    /// covers above. `solvemyastro` is the optional path dependency behind
+    /// the `solver` feature (on by default) — gated the same way, no
+    /// `render`/`stacking` dependency needed since `p'` is computed with the
+    /// already-in-scope `scaled_crpix` instead of `geom::to_output`.
+    #[test]
+    #[cfg(feature = "solver")]
+    fn scaled_solve_matches_the_solvers_own_pixel_to_sky_evaluator() {
+        use solvemyastro::{SipCoefficients, WcsSolution};
+
+        let solve = drizzle_record(); // has SIP
+        let s = 2u32;
+        let scaled = scale_plate_solve(&solve, s).unwrap();
+
+        let to_wcs = |r: &PlateSolveRecord| -> WcsSolution {
+            let order = r.sip_order.unwrap() as u8;
+            let a = sip_table(r.sip_a_coeffs.as_deref().unwrap());
+            let b = sip_table(r.sip_b_coeffs.as_deref().unwrap());
+            WcsSolution {
+                crpix: (r.crpix1, r.crpix2),
+                crval: (r.crval1, r.crval2),
+                cd: [[r.cd1_1, r.cd1_2], [r.cd2_1, r.cd2_2]],
+                sip_forward: Some((
+                    SipCoefficients { order, coeffs: a },
+                    SipCoefficients { order, coeffs: b },
+                )),
+                sip_reverse: None,
+            }
+        };
+
+        let orig_wcs = to_wcs(&solve);
+        let scaled_wcs = to_wcs(&scaled);
+
+        for (px, py) in [(0.0, 0.0), (500.0, 300.0), (-200.0, 4000.0)] {
+            let orig_sky = orig_wcs.pixel_to_sky(px, py);
+            let (opx, opy) = (scaled_crpix(px, s as f64), scaled_crpix(py, s as f64));
+            let scaled_sky = scaled_wcs.pixel_to_sky(opx, opy);
+
+            assert!(
+                (orig_sky.0 - scaled_sky.0).abs() < 1e-9,
+                "ra: {orig_sky:?} vs {scaled_sky:?}"
+            );
+            assert!(
+                (orig_sky.1 - scaled_sky.1).abs() < 1e-9,
+                "dec: {orig_sky:?} vs {scaled_sky:?}"
             );
         }
     }

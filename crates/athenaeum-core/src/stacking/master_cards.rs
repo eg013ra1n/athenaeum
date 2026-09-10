@@ -235,10 +235,18 @@ fn is_sip_term_keyword(keyword: &str) -> bool {
 /// [`build_drizzle_cards`] stamps into `ATH_DRZK`. Goes through
 /// `serde_json` rather than a hand-written match so the card can never
 /// drift from the config's own wire representation.
-fn drizzle_kernel_serde_name(kernel: DrizzleKernel) -> String {
+///
+/// Fix round 1 (review M6): returns `Result` rather than panicking — sound
+/// today (`DrizzleKernel` is a unit-only enum, so serde always yields a
+/// string), but a future struct-variant addition would otherwise turn into
+/// a runtime panic inside the header writer instead of a caller-visible
+/// error.
+fn drizzle_kernel_serde_name(kernel: DrizzleKernel) -> Result<String, FitsWriteError> {
     match serde_json::to_value(kernel) {
-        Ok(serde_json::Value::String(s)) => s,
-        other => unreachable!("DrizzleKernel serializes to a JSON string, got {other:?}"),
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        other => Err(FitsWriteError::Malformed(format!(
+            "DrizzleKernel did not serialize to a JSON string: {other:?}"
+        ))),
     }
 }
 
@@ -271,7 +279,7 @@ pub fn build_drizzle_cards(
         Card::new(ATH_DRZP, CardValue::Real(drop_shrink))?.with_comment("drizzle drop shrink"),
     );
     cards.push(
-        Card::new(ATH_DRZK, CardValue::Str(drizzle_kernel_serde_name(kernel)))?
+        Card::new(ATH_DRZK, CardValue::Str(drizzle_kernel_serde_name(kernel)?))?
             .with_comment("drizzle kernel"),
     );
 
@@ -409,12 +417,38 @@ pub struct WrittenDrizzle {
 /// drizzle output still names its own weight map, not a sibling's) — the
 /// same two-step pattern [`write_master_light`] uses for its rejection
 /// maps.
+///
+/// Not atomic as a pair (fix round 1, review M4 — the same property
+/// [`write_master_light`] documents for its own master/map pair): the
+/// drizzle output lands before the weight map, so a failed weight-map write
+/// leaves the drizzle output on disk with no weight map (re-running never
+/// overwrites it — `resolve_collision` suffixes the retry). Two runs
+/// writing into one folder concurrently can resolve the same free name
+/// (`resolve_collision` is check-then-write); the orchestrator serializes
+/// group writes.
+///
+/// `cards` must be built for `output.stats.scale` (`build_drizzle_cards`'s
+/// own `scale` argument) — a `debug_assert!` (fix round 1, review M3) below
+/// catches a caller that names the file for one scale while stamping
+/// `ATH_DRZ` for another, which would otherwise ship a drizzled master
+/// whose file name and header silently disagree.
 pub fn write_drizzled_master(
     dir: &Path,
     master_stem: &str,
     output: &DrizzleOutput,
     cards: &[Card],
 ) -> anyhow::Result<WrittenDrizzle> {
+    debug_assert!(
+        cards
+            .iter()
+            .find(|c| c.keyword == ATH_DRZ)
+            .and_then(|c| c.value.as_ref())
+            .is_none_or(|v| *v == CardValue::Integer(output.stats.scale as i64)),
+        "write_drizzled_master: cards' ATH_DRZ must match output.stats.scale ({}) \
+         — the drizzle file name and its header would otherwise disagree on scale",
+        output.stats.scale
+    );
+
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let (drizzle_name, _) = drizzle_file_names(master_stem, output.stats.scale);
@@ -1078,14 +1112,28 @@ mod tests {
         );
         assert_eq!(cards.iter().filter(|c| c.keyword == "A_2_0").count(), 1);
 
-        // no keyword wcs_cards emits is duplicated
-        for kw in [
-            "CTYPE1", "CRVAL1", "CD1_1", "CUNIT1", "RADESYS", "EQUINOX", "PLTSOLVD", "A_ORDER",
-        ] {
+        // Fix round 1 (review I1): DERIVED pins, not a second hand-copied
+        // keyword list — `is_wcs_keyword`'s whole job is to recognise every
+        // keyword `wcs_cards` can emit, so the test must check it against
+        // `wcs_cards` itself, not against a list that only agrees with the
+        // implementation because both were typed by hand from the same
+        // source. A future card added to `wcs_cards` without a matching
+        // `is_wcs_keyword` update now fails HERE instead of shipping as a
+        // silent duplicate FITS keyword in every drizzled master.
+        for c in wcs_cards(&solve).unwrap() {
+            assert!(
+                is_wcs_keyword(&c.keyword),
+                "wcs_cards emits {} but is_wcs_keyword does not know it",
+                c.keyword
+            );
+        }
+        // no keyword wcs_cards(&scaled) emits is duplicated in the output
+        for c in wcs_cards(&scaled).unwrap() {
             assert_eq!(
-                cards.iter().filter(|c| c.keyword == kw).count(),
+                cards.iter().filter(|x| x.keyword == c.keyword).count(),
                 1,
-                "{kw} duplicated or missing"
+                "{} duplicated or missing",
+                c.keyword
             );
         }
 
