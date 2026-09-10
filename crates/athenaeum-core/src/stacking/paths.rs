@@ -470,13 +470,17 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
 }
 
 /// Inputs to [`estimate_bytes`]: the groups a run would integrate, and the
-/// two output toggles that change how much gets written (whether registered
+/// output toggles that change how much gets written (whether registered
 /// frames are kept on disk, whether rejection maps are written alongside the
-/// master).
+/// master, and — M3 Task 5 — whether drizzle runs at all).
 pub struct EstimateInputs<'a> {
     pub groups: &'a [IntegrationGroup],
     pub write_registered: bool,
     pub write_maps: bool,
+    /// `Some((scale, write_weight_map, use_rejection))` when
+    /// `DrizzleConfig::enabled` — `None` when drizzle is off, adding
+    /// nothing to the estimate.
+    pub drizzle: Option<(u32, bool, bool)>,
 }
 
 /// Rough byte estimate for a run's working+output footprint: every group
@@ -491,6 +495,17 @@ pub struct EstimateInputs<'a> {
 /// early, before any run has even started). This is a footprint estimate,
 /// not an exact accounting: it ignores compression, FITS header overhead,
 /// and the ln/intermediates M2 adds.
+///
+/// M3 Task 5 (spec §7): when `i.drizzle` is `Some`, two more per-group terms
+/// use the SAME largest-member geometry the master term above does —
+/// rejection bitmaps (`use_rejection`, one `.rej` per included frame,
+/// `ceil(W/64)` u64 words per row per plane, per `rej.rs`'s own layout:
+/// `included * planes * ceil(W/64) * 8 * H`) and the drizzled output itself
+/// (`planes * (W*scale) * (H*scale) * 4`, doubled when `write_weight_map` is
+/// on — the weight map is the same geometry). "included" here is the
+/// group's own frame count (`g.frames.len()`), the same approximation the
+/// calibrated/master terms above already make — the real min-weight drop
+/// only happens inside a run, not at plan time.
 pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
     let mut total = 0u64;
     for g in i.groups {
@@ -515,6 +530,19 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
         let master_per_frame_bytes = planes * max_w * max_h * 4;
         let master_multiplier: u64 = if i.write_maps { 1 + 2 } else { 1 };
         total += master_per_frame_bytes * master_multiplier;
+
+        if let Some((scale, write_weight_map, use_rejection)) = i.drizzle {
+            if use_rejection {
+                let words_per_row = max_w.div_ceil(64);
+                total += g.frames.len() as u64 * planes * words_per_row * 8 * max_h;
+            }
+            let s = scale as u64;
+            let drizzle_output_bytes = planes * (max_w * s) * (max_h * s) * 4;
+            total += drizzle_output_bytes;
+            if write_weight_map {
+                total += drizzle_output_bytes;
+            }
+        }
     }
     total
 }
@@ -1041,6 +1069,7 @@ mod tests {
             groups: &groups,
             write_registered: false,
             write_maps: true,
+            drizzle: None,
         };
         let expected = 2 * 400 + 1 * 1200 + (400 * 3) + (1200 * 3);
         assert_eq!(estimate_bytes(&inputs), expected);
@@ -1053,17 +1082,65 @@ mod tests {
             groups: &groups,
             write_registered: false,
             write_maps: false,
+            drizzle: None,
         });
         let on = estimate_bytes(&EstimateInputs {
             groups: &groups,
             write_registered: true,
             write_maps: false,
+            drizzle: None,
         });
         assert_eq!(
             on,
             off + 3 * 400,
             "registered adds one more calibrated-sized copy per frame"
         );
+    }
+
+    /// M3 Task 5, brief test (g): the estimate grows by the bitmap +
+    /// drizzled-output terms once `drizzle` is `Some`. A 10x10 mono group of
+    /// 3 frames at `scale = 2`, `write_weight_map = true`,
+    /// `use_rejection = true`: bitmaps = `3 * 1 * ceil(10/64) * 8 * 10` =
+    /// `3 * 1 * 1 * 8 * 10` = `240`; drizzled output = `1 * 20 * 20 * 4` =
+    /// `1600`; weight map doubles it to `3200`. Total added: `240 + 3200`.
+    #[test]
+    fn estimate_grows_by_the_drizzle_bitmap_and_output_terms() {
+        let groups = vec![group(ColorMode::Mono, 3, 10, 10)];
+        let without_drizzle = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: None,
+        });
+        let with_drizzle = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: Some((2, true, true)),
+        });
+        assert_eq!(
+            with_drizzle,
+            without_drizzle + 240 + 3200,
+            "without = {without_drizzle}, with = {with_drizzle}"
+        );
+
+        // No weight map: the output term is added only once.
+        let with_drizzle_no_weight_map = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: Some((2, false, true)),
+        });
+        assert_eq!(with_drizzle_no_weight_map, without_drizzle + 240 + 1600);
+
+        // No rejection: the bitmap term drops out entirely.
+        let with_drizzle_no_rejection = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: Some((2, true, false)),
+        });
+        assert_eq!(with_drizzle_no_rejection, without_drizzle + 3200);
     }
 
     // ── usage + cleanup ──────────────────────────────────────────────────

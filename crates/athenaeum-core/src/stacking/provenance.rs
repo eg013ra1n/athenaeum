@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::integration::stats::ScaleEstimator;
 use crate::stacking::config::{ReferenceMode, StackingConfig};
+use crate::stacking::drizzle::DrizzleStats;
 use crate::stacking::integrate::GroupStats;
 use crate::stacking::plan::{MasterWork, Stage};
 
@@ -148,6 +149,23 @@ pub struct SummaryGroup {
     /// `SummaryFrame::ln_scale`'s own doc.
     #[serde(default)]
     pub ln_reference_path: Option<String>,
+    /// M3 Task 5 (spec §7, rulings R-M3-7/R-M3-9): the group's drizzled
+    /// master, when the run's drizzle stage wrote one for it — `None` when
+    /// drizzle is off, this group's drizzle failed (`warnings` carries the
+    /// reason; the master above is unaffected either way), or the group
+    /// never reached Output. `#[serde(default)]`, see `SummaryFrame::ln_scale`'s
+    /// own doc for why every M3 field here follows that convention.
+    #[serde(default)]
+    pub drizzle_path: Option<String>,
+    /// The drizzle weight map alongside `drizzle_path`, when
+    /// `DrizzleConfig::write_weight_map` was on for this run — `None`
+    /// whenever `drizzle_path` is `None` too, or the toggle was off.
+    #[serde(default)]
+    pub weight_map_path: Option<String>,
+    /// The drizzle stage's own per-group stats, `Some` exactly when
+    /// `drizzle_path` is.
+    #[serde(default)]
+    pub drizzle: Option<DrizzleStats>,
     pub frames: Vec<SummaryFrame>,
 }
 

@@ -37,6 +37,7 @@ use crate::stacking::config::{
 };
 use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::paths::{self, EstimateInputs};
+use crate::stacking::run::group_anchor_geometry;
 
 /// One pipeline stage (spec §10.2's `stage` enum, minus the `Ok`-only
 /// distinction between "never run" and "cached"). [`Self::as_str`] is the
@@ -163,6 +164,16 @@ pub struct PlanGroup {
     /// this field's computation in [`build_plan`] for why (the LN reference
     /// member list is a stage-3 weight quantity, unavailable at plan time).
     pub ln_cached: usize,
+    /// M3 Task 5: the group's reference-anchor member's own native
+    /// `NAXIS1`/`NAXIS2` — the SAME member and the SAME convention
+    /// `stacking::run::group_anchor_geometry` uses to stamp
+    /// `stacking_run_groups.width`/`height` at insert time (a plan and the
+    /// run it precedes must never disagree about which member anchors a
+    /// group's geometry). `None` only for an (unreachable in practice)
+    /// empty group. Frontend's Task 6 drizzle estimate line reads these —
+    /// the run's own actual reference geometry is not known this early.
+    pub anchor_width: Option<i64>,
+    pub anchor_height: Option<i64>,
 }
 
 /// The plan's resolved reference frame, or the lack of one. `Auto` never
@@ -1152,6 +1163,11 @@ pub fn build_plan(
         groups: &estimate_groups,
         write_registered: cfg.registration.write_registered_frames,
         write_maps: cfg.integration.write_rejection_maps,
+        drizzle: cfg.drizzle.enabled.then_some((
+            cfg.drizzle.scale,
+            cfg.drizzle.write_weight_map,
+            cfg.drizzle.use_rejection,
+        )),
     });
 
     // Gate 4: space.
@@ -1363,6 +1379,7 @@ pub fn build_plan(
             any_group_has_three_included = true;
         }
 
+        let (anchor_width, anchor_height) = group_anchor_geometry(g);
         plan_groups.push(PlanGroup {
             key: g.key.clone(),
             instrume: g.instrume.clone(),
@@ -1377,6 +1394,8 @@ pub fn build_plan(
             calibrated_cached,
             metrics_cached,
             ln_cached,
+            anchor_width,
+            anchor_height,
         });
     }
 
@@ -1410,11 +1429,14 @@ pub fn build_plan(
     // (M2) is no longer blocked here — fix round 1: `integrate_group` (M2
     // Task 7) has a real `GroupInput.ln` conduit for both output and
     // rejection normalization now, so a plan with `normalization.local.
-    // enabled` (or `rejection == "local"`) runs like any other.
-    if cfg.drizzle.enabled {
+    // enabled` (or `rejection == "local"`) runs like any other. M3 Task 5:
+    // drizzle itself is no longer blocked — only an out-of-range `scale`
+    // is (ruling R-M3-10; `dropShrink` outside `[0.5, 1.0]` is a run-time
+    // clamp, not a plan blocker).
+    if cfg.drizzle.enabled && !(1..=3).contains(&cfg.drizzle.scale) {
         blockers.push(PlanBlocker {
             code: "unsupported".to_string(),
-            message: "Drizzle arrives in M3".to_string(),
+            message: "drizzle scale must be 1, 2 or 3".to_string(),
         });
     }
 
@@ -3532,12 +3554,14 @@ mod tests {
     /// Blocker order is stable and matches the gate order exactly (fix
     /// round 1 item 7): no calibration links (masters/links) fires first,
     /// then both folder sentences (in `working`, `output` order), then
-    /// `frames` (fewer than 3 included), then drizzle's `unsupported`
-    /// toggle (the only one left — M2 fix round 1 item 1(a) removed local
-    /// normalization's own, `cfg.normalization.local.enabled` is set below
-    /// specifically to pin that it adds no blocker of its own) —
-    /// `reference`/`space` never appear here (Auto mode; free space is
-    /// never probed once the folders themselves are blocked).
+    /// `frames` (fewer than 3 included) — nothing from gate 6 (M2 fix round
+    /// 1 item 1(a) removed local normalization's own blocker,
+    /// `cfg.normalization.local.enabled` is set below specifically to pin
+    /// that it adds none of its own; M3 Task 5 removed drizzle's blanket
+    /// "arrives in M3" one — `cfg.drizzle.enabled` at its default `scale`
+    /// (2, in range) is pinned here to add none either, brief test (g)'s
+    /// first half) — `reference`/`space` never appear here (Auto mode; free
+    /// space is never probed once the folders themselves are blocked).
     #[test]
     fn blocker_order_is_stable() {
         let f = test_fixtures::frame_set("LDN 1272");
@@ -3565,12 +3589,52 @@ mod tests {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
         assert_eq!(
             codes,
-            vec!["links", "folders", "folders", "frames", "unsupported"],
+            vec!["links", "folders", "folders", "frames"],
             "{:?}",
             plan.blockers
         );
         assert_eq!(plan.blockers[1].message, "Choose a working folder");
         assert_eq!(plan.blockers[2].message, "Choose an output folder");
-        assert_eq!(plan.blockers[4].message, "Drizzle arrives in M3");
+    }
+
+    /// M3 Task 5, brief test (g), second half: an out-of-range drizzle
+    /// `scale` (ruling R-M3-10: only 1, 2 or 3 are supported) is the ONE
+    /// thing gate 6 still blocks on.
+    #[test]
+    fn drizzle_out_of_range_scale_is_the_one_gate_6_blocker() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"]
+            .iter()
+            .enumerate()
+        {
+            test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+        }
+
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 4;
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+
+        let unsupported: Vec<&str> = plan
+            .blockers
+            .iter()
+            .filter(|b| b.code == "unsupported")
+            .map(|b| b.message.as_str())
+            .collect();
+        assert_eq!(
+            unsupported,
+            vec!["drizzle scale must be 1, 2 or 3"],
+            "{:?}",
+            plan.blockers
+        );
     }
 }

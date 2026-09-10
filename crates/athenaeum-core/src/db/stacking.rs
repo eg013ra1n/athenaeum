@@ -244,6 +244,12 @@ pub struct NewGroup<'a> {
 pub struct GroupUpdate<'a> {
     pub included_count: Option<i64>,
     pub master_path: Option<&'a str>,
+    /// M3 Task 5: the group's drizzled master, when the run's drizzle stage
+    /// wrote one for it — set via its own, later `update_group` call (the
+    /// column exists since Plan 5a; drizzle just never had a writer for it
+    /// until now). `None` means "leave the column alone" like every other
+    /// field here, never "clear it".
+    pub drizzle_path: Option<&'a str>,
     pub rejection_low_path: Option<&'a str>,
     pub rejection_high_path: Option<&'a str>,
     pub stats_json: Option<&'a str>,
@@ -439,6 +445,7 @@ pub fn update_group(conn: &Connection, group_id: i64, u: &GroupUpdate<'_>) -> Re
     }
     set_field!("included_count", u.included_count);
     set_field!("master_path", u.master_path);
+    set_field!("drizzle_path", u.drizzle_path);
     set_field!("rejection_low_path", u.rejection_low_path);
     set_field!("rejection_high_path", u.rejection_high_path);
     set_field!("stats_json", u.stats_json);

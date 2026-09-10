@@ -239,13 +239,13 @@ pub enum StackingPreset {
 
 /// Resolves a [`StackingPreset`] to its `StackingConfig`.
 ///
-/// `MaximumQuality` implements only the two knobs M1 actually has
-/// (`distortion`, `writeRejectionMaps`): the spec's eventual text for this
-/// preset also turns on local normalization and 2x drizzle, but
-/// `integrate_group` refuses `RejectionNormalization::Local` today and the
-/// drizzle stage does not exist yet (M2/M3) — turning either on here would
-/// make the preset fail every run until those milestones land, so both stay
-/// at the M1 default (off) until then.
+/// `MaximumQuality` (M3 Task 5, spec §9.2): now turns on everything the spec
+/// text always described — `distortion`, `writeRejectionMaps`, LOCAL
+/// NORMALIZATION and 2x DRIZZLE. M1/M2 kept the latter two off here because
+/// `integrate_group` refused `RejectionNormalization::Local` and the
+/// drizzle stage did not exist yet; both landed (M2's acceptance run, this
+/// plan's own Tasks 1-4) and pass with the SAME preset config, so the
+/// preset no longer needs to hide them.
 pub fn preset(p: StackingPreset) -> StackingConfig {
     match p {
         StackingPreset::Default => StackingConfig::default(),
@@ -263,6 +263,9 @@ pub fn preset(p: StackingPreset) -> StackingConfig {
             let mut c = StackingConfig::default();
             c.registration.distortion = DistortionChoice::Polynomial3;
             c.integration.write_rejection_maps = true;
+            c.normalization.local.enabled = true;
+            c.drizzle.enabled = true;
+            c.drizzle.scale = 2;
             c
         }
     }
@@ -499,8 +502,12 @@ mod tests {
         let m = preset(StackingPreset::MaximumQuality);
         assert_eq!(m.registration.distortion, DistortionChoice::Polynomial3);
         assert!(m.integration.write_rejection_maps);
-        assert!(!m.normalization.local.enabled);
-        assert!(!m.drizzle.enabled);
+        // M3 Task 5, brief test (h): MaximumQuality turns on drizzle 2x AND
+        // local normalization (spec §9.2) — both hidden in M1/M2 only
+        // because neither stage existed yet.
+        assert!(m.normalization.local.enabled);
+        assert!(m.drizzle.enabled);
+        assert_eq!(m.drizzle.scale, 2);
         assert_eq!(preset(StackingPreset::Default), StackingConfig::default());
     }
 

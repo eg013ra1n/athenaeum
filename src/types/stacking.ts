@@ -165,7 +165,18 @@ export type PlanGroup = { key: string, instrume: string | null, colorMode: Color
  * this field's computation in [`build_plan`] for why (the LN reference
  * member list is a stage-3 weight quantity, unavailable at plan time).
  */
-lnCached: number, };
+lnCached: number, 
+/**
+ * M3 Task 5: the group's reference-anchor member's own native
+ * `NAXIS1`/`NAXIS2` — the SAME member and the SAME convention
+ * `stacking::run::group_anchor_geometry` uses to stamp
+ * `stacking_run_groups.width`/`height` at insert time (a plan and the
+ * run it precedes must never disagree about which member anchors a
+ * group's geometry). `None` only for an (unreachable in practice)
+ * empty group. Frontend's Task 6 drizzle estimate line reads these —
+ * the run's own actual reference geometry is not known this early.
+ */
+anchorWidth: number | null, anchorHeight: number | null, };
 
 export type PlanReference = { mode: ReferenceMode, frameId: number | null, filename: string | null, onDisk: boolean, };
 
@@ -232,7 +243,27 @@ export type SummaryGroup = { key: string, frameCount: number, includedCount: num
  * global normalization applied. `#[serde(default)]`, see
  * `SummaryFrame::ln_scale`'s own doc.
  */
-lnReferencePath: string | null, frames: Array<SummaryFrame>, };
+lnReferencePath: string | null, 
+/**
+ * M3 Task 5 (spec §7, rulings R-M3-7/R-M3-9): the group's drizzled
+ * master, when the run's drizzle stage wrote one for it — `None` when
+ * drizzle is off, this group's drizzle failed (`warnings` carries the
+ * reason; the master above is unaffected either way), or the group
+ * never reached Output. `#[serde(default)]`, see `SummaryFrame::ln_scale`'s
+ * own doc for why every M3 field here follows that convention.
+ */
+drizzlePath: string | null, 
+/**
+ * The drizzle weight map alongside `drizzle_path`, when
+ * `DrizzleConfig::write_weight_map` was on for this run — `None`
+ * whenever `drizzle_path` is `None` too, or the toggle was off.
+ */
+weightMapPath: string | null, 
+/**
+ * The drizzle stage's own per-group stats, `Some` exactly when
+ * `drizzle_path` is.
+ */
+drizzle: DrizzleStats | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 
@@ -328,4 +359,25 @@ weightedExposureS: number, totalExposureS: number, readMs: number, combineMs: nu
  * `Some`.
  */
 lnFrames: number, };
+
+export type DrizzleStats = { scale: number, outWidth: number, outHeight: number, 
+/**
+ * Included frames this pass drizzled (whether or not every one
+ * actually contributed — a frame skipped for zero weight still counts,
+ * mirroring `DrizzleInput::frames`'s own length).
+ */
+frames: number, kernel: DrizzleKernel, dropShrink: number, usedWeights: boolean, usedRejection: boolean, 
+/**
+ * Of `frames`, how many actually had their LN grids applied (`0` when
+ * local normalization was off for the run).
+ */
+lnFrames: number, 
+/**
+ * Per plane, measured on the drizzled (output-grid) planes.
+ */
+fwhmPx: Array<number>, eccentricity: Array<number>, noise: Array<number>, 
+/**
+ * Per plane, the fraction of output pixels with `W > 0`.
+ */
+coverage: Array<number>, readMs: number, depositMs: number, bytesRead: number, };
 

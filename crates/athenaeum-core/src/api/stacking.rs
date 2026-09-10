@@ -147,6 +147,16 @@ pub fn start_stacking(
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, ApiError> {
+    // Ruling R-M3-9: drizzle has no cache of its own — the bitmaps it reads
+    // come from integration, so "re-run from drizzle" is really "re-run
+    // from integrate". Clamped HERE, the one place both hosts call, so the
+    // web/desktop command surface never has to know this ruling exists.
+    let rerun_from = if rerun_from == Some(Stage::Drizzle) {
+        tracing::debug!(set_id, "rerun from drizzle clamped to integrate");
+        Some(Stage::Integrate)
+    } else {
+        rerun_from
+    };
     run::start_stacking(
         ctx,
         emitter,

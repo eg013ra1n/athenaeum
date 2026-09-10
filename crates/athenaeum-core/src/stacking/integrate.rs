@@ -591,6 +591,38 @@ pub(crate) fn integrate_planes<'g>(
     Ok((outputs, output_pairs_out))
 }
 
+/// The min-weight drop's DECISION (spec §6.2): a frame whose lowest
+/// per-channel normalized weight sits below `min_weight` never joins the
+/// stack; the reference is exempt (dropping it would leave nothing to
+/// normalize the rest against). Returns the included frame indices into
+/// `frames`, in `frames`' own order.
+///
+/// Extracted (M3 Task 5) so `stacking::run` can compute the SAME set BEFORE
+/// calling [`integrate_group`], to size and order a group's rejection-bitmap
+/// set to match what `integrate_group` will actually integrate — the two
+/// must never disagree about which frames survive the floor, so this is the
+/// only place the rule itself is expressed; both callers pass identical
+/// inputs and get an identical answer, deterministically.
+pub(crate) fn included_after_min_weight(
+    frames: &[StackFrame],
+    reference: usize,
+    min_weight: f64,
+) -> Vec<usize> {
+    frames
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let wmin = f
+                .weight
+                .normalized
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            (wmin >= min_weight || i == reference).then_some(i)
+        })
+        .collect()
+}
+
 /// Integrates one group, plane by plane (spec §6.1–6.3): resolves the Auto
 /// rejection rule, drops any frame below the weight floor, builds the
 /// rejection/output normalization pairs from the reference frame's
@@ -615,29 +647,28 @@ pub fn integrate_group(
     }
     validate_group_input(input)?;
 
-    // Min-weight drop (spec §6.2): a frame whose lowest per-channel
-    // normalized weight sits below the floor never joins the stack. The
-    // reference is exempt — dropping it would leave nothing to normalize
-    // the rest against.
+    // Min-weight drop (spec §6.2): the DECISION lives in
+    // `included_after_min_weight` (M3 Task 5) — `stacking::run` calls the
+    // same function, with the same inputs, to size and order a group's
+    // rejection-bitmap set BEFORE this call ever runs, so the two must never
+    // compute two different answers. The per-frame `warn!`s below are this
+    // function's own diagnostics over the extracted result, not a second
+    // copy of the drop rule itself.
     let min_weight = input.integration.min_weight;
-    let mut included: Vec<usize> = Vec::with_capacity(frames.len());
+    let included = included_after_min_weight(frames, input.reference, min_weight);
+    let mut included_mask = vec![false; frames.len()];
+    for &i in &included {
+        included_mask[i] = true;
+    }
     let mut dropped_below_min_weight = 0usize;
     for (i, f) in frames.iter().enumerate() {
-        let wmin = f
-            .weight
-            .normalized
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min);
-        let below = wmin < min_weight;
-        if below && i == input.reference {
-            warn!(
-                path = %f.path.display(),
-                weight = wmin,
-                min_weight,
-                "reference frame is below the minimum weight but is never dropped"
-            );
-        } else if below {
+        if !included_mask[i] {
+            let wmin = f
+                .weight
+                .normalized
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
             dropped_below_min_weight += 1;
             warn!(
                 path = %f.path.display(),
@@ -645,9 +676,22 @@ pub fn integrate_group(
                 min_weight,
                 "frame dropped below the minimum weight"
             );
-            continue;
+        } else if i == input.reference {
+            let wmin = f
+                .weight
+                .normalized
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            if wmin < min_weight {
+                warn!(
+                    path = %f.path.display(),
+                    weight = wmin,
+                    min_weight,
+                    "reference frame is below the minimum weight but is never dropped"
+                );
+            }
         }
-        included.push(i);
     }
     if included.len() < 3 {
         return Err(IntegrationError::BadInput(format!(
