@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use astroimage::ImageAnalyzer;
+use astroimage::{DetectionLevels, ImageAnalyzer};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -32,8 +32,23 @@ pub struct MeasureOptions {
     /// Detection cap (spec §9.2 `maxStars`).
     pub max_stars: usize,
     pub scale_estimator: ScaleEstimator,
-    /// The sensitivity dial — the detector itself is threshold-free.
+    /// The sensitivity dial — a flux-SNR floor on the detections the fitter
+    /// is seeded with (the detector's own `flux / sqrt(flux + pi*r_ap^2*sigma^2)`).
     pub min_snr: f32,
+    /// Star-detection threshold for the seed population, in sigma above the
+    /// LOCAL background (spec §9.2 `measurement.detectionSigma`). The
+    /// detector's two ladder levels become `background + k*noise` with
+    /// `k = detection_sigma` and `k/2` — the fainter level the scan retries
+    /// at, half the primary the way the rank budget's `24*max_stars` is four
+    /// times its `6*max_stars`.
+    ///
+    /// Noise-relative is the point: the rank budget this replaces set the
+    /// levels from a fixed bright-pixel count, so a sharp, bright-sky night
+    /// (higher peaks for the same flux) handed the estimator several times
+    /// the seed population a soft, dark one did, and the frame ranking
+    /// inverted against the external reference (M4a Task 2, ruling
+    /// R-M4a-1).
+    pub detection_sigma: f32,
 }
 
 impl Default for MeasureOptions {
@@ -43,9 +58,32 @@ impl Default for MeasureOptions {
             max_stars: 24576,
             scale_estimator: ScaleEstimator::Bwmv,
             min_snr: 5.0,
+            detection_sigma: DEFAULT_DETECTION_SIGMA,
         }
     }
 }
+
+/// Default for [`MeasureOptions::detection_sigma`] and
+/// [`crate::stacking::config::MeasurementConfig::detection_sigma`].
+///
+/// Calibrated in M4a Task 2 against an external reference's own per-frame
+/// PSF-fit counts and frame ranking on 368 real frames (a mono and an OSC
+/// group over three nights), sweeping `k` from 5 to 32.
+///
+/// It is deliberately far above the "5σ detection" convention, and that is
+/// not a contradiction: this threshold is compared against a star's PEAK
+/// pixel over the local background in units of the PER-PIXEL noise, while a
+/// structure-based detector's sensitivity aggregates a whole star's pixels.
+/// 20 is where our peak threshold reproduces that detector's answer best:
+/// every mono night's fit count lands inside `[0.7, 1.4]` of the
+/// reference's (1.01 / 1.05 / 0.82), and it is the only value tested at
+/// which BOTH groups' top-20 frame rankings agree with the reference
+/// (18/20 mono, 14/20 OSC — and the OSC top 20 draws from the same two
+/// nights the reference draws from). Below ~16 the population runs 15-30 %
+/// rich and the sharpest night crowds out the ranking; above ~24 that
+/// night is pushed off the top entirely and the soft nights start losing
+/// more than a quarter of their stars.
+pub const DEFAULT_DETECTION_SIGMA: f32 = 20.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -180,7 +218,15 @@ pub fn measure_plane_with_seeds(
         SeedSource::Fast => {
             let mut analyzer = ImageAnalyzer::new()
                 .with_max_stars(opts.max_stars.max(8))
-                .with_centroid_refine(false);
+                .with_centroid_refine(false)
+                // Noise-relative levels, not the detector's default rank
+                // budget: the seed population has to be set by how far
+                // above THIS frame's sky a star stands, not by a
+                // bright-pixel count that a brighter sky silently deepens.
+                .with_detection_levels(DetectionLevels::NoiseRelative {
+                    k1: opts.detection_sigma,
+                    k2: opts.detection_sigma * 0.5,
+                });
             if let Some(p) = pool {
                 analyzer = analyzer.with_thread_pool(Arc::clone(p));
             }
@@ -377,6 +423,7 @@ pub fn measure_frame_with_seeds(
             noise = m.noise,
             psf_signal_weight = m.psf_signal_weight,
             psf_snr = m.psf_snr,
+            detection_sigma = opts.detection_sigma,
             duration_ms = t.elapsed().as_millis() as u64,
             "frame plane measured"
         );
@@ -611,6 +658,59 @@ mod tests {
         assert!((c.location - 0.1).abs() < 0.001, "location {}", c.location);
     }
 
+    /// The threshold is a real dial: a high sigma keeps only the bright
+    /// end of the field, and the estimator's answer moves with the
+    /// population but not pathologically (PSFSW is quadratic in signal and
+    /// inverse-quadratic in noise — a 3x band bounds it).
+    #[test]
+    fn detection_sigma_steers_the_seed_population() {
+        // The fixture's faintest star is amplitude 0.1 on noise 0.002, i.e.
+        // 50 sigma, and the SECOND (fainter) level sits at half the dial —
+        // so the dial has to pass 100 before it cuts into the population at
+        // all. At 160 the deep level is 80 sigma and keeps roughly the
+        // brightest 70% (amplitudes are uniform on [0.1, 0.3]).
+        const HIGH_SIGMA: f32 = 160.0;
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let low = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                detection_sigma: 5.0,
+                ..MeasureOptions::default()
+            },
+            None,
+        );
+        let high = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                detection_sigma: HIGH_SIGMA,
+                ..MeasureOptions::default()
+            },
+            None,
+        );
+        assert!(
+            low.stars_fitted >= 120,
+            "sigma 5 keeps the fixture's pinned population: {}",
+            low.stars_fitted
+        );
+        assert!(
+            high.stars_fitted < low.stars_fitted,
+            "sigma {HIGH_SIGMA} must fit strictly fewer: {} vs {}",
+            high.stars_fitted,
+            low.stars_fitted
+        );
+        let r = high.psf_signal_weight / low.psf_signal_weight;
+        assert!(
+            r > 1.0 / 3.0 && r < 3.0,
+            "PSFSW sensitivity to the population is bounded: ratio {r} ({} vs {} fits)",
+            high.stars_fitted,
+            low.stars_fitted
+        );
+    }
+
     #[test]
     fn options_serde_defaults() {
         let d = MeasureOptions::default();
@@ -620,7 +720,10 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"psfModel\":\"auto\"") && json.contains("\"maxStars\":24576"));
         assert!(json.contains("\"scaleEstimator\":\"bwmv\"") && json.contains("\"minSnr\":5.0"));
-        assert!(!json.contains("\"detectionSigma\""));
+        // M4a Task 2 (ruling R-M4a-1): the seed threshold is a real option
+        // now — this used to assert the field's ABSENCE.
+        assert_eq!(d.detection_sigma, DEFAULT_DETECTION_SIGMA);
+        assert!(json.contains("\"detectionSigma\":20.0"));
         assert_eq!(
             serde_json::from_str::<MeasureOptions>("{}").unwrap(),
             MeasureOptions::default()

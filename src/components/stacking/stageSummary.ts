@@ -247,7 +247,7 @@ export function stageSummary(
     case 'debayer':
       return config.calibration.debayerOsc ? 'VNG debayer' : 'Debayer off';
     case 'measure':
-      return `${weightModeLabel(config.measurement.weightMode)} weight · ${psfModelLabel(config.measurement.psfModel)} PSF · max ${config.measurement.maxStars} stars`;
+      return `${weightModeLabel(config.measurement.weightMode)} weight · ${psfModelLabel(config.measurement.psfModel)} PSF · max ${config.measurement.maxStars} stars · σ ${config.measurement.detectionSigma}`;
     case 'reference':
       return config.reference.mode === 'auto' ? 'Auto (highest-weight frame)' : 'Manual selection';
     case 'register':

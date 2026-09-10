@@ -46,6 +46,17 @@ pub struct FitParams {
     /// A fit whose RMS residual reaches this fraction of its amplitude
     /// explains nothing and is dropped.
     pub max_fit_residual: f64,
+    /// The fitted centre must lie inside the sampling region shrunk by this
+    /// fraction per side: `|x0 − cx| ≤ (1 − 2·inner_margin)·r` (math
+    /// reference §1.4). A fit that walked out towards the region's rim is
+    /// measuring something the region only half covers.
+    pub inner_margin: f64,
+    /// Growth step of the adaptive sampling region, in pixels.
+    pub region_growth_step_px: usize,
+    /// The region stops growing once its median stops falling by at least
+    /// this fraction per step — a region that still gets darker as it grows
+    /// has not yet left the star.
+    pub region_growth_min_drop: f64,
 }
 
 impl Default for FitParams {
@@ -57,6 +68,9 @@ impl Default for FitParams {
             conv_tol: 1e-5,
             max_rejects: 5,
             max_fit_residual: 1.0,
+            inner_margin: 0.15,
+            region_growth_step_px: 1,
+            region_growth_min_drop: 0.01,
         }
     }
 }
@@ -171,6 +185,72 @@ fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<(f64, f64, f64)> {
     Some((l1.sqrt(), l2.sqrt(), theta))
 }
 
+/// Median of the `(2r+1)²` square centred on `(cx, cy)`, non-finite pixels
+/// skipped. `None` when the square holds no finite pixel.
+fn region_median(
+    data: &[f32],
+    w: usize,
+    cx: i64,
+    cy: i64,
+    r: i64,
+    scratch: &mut Vec<f32>,
+) -> Option<f64> {
+    scratch.clear();
+    for y in cy - r..=cy + r {
+        let row = y as usize * w;
+        for x in cx - r..=cx + r {
+            let v = data[row + x as usize];
+            if v.is_finite() {
+                scratch.push(v);
+            }
+        }
+    }
+    if scratch.is_empty() {
+        return None;
+    }
+    Some(median_in_place(scratch) as f64)
+}
+
+/// The adaptive sampling region (math reference §1.4): start at half the
+/// nominal stamp and grow while the region's MEDIAN keeps falling by at
+/// least `min_drop` per step. A region whose median still drops as it grows
+/// is still inside the star's light; once the median flattens, the region
+/// has reached the local sky and there is nothing to gain from more pixels
+/// — which is exactly the sky-relative behaviour a fixed `5σ` stamp lacks:
+/// on a bright sky the star's share of the median is small, so the region
+/// settles sooner, and on a dark one it keeps growing.
+///
+/// `r_max` is the caller's cap (twice the nominal stamp, and never past the
+/// image border). Returns the radius the growth stopped at.
+fn sampling_radius(
+    data: &[f32],
+    w: usize,
+    cx: i64,
+    cy: i64,
+    r_start: i64,
+    r_max: i64,
+    p: &FitParams,
+) -> i64 {
+    let step = p.region_growth_step_px.max(1) as i64;
+    let mut scratch: Vec<f32> = Vec::new();
+    let mut r = r_start;
+    let Some(mut prev) = region_median(data, w, cx, cy, r, &mut scratch) else {
+        return r;
+    };
+    while r + step <= r_max {
+        let next = r + step;
+        let Some(m) = region_median(data, w, cx, cy, next, &mut scratch) else {
+            return r;
+        };
+        r = next;
+        if !(m < (1.0 - p.region_growth_min_drop) * prev) {
+            break;
+        }
+        prev = m;
+    }
+    r
+}
+
 /// Fit one seed with a fixed β, seeded from the field σ (size) and the
 /// stamp's second moments (orientation and axis ratio); `None` when the
 /// stamp leaves the image, the fit fails, or the acceptance rules (math
@@ -184,11 +264,19 @@ fn fit_one(
     beta: f64,
     p: &FitParams,
 ) -> Option<StarFit> {
-    let r = stamp_radius(sigma0) as i64;
+    // Admission: the seed must have room for the NOMINAL stamp. The
+    // adaptive region below starts at half of it and may grow to twice it,
+    // but a seed that cannot even host the nominal one sits on the border
+    // and is measuring a truncated star.
+    let nominal = stamp_radius(sigma0) as i64;
     let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
-    if cx - r < 0 || cy - r < 0 || cx + r >= w as i64 || cy + r >= h as i64 {
+    if cx - nominal < 0 || cy - nominal < 0 || cx + nominal >= w as i64 || cy + nominal >= h as i64 {
         return None;
     }
+    let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
+    let r_max = (2 * nominal).min(48).min(to_border);
+    let r_start = (nominal / 2).max(3).min(r_max);
+    let r = sampling_radius(data, w, cx, cy, r_start, r_max, p);
     let cap = ((2 * r + 1) * (2 * r + 1)) as usize;
     let mut px = Vec::with_capacity(cap);
     let mut vals = Vec::with_capacity(cap);
@@ -278,10 +366,12 @@ fn accept(
     {
         return None;
     }
-    // Unreachable in practice: the centroid gate above already bounds
-    // |x0 − cx| ≤ 2 px while inner ≥ 5.1; kept for the reference's stated
-    // rule (math reference §1.4).
-    let inner = 0.85 * r;
+    // The fitted centre must sit inside the sampling region shrunk by
+    // `inner_margin` per side (math reference §1.4). With the default
+    // centroid tolerance this only bites on a small region, which is
+    // precisely where it should: a star whose region stayed narrow is one
+    // whose light the region barely contains.
+    let inner = (1.0 - 2.0 * p.inner_margin) * r;
     if (m.x0 - cx).abs() > inner || (m.y0 - cy).abs() > inner {
         return None;
     }
@@ -891,6 +981,89 @@ mod tests {
             fit_stars(&data, 160, 160, &[], PsfModel::Auto, &FitParams::default())
                 .fits
                 .is_empty()
+        );
+    }
+
+    /// The inner-region rule (math reference §1.4): a fit that settled
+    /// `0.8·r` from the sampling region's centre is refused, because the
+    /// region only half covers what it settled on. `inner_margin = 0.0` is
+    /// the SAME fit with the rule switched off — it is the rule that
+    /// rejects, not the fit failing.
+    ///
+    /// The fit here is a real one, run through the same fitter `fit_one`
+    /// uses, and then handed to `accept` directly. Driving the whole of
+    /// `fit_stars` with an off-centre seed cannot express this case: the LM
+    /// never walks more than about a pixel from its start on a real Moffat
+    /// field — past ~3 px off it simply fails instead of finding the star
+    /// — so a seed placed at `0.8·r` produces no fit to judge at all.
+    #[test]
+    fn a_fit_settled_at_the_region_rim_is_rejected() {
+        let stars = [round(100.0, 100.0, 0.5)];
+        let data = moffat_field(200, 200, &stars, 4.0, 0.05);
+        // Region: radius 10 centred 8 px right of the star, i.e. the fit
+        // will settle at 0.8·r from the centre.
+        let (cx, cy, r) = (108.0f64, 100.0f64, 10.0f64);
+        let mut px = Vec::new();
+        let mut vals = Vec::new();
+        let mut peak = f64::NEG_INFINITY;
+        for y in (cy as i64 - r as i64)..=(cy as i64 + r as i64) {
+            for x in (cx as i64 - r as i64)..=(cx as i64 + r as i64) {
+                let v = data[y as usize * 200 + x as usize];
+                peak = peak.max(v as f64);
+                vals.push(v);
+                px.push(PixelSample {
+                    x: x as f64,
+                    y: y as f64,
+                    value: v as f64,
+                });
+            }
+        }
+        let b0 = median_in_place(&mut vals) as f64;
+        let p = FitParams {
+            // The centroid gate must not be what rejects: this test is
+            // about the region rule alone.
+            centroid_tolerance_px: 40.0,
+            ..FitParams::default()
+        };
+        // Start the fit AT the star so it converges there — the point is
+        // where it settles relative to the region, not how it got there.
+        let fit = fit_moffat_2d_fixed_beta(
+            &px,
+            b0,
+            (peak - b0).max(1e-9),
+            100.0,
+            100.0,
+            2.0,
+            2.0,
+            0.0,
+            4.0,
+            p.max_iter,
+            p.conv_tol,
+            p.max_rejects,
+        )
+        .expect("the fit converges on a clean Moffat star");
+        assert!(
+            (fit.x0 - 100.0).abs() < 0.2,
+            "the fit settled on the star: {}",
+            fit.x0
+        );
+        let seed = Seed {
+            x: cx,
+            y: cy,
+            peak: 0.5,
+            flux: std::f64::consts::PI * 0.5 * 25.0 / 3.0,
+        };
+        assert!(
+            accept(&fit, &seed, cx, cy, r, &p).is_none(),
+            "|x0 − cx| = 8 exceeds (1 − 2·0.15)·10 = 7"
+        );
+        let off = FitParams {
+            inner_margin: 0.0,
+            ..p
+        };
+        assert!(
+            accept(&fit, &seed, cx, cy, r, &off).is_some(),
+            "with the rule off the same fit is accepted"
         );
     }
 

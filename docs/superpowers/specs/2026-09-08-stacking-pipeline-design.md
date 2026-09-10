@@ -217,8 +217,11 @@ frames and stores its own metrics on the run.
 
 ### 4.1 Metrics per calibrated frame, per channel
 
-Star detection (structure-map front end configurable per math reference
-§5.1; our detector's parameters are the ones exposed), PSF fitting with the
+Star detection (noise-relative levels at `background + detectionSigma·noise`
+and half that — spec §9.2 `measurement.detectionSigma`; the rank-budget
+levels this replaced were blind to sky brightness and handed a sharp,
+bright-sky night several times the seed population a soft one got, which
+inverted the frame ranking — M4a Task 2), PSF fitting with the
 `psfModel` (`auto` = Moffat β ∈ {2.5, 4, 6, 10} best MAD, or `moffat4`), the
 hybrid PSF/aperture flux at FWTM, RCR-cleaned and Winsorized mean fluxes,
 `M*`/`N*` from the large-scale background residual (MMT residual, scale 256),
@@ -665,8 +668,19 @@ grouping:      { exposureToleranceSec: 2.0 }   -- exposure ALWAYS splits a group
                                                 -- fine, the field is just silently ignored
 calibration:   CalibratedLightOptions (the export's: flat norm, hot pixels on, debayer on)
 measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 24576,
+                 detectionSigma: 20.0,
                  formula: { fwhm: 15, eccentricity: 15, snr: 20, stars: 0, pedestal: 50 },
                  keyword: "SSWEIGHT" }
+                -- detectionSigma: star-detection threshold for the quality measurement in σ
+                -- above the local background (noise-relative). The measurement detector's two
+                -- ladder levels are `background + k·noise` and `background + (k/2)·noise`
+                -- (M4a Task 2, ruling R-M4a-1) instead of the rank budget that preceded it.
+                -- The number is high because it is compared against a star's PEAK pixel in
+                -- units of the per-pixel noise, not against an aggregated structure response:
+                -- 20 is where our population and, more importantly, our frame RANKING match
+                -- the external reference's own on 368 real frames. Changing it changes the
+                -- measurement stage hash, so every cached measure artifact is recomputed
+                -- (R-M4a-9).
 selection:     { minWeightFraction: 0.05, maxFwhmPx: null, maxEccentricity: null,
                  minStars: null, excludeOnRegistrationFailure: true }
 reference:     { mode: "auto" }

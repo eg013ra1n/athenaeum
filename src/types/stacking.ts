@@ -123,7 +123,15 @@ maxStars: number, formula: FormulaWeights,
 /**
  * FITS keyword `WeightMode::Keyword` reads its value from.
  */
-keyword: string, };
+keyword: string, 
+/**
+ * Star-detection threshold for the quality measurement, in sigma above
+ * the local background (spec §9.2). The measurement detector's two
+ * levels sit at `background + k*noise` and `background + (k/2)*noise`,
+ * so the seed population follows THIS frame's sky instead of a fixed
+ * bright-pixel budget (M4a Task 2, ruling R-M4a-1).
+ */
+detectionSigma: number, };
 
 export type ReferenceMode = "auto" | "manual";
 

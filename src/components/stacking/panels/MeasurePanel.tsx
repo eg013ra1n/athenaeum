@@ -198,6 +198,17 @@ export function MeasurePanel({
         help={`default ${defaults.measurement.maxStars}`}
       />
 
+      <NumericField
+        label="Detection threshold (σ)"
+        value={m.detectionSigma}
+        onCommit={(n) => patchMeasurement({ detectionSigma: n })}
+        min={1}
+        max={100}
+        step={0.5}
+        disabled={disabled}
+        help={`default ${defaults.measurement.detectionSigma} — a star's peak above the local sky, in noise σ. Lower measures more, fainter stars.`}
+      />
+
       <div className="pt-3 border-t border-border/60 space-y-3">
         <h4 className="text-xs font-medium text-content-secondary">Selection filters</h4>
         <NumericField

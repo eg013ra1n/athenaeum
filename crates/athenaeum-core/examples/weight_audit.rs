@@ -29,7 +29,13 @@
 //!
 //! `cargo run --release -p athenaeum-core --example weight_audit -- \
 //!     [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] [--max-stars <n>] \
-//!     [--out <file.jsonl>] [--truncate] [--dump-planes <file.bin>] <file>…`
+//!     [--min-snr <x>] [--out <file.jsonl>] [--truncate] \
+//!     [--dump-planes <file.bin>] <file>…`
+//!
+//! `--sigma` is `MeasureOptions::detection_sigma` — the seed-detection
+//! threshold in σ above the local background; `--min-snr` is
+//! `MeasureOptions::min_snr`, the flux-SNR floor a detection must clear to
+//! become a fit seed. Both default to the production values.`
 use athenaeum_core::stacking::measure::{
     measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedSource,
 };
@@ -88,6 +94,7 @@ struct Args {
     sigma: Option<f32>,
     psf: PsfModel,
     max_stars: Option<usize>,
+    min_snr: Option<f32>,
     out: Option<String>,
     truncate: bool,
     dump_planes: Option<String>,
@@ -95,7 +102,8 @@ struct Args {
 }
 
 const USAGE: &str = "usage: weight_audit [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] \
-[--max-stars <n>] [--out <file.jsonl>] [--truncate] [--dump-planes <file.bin>] <file>…";
+[--max-stars <n>] [--min-snr <x>] [--out <file.jsonl>] [--truncate] \
+[--dump-planes <file.bin>] <file>…";
 
 /// Prints `usage:` context plus `msg` and exits 2 — used for every
 /// argument-parsing failure so a typo'd flag or a missing/non-numeric
@@ -111,6 +119,7 @@ fn parse_args() -> Args {
     let mut sigma = None;
     let mut psf = PsfModel::Auto;
     let mut max_stars = None;
+    let mut min_snr = None;
     let mut out = None;
     let mut truncate = false;
     let mut dump_planes = None;
@@ -158,6 +167,14 @@ fn parse_args() -> Args {
                     bad_arg(&format!("--max-stars value '{v}' is not a number"))
                 }));
             }
+            "--min-snr" => {
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--min-snr needs a numeric value"));
+                min_snr = Some(v.parse::<f32>().unwrap_or_else(|_| {
+                    bad_arg(&format!("--min-snr value '{v}' is not a number"))
+                }));
+            }
             "--out" => {
                 out = Some(
                     it.next()
@@ -185,6 +202,7 @@ fn parse_args() -> Args {
         sigma,
         psf,
         max_stars,
+        min_snr,
         out,
         truncate,
         dump_planes,
@@ -207,12 +225,16 @@ fn main() {
     if let Some(max_stars) = args.max_stars {
         opts.max_stars = max_stars;
     }
-    if args.sigma.is_some() {
-        // `MeasureOptions.detection_sigma` does not exist yet — Task 2 adds
-        // it and this becomes `opts.detection_sigma = sigma`. Accepted from
-        // the start (interface contract with Task 2) but a no-op today.
-        eprintln!("detection sigma ignored: not implemented yet");
+    if let Some(sigma) = args.sigma {
+        opts.detection_sigma = sigma;
     }
+    if let Some(min_snr) = args.min_snr {
+        opts.min_snr = min_snr;
+    }
+    eprintln!(
+        "weight_audit: detection_sigma {} min_snr {} max_stars {} psf {:?}",
+        opts.detection_sigma, opts.min_snr, opts.max_stars, opts.psf_model
+    );
 
     if let Some(dump_path) = &args.dump_planes {
         // Writes `read_planes`'s OWN output — for XISF, the ADU-domain

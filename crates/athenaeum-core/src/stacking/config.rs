@@ -105,6 +105,20 @@ pub struct MeasurementConfig {
     pub formula: FormulaWeights,
     /// FITS keyword `WeightMode::Keyword` reads its value from.
     pub keyword: String,
+    /// Star-detection threshold for the quality measurement, in sigma above
+    /// the local background (spec §9.2). The measurement detector's two
+    /// levels sit at `background + k*noise` and `background + (k/2)*noise`,
+    /// so the seed population follows THIS frame's sky instead of a fixed
+    /// bright-pixel budget (M4a Task 2, ruling R-M4a-1).
+    #[serde(default = "default_detection_sigma")]
+    pub detection_sigma: f64,
+}
+
+/// Serde default for [`MeasurementConfig::detection_sigma`] — a stored
+/// config written before M4a Task 2 has no such field and must decode to
+/// the calibrated value, not to `0.0`.
+fn default_detection_sigma() -> f64 {
+    crate::stacking::measure::DEFAULT_DETECTION_SIGMA as f64
 }
 
 impl Default for MeasurementConfig {
@@ -115,6 +129,7 @@ impl Default for MeasurementConfig {
             max_stars: 24_576,
             formula: FormulaWeights::default(),
             keyword: "SSWEIGHT".to_string(),
+            detection_sigma: default_detection_sigma(),
         }
     }
 }
@@ -134,6 +149,7 @@ impl MeasurementConfig {
             max_stars: self.max_stars,
             scale_estimator,
             min_snr: MeasureOptions::default().min_snr,
+            detection_sigma: self.detection_sigma as f32,
         }
     }
 }
@@ -468,6 +484,7 @@ mod tests {
         for needle in [
             "\"exposureToleranceSec\":2.0",
             "\"weightMode\":\"psfSignalWeight\"",
+            "\"detectionSigma\":20.0",
             "\"psfModel\":\"auto\"",
             "\"minWeightFraction\":0.05",
             "\"excludeOnRegistrationFailure\":true",
@@ -651,6 +668,23 @@ mod tests {
         );
     }
 
+    /// The seed threshold has to be part of stage 3's fingerprint: a run
+    /// with a different `detectionSigma` measured a different star
+    /// population, so a cached `stacking_artifacts` row from the other
+    /// value must not be reused (spec §9.3).
+    #[test]
+    fn config_hash_changes_when_detection_sigma_changes() {
+        let cfg = StackingConfig::default();
+        let mut other = cfg.clone();
+        other.measurement.detection_sigma += 1.0;
+        assert_ne!(config_hash(&cfg), config_hash(&other));
+        assert_ne!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&other), &[], &[]),
+            "the measurement stage hash must follow detectionSigma"
+        );
+    }
+
     #[test]
     fn stage_hash_is_order_insensitive() {
         let cfg = StackingConfig::default();
@@ -726,6 +760,14 @@ mod tests {
         // per-frame `stacking_artifacts` row goes stale over this (the
         // calibrate/measure/register stage hashes never fold in
         // `grouping`), only this whole-config fingerprint.
-        assert_eq!(default_hash, "b74baaa1e4322e9f");
+        //
+        // Changed again here (M4a Task 2, ruling R-M4a-1/R-M4a-9): adding
+        // `MeasurementConfig.detectionSigma` changes the canonical JSON of
+        // every stored `StackingConfig`. Unlike the M2 change this one DOES
+        // go stale on purpose — `measurement_subtree` serializes the whole
+        // `MeasurementConfig`, so every cached per-frame measure artifact
+        // is recomputed once, which is the point: the old ones were
+        // measured with the rank-budget seed population.
+        assert_eq!(default_hash, "fa9fda4f16439679");
     }
 }
