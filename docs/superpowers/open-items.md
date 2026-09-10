@@ -187,6 +187,45 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M2 — local normalization (2026-09-10)
+
+M2 (local normalization: background-model grids, PSF-flux scale, `.athln`
+sidecars, the LN reference, `NormalizePanel`'s LN block). Acceptance run on
+the real LDN 1272 catalog on 2026-09-10 — note
+`docs/superpowers/research/2026-09-10-m2-acceptance-run.md`: LN end-to-end
+on both groups (368/368 sidecars, no exclusions), master noise at 0.89–1.13×
+the external reference, no mesh imprint at the grid stride, cached sidecars
+re-used on a re-run from Integrate, cleanup removes `ln/`. Two attributed
+misses, both recorded below.
+
+- **Attributed miss (no code): LN stage time.** ≈ 28 min for 368 frames
+  (mono ≈ 19 frames/min, OSC ≈ 10/min) on the 16 GB acceptance machine —
+  the per-frame fan-out admits one OSC frame at a time under the RAM probe,
+  so the stage is memory-bound, not CPU-bound. Re-measure on a ≥ 32 GB
+  machine before treating it as a performance defect; the M4 performance
+  item covers the algorithmic side (detect-once, shared star lists).
+- **M4 follow-up: the linear-fit rejection dispersion is ≈ 1.4× the
+  external reference's.** Run 6 (LN both sides, linear fit 5.0/3.5) rejected
+  0.83 % (mono) / 0.74 % (OSC) where the external reference rejects
+  2.5–2.8 % with the same nominal thresholds; run 7 (identical inputs,
+  3.5/2.5) landed at 2.91 % / 2.67 % — the same numbers the external gets at
+  5.0/3.5. The under-rejection carried since M1 is therefore a dispersion
+  calibration of `2·adev·sqrt(1+b²)`, not an LN or reference problem. M4
+  calibrates the estimate so the shipped 5.0/3.5 reproduces ≈ 2.8 %.
+- **Owed:** the owner's own click-through of the LN block on the desktop
+  build (Enable local normalization, scale, reference frames, the `local`
+  rejection-normalization option and its 5 s reset notice, `LN: n/m frames`
+  in Results, the frames table's Scale column) and of the narrow-layout
+  toolbar: the acceptance click-through at ≈ 1250 CSS px found the toolbar
+  row overflowing the pane (fixed in the M2 final fix wave — the fix is what
+  needs the owner's eyes at 1024 px).
+- **Owed:** one LN run on Windows and one on Linux (the web build) — the
+  sidecar writer's tmp-and-rename and the fan-out's RAM probe are the
+  platform-specific parts.
+- **Release-note lines owed** (drafted in the acceptance note §9): local
+  normalization, the LN rejection option, camera-agnostic integration groups
+  (below), the `Scale` column and the `LN: n/m` results line.
+
 ### Stacking M2 — camera-agnostic grouping (2026-09-10)
 
 M2 Task 10 (owner decision 2026-09-10): groups are now keyed by colour
