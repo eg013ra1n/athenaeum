@@ -54,8 +54,10 @@ export type BoardStage = Stage | 'debayer';
  * `finishedStages` is already exactly what "a stage without an entry counts
  * as done when a later stage has one" (see the `outcome` branch below)
  * handles correctly, the same way `masters` having no timing when there is
- * no masters work already does. `drizzle` is M3 work, always `off` in M1 —
- * mirrored onto a real member below rather than included here.
+ * no masters work already does. `drizzle` (M3 Task 6) joins the same way —
+ * off for most runs, its own timing simply absent from `finishedStages`
+ * when the stage didn't run. This list is now every member of `STAGES`, so
+ * `TIMED_STAGES.indexOf` below never returns -1 for a real `Stage`.
  */
 const TIMED_STAGES: readonly Stage[] = [
   'masters',
@@ -65,6 +67,7 @@ const TIMED_STAGES: readonly Stage[] = [
   'register',
   'normalize',
   'integrate',
+  'drizzle',
   'output',
 ];
 
@@ -268,13 +271,90 @@ export function stageSummary(
   }
 }
 
+// ── drizzleEstimate ─────────────────────────────────────────────────────
+
+/**
+ * Provisional per-plane drizzle throughput at 2x scale, seconds/plane/frame
+ * — measured nowhere yet, a placeholder pending the M3 acceptance run
+ * (Task 7 re-fits this from real numbers). Time for a 1x/3x run scales by
+ * `(scale/2)²` relative to this, since work scales with the output pixel
+ * count.
+ */
+export const DRIZZLE_SECONDS_PER_PLANE_AT_2X = 1.2;
+
+export interface DrizzleEstimate {
+  /** Bitmap-temporary bytes (`0` when `useRejection` is off). */
+  bitmapBytes: number;
+  /** Output-file bytes (drizzled master, plus the weight map when on). */
+  outputBytes: number;
+  /** Estimated wall-clock seconds for the whole set's drizzle pass. */
+  seconds: number;
+  /** `true` when at least one group in `plan.groups` has no anchor
+   *  geometry (`anchorWidth`/`anchorHeight` both `null` — an empty group,
+   *  unreachable in practice) and was skipped rather than counted. */
+  incomplete: boolean;
+}
+
+/**
+ * Pure arithmetic for the Drizzle panel's estimate line (M3 Task 6): per
+ * group, with `W`/`H` the group's anchor-member geometry, `planes` 3 for an
+ * OSC group / 1 for mono, `n` the group's included-frame count and `s` the
+ * configured drizzle scale —
+ *
+ * - bitmap bytes: `n·planes·ceil(W/64)·8·H`, only when `config.drizzle.
+ *   useRejection` (the rejection-bitmap temporaries the M3 spec §6.2
+ *   allocates during integration; skipped devices for it are 0 when
+ *   rejection is off for the drizzle pass).
+ * - output bytes: `planes·(W·s)·(H·s)·4·(writeWeightMap ? 2 : 1)` (a
+ *   float32 drizzled master, doubled when the weight map is also written).
+ * - seconds: `n·planes·DRIZZLE_SECONDS_PER_PLANE_AT_2X·(s/2)²`.
+ *
+ * Never reads run/progress state — same purity contract as `stageSummary`/
+ * `rowState` above (Ruling 8) — so it is safe to call from both the
+ * frame-set tab's inspector and the Settings global-defaults one (which has
+ * no plan at all: `plan` is `null` there, and the caller is expected to
+ * render its own "no plan" fallback rather than calling this with an empty
+ * one — an empty/null plan here simply yields all-zero, `incomplete: false`,
+ * which reads as "nothing to estimate" rather than "no plan loaded").
+ */
+export function drizzleEstimate(config: StackingConfig, plan: StackingPlan | null): DrizzleEstimate {
+  const d = config.drizzle;
+  const s = d.scale;
+  let bitmapBytes = 0;
+  let outputBytes = 0;
+  let seconds = 0;
+  let incomplete = false;
+
+  for (const g of plan?.groups ?? []) {
+    const { anchorWidth: w, anchorHeight: h, includedCount: n, colorMode } = g;
+    if (w == null || h == null) {
+      incomplete = true;
+      continue;
+    }
+    const planes = colorMode === 'osc' ? 3 : 1;
+    if (d.useRejection) {
+      bitmapBytes += n * planes * Math.ceil(w / 64) * 8 * h;
+    }
+    outputBytes += planes * (w * s) * (h * s) * 4 * (d.writeWeightMap ? 2 : 1);
+    seconds += n * planes * DRIZZLE_SECONDS_PER_PLANE_AT_2X * (s / 2) ** 2;
+  }
+
+  return { bitmapBytes, outputBytes, seconds, incomplete };
+}
+
 // ── rowState ────────────────────────────────────────────────────────────
 
 /** Which board stage a plan blocker's `code` belongs to. `unsupported` is
- *  deliberately absent — the backend reuses that one code for both the LN
- *  and drizzle "arrives in a later milestone" blockers (`plan.rs` Gate 6),
- *  so it is disambiguated below by which optional stage is actually turned
- *  on, not by parsing the blocker's message text.
+ *  deliberately absent — historically the backend reused that one code for
+ *  both the LN and drizzle "arrives in a later milestone" blockers
+ *  (`plan.rs` Gate 6), disambiguated below by which optional stage is
+ *  actually turned on rather than by parsing the blocker's message text.
+ *  As of M2/M3, `plan.rs`'s own Gate 6 comment records that LN's blocker was
+ *  lifted first (M2 fix round 1) and drizzle's outright-refusal blocker
+ *  after it (M3 Task 5) — the ONLY `unsupported` blocker left is an
+ *  out-of-range drizzle `scale`, still surfaced on the drizzle row. The
+ *  `normalize` branch below is kept as a harmless no-op (no blocker source
+ *  names it any more) rather than assumed dead and removed.
  *
  *  `masters`/`masterFiles` moved from `calibrate` to `masters` (Plan 5b Task
  *  8, owner requirement 2026-09-09): the gate reinterpretation means these
@@ -413,8 +493,10 @@ export function rowState(
     if (finishedStages) {
       const mine = TIMED_STAGES.indexOf(stage);
       if (mine === -1) {
-        // Not one of the timeable stages (drizzle, still 'off' in M1) —
-        // fall through to the coarse read below rather than guess.
+        // M3 Task 6: `TIMED_STAGES` now covers every member of `STAGES`
+        // (drizzle joined it), so this branch is unreachable for any real
+        // `Stage` today — kept as a defensive fallback (never guess a row's
+        // state) rather than assumed permanently impossible.
       } else {
         let lastFinished = -1;
         for (const s of finishedStages) {

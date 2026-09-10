@@ -7,19 +7,17 @@ import { useNotifications } from '../../contexts/NotificationContext';
 import { useStackingContext } from '../../contexts/StackingContext';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { formatTimestamp } from '../../utils/dateFormatting';
-import type { GroupStats, StackingRunDetail, StackingRunGroupRow, StackingRunSummary, WorkUsage } from '../../types/stacking';
+import type {
+  GroupStats,
+  StackingRunDetail,
+  StackingRunGroupRow,
+  StackingRunSummary,
+  SummaryGroup,
+  WorkUsage,
+} from '../../types/stacking';
 import { readSelectedRunId, writeSelectedRunId } from './stackingPrefs';
 import { ProvenanceModal } from './ProvenanceModal';
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  const kb = n / 1024;
-  if (kb < 1024) return `${kb.toFixed(1)} KB`;
-  const mb = kb / 1024;
-  if (mb < 1024) return `${mb.toFixed(1)} MB`;
-  const gb = mb / 1024;
-  return `${gb.toFixed(2)} GB`;
-}
+import { formatBytes } from './formatBytes';
 
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
@@ -142,13 +140,40 @@ function RevealOrPath({ path }: { path: string | null }) {
   );
 }
 
+/** M3 Task 6: the same "run's finished `summary`, not the progressively-
+ *  updated `StackingRunGroupRow`" split as `lnReferencePath` below —
+ *  `weightMapPath` and the drizzle stats (`DrizzleStats`, per-plane FWHM/
+ *  coverage) live only on `SummaryGroup`, written once at Output. The gate
+ *  for whether drizzle ran at all is `group.drizzlePath` (the DB row,
+ *  present even before/without a loaded summary), not this slice's own
+ *  `drizzlePath` — see the render below. */
+type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 'drizzle'>;
+
 /** `SummaryGroup.lnReferencePath` lives on the run's finished `summary`, not
  *  on the `StackingRunGroupRow` this card is built from (that row updates
  *  progressively while the run is still in flight; the LN reference path is
  *  written once, at Output) — the caller matches it in by `groupKey` and
  *  hands it down here rather than this card reaching into `summary` itself. */
-function MasterCard({ group, lnReferencePath }: { group: StackingRunGroupRow; lnReferencePath: string | null }) {
+function MasterCard({
+  group,
+  lnReferencePath,
+  drizzleSummary,
+  drizzleConfigEnabled,
+}: {
+  group: StackingRunGroupRow;
+  lnReferencePath: string | null;
+  /** `null` when the run's `summary` hasn't loaded yet (or this group has
+   *  none in it) — the drizzle stats/weight-map path below are simply
+   *  omitted in that case; `group.drizzlePath` alone still drives whether
+   *  the "Drizzle" line renders at all. */
+  drizzleSummary: DrizzleGroupSummary | null;
+  /** `runDetail.summary?.config.drizzle.enabled` — whether THIS run's own
+   *  config had drizzle on, independent of the current draft config. Drives
+   *  the "skipped" line when the run had it on but this group has no path. */
+  drizzleConfigEnabled: boolean;
+}) {
   const stats = parseGroupStats(group.statsJson);
+  const dstats = drizzleSummary?.drizzle ?? null;
 
   return (
     <div className="bg-surface rounded-lg border border-border p-3 space-y-2 min-w-0">
@@ -197,6 +222,37 @@ function MasterCard({ group, lnReferencePath }: { group: StackingRunGroupRow; ln
             <RevealOrPath path={lnReferencePath} />
           </div>
         </div>
+      )}
+
+      {/* Drizzle (M3 Task 6): gated on `group.drizzlePath` — the DB row,
+       *  present as soon as the group's drizzle write lands, independent of
+       *  whether the run `summary` (built once, at Output) has loaded yet. */}
+      {group.drizzlePath != null ? (
+        <div className="pt-1 border-t border-border/40 space-y-1">
+          <div className="flex items-center gap-1.5 text-xs text-content-muted">
+            <span>Drizzle {dstats?.scale ?? '?'}×:</span>
+            <RevealOrPath path={group.drizzlePath} />
+          </div>
+          {dstats && (
+            <p className="text-xs text-content-secondary tabular-nums">
+              FWHM {dstats.fwhmPx.map((v) => v.toFixed(2)).join(' / ')} px
+              {' · '}
+              coverage {dstats.coverage.map((c) => `${(c * 100).toFixed(1)}%`).join(' / ')}
+            </p>
+          )}
+          {drizzleSummary?.weightMapPath != null && (
+            <div className="flex items-center gap-1.5 text-xs text-content-muted">
+              <span>Weight map:</span>
+              <RevealOrPath path={drizzleSummary.weightMapPath} />
+            </div>
+          )}
+        </div>
+      ) : (
+        drizzleConfigEnabled && (
+          <p className="pt-1 border-t border-border/40 text-xs text-content-muted">
+            Drizzle: skipped — see warnings
+          </p>
+        )
       )}
 
       {group.status === 'failed' && group.error && (
@@ -413,15 +469,20 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
 
           {runDetail.groups.length > 0 ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {runDetail.groups.map((g) => (
-                <MasterCard
-                  key={g.id}
-                  group={g}
-                  lnReferencePath={
-                    runDetail.summary?.groups.find((sg) => sg.key === g.groupKey)?.lnReferencePath ?? null
-                  }
-                />
-              ))}
+              {runDetail.groups.map((g) => {
+                const sg = runDetail.summary?.groups.find((s) => s.key === g.groupKey) ?? null;
+                return (
+                  <MasterCard
+                    key={g.id}
+                    group={g}
+                    lnReferencePath={sg?.lnReferencePath ?? null}
+                    drizzleSummary={
+                      sg ? { drizzlePath: sg.drizzlePath, weightMapPath: sg.weightMapPath, drizzle: sg.drizzle } : null
+                    }
+                    drizzleConfigEnabled={runDetail.summary?.config.drizzle.enabled ?? false}
+                  />
+                );
+              })}
             </div>
           ) : (
             <p className="text-sm text-content-muted">This run has no groups yet.</p>

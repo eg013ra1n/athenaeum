@@ -392,6 +392,12 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     );
   }, [setUserConfig]);
 
+  const handleToggleDrizzle = useCallback((checked: boolean) => {
+    setUserConfig((prev) =>
+      prev ? { ...prev, drizzle: { ...prev.drizzle, enabled: checked } } : prev,
+    );
+  }, [setUserConfig]);
+
   const handleSelectStage = useCallback((stage: BoardStage) => {
     setSelectedStage(stage);
     writeSelectedStage(stage);
@@ -736,6 +742,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             selectedStage={selectedStage}
             onSelectStage={handleSelectStage}
             onToggleWriteRegisteredFrames={handleToggleWriteRegisteredFrames}
+            onToggleDrizzle={handleToggleDrizzle}
           />
           <div className="bg-surface-elevated rounded-lg p-3">
             <h4 className="text-sm font-medium text-content mb-2">Groups ({plan.groups.length})</h4>

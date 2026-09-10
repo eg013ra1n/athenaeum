@@ -98,7 +98,9 @@ export function StageInspector({
       {stage === 'integrate' && (
         <IntegratePanel config={config} onChange={onChange} disabled={disabled} defaults={presetDefault} />
       )}
-      {stage === 'drizzle' && <DrizzlePanel config={config} />}
+      {stage === 'drizzle' && (
+        <DrizzlePanel config={config} onChange={onChange} disabled={disabled} defaults={presetDefault} plan={plan} />
+      )}
       {stage === 'output' && (
         <OutputPanel config={config} onChange={onChange} plan={plan} disabled={disabled} mode={mode} />
       )}

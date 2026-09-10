@@ -29,17 +29,22 @@ export interface PipelineBoardProps {
   finishedStages?: readonly Stage[] | null;
   selectedStage: BoardStage;
   onSelectStage: (stage: BoardStage) => void;
-  /** The Register row's write-registered-frames toggle. Drizzle's own toggle
-   *  stays read-only until M3 (spec §14 item 12); the Normalize row's LN
-   *  toggle went live in M2 Task 8 — it edits `config` directly through the
-   *  inspector panel, so the board row carries no toggle of its own any
-   *  more. */
+  /** The Register row's write-registered-frames toggle. The Normalize row's
+   *  LN toggle went live in M2 Task 8 — it edits `config` directly through
+   *  the inspector panel, so that board row carries no toggle of its own. */
   onToggleWriteRegisteredFrames: (checked: boolean) => void;
+  /** The Drizzle row's on/off toggle (M3 Task 6 — live; previously
+   *  disabled with a "coming in M3" note). Same shape as
+   *  `onToggleWriteRegisteredFrames`: patches `config.drizzle.enabled`
+   *  through the draft-config path, so the preset chip flips to Custom the
+   *  same way. */
+  onToggleDrizzle: (checked: boolean) => void;
 }
 
 /** The nine-row pipeline board (spec §11.1). Every row's state and summary
  *  text come from the pure functions in `stageSummary.ts` — this component
- *  only lays them out and wires the one live toggle. */
+ *  only lays them out and wires the two live toggles (write-registered-
+ *  frames on Register, on/off on Drizzle). */
 export function PipelineBoard({
   plan,
   config,
@@ -49,6 +54,7 @@ export function PipelineBoard({
   selectedStage,
   onSelectStage,
   onToggleWriteRegisteredFrames,
+  onToggleDrizzle,
 }: PipelineBoardProps) {
   return (
     <div className="bg-surface-elevated rounded-lg p-2 space-y-0.5">
@@ -57,9 +63,8 @@ export function PipelineBoard({
         if (stage === 'drizzle') {
           toggle = {
             checked: config.drizzle.enabled,
-            onChange: () => {},
-            disabled: true,
-            note: 'coming in M3',
+            onChange: onToggleDrizzle,
+            label: 'drizzle',
           };
         } else if (stage === 'register') {
           toggle = {

@@ -126,9 +126,13 @@ export function useStackingRuns() {
           return next;
         });
 
+        // M3 Task 6: append " · drizzled" when any master this run produced
+        // has a drizzle output — `StackingMasterRef.drizzlePath`, filled by
+        // M3 Task 5.
+        const anyDrizzled = payload.masters.some((m) => m.drizzlePath != null);
         notify({
           title: payload.success
-            ? `Stacking finished — ${payload.masters.length} master(s)`
+            ? `Stacking finished — ${payload.masters.length} master(s)${anyDrizzled ? ' · drizzled' : ''}`
             : payload.cancelled
               ? 'Stacking cancelled'
               : 'Stacking failed',
