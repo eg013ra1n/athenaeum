@@ -8,7 +8,17 @@
 //! `integrate_probe.rs::read_planes_any`) and measured one plane at a time
 //! with `stacking::measure::measure_plane` — printed as a JSON ARRAY of
 //! `ChannelMeasurement`s, since there is no frame-level header to build a
-//! `FrameMeasurement` from.
+//! `FrameMeasurement` from. The XISF branch's "not trustworthy" numbers in
+//! `docs/superpowers/research/2026-09-10-m3-acceptance-run.md` finding 1
+//! (M4a Task 1) were never a reader bug: rustafits returns a calibrated
+//! XISF light's Float32 samples in the u16-like ADU domain (a production
+//! contract other `athenaeum-core` readers depend on — controller ruling
+//! R-M4a-11), and this probe passed them straight into `measure_plane`,
+//! which assumes `[0, 1]` and applies its OWN ADU scale on top — a
+//! double-scale. `read_planes_any` below now divides by 65535 for exactly
+//! that reason, mirroring the `Uint16` arm's own normalization. For
+//! measuring many files at once (and comparing against an external
+//! per-frame log) use `examples/weight_audit.rs` instead.
 //!
 //! `cargo run --release -p athenaeum-core --example measure_probe -- <file.fits|file.xisf> [auto|moffat4]`
 
@@ -20,8 +30,10 @@ use athenaeum_core::stacking::psf_signal::PsfModel;
 
 /// As `integrate_probe.rs::read_planes_any`: FITS via `PlaneReader`,
 /// anything else via `astroimage::ImageConverter::read_raw` (XISF, the
-/// probe's own reason for existing — `PixelData::Float32` used as-is,
-/// `PixelData::Uint16` divided down to `[0, 1]`), returning planar planes.
+/// probe's own reason for existing — `PixelData::Float32` divided by
+/// 65535 down into `[0, 1]` just like `PixelData::Uint16`, since rustafits
+/// returns XISF float samples in the u16-like ADU domain), returning
+/// planar planes.
 fn read_planes_any(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
     if path
         .extension()
@@ -38,7 +50,9 @@ fn read_planes_any(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), String>
     }
     let (meta, pixels) = astroimage::ImageConverter::read_raw(path).map_err(|e| e.to_string())?;
     let data: Vec<f32> = match pixels {
-        astroimage::PixelData::Float32(v) => v,
+        // rustafits returns XISF float samples in the u16-like ADU domain
+        // (R-M4a-11); the estimator wants native [0, 1].
+        astroimage::PixelData::Float32(v) => v.into_iter().map(|x| x / 65535.0).collect(),
         astroimage::PixelData::Uint16(v) => v.iter().map(|&u| u as f32 / 65535.0).collect(),
     };
     let n = meta.width * meta.height;
