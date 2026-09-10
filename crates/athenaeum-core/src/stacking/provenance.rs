@@ -110,6 +110,20 @@ pub struct SummaryFrame {
     pub cached_calibrated: bool,
     pub cached_metrics: bool,
     pub cached_registration: bool,
+    /// Stage 6 (local normalization, M2): the frame's own relative scale
+    /// (mean across channels — [`crate::stacking::ln::LnFrameOutcome::scale`]),
+    /// `None` when local normalization never ran for this group (disabled,
+    /// or a ruling-R3 fallback to global normalization) or this frame was
+    /// excluded before reaching it. `#[serde(default)]` so a `runs/run-<id>.json`
+    /// written before M2 still deserializes.
+    #[serde(default)]
+    pub ln_scale: Option<f64>,
+    /// Whether stage 6 REUSED an existing `ln` artifact for this frame
+    /// rather than normalizing it fresh — same convention as
+    /// `cached_calibrated`/`cached_metrics`. `#[serde(default)]`, see
+    /// `ln_scale`'s own doc.
+    #[serde(default)]
+    pub cached_ln: bool,
 }
 
 /// One integration group's whole result. `stats`/`master_path`/rejection
@@ -126,6 +140,14 @@ pub struct SummaryGroup {
     pub rejection_high_path: Option<String>,
     pub stats: Option<GroupStats>,
     pub normalization_reference_frame_id: Option<i64>,
+    /// Stage 6 (local normalization, M2): the group's LN reference file
+    /// (`ln/<group>/reference.fits`, spec §9.5), when local normalization
+    /// ran for this group at all — `None` when it is disabled, the group
+    /// never reached Output (skipped/failed), or a ruling-R3 fallback to
+    /// global normalization applied. `#[serde(default)]`, see
+    /// `SummaryFrame::ln_scale`'s own doc.
+    #[serde(default)]
+    pub ln_reference_path: Option<String>,
     pub frames: Vec<SummaryFrame>,
 }
 

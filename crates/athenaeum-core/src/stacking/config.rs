@@ -379,6 +379,23 @@ pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     serde_json::json!({ "registration": cfg.registration })
 }
 
+/// Stage 6 (local normalization, M2) config subtree: the whole
+/// `normalization` block (global output/rejection choice AND the `local`
+/// block — a change to either invalidates a stored `.athln`/reference) plus
+/// the two measurement knobs the LN relative-scale estimator shares with
+/// stage 3 (`psfModel`, `maxStars` — the exact detection/PSF-fit budget
+/// [`crate::stacking::ln::scale::relative_scale`] uses for both the
+/// reference and target planes, per [`crate::stacking::ln::normalize_frame`]).
+pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
+    serde_json::json!({
+        "normalization": cfg.normalization,
+        "measurement": {
+            "psfModel": cfg.measurement.psf_model,
+            "maxStars": cfg.measurement.max_stars,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

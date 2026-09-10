@@ -25,13 +25,15 @@ use crate::db::stacking::{
     StackingArtifactRow,
 };
 use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
+use crate::integration::stats::RejectionNormalization;
 use crate::registration::db::{
     get_frame_set_reference, get_registration_for_frame_set, RegistrationRecord,
 };
 use crate::settings::{keys, SettingsManager};
 use crate::stacking::config::{
-    calibration_subtree, config_hash, measurement_subtree, registration_subtree, resolve_config,
-    stage_hash, ReferenceMode, SourceIdentity, StackingConfig,
+    calibration_subtree, config_hash, measurement_subtree, normalization_subtree,
+    registration_subtree, resolve_config, stage_hash, ReferenceMode, SourceIdentity,
+    StackingConfig,
 };
 use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::paths::{self, EstimateInputs};
@@ -149,6 +151,12 @@ pub struct PlanGroup {
     pub total_exposure_s: f64,
     pub calibrated_cached: usize,
     pub metrics_cached: usize,
+    /// Frames (of `included_count`) whose `.athln` sidecar already exists on
+    /// disk (spec §9.3, M2) — `0` when local normalization is off. A
+    /// PRESENCE check, not a hash-verified freshness one: see the doc on
+    /// this field's computation in [`build_plan`] for why (the LN reference
+    /// member list is a stage-3 weight quantity, unavailable at plan time).
+    pub ln_cached: usize,
 }
 
 /// The plan's resolved reference frame, or the lack of one. `Auto` never
@@ -410,6 +418,30 @@ pub(crate) fn registration_hash_for(
         ],
         &[],
     )
+}
+
+/// Stage 6 (local normalization, M2) config-hash: `normalization_subtree`
+/// keyed on `registration_hash` — either this ONE frame's own stage-5 hash
+/// (the `ln` artifact, per frame) or a caller-combined token standing in for
+/// EVERY reference member's stage-5 hash (the `ln_reference` artifact, one
+/// per group — see `stacking::run`'s own construction of that token, since
+/// there is no single frame to key it on) — plus `reference_member_ids`, the
+/// group's chosen LN reference frame ids (the best-weighted `referenceFrames`
+/// included members, spec §5.2): a changed member list invalidates every
+/// frame's sidecar AND the reference itself, even when neither `cfg` nor
+/// this frame's own registration changed. No DB access here (unlike
+/// [`calibration_hash_for`]'s `SourceIdentity`s) — the caller has already
+/// resolved both hashes; `sources` stays empty, same convention as
+/// [`registration_hash_for`]'s own plain-string upstream.
+pub(crate) fn normalization_hash_for(
+    cfg: &StackingConfig,
+    registration_hash: &str,
+    reference_member_ids: &[i64],
+) -> String {
+    let mut upstream: Vec<String> = vec!["register".to_string(), registration_hash.to_string()];
+    upstream.extend(reference_member_ids.iter().map(|id| format!("ln_ref:{id}")));
+    let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
+    stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
 
 /// The `calibrated`-artifact reuse contract (spec §9.3): a row is reusable
@@ -1070,10 +1102,14 @@ pub fn build_plan(
     let mut calibrate_stale = false;
     let mut measure_stale = false;
     let mut any_group_has_three_included = false;
+    let local_normalization_active = cfg.normalization.local.enabled
+        || cfg.normalization.rejection == RejectionNormalization::Local;
+    let mut normalize_stale = false;
 
     for g in &groups {
         let mut calibrated_cached = 0usize;
         let mut metrics_cached = 0usize;
+        let mut ln_cached = 0usize;
         let mut included_count = 0usize;
 
         for f in &g.frames {
@@ -1117,6 +1153,32 @@ pub fn build_plan(
             } else if !is_excluded {
                 measure_stale = true;
             }
+
+            // Stage 6 (local normalization, M2): `ln_cached`/`normalize_stale`
+            // are a PRESENCE check only — path+size on disk, no hash
+            // comparison — because the true freshness hash
+            // (`normalization_hash_for`) needs the group's chosen LN
+            // reference members, and those are picked by WEIGHT (spec §5.2),
+            // a stage-3 quantity this DB-plus-cheap-FS-probe gate never
+            // computes (unlike stage 1/3's own hashes, which only need
+            // catalog/calibration-plan data already at hand here). A frame
+            // whose `.athln` merely exists is treated as covered; a run that
+            // actually starts may still redo it if the reference member list
+            // or this frame's own registration changed since — this is a
+            // coarser signal than `calibrated_cached`/`metrics_cached`, by
+            // necessity, not an oversight.
+            if local_normalization_active {
+                let ln_artifact =
+                    find_artifact(conn, frames_set_id, &g.key, "ln", Some(f.frame_id))?;
+                let ln_present = ln_artifact
+                    .and_then(|row| row.path)
+                    .is_some_and(|p| std::fs::metadata(p).is_ok());
+                if ln_present {
+                    ln_cached += 1;
+                } else if !is_excluded {
+                    normalize_stale = true;
+                }
+            }
         }
 
         if included_count >= 3 {
@@ -1137,6 +1199,7 @@ pub fn build_plan(
             total_exposure_s: g.total_exposure_s,
             calibrated_cached,
             metrics_cached,
+            ln_cached,
         });
     }
 
@@ -1160,6 +1223,9 @@ pub fn build_plan(
     }
     if register_stale {
         stale_stages.push(Stage::Register);
+    }
+    if local_normalization_active && normalize_stale {
+        stale_stages.push(Stage::Normalize);
     }
 
     // Gate 6: unsupported — checked last, so a user only sees these once
