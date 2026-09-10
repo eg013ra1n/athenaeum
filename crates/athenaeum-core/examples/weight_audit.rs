@@ -15,11 +15,21 @@
 //! (`docs/superpowers/research/2026-09-10-m3-acceptance-run.md` finding
 //! 1): the reader was never wrong, the probe never divided its Float32
 //! samples back down. `read_planes` below divides by 65535 for exactly
-//! that reason, mirroring the `Uint16` arm's own normalization.
+//! that reason, mirroring the `Uint16` arm's own normalization —
+//! `--dump-planes` therefore writes the DIVIDED-BACK `[0, 1]`-domain
+//! samples, not the file's raw attachment bytes (they round-trip
+//! bit-exact for Float32 on every real file checked so far, since the
+//! reader's own `* 65535.0` and this division are exact inverses in
+//! practice, but the dump is not literally "no conversion" any more).
+//!
+//! `--out` APPENDS to an existing file (so a large file list can be split
+//! across several invocations without clobbering earlier chunks, e.g.
+//! Task 2's calibration grid); pass `--truncate` to empty it first
+//! instead.
 //!
 //! `cargo run --release -p athenaeum-core --example weight_audit -- \
 //!     [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] [--max-stars <n>] \
-//!     [--out <file.jsonl>] [--dump-planes <file.bin>] <file>…`
+//!     [--out <file.jsonl>] [--truncate] [--dump-planes <file.bin>] <file>…`
 use athenaeum_core::stacking::measure::{
     measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedSource,
 };
@@ -39,9 +49,9 @@ struct Line<'a> {
 }
 
 /// FITS via `PlaneReader`, anything else (XISF) via
-/// `astroimage::ImageConverter::read_raw`. `PixelData::Float32` is used
-/// as-is — see the module doc comment above for why that is correct only
-/// after this task's XISF reader fix.
+/// `astroimage::ImageConverter::read_raw` — `PixelData::Float32` divided
+/// by 65535 down into `[0, 1]` just like `PixelData::Uint16`, since
+/// rustafits returns XISF float samples in the u16-like ADU domain.
 fn read_planes(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), String> {
     let is_fits = path
         .extension()
@@ -79,8 +89,21 @@ struct Args {
     psf: PsfModel,
     max_stars: Option<usize>,
     out: Option<String>,
+    truncate: bool,
     dump_planes: Option<String>,
     files: Vec<String>,
+}
+
+const USAGE: &str = "usage: weight_audit [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] \
+[--max-stars <n>] [--out <file.jsonl>] [--truncate] [--dump-planes <file.bin>] <file>…";
+
+/// Prints `usage:` context plus `msg` and exits 2 — used for every
+/// argument-parsing failure so a typo'd flag or a missing/non-numeric
+/// value is never silently swallowed into the file list.
+fn bad_arg(msg: &str) -> ! {
+    eprintln!("weight_audit: {msg}");
+    eprintln!("{USAGE}");
+    std::process::exit(2);
 }
 
 fn parse_args() -> Args {
@@ -89,6 +112,7 @@ fn parse_args() -> Args {
     let mut psf = PsfModel::Auto;
     let mut max_stars = None;
     let mut out = None;
+    let mut truncate = false;
     let mut dump_planes = None;
     let mut files = Vec::new();
 
@@ -96,36 +120,61 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--seed" => {
-                seed = match it.next().as_deref() {
-                    Some("full") => SeedSource::Full,
-                    Some("fast") | None => SeedSource::Fast,
-                    Some(other) => {
-                        eprintln!("weight_audit: unknown --seed value '{other}', using fast");
-                        SeedSource::Fast
-                    }
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--seed needs a value (fast|full)"));
+                seed = match v.as_str() {
+                    "full" => SeedSource::Full,
+                    "fast" => SeedSource::Fast,
+                    other => bad_arg(&format!("unknown --seed value '{other}' (want fast|full)")),
                 };
             }
             "--sigma" => {
-                sigma = it.next().and_then(|v| v.parse::<f32>().ok());
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--sigma needs a numeric value"));
+                sigma =
+                    Some(v.parse::<f32>().unwrap_or_else(|_| {
+                        bad_arg(&format!("--sigma value '{v}' is not a number"))
+                    }));
             }
             "--psf" => {
-                psf = match it.next().as_deref() {
-                    Some("moffat4") => PsfModel::Moffat4,
-                    Some("auto") | None => PsfModel::Auto,
-                    Some(other) => {
-                        eprintln!("weight_audit: unknown --psf value '{other}', using auto");
-                        PsfModel::Auto
-                    }
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--psf needs a value (auto|moffat4)"));
+                psf = match v.as_str() {
+                    "moffat4" => PsfModel::Moffat4,
+                    "auto" => PsfModel::Auto,
+                    other => bad_arg(&format!(
+                        "unknown --psf value '{other}' (want auto|moffat4)"
+                    )),
                 };
             }
             "--max-stars" => {
-                max_stars = it.next().and_then(|v| v.parse::<usize>().ok());
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--max-stars needs a numeric value"));
+                max_stars = Some(v.parse::<usize>().unwrap_or_else(|_| {
+                    bad_arg(&format!("--max-stars value '{v}' is not a number"))
+                }));
             }
             "--out" => {
-                out = it.next();
+                out = Some(
+                    it.next()
+                        .unwrap_or_else(|| bad_arg("--out needs a file path")),
+                );
+            }
+            "--truncate" => {
+                truncate = true;
             }
             "--dump-planes" => {
-                dump_planes = it.next();
+                dump_planes = Some(
+                    it.next()
+                        .unwrap_or_else(|| bad_arg("--dump-planes needs a file path")),
+                );
+            }
+            other if other.starts_with("--") => {
+                bad_arg(&format!("unrecognized flag '{other}'"));
             }
             other => files.push(other.to_string()),
         }
@@ -137,6 +186,7 @@ fn parse_args() -> Args {
         psf,
         max_stars,
         out,
+        truncate,
         dump_planes,
         files,
     }
@@ -146,10 +196,7 @@ fn main() {
     let args = parse_args();
 
     if args.files.is_empty() {
-        eprintln!(
-            "usage: weight_audit [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] \
-             [--max-stars <n>] [--out <file.jsonl>] [--dump-planes <file.bin>] <file>…"
-        );
+        eprintln!("{USAGE}");
         std::process::exit(2);
     }
 
@@ -168,6 +215,12 @@ fn main() {
     }
 
     if let Some(dump_path) = &args.dump_planes {
+        // Writes `read_planes`'s OWN output — for XISF, the ADU-domain
+        // Float32 samples already divided back by 65535 into `[0, 1]`,
+        // not the file's raw attachment bytes (see the module doc
+        // comment). For the default bounds `0:1` that round trip is
+        // bit-exact in practice, so this is still the right pairing for
+        // `weight_audit_compare.py --dump-first-image`'s byte diff.
         let Some(first) = args.files.first() else {
             eprintln!("weight_audit: --dump-planes needs a file");
             std::process::exit(2);
@@ -201,17 +254,25 @@ fn main() {
     }
 
     let mut out_writer: Box<dyn Write> = match &args.out {
-        Some(path) => match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                eprintln!("weight_audit: cannot open {path}: {e}");
-                std::process::exit(1);
+        Some(path) => {
+            // APPENDS by default (a large file list can be split across
+            // several invocations, e.g. Task 2's calibration grid runs);
+            // `--truncate` empties the file first instead.
+            let mut open_opts = std::fs::OpenOptions::new();
+            open_opts.create(true);
+            if args.truncate {
+                open_opts.write(true).truncate(true);
+            } else {
+                open_opts.append(true);
             }
-        },
+            match open_opts.open(path) {
+                Ok(f) => Box::new(f),
+                Err(e) => {
+                    eprintln!("weight_audit: cannot open {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         None => Box::new(std::io::stdout()),
     };
 

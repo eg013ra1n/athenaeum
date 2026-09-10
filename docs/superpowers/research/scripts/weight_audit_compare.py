@@ -5,7 +5,7 @@ instrument for the stacking pipeline's PSF-weight work). stdlib only.
 
 Usage:
   weight_audit_compare.py --log <external.log> --ours <file.jsonl> \
-      [--terms-out wbpp-terms.json]
+      [--terms-out external-terms.json]
   weight_audit_compare.py --dump-first-image <file.xisf> <out.bin>
 
 The first form parses the external log's per-frame blocks and the
@@ -17,9 +17,12 @@ targets (grep `^(PASS|MISS) `).
 The second form is the Step 1 raw-bytes fallback: it reads an XISF
 file's own signature + XML header, finds the FIRST `<Image>` element's
 `location="attachment:pos:size"`, and writes those `size` raw bytes at
-`pos` to `out.bin` verbatim (no conversion) — for diffing against
-`weight_audit --dump-planes` when the two-image fixture test does not
-reproduce the disagreement.
+`pos` to `out.bin` verbatim (no conversion) — pair it with `weight_audit
+--dump-planes`, which (unlike this raw dump) writes the READER's
+ADU-domain Float32 samples divided back by 65535 into `[0, 1]`; for the
+default bounds `0:1` the two are bit-exact in practice (the reader's own
+`* 65535.0` and that division are exact inverses), so the byte diff still
+works, it just is not comparing two "no conversion" dumps any more.
 """
 import argparse
 import json
@@ -30,6 +33,11 @@ import struct
 import sys
 
 LOAD_RE = re.compile(r"\* Loading target (?:calibration frame|file): (.+)$")
+# Both log shapes seen in practice write this line — mono prefixes it with
+# `* `, OSC does not — either way it marks the end of a frame's own
+# diagnostic block, so `parse_external_log` resets its current-frame
+# context here rather than only on the NEXT `Loading target …` line.
+WRITING_RE = re.compile(r"(?:\* )?Writing (?:output file|image):")
 PSF_RE = re.compile(
     r"ch (\d+) : TFlux = ([0-9.eE+-]+), TMeanFlux = ([0-9.eE+-]+), "
     r"M\* = ([0-9.eE+-]+), N\* = ([0-9.eE+-]+), (\d+) PSF fits"
@@ -73,7 +81,11 @@ def parse_external_log(path):
     or `* Loading target file: <path>` (OSC — the ALREADY-calibrated `_c`
     CFA file being debayered); either way the stem is stripped of a
     trailing `_c` so mono and OSC stems land on the same base as
-    `load_ours`'s post-strip stems.
+    `load_ours`'s post-strip stems. The block ends at its own `Writing
+    output file:`/`Writing image:` line (`WRITING_RE`) — resetting there,
+    not only on the NEXT `Loading target …` line, keeps a later section's
+    unrelated `ch N :` lines (calibration-frame combination, cosmetic
+    correction, …) from ever being attributed to the wrong frame.
     """
     result = {}
     current = None
@@ -84,6 +96,9 @@ def parse_external_log(path):
                 stem = strip_suffix(stem_of(m.group(1).strip()), ["_c"])
                 current = stem
                 result.setdefault(current, {"ch": {}})
+                continue
+            if WRITING_RE.search(line):
+                current = None
                 continue
             if current is None:
                 continue
@@ -236,6 +251,10 @@ def report(ext, ours):
                     [],
                     [],
                 )
+                # `n` counts frames that actually had a channel-`ch_idx`
+                # term to compare (not every stem matched to a night) —
+                # what the printed medians are actually a summary of.
+                n_contributing = 0
                 for s in night_stems:
                     if ch_idx >= len(ours[s]):
                         continue
@@ -243,6 +262,7 @@ def report(ext, ours):
                     ec = ext[s]["ch"].get(ch_idx)
                     if ec is None:
                         continue
+                    n_contributing += 1
                     if ec.get("fits"):
                         stars_r.append(oc["starsFitted"] / ec["fits"])
                     if ec.get("tflux"):
@@ -256,7 +276,7 @@ def report(ext, ours):
                     if ec.get("sigma"):
                         noise_r.append(oc["noise"] / ec["sigma"])
                 print(
-                    f"{night:<12} {len(night_stems):>4} {_fmt(_med(stars_r)):>11} "
+                    f"{night:<12} {n_contributing:>4} {_fmt(_med(stars_r)):>11} "
                     f"{_fmt(_med(tflux_r)):>11} {_fmt(_med(tmean_r)):>11} "
                     f"{_fmt(_med(mstar_r)):>11} {_fmt(_med(nstar_r)):>11} {_fmt(_med(noise_r)):>11}"
                 )
