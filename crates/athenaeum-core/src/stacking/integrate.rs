@@ -9,7 +9,6 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +16,9 @@ use tracing::{debug, info, warn};
 
 use crate::geometry::PixelMap;
 use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
-use crate::integration::engine::{integrate_stack, EngineProgress, StackOutput, StackParams};
+use crate::integration::engine::{
+    integrate_stack, EngineProgress, LocalNormRow, LocalNormRowFactory, StackOutput, StackParams,
+};
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
 use crate::integration::stats::{
@@ -326,21 +327,23 @@ pub(crate) fn validate_group_input(input: &GroupInput<'_>) -> Result<(), Integra
     Ok(())
 }
 
-/// Wraps one channel's LN grid as an `integration::engine::LocalNormRow`
-/// closure (M2 Task 6): `Fn(y_abs, a_row, b_row)` evaluates that row via
-/// [`LnGrid::evaluate_row_into`], reusing one [`LnScratch`] across every row
-/// of the plane rather than allocating one per call (see
-/// [`LnGrid::evaluate_row`]'s own doc, which names this exact reuse as the
-/// band loop's job). The scratch is small (`gw`-sized) and its only mutable
-/// state, so a `Mutex` keeps the closure `Sync` — callable from any of the
-/// engine's parallel per-row workers — at the cost of a short per-row
-/// critical section for this one frame's grid, negligible next to the
-/// per-pixel combine it feeds.
-fn local_norm_row(grid: &LnGrid) -> impl Fn(usize, &mut [f32], &mut [f32]) + Sync + '_ {
-    let scratch = Mutex::new(LnScratch::for_grid(grid));
-    move |y, a_row, b_row| {
-        let mut guard = scratch.lock().unwrap();
-        grid.evaluate_row_into(y, a_row, b_row, &mut guard);
+/// Wraps one channel's LN grid as an `integration::engine::LocalNormRowFactory`
+/// (M2 Task 6, fix round 1, item 3): calling the returned factory produces a
+/// FRESH `LnScratch` and a `FnMut(y_abs, a_row, b_row)` that owns it
+/// exclusively, evaluating the row via [`LnGrid::evaluate_row_into`] (see
+/// [`LnGrid::evaluate_row`]'s own doc, which names exactly this reuse — one
+/// scratch across every row a worker evaluates — as the band loop's job).
+/// The engine calls this factory once per worker thread (never per row or
+/// pixel), so every worker gets its own private scratch with no lock: a
+/// single shared closure behind a `Mutex<LnScratch>` (the fix round 1 review
+/// finding) would instead serialize every worker through one frame's
+/// scratch, capping parallelism at the frame count.
+fn local_norm_row_factory<'g>(grid: &'g LnGrid) -> impl Fn() -> Box<LocalNormRow<'g>> + Sync + 'g {
+    move || {
+        let mut scratch = LnScratch::for_grid(grid);
+        Box::new(move |y: usize, a_row: &mut [f32], b_row: &mut [f32]| {
+            grid.evaluate_row_into(y, a_row, b_row, &mut scratch);
+        })
     }
 }
 
@@ -377,14 +380,14 @@ fn local_norm_row(grid: &LnGrid) -> impl Fn(usize, &mut [f32], &mut [f32]) + Syn
 /// Returns one [`StackOutput`] per plane, in channel order — no
 /// stats/accumulation/writing: that tail is the caller's job.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn integrate_planes(
+pub(crate) fn integrate_planes<'g>(
     input: &GroupInput<'_>,
     frame_indices: &[usize],
     weights: &[Vec<f32>],
     output_mode: OutputNormalization,
     rejection_mode: RejectionNormalization,
     local_for_output: bool,
-    ln: Option<&[Option<LnFrameGrids>]>,
+    ln: Option<&'g [Option<LnFrameGrids>]>,
     recipe: IntegrationRecipe,
     write_maps: bool,
     pool: &rayon::ThreadPool,
@@ -399,6 +402,13 @@ pub(crate) fn integrate_planes(
             weights.len()
         )));
     }
+    // Fix round 1, item 4: validate every provided grid's shape BEFORE any
+    // rayon worker ever touches it. `LnGrid::evaluate_row_into` `assert!`s
+    // `y < ref_height` and the row buffers' length against `ref_width` —
+    // both would otherwise panic INSIDE a worker thread the first time a
+    // mismatched grid's row got evaluated (Task 7 feeds cached, on-disk
+    // sidecars into `ln`, which is exactly the kind of input this needs to
+    // refuse cleanly rather than crash on).
     if let Some(grids) = ln {
         if grids.len() != input.frames.len() {
             return Err(IntegrationError::BadInput(format!(
@@ -406,6 +416,29 @@ pub(crate) fn integrate_planes(
                 grids.len(),
                 input.frames.len()
             )));
+        }
+        for (i, g) in grids.iter().enumerate() {
+            let Some(fg) = g else { continue };
+            if fg.channels.len() < input.channels {
+                return Err(IntegrationError::BadInput(format!(
+                    "frame {i} ({}) has {} LN channels, the group has {}",
+                    input.frames[i].path.display(),
+                    fg.channels.len(),
+                    input.channels
+                )));
+            }
+            for (c, grid) in fg.channels.iter().take(input.channels).enumerate() {
+                if grid.ref_width != input.width || grid.ref_height != input.height {
+                    return Err(IntegrationError::BadInput(format!(
+                        "frame {i} ({}) LN grid channel {c} is {}x{}, the group is {}x{}",
+                        input.frames[i].path.display(),
+                        grid.ref_width,
+                        grid.ref_height,
+                        input.width,
+                        input.height
+                    )));
+                }
+            }
         }
     }
     let frames = input.frames;
@@ -425,15 +458,17 @@ pub(crate) fn integrate_planes(
         let mut output_pairs = Vec::with_capacity(n);
         let mut plane_weights = Vec::with_capacity(n);
         let mut registered_frames = Vec::with_capacity(n);
-        // M2: this plane's local-normalization closures, one per entry of
-        // `frame_indices` — `local_closures` owns the boxed closures (each
-        // wraps one frame's `LnGrid` for channel `p`), `local_refs` is the
-        // `&dyn Fn` view `StackParams::local` actually wants. Built even
-        // when `ln` is `None` (every entry then comes out `None` too) so the
-        // plumbing has one shape regardless — negligible cost, `n` is small.
-        let mut local_closures: Vec<
-            Option<Box<dyn Fn(usize, &mut [f32], &mut [f32]) + Sync + '_>>,
-        > = Vec::with_capacity(n);
+        // M2: this plane's local-normalization row-evaluator FACTORIES, one
+        // per entry of `frame_indices` (fix round 1, item 3 — `StackParams::local`
+        // now carries factories, not evaluators: the engine calls one once
+        // per worker thread, never sharing an evaluator, so no per-frame
+        // lock is needed). `local_factories` owns the boxed factory
+        // closures (each wraps one frame's already-validated `LnGrid` for
+        // channel `p`), `local_refs` is the `&dyn Fn` view `StackParams::local`
+        // actually wants. Built even when `ln` is `None` (every entry then
+        // comes out `None` too) so the plumbing has one shape regardless —
+        // negligible cost, `n` is small.
+        let mut local_factories: Vec<Option<Box<LocalNormRowFactory<'_>>>> = Vec::with_capacity(n);
         for (k, &i) in frame_indices.iter().enumerate() {
             let f = &frames[i];
             let frame_ls = f.measurement.channels[p].location_scale();
@@ -450,13 +485,12 @@ pub(crate) fn integrate_planes(
                 .and_then(|grids| grids.get(i))
                 .and_then(|g| g.as_ref())
                 .map(|fg| &fg.channels[p]);
-            local_closures.push(grid.map(|grid| {
-                Box::new(local_norm_row(grid))
-                    as Box<dyn Fn(usize, &mut [f32], &mut [f32]) + Sync + '_>
+            local_factories.push(grid.map(|grid| {
+                Box::new(local_norm_row_factory(grid)) as Box<LocalNormRowFactory<'_>>
             }));
         }
-        let local_refs: Vec<Option<&(dyn Fn(usize, &mut [f32], &mut [f32]) + Sync)>> =
-            local_closures.iter().map(|o| o.as_deref()).collect();
+        let local_refs: Vec<Option<&LocalNormRowFactory<'_>>> =
+            local_factories.iter().map(|o| o.as_deref()).collect();
 
         let src = RegisteredSource::open(
             &registered_frames,
@@ -820,7 +854,8 @@ pub fn integrate_group(
             bytes_read: bytes_read_total,
             // `integrate_planes` above is always called with `ln: None` —
             // see that call site's comment — so no included frame has a
-            // grid through this path yet.
+            // grid through this path yet. Task 7 fills this in once
+            // `integrate_group` has a real conduit for grids.
             ln_frames: 0,
         },
     })
@@ -1073,6 +1108,90 @@ mod tests {
                 assert!(msg.contains("local normalization"), "{msg}")
             }
             other => panic!("expected BadInput, got {other:?}"),
+        }
+    }
+
+    /// Fix round 1, item 4: an LN grid whose `ref_width`/`ref_height` don't
+    /// match the group's declared geometry must be refused up front — before
+    /// `RegisteredSource::open` or any rayon worker ever reads it —
+    /// `LnGrid::evaluate_row_into` only `assert!`s the mismatch, which would
+    /// otherwise panic inside a worker thread the first time this frame's
+    /// row got evaluated. Calls `integrate_planes` directly (no file I/O:
+    /// the validation runs before any path is opened).
+    #[test]
+    fn a_mismatched_ln_grid_geometry_is_refused_before_any_worker_runs() {
+        let frames = vec![
+            StackFrame {
+                path: PathBuf::from("a.fits"),
+                map: identity_map(),
+                measurement: dummy_measurement(1),
+                weight: weight(1.0, 1),
+                exposure_s: 60.0,
+                date_obs: None,
+            },
+            StackFrame {
+                path: PathBuf::from("b.fits"),
+                map: identity_map(),
+                measurement: dummy_measurement(1),
+                weight: weight(1.0, 1),
+                exposure_s: 60.0,
+                date_obs: None,
+            },
+        ];
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: 20,
+            height: 20,
+            channels: 1,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+        };
+        // Frame 1's grid is built for a 10x10 reference geometry — the
+        // group above declares 20x20.
+        let bad_grid = LnGrid::constant(10, 10, 128, 1.0, 0.0);
+        let grids: Vec<Option<LnFrameGrids>> = vec![
+            None,
+            Some(LnFrameGrids {
+                channels: vec![bad_grid],
+            }),
+        ];
+        let pool = pool();
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
+        };
+        let result = integrate_planes(
+            &input,
+            &[0, 1],
+            &[vec![1.0], vec![1.0]],
+            OutputNormalization::default(),
+            RejectionNormalization::default(),
+            false,
+            Some(&grids),
+            IntegrationRecipe::average(Rejection::None),
+            false,
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(1_000_000),
+        );
+        match result {
+            Err(IntegrationError::BadInput(msg)) => {
+                assert!(msg.contains("10x10"), "{msg}");
+                assert!(msg.contains('1'), "error should name the frame: {msg}");
+            }
+            Err(other) => panic!("expected BadInput, got {other:?}"),
+            Ok(_) => panic!("expected the mismatched grid to be refused"),
         }
     }
 

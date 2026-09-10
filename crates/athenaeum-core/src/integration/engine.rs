@@ -435,20 +435,30 @@ fn integrate_bias_like_inner(
 /// own `y0` before calling this — see `integrate_stack`'s band loop), fills
 /// `a_row`/`b_row` (both the plane's `width` long) with the per-pixel
 /// `(a, b)` local pair so the caller applies `v′ = a·v + b` in place of that
-/// frame's global normalization pair.
+/// frame's global normalization pair. `FnMut`, not `Fn`: an instance is
+/// never shared between workers (see `LocalNormRowFactory` below), so it is
+/// free to own real mutable scratch with no locking.
 ///
 /// Defined here, as an opaque closure, rather than taking
 /// `crate::stacking::ln::grid::LnGrid` directly: `integration/` is gated on
 /// the `render` feature alone, while the whole `stacking` tree additionally
 /// requires `solver` — a direct dependency here would tie this module's
-/// compilation to a feature it does not otherwise need. The caller
-/// (`stacking::integrate::integrate_planes`) builds one of these per frame
-/// per plane by closing over that frame's `LnGrid` and a reusable
-/// `LnScratch` (see its own doc for how it keeps the closure `Sync`).
-pub type LocalNormRow<'a> = dyn Fn(usize, &mut [f32], &mut [f32]) + Sync + 'a;
+/// compilation to a feature it does not otherwise need.
+pub type LocalNormRow<'a> = dyn FnMut(usize, &mut [f32], &mut [f32]) + 'a;
+
+/// Factory for one frame's [`LocalNormRow`] (M2, fix round 1, item 3):
+/// called once per rayon WORKER (via `for_each_init` in `integrate_stack`'s
+/// band loop, never per row or per pixel) to produce a fresh, independent
+/// evaluator that worker owns exclusively for the rest of the band. The
+/// caller (`stacking::integrate::integrate_planes`, via `local_norm_row`)
+/// builds one of these per frame per plane by closing over that frame's
+/// `LnGrid`; every call to the factory allocates ITS OWN `LnScratch`, so
+/// concurrent workers never contend on one frame's scratch buffer the way a
+/// single shared `Fn` + `Mutex<LnScratch>` would.
+pub type LocalNormRowFactory<'a> = dyn Fn() -> Box<LocalNormRow<'a>> + Sync + 'a;
 
 /// Per-frame inputs of the stacking path, all indexed by the source's frame order.
-pub struct StackParams<'a> {
+pub struct StackParams<'a, 'f> {
     /// Rejection-normalization pair per frame (applied to the working copy).
     pub rejection: &'a [NormalizationPair],
     /// Output-normalization pair per frame (applied to the averaged values).
@@ -460,14 +470,28 @@ pub struct StackParams<'a> {
     pub range_high: Option<f32>,
     /// Accumulate per-pixel low/high rejection counts.
     pub rejection_maps: bool,
-    /// Per-frame local-normalization row evaluator (M2, spec §5.2). `None`
-    /// (the whole option) means no frame has a grid — every Plan 4 caller
-    /// passes this, and the band loop skips the local-normalization work
-    /// entirely, byte-identical to before this field existed. A frame's own
-    /// entry is `None` when that frame has no sidecar; it then keeps using
-    /// its global `rejection`/`output` pair (see `local_for_rejection`/
-    /// `local_for_output` below for which pair(s) a grid actually replaces).
-    pub local: Option<&'a [Option<&'a LocalNormRow<'a>>]>,
+    /// Per-frame local-normalization row evaluator FACTORY (M2, spec §5.2).
+    /// `None` (the whole option) means no frame has a grid — every Plan 4
+    /// caller passes this, and the band loop skips the local-normalization
+    /// work entirely, byte-identical to before this field existed. A
+    /// frame's own entry is `None` when that frame has no sidecar; it then
+    /// keeps using its global `rejection`/`output` pair (see
+    /// `local_for_rejection`/`local_for_output` below for which pair(s) a
+    /// grid actually replaces). A `Some` entry is a FACTORY, not the
+    /// evaluator itself (fix round 1, item 3) — `integrate_stack` calls it
+    /// once per worker thread, never per row/pixel.
+    ///
+    /// `'f` is deliberately its OWN lifetime parameter, distinct from `'a`:
+    /// the factories genuinely live as long as the caller's underlying LN
+    /// grids (`stacking::integrate::integrate_planes` builds a fresh,
+    /// short-lived `&'a [...]` array of them per plane, but each factory
+    /// closure inside it borrows a `LnGrid` that outlives every plane of
+    /// the call). Collapsing `'f` into `'a` made the per-plane array itself
+    /// unbuildable — the borrow checker's dropck rules require a `dyn
+    /// Trait`'s OWN embedded lifetime bound to be provable independently of
+    /// how long the (short-lived) collection holding references to it is
+    /// borrowed for.
+    pub local: Option<&'a [Option<&'a LocalNormRowFactory<'f>>]>,
     /// Apply a frame's local pair to the working copy before rejection, in
     /// place of `rejection[i]`, for a frame that has one.
     pub local_for_rejection: bool,
@@ -503,9 +527,9 @@ pub struct StackOutput {
 /// `raw·rs + ro` decides survival and the output copy `raw·os + oo` is what
 /// the survivors' weighted mean (or median) is taken over.
 #[allow(clippy::too_many_arguments)]
-pub fn integrate_stack<S: FrameSource + ?Sized>(
+pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     src: &S,
-    params: &StackParams<'_>,
+    params: &StackParams<'p, 'f>,
     recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
@@ -568,6 +592,36 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
         }
     }
     let want_local = params.local.is_some() && (params.local_for_rejection || params.local_for_output);
+    // Fix round 1, item 1: split the frame set ONCE, here — never per row,
+    // never per pixel — into the frames a grid actually applies to
+    // (`local_factories`, paired with their factory) and every other frame
+    // (`frames_without_local`). With `want_local` false (every Plan 4
+    // caller, `local: None`) `local_factories` is empty and
+    // `frames_without_local` is `0..n` in ascending order — the per-pixel
+    // loop below then runs exactly one loop, in the exact frame order the
+    // pre-M2 code always used, with zero local-normalization branching or
+    // lookups anywhere in it. This is what keeps the Plan 4 `to_bits()` pin
+    // byte-identical: not just "produces the same value" but "executes the
+    // same instructions."
+    let local_factories: Vec<(usize, &'p LocalNormRowFactory<'f>)> = if want_local {
+        match params.local {
+            Some(grids) => grids
+                .iter()
+                .enumerate()
+                .filter_map(|(i, g)| g.map(|factory| (i, factory)))
+                .collect(),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let frames_without_local: Vec<usize> = {
+        let mut has_local = vec![false; n];
+        for &(i, _) in &local_factories {
+            has_local[i] = true;
+        }
+        (0..n).filter(|&i| !has_local[i]).collect()
+    };
     let mut out = vec![0f32; w * h];
     let rejected = AtomicUsize::new(0);
     let rejected_low = AtomicU64::new(0);
@@ -601,12 +655,28 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
         } else {
             &mut high_guard[..rows * width]
         };
+        // Fix round 1, items 2 + 3: per-worker state, built once per rayon
+        // job (`for_each_init`'s own contract — see its doc: called "only as
+        // needed for a value to be paired with the group of items in each
+        // rayon job", never per row or per pixel) and reused across every
+        // row that worker processes within THIS band. One entry per
+        // frame-with-a-grid: `(frame_index, its OWN evaluator instance from
+        // the factory, a_row, b_row)` — calling the factory here, not
+        // sharing one evaluator across workers, is what removes the need
+        // for any lock on the hot path (a shared `Fn` + `Mutex<LnScratch>`
+        // serialized every worker through one frame's scratch buffer).
+        let init_local_state = || -> Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)> {
+            local_factories
+                .iter()
+                .map(|&(i, factory)| (i, factory(), vec![0f32; width], vec![0f32; width]))
+                .collect()
+        };
         out_band
             .par_chunks_mut(width)
             .zip(low_band.par_chunks_mut(width))
             .zip(high_band.par_chunks_mut(width))
             .enumerate()
-            .for_each(|(row_in_band, ((out_row, low_row), high_row))| {
+            .for_each_init(init_local_state, |local_state, (row_in_band, ((out_row, low_row), high_row))| {
                 // Per-worker scratch, allocated once per ROW (not per pixel):
                 // `work`/`out_vals`/`mask` feed `combine_pixel_weighted`,
                 // `scratch` is its own reused survivor-value buffer (Task 1
@@ -632,34 +702,20 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                 let mut row_low = 0u64;
                 let mut row_high = 0u64;
                 let mut row_all_bad = 0usize;
-                // M2: this row's local-normalization `(a, b)` samples, one
-                // pair of width-long buffers per frame that has a grid —
-                // `None` for a frame without one (see `StackParams::local`'s
-                // doc) and an empty `Vec` altogether when neither consumer
-                // wants local normalization at all (`want_local` false),
-                // which is exactly the Plan 4 (`local: None`) case and every
-                // existing caller today. Evaluated once per row here, not
-                // once per pixel — `LnGrid::evaluate_row_into` is O(gw +
-                // width), not O(width) per call.
+                // M2: evaluate every local grid's row ONCE per row — never
+                // once per pixel (`LnGrid::evaluate_row_into` is O(gw +
+                // width), not O(width) per call) — into THIS WORKER's own
+                // buffers from `local_state` (fix round 1, items 2 + 3: no
+                // allocation and no lock here, both already paid for once,
+                // outside this closure, by `init_local_state` above).
+                // `y_abs` is the ABSOLUTE output row — `y0` is this band's
+                // first row, `row_in_band` is relative to it — never the
+                // band-relative row alone (fix round 1, item 5's own test
+                // pins this against a forced multi-band run).
                 let y_abs = y0 + row_in_band;
-                let local_rows: Vec<Option<(Vec<f32>, Vec<f32>)>> = if want_local {
-                    match params.local {
-                        Some(grids) => grids
-                            .iter()
-                            .map(|&g| {
-                                g.map(|eval| {
-                                    let mut a_row = vec![0f32; width];
-                                    let mut b_row = vec![0f32; width];
-                                    eval(y_abs, &mut a_row, &mut b_row);
-                                    (a_row, b_row)
-                                })
-                            })
-                            .collect(),
-                        None => Vec::new(),
-                    }
-                } else {
-                    Vec::new()
-                };
+                for (_, eval, a_row, b_row) in local_state.iter_mut() {
+                    eval(y_abs, a_row, b_row);
+                }
                 for (x, out_px) in out_row.iter_mut().enumerate() {
                     work.clear();
                     combine::mask_clear(&mut mask);
@@ -667,7 +723,17 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                     let idx = row_in_band * width + x;
                     let mut low_here = 0u32;
                     let mut high_here = 0u32;
-                    for i in 0..n {
+                    // Fix round 1, item 1: frames with NO active local
+                    // override run the EXACT pre-M2 instructions — no
+                    // local-normalization branch, lookup, or closure call
+                    // anywhere in this loop body. With `want_local` false
+                    // (every Plan 4 caller) `local_state` is empty and
+                    // `frames_without_local` is `0..n` in ascending order,
+                    // so this is the ENTIRE per-pixel frame loop, in the
+                    // exact order the pre-M2 code always used — the Plan 4
+                    // `to_bits()` pin's byte-identity comes from this, not
+                    // just from the arithmetic happening to agree.
+                    for &i in &frames_without_local {
                         let raw = planes.sample(i, idx);
                         if !raw.is_finite() {
                             row_bad[i] += 1;
@@ -688,27 +754,52 @@ pub fn integrate_stack<S: FrameSource + ?Sized>(
                                 continue;
                             }
                         }
-                        // M2: `local_ab` is `Some((a, b))` only for a frame
-                        // that both has a grid AND whose row was evaluated
-                        // above (`want_local`); `local_for_rejection`/
-                        // `local_for_output` independently decide which
-                        // consumer(s) a grid replaces — the same pair feeds
-                        // both when both are set.
-                        let local_ab = local_rows
-                            .get(i)
-                            .and_then(|o| o.as_ref())
-                            .map(|(a, b)| (a[x], b[x]));
+                        let rej = params.rejection[i].apply(raw);
+                        let outv = params.output[i].apply(raw);
+                        if !rej.is_finite() || !outv.is_finite() {
+                            row_bad[i] += 1;
+                            continue;
+                        }
+                        out_vals[i] = outv;
+                        rej_vals[i] = rej;
+                        combine::mask_set(&mut present, i);
+                        work.push((rej, i as u16));
+                    }
+                    // Frames WITH an active grid: `local_for_rejection`/
+                    // `local_for_output` independently decide which
+                    // consumer(s) the grid's `(a, b)` pair replaces — the
+                    // frame's global pair still applies to whichever one is
+                    // not set.
+                    for (i, _eval, a_row, b_row) in local_state.iter() {
+                        let i = *i;
+                        let raw = planes.sample(i, idx);
+                        if !raw.is_finite() {
+                            row_bad[i] += 1;
+                            continue;
+                        }
+                        row_samples[i] += 1;
+                        if let Some(lo) = params.range_low {
+                            if raw <= lo {
+                                low_here += 1;
+                                row_rejected[i] += 1;
+                                continue;
+                            }
+                        }
+                        if let Some(hi) = params.range_high {
+                            if raw >= hi {
+                                high_here += 1;
+                                row_rejected[i] += 1;
+                                continue;
+                            }
+                        }
+                        let (a, b) = (a_row[x], b_row[x]);
                         let rej = if params.local_for_rejection {
-                            local_ab
-                                .map(|(a, b)| a * raw + b)
-                                .unwrap_or_else(|| params.rejection[i].apply(raw))
+                            a * raw + b
                         } else {
                             params.rejection[i].apply(raw)
                         };
                         let outv = if params.local_for_output {
-                            local_ab
-                                .map(|(a, b)| a * raw + b)
-                                .unwrap_or_else(|| params.output[i].apply(raw))
+                            a * raw + b
                         } else {
                             params.output[i].apply(raw)
                         };
@@ -1799,6 +1890,16 @@ mod tests {
     /// WHOLE frame) would leave behind once the spatially varying half is
     /// removed. Frame 1 has no grid (`local[0] = None`) and keeps using its
     /// global identity pair, exactly as `StackParams::local`'s doc describes.
+    ///
+    /// Fix round 1, item 5: the budget is deliberately small so
+    /// `out.base.bands >= 2` (asserted below) — the original version of this
+    /// test used a 1 MiB budget, which gives exactly one band (`y0 = 0`
+    /// always), so `y_abs = y0 + row_in_band` was indistinguishable from
+    /// `row_in_band` alone. Verified by temporarily reverting `integrate_stack`
+    /// to `let y_abs = row_in_band;` and re-running: every row past the
+    /// first band failed (wrong gradient sample), confirming this version
+    /// actually exercises the absolute-row rule; reverted back before
+    /// committing (see the fix round 1 report section).
     #[test]
     fn local_grids_replace_the_output_pair_for_a_frame_that_has_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -1811,20 +1912,26 @@ mod tests {
         ];
         let src = BandSource::open(&paths, dir.path(), 1).unwrap();
         let ident = vec![NormalizationPair::IDENTITY; 2];
-        // Frame 2's local row evaluator: constant A = 2, B = -2·gradient(x, y)
-        // — a real `LnGrid` reproduces an affine function of the node values
-        // exactly (see `stacking::ln::grid::LnGrid`'s own doc and its
-        // `linear_ramp_is_reproduced_by_the_spline_between_nodes` test); this
-        // closure stands in for that without pulling `stacking` (gated on
-        // `solver` too) into `integration/`'s own test module.
-        let local_frame2 = move |y: usize, a_row: &mut [f32], b_row: &mut [f32]| {
-            for (x, (a, b)) in a_row.iter_mut().zip(b_row.iter_mut()).enumerate() {
-                *a = 2.0;
-                *b = -2.0 * gradient(x, y);
-            }
+        // Frame 2's local row evaluator FACTORY: constant A = 2, B =
+        // -2·gradient(x, y) — a real `LnGrid` reproduces an affine function
+        // of the node values exactly (see `stacking::ln::grid::LnGrid`'s own
+        // doc and its `linear_ramp_is_reproduced_by_the_spline_between_nodes`
+        // test); this closure stands in for that without pulling `stacking`
+        // (gated on `solver` too) into `integration/`'s own test module. A
+        // factory, not a direct evaluator (fix round 1, item 3): calling it
+        // allocates nothing shared, so it is trivially safe to call once per
+        // worker thread — this test only ever calls it on one thread, but
+        // the shape must still match `StackParams::local`.
+        let local_frame2_factory = move || -> Box<LocalNormRow<'static>> {
+            Box::new(move |y: usize, a_row: &mut [f32], b_row: &mut [f32]| {
+                for (x, (a, b)) in a_row.iter_mut().zip(b_row.iter_mut()).enumerate() {
+                    *a = 2.0;
+                    *b = -2.0 * gradient(x, y);
+                }
+            })
         };
-        let local: Vec<Option<&(dyn Fn(usize, &mut [f32], &mut [f32]) + Sync)>> =
-            vec![None, Some(&local_frame2)];
+        let local: Vec<Option<&LocalNormRowFactory<'_>>> =
+            vec![None, Some(&local_frame2_factory)];
         let params = StackParams {
             rejection: &ident,
             output: &ident,
@@ -1836,6 +1943,9 @@ mod tests {
             local_for_rejection: false,
             local_for_output: true,
         };
+        // budget: `per_row_bytes` for 2 f32 frames at width 16 is
+        // 2*16*4 + 16*8 = 256; 2_000 / 256 -> 7-row bands, so 12 rows run
+        // as 2 bands (7 + 5) — comfortably `>= 2`.
         let out = integrate_stack(
             &src,
             &params,
@@ -1843,9 +1953,10 @@ mod tests {
             &pool(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &nop(), on_combine: &nop() },
-            io(1 << 20),
+            io(2_000),
         )
         .unwrap();
+        assert!(out.base.bands >= 2, "expected a multi-band run, got {}", out.base.bands);
         for (i, &v) in out.base.data.iter().enumerate() {
             assert!((v - c).abs() < 1e-4, "pixel {i} (row {}): {v} vs {c}", i / w);
         }
@@ -1921,19 +2032,25 @@ mod tests {
         );
 
         // With LN: every frame's grid is constant (A = 1, B = -offset) —
-        // subtracting exactly the drift this fixture added.
-        let closures: Vec<_> = offsets
+        // subtracting exactly the drift this fixture added. Factories, not
+        // direct evaluators (fix round 1, item 3): each produces a fresh
+        // closure that owns nothing shared, so calling one more than once
+        // (as the real engine now does, once per worker thread) is trivially
+        // safe here too.
+        let factories: Vec<_> = offsets
             .iter()
             .map(|&o| {
-                move |_y: usize, a_row: &mut [f32], b_row: &mut [f32]| {
-                    a_row.fill(1.0);
-                    b_row.fill(-o);
+                move || -> Box<LocalNormRow<'static>> {
+                    Box::new(move |_y: usize, a_row: &mut [f32], b_row: &mut [f32]| {
+                        a_row.fill(1.0);
+                        b_row.fill(-o);
+                    })
                 }
             })
             .collect();
-        let local: Vec<Option<&(dyn Fn(usize, &mut [f32], &mut [f32]) + Sync)>> = closures
+        let local: Vec<Option<&LocalNormRowFactory<'_>>> = factories
             .iter()
-            .map(|c| Some(c as &(dyn Fn(usize, &mut [f32], &mut [f32]) + Sync)))
+            .map(|f| Some(f as &LocalNormRowFactory<'_>))
             .collect();
         let params_local = StackParams {
             rejection: &ident,
@@ -1960,6 +2077,35 @@ mod tests {
             out_local.rejected_per_frame[hot_idx] > 0,
             "with local rejection normalization the hot pixel must be caught, got {:?}",
             out_local.rejected_per_frame
+        );
+        // Minor item 6: `local_for_rejection` (with `local_for_output`
+        // false) must not leak into the OUTPUT sample — the survivors'
+        // contribution to the average must still be their GLOBAL (here:
+        // identity, i.e. raw) value. Pin the exact rejection pattern first
+        // (exactly one rejection, on `hot_idx`) so the hand-computed
+        // "mean of every other frame's raw value" below is the one true
+        // expected answer, not a coincidence.
+        // Every one of the fixture's w×h pixels carries the same constant
+        // per frame, so the rejection fires at every pixel identically —
+        // `rejected_per_frame` sums over the whole image, not one sample.
+        let total_pixels = (w * h) as u64;
+        assert_eq!(out_local.rejected_per_frame[hot_idx], total_pixels);
+        assert_eq!(out_local.rejected_per_frame.iter().sum::<u64>(), total_pixels);
+        let raw_values: Vec<f32> = (0..n)
+            .map(|i| {
+                let mut v = base + offsets[i];
+                if i == hot_idx {
+                    v += hot_bump;
+                }
+                v
+            })
+            .collect();
+        let survivors_sum: f32 = (0..n).filter(|&i| i != hot_idx).map(|i| raw_values[i]).sum();
+        let expected = survivors_sum / (n - 1) as f32;
+        assert!(
+            out_local.base.data.iter().all(|&v| (v - expected).abs() < 1e-6),
+            "local_for_rejection leaked into the output sample: {:?} vs expected {expected}",
+            out_local.base.data
         );
     }
 }
