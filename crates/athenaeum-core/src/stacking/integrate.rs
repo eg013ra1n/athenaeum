@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::geometry::PixelMap;
 use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
-use crate::integration::engine::{integrate_stack, EngineProgress, StackParams};
+use crate::integration::engine::{integrate_stack, EngineProgress, StackOutput, StackParams};
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
 use crate::integration::stats::{
@@ -289,6 +289,110 @@ pub struct GroupProgress<'a> {
     pub engine: EngineProgress<'a>,
 }
 
+/// The per-plane engine loop shared by [`integrate_group`] and the LN
+/// reference builder (`stacking::ln::reference::build_reference`, M2 Task
+/// 4): for every plane, builds the rejection/output normalization pairs of
+/// `frame_indices` against `input`'s own normalization reference
+/// (`input.frames[input.reference]` — the anchor is always the group's
+/// reference, whether or not it is itself one of `frame_indices`), opens a
+/// `RegisteredSource` over exactly that subset and runs the weighted engine.
+/// `weights[k]` is frame `frame_indices[k]`'s per-channel weight (length
+/// `input.channels`; a missing channel weighs zero, same convention as the
+/// caller building it) — callers with a real per-frame weight vector pass it
+/// through unchanged, callers that want equal weighting (the LN reference)
+/// pass all-`1.0` rows. `output_mode`/`rejection_mode`/`recipe`/`write_maps`
+/// are explicit rather than read from `input.normalization`/`input.integration`
+/// so a caller can force plain global normalization (the LN reference always
+/// does) independently of what the group itself is configured to use.
+/// Returns one [`StackOutput`] per plane, in channel order — no
+/// stats/accumulation/writing: that tail is the caller's job.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn integrate_planes(
+    input: &GroupInput<'_>,
+    frame_indices: &[usize],
+    weights: &[Vec<f32>],
+    output_mode: OutputNormalization,
+    rejection_mode: RejectionNormalization,
+    recipe: IntegrationRecipe,
+    write_maps: bool,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: &GroupProgress<'_>,
+    io: IoPolicy,
+) -> Result<Vec<StackOutput>, IntegrationError> {
+    if weights.len() != frame_indices.len() {
+        return Err(IntegrationError::BadInput(format!(
+            "{} frame indices but {} weight rows",
+            frame_indices.len(),
+            weights.len()
+        )));
+    }
+    let frames = input.frames;
+    let n = frame_indices.len();
+    let mut outputs = Vec::with_capacity(input.channels);
+
+    for p in 0..input.channels {
+        if cancel.load(Ordering::Relaxed) {
+            warn!(plane = p, "group integration cancelled");
+            return Err(IntegrationError::Cancelled);
+        }
+        (progress.on_plane)(p, input.channels);
+
+        let ref_ls = frames[input.reference].measurement.channels[p].location_scale();
+        let mut rejection_pairs = Vec::with_capacity(n);
+        let mut output_pairs = Vec::with_capacity(n);
+        let mut plane_weights = Vec::with_capacity(n);
+        let mut registered_frames = Vec::with_capacity(n);
+        for (k, &i) in frame_indices.iter().enumerate() {
+            let f = &frames[i];
+            let frame_ls = f.measurement.channels[p].location_scale();
+            // `RejectionNormalization::Local` was refused before this call
+            // (`integrate_group` validates it up front; the LN reference
+            // never passes it), so every remaining mode returns `Some`.
+            let rp = rejection_pair(ref_ls, frame_ls, rejection_mode)
+                .expect("Local rejection normalization was refused before this call");
+            let op = output_pair(ref_ls, frame_ls, output_mode);
+            rejection_pairs.push(rp);
+            output_pairs.push(op);
+            plane_weights.push(weights[k].get(p).copied().unwrap_or(0.0));
+            registered_frames.push(RegisteredFrame {
+                path: f.path.clone(),
+                map: f.map.clone(),
+            });
+        }
+
+        let src = RegisteredSource::open(
+            &registered_frames,
+            input.width,
+            input.height,
+            p,
+            input.interpolation,
+            input.clamping,
+        )?;
+
+        let params = StackParams {
+            rejection: &rejection_pairs,
+            output: &output_pairs,
+            weights: &plane_weights,
+            range_low: input.integration.range_low.map(|v| v as f32),
+            range_high: input.integration.range_high.map(|v| v as f32),
+            rejection_maps: write_maps,
+        };
+        // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
+        // fields are — so it must be rebuilt (not read) from
+        // `progress.engine` each plane, since we only hold
+        // `&GroupProgress`, not an owned one.
+        let engine_progress = EngineProgress {
+            on_band: progress.engine.on_band,
+            on_combine: progress.engine.on_combine,
+        };
+        let out = integrate_stack(&src, &params, recipe, pool, cancel, engine_progress, io)?;
+        outputs.push(out);
+    }
+
+    Ok(outputs)
+}
+
 /// Integrates one group, plane by plane (spec §6.1–6.3): resolves the Auto
 /// rejection rule, drops any frame below the weight floor, builds the
 /// rejection/output normalization pairs from the reference frame's
@@ -437,62 +541,44 @@ pub fn integrate_group(
     let mut master_fwhm_px = Vec::with_capacity(input.channels);
     let mut master_eccentricity = Vec::with_capacity(input.channels);
 
-    for p in 0..input.channels {
-        if cancel.load(Ordering::Relaxed) {
-            warn!(plane = p, "group integration cancelled");
-            return Err(IntegrationError::Cancelled);
-        }
-        let plane_start = Instant::now();
-        (progress.on_plane)(p, input.channels);
-
-        let ref_ls = frames[input.reference].measurement.channels[p].location_scale();
-        let mut rejection_pairs = Vec::with_capacity(included_count);
-        let mut output_pairs = Vec::with_capacity(included_count);
-        let mut weights = Vec::with_capacity(included_count);
-        let mut registered_frames = Vec::with_capacity(included_count);
-        for &i in &included {
+    // Per-channel weight row for each included frame, in `included` order —
+    // the same `.get(p).copied().unwrap_or(0.0)` convention the per-plane
+    // loop used inline before this was pulled out into `integrate_planes`
+    // (a frame whose own weight vector is short weighs zero on the missing
+    // channels, warned above).
+    let weights_per_frame: Vec<Vec<f32>> = included
+        .iter()
+        .map(|&i| {
             let f = &frames[i];
-            let frame_ls = f.measurement.channels[p].location_scale();
-            // `normalization.rejection != Local` was validated above, so
-            // every remaining mode returns `Some`.
-            let rp = rejection_pair(ref_ls, frame_ls, input.normalization.rejection)
-                .expect("Local rejection normalization was refused before this loop");
-            let op = output_pair(ref_ls, frame_ls, input.normalization.output);
-            rejection_pairs.push(rp);
-            output_pairs.push(op);
-            weights.push(f.weight.normalized.get(p).copied().unwrap_or(0.0) as f32);
-            registered_frames.push(RegisteredFrame {
-                path: f.path.clone(),
-                map: f.map.clone(),
-            });
-        }
+            (0..input.channels)
+                .map(|p| f.weight.normalized.get(p).copied().unwrap_or(0.0) as f32)
+                .collect()
+        })
+        .collect();
 
-        let src = RegisteredSource::open(
-            &registered_frames,
-            input.width,
-            input.height,
-            p,
-            input.interpolation,
-            input.clamping,
-        )?;
+    let outputs = integrate_planes(
+        input,
+        &included,
+        &weights_per_frame,
+        input.normalization.output,
+        input.normalization.rejection,
+        recipe,
+        input.integration.write_rejection_maps,
+        pool,
+        cancel,
+        progress,
+        io,
+    )?;
 
-        let params = StackParams {
-            rejection: &rejection_pairs,
-            output: &output_pairs,
-            weights: &weights,
-            range_low: input.integration.range_low.map(|v| v as f32),
-            range_high: input.integration.range_high.map(|v| v as f32),
-            rejection_maps: input.integration.write_rejection_maps,
-        };
-        // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
-        // fields are — so it must be rebuilt (not read) from
-        // `progress.engine` each plane, since we only hold
-        // `&GroupProgress`, not an owned one.
-        let engine_progress = EngineProgress {
-            on_band: progress.engine.on_band,
-            on_combine: progress.engine.on_combine,
-        };
-        let out = integrate_stack(&src, &params, recipe, pool, cancel, engine_progress, io)?;
+    for (p, out) in outputs.into_iter().enumerate() {
+        // `integrate_planes` no longer exposes a per-plane wall-clock split
+        // (it runs every plane's `RegisteredSource::open` + `integrate_stack`
+        // before this tail even starts), so the logged `duration_ms` below is
+        // now `out.base`'s own read+combine time plus this tail's own
+        // elapsed time — the dominant costs, not `RegisteredSource::open`'s
+        // (comparatively negligible) setup — rather than the true
+        // open-to-tail span the pre-extraction code measured.
+        let stats_start = Instant::now();
 
         read_ms_total += out.base.read_duration.as_millis() as u64;
         combine_ms_total += out.base.combine_duration.as_millis() as u64;
@@ -557,7 +643,9 @@ pub fn integrate_group(
         };
         snr_gain.push(gain);
 
-        let plane_duration_ms = plane_start.elapsed().as_millis() as u64;
+        let plane_duration_ms =
+            (out.base.read_duration + out.base.combine_duration + stats_start.elapsed())
+                .as_millis() as u64;
         debug!(
             plane = p,
             rejected_low = out.rejected_low,

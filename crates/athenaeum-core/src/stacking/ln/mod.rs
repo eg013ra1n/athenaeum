@@ -7,15 +7,20 @@
 //! model on the same stride mesh — the input Task 5 builds `B = B_ref −
 //! s·B_tgt` from. `scale` (M2 Task 3) is the frame-global multiplicative
 //! term `s` — the RCR location of matched-star PSF-flux ratios — Task 5
-//! stamps onto the grid as `A`. Later M2 tasks (measurement, application,
-//! provenance) build on this foundation.
+//! stamps onto the grid as `A`. `reference` (M2 Task 4) is the per-group
+//! low-noise reference (`LnReference`) Task 5 measures background/scale
+//! against — built by sharing `stacking::integrate::integrate_planes`, the
+//! same per-plane engine loop `integrate_group` (Plan 4) drives. Later M2
+//! tasks (application, provenance) build on this foundation.
 
 pub mod background;
 pub mod grid;
+pub mod reference;
 pub mod scale;
 
 pub use background::{background_grid, BackgroundGrid, BackgroundParams, DEFAULT_PARAMS};
 pub use grid::{LnFrameGrids, LnGrid};
+pub use reference::{build_reference, read_reference, write_reference, LnReference};
 pub use scale::{relative_scale, ScaleResult};
 
 /// Local-normalization errors shared by every M2 task past detection: a
