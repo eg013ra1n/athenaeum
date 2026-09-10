@@ -1149,6 +1149,41 @@ pub fn build_plan(
     } else {
         HashMap::new()
     };
+    // Carry-over (c), Task 5's re-review: a frame the LATEST run itself
+    // runtime-excluded for a local-normalization reason (`TooFewMatches`, a
+    // sidecar write failure, an unreadable cached sidecar — M2 Task 7's
+    // `exclude_frame_and_persist` calls, `run.rs`) has no `ln` artifact by
+    // design — its own `normalize_frame` call never produced one, and won't
+    // for the same underlying reason until something upstream changes.
+    // Without this, `normalize_stale` would stay true FOREVER for that
+    // group: this one known-bad frame can never earn a fresh `ln` row on
+    // its own. Every LN exclusion reason (`LnError`'s `Display`, and Task
+    // 7's own "sidecar unreadable" text) starts with the literal
+    // "local normalization:" prefix — checked, never assumed, so an
+    // unrelated exclusion (registration failure, manual list, weight floor)
+    // is never mistaken for one. Same "fetch once per build, look up per
+    // frame" shape as `ln_registration_by_frame` above; `compute_register_stale`
+    // below fetches the same last-run frame rows independently for its own
+    // purpose — kept separate rather than threading a shared fetch through,
+    // since the two staleness computations are otherwise unrelated.
+    let ln_runtime_excluded_by_frame: HashSet<i64> = if local_normalization_active {
+        match list_runs(conn, frames_set_id, 1)?.into_iter().next() {
+            Some(last_run) => list_frame_rows(conn, last_run.id)?
+                .into_iter()
+                .filter(|row| {
+                    !row.included
+                        && row
+                            .exclusion_reason
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with("local normalization:"))
+                })
+                .map(|row| row.frame_id)
+                .collect(),
+            None => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
+    };
 
     for g in &groups {
         // Fix round 1, item 5: the group's LN reference artifact carries the
@@ -1245,7 +1280,11 @@ pub fn build_plan(
                 };
                 if ln_fresh {
                     ln_cached += 1;
-                } else if !is_excluded {
+                } else if !is_excluded && !ln_runtime_excluded_by_frame.contains(&f.frame_id) {
+                    // Carry-over (c): a frame the latest run itself already
+                    // excluded for a local-normalization reason has no `ln`
+                    // artifact by design and is not owed one — see
+                    // `ln_runtime_excluded_by_frame`'s own doc above.
                     normalize_stale = true;
                 }
             }
@@ -2744,6 +2783,299 @@ mod tests {
             plan2.stale_stages
         );
         assert_eq!(plan2.groups[0].ln_cached, 0, "{:?}", plan2.groups[0]);
+    }
+
+    /// M2 Task 7 carry-over (c) (Task 5's re-review): a frame the LATEST run
+    /// itself runtime-excluded for a local-normalization reason
+    /// (`TooFewMatches`, a sidecar write/read failure) has no `ln` artifact
+    /// BY DESIGN — its own `normalize_frame` call never produced one, and
+    /// won't for the same underlying reason until something upstream
+    /// changes. Before the fix, `normalize_stale` stayed `true` FOREVER for
+    /// such a group: this one known-bad frame could never earn a fresh `ln`
+    /// row on its own. `ids[2]` gets no `ln` artifact and no registration
+    /// row at all (same shape `register_stale_ignores_a_frame_the_run_excluded`
+    /// uses for its own analogous case) — only a `stacking_run_frames` row
+    /// saying `included = false` with a "local normalization: …" reason.
+    #[test]
+    fn normalize_stale_ignores_a_frame_the_run_excluded_for_local_normalization() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        cfg.normalization.local.enabled = true;
+        set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+        let group_key = groups[0].key.clone();
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        // Calibrated + metrics artifacts for all three — this test is about
+        // Normalize staleness specifically, so Calibrate/Measure must read
+        // as fresh for every frame, excluded one included (its file was
+        // still calibrated/measured; only stage 6's own normalize_frame
+        // call failed for it).
+        for gf in &groups[0].frames {
+            let hash = calib_hashes.get(&gf.frame_id).unwrap().clone();
+            let cal_path = f
+                .dir
+                .path()
+                .join(format!("calibrated_{}.fits", gf.frame_id));
+            std::fs::write(&cal_path, [0u8]).unwrap();
+            let size = std::fs::metadata(&cal_path).unwrap().len() as i64;
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "calibrated",
+                    path: Some(cal_path.to_str().unwrap()),
+                    config_hash: &hash,
+                    size: Some(size),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+
+            let metrics_hash = measurement_hash_for(&cfg, &hash);
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &group_key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &metrics_hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+        }
+
+        // The run: ids[0]/ids[1] included and normalized; ids[2] excluded by
+        // stage 6 itself, the same way `run_group_normalization`'s own
+        // `exclude_frame_and_persist` call would leave it.
+        let run_id = crate::db::stacking::insert_run(
+            &f.conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: f.set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: Some(ids[0]),
+                reference_mode: "manual",
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+        let group_id = crate::db::stacking::insert_group(
+            &f.conn,
+            &crate::db::stacking::NewGroup {
+                run_id,
+                group_key: &group_key,
+                instrume: None,
+                color_mode: "mono",
+                filter: None,
+                binning: Some(1),
+                width: Some(1),
+                height: Some(1),
+                exposure: None,
+                frame_count: 3,
+                included_count: 2,
+            },
+        )
+        .unwrap();
+        let seed_frame_row = |included: bool, reason: Option<&str>, frame_id: i64| {
+            crate::db::stacking::upsert_frame_row(
+                &f.conn,
+                &crate::db::stacking::NewFrameRow {
+                    run_id,
+                    group_id,
+                    frame_id,
+                    included,
+                    exclusion_reason: reason,
+                    weight: None,
+                    weight_channels_json: None,
+                    metrics_json: None,
+                    reg_status: None,
+                    reg_model: None,
+                    reg_rms_px: None,
+                    reg_inliers: None,
+                    reg_inlier_ratio: None,
+                    reg_flipped: None,
+                    rejected_fraction: None,
+                },
+            )
+            .unwrap();
+        };
+        seed_frame_row(true, None, ids[0]);
+        seed_frame_row(true, None, ids[1]);
+        seed_frame_row(
+            false,
+            Some("local normalization: 5 matched stars (< 20)"),
+            ids[2],
+        );
+
+        // Registration rows for the two INCLUDED-AND-NORMALIZED frames only
+        // — none at all for ids[2], same as the run-excluded case elsewhere.
+        let reference_calib_hash = calib_hashes.get(&ids[0]).unwrap().clone();
+        let mut registration_hashes: HashMap<i64, String> = HashMap::new();
+        for &frame_id in &ids[..2] {
+            let frame_hash = calib_hashes.get(&frame_id).unwrap();
+            let expected = registration_hash_for(&cfg, ids[0], &reference_calib_hash, frame_hash);
+            registration_hashes.insert(frame_id, expected.clone());
+            let is_reference = frame_id == ids[0];
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id,
+                reference_frame_id: ids[0],
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        // The LN reference: only the two normalized frames are candidates —
+        // ids[2] was never eligible (it failed before ever contributing).
+        let reference_member_ids: Vec<i64> = ids[..2].to_vec();
+        let combined = {
+            let mut hashes: Vec<&str> = reference_member_ids
+                .iter()
+                .map(|id| registration_hashes[id].as_str())
+                .collect();
+            hashes.sort_unstable();
+            hashes.join(",")
+        };
+        let reference_hash = normalization_hash_for(&cfg, &combined, &reference_member_ids, "");
+        let reference_payload = serde_json::to_string(&LnReferencePayload {
+            reference_member_ids: reference_member_ids.clone(),
+            reference_hash: reference_hash.clone(),
+        })
+        .unwrap();
+        let reference_path = f.dir.path().join("reference.fits");
+        std::fs::write(&reference_path, [0u8]).unwrap();
+        let reference_size = std::fs::metadata(&reference_path).unwrap().len() as i64;
+        crate::db::stacking::upsert_artifact(
+            &f.conn,
+            &crate::db::stacking::NewArtifact {
+                frames_set_id: f.set_id,
+                frame_id: None,
+                group_key: &group_key,
+                kind: "ln_reference",
+                path: Some(reference_path.to_str().unwrap()),
+                config_hash: &reference_hash,
+                size: Some(reference_size),
+                modified_at: None,
+                payload_json: Some(&reference_payload),
+            },
+        )
+        .unwrap();
+
+        // `ln` artifacts for ids[0]/ids[1] only — none at all for ids[2].
+        for &frame_id in &ids[..2] {
+            let frame_hash = normalization_hash_for(
+                &cfg,
+                &registration_hashes[&frame_id],
+                &reference_member_ids,
+                &reference_hash,
+            );
+            let sidecar_path = f.dir.path().join(format!("f{frame_id}.athln"));
+            std::fs::write(&sidecar_path, [0u8]).unwrap();
+            let size = std::fs::metadata(&sidecar_path).unwrap().len() as i64;
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(frame_id),
+                    group_key: &group_key,
+                    kind: "ln",
+                    path: Some(sidecar_path.to_str().unwrap()),
+                    config_hash: &frame_hash,
+                    size: Some(size),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Normalize),
+            "a run-excluded LN frame must not keep Normalize stale forever: {:?}",
+            plan.stale_stages
+        );
+        assert_eq!(
+            plan.groups[0].ln_cached, 2,
+            "only the two normalized frames are cached: {:?}",
+            plan.groups[0]
+        );
+
+        // Control: flip ids[2]'s row to `included = true` with no LN
+        // exclusion reason (still no `ln` artifact — some OTHER, non-LN gap)
+        // — this is the ordinary "missing artifact" case and MUST still
+        // read as stale, proving the fix is scoped to the LN-exclusion
+        // reason, not a blanket "ignore any run-excluded-or-not frame".
+        seed_frame_row(true, None, ids[2]);
+        let plan2 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            plan2.stale_stages.contains(&Stage::Normalize),
+            "an included frame with no ln artifact and no LN exclusion reason must still be stale: {:?}",
+            plan2.stale_stages
+        );
     }
 
     /// Final fix wave item 3, scenario (c): a frame the LATEST RUN itself

@@ -50,7 +50,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 ## Module Map
 
-**`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4), `config`/`groups`/`paths`/`plan`/`run`/`provenance` (config precedence, group discovery, artifact paths, the plan gate, the run thread, provenance rows — Plan 5a orchestration) plus `api/stacking.rs` (the command-facing orchestration layer both hosts call); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs` and `examples/integrate_probe.rs`. See **## Stacking** below for the tab, the commands and the acceptance state.
+**`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4), `config`/`groups`/`paths`/`plan`/`run`/`provenance` (config precedence, group discovery, artifact paths, the plan gate, the run thread, provenance rows — Plan 5a orchestration), `ln` (local normalization — reference build, background model, PSF-flux scale, `.athln` sidecars, M2) plus `api/stacking.rs` (the command-facing orchestration layer both hosts call); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs`, `examples/integrate_probe.rs` and `examples/ln_probe.rs`. See **## Stacking** below for the tab, the commands and the acceptance state.
 
 **Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 249 functions across 23 modules (re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
@@ -412,12 +412,14 @@ build itself) → `Calibrate` (reuses the calibrated-lights export engine
 verbatim) → `Measure` → `Reference` (one frame for the whole set — highest
 weight, or the user's pinned choice via `set_frame_set_reference`) →
 `Register` (registration v2: quad-seeded RANSAC + distortion) → `Normalize`
-→ `Integrate` (banded, weighted, Auto rejection) → `Drizzle` (M3, off in M1)
-→ `Output` (master-light header/naming/writers + WCS/SIP from the stored
-solve). `Calibrate`/`Measure`/`Register` are the only cacheable per-frame
-stages (`stacking_artifacts`, keyed by a per-stage config hash — spec §9.3;
-`StackingPlan.stale_stages` lists which of the three a fresh run would have
-to redo).
+(local normalization, M2 — see below; a no-op when
+`normalization.local.enabled` is off and `normalization.rejection` isn't
+`"local"`) → `Integrate` (banded, weighted, Auto rejection) → `Drizzle` (M3,
+off in M1) → `Output` (master-light header/naming/writers + WCS/SIP from the
+stored solve). `Calibrate`/`Measure`/`Register`/`Normalize` are the only
+cacheable per-frame stages (`stacking_artifacts`, keyed by a per-stage
+config hash — spec §9.3; `StackingPlan.stale_stages` lists which of the
+four a fresh run would have to redo).
 
 **The plan gate** (`stacking::plan::build_plan`, DB + cheap FS probes, no
 pixel I/O) returns a `StackingPlan`: groups (`stacking::groups`, catalog
@@ -496,11 +498,71 @@ per-group reference with no cross-group registration; until M4 the plan gate
 names a foreign-scale group as a blocker instead of registration silently
 dropping its frames).
 
+**M2 — local normalization** (spec §5.2, executed 2026-09-10): stage 6
+(`Stage::Normalize`) stops being a no-op the moment
+`normalization.local.enabled` is on or `normalization.rejection == "local"`.
+Per group it ranks included members by weight, integrates the best
+`referenceFrames` of them
+(default 20) into an in-RAM LN reference (linear-fit rejection, plain
+global normalization — never the group's own configured normalization),
+models that reference's background on the `scale/8` node mesh (default
+scale 1024 → stride 128), then fans out per included member: warp into the
+reference geometry, model the target's own background the same way (a
+looser deviation threshold), take the PSF-flux relative scale against the
+reference by RCR over matched-star fits, and write `A = s`,
+`B = B_ref − s·B_tgt` on the stride grid as a `.athln` sidecar
+(`stacking::ln`). Sidecars are cached as `stacking_artifacts` rows exactly
+like every other per-frame stage — `kind = "ln"` per frame, `kind =
+"ln_reference"` per group (`frame_id` `NULL`) — keyed by a config hash that
+folds in the reference member list and the reference's own hash, so
+re-registering ONE reference member correctly invalidates every other
+member's sidecar too, not just its own.
+
+`stacking::run` reads the cached sidecars back into `GroupInput.ln`
+(indexed like the group's own frame list, `None` for a frame with no
+grid) and forwards it to `integrate_planes`, which wraps each channel's
+`LnGrid` as an opaque row-evaluator factory so `integration/engine.rs`
+never depends on the `stacking` tree directly (`StackParams.local`, a
+factory called once per rayon worker — never shared behind a lock). The
+engine's band loop applies `v' = A·v + B` (the SAME bicubic B-spline
+reconstruction of the coarse grid the acceptance probe below uses) in
+place of a frame's global `(offset, scale)` pair for OUTPUT normalization
+when `normalization.local.enabled`, and for REJECTION normalization when
+`normalization.rejection == "local"` — independently gated, so a group can
+use one without the other; a frame with no grid always falls back to its
+own global pair, keeping the M1 byte-identical pins intact when `local` is
+off entirely. A frame whose own relative scale can't be measured (fewer
+than 20 matched stars) or whose sidecar can't be read back (corruption, a
+stale cache hit) is excluded from the group with a reason, never silently
+degraded, when LN drives OUTPUT normalization; it keeps global
+normalization with a warning when LN drives rejection only.
+
+`normalization.local` config (spec §9.2): `enabled`, `scale` (the tile
+size in px — 256–4096, step 256 in the UI), `referenceFrames` (3–50),
+`psfModel`, `localScale` (still disabled — a per-cell local scale spline
+is M4). On-disk layout: `<working_dir>/<set_slug>/ln/<group>/reference.fits`
++ `ln/<group>/<calibrated-stem>.athln`.
+
+**Known gap, not closed by this landing**: `build_plan`'s own Gate 6
+(`plan.rs`, code `"unsupported"`, message "Local normalization arrives in
+M2") still refuses any plan with `normalization.local.enabled = true`
+outright, and `integrate_group` (`stacking/integrate.rs`) still refuses
+`normalization.rejection == "local"` with a `BadInput` before it ever
+reaches the engine — both are the M1-era guards this feature was built
+against, neither lifted yet. The wiring above is complete and covered by
+tests that drive `RunContext` directly (bypassing `build_plan`/
+`start_stacking`, the same pattern the stage-6 driver's own tests use),
+and by `examples/ln_probe.rs` against a real catalog — but `start_stacking`
+itself will not yet run a plan with local normalization on until a
+follow-up task removes both refusals.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,robust,integrate,
 master_cards}.rs`, `stacking/register/{mod,detect,align,frame,writer}.rs`,
+`stacking/ln/{mod,grid,background,scale,reference}.rs`,
 `crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
-fits_writer/wcs.rs`; dev probes `examples/{measure,register,integrate}_probe.rs`.
+fits_writer/wcs.rs`; dev probes
+`examples/{measure,register,integrate,ln}_probe.rs`.
 Frontend: `src/components/stacking/` (above),
 `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.
 

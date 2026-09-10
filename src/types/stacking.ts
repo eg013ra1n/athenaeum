@@ -159,7 +159,15 @@ export type PlanMaster = { setId: number, kind: MasterWork, imagetyp: string, fr
 
 export type PlanBlocker = { code: string, message: string, };
 
-export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, width: number, height: number, exposureS: number | null, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, };
+export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, width: number, height: number, exposureS: number | null, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
+/**
+ * Frames (of `included_count`) whose `.athln` sidecar already exists on
+ * disk (spec §9.3, M2) — `0` when local normalization is off. A
+ * PRESENCE check, not a hash-verified freshness one: see the doc on
+ * this field's computation in [`build_plan`] for why (the LN reference
+ * member list is a stage-3 weight quantity, unavailable at plan time).
+ */
+lnCached: number, };
 
 export type PlanReference = { mode: ReferenceMode, frameId: number | null, filename: string | null, onDisk: boolean, };
 
@@ -186,9 +194,34 @@ export type SummaryReference = { frameId: number | null, filename: string | null
 
 export type SummaryMeasurement = { seedSource: string, scaleEstimator: ScaleEstimator, };
 
-export type SummaryFrame = { frameId: number, filename: string, included: boolean, exclusionReason: string | null, weight: number | null, weightChannels: Array<number>, fwhmPx: number | null, eccentricity: number | null, stars: number | null, psfSignalWeight: number | null, psfSnr: number | null, noise: number | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, calibratedPath: string | null, cachedCalibrated: boolean, cachedMetrics: boolean, cachedRegistration: boolean, };
+export type SummaryFrame = { frameId: number, filename: string, included: boolean, exclusionReason: string | null, weight: number | null, weightChannels: Array<number>, fwhmPx: number | null, eccentricity: number | null, stars: number | null, psfSignalWeight: number | null, psfSnr: number | null, noise: number | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, calibratedPath: string | null, cachedCalibrated: boolean, cachedMetrics: boolean, cachedRegistration: boolean, 
+/**
+ * Stage 6 (local normalization, M2): the frame's own relative scale
+ * (mean across channels — [`crate::stacking::ln::LnFrameOutcome::scale`]),
+ * `None` when local normalization never ran for this group (disabled,
+ * or a ruling-R3 fallback to global normalization) or this frame was
+ * excluded before reaching it. `#[serde(default)]` so a `runs/run-<id>.json`
+ * written before M2 still deserializes.
+ */
+lnScale: number | null, 
+/**
+ * Whether stage 6 REUSED an existing `ln` artifact for this frame
+ * rather than normalizing it fresh — same convention as
+ * `cached_calibrated`/`cached_metrics`. `#[serde(default)]`, see
+ * `ln_scale`'s own doc.
+ */
+cachedLn: boolean, };
 
-export type SummaryGroup = { key: string, frameCount: number, includedCount: number, masterPath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, stats: GroupStats | null, normalizationReferenceFrameId: number | null, frames: Array<SummaryFrame>, };
+export type SummaryGroup = { key: string, frameCount: number, includedCount: number, masterPath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, stats: GroupStats | null, normalizationReferenceFrameId: number | null, 
+/**
+ * Stage 6 (local normalization, M2): the group's LN reference file
+ * (`ln/<group>/reference.fits`, spec §9.5), when local normalization
+ * ran for this group at all — `None` when it is disabled, the group
+ * never reached Output (skipped/failed), or a ruling-R3 fallback to
+ * global normalization applied. `#[serde(default)]`, see
+ * `SummaryFrame::ln_scale`'s own doc.
+ */
+lnReferencePath: string | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 
@@ -270,5 +303,13 @@ snrGain: Array<number>, masterFwhmPx: Array<number>, masterEccentricity: Array<n
  * `Σ exposure_i · weight_i` over included frames, `weight_i` the mean
  * over planes of frame i's normalized weight (`FrameWeight::normalized_mean`).
  */
-weightedExposureS: number, totalExposureS: number, readMs: number, combineMs: number, bytesRead: number, };
+weightedExposureS: number, totalExposureS: number, readMs: number, combineMs: number, bytesRead: number, 
+/**
+ * Included frames integrated with an LN grid (M2 Task 7) — `0` when the
+ * caller passes no grids at all (`GroupInput.ln: None`: local
+ * normalization off for this group, or `stacking::run` never resolved
+ * any), otherwise the count of included frames whose own `ln[i]` was
+ * `Some`.
+ */
+lnFrames: number, };
 

@@ -905,6 +905,7 @@ fn main() {
         clamping: args.reg.clamping_threshold,
         integration: &integration,
         normalization: &normalization,
+        ln: None,
     };
 
     let band_throttle = Throttle::new(Duration::from_secs(2));

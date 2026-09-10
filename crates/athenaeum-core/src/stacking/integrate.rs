@@ -218,6 +218,17 @@ pub struct GroupInput<'a> {
     pub clamping: f32,
     pub integration: &'a IntegrationConfig,
     pub normalization: &'a NormalizationConfig,
+    /// M2 Task 7: per-frame local-normalization grids, indexed like `frames`
+    /// (not like a group's `included`/`frame_indices` subset) — `stacking::run`
+    /// reads these back from cached `.athln` artifacts once stage 6 has run
+    /// for the group; `None` for a frame with no sidecar (LN never ran for
+    /// it, or it drives rejection only and its own `normalize_frame` call
+    /// failed). The whole field is `None` when local normalization never ran
+    /// for this group at all (disabled, or a ruling-R3-shaped fallback to
+    /// global normalization) — `integrate_group` forwards it verbatim to
+    /// [`integrate_planes`], which already treats `None` the same way for
+    /// every M1 caller.
+    pub ln: Option<&'a [Option<LnFrameGrids>]>,
 }
 
 // `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
@@ -271,9 +282,11 @@ pub struct GroupStats {
     pub read_ms: u64,
     pub combine_ms: u64,
     pub bytes_read: u64,
-    /// Included frames integrated with an LN grid (M2) — always `0` while
-    /// every caller of [`integrate_group`] passes `ln: None` to
-    /// [`integrate_planes`].
+    /// Included frames integrated with an LN grid (M2 Task 7) — `0` when the
+    /// caller passes no grids at all (`GroupInput.ln: None`: local
+    /// normalization off for this group, or `stacking::run` never resolved
+    /// any), otherwise the count of included frames whose own `ln[i]` was
+    /// `Some`.
     pub ln_frames: usize,
 }
 
@@ -680,15 +693,14 @@ pub fn integrate_group(
         &weights_per_frame,
         input.normalization.output,
         input.normalization.rejection,
-        // M2: `integrate_group` has no channel yet to receive real LN
-        // grids — `ln: None` below always makes this a no-op today (a
-        // follow-up wires the real thing) — so `local_for_output` here is
-        // harmless to pass through honestly rather than hardcoding `false`:
-        // every existing config's `local.enabled` defaults to `false`
-        // anyway, and a caller that already flips it on will "just work"
-        // once `ln` stops being `None`.
+        // M2 Task 7: `input.ln` carries whatever real per-frame grids
+        // `stacking::run` resolved for this group (`None` when local
+        // normalization never ran for it at all) — `local_for_output` is
+        // `input.normalization.local.enabled` regardless of whether any
+        // frame actually has a grid; a frame with none falls back to its
+        // global pair either way (see `integrate_planes`'s own doc).
         input.normalization.local.enabled,
-        None,
+        input.ln,
         recipe,
         input.integration.write_rejection_maps,
         pool,
@@ -822,6 +834,20 @@ pub fn integrate_group(
         "group integration finished"
     );
 
+    // M2 Task 7: `input.ln` is `Some` only when `stacking::run` resolved
+    // real per-frame grids for this group (see `GroupInput.ln`'s own doc) —
+    // count how many of the INCLUDED frames (post min-weight drop) actually
+    // carried one.
+    let ln_frames = input
+        .ln
+        .map(|grids| {
+            included
+                .iter()
+                .filter(|&&i| grids.get(i).is_some_and(|g| g.is_some()))
+                .count()
+        })
+        .unwrap_or(0);
+
     Ok(GroupOutput {
         width: input.width,
         height: input.height,
@@ -852,11 +878,7 @@ pub fn integrate_group(
             read_ms: read_ms_total,
             combine_ms: combine_ms_total,
             bytes_read: bytes_read_total,
-            // `integrate_planes` above is always called with `ln: None` —
-            // see that call site's comment — so no included frame has a
-            // grid through this path yet. Task 7 fills this in once
-            // `integrate_group` has a real conduit for grids.
-            ln_frames: 0,
+            ln_frames,
         },
     })
 }
@@ -1083,6 +1105,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1150,6 +1173,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         // Frame 1's grid is built for a 10x10 reference geometry — the
         // group above declares 20x20.
@@ -1263,6 +1287,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let out = integrate_group(
             &input,
@@ -1392,6 +1417,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1534,6 +1560,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let pool = pool();
         let planes_seen = std::sync::Mutex::new(Vec::new());

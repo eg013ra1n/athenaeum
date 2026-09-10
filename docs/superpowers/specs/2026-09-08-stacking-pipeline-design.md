@@ -549,7 +549,7 @@ registration:  { model: "auto", distortion: "off", interpolation: "bicubicBSplin
 normalization: { output: "additiveWithScaling", rejection: "scaleZeroOffset",
                  scaleEstimator: "bwmv",
                  local: { enabled: false, scale: 1024, referenceFrames: 20,
-                          psfModel: "auto", localScale: false } }      -- enabled: true from M2
+                          psfModel: "auto", localScale: false } }      -- stays false (§14 M2)
 integration:   { combination: "average", rejection: { method: "auto" },
                  minWeight: 0.005, rangeLow: 0.0, rangeHigh: null,
                  writeRejectionMaps: false }
@@ -867,6 +867,21 @@ Reference build per group, MMT background models, PSF-flux scale with RCR,
 `.athln` sidecars, engine hook (output + rejection normalization),
 `NormalizePanel` LN block live, acceptance re-run (noise target re-measured
 with LN on both sides).
+
+**Executed 2026-09-10**, plan
+`docs/superpowers/plans/2026-09-10-stacking-m2-plan-local-normalization.md`
+(Tasks 1–7: `LnGrid`/the bicubic B-spline evaluator/`.athln` sidecar, the
+background model, PSF-flux relative scale with RCR, the per-group reference,
+the stage-6 driver + artifact caching, the engine hook, and the wiring that
+reads cached sidecars back into `GroupInput.ln` + `examples/ln_probe.rs`).
+Tasks 8 (`NormalizePanel` LN block, results/frames-table surfacing) and 9
+(the LDN 1272 acceptance re-run) are tracked separately in the same plan.
+Two M1-era guards are DELIBERATELY still in place after Task 7 — `build_plan`
+refuses any plan with `normalization.local.enabled = true` (Gate 6,
+`plan.rs`), and `integrate_group` refuses `normalization.rejection ==
+"local"` — so `start_stacking` does not yet run an LN-enabled plan
+end-to-end; lifting both is scoped to whichever task next needs a real run
+(Task 8's UI or Task 9's acceptance run).
 
 ### M3 — drizzle
 

@@ -63,8 +63,8 @@ use crate::stacking::integrate::{
 };
 use crate::stacking::ln::{
     background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
-    write_reference, BackgroundGrid, BackgroundParams, LnReference, LnReferenceForDetection,
-    DEFAULT_PARAMS,
+    write_reference, BackgroundGrid, BackgroundParams, LnFrameGrids, LnReference,
+    LnReferenceForDetection, DEFAULT_PARAMS,
 };
 use crate::stacking::master_cards::{
     build_master_light_cards, master_file_name, write_master_light, MasterCardInputs,
@@ -157,6 +157,18 @@ pub struct StartedStacking {
 pub(crate) enum RunError {
     Cancelled,
     Other(String),
+    /// M2 Task 7 (carry-over (b) from Task 5's re-review): a DB error while
+    /// persisting a stage-6 exclusion (`exclude_frame_and_persist`), raised
+    /// AFTER that call already flipped the frame's in-memory
+    /// `MeasuredFrame::included` — the frame's state is now inconsistent
+    /// (excluded in memory, possibly not on disk), so the caller must fail
+    /// the group outright rather than treat this like any other recoverable
+    /// local-normalization error and continue with global normalization as
+    /// if the frame were still a normal member. Constructed nowhere else;
+    /// never escapes `process_group_output`, which converts it to a
+    /// `fail_group` call — the arm on the top-level status match below is
+    /// exhaustiveness only.
+    ExclusionPersistFailed(String),
 }
 
 impl From<ApiError> for RunError {
@@ -791,7 +803,7 @@ fn run_thread(mut rc: RunContext) {
             tracing::info!(run_id, "stacking run cancelled");
             ("cancelled", false, true, None)
         }
-        Err(RunError::Other(msg)) => {
+        Err(RunError::Other(msg)) | Err(RunError::ExclusionPersistFailed(msg)) => {
             tracing::error!(run_id, error = %msg, "stacking run failed");
             ("failed", false, false, Some(msg.clone()))
         }
@@ -3419,6 +3431,10 @@ fn process_group_output(
         clamping: rc.config.registration.clamping_threshold,
         integration: &group_integration,
         normalization: &normalization_cfg,
+        // Stage 6 has not run yet at this point — nothing to hand
+        // `integrate_group` until the LN pass below (if any) resolves real
+        // sidecars; the second `GroupInput` further down carries them.
+        ln: None,
     };
 
     let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
@@ -3446,10 +3462,20 @@ fn process_group_output(
     let ln_active = normalization_cfg.local.enabled
         || normalization_cfg.rejection == RejectionNormalization::Local;
     let mut ln_reference_path: Option<String> = None;
+    // M2 Task 7: names, for every member `run_group_normalization` itself
+    // confirmed has a usable `ln` artifact THIS run, the `.athln` path to
+    // read back below — `None` (never populated) whenever LN never actually
+    // ran for the group at all (`LnGroupOutcome.reference_path` is `None`:
+    // disabled, or a ruling-R3-shaped fallback to global normalization —
+    // carry-over (a), Task 5's re-review: `Some` means "LN ran", full stop).
+    let mut ln_sidecar_paths: Option<HashMap<i64, PathBuf>> = None;
     if ln_active {
         match run_group_normalization(rc, group, &members, &input, measure_opts, io) {
             Ok(outcome) => {
-                ln_reference_path = outcome.reference_path;
+                ln_reference_path = outcome.reference_path.clone();
+                if outcome.reference_path.is_some() {
+                    ln_sidecar_paths = Some(outcome.sidecar_paths);
+                }
                 if !outcome.excluded_frame_ids.is_empty() {
                     let excluded: HashSet<i64> = outcome.excluded_frame_ids.into_iter().collect();
                     members.retain(|m| !excluded.contains(&m.frame_id));
@@ -3485,6 +3511,26 @@ fn process_group_output(
                 }
             }
             Err(RunError::Cancelled) => return Err(RunError::Cancelled),
+            // Carry-over (b), Task 5's re-review: this can only reach
+            // `process_group_output` after `exclude_frame_and_persist`
+            // already flipped a frame's in-memory state — the group cannot
+            // safely continue as if that exclusion never happened, so it
+            // fails outright (same shape every other group-fatal condition
+            // in this function uses) rather than falling into the generic
+            // "warn and continue with global normalization" arm below.
+            Err(RunError::ExclusionPersistFailed(msg)) => {
+                let (i, o) = zero();
+                return Ok((
+                    fail_group(
+                        rc,
+                        group,
+                        members.len(),
+                        &format!("local normalization: persisting a frame exclusion failed: {msg}"),
+                    )?,
+                    i,
+                    o,
+                ));
+            }
             Err(RunError::Other(msg)) => {
                 tracing::warn!(
                     run_id = rc.run_id,
@@ -3511,6 +3557,105 @@ fn process_group_output(
         );
     }
 
+    // M2 Task 7: read the sidecars stage 6 wrote/confirmed fresh back into
+    // per-frame LN grids, aligned with `members`' (possibly already
+    // LN-narrowed) order. `ln_sidecar_paths` is `None` whenever LN never
+    // actually ran for this group — the group stays on plain global
+    // normalization and `GroupInput.ln` below is `None` too, matching every
+    // M1 caller byte-for-byte. A member with no entry in the map (kept with
+    // a warning while LN drives rejection only, after its OWN
+    // `normalize_frame` call failed this run) gets `None` here — never a
+    // stale guess at a path nothing confirmed. A member the map DOES name,
+    // whose `.athln` can't actually be read back (corruption, a deleted
+    // file, or a fresh cache hit that never reopened the file at all and
+    // trusted a DB row alone) is excluded here, on the same
+    // `exclude_frame_and_persist` path as any other stage-6 exclusion —
+    // narrowing `members`/`reference_idx`/`stack_frames` again exactly the
+    // way the block above does.
+    let mut ln_grids: Option<Vec<Option<LnFrameGrids>>> = None;
+    if let Some(sidecars) = ln_sidecar_paths {
+        let mut read_grids: HashMap<i64, LnFrameGrids> = HashMap::with_capacity(sidecars.len());
+        let mut unreadable: Vec<i64> = Vec::new();
+        for m in &members {
+            if let Some(path) = sidecars.get(&m.frame_id) {
+                match LnFrameGrids::read(path) {
+                    Ok(g) => {
+                        read_grids.insert(m.frame_id, g);
+                    }
+                    Err(_) => unreadable.push(m.frame_id),
+                }
+            }
+        }
+        if !unreadable.is_empty() {
+            for &frame_id in &unreadable {
+                if let Err(e) = exclude_frame_and_persist(
+                    rc,
+                    group,
+                    frame_id,
+                    "local normalization: sidecar unreadable".to_string(),
+                ) {
+                    if let RunError::Cancelled = e {
+                        return Err(RunError::Cancelled);
+                    }
+                    let (i, o) = zero();
+                    return Ok((
+                        fail_group(
+                            rc,
+                            group,
+                            members.len(),
+                            "local normalization: excluding a frame with an unreadable sidecar failed",
+                        )?,
+                        i,
+                        o,
+                    ));
+                }
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    frame_id,
+                    "frame excluded: local normalization sidecar unreadable"
+                );
+            }
+            let excluded: HashSet<i64> = unreadable.into_iter().collect();
+            members.retain(|m| !excluded.contains(&m.frame_id));
+            if members.len() < 3 {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    count = members.len(),
+                    "stacking group skipped: an unreadable local-normalization sidecar left fewer than 3 members"
+                );
+                let (i, o) = zero();
+                return Ok((skip_group(rc, group, members.len())?, i, o));
+            }
+            reference_idx = match pick_reference_idx(&members) {
+                Some(idx) => idx,
+                None => {
+                    let (i, o) = zero();
+                    return Ok((
+                        fail_group(
+                            rc,
+                            group,
+                            members.len(),
+                            "no included frame to anchor normalization",
+                        )?,
+                        i,
+                        o,
+                    ));
+                }
+            };
+            normalization_reference_frame_id = members[reference_idx].frame_id;
+            channels = members[reference_idx].measurement.channels.len();
+            stack_frames = build_stack_frames(&members);
+        }
+        ln_grids = Some(
+            members
+                .iter()
+                .map(|m| read_grids.remove(&m.frame_id))
+                .collect(),
+        );
+    }
+
     // `input` borrowed the STACK_FRAMES built above; when the LN pass
     // narrowed `members` (and rebuilt `stack_frames`), that borrow must be
     // dropped and rebuilt before anything below reads it — always rebuilding
@@ -3526,6 +3671,7 @@ fn process_group_output(
         clamping: rc.config.registration.clamping_threshold,
         integration: &group_integration,
         normalization: &normalization_cfg,
+        ln: ln_grids.as_deref(),
     };
 
     // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`
@@ -3831,13 +3977,24 @@ fn process_group_output(
 }
 
 /// One group's stage-6 result: the reference's own artifact path (feeds
-/// `SummaryGroup.ln_reference_path`, `None` when LN never actually ran for
-/// this group — disabled by the caller, or a ruling-R3 fallback below) and
-/// which frame ids the pass excluded (only ever non-empty when LN drives
-/// OUTPUT normalization; ruling R2).
+/// `SummaryGroup.ln_reference_path` — `None` means "LN did not run for this
+/// group", full stop: disabled by the caller, OR EITHER shape of the
+/// group-level ruling-R3-style fallback below — carry-over (a), Task 5's
+/// re-review) and which frame ids the pass excluded (only ever non-empty
+/// when LN drives OUTPUT normalization; ruling R2). `sidecar_paths` (M2 Task
+/// 7) names, for every member this call itself confirmed has a usable `ln`
+/// artifact THIS run — a fresh cache hit whose payload parsed, or a fan-out
+/// item that normalized and wrote successfully — the `.athln` path
+/// `process_group_output` should read back; a member absent from this map
+/// (kept with a warning while LN drives rejection only, after its OWN
+/// `normalize_frame` call failed) has no confirmed sidecar and must fall
+/// back to `None` in `GroupInput.ln`, never a stale guess at its path.
+/// Always empty when `reference_path` is `None` (LN never ran, nothing to
+/// read).
 struct LnGroupOutcome {
     reference_path: Option<String>,
     excluded_frame_ids: Vec<i64>,
+    sidecar_paths: HashMap<i64, PathBuf>,
 }
 
 /// The scalar diagnostics [`crate::stacking::ln::LnFrameOutcome`] carries, persisted as the `ln`
@@ -3938,6 +4095,7 @@ fn run_group_normalization(
         return Ok(LnGroupOutcome {
             reference_path: None,
             excluded_frame_ids: Vec::new(),
+            sidecar_paths: HashMap::new(),
         });
     }
     let reference_members: Vec<usize> = ranked[..n].to_vec();
@@ -4027,7 +4185,12 @@ fn run_group_normalization(
     // caller "should refuse", never trust. A broken REFERENCE background
     // makes no frame's sidecar trustworthy, so this is a group-level
     // ruling-R3-shaped fallback (warn + global normalization), not a
-    // per-frame failure.
+    // per-frame failure. Carry-over (a), Task 5's re-review:
+    // `reference_path` is `None` here, same as the `n < 3` fallback above —
+    // `Some` means "LN ran"; the reference FILE was still written to disk at
+    // `reference_path_buf` (harmless, just not reported as a usable one),
+    // but nothing below normalized against it, so there is nothing to read
+    // back.
     for (p, bg) in ref_backgrounds.iter().enumerate() {
         let total_cells = bg.gw * bg.gh;
         if total_cells > 0 && bg.invalid_cells == total_cells {
@@ -4042,8 +4205,9 @@ fn run_group_normalization(
                 group.key
             ));
             return Ok(LnGroupOutcome {
-                reference_path: Some(reference_path_buf.display().to_string()),
+                reference_path: None,
                 excluded_frame_ids: Vec::new(),
+                sidecar_paths: HashMap::new(),
             });
         }
     }
@@ -4057,6 +4221,12 @@ fn run_group_normalization(
     let mut sidecar_paths: Vec<PathBuf> = Vec::with_capacity(members.len());
     let mut per_member_hash: Vec<String> = Vec::with_capacity(members.len());
     let mut needs_normalize: Vec<usize> = Vec::new();
+    // M2 Task 7: every member this function itself confirms has a usable
+    // `ln` artifact THIS run (a fresh cache hit whose payload parsed, or a
+    // fan-out item normalized and written below) — becomes the returned
+    // `LnGroupOutcome.sidecar_paths` for `process_group_output` to read
+    // back. A member that fails or is never attempted is simply absent.
+    let mut valid_sidecars: HashMap<i64, PathBuf> = HashMap::with_capacity(members.len());
 
     for (i, m) in members.iter().enumerate() {
         let stem = match group_frames_by_id.get(&m.frame_id).copied() {
@@ -4105,6 +4275,7 @@ fn run_group_normalization(
             match cached_payload {
                 Some(payload) => {
                     set_ln_summary(rc, &group.key, m.frame_id, Some(payload.scale), true);
+                    valid_sidecars.insert(m.frame_id, sidecar_paths[i].clone());
                 }
                 None => {
                     // Fix round 1, item 9: a fresh-by-hash row whose
@@ -4211,6 +4382,7 @@ fn run_group_normalization(
                     "ln frame normalized"
                 );
                 set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
+                valid_sidecars.insert(frame_id, outcome.sidecar.clone());
             }
             Some(Err(msg)) => {
                 if ln_drives_output {
@@ -4221,7 +4393,25 @@ fn run_group_normalization(
                     // frame's `stacking_run_frames` row still says
                     // `included = 1` and the frames table would render a
                     // frame the master does not contain as stacked.
-                    exclude_frame_and_persist(rc, group, frame_id, msg.clone())?;
+                    //
+                    // Carry-over (b), Task 5's re-review: a DB error HERE
+                    // happens AFTER `exclude_frame_and_persist` already
+                    // flipped `rc.measured`'s in-memory state — the generic
+                    // "Other -> warn, continue with global normalization"
+                    // treatment the caller gives every other internal error
+                    // would silently leave this frame excluded in memory
+                    // while the group proceeds as if the exclusion never
+                    // happened. `RunError::ExclusionPersistFailed` forces
+                    // `process_group_output` to fail the group outright
+                    // instead.
+                    if let Err(e) = exclude_frame_and_persist(rc, group, frame_id, msg.clone()) {
+                        let text = match e {
+                            RunError::Cancelled => return Err(RunError::Cancelled),
+                            RunError::Other(inner) => inner,
+                            RunError::ExclusionPersistFailed(inner) => inner,
+                        };
+                        return Err(RunError::ExclusionPersistFailed(text));
+                    }
                     tracing::warn!(
                         run_id = rc.run_id,
                         frame_id,
@@ -4257,6 +4447,7 @@ fn run_group_normalization(
     Ok(LnGroupOutcome {
         reference_path: Some(reference_path_buf.display().to_string()),
         excluded_frame_ids,
+        sidecar_paths: valid_sidecars,
     })
 }
 
@@ -7027,6 +7218,19 @@ mod tests {
     /// registration hash for it. `referenceFrames` defaults to 20 (clamped
     /// to this fixture's 4 members), so ALL FOUR are reference members —
     /// touching any one of them is guaranteed to touch the reference.
+    ///
+    /// Carry-over (d), Task 5's re-review: the touched member
+    /// (`light_ids[0]`) must NOT also be the run's own REGISTRATION
+    /// reference — `registration_hash_for` folds the registration
+    /// reference's own identity into EVERY frame's registration hash
+    /// (`stage_reference`/`stage_register`), so touching the registration
+    /// reference itself would already invalidate every OTHER frame's plain
+    /// registration hash regardless of this task's item-2 fix, confounding
+    /// what the test is meant to isolate. Pinned via a MANUAL registration
+    /// reference at `light_ids[1]` (any frame other than the touched one)
+    /// so `light_ids[0]`'s own registration change cannot cascade into the
+    /// other three frames' registration hashes on its own — only the LN
+    /// reference's own hash (item 2's fix) can.
     #[test]
     fn local_normalization_sidecars_all_rebuild_when_a_reference_members_registration_changes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7042,9 +7246,16 @@ mod tests {
             STAR_FIELD_WIDTH,
             STAR_FIELD_HEIGHT,
         );
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            light_ids[1],
+        )
+        .unwrap();
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        cfg.reference.mode = ReferenceMode::Manual;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -7310,5 +7521,221 @@ mod tests {
         )
         .unwrap();
         assert!(ln_ref_artifacts.is_empty(), "{ln_ref_artifacts:?}");
+    }
+
+    /// M2 Task 7: `GroupInput.ln` — read back from the sidecars stage 6 just
+    /// wrote/confirmed fresh — must actually reach `integrate_group`, not
+    /// just exist as an unused field. `GroupStats.ln_frames` (Task 6) is the
+    /// signal: it is computed from `input.ln` alone (`integrate.rs`), so if
+    /// the wiring in `process_group_output` were broken (still passing
+    /// `None`, or misaligned with `frames`' own order), it would read `0`
+    /// even though every included frame has a real sidecar.
+    #[test]
+    fn local_normalization_grids_reach_integration_and_ln_frames_matches_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let group_summary = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let stats = group_summary
+            .stats
+            .as_ref()
+            .expect("group wrote a master and its stats");
+        assert_eq!(stats.included, 4, "{stats:?}");
+        assert_eq!(
+            stats.ln_frames, stats.included,
+            "every included frame must have carried its LN grid into integration: {stats:?}"
+        );
+    }
+
+    /// M2 Task 7: a `ln` artifact row a cache hit trusts (hash/size/mtime
+    /// all still match) whose actual FILE content can no longer be read —
+    /// corruption, a race, anything short of the size changing — must be
+    /// caught at read-back time, not silently treated as a valid grid (or
+    /// worse, panic deep inside `integrate_planes`'s geometry validation).
+    /// One payload byte is flipped WITHOUT changing the file's length, so
+    /// `is_fresh`'s live `std::fs::metadata` stat still agrees with the
+    /// artifact row's stored size — `run_group_normalization` never reopens
+    /// a cache hit's file at all, so Task 7's own read-back in
+    /// `process_group_output` is the first point this second run actually
+    /// looks at the bytes. (Contrast
+    /// `local_normalization_excludes_a_frame_whose_sidecar_write_fails`,
+    /// which exercises a WRITE failure via a directory at the path — a
+    /// `needs_normalize` frame is never treated as a cache hit at all.)
+    #[test]
+    fn local_normalization_excludes_a_frame_whose_cached_sidecar_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+
+        let build = |run_id: i64, group_ids: HashMap<String, i64>| {
+            test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output_dir.clone(),
+                group_ids,
+            )
+        };
+
+        let (run_id1, group_ids1) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc1 = build(run_id1, group_ids1);
+        run_stages_for_test(&mut rc1, Stage::Register).unwrap();
+        stage_output(&mut rc1).unwrap();
+
+        // Corrupt f1's sidecar payload in place, same total length: the
+        // artifact row's stored size/hash are untouched, so the second
+        // run's `is_fresh` check still calls this a cache hit.
+        let blocked_frame_id = light_ids[1];
+        let sidecar = layout.ln_sidecar_path(&group_key, "f1");
+        let mut bytes = std::fs::read(&sidecar).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&sidecar, &bytes).unwrap();
+
+        let (run_id2, group_ids2) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc2 = build(run_id2, group_ids2);
+        run_stages_for_test(&mut rc2, Stage::Register).unwrap();
+        stage_output(&mut rc2).unwrap();
+
+        let group_summary = rc2
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let blocked_summary = group_summary
+            .frames
+            .iter()
+            .find(|f| f.frame_id == blocked_frame_id)
+            .expect("f1's own summary entry exists");
+        assert!(!blocked_summary.included, "{blocked_summary:?}");
+        assert!(
+            blocked_summary
+                .exclusion_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sidecar unreadable"),
+            "{blocked_summary:?}"
+        );
+        // The other three frames' own artifacts were never touched — this
+        // exclusion must not spuriously invalidate them.
+        for f in group_summary
+            .frames
+            .iter()
+            .filter(|f| f.frame_id != blocked_frame_id)
+        {
+            assert!(f.cached_ln, "{f:?}");
+        }
+
+        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+        assert_eq!(included.len(), 3, "{:?}", group_summary.frames);
+        assert!(group_summary.master_path.is_some(), "{group_summary:?}");
+        assert!(Path::new(group_summary.master_path.as_ref().unwrap()).exists());
+        let stats = group_summary.stats.as_ref().unwrap();
+        assert_eq!(stats.included, 3, "{stats:?}");
+        assert_eq!(
+            stats.ln_frames, 3,
+            "the 3 surviving members all had readable grids: {stats:?}"
+        );
+
+        // Item 1's own guarantee (Task 5's fix round) must still hold for
+        // this NEW exclusion path too: the same reason reaches the frame's
+        // own `stacking_run_frames` row, not just the in-memory summary.
+        let frame_rows = crate::db::stacking::list_frame_rows(&fixture.conn, rc2.run_id).unwrap();
+        let blocked_row = frame_rows
+            .iter()
+            .find(|r| r.frame_id == blocked_frame_id)
+            .expect("f1's own stacking_run_frames row exists");
+        assert!(!blocked_row.included, "{blocked_row:?}");
+        assert!(
+            blocked_row
+                .exclusion_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sidecar unreadable"),
+            "{blocked_row:?}"
+        );
     }
 }

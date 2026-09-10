@@ -404,6 +404,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -453,6 +454,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -500,6 +502,7 @@ mod tests {
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
+            ln: None,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
