@@ -46,7 +46,17 @@ pub struct MasterCardInputs<'a> {
     pub recipe: &'a str,        // IntegrationRecipe::describe()
     pub weight_mode: &'a str,   // the WeightMode serde name
     pub normalization: &'a str, // "<output>/<rejection>" serde names, e.g. "additiveWithScaling/scaleZeroOffset"
-    pub reference_id: &'a str, // ATH_STKF — the reference frame's identity (Plan 5 decides the string)
+    // ATH_STKF — intentionally the group's NORMALIZATION ANCHOR's identity
+    // (ruling R-M3-17 v2, spec §4.4/§6.4), not the run's registration
+    // reference: it has always named whichever frame the group's own
+    // copy-through header/WCS was built from (the M1 Checkpoint B OSC
+    // master already read `ATH_STKF = '…_0019'`, that group's own
+    // best-weighted member, never the mono set's registration reference).
+    // The registration reference is a RUN-level fact, not a per-master
+    // header card — it lives in `stacking_runs.reference_frame_id` /
+    // `RunSummary.reference`, unaffected by which frame any one group
+    // normalizes to.
+    pub reference_id: &'a str,
     pub group_key: &'a str,    // ATH_STKG
     /// Every distinct camera in the group (`IntegrationGroup.cameras`,
     /// already trimmed/sorted/deduped) — `ATH_STKC` (owner decision

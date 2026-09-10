@@ -3497,6 +3497,22 @@ impl From<DrizzleError> for DrizzleFailure {
     }
 }
 
+/// The result of one `pick_reference_idx` call (ruling R-M3-17 v2 + its
+/// coverage addendum, fix round 1 Important 3): `idx` is always a valid
+/// index into the `members` slice the closure was called with — a group
+/// with `>= 3` members always gets an anchor, restoring the pre-this-
+/// ruling guarantee `best_by_weight` used to provide unconditionally.
+/// `coverage_dropped`/`sky_fallback` are `Some(count)` when the closure
+/// had to relax ITS OWN filter to reach that guarantee (fewer than 3
+/// members covered the reference geometry; or every covering member's
+/// background was non-finite/non-positive) — the caller (which alone holds
+/// `&mut rc`) turns either into a `warn!` + a run warning.
+struct AnchorPick {
+    idx: usize,
+    coverage_dropped: Option<usize>,
+    sky_fallback: Option<usize>,
+}
+
 /// Normalize (stage 6, M2 Task 5 — [`run_group_normalization`]), integrate
 /// and write the master for one group. LN DISABLED keeps the exact pre-M2
 /// shape: a static 1/1 "Normalize" progress tick and no other effect (spec
@@ -3633,10 +3649,7 @@ fn process_group_output(
     let run_id = rc.run_id;
     let ref_width = rc.reference_width;
     let ref_height = rc.reference_height;
-    // `Some((idx, coverage_dropped))` — `coverage_dropped` is
-    // `Some(admissible_count)` when this call had to fall back to no
-    // coverage filter (fewer than 3 members passed it).
-    let pick_reference_idx = |members: &[GroupMember]| -> Option<(usize, Option<usize>)> {
+    let pick_reference_idx = |members: &[GroupMember]| -> Option<AnchorPick> {
         let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
         let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
         let sky: Vec<f64> = members.iter().map(|m| m.measurement.mean_median()).collect();
@@ -3673,9 +3686,32 @@ fn process_group_output(
             );
         }
 
-        let idx = sky_penalized_order(&weights, &included_mask, &star_counts, &sky)
-            .into_iter()
-            .next()?;
+        // Fix round 1, Important 3: `sky_penalized_order` returning empty
+        // (every admissible member's background non-finite/non-positive —
+        // e.g. a narrowband set whose dark slightly over-subtracts every
+        // frame) used to fail the WHOLE GROUP here. A group with `>= 3`
+        // members always got an anchor before this ruling existed
+        // (`best_by_weight` never refuses a non-empty candidate set); this
+        // restores that guarantee by falling back to it over the SAME
+        // `included_mask` (still coverage-filtered) the sky-penalized rank
+        // used, rather than failing the group over a background
+        // measurement problem the anchor pick itself can't fix.
+        let ordered = sky_penalized_order(&weights, &included_mask, &star_counts, &sky);
+        let (idx, sky_fallback) = match ordered.into_iter().next() {
+            Some(idx) => (idx, None),
+            None => {
+                let count = included_mask.iter().filter(|&&ok| ok).count();
+                tracing::warn!(
+                    run_id,
+                    group_key = %group.key,
+                    count,
+                    "no admissible member has a usable measured background; \
+                     anchoring by weight alone"
+                );
+                let idx = best_by_weight(&weights, &included_mask, &star_counts)?;
+                (idx, Some(count))
+            }
+        };
         tracing::info!(
             run_id,
             group_key = %group.key,
@@ -3684,7 +3720,11 @@ fn process_group_output(
             background = sky[idx],
             "normalization anchor chosen"
         );
-        Some((idx, coverage_dropped))
+        Some(AnchorPick {
+            idx,
+            coverage_dropped,
+            sky_fallback,
+        })
     };
     // Same shape as `StackFrame`'s own construction from a `GroupMember`
     // list — a closure, not a one-shot `.map()`, because the LN pass can
@@ -3704,15 +3744,22 @@ fn process_group_output(
     };
 
     let mut reference_idx = match pick_reference_idx(&members) {
-        Some((idx, coverage_dropped)) => {
-            if let Some(count) = coverage_dropped {
+        Some(pick) => {
+            if let Some(count) = pick.coverage_dropped {
                 rc.warnings.push(format!(
                     "group {}: reference-coverage filter dropped for normalization anchoring — \
                      only {count} member(s) cover the reference geometry (need >= 3)",
                     group.key
                 ));
             }
-            idx
+            if let Some(count) = pick.sky_fallback {
+                rc.warnings.push(format!(
+                    "group {}: no admissible member has a usable measured background — \
+                     anchored by weight alone among {count} candidate(s)",
+                    group.key
+                ));
+            }
+            pick.idx
         }
         None => {
             let (n, i, d, o) = zero();
@@ -3855,8 +3902,8 @@ fn process_group_output(
                         return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
                     }
                     reference_idx = match pick_reference_idx(&members) {
-                        Some((idx, coverage_dropped)) => {
-                            if let Some(count) = coverage_dropped {
+                        Some(pick) => {
+                            if let Some(count) = pick.coverage_dropped {
                                 rc.warnings.push(format!(
                                     "group {}: reference-coverage filter dropped for \
                                      normalization anchoring — only {count} member(s) cover \
@@ -3864,7 +3911,15 @@ fn process_group_output(
                                     group.key
                                 ));
                             }
-                            idx
+                            if let Some(count) = pick.sky_fallback {
+                                rc.warnings.push(format!(
+                                    "group {}: no admissible member has a usable measured \
+                                     background — anchored by weight alone among {count} \
+                                     candidate(s)",
+                                    group.key
+                                ));
+                            }
+                            pick.idx
                         }
                         None => {
                             let n = normalize_start.elapsed();
@@ -10599,6 +10654,297 @@ mod tests {
             vec![light_ids[3], light_ids[4], light_ids[5]],
             "the LN reference's members must be the three dark-night frames (the higher \
              sky-penalized score), not the higher-raw-weight bright-night ones: {payload:?}"
+        );
+    }
+
+    /// Fix round 1, Important 3: when EVERY member's measured background
+    /// is non-positive (an over-subtracted master dark is one real cause —
+    /// a warmer/longer dark, an amp-glow mismatch), `sky_penalized_order`
+    /// returns an empty order for the whole group; `pick_reference_idx`
+    /// must fall back to `best_by_weight` rather than fail the group
+    /// outright — restoring the pre-R-M3-17 guarantee that a group with
+    /// `>= 3` members always gets a written master. The background is
+    /// forced bad directly on the already-measured entries (WEIGHT is
+    /// untouched, still a real, positive `PsfSignalWeight` from the real
+    /// star field) rather than fought for through calibration math — this
+    /// isolates the ONE condition under test ("weight fine, background
+    /// unusable") from whatever combination of calibration parameters a
+    /// real over-subtracted dark would also perturb (fewer/dimmer star
+    /// detections, a different noise estimate, …), the same "pre-create a
+    /// failure deterministically" technique
+    /// `local_normalization_excludes_a_frame_whose_sidecar_write_fails`
+    /// uses for its own targeted exclusion.
+    #[test]
+    fn an_all_negative_background_group_falls_back_to_best_by_weight_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        for entry in rc.measured.get_mut(&group_key).unwrap() {
+            if let Some(m) = entry.measurement.as_mut() {
+                for ch in &mut m.channels {
+                    ch.median = -1.0;
+                }
+            }
+        }
+        stage_output(&mut rc).unwrap();
+
+        let group_summary = &rc.summary.groups[0];
+        assert!(
+            group_summary.master_path.is_some(),
+            "the group must still write a master despite every background being \
+             unusable: {group_summary:?}"
+        );
+        assert!(
+            group_summary.normalization_reference_frame_id.is_some(),
+            "an anchor must still be chosen: {group_summary:?}"
+        );
+        assert!(
+            rc.warnings.iter().any(|w| w
+                .contains("no admissible member has a usable measured background")),
+            "the fallback must be visible in the run's own warnings: {:?}",
+            rc.warnings
+        );
+    }
+
+    /// Fix round 1, Important 5: the addendum's rotated-frame skip, as a
+    /// COMPOSITE test through `pick_reference_idx` itself (the unit-level
+    /// `weights::coverage_filter_then_sky_penalized_rank_skips_a_rotated_
+    /// top_score_candidate` re-implements the wiring rather than exercising
+    /// it) — this catches a transposed `src_w`/`ref_w` argument, an
+    /// inverted `>= 3` fallback, or the wrong axis pair, none of which the
+    /// unit test can. A member with a NATIVE EXTENT smaller than the
+    /// group's own reference geometry stands in for "a rotated frame" —
+    /// grouping is camera/geometry-agnostic (spec §2), so this member
+    /// shares its group with 4 normal-sized ones — both a rotation and a
+    /// size mismatch fail `reference_coverage` the same way, and a size
+    /// mismatch is far cheaper to engineer reliably through the real
+    /// detector/registration pipeline than an actual rotated star field.
+    /// The mismatched member is given by far the highest weight
+    /// (`WeightMode::Exposure`) — the addendum's "top-score member" — and
+    /// must still be skipped as both the normalization anchor and the LN
+    /// reference's sole member, with NO coverage-dropped warning (4 normal
+    /// members comfortably clear the `>= 3` fallback threshold — "the
+    /// warning-free path").
+    #[test]
+    fn coverage_gate_skips_a_top_score_member_with_a_mismatched_native_extent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+
+        // 4 normal-sized members (the reference's own geometry), distinct
+        // exptimes so the "next-best" anchor after the mismatched member is
+        // skipped is unambiguous.
+        let normal_exptimes = [45.0f64, 40.0, 35.0, 30.0];
+        let mut normal_ids = Vec::new();
+        for (i, &exptime) in normal_exptimes.iter().enumerate() {
+            let stem = format!("n{i}");
+            let date_obs = date_obs_at(i);
+            let spec = LightSpec {
+                exptime,
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let stars = shifted_stars(0.0, 0.0);
+            let (id, _path) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &stars,
+                1000.0,
+                3.0,
+                100 + i as u64,
+            );
+            normal_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &normal_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        // The mismatched member: a canvas well under the reference's own
+        // (192x144) but still large enough to contain BASE_STARS' own
+        // extent (max x=150, y=102) with a safe margin — by far the
+        // highest weight.
+        const SMALL_W: usize = 180;
+        const SMALL_H: usize = 130;
+        let small_date_obs = date_obs_at(4);
+        let small_spec = LightSpec {
+            width: SMALL_W,
+            height: SMALL_H,
+            exptime: 100.0,
+            ..star_light_spec("small", &small_date_obs)
+        };
+        let small_stars = shifted_stars(0.0, 0.0);
+        let (small_id, _path) = test_fixtures::add_light_with_field(
+            &fixture,
+            &small_spec,
+            &small_stars,
+            1000.0,
+            3.0,
+            999,
+        );
+        test_fixtures::add_master_dark_and_flat(&fixture, &[small_id], SMALL_W, SMALL_H);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        // Manual pin: the registration reference is n1 — a DIFFERENT
+        // normal member than the one the normalization anchor should end
+        // up being (n0, the highest-weighted survivor once the mismatched
+        // member is excluded) — reinforcing that registration and
+        // normalization stay separate concepts (ruling R-M3-17).
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            normal_ids[1],
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        // Sorted exptimes are 30/35/40/45/100 — the cluster anchors on the
+        // FIRST (30), so the tolerance must cover the 70s gap up to 100.
+        cfg.grouping.exposure_tolerance_sec = 80.0;
+        cfg.measurement.weight_mode = WeightMode::Exposure;
+        // `rejection = Local` (not `local.enabled`), same reasoning as
+        // `ln_reference_members_are_sky_penalized_not_weight_only`: this
+        // fixture's star field is under the 20-matched-star floor
+        // `normalize_frame` needs, so `local.enabled` would exclude every
+        // member from the group instead of just skipping the mismatched
+        // one from the LN reference's member list. `referenceFrames = 3`,
+        // not 1: `build_reference`/`build_ln_reference` refuse fewer than
+        // 3 candidates outright.
+        cfg.normalization.rejection = RejectionNormalization::Local;
+        cfg.normalization.local.reference_frames = 3;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        assert_eq!(
+            rc.reference_frame_id,
+            Some(normal_ids[1]),
+            "the registration reference must stay the manual pin"
+        );
+        stage_output(&mut rc).unwrap();
+
+        let group_summary = &rc.summary.groups[0];
+        assert_eq!(
+            group_summary.normalization_reference_frame_id,
+            Some(normal_ids[0]),
+            "the mismatched-geometry top-score member ('small') must be skipped for \
+             the next-best COVERING member: {group_summary:?}"
+        );
+
+        // The warning-free path: 4 normal members comfortably clear the
+        // >= 3 fallback threshold, so the real coverage filter stays
+        // active and no "filter dropped" warning fires.
+        assert!(
+            !rc.warnings
+                .iter()
+                .any(|w| w.contains("reference-coverage filter dropped")),
+            "4 covering members must never trip the < 3 fallback: {:?}",
+            rc.warnings
+        );
+
+        // The LN reference (referenceFrames = 1) must also skip the
+        // mismatched member — with `referenceFrames = 3` and the mismatched
+        // member excluded by coverage, the members are the 3 BEST-SCORING
+        // of the 4 covering normals (n0/n1/n2, exptime 45/40/35), never
+        // `small` despite its own top raw score.
+        let artifact = crate::db::stacking::find_artifact(
+            &fixture.conn,
+            fixture.set_id,
+            &group_key,
+            "ln_reference",
+            None,
+        )
+        .unwrap()
+        .expect("ln_reference artifact row written");
+        let payload: crate::stacking::plan::LnReferencePayload =
+            serde_json::from_str(artifact.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            payload.reference_member_ids,
+            vec![normal_ids[0], normal_ids[1], normal_ids[2]],
+            "the LN reference's members must never include the mismatched-geometry \
+             one despite its own top raw score: {payload:?}"
         );
     }
 }

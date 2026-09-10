@@ -309,7 +309,26 @@ corners — normalizing to it, or modelling the LN reference's background on
 it, would carry its uncovered corners/edges into every other frame). The
 coverage filter is dropped for a group where fewer than 3 members would
 pass it (a warning, not a hard failure) — ranking among too few candidates
-to mean anything is worse than no filter.
+to mean anything is worse than no filter. **Amendment (2026-09-10, fix
+round 1, Important 6):** the 0.97 threshold was chosen from the estimator's
+own measured values at 6224×4168 (a pure rotation about the rectangle's
+centre): 1°→1.0, 2°→0.988, 3°→0.980, **4°→0.969 (the first crossing below
+0.97)**, 5°→0.957; a 30-px translation dither loses far less, ≈0.995 — a
+small rotation only clips the four corners' nearest grid cell(s)
+(tangential-to-the-boundary near each corner, not radial), so it grows
+slower than a first guess of "a couple of degrees" suggests. `0.97` sits
+just past the measured 4° crossing.
+Fewer than 3 admissible candidates for the anchor pick alone falls back to
+plain `best_by_weight` with a warning too (fix round 1, Important 2/3): a
+candidate's background is floored to 1% of the admissible candidates' own
+median before the square root (a near-zero-but-positive background — an
+over-subtracted master dark, not a broken frame — would otherwise dominate
+the score by a landslide), and if EVERY candidate's background is still
+non-finite/non-positive after that (every member's calibration is
+genuinely suspect), the anchor falls back to `best_by_weight` over the
+same admissible set rather than failing the group — a group with `>= 3`
+members has always been guaranteed an anchor, and this ruling does not
+lift that guarantee.
 
 The LN reference's member list (§5.2) is ranked the same sky-penalized way,
 not by raw weight — see the note there.
@@ -461,15 +480,22 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
 ### 6.4 Output
 
 - Master: float32 FITS, 1 or 3 planes (`write_fits_f32`), path
-  `<output>/<master name>` (§9.5). Header: copy-through cards from the
-  reference frame (object, instrument, filter, dates, Bayer-free, `ROWORDER`),
-  `IMAGETYP = 'Master Light'`, `NCOMBINE`, `EXPTIME` = weighted total,
-  `DATE-OBS`/`DATE-END` = earliest/latest, the **WCS** of the reference
-  frame's plate solve rewritten by the new WCS card writer (CRPIX unchanged —
-  the master is in reference geometry; SIP cards when the solve has them),
+  `<output>/<master name>` (§9.5). Header: copy-through cards (object,
+  instrument, filter, dates, Bayer-free, `ROWORDER`) and `ATH_STKF` (below)
+  come from the group's **normalization anchor** (§4.4, ruling R-M3-17 v2 —
+  the sky-penalized pick, not necessarily the set's registration reference);
+  the **WCS** is the **registration reference**'s plate solve rewritten by
+  the new WCS card writer (CRPIX unchanged — the master is in reference
+  geometry; SIP cards when the solve has them) — these two frames can
+  differ, and each header field comes from whichever one it always has.
+  Also `IMAGETYP = 'Master Light'`, `NCOMBINE`, `EXPTIME` = weighted total,
+  `DATE-OBS`/`DATE-END` = earliest/latest,
   and the provenance cards `ATH_STK = 1`, `ATH_STKV` (format version),
   `ATH_STKN` (frames), `ATH_STKR` (recipe string), `ATH_STKW` (weight mode),
-  `ATH_STKO` (normalization), `ATH_STKF` (reference frame uuid), `ATH_STKG`
+  `ATH_STKO` (normalization), `ATH_STKF` (the normalization anchor's
+  identity — the registration reference is a run-level fact instead,
+  `stacking_runs.reference_frame_id` / `RunSummary.reference`, not a
+  per-master card), `ATH_STKG`
   (group key), `ATH_STKC` (2026-09-10 — groups are camera-agnostic: every
   distinct camera in the group, comma-joined, sorted, e.g.
   `'ATR2600M,ZWO ASI2600MC Duo'`, truncated with `…` past 68 chars),

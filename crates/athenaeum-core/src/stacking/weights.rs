@@ -365,13 +365,36 @@ pub fn best_by_weight(
 /// candidate at all (dropped from the result, not merely ranked last) —
 /// there is no physical background to take a square root of.
 ///
+/// Fix round 1, Important 2: `sky[i]` is floored to
+/// `SKY_BACKGROUND_FLOOR_FRACTION` (1%) of the admissible candidates' own
+/// median background before the square root — an over-subtracted master
+/// dark (a warmer/longer dark, an amp-glow mismatch) can leave a frame's
+/// measured background genuinely near zero without the frame's own
+/// calibration having failed outright (which is what the `<= 0` drop above
+/// already catches); left unfloored, such a frame would win by a landslide
+/// and become the anchor AND the whole LN reference, normalizing the
+/// master to the one frame whose calibration is suspect. The floor is
+/// relative, not absolute, because a real background sits anywhere from
+/// ~1e-3 to ~5e-2 in native units depending on the site/target — no single
+/// absolute constant would both catch a genuinely broken frame and leave a
+/// genuinely dark-sky one alone.
+///
 /// Returns the admissible candidates' ORIGINAL indices, descending by
 /// `s_i`; ties broken by the higher weight, then by star count
-/// ([`best_by_weight`]'s own tie-break). On a group whose members share one
-/// background (the common case on a single-night set), `s_i` is monotonic
-/// in weight, so this order's first element is exactly what
-/// [`best_by_weight`] would return — the two rules coincide except when
-/// sky varies enough across members to move the ranking.
+/// ([`best_by_weight`]'s own tie-break), then by the higher original
+/// index — this last tie-break exists ONLY so a FULL tie (equal score,
+/// equal weight, equal star count) matches `best_by_weight`'s own
+/// `Iterator::max_by` semantics, which return the LAST of equally maximum
+/// elements; without it a stable sort's "first survivor wins" would
+/// disagree with `best_by_weight` on that one degenerate case (pinned by
+/// `sky_penalized_order_matches_best_by_weight_on_a_full_tie`). On a group
+/// whose members share one background (the common case on a single-night
+/// set), `s_i` is monotonic in weight, so this order's first element is
+/// exactly what [`best_by_weight`] would return — the two rules coincide
+/// except when sky varies enough across members to move the ranking (a
+/// real single night can drift 20-30% night-to-night with altitude/
+/// moonrise, enough to reorder near-ties even without a second night in
+/// the mix).
 ///
 /// The caller takes the first element as the group's NORMALIZATION anchor
 /// (`GroupInput.reference`, `normalization_reference_frame_id`), and the
@@ -380,7 +403,10 @@ pub fn best_by_weight(
 /// place of ranking by raw weight alone — `stacking::ln::reference::
 /// build_reference` itself is unchanged, it still ranks by weight whatever
 /// candidate set it is handed, but the run now hands it this sky-penalized
-/// top-N instead of the whole group).
+/// top-N instead of the whole group). Fix round 1, Important 3: an EMPTY
+/// result (every member dropped for a non-finite/non-positive background)
+/// is the caller's signal to fall back to [`best_by_weight`] — this
+/// function itself never fails, an empty `Vec` is a valid, honest answer.
 pub(crate) fn sky_penalized_order(
     weights: &[FrameWeight],
     included: &[bool],
@@ -391,25 +417,54 @@ pub(crate) fn sky_penalized_order(
         .filter(|&i| included.get(i).copied().unwrap_or(false))
         .filter(|&i| sky.get(i).is_some_and(|&bg| bg.is_finite() && bg > 0.0))
         .collect();
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let median_bg = {
+        let mut bgs: Vec<f64> = candidates.iter().map(|&i| sky[i]).collect();
+        bgs.sort_by(f64::total_cmp);
+        let n = bgs.len();
+        if n % 2 == 1 {
+            bgs[n / 2]
+        } else {
+            0.5 * (bgs[n / 2 - 1] + bgs[n / 2])
+        }
+    };
+    let floor = SKY_BACKGROUND_FLOOR_FRACTION * median_bg;
+    let score = |i: usize| weights[i].normalized_mean / sky[i].max(floor).sqrt();
     candidates.sort_by(|&a, &b| {
-        let sa = weights[a].normalized_mean / sky[a].sqrt();
-        let sb = weights[b].normalized_mean / sky[b].sqrt();
-        sb.total_cmp(&sa)
+        score(b)
+            .total_cmp(&score(a))
             .then_with(|| {
                 weights[b]
                     .normalized_mean
                     .total_cmp(&weights[a].normalized_mean)
             })
             .then_with(|| star_counts.get(b).cmp(&star_counts.get(a)))
+            .then_with(|| b.cmp(&a))
     });
     candidates
 }
 
+/// Fix round 1, Important 2: the floor [`sky_penalized_order`] clamps a
+/// candidate's background to, as a fraction of the admissible candidates'
+/// own median background — see that function's doc for the rationale.
+const SKY_BACKGROUND_FLOOR_FRACTION: f64 = 0.01;
+
 /// Minimum [`reference_coverage`] fraction for a candidate to be
 /// admissible as the normalization anchor or an LN-reference member (spec
-/// §4.4, ruling R-M3-17 v2 addendum): a 30-px dither on a several-thousand-
-/// px frame loses well under a percent, a 2° rotation loses several — 0.97
-/// separates the two comfortably.
+/// §4.4, ruling R-M3-17 v2 addendum). Fix round 1, Important 6: the
+/// threshold was chosen from the estimator's OWN measured values at
+/// 6224×4168 (reproducible with [`reference_coverage`] as shipped, a pure
+/// rotation about the rectangle's centre) — 1°→1.0, 2°→0.988, 3°→0.980,
+/// **4°→0.969 (the first crossing below 0.97)**, 5°→0.957; a 30-px
+/// translation dither loses far less, ≈0.995. A rotation this small only
+/// clips the four corners' nearest grid cell(s) — the loss is
+/// tangential-to-the-boundary near each corner, not radial, so it grows
+/// slower than a first guess of "a couple of degrees" suggests; 0.97 is
+/// set just past the measured 4° crossing, comfortably below what a real
+/// misregistration this filter exists to catch (a different camera angle,
+/// a badly failed solve) actually produces.
 pub(crate) const MIN_REFERENCE_COVERAGE: f64 = 0.97;
 
 /// The fraction of the reference rectangle `[0, ref_w) x [0, ref_h)` a
@@ -731,6 +786,58 @@ mod tests {
         assert_eq!(order, vec![2, 0, 1]);
     }
 
+    /// Fix round 1, Important 4: on a FULL tie (equal score, equal weight,
+    /// equal star count) the two rules must still agree — `best_by_weight`
+    /// (`Iterator::max_by`) returns the LAST of equally maximum elements,
+    /// so `sky_penalized_order`'s own final index tie-break must too.
+    #[test]
+    fn sky_penalized_order_matches_best_by_weight_on_a_full_tie() {
+        let weights = vec![fw(0.7), fw(0.7), fw(0.7)];
+        let included = [true, true, true];
+        let star_counts = [50usize, 50, 50];
+        let sky = [4.0, 4.0, 4.0];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert_eq!(
+            order.first().copied(),
+            best_by_weight(&weights, &included, &star_counts),
+            "on a full tie the top pick must still match best_by_weight's own \
+             last-wins semantics: order={order:?}"
+        );
+        assert_eq!(
+            order.first().copied(),
+            Some(2),
+            "max_by returns the LAST of equally maximum elements"
+        );
+    }
+
+    /// Fix round 1, Important 2: a near-zero background must not let a
+    /// low-weight candidate dominate by raw `1/sqrt(bg)` — it is floored to
+    /// a fraction of the admissible candidates' own median background.
+    #[test]
+    fn sky_penalized_order_floors_a_near_zero_background_so_it_cannot_dominate() {
+        // Unfloored, candidate 3's score would be 0.05 / sqrt(1e-6) = 50 —
+        // far above every other candidate's ~0.4-0.5. Floored to 1% of the
+        // admissible median (4.0), its score becomes 0.05 / sqrt(0.04) =
+        // 0.25, below candidate 0's 1.0 / sqrt(4.0) = 0.5.
+        let weights = vec![fw(1.0), fw(0.9), fw(0.8), fw(0.05)];
+        let included = [true, true, true, true];
+        let star_counts = [100usize; 4];
+        let sky = [4.0, 4.0, 4.0, 1e-6];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert_eq!(
+            order.first().copied(),
+            Some(0),
+            "the near-zero-background candidate (index 3) must not dominate: order={order:?}"
+        );
+        assert_ne!(
+            order.first().copied(),
+            Some(3),
+            "an unfloored score of ~50 would otherwise make index 3 win outright"
+        );
+    }
+
     /// A frame with no physical background (zero, negative, or non-finite)
     /// is not a candidate at all — never merely ranked last.
     #[test]
@@ -754,6 +861,26 @@ mod tests {
         let sky_neg = [-3.0, 4.0, 1.0];
         let order_neg = sky_penalized_order(&weights, &included, &star_counts, &sky_neg);
         assert_eq!(order_neg, vec![2, 1], "a negative background is skipped too");
+    }
+
+    /// Fix round 1, Important 3: when EVERY admissible member's background
+    /// is non-finite/non-positive (a real scenario: an over-subtracted
+    /// master dark), the order is a valid, honest empty `Vec` — this
+    /// function never fails; the caller (`stacking::run::
+    /// process_group_output`'s `pick_reference_idx`) is the one that must
+    /// fall back to `best_by_weight`, see the composite test in `run.rs`.
+    #[test]
+    fn sky_penalized_order_returns_empty_when_every_candidate_has_no_usable_background() {
+        let weights = vec![fw(1.0), fw(0.9), fw(0.5)];
+        let included = [true, true, true];
+        let star_counts = [100usize; 3];
+        let sky = [0.0, f64::NAN, -1.0];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert!(
+            order.is_empty(),
+            "every candidate has a non-finite/non-positive background: {order:?}"
+        );
     }
 
     /// The same `included` admissibility [`best_by_weight`] applies — an
