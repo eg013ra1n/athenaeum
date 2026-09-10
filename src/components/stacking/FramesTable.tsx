@@ -35,6 +35,12 @@ export interface FrameRow {
   stars: number | null;
   regRmsPx: number | null;
   regInliers: number | null;
+  /** Stage 6 (local normalization, M2): the frame's own relative scale
+   *  (`SummaryFrame.lnScale`) — `null` when LN never ran for this group's
+   *  frame (disabled, a ruling-R3 fallback to global normalization, or the
+   *  run's summary isn't loaded yet), same convention as every other
+   *  summary-sourced metric column here. */
+  lnScale: number | null;
   statusLabel: string;
   statusTone: StatusTone;
 }
@@ -47,10 +53,11 @@ type SortKey =
   | 'eccentricity'
   | 'stars'
   | 'regRmsPx'
+  | 'lnScale'
   | 'regInliers'
   | 'statusLabel';
 
-const COLUMNS: { key: SortKey; label: string; numeric?: boolean }[] = [
+const COLUMNS: { key: SortKey; label: string; numeric?: boolean; title?: string }[] = [
   { key: 'filename', label: 'Filename' },
   { key: 'group', label: 'Group' },
   { key: 'weight', label: 'Weight', numeric: true },
@@ -58,6 +65,7 @@ const COLUMNS: { key: SortKey; label: string; numeric?: boolean }[] = [
   { key: 'eccentricity', label: 'Ecc', numeric: true },
   { key: 'stars', label: 'Seeds', numeric: true },
   { key: 'regRmsPx', label: 'Reg RMS', numeric: true },
+  { key: 'lnScale', label: 'Scale', numeric: true, title: 'Local-normalization relative scale' },
   { key: 'regInliers', label: 'Inliers', numeric: true },
   { key: 'statusLabel', label: 'Status' },
 ];
@@ -189,6 +197,7 @@ export function buildFrameRows(
         eccentricity: null,
         stars: null,
         regRmsPx: null,
+        lnScale: null,
         regInliers: null,
         statusLabel: manuallyExcluded ? 'Excluded (manual)' : 'Included',
         statusTone: manuallyExcluded ? 'warning' : 'success',
@@ -212,6 +221,7 @@ export function buildFrameRows(
       eccentricity: s?.eccentricity ?? null,
       stars: s?.stars ?? null,
       regRmsPx: s?.regRmsPx ?? runRow.regRmsPx,
+      lnScale: s?.lnScale ?? null,
       regInliers: s?.regInliers ?? runRow.regInliers,
       statusLabel,
       statusTone,
@@ -327,7 +337,7 @@ export function FramesTable({
               <thead>
                 <tr className="text-content-muted text-left border-b border-border">
                   {COLUMNS.map((c) => (
-                    <th key={c.key} className="py-1.5 px-2 font-medium">
+                    <th key={c.key} className="py-1.5 px-2 font-medium" title={c.title}>
                       <button
                         type="button"
                         onClick={() => handleSort(c.key)}
@@ -361,6 +371,7 @@ export function FramesTable({
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.eccentricity, 3)}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtInt(r.stars)}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.regRmsPx, 3, ' px')}</td>
+                    <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.lnScale, 3)}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtInt(r.regInliers)}</td>
                     <td className="py-1.5 px-2">
                       <span

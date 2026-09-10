@@ -29,8 +29,11 @@ export interface PipelineBoardProps {
   finishedStages?: readonly Stage[] | null;
   selectedStage: BoardStage;
   onSelectStage: (stage: BoardStage) => void;
-  /** The Register row's only live control in M1 — everything else on the
-   *  optional stages (LN, drizzle) is read-only until M2/M3 (spec §14 item 12). */
+  /** The Register row's write-registered-frames toggle. Drizzle's own toggle
+   *  stays read-only until M3 (spec §14 item 12); the Normalize row's LN
+   *  toggle went live in M2 Task 8 — it edits `config` directly through the
+   *  inspector panel, so the board row carries no toggle of its own any
+   *  more. */
   onToggleWriteRegisteredFrames: (checked: boolean) => void;
 }
 
@@ -51,14 +54,7 @@ export function PipelineBoard({
     <div className="bg-surface-elevated rounded-lg p-2 space-y-0.5">
       {ROWS.map(({ stage, index, label }) => {
         let toggle: StageRowToggle | undefined;
-        if (stage === 'normalize') {
-          toggle = {
-            checked: config.normalization.local.enabled,
-            onChange: () => {},
-            disabled: true,
-            note: 'coming in M2',
-          };
-        } else if (stage === 'drizzle') {
+        if (stage === 'drizzle') {
           toggle = {
             checked: config.drizzle.enabled,
             onChange: () => {},

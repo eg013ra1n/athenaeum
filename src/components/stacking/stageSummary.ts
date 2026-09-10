@@ -245,13 +245,14 @@ export function stageSummary(
     case 'normalize': {
       const local = config.normalization.local;
       if (local.enabled) {
-        const localScale = local.localScale ? ' · local scale' : '';
-        return `Local · tile ${local.scale}px · ${local.referenceFrames} reference frames · ${psfModelLabel(local.psfModel)} PSF${localScale}`;
+        return `Local · scale ${local.scale} · ref ${local.referenceFrames} frames`;
       }
-      return `Global · ${outputNormLabel(config.normalization.output)} output · ${rejectionNormLabel(config.normalization.rejection)} rejection`;
+      return `Global · ${outputNormLabel(config.normalization.output)} · ${config.normalization.scaleEstimator.toUpperCase()}`;
     }
-    case 'integrate':
-      return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${formatUpTo3Decimals(config.integration.minWeight)}`;
+    case 'integrate': {
+      const lnRejection = config.normalization.rejection === 'local' ? ' · LN rejection' : '';
+      return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${formatUpTo3Decimals(config.integration.minWeight)}${lnRejection}`;
+    }
     case 'drizzle':
       if (!config.drizzle.enabled) return 'Off';
       return `${config.drizzle.scale}× · ${kernelLabel(config.drizzle.kernel)} kernel · drop ${config.drizzle.dropShrink.toFixed(2)}`;

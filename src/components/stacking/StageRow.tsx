@@ -2,13 +2,15 @@ import { Circle, CircleDot, CheckCircle2, XCircle, MinusCircle, AlertCircle } fr
 import type { BoardStage, RowState } from './stageSummary';
 import type { RunProgress } from '../../hooks/useStackingRuns';
 
-/** A stage row's optional toggle (LN / drizzle / write-registered-frames). */
+/** A stage row's optional toggle (drizzle / write-registered-frames — local
+ *  normalization edits `config` through the Normalize inspector panel
+ *  instead, since M2 Task 8, so it no longer carries one of these). */
 export interface StageRowToggle {
   checked: boolean;
   onChange: (checked: boolean) => void;
   /** Short text before the checkbox, e.g. "write registered frames". */
   label?: string;
-  /** e.g. "coming in M2" for the still-disabled LN/drizzle toggles. */
+  /** e.g. "coming in M3" for the still-disabled drizzle toggle. */
   disabled?: boolean;
   note?: string;
 }

@@ -132,7 +132,12 @@ function RevealOrPath({ path }: { path: string | null }) {
   );
 }
 
-function MasterCard({ group }: { group: StackingRunGroupRow }) {
+/** `SummaryGroup.lnReferencePath` lives on the run's finished `summary`, not
+ *  on the `StackingRunGroupRow` this card is built from (that row updates
+ *  progressively while the run is still in flight; the LN reference path is
+ *  written once, at Output) — the caller matches it in by `groupKey` and
+ *  hands it down here rather than this card reaching into `summary` itself. */
+function MasterCard({ group, lnReferencePath }: { group: StackingRunGroupRow; lnReferencePath: string | null }) {
   const stats = parseGroupStats(group.statsJson);
 
   return (
@@ -162,6 +167,23 @@ function MasterCard({ group }: { group: StackingRunGroupRow }) {
           {' · '}
           {stats.snrGain.length > 0 ? `SNR gain ${stats.snrGain[0].toFixed(2)}×` : 'SNR gain —'}
         </p>
+      )}
+
+      {/* LN reference (M2 Task 8): `lnReferencePath` is `None` whenever local
+       *  normalization didn't run for this group at all (disabled, the run
+       *  never reached Output, or a ruling-R3 fallback to global
+       *  normalization applied) — that single flag is the gate for the
+       *  whole block, per the field's own doc in `types/stacking.ts`. */}
+      {lnReferencePath != null && (
+        <div className="pt-1 border-t border-border/40 space-y-1">
+          <p className="text-xs text-content-secondary tabular-nums">
+            LN: {stats ? `${stats.lnFrames}/${group.includedCount}` : `—/${group.includedCount}`} frames
+          </p>
+          <div className="flex items-center gap-1.5 text-xs text-content-muted">
+            <span>LN reference:</span>
+            <RevealOrPath path={lnReferencePath} />
+          </div>
+        </div>
       )}
 
       {group.status === 'failed' && group.error && (
@@ -379,7 +401,13 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
           {runDetail.groups.length > 0 ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {runDetail.groups.map((g) => (
-                <MasterCard key={g.id} group={g} />
+                <MasterCard
+                  key={g.id}
+                  group={g}
+                  lnReferencePath={
+                    runDetail.summary?.groups.find((sg) => sg.key === g.groupKey)?.lnReferencePath ?? null
+                  }
+                />
               ))}
             </div>
           ) : (
