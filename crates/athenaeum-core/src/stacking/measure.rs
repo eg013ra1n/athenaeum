@@ -387,7 +387,8 @@ mod tests {
     use super::*;
     use crate::fits_writer::write_fits_f32;
     use crate::geometry::ransac::SplitMix64;
-    use crate::test_support::{add_noise, gaussian_field};
+    use crate::stacking::test_fixtures::synthetic_star_field;
+    use crate::test_support::add_noise;
     use std::path::PathBuf;
 
     /// 150 Gaussian stars (σ 1.8 px) on a jittered 15×10 grid, amplitudes
@@ -403,8 +404,9 @@ mod tests {
                 stars.push((x, y, (0.1 + 0.2 * rng.next_f64()) * amp_scale));
             }
         }
-        let mut data = gaussian_field(w, h, &stars, 1.8, 0.08);
-        add_noise(&mut data, noise, seed + 100);
+        let sigma = 1.8;
+        let fwhm = 2.354_820_045_030_949_3 * sigma;
+        let data = synthetic_star_field(w, h, &stars, fwhm, noise, seed + 100);
         (data, w, h)
     }
 

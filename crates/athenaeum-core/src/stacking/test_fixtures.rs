@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 use crate::db::schema::init_db;
 use crate::fits_writer::card::{format_card, Card, CardValue, BLOCK_SIZE, CARD_SIZE};
 use crate::fits_writer::write_fits_f32;
-use crate::test_support::gaussian_field;
+use crate::test_support::{add_noise, gaussian_field};
 
 /// One fixture's whole catalog: an in-memory `Connection` seeded with a
 /// frame set, one imaging night spanning it, and one session inside that
@@ -531,6 +531,36 @@ fn write_fits_i16(path: &Path, width: usize, height: usize, data: &[i16], cards:
     bytes.extend(std::iter::repeat(0u8).take(data_pad));
 
     std::fs::write(path, &bytes).expect("write fixture light FITS");
+}
+
+// ── Synthetic star fields (in-memory planes, no FITS I/O) ──────────────────
+
+/// `FWHM = 2·√(2·ln 2)·σ` for a Gaussian profile.
+const GAUSSIAN_FWHM_FACTOR: f64 = 2.354_820_045_030_949_3;
+
+/// A synthetic Gaussian star field for stacking-pipeline unit tests that
+/// exercise detection/PSF-fitting directly on an in-memory plane (no FITS
+/// round-trip): `stars` are `(x, y, amplitude)` on a flat `0.08` background,
+/// rendered at the given `fwhm` (px), with optional zero-mean Gaussian
+/// `noise` (`0.0` = none, reproducible via `seed`). Lifted out of
+/// `measure.rs`'s own private `field()` test helper (M2 Task 3) so
+/// `ln::scale`'s tests build the same kind of field without duplicating the
+/// rendering step; `measure.rs` keeps its own star-placement grid and calls
+/// this for the pixels.
+pub(crate) fn synthetic_star_field(
+    w: usize,
+    h: usize,
+    stars: &[(f64, f64, f64)],
+    fwhm: f64,
+    noise: f32,
+    seed: u64,
+) -> Vec<f32> {
+    let sigma = fwhm / GAUSSIAN_FWHM_FACTOR;
+    let mut data = gaussian_field(w, h, stars, sigma, 0.08);
+    if noise > 0.0 {
+        add_noise(&mut data, noise, seed);
+    }
+    data
 }
 
 // ── Fixture self-test ────────────────────────────────────────────────────
