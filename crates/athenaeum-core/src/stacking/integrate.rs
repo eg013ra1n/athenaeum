@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ use crate::integration::stats::{
 };
 use crate::integration::IntegrationError;
 use crate::resample::Interpolation;
+use crate::stacking::ln::grid::LnScratch;
+use crate::stacking::ln::{LnFrameGrids, LnGrid};
 use crate::stacking::measure::{measure_plane, FrameMeasurement, MeasureOptions};
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
@@ -267,6 +270,10 @@ pub struct GroupStats {
     pub read_ms: u64,
     pub combine_ms: u64,
     pub bytes_read: u64,
+    /// Included frames integrated with an LN grid (M2) — always `0` while
+    /// every caller of [`integrate_group`] passes `ln: None` to
+    /// [`integrate_planes`].
+    pub ln_frames: usize,
 }
 
 #[derive(Debug)]
@@ -319,6 +326,24 @@ pub(crate) fn validate_group_input(input: &GroupInput<'_>) -> Result<(), Integra
     Ok(())
 }
 
+/// Wraps one channel's LN grid as an `integration::engine::LocalNormRow`
+/// closure (M2 Task 6): `Fn(y_abs, a_row, b_row)` evaluates that row via
+/// [`LnGrid::evaluate_row_into`], reusing one [`LnScratch`] across every row
+/// of the plane rather than allocating one per call (see
+/// [`LnGrid::evaluate_row`]'s own doc, which names this exact reuse as the
+/// band loop's job). The scratch is small (`gw`-sized) and its only mutable
+/// state, so a `Mutex` keeps the closure `Sync` — callable from any of the
+/// engine's parallel per-row workers — at the cost of a short per-row
+/// critical section for this one frame's grid, negligible next to the
+/// per-pixel combine it feeds.
+fn local_norm_row(grid: &LnGrid) -> impl Fn(usize, &mut [f32], &mut [f32]) + Sync + '_ {
+    let scratch = Mutex::new(LnScratch::for_grid(grid));
+    move |y, a_row, b_row| {
+        let mut guard = scratch.lock().unwrap();
+        grid.evaluate_row_into(y, a_row, b_row, &mut guard);
+    }
+}
+
 /// The per-plane engine loop shared by [`integrate_group`] and the LN
 /// reference builder (`stacking::ln::reference::build_reference`, M2 Task
 /// 4): for every plane, builds the rejection/output normalization pairs of
@@ -333,7 +358,22 @@ pub(crate) fn validate_group_input(input: &GroupInput<'_>) -> Result<(), Integra
 /// pass all-`1.0` rows. `output_mode`/`rejection_mode`/`recipe`/`write_maps`
 /// are explicit rather than read from `input.normalization`/`input.integration`
 /// so a caller can force plain global normalization (the LN reference always
-/// does) independently of what the group itself is configured to use.
+/// does) independently of what the group itself is configured to use —
+/// `local_for_output` (M2) joins them for the same reason: the LN reference
+/// forces it `false` (its own doc: local normalization "doesn't exist yet at
+/// reference-build time"). `local_for_rejection` is not a separate parameter
+/// — it is `rejection_mode == RejectionNormalization::Local`, since that
+/// enum value already says the same thing a caller would otherwise have to
+/// repeat.
+///
+/// `ln` (M2) is `Some` per-frame [`LnFrameGrids`], indexed like
+/// `input.frames` (not `frame_indices`) — `None`, the whole option, is every
+/// caller today; a frame's own entry is `None` when it has no sidecar. Per
+/// plane, this wraps `ln[i].channels[p]` (`i` = the frame's index into
+/// `input.frames`) as a `LocalNormRow` via [`local_norm_row`] and hands
+/// the resulting per-frame-indices row of closures to
+/// [`crate::integration::engine::StackParams::local`] — engine.rs never
+/// depends on `LnGrid` directly (see `LocalNormRow`'s own doc for why).
 /// Returns one [`StackOutput`] per plane, in channel order — no
 /// stats/accumulation/writing: that tail is the caller's job.
 #[allow(clippy::too_many_arguments)]
@@ -343,6 +383,8 @@ pub(crate) fn integrate_planes(
     weights: &[Vec<f32>],
     output_mode: OutputNormalization,
     rejection_mode: RejectionNormalization,
+    local_for_output: bool,
+    ln: Option<&[Option<LnFrameGrids>]>,
     recipe: IntegrationRecipe,
     write_maps: bool,
     pool: &rayon::ThreadPool,
@@ -357,8 +399,18 @@ pub(crate) fn integrate_planes(
             weights.len()
         )));
     }
+    if let Some(grids) = ln {
+        if grids.len() != input.frames.len() {
+            return Err(IntegrationError::BadInput(format!(
+                "local-normalization grids for {} frames, the group has {}",
+                grids.len(),
+                input.frames.len()
+            )));
+        }
+    }
     let frames = input.frames;
     let n = frame_indices.len();
+    let local_for_rejection = rejection_mode == RejectionNormalization::Local;
     let mut outputs = Vec::with_capacity(input.channels);
 
     for p in 0..input.channels {
@@ -373,14 +425,19 @@ pub(crate) fn integrate_planes(
         let mut output_pairs = Vec::with_capacity(n);
         let mut plane_weights = Vec::with_capacity(n);
         let mut registered_frames = Vec::with_capacity(n);
+        // M2: this plane's local-normalization closures, one per entry of
+        // `frame_indices` — `local_closures` owns the boxed closures (each
+        // wraps one frame's `LnGrid` for channel `p`), `local_refs` is the
+        // `&dyn Fn` view `StackParams::local` actually wants. Built even
+        // when `ln` is `None` (every entry then comes out `None` too) so the
+        // plumbing has one shape regardless — negligible cost, `n` is small.
+        let mut local_closures: Vec<
+            Option<Box<dyn Fn(usize, &mut [f32], &mut [f32]) + Sync + '_>>,
+        > = Vec::with_capacity(n);
         for (k, &i) in frame_indices.iter().enumerate() {
             let f = &frames[i];
             let frame_ls = f.measurement.channels[p].location_scale();
-            // `RejectionNormalization::Local` was refused before this call
-            // (`integrate_group` validates it up front; the LN reference
-            // never passes it), so every remaining mode returns `Some`.
-            let rp = rejection_pair(ref_ls, frame_ls, rejection_mode)
-                .expect("Local rejection normalization was refused before this call");
+            let rp = rejection_pair(ref_ls, frame_ls, rejection_mode);
             let op = output_pair(ref_ls, frame_ls, output_mode);
             rejection_pairs.push(rp);
             output_pairs.push(op);
@@ -389,7 +446,17 @@ pub(crate) fn integrate_planes(
                 path: f.path.clone(),
                 map: f.map.clone(),
             });
+            let grid = ln
+                .and_then(|grids| grids.get(i))
+                .and_then(|g| g.as_ref())
+                .map(|fg| &fg.channels[p]);
+            local_closures.push(grid.map(|grid| {
+                Box::new(local_norm_row(grid))
+                    as Box<dyn Fn(usize, &mut [f32], &mut [f32]) + Sync + '_>
+            }));
         }
+        let local_refs: Vec<Option<&(dyn Fn(usize, &mut [f32], &mut [f32]) + Sync)>> =
+            local_closures.iter().map(|o| o.as_deref()).collect();
 
         let src = RegisteredSource::open(
             &registered_frames,
@@ -407,6 +474,9 @@ pub(crate) fn integrate_planes(
             range_low: input.integration.range_low.map(|v| v as f32),
             range_high: input.integration.range_high.map(|v| v as f32),
             rejection_maps: write_maps,
+            local: ln.is_some().then_some(local_refs.as_slice()),
+            local_for_rejection,
+            local_for_output,
         };
         // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
         // fields are — so it must be rebuilt (not read) from
@@ -576,6 +646,15 @@ pub fn integrate_group(
         &weights_per_frame,
         input.normalization.output,
         input.normalization.rejection,
+        // M2: `integrate_group` has no channel yet to receive real LN
+        // grids — `ln: None` below always makes this a no-op today (a
+        // follow-up wires the real thing) — so `local_for_output` here is
+        // harmless to pass through honestly rather than hardcoding `false`:
+        // every existing config's `local.enabled` defaults to `false`
+        // anyway, and a caller that already flips it on will "just work"
+        // once `ln` stops being `None`.
+        input.normalization.local.enabled,
+        None,
         recipe,
         input.integration.write_rejection_maps,
         pool,
@@ -739,6 +818,10 @@ pub fn integrate_group(
             read_ms: read_ms_total,
             combine_ms: combine_ms_total,
             bytes_read: bytes_read_total,
+            // `integrate_planes` above is always called with `ln: None` —
+            // see that call site's comment — so no included frame has a
+            // grid through this path yet.
+            ln_frames: 0,
         },
     })
 }

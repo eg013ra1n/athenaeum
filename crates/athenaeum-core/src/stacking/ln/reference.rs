@@ -163,6 +163,12 @@ pub fn build_reference(
         &weights,
         output_mode,
         rejection_mode,
+        // M2: local normalization "doesn't exist yet at reference-build
+        // time" (this function's own doc) — forced off independently of
+        // whatever the group itself has configured, same reasoning as
+        // `output_mode`/`rejection_mode` above.
+        false,
+        None,
         recipe,
         write_maps,
         pool,

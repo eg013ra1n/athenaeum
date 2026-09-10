@@ -327,14 +327,19 @@ pub fn output_pair(
     }
 }
 
-/// The pair applied to the working copy before rejection; `None` for
-/// `Local`, whose grids the caller supplies.
+/// The pair applied to the working copy before rejection. For `Local` (M2)
+/// this is explicitly `NormalizationPair::IDENTITY`: the real per-pixel
+/// local normalization comes from the caller's LN grids
+/// (`integration::engine::StackParams::local`, applied when
+/// `local_for_rejection` is set), not from this pair — this is the pair a
+/// frame with no grid falls back to (ruling R2: a frame with no grid is
+/// effectively un-normalized for rejection, not refused).
 pub fn rejection_pair(
     reference: LocationScale,
     frame: LocationScale,
     mode: RejectionNormalization,
-) -> Option<NormalizationPair> {
-    Some(match mode {
+) -> NormalizationPair {
+    match mode {
         RejectionNormalization::None => NormalizationPair::IDENTITY,
         RejectionNormalization::ScaleZeroOffset => {
             output_pair(reference, frame, OutputNormalization::AdditiveWithScaling)
@@ -342,8 +347,8 @@ pub fn rejection_pair(
         RejectionNormalization::EqualizeFluxes => {
             output_pair(reference, frame, OutputNormalization::Multiplicative)
         }
-        RejectionNormalization::Local => return None,
-    })
+        RejectionNormalization::Local => NormalizationPair::IDENTITY,
+    }
 }
 
 #[cfg(test)]
@@ -496,17 +501,20 @@ mod tests {
         );
         assert_eq!(
             rejection_pair(r, f, RejectionNormalization::ScaleZeroOffset),
-            Some(output_pair(r, f, OutputNormalization::AdditiveWithScaling))
+            output_pair(r, f, OutputNormalization::AdditiveWithScaling)
         );
         assert_eq!(
             rejection_pair(r, f, RejectionNormalization::EqualizeFluxes),
-            Some(output_pair(r, f, OutputNormalization::Multiplicative))
+            output_pair(r, f, OutputNormalization::Multiplicative)
         );
         assert_eq!(
             rejection_pair(r, f, RejectionNormalization::None),
-            Some(NormalizationPair::IDENTITY)
+            NormalizationPair::IDENTITY
         );
-        assert_eq!(rejection_pair(r, f, RejectionNormalization::Local), None);
+        assert_eq!(
+            rejection_pair(r, f, RejectionNormalization::Local),
+            NormalizationPair::IDENTITY
+        );
         let zero = LocationScale {
             location: 0.0,
             scale: 0.0,

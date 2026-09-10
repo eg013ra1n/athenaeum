@@ -302,6 +302,7 @@ mod tests {
             read_ms: 0,
             combine_ms: 0,
             bytes_read: 0,
+            ln_frames: 0,
         }
     }
 
