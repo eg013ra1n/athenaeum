@@ -15,6 +15,26 @@
 //! the two-node slope keeps that property intact all the way to the last
 //! pixel, which is what `linear_ramp_is_reproduced_by_the_spline_between_nodes`
 //! below pins.
+//!
+//! **Kernel semantics — read before touching `evaluate_row`.**
+//! `BicubicBSpline` is the SMOOTHING cubic B-spline, applied directly to the
+//! node values with no interpolating prefilter. That means the evaluated
+//! surface does **not** pass through the node values: a node surrounded by
+//! zeros evaluates to `2/3` at its own pixel (`cubic_bspline(0.0) == 2/3`,
+//! `resample::kernels`), not `1.0`, and a quadratic sampled onto the nodes
+//! carries a constant bias of `stride²·f″/6` wherever it is evaluated. What
+//! it DOES reproduce exactly is an affine (constant or linear) function of
+//! the node values, which is the property the tests below pin and the one
+//! the math reference (§4.1/§4.4) relies on. **Controller ruling**: this is
+//! the chosen behaviour, not a defect — at stride 128 the resulting bias on
+//! the `B` surface is ≈0.26% of the field amplitude, this is the same
+//! kernel the M1 resampler already uses elsewhere in the pipeline, and the
+//! background model this feeds is smooth by construction, so the missing
+//! prefilter costs nothing in practice. An interpolating prefilter (making
+//! the surface pass through the node values exactly) is an M4 option, only
+//! if the acceptance re-run ever shows a visible mesh imprint. Later tasks
+//! must not expect `evaluate_row`/`evaluate_row_into` to reproduce `a`/`b`
+//! at a node's own pixel.
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -35,16 +55,27 @@ const HEADER_LEN: usize = 8 + 4 * 5;
 /// Per-channel fixed-size prefix (gw + gh + 4 f64s), before the `a`/`b`
 /// float arrays.
 const CHANNEL_HEADER_LEN: usize = 4 + 4 + 8 * 4;
+/// Upper bound on the `channels` field a sidecar may declare — a real
+/// frame has at most 3 planes (OSC), so 8 is generous headroom. Checked
+/// BEFORE `read()` reserves a `Vec<LnGrid>` sized by that field: without
+/// this bound, a corrupt or crafted `channels = 0xFFFFFFFF` asks for
+/// hundreds of GB and the process aborts on allocation failure — the xxh3
+/// trailer is a checksum, not a defence against a value it never
+/// interprets as a size until after the hash already matched.
+const MAX_CHANNELS: u32 = 8;
 
 /// One channel's local-normalization model on the stride grid (spec §5.2,
-/// math §4.1/§4.4).
+/// math §4.1/§4.4). Evaluated with the SMOOTHING cubic B-spline (no
+/// interpolating prefilter) — see the module doc's "Kernel semantics"
+/// section before assuming `evaluate_row` reproduces `a`/`b` at a node's
+/// own pixel; it does not, by design.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LnGrid {
     pub ref_width: usize, // reference geometry the grid covers
     pub ref_height: usize,
-    pub scale: u32, // the LN scale (1024); stride = scale / 8
-    pub gw: usize,  // grid columns = ceil(ref_width / stride) + 1
-    pub gh: usize,
+    pub scale: u32,        // the LN scale (1024); stride = scale / 8
+    pub gw: usize,         // grid columns = ceil((ref_width - 1) / stride) + 1 (Self::node_count)
+    pub gh: usize,         // grid rows = ceil((ref_height - 1) / stride) + 1 (Self::node_count)
     pub a: Vec<f32>,       // gw × gh, row-major — local scale
     pub b: Vec<f32>,       // gw × gh — local zero offset
     pub global_scale: f64, // s from the PSF method
@@ -142,15 +173,48 @@ impl LnGrid {
     }
 
     /// Evaluates A and B along output row `y` (reference coordinates) into
-    /// `a_row`/`b_row` (length `ref_width`) with the bicubic B-spline over
-    /// the grid; node `(i, j)` sits at `(i·stride, j·stride)`. `O(4·gw +
-    /// 4·ref_width)`: the four row-nodes nearest `y` are combined once into
-    /// two temporary rows of length `gw`, then every output pixel
-    /// interpolates from those with its own four column weights — never
-    /// `O(4·gw·ref_width)`.
+    /// `a_row`/`b_row` (length `ref_width`) with the SMOOTHING bicubic
+    /// B-spline over the grid (see the module doc's "Kernel semantics" —
+    /// this does not reproduce `a`/`b` exactly at a node's own pixel, only
+    /// affine functions of them); node `(i, j)` sits at `(i·stride,
+    /// j·stride)`. Allocates a fresh [`LnScratch`] per call — prefer
+    /// [`Self::evaluate_row_into`] with a scratch reused across rows in a
+    /// loop (Task 6's band loop does).
     pub fn evaluate_row(&self, y: usize, a_row: &mut [f32], b_row: &mut [f32]) {
+        let mut scratch = LnScratch::for_grid(self);
+        self.evaluate_row_into(y, a_row, b_row, &mut scratch);
+    }
+
+    /// Same as [`Self::evaluate_row`], writing into caller-supplied
+    /// `scratch` (sized by [`LnScratch::for_grid`]) instead of allocating
+    /// two temporary rows on every call. `O(4·gw + 4·ref_width)`: the four
+    /// row-nodes nearest `y` are combined once into `scratch`, then every
+    /// output pixel interpolates from that with its own four column
+    /// weights — never `O(4·gw·ref_width)`.
+    pub fn evaluate_row_into(
+        &self,
+        y: usize,
+        a_row: &mut [f32],
+        b_row: &mut [f32],
+        scratch: &mut LnScratch,
+    ) {
+        assert!(
+            y < self.ref_height,
+            "y ({y}) must be < ref_height ({})",
+            self.ref_height
+        );
         assert_eq!(a_row.len(), self.ref_width, "a_row must be ref_width long");
         assert_eq!(b_row.len(), self.ref_width, "b_row must be ref_width long");
+        assert_eq!(
+            scratch.a.len(),
+            self.gw,
+            "scratch must match this grid's gw"
+        );
+        assert_eq!(
+            scratch.b.len(),
+            self.gw,
+            "scratch must match this grid's gw"
+        );
 
         let stride = self.stride() as f32;
         let offset = Interpolation::BicubicBSpline.first_tap_offset();
@@ -161,14 +225,14 @@ impl LnGrid {
         let mut wy = [0f32; 8];
         Interpolation::BicubicBSpline.weights(fy, &mut wy);
 
-        let mut tmp_a = vec![0f32; self.gw];
-        let mut tmp_b = vec![0f32; self.gw];
+        scratch.a.fill(0.0);
+        scratch.b.fill(0.0);
         for k in 0..4usize {
             let j = j0 + offset + k as isize;
             let w = wy[k];
             for i in 0..self.gw {
-                tmp_a[i] += w * self.node(&self.a, j, i);
-                tmp_b[i] += w * self.node(&self.b, j, i);
+                scratch.a[i] += w * self.node(&self.a, j, i);
+                scratch.b[i] += w * self.node(&self.b, j, i);
             }
         }
 
@@ -183,8 +247,8 @@ impl LnGrid {
             let mut vb = 0f32;
             for k in 0..4usize {
                 let i = i0 + offset + k as isize;
-                va += wx[k] * Self::ghost_1d(&tmp_a, i);
-                vb += wx[k] * Self::ghost_1d(&tmp_b, i);
+                va += wx[k] * Self::ghost_1d(&scratch.a, i);
+                vb += wx[k] * Self::ghost_1d(&scratch.b, i);
             }
             a_row[x] = va;
             b_row[x] = vb;
@@ -197,7 +261,36 @@ impl LnGrid {
     }
 }
 
-/// One frame's sidecar: one grid per channel.
+/// Reusable scratch buffers for [`LnGrid::evaluate_row_into`] — two rows of
+/// length `gw`, avoiding a pair of heap allocations on every call when a
+/// caller (Task 6's band loop) evaluates many rows against the same grid.
+/// Fields are private: the only way to build one is [`Self::for_grid`],
+/// which sizes it correctly for the grid it will be used with.
+pub struct LnScratch {
+    a: Vec<f32>,
+    b: Vec<f32>,
+}
+
+impl LnScratch {
+    /// Buffers sized for `grid`'s `gw`. Reusable across calls against any
+    /// grid that shares the same `gw` (typically every channel of one
+    /// frame, since they share one reference geometry — see
+    /// [`LnFrameGrids`]'s doc).
+    pub fn for_grid(grid: &LnGrid) -> LnScratch {
+        LnScratch {
+            a: vec![0.0; grid.gw],
+            b: vec![0.0; grid.gw],
+        }
+    }
+}
+
+/// One frame's sidecar: one grid per channel. The `.athln` format stores a
+/// single reference geometry (`ref_width`/`ref_height`/`scale`) for the
+/// whole file, taken from `channels[0]` on write — every channel MUST
+/// share one geometry, or it would not round-trip (a later channel's own
+/// `ref_width`/`ref_height`/`scale` would be silently dropped in favour of
+/// the first). [`Self::write`] refuses a mismatched set with an error
+/// rather than silently taking the first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LnFrameGrids {
     pub channels: Vec<LnGrid>,
@@ -217,8 +310,32 @@ fn tmp_sidecar_path(path: &Path) -> PathBuf {
 }
 
 impl LnFrameGrids {
+    /// Refuses a `channels` set whose members disagree on the one geometry
+    /// the `.athln` format can actually store (see the struct doc). A
+    /// single channel, or none, trivially agrees with itself.
+    fn validate_uniform_geometry(&self) -> Result<()> {
+        let Some(first) = self.channels.first() else {
+            return Ok(());
+        };
+        for (idx, g) in self.channels.iter().enumerate().skip(1) {
+            if g.ref_width != first.ref_width
+                || g.ref_height != first.ref_height
+                || g.scale != first.scale
+            {
+                bail!(
+                    ".athln sidecar: channel {idx} geometry ({}x{}, scale {}) does not match channel 0's ({}x{}, scale {}) — every channel must share one reference geometry",
+                    g.ref_width, g.ref_height, g.scale, first.ref_width, first.ref_height, first.scale
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Encodes the sidecar payload (everything except the trailing xxh3
     /// trailer) — shared by `write` (which hashes it) and nothing else.
+    /// Geometry (`ref_width`/`ref_height`/`scale`) is taken from
+    /// `channels[0]` — [`Self::write`] has already refused a mismatched set
+    /// via [`Self::validate_uniform_geometry`] by the time this runs.
     fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
@@ -252,8 +369,11 @@ impl LnFrameGrids {
     }
 
     /// Writes the sidecar: tmp file + atomic rename, never leaving a
-    /// truncated/partial file at `path`.
+    /// truncated/partial file at `path`. Refuses (before touching disk) a
+    /// `channels` set whose members don't share one reference geometry —
+    /// see the struct doc.
     pub fn write(&self, path: &Path) -> Result<()> {
+        self.validate_uniform_geometry()?;
         let payload = self.encode()?;
         let hash = {
             let mut hasher = Xxh3::new();
@@ -296,8 +416,17 @@ impl LnFrameGrids {
     /// Reads and validates a sidecar written by [`Self::write`]. The xxh3
     /// trailer is checked BEFORE any field is interpreted, so any single
     /// flipped byte anywhere in the payload is refused rather than
-    /// silently parsed into a wrong value.
+    /// silently parsed into a wrong value. Every error path is logged
+    /// (path + error) before returning — see [`Self::read_inner`] for the
+    /// actual parse.
     pub fn read(path: &Path) -> Result<LnFrameGrids> {
+        Self::read_inner(path).map_err(|e| {
+            tracing::error!(path = %path.display(), error = %e, "failed to read .athln sidecar");
+            e
+        })
+    }
+
+    fn read_inner(path: &Path) -> Result<LnFrameGrids> {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         if bytes.len() < HEADER_LEN + 8 {
             bail!(".athln sidecar too short: {}", path.display());
@@ -332,8 +461,31 @@ impl LnFrameGrids {
         let scale = cursor.read_u32::<LittleEndian>()?;
         let channel_count = cursor.read_u32::<LittleEndian>()?;
 
+        // Critical: bound `channels` BEFORE reserving anything sized by it.
+        // The xxh3 trailer already matched at this point, but a checksum
+        // only proves the bytes weren't corrupted in transit — it says
+        // nothing about whether the value they encode is a sane size to
+        // allocate, so a deliberately-crafted file with a valid trailer and
+        // `channels = 0xFFFFFFFF` must still be refused here, not after
+        // `Vec::with_capacity` has already asked the allocator for it.
+        if channel_count == 0 || channel_count > MAX_CHANNELS {
+            bail!(
+                ".athln sidecar channels out of range ({channel_count}, expected 1..={MAX_CHANNELS}): {}",
+                path.display()
+            );
+        }
+
+        // Important: every channel's `gw`/`gh` must equal what the header's
+        // own ref_width/ref_height/scale imply — computed once since the
+        // geometry is shared across all channels (see `LnFrameGrids`'s
+        // doc). A grid too small (or too large) for its declared geometry
+        // would otherwise parse cleanly and silently extrapolate or
+        // truncate the wrong surface.
+        let stride = (scale / 8).max(2) as usize;
+        let (expected_gw, expected_gh) = LnGrid::grid_dims(ref_width, ref_height, stride);
+
         let mut channels = Vec::with_capacity(channel_count as usize);
-        for _ in 0..channel_count {
+        for idx in 0..channel_count {
             if cursor.len() < CHANNEL_HEADER_LEN {
                 bail!(
                     ".athln sidecar truncated channel header: {}",
@@ -342,6 +494,12 @@ impl LnFrameGrids {
             }
             let gw = cursor.read_u32::<LittleEndian>()? as usize;
             let gh = cursor.read_u32::<LittleEndian>()? as usize;
+            if gw != expected_gw || gh != expected_gh {
+                bail!(
+                    ".athln sidecar channel {idx} grid dims {gw}x{gh} do not match the geometry the header implies ({expected_gw}x{expected_gh} for {ref_width}x{ref_height} at scale {scale}): {}",
+                    path.display()
+                );
+            }
             let global_scale = cursor.read_f64::<LittleEndian>()?;
             let location_ref = cursor.read_f64::<LittleEndian>()?;
             let location_tgt = cursor.read_f64::<LittleEndian>()?;
@@ -427,5 +585,79 @@ mod tests {
         bytes[40] ^= 0x01;
         std::fs::write(&p, bytes).unwrap();
         assert!(LnFrameGrids::read(&p).is_err());
+    }
+
+    /// Patches a little-endian `u32` field at `offset` in a sidecar file
+    /// and recomputes the trailer, so a test can build a "corrupt but
+    /// checksum-consistent" file without hand-duplicating `encode`'s
+    /// layout.
+    fn patch_u32_and_rehash(path: &Path, offset: usize, new_value: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[offset..offset + 4].copy_from_slice(&new_value.to_le_bytes());
+        let trailer_at = bytes.len() - 8;
+        let hash = {
+            let mut hasher = Xxh3::new();
+            hasher.update(&bytes[..trailer_at]);
+            hasher.digest()
+        };
+        bytes[trailer_at..].copy_from_slice(&hash.to_le_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn a_channel_count_beyond_max_is_refused_without_allocating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let g = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        LnFrameGrids {
+            channels: vec![g.clone(), g],
+        }
+        .write(&p)
+        .unwrap();
+
+        // `channels` is the last u32 of the fixed file header.
+        let channels_at = HEADER_LEN - 4;
+        patch_u32_and_rehash(&p, channels_at, 0xFFFF_FFFF);
+
+        let err = LnFrameGrids::read(&p).unwrap_err();
+        assert!(
+            err.to_string().contains("channels"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_grid_too_small_for_its_declared_geometry_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let g = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        LnFrameGrids { channels: vec![g] }.write(&p).unwrap();
+
+        // Channel 0's `gw` is the first u32 right after the file header.
+        let gw_at = HEADER_LEN;
+        let bytes = std::fs::read(&p).unwrap();
+        let original_gw = u32::from_le_bytes(bytes[gw_at..gw_at + 4].try_into().unwrap());
+        patch_u32_and_rehash(&p, gw_at, original_gw - 1);
+
+        let err = LnFrameGrids::read(&p).unwrap_err();
+        assert!(
+            err.to_string().contains("grid dims"),
+            "error should describe the mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn write_refuses_channels_with_different_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let a = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        let b = LnGrid::constant(64, 48, 256, 1.0, 0.0); // different scale
+        let err = LnFrameGrids {
+            channels: vec![a, b],
+        }
+        .write(&p)
+        .unwrap_err();
+        assert!(err.to_string().contains("geometry"), "{err}");
+        assert!(!p.exists(), "a refused write must not touch disk");
     }
 }
