@@ -263,6 +263,57 @@ other masters should adopt. On the owner's data this picks a frame of the
 208-frame mono group, as WBPP did. Auto never writes `frame_set_reference`;
 the run records `reference_frame_id` and `reference_mode`.
 
+**Amendment (2026-09-10, ruling R-M3-17 v2, owner-driven).** The frame this
+section picks — manual pin or auto best-by-weight — is the REGISTRATION
+reference only: every subject frame's `PixelMap` is fitted against it, and
+it names the master's copy-through header cards / WCS anchor. It no longer
+anchors normalization. On LDN 1272 the OSC group's normalization reference
+was `2025-09-14_02-19-02_0019`, the group's top-PSF-weight member — a
+bright-sky night (G background 0.0083) — so the master inherited that
+night's sky level and large-scale background shape (R-plane corners 0.85 of
+centre vs. a reference tool's 0.69 when it normalized to a dark-sky
+2025-10-18 frame, G ≈ 0.0028). Calibration, registration, LN and
+integration were verified identical frame-for-frame; the ONLY difference
+was which frame anchored normalization.
+
+Every group now picks its own NORMALIZATION anchor — `GroupInput.reference`,
+the frame §5.1's global normalization and §5.2's LN reference integration
+normalize to, and the `normalization_reference_frame_id` the run summary
+records — sky-penalized: per admissible included member (the same
+weight-floor/star-count/coverage admissibility this section's own
+best-by-weight uses, see the coverage note below), score
+
+```
+s_i = weight.normalized_mean / sqrt(background_i)
+```
+
+(`background_i` = mean over planes of the frame's measured background
+median; a member whose background is non-finite or `<= 0` is not a
+candidate). The anchor is `argmax s_i` (ties → the higher weight, then star
+count); on a single-night set where every member shares roughly one sky
+level, `s_i` is monotonic in weight and this coincides with plain
+best-by-weight — the two rules only diverge on a mixed set, exactly where
+Ruling 7 (superseded) got LDN 1272 wrong. Rationale: faint-signal SNR scales
+as `1/sqrt(background)`, so this both ranks by weight and penalizes a
+bright sky, without needing a fixed top-K or weight-fraction band (an
+initial "good half by weight ≥ 0.5·max" draft still failed to reach LDN
+1272's dark-sky night, since that set's own top-8-by-weight frames were ALL
+from the bright night).
+
+A candidate must also cover the reference geometry: `reference_coverage`
+maps a 32×32 grid of reference-pixel cell centres through the member's own
+`PixelMap::inverse` and counts the fraction landing inside its native
+`[0, width) × [0, height)` extent; `>= 0.97` is required (a rotated frame, a
+mismatched camera angle, or a badly offset one loses coverage at the
+corners — normalizing to it, or modelling the LN reference's background on
+it, would carry its uncovered corners/edges into every other frame). The
+coverage filter is dropped for a group where fewer than 3 members would
+pass it (a warning, not a hard failure) — ranking among too few candidates
+to mean anything is worse than no filter.
+
+The LN reference's member list (§5.2) is ranked the same sky-penalized way,
+not by raw weight — see the note there.
+
 ## 5. Normalization
 
 ### 5.1 Global (M1)
@@ -288,9 +339,19 @@ per-frame grids.
 ### 5.2 Local (M2)
 
 - **Reference** per group: integration of the best `referenceFrames` (20)
-  included frames by weight, linear-fit rejection, global normalization,
-  resampled lazily, kept in RAM for the LN pass and written to
-  `ln/<group>/reference.fits` as an artifact.
+  included frames, linear-fit rejection, global normalization, resampled
+  lazily, kept in RAM for the LN pass and written to
+  `ln/<group>/reference.fits` as an artifact — normalized to the group's
+  sky-penalized normalization anchor (§4.4 amendment, ruling R-M3-17 v2),
+  not the set's registration reference. **Amendment (2026-09-10, ruling
+  R-M3-17 v2):** "best `referenceFrames`" is by the SAME sky-penalized score
+  `s_i = weight.normalized_mean / sqrt(background_i)` §4.4 defines for the
+  anchor, not raw weight — the run ranks candidates once
+  (`sky_penalized_order`, admissible by weight-floor/star-count/coverage the
+  same way) and hands the reference builder exactly that top-N set; the
+  reference builder itself still integrates however it always did (linear-
+  fit rejection, global normalization, equal per-frame weighting) — only
+  WHICH `referenceFrames` frames make up that set changed.
 - **Per frame**: reference and target background models (MMT residual at
   `scale` 1024 after hot-pixel median filter radius 2, low clip 4.5e-5, high
   clip 0.85 relative, deviation thresholds 3.0σ / 3.2σ, rejection limit 0.3

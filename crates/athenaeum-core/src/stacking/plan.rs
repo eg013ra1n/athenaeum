@@ -438,9 +438,11 @@ pub(crate) fn registration_hash_for(
 }
 
 /// The group's LN reference artifact payload (fix round 1, item 5, spec
-/// §9.3): the resolved `reference_member_ids` (weight-ordered — the
-/// best-weighted `referenceFrames` included members, spec §5.2) and the
-/// reference's OWN [`normalization_hash_for`] value (redundant with the
+/// §9.3): the resolved `reference_member_ids` (ruling R-M3-17 v2:
+/// sky-penalized-score-ordered — `s_i = weight.normalized_mean /
+/// sqrt(background)`, not raw weight — the top `referenceFrames` included
+/// members by that score, spec §4.4/§5.2) and the reference's OWN
+/// [`normalization_hash_for`] value (redundant with the
 /// artifact row's own `config_hash` column, kept here too so [`build_plan`]
 /// needs only this one `payload_json` parse to verify every `ln` row — it
 /// never re-reads the `ln_reference` row's `config_hash` column
@@ -462,8 +464,9 @@ pub(crate) struct LnReferencePayload {
 /// EVERY reference member's stage-5 hash (the `ln_reference` artifact, one
 /// per group — see `stacking::run`'s own construction of that token, since
 /// there is no single frame to key it on) — plus `reference_member_ids`, the
-/// group's chosen LN reference frame ids (the best-weighted `referenceFrames`
-/// included members, spec §5.2): a changed member list invalidates every
+/// group's chosen LN reference frame ids (the sky-penalized-score-ordered
+/// top `referenceFrames` included members, ruling R-M3-17 v2, spec §4.4/
+/// §5.2): a changed member list invalidates every
 /// frame's sidecar AND the reference itself, even when neither `cfg` nor
 /// this frame's own registration changed. `reference_hash` (fix round 1,
 /// item 2) is the group's OWN LN-reference hash — empty (`""`) when

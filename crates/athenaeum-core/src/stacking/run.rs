@@ -91,7 +91,8 @@ use crate::stacking::register::writer::{
 };
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{
-    best_by_weight, compute_weights, select_frames, FrameWeight, WeightInput, WeightMode,
+    best_by_weight, compute_weights, reference_coverage, select_frames, sky_penalized_order,
+    FrameWeight, WeightInput, WeightMode, MIN_REFERENCE_COVERAGE,
 };
 
 /// Wire event for `stacking-progress`. `percent` is `100 * current / total`
@@ -3596,27 +3597,94 @@ fn process_group_output(
         return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
     }
 
-    // Ruling 7: the global reference anchors normalization only when it is
-    // itself a member of this group; otherwise the group's own best-weighted
-    // included member does. Factored into a closure (not just a one-shot
-    // match) because stage 6's LN pass, below, can narrow `members` further
-    // (a `TooFewMatches` exclusion when LN drives OUTPUT normalization) —
-    // the anchor is re-derived from whichever members survive that.
-    let global_reference_frame_id = rc.reference_frame_id;
-    let pick_reference_idx = |members: &[GroupMember]| -> Option<usize> {
-        match members
+    // Ruling R-M3-17 v2 (supersedes Ruling 7): the set's reference (manual
+    // pin or auto best-by-weight, `rc.reference_frame_id`) is the
+    // REGISTRATION reference only — it no longer anchors normalization just
+    // because it happens to be a member of this group. Every group's
+    // NORMALIZATION anchor is chosen sky-penalized instead
+    // (`sky_penalized_order`, spec §4.4): among the group's admissible
+    // members, the one with the highest `weight / sqrt(background)` wins —
+    // faint-signal SNR scales as `1/sqrt(background)`, so a bright-sky
+    // top-weight member no longer outranks a slightly-lower-weight
+    // dark-sky one (LDN 1272, 2026-09-10: the OSC group's normalization
+    // reference was the top-PSF-weight member of a 3x-brighter-sky night;
+    // the master inherited that night's sky level).
+    //
+    // Addendum: a member whose registered footprint does not cover the
+    // reference rectangle (`reference_coverage` < `MIN_REFERENCE_COVERAGE`
+    // — a rotated frame, a mismatched camera angle, a badly offset one) is
+    // not admissible either — normalizing to it (or modelling the LN
+    // reference's background on it) would carry its uncovered corners/
+    // edges into every other frame. The coverage filter itself is dropped
+    // for a group where fewer than 3 members would pass it (a `warn!` +
+    // run warning), rather than ranking among too few candidates to mean
+    // anything.
+    //
+    // Factored into a closure (not just a one-shot call) because stage 6's
+    // LN pass, below, can narrow `members` further (a `TooFewMatches`
+    // exclusion when LN drives OUTPUT normalization) — the anchor is
+    // re-derived from whichever members survive that. `run_id`/`ref_width`/
+    // `ref_height`/`group` are captured by copy/shared reference (never
+    // `rc` itself), so the closure holds no live borrow of `rc` across the
+    // mutable uses of it between the two call sites below — the coverage
+    // filter's "dropped" case is instead returned to the caller, which
+    // pushes the run warning itself (the closure can only `tracing::warn!`,
+    // never touch `rc.warnings`).
+    let run_id = rc.run_id;
+    let ref_width = rc.reference_width;
+    let ref_height = rc.reference_height;
+    // `Some((idx, coverage_dropped))` — `coverage_dropped` is
+    // `Some(admissible_count)` when this call had to fall back to no
+    // coverage filter (fewer than 3 members passed it).
+    let pick_reference_idx = |members: &[GroupMember]| -> Option<(usize, Option<usize>)> {
+        let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
+        let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
+        let sky: Vec<f64> = members.iter().map(|m| m.measurement.mean_median()).collect();
+
+        let coverage: Vec<f64> = members
             .iter()
-            .position(|m| Some(m.frame_id) == global_reference_frame_id)
-        {
-            Some(idx) => Some(idx),
-            None => {
-                let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
-                let included_mask = vec![true; members.len()];
-                let star_counts: Vec<usize> =
-                    members.iter().map(|m| m.measurement.min_stars()).collect();
-                best_by_weight(&weights, &included_mask, &star_counts)
-            }
+            .map(|m| {
+                reference_coverage(
+                    &m.map,
+                    m.measurement.width,
+                    m.measurement.height,
+                    ref_width,
+                    ref_height,
+                )
+            })
+            .collect();
+        let coverage_mask: Vec<bool> = coverage
+            .iter()
+            .map(|&c| c >= MIN_REFERENCE_COVERAGE)
+            .collect();
+        let admissible_count = coverage_mask.iter().filter(|&&ok| ok).count();
+        let (included_mask, coverage_dropped) = if admissible_count >= 3 {
+            (coverage_mask, None)
+        } else {
+            (vec![true; members.len()], Some(admissible_count))
+        };
+        if let Some(count) = coverage_dropped {
+            tracing::warn!(
+                run_id,
+                group_key = %group.key,
+                count,
+                min_coverage = MIN_REFERENCE_COVERAGE,
+                "reference-coverage filter dropped for this group: fewer than 3 members pass"
+            );
         }
+
+        let idx = sky_penalized_order(&weights, &included_mask, &star_counts, &sky)
+            .into_iter()
+            .next()?;
+        tracing::info!(
+            run_id,
+            group_key = %group.key,
+            frame_id = members[idx].frame_id,
+            weight = weights[idx].normalized_mean,
+            background = sky[idx],
+            "normalization anchor chosen"
+        );
+        Some((idx, coverage_dropped))
     };
     // Same shape as `StackFrame`'s own construction from a `GroupMember`
     // list — a closure, not a one-shot `.map()`, because the LN pass can
@@ -3636,7 +3704,16 @@ fn process_group_output(
     };
 
     let mut reference_idx = match pick_reference_idx(&members) {
-        Some(idx) => idx,
+        Some((idx, coverage_dropped)) => {
+            if let Some(count) = coverage_dropped {
+                rc.warnings.push(format!(
+                    "group {}: reference-coverage filter dropped for normalization anchoring — \
+                     only {count} member(s) cover the reference geometry (need >= 3)",
+                    group.key
+                ));
+            }
+            idx
+        }
         None => {
             let (n, i, d, o) = zero();
             return Ok((
@@ -3778,7 +3855,17 @@ fn process_group_output(
                         return Ok((skip_group(rc, group, members.len())?, n, i, d, o));
                     }
                     reference_idx = match pick_reference_idx(&members) {
-                        Some(idx) => idx,
+                        Some((idx, coverage_dropped)) => {
+                            if let Some(count) = coverage_dropped {
+                                rc.warnings.push(format!(
+                                    "group {}: reference-coverage filter dropped for \
+                                     normalization anchoring — only {count} member(s) cover \
+                                     the reference geometry (need >= 3)",
+                                    group.key
+                                ));
+                            }
+                            idx
+                        }
                         None => {
                             let n = normalize_start.elapsed();
                             let (_, i, d, o) = zero();
@@ -4716,18 +4803,58 @@ fn run_group_normalization(
     let ln_cfg = cfg.normalization.local;
     let ln_drives_output = ln_cfg.enabled;
 
-    // Best-weighted members first (stable sort — ties keep `members`' own
-    // order), same ranking [`build_ln_reference`] performs internally: computed
-    // here too because the normalize-stage hash needs the member LIST before
-    // knowing whether the reference will be rebuilt or reused (a cache hit's
-    // `LnReference::frames_used` always comes back empty, see its own doc).
-    let mut ranked: Vec<usize> = (0..members.len()).collect();
-    ranked.sort_by(|&a, &b| {
-        members[b]
-            .weight
-            .normalized_mean
-            .total_cmp(&members[a].weight.normalized_mean)
-    });
+    // Sky-penalized members first (spec §4.4/§5.2, ruling R-M3-17 v2 —
+    // supersedes plain best-weighted-first): the SAME `sky_penalized_order`
+    // ranking `process_group_output`'s `pick_reference_idx` uses for the
+    // normalization anchor (coverage filter included — the addendum
+    // filters BOTH candidate lists the same way), computed here too
+    // because the normalize-stage hash needs the member LIST before
+    // knowing whether the reference will be rebuilt or reused (a cache
+    // hit's `LnReference::frames_used` always comes back empty, see its
+    // own doc). [`build_ln_reference`] (`ln::reference::build_reference`)
+    // itself is UNCHANGED — it still ranks by weight internally whatever
+    // `included` list it is handed — but `build_and_write_ln_reference`
+    // below now hands it the sky-penalized top-`n` slice computed here,
+    // not the whole group, so its internal re-sort only reorders those `n`
+    // (already the right SET), never changes WHICH `n` are used.
+    let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
+    let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
+    let sky: Vec<f64> = members.iter().map(|m| m.measurement.mean_median()).collect();
+    let coverage: Vec<f64> = members
+        .iter()
+        .map(|m| {
+            reference_coverage(
+                &m.map,
+                m.measurement.width,
+                m.measurement.height,
+                rc.reference_width,
+                rc.reference_height,
+            )
+        })
+        .collect();
+    let coverage_mask: Vec<bool> = coverage
+        .iter()
+        .map(|&c| c >= MIN_REFERENCE_COVERAGE)
+        .collect();
+    let coverage_admissible_count = coverage_mask.iter().filter(|&&ok| ok).count();
+    let included_mask = if coverage_admissible_count >= 3 {
+        coverage_mask
+    } else {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            count = coverage_admissible_count,
+            min_coverage = MIN_REFERENCE_COVERAGE,
+            "reference-coverage filter dropped for this group: fewer than 3 members pass"
+        );
+        rc.warnings.push(format!(
+            "group {}: reference-coverage filter dropped for the LN reference's member list — \
+             only {coverage_admissible_count} member(s) cover the reference geometry (need >= 3)",
+            group.key
+        ));
+        vec![true; members.len()]
+    };
+    let ranked = sky_penalized_order(&weights, &included_mask, &star_counts, &sky);
     let n = (ln_cfg.reference_frames as usize).min(ranked.len());
     if n < 3 {
         // Fix round 1, item 10: this branch fires ONLY when the config's
@@ -4817,6 +4944,7 @@ fn run_group_normalization(
                     rc,
                     group,
                     input,
+                    &reference_members,
                     n,
                     io,
                     &reference_hash,
@@ -4828,6 +4956,7 @@ fn run_group_normalization(
             rc,
             group,
             input,
+            &reference_members,
             n,
             io,
             &reference_hash,
@@ -5212,19 +5341,27 @@ fn build_and_write_ln_reference(
     rc: &mut RunContext,
     group: &IntegrationGroup,
     input: &GroupInput<'_>,
+    // Ruling R-M3-17 v2: the sky-penalized top-`n` slice
+    // `run_group_normalization` already computed — `build_ln_reference`
+    // (`ln::reference::build_reference`) below is UNCHANGED and still
+    // ranks whatever it is handed BY WEIGHT internally, but since this is
+    // already exactly `n` candidates, its `take = n.min(len)` uses all of
+    // them: the SET is the caller's sky-penalized choice, only the internal
+    // `frames_used` order (irrelevant to equal-weighted integration) is
+    // re-derived by weight.
+    included: &[usize],
     n: usize,
     io: IoPolicy,
     reference_hash: &str,
     reference_member_ids: &[i64],
 ) -> Result<LnReference, RunError> {
     let build_start = Instant::now();
-    let included: Vec<usize> = (0..input.frames.len()).collect();
     let cancel: &AtomicBool = &rc.cancel;
     let pool: &rayon::ThreadPool = rc.ctx.image_pool.as_ref();
     let no_progress = |_: usize, _: usize| {};
 
     let built =
-        build_ln_reference(input, &included, n, pool, cancel, io, &no_progress).map_err(|e| {
+        build_ln_reference(input, included, n, pool, cancel, io, &no_progress).map_err(|e| {
             if matches!(e, IntegrationError::Cancelled) {
                 RunError::Cancelled
             } else {
@@ -7284,6 +7421,20 @@ mod tests {
         // fixture lights) — never the calibrated artifact's own on-disk
         // name (which would need `c_`/`_d` stripping the source name never
         // does).
+        //
+        // Ruling R-M3-17 v2: `ATH_STKF` names the group's NORMALIZATION
+        // anchor (`members[reference_idx]`, sky-penalized), which since
+        // this ruling is no longer guaranteed to be `run_row.
+        // reference_frame_id` (the REGISTRATION reference, auto-picked by
+        // weight over the whole set). This assertion only still holds
+        // because `seed_star_group`'s fixture gives every frame the SAME
+        // configured background (600.0) — `s_i = w_i / sqrt(bg_i)` is then
+        // monotonic in weight, so the sky-penalized anchor coincides with
+        // the auto/best-by-weight registration reference by construction,
+        // not because the two are the same thing in general (see the
+        // dedicated `normalization_anchor_prefers_the_dark_night_over_the_
+        // pinned_bright_reference` test below for a fixture where they
+        // deliberately differ).
         let reference_frame_id = run_row
             .reference_frame_id
             .expect("reference frame recorded");
@@ -10134,6 +10285,320 @@ mod tests {
         assert_eq!(
             actual_stems, expected_stems,
             "rej/ must hold exactly the kept frames' bitmaps, named by their own calibrated stems"
+        );
+    }
+
+    // ── R-M3-17 v2: sky-penalized normalization anchor ──────────────────
+
+    /// Seeds 6 star-field lights for the sky-penalized-anchor tests
+    /// (ruling R-M3-17 v2): `f0`-`f2` are a bright night (exptime
+    /// 100/95/90s -> normalized weight 1.0/0.95/0.9 under
+    /// `WeightMode::Exposure`, background 3000 raw ADU), `f3`-`f5` a dark
+    /// night (exptime 60/55/50s -> weight 0.6/0.55/0.5, background 300 raw
+    /// ADU — a 10x darker sky; three of them, not two, so `referenceFrames
+    /// = 3` can pick a member list that is ENTIRELY dark-night — `build_
+    /// reference`/`build_ln_reference` refuse fewer than 3 candidates
+    /// outright, so a 2-frame dark night could never populate a whole LN
+    /// reference on its own). Weight is exact and controllable via
+    /// `WeightMode::Exposure` (`weight == exptime`, the same trick
+    /// `drizzle_over_a_min_weight_drop_matches_the_kept_frames_exact_
+    /// weighted_mean` uses) rather than fought for through noise/PSF
+    /// fitting. Zero relative shift for every frame (identity
+    /// registration, full reference coverage) — these tests are about
+    /// weight/background interaction, not registration robustness, which
+    /// `drizzle_runs_for_a_group_whose_members_differ_in_native_geometry_
+    /// from_the_reference` and the register-module tests already cover.
+    /// Does NOT link a master dark/flat — callers call
+    /// `test_fixtures::add_master_dark_and_flat` themselves.
+    fn seed_sky_penalty_group(
+        db_path: &Path,
+        set_name: &str,
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let exptimes = [100.0f64, 95.0, 90.0, 60.0, 55.0, 50.0];
+        let backgrounds = [3000.0f32, 3000.0, 3000.0, 300.0, 300.0, 300.0];
+        let noise = [3.0f32; 6];
+
+        let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, set_name);
+
+        let mut light_ids = Vec::new();
+        for i in 0..6 {
+            let stem = format!("f{i}");
+            let date_obs = date_obs_at(i);
+            let spec = LightSpec {
+                stem: &stem,
+                instrume: "cam",
+                filter: None,
+                binning: 1,
+                width: STAR_FIELD_WIDTH,
+                height: STAR_FIELD_HEIGHT,
+                exptime: exptimes[i],
+                date_obs: &date_obs,
+                bayerpat: None,
+                write_file: true,
+            };
+            let stars = shifted_stars(0.0, 0.0);
+            let (id, _path) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &stars,
+                backgrounds[i],
+                noise[i],
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        (fixture, light_ids, working, output)
+    }
+
+    /// Ruling R-M3-17 v2 (spec §4.4): the set's reference — here manually
+    /// pinned to `f0`, the brightest-WEIGHTED frame — anchors REGISTRATION
+    /// only. The group's NORMALIZATION anchor is chosen sky-penalized
+    /// instead (`s_i = weight.normalized_mean / sqrt(background)`), so the
+    /// dark-night frame `f3` (weight 0.6, background 300) outranks the
+    /// bright-night trio (`f0`-`f2`, weight 1.0/0.95/0.9, background 3000):
+    /// `s3 ≈ 0.0346` beats `s0 ≈ 0.0183` despite the lower raw weight. The
+    /// master's background at a star-free region must track `f3`'s own
+    /// calibrated level, not `f0`'s (pinned) or the bright night's — this
+    /// is the LDN 1272 bug this ruling fixes, reproduced on a synthetic
+    /// fixture.
+    #[test]
+    fn normalization_anchor_prefers_the_dark_night_over_the_pinned_bright_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        let (fixture, light_ids, working, output) = seed_sky_penalty_group(&db_path, SET_NAME);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        // Manual pin: the registration reference is f0 — the brightest-
+        // weighted frame, and the OPPOSITE of the normalization anchor this
+        // test expects. A regression back to Ruling 7 (pinned reference ==
+        // normalization anchor) would fail the normalization_reference_
+        // frame_id assertion below.
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            light_ids[0],
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        // Sorted exptimes are 50/55/60/90/95/100 — the cluster anchors on
+        // the FIRST (50), so the tolerance must cover the 50s gap up to
+        // 100.
+        cfg.grouping.exposure_tolerance_sec = 55.0;
+        cfg.measurement.weight_mode = WeightMode::Exposure;
+        // No algorithm rejection: nothing in the flat background region
+        // this test samples should ever be flagged, whatever a real
+        // sigma-clip might make of frames with deliberately different raw
+        // background levels.
+        cfg.integration.rejection = crate::stacking::integrate::RejectionChoice::None;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        assert_eq!(
+            rc.reference_frame_id,
+            Some(light_ids[0]),
+            "the registration reference must stay the manual pin"
+        );
+        stage_output(&mut rc).unwrap();
+
+        let group_summary = &rc.summary.groups[0];
+        assert_eq!(
+            group_summary.normalization_reference_frame_id,
+            Some(light_ids[3]),
+            "the dark-night frame (lowest background, still well-weighted) must anchor \
+             normalization, not the pinned bright reference: {group_summary:?}"
+        );
+
+        // Measured directly from the SAME files the output stage itself
+        // reads, at a coordinate far from every star (see the drizzle
+        // min-weight-drop test above for the same (165, 110, 20, 20)
+        // star-free patch on this fixture's canvas).
+        let region_mean =
+            |plane: &[f32], width: usize, x0: usize, y0: usize, w: usize, h: usize| -> f64 {
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for y in y0..y0 + h {
+                    for x in x0..x0 + w {
+                        sum += plane[y * width + x] as f64;
+                        count += 1;
+                    }
+                }
+                sum / count as f64
+            };
+        let level_of = |frame_id: i64| -> f64 {
+            let path = group_summary
+                .frames
+                .iter()
+                .find(|f| f.frame_id == frame_id)
+                .and_then(|f| f.calibrated_path.as_ref())
+                .unwrap_or_else(|| panic!("frame {frame_id} has no calibrated_path"));
+            let reader = PlaneReader::open(Path::new(path)).unwrap();
+            let plane = reader.read_plane(0).unwrap();
+            region_mean(&plane, reader.width(), 165, 110, 20, 20)
+        };
+
+        let dark_level = level_of(light_ids[3]);
+        let bright_level = level_of(light_ids[0]);
+        assert!(
+            bright_level > dark_level * 2.0,
+            "fixture sanity: the bright frame's own calibrated background must be well \
+             above the dark frame's: bright={bright_level} dark={dark_level}"
+        );
+
+        let master_path = group_summary
+            .master_path
+            .as_ref()
+            .expect("group master written");
+        let master_reader = PlaneReader::open(Path::new(master_path)).unwrap();
+        let master_plane = master_reader.read_plane(0).unwrap();
+        let master_level = region_mean(&master_plane, master_reader.width(), 165, 110, 20, 20);
+
+        assert!(
+            (master_level - dark_level).abs() < 0.2 * (bright_level - dark_level).abs(),
+            "the master's background must track the dark-night anchor, not the bright/pinned \
+             frame: master={master_level} dark={dark_level} bright={bright_level}"
+        );
+    }
+
+    /// Ruling R-M3-17 v2: the LN reference's member list is the top `N` by
+    /// the SAME sky-penalized score the normalization anchor uses, not raw
+    /// weight — with `referenceFrames = 3` on this fixture, the three
+    /// dark-night frames (`f3`/`f4`/`f5`) must be chosen over the
+    /// higher-raw-weight bright-night frames.
+    #[test]
+    fn ln_reference_members_are_sky_penalized_not_weight_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        let (fixture, light_ids, working, output) = seed_sky_penalty_group(&db_path, SET_NAME);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.grouping.exposure_tolerance_sec = 55.0;
+        cfg.measurement.weight_mode = WeightMode::Exposure;
+        // `rejection = Local` (not `local.enabled`): this fixture's
+        // `BASE_STARS` field is only 10 stars, under the 20-matched-star
+        // floor `normalize_frame` needs to measure a per-frame relative
+        // scale — with `local.enabled` (LN driving OUTPUT normalization) a
+        // frame that fails that floor is EXCLUDED from the group, and all
+        // 6 would be, emptying it. LN driving REJECTION normalization only
+        // still builds the reference and ranks its members the same
+        // sky-penalized way (`run_group_normalization` runs whenever
+        // either is set), but a frame whose scale can't be measured keeps
+        // global normalization with a warning instead of being dropped —
+        // exactly what this test needs to reach a written master.
+        cfg.normalization.rejection = RejectionNormalization::Local;
+        // 3, not 2: `build_reference`/`build_ln_reference` refuse fewer
+        // than 3 candidates outright, and the fixture's dark night is
+        // exactly 3 frames deep for this reason.
+        cfg.normalization.local.reference_frames = 3;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let artifact = crate::db::stacking::find_artifact(
+            &fixture.conn,
+            fixture.set_id,
+            &group_key,
+            "ln_reference",
+            None,
+        )
+        .unwrap()
+        .expect("ln_reference artifact row written");
+        let payload: crate::stacking::plan::LnReferencePayload =
+            serde_json::from_str(artifact.payload_json.as_deref().unwrap()).unwrap();
+
+        assert_eq!(
+            payload.reference_member_ids,
+            vec![light_ids[3], light_ids[4], light_ids[5]],
+            "the LN reference's members must be the three dark-night frames (the higher \
+             sky-penalized score), not the higher-raw-weight bright-night ones: {payload:?}"
         );
     }
 }

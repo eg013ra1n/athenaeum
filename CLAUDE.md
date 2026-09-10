@@ -410,8 +410,12 @@ pre-calibration master a missing flat master's rebuild reads, dependency
 order bias/darkflat → dark → flat, so a run never blocks on a master it can
 build itself) → `Calibrate` (reuses the calibrated-lights export engine
 verbatim) → `Measure` → `Reference` (one frame for the whole set — highest
-weight, or the user's pinned choice via `set_frame_set_reference`) →
-`Register` (registration v2: quad-seeded RANSAC + distortion) → `Normalize`
+weight, or the user's pinned choice via `set_frame_set_reference`; this
+frame REGISTERS every group — since ruling R-M3-17 (2026-09-10) it no
+longer anchors normalization, which every group instead picks sky-
+penalized: `s = weight / sqrt(background)`, so a dark-sky frame outranks a
+brighter-sky one of similar weight) → `Register` (registration v2:
+quad-seeded RANSAC + distortion) → `Normalize`
 (local normalization, M2 — see below; a no-op when
 `normalization.local.enabled` is off and `normalization.rejection` isn't
 `"local"`) → `Integrate` (banded, weighted, Auto rejection) → `Drizzle` (M3

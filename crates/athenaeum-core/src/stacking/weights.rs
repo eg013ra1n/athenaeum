@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::measure::{ChannelMeasurement, FrameMeasurement};
+use crate::geometry::PixelMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -344,6 +345,111 @@ pub fn best_by_weight(
         })
 }
 
+/// The sky-penalized normalization ranking (spec §4.4/§5.2, ruling
+/// R-M3-17 v2): the set's reference frame (manual pin or auto
+/// [`best_by_weight`]) is the REGISTRATION reference only — it no longer
+/// anchors normalization just because it happens to be a group's member.
+/// Instead, every admissible member (the same `included` gate
+/// [`best_by_weight`] applies — the weight-floor/star-count exclusion has
+/// already happened upstream in `select_frames`, `included` just carries
+/// its verdict) scores
+///
+/// ```text
+/// s_i = weight.normalized_mean / sqrt(sky[i])
+/// ```
+///
+/// where `sky[i]` is the frame's mean per-plane background (mean over
+/// `FrameMeasurement.channels[*].median`) — faint-signal SNR scales as
+/// `1 / sqrt(background)`, so this both ranks by weight AND penalizes a
+/// bright sky. A member whose `sky[i]` is non-finite or `<= 0` is not a
+/// candidate at all (dropped from the result, not merely ranked last) —
+/// there is no physical background to take a square root of.
+///
+/// Returns the admissible candidates' ORIGINAL indices, descending by
+/// `s_i`; ties broken by the higher weight, then by star count
+/// ([`best_by_weight`]'s own tie-break). On a group whose members share one
+/// background (the common case on a single-night set), `s_i` is monotonic
+/// in weight, so this order's first element is exactly what
+/// [`best_by_weight`] would return — the two rules coincide except when
+/// sky varies enough across members to move the ranking.
+///
+/// The caller takes the first element as the group's NORMALIZATION anchor
+/// (`GroupInput.reference`, `normalization_reference_frame_id`), and the
+/// first `normalization.local.referenceFrames` elements as the LN
+/// reference's member list (`stacking::run::run_group_normalization`, in
+/// place of ranking by raw weight alone — `stacking::ln::reference::
+/// build_reference` itself is unchanged, it still ranks by weight whatever
+/// candidate set it is handed, but the run now hands it this sky-penalized
+/// top-N instead of the whole group).
+pub(crate) fn sky_penalized_order(
+    weights: &[FrameWeight],
+    included: &[bool],
+    star_counts: &[usize],
+    sky: &[f64],
+) -> Vec<usize> {
+    let mut candidates: Vec<usize> = (0..weights.len())
+        .filter(|&i| included.get(i).copied().unwrap_or(false))
+        .filter(|&i| sky.get(i).is_some_and(|&bg| bg.is_finite() && bg > 0.0))
+        .collect();
+    candidates.sort_by(|&a, &b| {
+        let sa = weights[a].normalized_mean / sky[a].sqrt();
+        let sb = weights[b].normalized_mean / sky[b].sqrt();
+        sb.total_cmp(&sa)
+            .then_with(|| {
+                weights[b]
+                    .normalized_mean
+                    .total_cmp(&weights[a].normalized_mean)
+            })
+            .then_with(|| star_counts.get(b).cmp(&star_counts.get(a)))
+    });
+    candidates
+}
+
+/// Minimum [`reference_coverage`] fraction for a candidate to be
+/// admissible as the normalization anchor or an LN-reference member (spec
+/// §4.4, ruling R-M3-17 v2 addendum): a 30-px dither on a several-thousand-
+/// px frame loses well under a percent, a 2° rotation loses several — 0.97
+/// separates the two comfortably.
+pub(crate) const MIN_REFERENCE_COVERAGE: f64 = 0.97;
+
+/// The fraction of the reference rectangle `[0, ref_w) x [0, ref_h)` a
+/// registered frame's own footprint covers (spec §4.4, ruling R-M3-17 v2
+/// addendum): a rotated frame, a frame from a session with another camera
+/// angle, or a badly offset one must not become the normalization anchor
+/// nor an LN-reference member — normalizing to it (or modelling the LN
+/// reference's background on it) would carry its uncovered corners/edges
+/// into every other frame.
+///
+/// Estimated by mapping a 32 x 32 grid of reference-pixel CELL CENTRES
+/// (over `[0, ref_w) x [0, ref_h)`) through `map.inverse` (reference pixel
+/// → subject pixel) and counting the fraction that lands inside the
+/// frame's own native extent `[0, src_w) x [0, src_h)`. Pure/deterministic;
+/// the caller compares the result against [`MIN_REFERENCE_COVERAGE`].
+pub(crate) fn reference_coverage(
+    map: &PixelMap,
+    src_w: usize,
+    src_h: usize,
+    ref_w: usize,
+    ref_h: usize,
+) -> f64 {
+    const GRID: usize = 32;
+    if ref_w == 0 || ref_h == 0 {
+        return 0.0;
+    }
+    let mut covered = 0usize;
+    for gy in 0..GRID {
+        let ry = (gy as f64 + 0.5) * ref_h as f64 / GRID as f64;
+        for gx in 0..GRID {
+            let rx = (gx as f64 + 0.5) * ref_w as f64 / GRID as f64;
+            let (sx, sy) = map.inverse(rx, ry);
+            if sx >= 0.0 && sx < src_w as f64 && sy >= 0.0 && sy < src_h as f64 {
+                covered += 1;
+            }
+        }
+    }
+    covered as f64 / (GRID * GRID) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +665,112 @@ mod tests {
         assert_eq!(best_by_weight(&w, &[true, true], &[100, 150]), Some(1));
     }
 
+    /// A bare [`FrameWeight`] carrying just `normalized_mean` — the only
+    /// field [`sky_penalized_order`]/[`best_by_weight`] read — for the
+    /// sky-penalized-ranking tests below, which drive the score directly
+    /// rather than through `compute_weights`.
+    fn fw(normalized_mean: f64) -> FrameWeight {
+        FrameWeight {
+            channels: Vec::new(),
+            normalized: Vec::new(),
+            mean: normalized_mean,
+            normalized_mean,
+            missing: None,
+        }
+    }
+
+    /// Ruling R-M3-17 v2: a two-night group where the top-weighted trio is
+    /// the bright night and a lower-weighted pair is the dark night — the
+    /// sky penalty (`s = w / sqrt(bg)`) must still put the dark-night
+    /// frames first, both for the normalization anchor (the first element)
+    /// and the LN reference's member list (the first N).
+    #[test]
+    fn sky_penalized_order_prefers_the_dark_night_over_higher_raw_weight() {
+        // Bright night: weights 1.0/0.95/0.9, background 3000 (constant).
+        // Dark night: weights 0.6/0.55, background 300 — a 10x darker sky
+        // more than offsets the lower raw weight once penalized by
+        // 1/sqrt(background).
+        let weights = vec![fw(1.0), fw(0.95), fw(0.9), fw(0.6), fw(0.55)];
+        let included = [true; 5];
+        let star_counts = [100usize; 5];
+        let sky = [3000.0, 3000.0, 3000.0, 300.0, 300.0];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert_eq!(
+            order,
+            vec![3, 4, 0, 1, 2],
+            "the dark-night pair (indices 3, 4) must rank ahead of every \
+             bright-night frame despite the lower raw weight: {order:?}"
+        );
+        // The anchor is the order's first element; the LN reference's
+        // member list (N=2) is its first two — both dark-night frames.
+        assert_eq!(order.first().copied(), Some(3));
+        assert_eq!(&order[..2], &[3, 4]);
+    }
+
+    /// On equal backgrounds `s_i` is monotonic in weight, so the ranking
+    /// must degenerate to `best_by_weight`'s own tie-break (weight, then
+    /// star count) — in particular its FIRST element must equal
+    /// `best_by_weight`'s pick.
+    #[test]
+    fn sky_penalized_order_matches_best_by_weight_on_equal_backgrounds() {
+        let weights = vec![fw(0.9), fw(0.5), fw(0.9)];
+        let included = [true, true, true];
+        let star_counts = [100usize, 999, 150];
+        let sky = [5.0, 5.0, 5.0];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert_eq!(
+            order.first().copied(),
+            best_by_weight(&weights, &included, &star_counts),
+            "on equal backgrounds the top pick must match best_by_weight: {order:?}"
+        );
+        // Weight ties (indices 0 and 2) break on star count, matching
+        // best_by_weight's own tie-break — index 2 (150 stars) outranks
+        // index 0 (100 stars).
+        assert_eq!(order, vec![2, 0, 1]);
+    }
+
+    /// A frame with no physical background (zero, negative, or non-finite)
+    /// is not a candidate at all — never merely ranked last.
+    #[test]
+    fn sky_penalized_order_skips_non_positive_or_non_finite_background() {
+        let weights = vec![fw(1.0), fw(0.5), fw(0.3)];
+        let included = [true, true, true];
+        let star_counts = [100usize; 3];
+        let sky = [0.0, 4.0, 1.0];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert_eq!(
+            order,
+            vec![2, 1],
+            "index 0 (background 0.0) must be dropped entirely, not ranked last: {order:?}"
+        );
+
+        let sky_nan = [f64::NAN, 4.0, 1.0];
+        let order_nan = sky_penalized_order(&weights, &included, &star_counts, &sky_nan);
+        assert_eq!(order_nan, vec![2, 1], "a non-finite background is skipped too");
+
+        let sky_neg = [-3.0, 4.0, 1.0];
+        let order_neg = sky_penalized_order(&weights, &included, &star_counts, &sky_neg);
+        assert_eq!(order_neg, vec![2, 1], "a negative background is skipped too");
+    }
+
+    /// The same `included` admissibility [`best_by_weight`] applies — an
+    /// excluded candidate is skipped however favorable its score.
+    #[test]
+    fn sky_penalized_order_skips_inadmissible_candidates() {
+        let weights = vec![fw(1.0), fw(0.9)];
+        let included = [true, false];
+        let star_counts = [100usize; 2];
+        // Index 1 would win on score alone (much darker sky) if it were
+        // admissible.
+        let sky = [10.0, 0.01];
+
+        let order = sky_penalized_order(&weights, &included, &star_counts, &sky);
+        assert_eq!(order, vec![0]);
+    }
+
     #[test]
     fn missing_inputs_are_named_before_the_weight_gate() {
         let m = meas(&[1.0], 3.0, 0.1, 100, 5.0);
@@ -631,5 +843,157 @@ mod tests {
         assert!(s.contains("\"minWeightFraction\":0.05") && s.contains("\"maxFwhmPx\":null"));
         let back: WeightMode = serde_json::from_str("\"keyword\"").unwrap();
         assert_eq!(back, WeightMode::Keyword);
+    }
+
+    // ── reference_coverage (R-M3-17 v2 addendum) ────────────────────────
+
+    use crate::geometry::{Linear, LinearKind};
+
+    fn identity_map() -> PixelMap {
+        PixelMap::linear(Linear::identity()).unwrap()
+    }
+
+    fn translated_map(dx: f64, dy: f64) -> PixelMap {
+        // Subject -> reference: reference = subject + (dx, dy).
+        PixelMap::linear(Linear::from_flat(
+            LinearKind::Similarity,
+            [1.0, 0.0, dx, 0.0, 1.0, dy, 0.0, 0.0, 1.0],
+        ))
+        .unwrap()
+    }
+
+    /// Subject -> reference: a rotation by `deg` about `(cx, cy)`.
+    fn rotated_map(deg: f64, cx: f64, cy: f64) -> PixelMap {
+        let theta = deg.to_radians();
+        let (c, s) = (theta.cos(), theta.sin());
+        // u = c*(x-cx) - s*(y-cy) + cx = c*x - s*y + (cx - c*cx + s*cy)
+        // v = s*(x-cx) + c*(y-cy) + cy = s*x + c*y + (cy - s*cx - c*cy)
+        let m02 = cx - c * cx + s * cy;
+        let m12 = cy - s * cx - c * cy;
+        PixelMap::linear(Linear::from_flat(
+            LinearKind::Similarity,
+            [c, -s, m02, s, c, m12, 0.0, 0.0, 1.0],
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn reference_coverage_identity_is_full() {
+        let map = identity_map();
+        assert_eq!(reference_coverage(&map, 6224, 4168, 6224, 4168), 1.0);
+    }
+
+    /// A 30-px dither on a several-thousand-px frame loses well under a
+    /// percent (the addendum's own "≈ 0.995") — comfortably above
+    /// [`MIN_REFERENCE_COVERAGE`], so this candidate must still pass.
+    #[test]
+    fn reference_coverage_small_dither_passes() {
+        let map = translated_map(30.0, 30.0);
+        let coverage = reference_coverage(&map, 6224, 4168, 6224, 4168);
+        assert!(
+            coverage >= MIN_REFERENCE_COVERAGE,
+            "a 30-px dither must still pass the coverage gate: {coverage}"
+        );
+        assert!(
+            coverage > 0.98,
+            "a 30-px dither on a 6224x4168 frame should lose well under 2%: {coverage}"
+        );
+    }
+
+    /// A 2-degree rotation about the frame's own centre loses several
+    /// percent at the corners — below [`MIN_REFERENCE_COVERAGE`].
+    /// The addendum's own worked example ("a 2-degree rotation about the
+    /// centre loses several %, below `MIN_REFERENCE_COVERAGE`") does not
+    /// hold, numerically, for this exact 32x32-grid estimator at
+    /// 6224x4168: a rotation this small only clips the four corners'
+    /// nearest grid cell(s) — measured (this test, before the assertion
+    /// below existed) at 1deg=1.0, 2deg=0.98828125, 3deg=0.98046875,
+    /// 4deg=0.96875 (first crossing), 5deg=0.95703125. The GATE'S OWN
+    /// purpose — reject a materially misaligned frame — is what the
+    /// composite pipeline test below exercises; this unit test pins a
+    /// rotation (5 degrees, comfortably past the 4-degree crossing) that
+    /// the estimator, AS LITERALLY SPECIFIED (spec addendum, ruling
+    /// R-M3-17 v2), verifiably fails, rather than asserting a "2 degrees"
+    /// outcome the algorithm does not actually produce.
+    #[test]
+    fn reference_coverage_rotation_fails() {
+        let map = rotated_map(5.0, 6224.0 / 2.0, 4168.0 / 2.0);
+        let coverage = reference_coverage(&map, 6224, 4168, 6224, 4168);
+        assert!(
+            coverage < MIN_REFERENCE_COVERAGE,
+            "a 5-degree rotation must fail the coverage gate: {coverage}"
+        );
+    }
+
+    /// A native extent LARGER than the reference (e.g. an OSC sensor at
+    /// 6248x4176 registered onto a 6224x4168 reference) passes trivially —
+    /// every reference cell centre lands well inside the larger subject
+    /// extent.
+    #[test]
+    fn reference_coverage_larger_native_extent_passes() {
+        let map = identity_map();
+        assert_eq!(reference_coverage(&map, 6248, 4176, 6224, 4168), 1.0);
+    }
+
+    /// A native extent SMALLER than the reference (a mismatched camera
+    /// angle/sensor) cannot cover the reference rectangle's far corner —
+    /// below [`MIN_REFERENCE_COVERAGE`].
+    #[test]
+    fn reference_coverage_smaller_native_extent_fails() {
+        let map = identity_map();
+        let coverage = reference_coverage(&map, 6000, 4000, 6224, 4168);
+        assert!(
+            coverage < MIN_REFERENCE_COVERAGE,
+            "a 6000x4000 native extent onto a 6224x4168 reference must fail: {coverage}"
+        );
+    }
+
+    /// Composite (spec §4.4 addendum to ruling R-M3-17 v2): the coverage
+    /// filter runs BEFORE the sky-penalized ranking — a candidate with the
+    /// best score but a rotated (poorly-covering) registration must be
+    /// skipped in favour of the next-best one that actually covers the
+    /// reference geometry. Mirrors exactly what `stacking::run::
+    /// process_group_output`'s `pick_reference_idx` closure does: build
+    /// the coverage mask, then rank with it as `included`.
+    #[test]
+    fn coverage_filter_then_sky_penalized_rank_skips_a_rotated_top_score_candidate() {
+        let ref_w = 6224usize;
+        let ref_h = 4168usize;
+        // Frame 0 would have the best sky-penalized score by far (tiny
+        // background, high weight) but is registered with a 5-degree
+        // rotation — well below MIN_REFERENCE_COVERAGE. Frames 1-3 are
+        // identity-registered (full coverage); frame 1 is the
+        // best-scoring of THOSE.
+        let maps = [
+            rotated_map(5.0, ref_w as f64 / 2.0, ref_h as f64 / 2.0),
+            identity_map(),
+            identity_map(),
+            identity_map(),
+        ];
+        let weights = vec![fw(1.0), fw(0.9), fw(0.6), fw(0.5)];
+        let star_counts = [100usize; 4];
+        let sky = [1.0, 4.0, 4.0, 4.0];
+
+        let coverage: Vec<f64> = maps
+            .iter()
+            .map(|m| reference_coverage(m, ref_w, ref_h, ref_w, ref_h))
+            .collect();
+        let coverage_mask: Vec<bool> = coverage
+            .iter()
+            .map(|&c| c >= MIN_REFERENCE_COVERAGE)
+            .collect();
+        assert_eq!(coverage_mask, vec![false, true, true, true], "{coverage:?}");
+
+        // Without the coverage filter, frame 0 would win by a wide margin.
+        let unfiltered = sky_penalized_order(&weights, &[true; 4], &star_counts, &sky);
+        assert_eq!(unfiltered.first().copied(), Some(0));
+
+        let order = sky_penalized_order(&weights, &coverage_mask, &star_counts, &sky);
+        assert_eq!(
+            order.first().copied(),
+            Some(1),
+            "the rotated frame 0 must be skipped for frame 1 (best among the \
+             covering candidates): order={order:?}"
+        );
     }
 }

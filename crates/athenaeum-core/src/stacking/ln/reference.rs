@@ -76,6 +76,19 @@ pub struct LnReference {
 /// included frames falls back to global normalization with a warning,
 /// never a hard failure — but that fallback is the CALLER's job (Task 5),
 /// not this function's; `build_reference` only ever reports the refusal.
+///
+/// Ruling R-M3-17 v2 (spec §4.4): `input.reference` — the anchor this
+/// function's member integration normalizes to — is chosen SKY-PENALIZED
+/// by the run (`stacking::weights::sky_penalized_order`), never just the
+/// set's own registration reference. `included`'s own ranking is likewise
+/// the run's business, not this function's: `build_reference` still ranks
+/// whatever `included` it is handed by raw weight internally (unchanged)
+/// and takes the best `n` of THAT — the caller (`stacking::run::
+/// run_group_normalization`) achieves "best `n` by sky-penalized score"
+/// not by changing this function, but by narrowing `included` to already
+/// be exactly that top-`n` sky-penalized set before calling in, so the
+/// internal by-weight re-sort only reorders those `n` (a no-op on which
+/// members end up in `frames_used`).
 /// [`validate_group_input`] runs first — the same reference-range and
 /// per-frame channel-count checks `integrate_group` performs, shared so a
 /// malformed `GroupInput` is refused here too instead of indexing out of
