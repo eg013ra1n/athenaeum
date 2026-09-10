@@ -30,7 +30,9 @@ use tracing::debug;
 
 use super::LnError;
 use crate::geometry::kdtree::KdTree2;
-use crate::stacking::psf_signal::{fit_stars, fit_stars_with_beta, FitParams, PsfModel, Seed};
+use crate::stacking::psf_signal::{
+    fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed,
+};
 use crate::stacking::register::detect::{detect_stars, Star};
 use crate::stacking::register::DetectionConfig;
 
@@ -95,8 +97,53 @@ fn to_seed(star: &Star) -> Seed {
     }
 }
 
+/// The reference side of [`relative_scale`] (detection + PSF fit + the
+/// built match tree), computed ONCE PER GROUP instead of once per frame
+/// (final fix wave, I2): the LN reference plane is immutable for a group's
+/// whole fan-out, but `relative_scale` used to re-detect and re-fit it on
+/// EVERY call — `LnReferenceForDetection` (`ln/mod.rs`) already hoists the
+/// group-level sanitized copy for this exact reason (fix round 1, item 6);
+/// this hoists the far more expensive detect+fit+tree half that was left
+/// behind. `outcome.fits[i].signal`/`outcome.beta` are what
+/// [`relative_scale_against`] reads; `tree` is built from the same fits'
+/// centroids, exactly as [`relative_scale`]'s own body used to build it
+/// inline.
+pub struct PreparedReferenceChannel {
+    outcome: FitOutcome,
+    tree: KdTree2,
+}
+
+impl PreparedReferenceChannel {
+    /// `reference` is one channel's row-major `width × height` plane
+    /// (already in the reference geometry); `psf`/`max_stars` are the
+    /// SAME values a direct [`relative_scale`] call on this reference would
+    /// use.
+    pub fn build(
+        reference: &[f32],
+        width: usize,
+        height: usize,
+        psf: PsfModel,
+        max_stars: usize,
+    ) -> PreparedReferenceChannel {
+        let ref_seeds = detect_seeds(reference, width, height, max_stars);
+        let outcome = fit_stars(
+            reference,
+            width,
+            height,
+            &ref_seeds,
+            psf,
+            &FitParams::default(),
+        );
+        let ref_points: Vec<(f64, f64)> = outcome.fits.iter().map(|f| (f.x, f.y)).collect();
+        let tree = KdTree2::build(&ref_points);
+        PreparedReferenceChannel { outcome, tree }
+    }
+}
+
 /// Global relative scale `s = RCR_loc(z_k)`, `z_k = flux_ref,k / flux_tgt,k`
-/// over stars matched within `match_radius_px` of each other (math §4.3).
+/// over stars matched within `match_radius_px` of each other (math §4.3),
+/// against an already-[`PreparedReferenceChannel::build`]t reference — the
+/// per-frame half of what [`relative_scale`] used to do in one call.
 /// `z_k` is built from [`StarFit::signal`] (background-subtracted flux
 /// inside the fitted FWTM ellipse), never [`StarFit::mean_flux`]: for a
 /// fixed β the FWTM ellipse encloses a fixed fraction of the profile
@@ -105,51 +152,36 @@ fn to_seed(star: &Star) -> Seed {
 /// scales as FWTM²) and would leak the two planes' seeing difference
 /// straight into the scale.
 ///
-/// The reference fits with the caller's own `psf` choice (`fit_stars`);
-/// the TARGET always fits at the reference's OWN resolved β
+/// The TARGET always fits at the reference's OWN resolved β
 /// ([`psf_signal::fit_stars_with_beta`], never a second, independent
 /// `Auto` search) — because β changes the FWTM-enclosed flux fraction
 /// (math §1.4), fitting the two planes at two different β values would
 /// bias the ratio systematically even though `signal` itself is
 /// width-independent for a FIXED β (the original review's finding).
-/// `reference`/`target` are row-major `width × height` planes already in
-/// the reference geometry (registered); `max_stars` should be the same
-/// `measurement` config value the frame's own measurement pass used.
-/// Fewer than [`MIN_MATCHES`] surviving pairs is
-/// [`LnError::TooFewMatches`] — the caller excludes the frame from the LN
-/// pass rather than trust a scale from a handful of stars.
-pub fn relative_scale(
-    reference: &[f32],
+/// `target` is a row-major `width × height` plane already in the reference
+/// geometry (registered); `max_stars` should be the same `measurement`
+/// config value the frame's own measurement pass used. Fewer than
+/// [`MIN_MATCHES`] surviving pairs is [`LnError::TooFewMatches`] — the
+/// caller excludes the frame from the LN pass rather than trust a scale
+/// from a handful of stars.
+pub fn relative_scale_against(
+    prepared: &PreparedReferenceChannel,
     target: &[f32],
     width: usize,
     height: usize,
-    psf: PsfModel,
     max_stars: usize,
     match_radius_px: f64,
     rcr_limit: f64,
 ) -> Result<ScaleResult, LnError> {
-    let ref_seeds = detect_seeds(reference, width, height, max_stars);
-    let ref_outcome = fit_stars(
-        reference,
-        width,
-        height,
-        &ref_seeds,
-        psf,
-        &FitParams::default(),
-    );
-
     let tgt_seeds = detect_seeds(target, width, height, max_stars);
     let tgt_outcome = fit_stars_with_beta(
         target,
         width,
         height,
         &tgt_seeds,
-        ref_outcome.beta,
+        prepared.outcome.beta,
         &FitParams::default(),
     );
-
-    let ref_points: Vec<(f64, f64)> = ref_outcome.fits.iter().map(|f| (f.x, f.y)).collect();
-    let tree = KdTree2::build(&ref_points);
 
     let mut ratios: Vec<f64> = Vec::with_capacity(tgt_outcome.fits.len());
     for tf in &tgt_outcome.fits {
@@ -159,10 +191,10 @@ pub fn relative_scale(
         // crowded field — RCR (below) absorbs the resulting duplicate or
         // skewed ratios. The barycentre one-to-one pass (spec §4.3) is
         // deferred to M4 (ruling R2), same as the module doc above.
-        let Some((i, _dist)) = tree.nearest_within(tf.x, tf.y, match_radius_px) else {
+        let Some((i, _dist)) = prepared.tree.nearest_within(tf.x, tf.y, match_radius_px) else {
             continue;
         };
-        let (flux_ref, flux_tgt) = (ref_outcome.fits[i].signal, tf.signal);
+        let (flux_ref, flux_tgt) = (prepared.outcome.fits[i].signal, tf.signal);
         if flux_ref > 0.0 && flux_tgt > 0.0 {
             ratios.push(flux_ref / flux_tgt);
         }
@@ -187,8 +219,37 @@ pub fn relative_scale(
         sigma: r.scale,
         matches: ratios.len(),
         rejected: r.rejected,
-        beta: ref_outcome.beta,
+        beta: prepared.outcome.beta,
     })
+}
+
+/// Thin wrapper: [`PreparedReferenceChannel::build`] +
+/// [`relative_scale_against`] in one call — used by the probe and by every
+/// existing test that has no group-level `PreparedReferenceChannel` handy.
+/// `normalize_frame` (the real per-frame pipeline, `ln/mod.rs`) calls
+/// [`relative_scale_against`] directly against the group's ONE prepared
+/// reference channel instead, so it never re-detects or re-fits the
+/// reference plane per frame (final fix wave, I2).
+pub fn relative_scale(
+    reference: &[f32],
+    target: &[f32],
+    width: usize,
+    height: usize,
+    psf: PsfModel,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+) -> Result<ScaleResult, LnError> {
+    let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars);
+    relative_scale_against(
+        &prepared,
+        target,
+        width,
+        height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+    )
 }
 
 #[cfg(test)]
@@ -256,6 +317,37 @@ mod tests {
         // `robust.rs` allows up to 5% on a much larger sample) — the bar
         // here is "no systematic rejection", not zero.
         assert!(r.rejected <= 5, "rejected {} of {}", r.rejected, r.matches);
+    }
+
+    /// I2 (final fix wave): `relative_scale` is now a thin
+    /// build-then-`relative_scale_against` wrapper — this pins that the
+    /// split produces IDENTICAL results to a direct `relative_scale_against`
+    /// call against a `PreparedReferenceChannel` built the same way.
+    #[test]
+    fn relative_scale_equals_relative_scale_against_a_prepared_reference() {
+        let stars = star_grid(1);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 11);
+        let target_stars = scale_stars(&stars, 0.8);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 21);
+
+        let via_wrapper = relative_scale(
+            &reference,
+            &target,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            4.0,
+            0.3,
+        )
+        .expect("a clean uniformly-scaled field must match");
+
+        let prepared =
+            PreparedReferenceChannel::build(&reference, WIDTH, HEIGHT, PsfModel::Moffat4, 200);
+        let via_prepared = relative_scale_against(&prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3)
+            .expect("the same prepared reference must match the same target");
+
+        assert_eq!(via_wrapper, via_prepared);
     }
 
     #[test]
@@ -326,8 +418,9 @@ mod tests {
     }
 
     /// `FWHM = 2·α·√(2^{1/β} − 1)` for a Moffat profile (the analogue of
-    /// [`crate::stacking::psf_signal::fwtm_from_alpha`] at tenth- rather
-    /// than half-maximum), inverted for `α`.
+    /// [`crate::stacking::psf_signal::fwtm_from_alpha`] at half- rather
+    /// than tenth-maximum — FWHM is the half-maximum width, FWTM the
+    /// tenth-maximum one), inverted for `α`.
     fn moffat_alpha_for_fwhm(fwhm: f64, beta: f64) -> f64 {
         fwhm / (2.0 * (2f64.powf(1.0 / beta) - 1.0).sqrt())
     }

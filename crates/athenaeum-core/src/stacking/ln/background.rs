@@ -159,9 +159,12 @@ pub fn background_grid(
 
 /// The high clip of math §4.2 as ruled in the module doc: `high_clip_rel`
 /// of full scale (1.0 in the pipeline's normalized units) — an absolute
-/// near-saturation threshold, independent of the plane's content. Used
-/// both as the hot-pixel candidate cutoff and the global high clip below.
-fn high_clip_threshold(_plane: &[f32], p: &BackgroundParams) -> f32 {
+/// near-saturation threshold, independent of the plane's content (M7,
+/// final fix wave: no longer takes a `plane` parameter — it never read one;
+/// that was a leftover from the plane-maximum reading the controller's
+/// ruling replaced with this full-scale constant). Used both as the
+/// hot-pixel candidate cutoff and the global high clip below.
+fn high_clip_threshold(p: &BackgroundParams) -> f32 {
     p.high_clip_rel
 }
 
@@ -172,7 +175,7 @@ fn high_clip_threshold(_plane: &[f32], p: &BackgroundParams) -> f32 {
 /// returned copy is the small per-candidate hot-pixel window (at most
 /// `(2·hot_radius+1)²` samples), built only for pixels past the high clip.
 fn clean_plane(plane: &[f32], width: usize, height: usize, p: &BackgroundParams) -> Vec<f32> {
-    let high_thresh = high_clip_threshold(plane, p);
+    let high_thresh = high_clip_threshold(p);
 
     let mut cleaned = plane.to_vec();
     for y in 0..height {
@@ -464,5 +467,48 @@ mod tests {
         );
         assert_eq!(g.invalid_cells, 0, "cells: {:?}", g.cells);
         assert!(g.cells.iter().all(|c| (c - 0.10).abs() < 1e-4));
+    }
+
+    /// M8 (final fix wave): `robust_cell_level`'s `fraction > p.rejection_limit`
+    /// branch — distinct from the empty-samples path every other invalid-cell
+    /// test in this module reaches. A tight 6-sample cluster (nonzero MAD, so
+    /// the deviation bound is meaningful, not the `mad <= 0.0` early break) plus
+    /// a 4-sample block far enough outside that bound: the iterative clip
+    /// removes exactly the 4 (40%, above the 30% `rejection_limit`) and
+    /// stabilizes there — `kept` is the 6-sample majority, never empty.
+    #[test]
+    fn robust_cell_level_over_rejected_by_the_iterative_clip_is_invalid() {
+        let mut samples = vec![0.098f32, 0.099, 0.100, 0.101, 0.102, 0.103];
+        samples.extend([0.50f32; 4]);
+        let (level, ok) = robust_cell_level(samples, &DEFAULT_PARAMS);
+        assert!(
+            !ok,
+            "40% of the cell is a systematic outlier block, above the 30% \
+             rejection limit: must be flagged invalid, got level {level}"
+        );
+    }
+
+    /// M8 (final fix wave): `fill_invalid_cells`'s terminal branch — "no cell
+    /// anywhere was ever valid" (`invalid_cells == gw * gh`). Every pixel
+    /// below `low_clip` clips to NaN in `clean_plane`, so every cell's
+    /// `gather_cell` comes back empty and every `robust_cell_level` call is
+    /// the `samples.is_empty()` case — this is the group-level LN fallback
+    /// trigger 2 in `run.rs` (C1's "reference background has no measurable
+    /// cell" path).
+    #[test]
+    fn a_plane_entirely_below_the_low_clip_is_fully_invalid() {
+        let (w, h) = (128, 128);
+        let plane = vec![0.0f32; w * h]; // < low_clip (4.5e-5) everywhere
+        let g = background_grid(
+            &plane,
+            w,
+            h,
+            &BackgroundParams {
+                scale: 256,
+                ..DEFAULT_PARAMS
+            },
+        );
+        assert_eq!(g.invalid_cells, g.gw * g.gh, "{:?}", g.cells);
+        assert!(g.cells.iter().all(|&v| v == 0.0), "{:?}", g.cells);
     }
 }

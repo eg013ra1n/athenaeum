@@ -397,6 +397,20 @@ registration row for each — run stacking through Register first); found {}",
 
     let integration_cfg = cfg.integration.clone();
     let normalization_cfg = NormalizationConfig::default();
+    // Moved up from just before its own first use (final fix wave, I2):
+    // `LnReferenceForDetection::build` now needs `local_cfg.psf_model`/
+    // `measure_opts.max_stars` too, since it hoists the reference-side
+    // detection + fit that used to happen inside `relative_scale` itself.
+    let local_cfg = LocalNormalizationConfig {
+        enabled: true,
+        scale: args.scale,
+        reference_frames: args.frames,
+        psf_model: PsfModel::Auto,
+        local_scale: false,
+    };
+    let measure_opts = cfg
+        .measurement
+        .measure_options(cfg.normalization.scale_estimator);
     let group_input = GroupInput {
         frames: &stack_frames,
         reference: 0, // best-weighted candidate, index 0 after the sort above
@@ -437,7 +451,8 @@ registration row for each — run stacking through Register first); found {}",
         reference.height
     );
 
-    let ref_for_detection = LnReferenceForDetection::build(&reference);
+    let ref_for_detection =
+        LnReferenceForDetection::build(&reference, local_cfg.psf_model, measure_opts.max_stars);
     let ref_params = BackgroundParams {
         scale: args.scale,
         ..DEFAULT_PARAMS
@@ -476,17 +491,6 @@ registration row for each — run stacking through Register first); found {}",
         candidates[target_index].frame.frame_id,
         target.path.display()
     );
-
-    let local_cfg = LocalNormalizationConfig {
-        enabled: true,
-        scale: args.scale,
-        reference_frames: args.frames,
-        psf_model: PsfModel::Auto,
-        local_scale: false,
-    };
-    let measure_opts = cfg
-        .measurement
-        .measure_options(cfg.normalization.scale_estimator);
 
     let sidecar_dir = tempfile::tempdir().expect("create a tempdir for the sidecar");
     let sidecar_path = sidecar_dir.path().join("probe.athln");

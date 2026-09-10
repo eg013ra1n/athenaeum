@@ -130,9 +130,9 @@ pub fn build_reference(
     let frames_used: Vec<usize> = ranked[..take].to_vec();
 
     info!(
-        included = included.len(),
-        used = frames_used.len(),
-        reference_frames = n,
+        count = included.len(),
+        ln_reference_frames = frames_used.len(),
+        ln_reference_frames_configured = n,
         "LN reference: integrating the best-weighted included frames"
     );
 

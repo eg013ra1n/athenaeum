@@ -328,12 +328,21 @@ pub fn output_pair(
 }
 
 /// The pair applied to the working copy before rejection. For `Local` (M2)
-/// this is explicitly `NormalizationPair::IDENTITY`: the real per-pixel
-/// local normalization comes from the caller's LN grids
-/// (`integration::engine::StackParams::local`, applied when
-/// `local_for_rejection` is set), not from this pair — this is the pair a
-/// frame with no grid falls back to (ruling R2: a frame with no grid is
-/// effectively un-normalized for rejection, not refused).
+/// this pair is the FALLBACK only: a frame WITH a grid is overridden in the
+/// engine by `local_for_rejection` (the real per-pixel local normalization,
+/// `integration::engine::StackParams::local`), but a frame WITHOUT one —
+/// every LN fallback trigger the group-level and per-frame LN error paths
+/// can hit — integrates with whatever this function returns. Every one of
+/// those fallback warnings says "continuing with global normalization", so
+/// `Local` resolves to the SAME pair as `ScaleZeroOffset` here (additive
+/// with scaling against the reference) — never `IDENTITY`, which would
+/// silently drop rejection normalization instead of falling back to the
+/// global one the warnings claim. This is the one enum variant whose
+/// fallback is baked into the match arm rather than a separate config
+/// field: local *output* normalization is a sibling boolean beside
+/// `normalization.output`, so its own fallback reads `params.output[i]`
+/// correctly, but local *rejection* is a variant of this very enum, so
+/// selecting `Local` has no other value to fall back to.
 pub fn rejection_pair(
     reference: LocationScale,
     frame: LocationScale,
@@ -341,13 +350,12 @@ pub fn rejection_pair(
 ) -> NormalizationPair {
     match mode {
         RejectionNormalization::None => NormalizationPair::IDENTITY,
-        RejectionNormalization::ScaleZeroOffset => {
+        RejectionNormalization::ScaleZeroOffset | RejectionNormalization::Local => {
             output_pair(reference, frame, OutputNormalization::AdditiveWithScaling)
         }
         RejectionNormalization::EqualizeFluxes => {
             output_pair(reference, frame, OutputNormalization::Multiplicative)
         }
-        RejectionNormalization::Local => NormalizationPair::IDENTITY,
     }
 }
 
@@ -513,7 +521,7 @@ mod tests {
         );
         assert_eq!(
             rejection_pair(r, f, RejectionNormalization::Local),
-            NormalizationPair::IDENTITY
+            rejection_pair(r, f, RejectionNormalization::ScaleZeroOffset)
         );
         let zero = LocationScale {
             location: 0.0,
@@ -535,6 +543,26 @@ mod tests {
             output_pair(zero, f, OutputNormalization::Additive).offset,
             -0.15
         );
+    }
+
+    #[test]
+    fn local_rejection_normalization_falls_back_to_global_scale_zero_offset() {
+        // C1: a frame with no LN grid must integrate under the same pair
+        // ScaleZeroOffset would give it — never IDENTITY, which would
+        // contradict every "continuing with global normalization" warning
+        // in the LN fallback paths.
+        let r = LocationScale {
+            location: 0.32,
+            scale: 0.05,
+        };
+        let f = LocationScale {
+            location: 0.21,
+            scale: 0.09,
+        };
+        let local = rejection_pair(r, f, RejectionNormalization::Local);
+        let global = rejection_pair(r, f, RejectionNormalization::ScaleZeroOffset);
+        assert_eq!(local, global);
+        assert_ne!(local, NormalizationPair::IDENTITY);
     }
 
     #[test]

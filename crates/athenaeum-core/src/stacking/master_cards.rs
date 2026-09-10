@@ -62,7 +62,12 @@ pub struct MasterCardInputs<'a> {
 /// sanitize_text` silently rewrites a non-ASCII byte to `?` and logs
 /// `warn!("non-ASCII characters in header value sanitized")` on every long
 /// camera list, which would have fired on every truncated `ATH_STKC`).
-const ATH_STKC_MAX_CHARS: usize = 68;
+/// M10 (final fix wave): a direct alias of
+/// [`crate::fits_writer::card::MAX_STR_CONTENT`] (`pub(crate)` precisely so
+/// this can reference it) — this used to be its own hard-coded `68` with a
+/// comment merely NAMING that constant, so the two could silently drift if
+/// it ever changed.
+const ATH_STKC_MAX_CHARS: usize = crate::fits_writer::card::MAX_STR_CONTENT;
 const ATH_STKC_MARKER: &str = "...";
 
 /// Sorted, comma-joined camera list for `ATH_STKC`, truncated to
@@ -201,10 +206,18 @@ fn blank(s: Option<&str>) -> Option<&str> {
 /// clustered every frame in `n` to within the group's own exposure
 /// tolerance, so one exposure value (the cluster's label) is always the
 /// honest answer.
+/// M11 (final fix wave, ruling): `binning` gains a `bin<n>` token ONLY when
+/// `>= 2` — bin-1 names are unchanged (existing masters, including the
+/// acceptance run's, keep their names). Without this token, a bin-1 and a
+/// bin-2 group of the same filter/colour-mode/exposure would differ only by
+/// the opaque `_2` collision suffix — the same reasoning Task 10's ruling
+/// used to keep the colour-mode token always present, just for the fourth
+/// group-key axis instead of the second.
 pub fn master_file_name(
     set_name: &str,
     filter: Option<&str>,
     color_mode: ColorMode,
+    binning: i64,
     exposure_s: Option<f64>,
     n: usize,
 ) -> String {
@@ -221,7 +234,11 @@ pub fn master_file_name(
         Some(e) => format!("{}s", fmt_num(e)),
         None => "unknown".to_string(),
     };
-    format!("{slug}_{filter}_{color_tok}_{exp}_{n}x.fits")
+    if binning >= 2 {
+        format!("{slug}_{filter}_{color_tok}_bin{binning}_{exp}_{n}x.fits")
+    } else {
+        format!("{slug}_{filter}_{color_tok}_{exp}_{n}x.fits")
+    }
 }
 
 pub struct WrittenMaster {
@@ -394,40 +411,65 @@ mod tests {
     fn master_name_follows_the_layout_rules() {
         // The pin (owner decision 2026-09-10, fix round 1 ruling): no
         // camera token, but the colour-mode token is ALWAYS present —
-        // exposure before frame count.
+        // exposure before frame count. `binning = 1` throughout this test:
+        // bin-1 names are unchanged by M11 (final fix wave) — no `bin<n>`
+        // token.
         assert_eq!(
             master_file_name(
                 "LDN 1272",
                 Some("NoFilter"),
                 ColorMode::Mono,
+                1,
                 Some(180.0),
                 208
             ),
             "LDN_1272_NoFilter_mono_180s_208x.fits"
         );
         assert_eq!(
-            master_file_name("M 31", Some("Ha"), ColorMode::Mono, Some(300.0), 3),
+            master_file_name("M 31", Some("Ha"), ColorMode::Mono, 1, Some(300.0), 3),
             "M_31_Ha_mono_300s_3x.fits"
         );
         // Sub-second exposure, `fmt_num`'s trimmed-decimal form.
         assert_eq!(
-            master_file_name("a/b:c", Some("L"), ColorMode::Mono, Some(0.5), 2),
+            master_file_name("a/b:c", Some("L"), ColorMode::Mono, 1, Some(0.5), 2),
             "a_b_c_L_mono_0.5s_2x.fits"
         );
         // Blank filter falls back to NoFilter; an empty/whitespace set name
         // falls back to "set".
         assert_eq!(
-            master_file_name("M 31", Some("  "), ColorMode::Mono, Some(60.0), 2),
+            master_file_name("M 31", Some("  "), ColorMode::Mono, 1, Some(60.0), 2),
             "M_31_NoFilter_mono_60s_2x.fits"
         );
         assert_eq!(
-            master_file_name("...", Some("L"), ColorMode::Mono, Some(60.0), 1),
+            master_file_name("...", Some("L"), ColorMode::Mono, 1, Some(60.0), 1),
             "set_L_mono_60s_1x.fits"
         );
         // No EXPTIME anywhere in the cluster — the "unknown" token.
         assert_eq!(
-            master_file_name("M 31", None, ColorMode::Mono, None, 3),
+            master_file_name("M 31", None, ColorMode::Mono, 1, None, 3),
             "M_31_NoFilter_mono_unknown_3x.fits"
+        );
+    }
+
+    /// M11 (final fix wave, ruling): binning >= 2 gains a `bin<n>` token;
+    /// binning <= 1 (0 = unknown, treated the same as 1) does not.
+    #[test]
+    fn master_name_carries_a_bin_token_only_at_bin_two_and_above() {
+        assert_eq!(
+            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 2, Some(180.0), 40),
+            "LDN_1272_Ha_mono_bin2_180s_40x.fits"
+        );
+        assert_eq!(
+            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 3, Some(180.0), 40),
+            "LDN_1272_Ha_mono_bin3_180s_40x.fits"
+        );
+        assert_eq!(
+            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 1, Some(180.0), 40),
+            "LDN_1272_Ha_mono_180s_40x.fits"
+        );
+        assert_eq!(
+            master_file_name("LDN 1272", Some("Ha"), ColorMode::Mono, 0, Some(180.0), 40),
+            "LDN_1272_Ha_mono_180s_40x.fits"
         );
     }
 
@@ -438,8 +480,8 @@ mod tests {
     /// names honestly distinct.
     #[test]
     fn mono_and_osc_names_never_collide_on_the_same_filter_and_exposure() {
-        let mono = master_file_name("LDN 1272", None, ColorMode::Mono, Some(180.0), 208);
-        let osc = master_file_name("LDN 1272", None, ColorMode::Osc, Some(180.0), 160);
+        let mono = master_file_name("LDN 1272", None, ColorMode::Mono, 1, Some(180.0), 208);
+        let osc = master_file_name("LDN 1272", None, ColorMode::Osc, 1, Some(180.0), 160);
         assert_eq!(mono, "LDN_1272_NoFilter_mono_180s_208x.fits");
         assert_eq!(osc, "LDN_1272_NoFilter_osc_180s_160x.fits");
         assert_ne!(mono, osc);
@@ -537,7 +579,9 @@ mod tests {
         // old comment (`multiplicativeWithScaling/scaleZeroOffset`, 41
         // chars) must still format — ATH_STKF goes through the CONTINUE
         // chain and reads back whole.
-        let long_reference_id = "file:/Volumes/BigMac/Users/astrobureau/Pictures/Calibration Test/LDN1272-WBPP/LDN1272-ATH/LDN 1272/camera_atr2600m/lights/c_2025-10-18_02-02-02__-9.90_180.00s_0073.fits";
+        // M14 (final fix wave): sanitized from a pre-existing test path
+        // literal that named the external reference software directly.
+        let long_reference_id = "file:/Volumes/BigMac/Users/astrobureau/Pictures/Calibration Test/LDN1272-external/LDN1272-ATH/LDN 1272/camera_atr2600m/lights/c_2025-10-18_02-02-02__-9.90_180.00s_0073.fits";
         let long_cards = build_master_light_cards(&MasterCardInputs {
             reference_cards: &reference_cards,
             wcs: Some(&solve),

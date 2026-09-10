@@ -571,12 +571,14 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
             )));
         }
     }
-    // M2, ruling R2: rejection-only local normalization tolerates a frame
-    // with no grid (it falls back to its global rejection pair, effectively
-    // un-normalized for rejection) — Task 5's own pipeline already excludes
-    // a grid-less frame when LN drives OUTPUT normalization instead, so no
-    // equivalent warning is needed for `local_for_output`. Logged once per
-    // call, not per row/pixel.
+    // M2, ruling R2 (amended by C1): rejection-only local normalization
+    // tolerates a frame with no grid — it falls back to the SAME global
+    // rejection pair `ScaleZeroOffset` would give it (`stats::rejection_pair`
+    // resolves `Local` to `output_pair(.., AdditiveWithScaling)` precisely
+    // for this fallback), never an un-normalized identity pair — Task 5's
+    // own pipeline already excludes a grid-less frame when LN drives OUTPUT
+    // normalization instead, so no equivalent warning is needed for
+    // `local_for_output`. Logged once per call, not per row/pixel.
     if params.local_for_rejection {
         let missing = match params.local {
             Some(local) => local.iter().filter(|g| g.is_none()).count(),
@@ -585,7 +587,7 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         if missing > 0 {
             tracing::warn!(
                 missing,
-                total = n,
+                frames = n,
                 "local rejection normalization: some frames have no grid; \
                  falling back to their global rejection pair for those frames"
             );
@@ -621,6 +623,21 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
             has_local[i] = true;
         }
         (0..n).filter(|&i| !has_local[i]).collect()
+    };
+    // A5 (final fix wave): frame index -> its position in `local_factories`
+    // (and, since `init_local_state` below builds each worker's own
+    // `local_state` by mapping `local_factories` in the same order, that
+    // position is ALSO `local_state`'s position for the same frame) —
+    // precomputed ONCE for the whole call, never per row/pixel, purely so
+    // the mixed-order per-pixel loop can ask "does frame i have an active
+    // grid, and where" in O(1). Only consulted when `local_state` is
+    // non-empty; see that branch's own doc below for why this exists.
+    let local_pos_by_frame: Vec<Option<usize>> = {
+        let mut pos = vec![None; n];
+        for (k, &(i, _)) in local_factories.iter().enumerate() {
+            pos[i] = Some(k);
+        }
+        pos
     };
     let mut out = vec![0f32; w * h];
     let rejected = AtomicUsize::new(0);
@@ -723,94 +740,114 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                     let idx = row_in_band * width + x;
                     let mut low_here = 0u32;
                     let mut high_here = 0u32;
-                    // Fix round 1, item 1: frames with NO active local
-                    // override run the EXACT pre-M2 instructions — no
-                    // local-normalization branch, lookup, or closure call
-                    // anywhere in this loop body. With `want_local` false
-                    // (every Plan 4 caller) `local_state` is empty and
-                    // `frames_without_local` is `0..n` in ascending order,
-                    // so this is the ENTIRE per-pixel frame loop, in the
-                    // exact order the pre-M2 code always used — the Plan 4
-                    // `to_bits()` pin's byte-identity comes from this, not
-                    // just from the arithmetic happening to agree.
-                    for &i in &frames_without_local {
-                        let raw = planes.sample(i, idx);
-                        if !raw.is_finite() {
-                            row_bad[i] += 1;
-                            continue;
-                        }
-                        row_samples[i] += 1;
-                        if let Some(lo) = params.range_low {
-                            if raw <= lo {
-                                low_here += 1;
-                                row_rejected[i] += 1;
+                    if local_state.is_empty() {
+                        // Fix round 1, item 1: frames with NO active local
+                        // override run the EXACT pre-M2 instructions — no
+                        // local-normalization branch, lookup, or closure
+                        // call anywhere in this loop body. With
+                        // `want_local` false (every Plan 4 caller)
+                        // `local_state` is empty and `frames_without_local`
+                        // is `0..n` in ascending order, so this is the
+                        // ENTIRE per-pixel frame loop, in the exact order
+                        // the pre-M2 code always used — the Plan 4
+                        // `to_bits()` pin's byte-identity comes from this,
+                        // not just from the arithmetic happening to agree.
+                        // Left textually untouched by A5 (below) on
+                        // purpose: this is the hot path (LN off), and nothing
+                        // about the ordering defect A5 fixes can reach it —
+                        // it only ever had one list to walk.
+                        for &i in &frames_without_local {
+                            let raw = planes.sample(i, idx);
+                            if !raw.is_finite() {
+                                row_bad[i] += 1;
                                 continue;
                             }
-                        }
-                        if let Some(hi) = params.range_high {
-                            if raw >= hi {
-                                high_here += 1;
-                                row_rejected[i] += 1;
+                            row_samples[i] += 1;
+                            if let Some(lo) = params.range_low {
+                                if raw <= lo {
+                                    low_here += 1;
+                                    row_rejected[i] += 1;
+                                    continue;
+                                }
+                            }
+                            if let Some(hi) = params.range_high {
+                                if raw >= hi {
+                                    high_here += 1;
+                                    row_rejected[i] += 1;
+                                    continue;
+                                }
+                            }
+                            let rej = params.rejection[i].apply(raw);
+                            let outv = params.output[i].apply(raw);
+                            if !rej.is_finite() || !outv.is_finite() {
+                                row_bad[i] += 1;
                                 continue;
                             }
+                            out_vals[i] = outv;
+                            rej_vals[i] = rej;
+                            combine::mask_set(&mut present, i);
+                            work.push((rej, i as u16));
                         }
-                        let rej = params.rejection[i].apply(raw);
-                        let outv = params.output[i].apply(raw);
-                        if !rej.is_finite() || !outv.is_finite() {
-                            row_bad[i] += 1;
-                            continue;
-                        }
-                        out_vals[i] = outv;
-                        rej_vals[i] = rej;
-                        combine::mask_set(&mut present, i);
-                        work.push((rej, i as u16));
-                    }
-                    // Frames WITH an active grid: `local_for_rejection`/
-                    // `local_for_output` independently decide which
-                    // consumer(s) the grid's `(a, b)` pair replaces — the
-                    // frame's global pair still applies to whichever one is
-                    // not set.
-                    for (i, _eval, a_row, b_row) in local_state.iter() {
-                        let i = *i;
-                        let raw = planes.sample(i, idx);
-                        if !raw.is_finite() {
-                            row_bad[i] += 1;
-                            continue;
-                        }
-                        row_samples[i] += 1;
-                        if let Some(lo) = params.range_low {
-                            if raw <= lo {
-                                low_here += 1;
-                                row_rejected[i] += 1;
+                    } else {
+                        // A5 (final fix wave): frames visited `0..n` in
+                        // ASCENDING index order regardless of whether each
+                        // one has an active grid — `local_for_rejection`/
+                        // `local_for_output` independently decide which
+                        // consumer(s) the grid's `(a, b)` pair replaces for
+                        // a frame that has one; the frame's global pair
+                        // still applies to whichever consumer is not set,
+                        // AND to every frame with no grid at all (`grid` is
+                        // `None` for those — the `_` arms below). Previously
+                        // this pushed every no-grid frame into `work`
+                        // before any grid frame, in two separate
+                        // concatenated lists — tied rejection samples then
+                        // summed (and were attributed in
+                        // `rejected_per_frame`) in whatever order the two
+                        // lists happened to interleave, not the frame's own
+                        // index order, breaking `combine_pixel_weighted`'s
+                        // stable-sort contract for reproducible ties.
+                        for i in 0..n {
+                            let raw = planes.sample(i, idx);
+                            if !raw.is_finite() {
+                                row_bad[i] += 1;
                                 continue;
                             }
-                        }
-                        if let Some(hi) = params.range_high {
-                            if raw >= hi {
-                                high_here += 1;
-                                row_rejected[i] += 1;
+                            row_samples[i] += 1;
+                            if let Some(lo) = params.range_low {
+                                if raw <= lo {
+                                    low_here += 1;
+                                    row_rejected[i] += 1;
+                                    continue;
+                                }
+                            }
+                            if let Some(hi) = params.range_high {
+                                if raw >= hi {
+                                    high_here += 1;
+                                    row_rejected[i] += 1;
+                                    continue;
+                                }
+                            }
+                            let grid = local_pos_by_frame[i].map(|k| {
+                                let (_, _eval, a_row, b_row) = &local_state[k];
+                                (a_row[x], b_row[x])
+                            });
+                            let rej = match grid {
+                                Some((a, b)) if params.local_for_rejection => a * raw + b,
+                                _ => params.rejection[i].apply(raw),
+                            };
+                            let outv = match grid {
+                                Some((a, b)) if params.local_for_output => a * raw + b,
+                                _ => params.output[i].apply(raw),
+                            };
+                            if !rej.is_finite() || !outv.is_finite() {
+                                row_bad[i] += 1;
                                 continue;
                             }
+                            out_vals[i] = outv;
+                            rej_vals[i] = rej;
+                            combine::mask_set(&mut present, i);
+                            work.push((rej, i as u16));
                         }
-                        let (a, b) = (a_row[x], b_row[x]);
-                        let rej = if params.local_for_rejection {
-                            a * raw + b
-                        } else {
-                            params.rejection[i].apply(raw)
-                        };
-                        let outv = if params.local_for_output {
-                            a * raw + b
-                        } else {
-                            params.output[i].apply(raw)
-                        };
-                        if !rej.is_finite() || !outv.is_finite() {
-                            row_bad[i] += 1;
-                            continue;
-                        }
-                        out_vals[i] = outv;
-                        rej_vals[i] = rej;
-                        combine::mask_set(&mut present, i);
-                        work.push((rej, i as u16));
                     }
                     if work.is_empty() {
                         *out_px = 0.0;

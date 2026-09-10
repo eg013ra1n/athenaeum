@@ -1010,6 +1010,9 @@ fn main() {
         } else {
             ColorMode::Mono
         },
+        // M11 (final fix wave): this probe has no real binning input of its
+        // own — 1 keeps the pre-M11 filename shape (no `bin<n>` token).
+        1,
         included_exposures.first().copied(),
         stats.included,
     );

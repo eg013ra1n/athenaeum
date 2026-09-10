@@ -48,7 +48,7 @@ pub use background::{
 };
 pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
-pub use scale::{relative_scale, ScaleResult};
+pub use scale::{relative_scale, relative_scale_against, PreparedReferenceChannel, ScaleResult};
 
 /// Local-normalization errors shared by every M2 task past detection: a
 /// frame that cannot be trusted for LN (too few matched stars — see
@@ -161,13 +161,30 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 /// round 1, item 7 — see [`median_of_finite`]) — reused directly as
 /// [`LnGrid::location_ref`] so it, too, is computed once, not once per
 /// frame.
+///
+/// `prepared[p]` (final fix wave, I2) is channel `p`'s
+/// [`scale::PreparedReferenceChannel`] — the reference-side star detection
+/// + PSF fit + match tree `scale::relative_scale` used to redo on EVERY
+/// `normalize_frame` call, hoisted here for the same reason
+/// `sanitized_planes`/`locations` already are: the reference is immutable
+/// for the whole group, so this is built once and read by every frame's
+/// [`scale::relative_scale_against`] call instead.
 pub struct LnReferenceForDetection {
     pub sanitized_planes: Vec<Vec<f32>>,
     pub locations: Vec<f64>,
+    pub prepared: Vec<scale::PreparedReferenceChannel>,
 }
 
 impl LnReferenceForDetection {
-    pub fn build(reference: &LnReference) -> LnReferenceForDetection {
+    /// `psf`/`max_stars` are the group's own LN config — the SAME values
+    /// [`normalize_frame`]'s own `relative_scale_against` calls use, so the
+    /// prepared reference channel matches what a direct (unhoisted)
+    /// `relative_scale` call on this reference would have produced.
+    pub fn build(
+        reference: &LnReference,
+        psf: crate::stacking::psf_signal::PsfModel,
+        max_stars: usize,
+    ) -> LnReferenceForDetection {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
         for plane in &reference.planes {
@@ -183,9 +200,22 @@ impl LnReferenceForDetection {
             sanitized_planes.push(sanitized);
             locations.push(location);
         }
+        let prepared = sanitized_planes
+            .iter()
+            .map(|plane| {
+                scale::PreparedReferenceChannel::build(
+                    plane,
+                    reference.width,
+                    reference.height,
+                    psf,
+                    max_stars,
+                )
+            })
+            .collect();
         LnReferenceForDetection {
             sanitized_planes,
             locations,
+            prepared,
         }
     }
 }
@@ -246,11 +276,13 @@ pub fn normalize_frame(
     }
     if reference_for_detection.sanitized_planes.len() != channels
         || reference_for_detection.locations.len() != channels
+        || reference_for_detection.prepared.len() != channels
     {
         return Err(LnError::Other(format!(
-            "reference-for-detection has {}/{} channels, the LN reference has {channels}",
+            "reference-for-detection has {}/{}/{} channels, the LN reference has {channels}",
             reference_for_detection.sanitized_planes.len(),
-            reference_for_detection.locations.len()
+            reference_for_detection.locations.len(),
+            reference_for_detection.prepared.len()
         )));
     }
 
@@ -341,12 +373,15 @@ pub fn normalize_frame(
             }
         }
 
-        let scale_result = relative_scale(
-            &reference_for_detection.sanitized_planes[p],
+        // I2 (final fix wave): the reference side (detection + PSF fit +
+        // match tree) was already prepared ONCE for the whole group by
+        // `LnReferenceForDetection::build` — `relative_scale_against` only
+        // re-detects/re-fits the TARGET, not the reference, on every call.
+        let scale_result = scale::relative_scale_against(
+            &reference_for_detection.prepared[p],
             &target,
             reference.width,
             reference.height,
-            cfg.psf_model,
             measure.max_stars,
             4.0,
             0.3,

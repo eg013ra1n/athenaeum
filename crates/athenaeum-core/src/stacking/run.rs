@@ -3282,18 +3282,23 @@ fn emit_integrate_tick(
     );
 }
 
-/// Normalize (stage 6, M2 Task 5 — [`run_group_normalization`], folded into
-/// this function itself, nothing separate to time or wall-clock — fix round
-/// 1, item 6: no `StageTiming` entry for it, only the progress event(s)),
-/// integrate and write the master for one group. LN DISABLED keeps the
-/// exact pre-M2 shape: a static 1/1 "Normalize" progress tick and no other
-/// effect (spec ruling 14). LN enabled resolves/caches the group's LN
-/// reference and per-frame `.athln` sidecars (real per-frame progress); a
-/// frame LN could not measure is excluded here when LN drives OUTPUT
-/// normalization, narrowing `members` before integration ever sees it (see
+/// Normalize (stage 6, M2 Task 5 — [`run_group_normalization`]), integrate
+/// and write the master for one group. LN DISABLED keeps the exact pre-M2
+/// shape: a static 1/1 "Normalize" progress tick and no other effect (spec
+/// ruling 14). LN enabled resolves/caches the group's LN reference and
+/// per-frame `.athln` sidecars (real per-frame progress); a frame LN could
+/// not measure is excluded here when LN drives OUTPUT normalization,
+/// narrowing `members` before integration ever sees it (see
 /// [`run_group_normalization`]'s own doc). Returns the outcome plus
-/// (integrate, output) wall time for [`stage_output`]'s own per-stage
-/// [`crate::stacking::provenance::StageTiming`] totals.
+/// (normalize, integrate, output) wall time for [`stage_output`]'s own
+/// per-stage [`crate::stacking::provenance::StageTiming`] totals — ruling R5
+/// (reverses fix round 1, item 6): the `normalize` component is
+/// `run_group_normalization`'s own wall time (reference build + fan-out),
+/// timed here because the acceptance run found it the single most expensive
+/// stage and therefore not one `RunSummary.stages` can leave invisible;
+/// `stage_output` only pushes a `Normalize` `StageTiming` when the group's
+/// own config had LN active (disabled stays a bare progress tick, nothing
+/// worth reporting).
 /// `Err(RunError::Cancelled)` — from `IntegrationError::Cancelled` or a
 /// cancel noticed before this group started — is the ONLY error that
 /// propagates; everything else becomes `Ok((GroupOutcome::Failed, ..))` via
@@ -3304,8 +3309,8 @@ fn process_group_output(
     group: &IntegrationGroup,
     measure_opts: &MeasureOptions,
     wcs: Option<&PlateSolveRecord>,
-) -> Result<(GroupOutcome, Duration, Duration), RunError> {
-    let zero = || (Duration::ZERO, Duration::ZERO);
+) -> Result<(GroupOutcome, Duration, Duration, Duration), RunError> {
+    let zero = || (Duration::ZERO, Duration::ZERO, Duration::ZERO);
 
     let included_count = rc
         .measured
@@ -3313,8 +3318,8 @@ fn process_group_output(
         .map(|v| v.iter().filter(|e| e.included).count())
         .unwrap_or(0);
     if included_count < 3 {
-        let (i, o) = zero();
-        return Ok((skip_group(rc, group, included_count)?, i, o));
+        let (n, i, o) = zero();
+        return Ok((skip_group(rc, group, included_count)?, n, i, o));
     }
 
     // Snapshot the included members' data — nothing below needs `rc` again
@@ -3366,8 +3371,8 @@ fn process_group_output(
             count = members.len(),
             "stacking group skipped: fewer than 3 registered members reached integration"
         );
-        let (i, o) = zero();
-        return Ok((skip_group(rc, group, members.len())?, i, o));
+        let (n, i, o) = zero();
+        return Ok((skip_group(rc, group, members.len())?, n, i, o));
     }
 
     // Ruling 7: the global reference anchors normalization only when it is
@@ -3412,7 +3417,7 @@ fn process_group_output(
     let mut reference_idx = match pick_reference_idx(&members) {
         Some(idx) => idx,
         None => {
-            let (i, o) = zero();
+            let (n, i, o) = zero();
             return Ok((
                 fail_group(
                     rc,
@@ -3420,6 +3425,7 @@ fn process_group_output(
                     members.len(),
                     "no included frame to anchor normalization",
                 )?,
+                n,
                 i,
                 o,
             ));
@@ -3497,11 +3503,19 @@ fn process_group_output(
     // `reference_idx`/`stack_frames`/`input` above were built from, so all
     // three are rebuilt from the surviving members before integration ever
     // sees them. LN DISABLED keeps the exact pre-M2 behaviour: a static
-    // 1/1 "Normalize" progress tick and nothing else (spec ruling 14 —
-    // folded into this function, nothing separate to time or wall-clock;
-    // fix round 1, item 6: no `StageTiming` entry for it).
+    // 1/1 "Normalize" progress tick and nothing else (spec ruling 14).
+    // Ruling R5 (reverses fix round 1, item 6): the acceptance run measured
+    // LN as the run's single most expensive stage (≈28 of 49 min) — a stage
+    // that costs more than every other one combined cannot stay invisible
+    // in `RunSummary.stages`, so its wall time IS timed here
+    // (`normalize_start`, wrapping the whole match below — reference build +
+    // fan-out, i.e. `run_group_normalization`'s own wall time, never folded
+    // into `integrate_dur`) and pushed by `stage_output` as a `Normalize`
+    // `StageTiming`, but only when `ln_active` (disabled stays invisible —
+    // the pre-M2 shape — since it is genuinely a no-op tick).
     let ln_active = normalization_cfg.local.enabled
         || normalization_cfg.rejection == RejectionNormalization::Local;
+    let normalize_start = Instant::now();
     let mut ln_reference_path: Option<String> = None;
     // M2 Task 7 (fix round 1, item 3): every member `run_group_normalization`
     // itself confirmed a READABLE `ln` artifact for THIS run — verified at
@@ -3533,13 +3547,15 @@ fn process_group_output(
                             count = members.len(),
                             "stacking group skipped: local normalization left fewer than 3 members"
                         );
-                        let (i, o) = zero();
-                        return Ok((skip_group(rc, group, members.len())?, i, o));
+                        let n = normalize_start.elapsed();
+                        let (_, i, o) = zero();
+                        return Ok((skip_group(rc, group, members.len())?, n, i, o));
                     }
                     reference_idx = match pick_reference_idx(&members) {
                         Some(idx) => idx,
                         None => {
-                            let (i, o) = zero();
+                            let n = normalize_start.elapsed();
+                            let (_, i, o) = zero();
                             return Ok((
                                 fail_group(
                                     rc,
@@ -3547,6 +3563,7 @@ fn process_group_output(
                                     members.len(),
                                     "no included frame to anchor normalization",
                                 )?,
+                                n,
                                 i,
                                 o,
                             ));
@@ -3566,7 +3583,8 @@ fn process_group_output(
             // in this function uses) rather than falling into the generic
             // "warn and continue with global normalization" arm below.
             Err(RunError::ExclusionPersistFailed(msg)) => {
-                let (i, o) = zero();
+                let n = normalize_start.elapsed();
+                let (_, i, o) = zero();
                 return Ok((
                     fail_group(
                         rc,
@@ -3574,6 +3592,7 @@ fn process_group_output(
                         members.len(),
                         &format!("local normalization: persisting a frame exclusion failed: {msg}"),
                     )?,
+                    n,
                     i,
                     o,
                 ));
@@ -3603,6 +3622,7 @@ fn process_group_output(
             None,
         );
     }
+    let normalize_dur = normalize_start.elapsed();
 
     // M2 Task 7 (fix round 1, item 3): `GroupInput.ln`, aligned with
     // `members`' (possibly LN-narrowed) order, built directly from the
@@ -3724,7 +3744,7 @@ fn process_group_output(
                 members.len(),
                 &format!("group integration failed: {e}"),
             )?;
-            return Ok((outcome, integrate_start.elapsed(), Duration::ZERO));
+            return Ok((outcome, normalize_dur, integrate_start.elapsed(), Duration::ZERO));
         }
     };
     emit_integrate_tick(
@@ -3754,7 +3774,7 @@ fn process_group_output(
                 members.len(),
                 &format!("failed to read the group reference's header: {e}"),
             )?;
-            return Ok((outcome, integrate_dur, output_start.elapsed()));
+            return Ok((outcome, normalize_dur, integrate_dur, output_start.elapsed()));
         }
     };
 
@@ -3812,7 +3832,7 @@ fn process_group_output(
                 members.len(),
                 &format!("failed to build the master header: {e}"),
             )?;
-            return Ok((outcome, integrate_dur, output_start.elapsed()));
+            return Ok((outcome, normalize_dur, integrate_dur, output_start.elapsed()));
         }
     };
 
@@ -3820,6 +3840,7 @@ fn process_group_output(
         &rc.set_name,
         group.filter.as_deref(),
         group.color_mode,
+        group.binning,
         group.exposure_s,
         output.stats.included,
     );
@@ -3850,7 +3871,7 @@ fn process_group_output(
                 members.len(),
                 &format!("failed to write the master: {e:#}"),
             )?;
-            return Ok((outcome, integrate_dur, output_start.elapsed()));
+            return Ok((outcome, normalize_dur, integrate_dur, output_start.elapsed()));
         }
     };
 
@@ -3930,7 +3951,7 @@ fn process_group_output(
         None,
     );
 
-    Ok((GroupOutcome::Written, integrate_dur, output_dur))
+    Ok((GroupOutcome::Written, normalize_dur, integrate_dur, output_dur))
 }
 
 /// One group's stage-6 result: the reference's own artifact path (feeds
@@ -4097,9 +4118,21 @@ fn run_group_normalization(
             .map(PathBuf::from)
     };
 
+    // M6 (final fix wave): the path reported in the summary must be the
+    // RESOLVED one — the artifact row's own stored path on a cache hit
+    // (which can differ from `reference_path_buf` if the working folder
+    // moved since that row was written, same reasoning Task 7's fix round
+    // already applied to a per-frame sidecar's own path), the freshly
+    // written `reference_path_buf` otherwise (`build_and_write_ln_reference`
+    // always writes there). Defaults to `reference_path_buf` and is
+    // overridden only by the cache-hit-success arm below.
+    let mut resolved_reference_path: PathBuf = reference_path_buf.clone();
     let ln_reference: LnReference = match cached_reference_path {
         Some(path) => match read_reference(&path) {
-            Ok(r) => r,
+            Ok(r) => {
+                resolved_reference_path = path;
+                r
+            }
             Err(e) => {
                 tracing::warn!(
                     run_id = rc.run_id,
@@ -4172,7 +4205,12 @@ fn run_group_normalization(
     }
 
     // Fix round 1, item 6: computed ONCE per group, not once per frame.
-    let reference_for_detection = LnReferenceForDetection::build(&ln_reference);
+    // I2 (final fix wave): also hoists the reference-side star detection +
+    // PSF fit + match tree (`prepared`), so `normalize_frame`'s
+    // `relative_scale_against` call never re-detects/re-fits the
+    // reference plane on every frame either.
+    let reference_for_detection =
+        LnReferenceForDetection::build(&ln_reference, ln_cfg.psf_model, measure_opts.max_stars);
 
     let group_frames_by_id: HashMap<i64, &GroupFrame> =
         group.frames.iter().map(|f| (f.frame_id, f)).collect();
@@ -4460,7 +4498,9 @@ fn run_group_normalization(
                             rc,
                             &mut excluded_frame_ids,
                             frame_id,
-                            format!("writing .athln sidecar: reading it back failed: {e:#}"),
+                            format!(
+                                "local normalization: writing .athln sidecar: reading it back failed: {e:#}"
+                            ),
                         )?;
                     }
                 }
@@ -4483,7 +4523,7 @@ fn run_group_normalization(
     );
 
     Ok(LnGroupOutcome {
-        reference_path: Some(reference_path_buf.display().to_string()),
+        reference_path: Some(resolved_reference_path.display().to_string()),
         excluded_frame_ids,
         sidecar_grids,
     })
@@ -4612,12 +4652,19 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
 
     let groups = rc.plan_groups.clone();
     let mut any_master = false;
+    let mut normalize_total = Duration::ZERO;
     let mut integrate_total = Duration::ZERO;
     let mut output_total = Duration::ZERO;
+    // Same expression `process_group_output` uses per group to decide
+    // whether its own LN pass ran at all — one run has one `normalization`
+    // config, so this is the same answer for every group.
+    let ln_active = cfg.normalization.local.enabled
+        || cfg.normalization.rejection == RejectionNormalization::Local;
 
     for group in &groups {
         rc.check_cancel()?;
-        let (outcome, i, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
+        let (outcome, n, i, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
+        normalize_total += n;
         integrate_total += i;
         output_total += o;
         if matches!(outcome, GroupOutcome::Written) {
@@ -4625,11 +4672,15 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         }
     }
 
-    // Fix round 1, item 6: no `StageTiming` entry for `Normalize` — it runs
-    // inside `process_group_output` itself (a static 1/1 tick when disabled,
-    // `run_group_normalization`'s real per-frame work when enabled, M2 Task
-    // 5), so there is nothing separate to time; the `Normalize` progress
-    // event(s) stay.
+    // Ruling R5 (reverses fix round 1, item 6): pushed BEFORE `Integrate`
+    // (stage order) and only when this run's own config had LN active — LN
+    // disabled keeps the pre-M2 shape (no entry at all, not a zero one).
+    if ln_active {
+        rc.timings.push(crate::stacking::provenance::StageTiming {
+            stage: Stage::Normalize,
+            duration_ms: normalize_total.as_millis() as u64,
+        });
+    }
     rc.timings.push(crate::stacking::provenance::StageTiming {
         stage: Stage::Integrate,
         duration_ms: integrate_total.as_millis() as u64,
@@ -7778,5 +7829,476 @@ mod tests {
             .expect("f1's own stacking_run_frames row exists");
         assert!(touched_row.included, "{touched_row:?}");
         assert!(touched_row.exclusion_reason.is_none(), "{touched_row:?}");
+    }
+
+    /// Final fix wave, A1 (ruling R5): with local normalization on,
+    /// `RunSummary.stages` (here, `rc.timings` — `stage_output` pushes into
+    /// it directly, same source the run's final summary copies) must carry
+    /// a `Normalize` entry with a real, non-zero duration, positioned
+    /// BEFORE `Integrate` (stage order) — the acceptance run measured LN as
+    /// the single most expensive stage, so it cannot stay invisible.
+    #[test]
+    fn local_normalization_pushes_a_stage_timing_before_integrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        let normalize_idx = rc
+            .timings
+            .iter()
+            .position(|t| t.stage == Stage::Normalize)
+            .expect("a Normalize StageTiming must be pushed when LN is active");
+        let integrate_idx = rc
+            .timings
+            .iter()
+            .position(|t| t.stage == Stage::Integrate)
+            .expect("Integrate StageTiming always pushed");
+        assert!(
+            normalize_idx < integrate_idx,
+            "Normalize must precede Integrate in stage order: {:?}",
+            rc.timings
+        );
+        assert!(
+            rc.timings[normalize_idx].duration_ms > 0,
+            "LN did real work (a reference build + a 4-frame fan-out); its timing must not be zero: {:?}",
+            rc.timings[normalize_idx]
+        );
+    }
+
+    /// Same run shape, LN off (the M1 shape): no `Normalize` entry at all —
+    /// not a zero-duration one.
+    #[test]
+    fn local_normalization_off_pushes_no_stage_timing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let cfg = StackingConfig::default();
+        assert!(!cfg.normalization.local.enabled);
+        assert_eq!(cfg.normalization.rejection, RejectionNormalization::ScaleZeroOffset);
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+
+        assert!(
+            !rc.timings.iter().any(|t| t.stage == Stage::Normalize),
+            "LN disabled must push no Normalize entry at all: {:?}",
+            rc.timings
+        );
+    }
+
+    /// B1 (Critical C1), test (ii): the group-level LN fallback (ruling
+    /// R3-shaped — here forced via trigger 1, an unwritable `ln/<group>`
+    /// path so `run_group_normalization`'s own `create_dir_all` fails
+    /// outright before any frame is attempted) must integrate with the SAME
+    /// rejection pair `ScaleZeroOffset` would give it — never an
+    /// un-normalized identity pair. Proven by bit-for-bit pixel equality
+    /// against the identical fixture integrated with
+    /// `rejection = scaleZeroOffset` and LN off entirely (the fallback
+    /// leaves `GroupInput.ln` `None`, so `local_for_output`'s value cannot
+    /// affect the written pixels either — see `integrate_planes`'s own doc).
+    #[test]
+    fn local_rejection_normalization_group_fallback_matches_global_scale_zero_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let plan_groups_probe =
+            group_frames(&fixture.conn, fixture.set_id, &StackingConfig::default().grouping)
+                .unwrap();
+        let group_key = plan_groups_probe[0].key.clone();
+
+        // ── Run A: rejection = local, group-level fallback forced ──
+        let mut cfg_fallback = StackingConfig::default();
+        cfg_fallback.normalization.rejection = RejectionNormalization::Local;
+        cfg_fallback.normalization.local.enabled = true;
+
+        let layout_a = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        // Trigger 1: a plain FILE where `run_group_normalization` expects to
+        // `create_dir_all` the group's `ln/` directory — the mkdir fails
+        // outright, before any per-frame work, landing in the
+        // `Err(RunError::Other(..))` arm ("continuing with global
+        // normalization").
+        let blocked_ln_dir = layout_a.ln_dir(&group_key);
+        std::fs::create_dir_all(blocked_ln_dir.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_ln_dir, b"not a directory").unwrap();
+
+        let plan_groups_a =
+            group_frames(&fixture.conn, fixture.set_id, &cfg_fallback.grouping).unwrap();
+        let (run_id_a, group_ids_a) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups_a,
+            working.path(),
+            output.path(),
+        );
+        let mut rc_a = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id_a,
+            fixture.set_id,
+            SET_NAME,
+            cfg_fallback,
+            plan_groups_a,
+            layout_a,
+            output.path().to_path_buf(),
+            group_ids_a,
+        );
+        run_stages_for_test(&mut rc_a, Stage::Register).unwrap();
+        stage_output(&mut rc_a).unwrap();
+
+        let group_summary_a = rc_a
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        assert!(
+            group_summary_a.ln_reference_path.is_none(),
+            "the mkdir failure must fall back to global normalization, not run LN: {group_summary_a:?}"
+        );
+        assert!(
+            rc_a.warnings
+                .iter()
+                .any(|w| w.contains("local normalization failed")),
+            "the fallback must warn: {:?}",
+            rc_a.warnings
+        );
+        let master_a = group_summary_a
+            .master_path
+            .clone()
+            .expect("group A wrote a master despite the LN fallback");
+
+        // ── Run B: rejection = scaleZeroOffset, LN off, separate output dir ──
+        let mut cfg_global = StackingConfig::default();
+        cfg_global.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
+        cfg_global.normalization.local.enabled = false;
+
+        let working_b = tempfile::tempdir().unwrap();
+        let output_b = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working_b.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output_b.path().to_str().unwrap(),
+        )
+        .unwrap();
+        let layout_b = WorkingLayout::new(working_b.path(), &set_slug(SET_NAME));
+        let plan_groups_b =
+            group_frames(&fixture.conn, fixture.set_id, &cfg_global.grouping).unwrap();
+        let (run_id_b, group_ids_b) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups_b,
+            working_b.path(),
+            output_b.path(),
+        );
+        let mut rc_b = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id_b,
+            fixture.set_id,
+            SET_NAME,
+            cfg_global,
+            plan_groups_b,
+            layout_b,
+            output_b.path().to_path_buf(),
+            group_ids_b,
+        );
+        run_stages_for_test(&mut rc_b, Stage::Register).unwrap();
+        stage_output(&mut rc_b).unwrap();
+
+        let group_summary_b = rc_b
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        assert!(group_summary_b.ln_reference_path.is_none());
+        let master_b = group_summary_b
+            .master_path
+            .clone()
+            .expect("group B wrote a master");
+
+        // ── Compare pixel data bit-for-bit (headers legitimately differ:
+        // NORMALIZATION card, run id, timestamps). ──
+        let reader_a = PlaneReader::open(Path::new(&master_a)).unwrap();
+        let reader_b = PlaneReader::open(Path::new(&master_b)).unwrap();
+        assert_eq!(reader_a.channels(), reader_b.channels());
+        for p in 0..reader_a.channels() {
+            let plane_a = reader_a.read_plane(p).unwrap();
+            let plane_b = reader_b.read_plane(p).unwrap();
+            assert_eq!(plane_a.len(), plane_b.len());
+            for (i, (a, b)) in plane_a.iter().zip(plane_b.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "plane {p} pixel {i}: fallback {a} vs global-normalization {b}"
+                );
+            }
+        }
+    }
+
+    /// B1, test (iii) + A3: the rejection-only composite mode
+    /// (`rejection = local`, `local.enabled = false`) with one frame whose
+    /// own LN normalization fails (a directory pre-created at its sidecar
+    /// path, same deterministic trick as
+    /// `local_normalization_excludes_a_frame_whose_sidecar_write_fails`) —
+    /// the frame stays INCLUDED (ruling R2: LN driving rejection only never
+    /// excludes), `ln_frames < included`, the group still integrates and
+    /// writes a master, and a `warn!`/`rc.warnings` entry is recorded. The
+    /// SURVIVING grid-less frame's own rejection normalization must have
+    /// used the global pair — proven the same way as the group-level test
+    /// above, by bit-for-bit pixel equality against the identical fixture
+    /// integrated with `rejection = scaleZeroOffset` (no LN at all).
+    #[test]
+    fn local_normalization_rejection_only_frame_failure_keeps_global_normalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg_rejection_only = StackingConfig::default();
+        cfg_rejection_only.normalization.rejection = RejectionNormalization::Local;
+        cfg_rejection_only.normalization.local.enabled = false;
+
+        let layout_a = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups_a =
+            group_frames(&fixture.conn, fixture.set_id, &cfg_rejection_only.grouping).unwrap();
+        let group_key = plan_groups_a[0].key.clone();
+
+        // f1's stem is plain "f1" — same deterministic write-failure trick
+        // as the OUTPUT-normalization exclusion test above.
+        let blocked_sidecar = layout_a.ln_sidecar_path(&group_key, "f1");
+        std::fs::create_dir_all(&blocked_sidecar).unwrap();
+
+        let (run_id_a, group_ids_a) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups_a,
+            working.path(),
+            output.path(),
+        );
+        let mut rc_a = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id_a,
+            fixture.set_id,
+            SET_NAME,
+            cfg_rejection_only,
+            plan_groups_a,
+            layout_a,
+            output_dir,
+            group_ids_a,
+        );
+        run_stages_for_test(&mut rc_a, Stage::Register).unwrap();
+        stage_output(&mut rc_a).unwrap();
+
+        let blocked_frame_id = light_ids[1];
+        let group_summary_a = rc_a
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let stats_a = group_summary_a
+            .stats
+            .as_ref()
+            .expect("group wrote a master and its stats");
+        assert_eq!(stats_a.included, 4, "{stats_a:?}");
+        assert!(
+            stats_a.ln_frames < stats_a.included,
+            "the blocked frame's own grid must be missing: {stats_a:?}"
+        );
+        let blocked_summary = group_summary_a
+            .frames
+            .iter()
+            .find(|f| f.frame_id == blocked_frame_id)
+            .expect("f1's own summary entry exists");
+        assert!(
+            blocked_summary.included,
+            "rejection-only LN never excludes a frame it could not normalize: {blocked_summary:?}"
+        );
+        assert!(
+            rc_a.warnings
+                .iter()
+                .any(|w| w.contains(&blocked_frame_id.to_string()) && w.contains("local normalization")),
+            "the per-frame failure must warn: {:?}",
+            rc_a.warnings
+        );
+        let master_a = group_summary_a
+            .master_path
+            .clone()
+            .expect("group A wrote a master with the blocked frame kept");
+
+        // ── Comparison run: rejection = scaleZeroOffset, LN off entirely ──
+        let mut cfg_global = StackingConfig::default();
+        cfg_global.normalization.rejection = RejectionNormalization::ScaleZeroOffset;
+        cfg_global.normalization.local.enabled = false;
+
+        let working_b = tempfile::tempdir().unwrap();
+        let output_b = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working_b.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output_b.path().to_str().unwrap(),
+        )
+        .unwrap();
+        let layout_b = WorkingLayout::new(working_b.path(), &set_slug(SET_NAME));
+        let plan_groups_b =
+            group_frames(&fixture.conn, fixture.set_id, &cfg_global.grouping).unwrap();
+        let (run_id_b, group_ids_b) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups_b,
+            working_b.path(),
+            output_b.path(),
+        );
+        let mut rc_b = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id_b,
+            fixture.set_id,
+            SET_NAME,
+            cfg_global,
+            plan_groups_b,
+            layout_b,
+            output_b.path().to_path_buf(),
+            group_ids_b,
+        );
+        run_stages_for_test(&mut rc_b, Stage::Register).unwrap();
+        stage_output(&mut rc_b).unwrap();
+
+        let group_summary_b = rc_b
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let master_b = group_summary_b
+            .master_path
+            .clone()
+            .expect("comparison group wrote a master");
+
+        let reader_a = PlaneReader::open(Path::new(&master_a)).unwrap();
+        let reader_b = PlaneReader::open(Path::new(&master_b)).unwrap();
+        assert_eq!(reader_a.channels(), reader_b.channels());
+        for p in 0..reader_a.channels() {
+            let plane_a = reader_a.read_plane(p).unwrap();
+            let plane_b = reader_b.read_plane(p).unwrap();
+            assert_eq!(plane_a.len(), plane_b.len());
+            for (i, (a, b)) in plane_a.iter().zip(plane_b.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "plane {p} pixel {i}: rejection-only fallback {a} vs global-normalization {b}"
+                );
+            }
+        }
     }
 }

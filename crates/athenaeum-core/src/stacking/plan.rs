@@ -465,7 +465,14 @@ pub(crate) struct LnReferencePayload {
 /// re-registration) could not catch that. No DB access here (unlike
 /// [`calibration_hash_for`]'s `SourceIdentity`s) — the caller has already
 /// resolved every hash; `sources` stays empty, same convention as
-/// [`registration_hash_for`]'s own plain-string upstream.
+/// [`registration_hash_for`]'s own plain-string upstream. `registration_hash`
+/// is a plain caller-supplied string with no NULL handling of its own — a
+/// `NULL` stored `registration_results.config_hash` must be turned into
+/// `""` by BOTH sides before it reaches here (M12, final fix wave):
+/// `run.rs`'s writer already does (`unwrap_or_default()`), and
+/// `plan.rs`'s own freshness read now mirrors it, so a frame with a
+/// genuinely-NULL config hash is not reported permanently stale by the plan
+/// gate while cache-hitting correctly inside a real run.
 pub(crate) fn normalization_hash_for(
     cfg: &StackingConfig,
     registration_hash: &str,
@@ -1196,8 +1203,9 @@ pub fn build_plan(
     // for the same underlying reason until something upstream changes.
     // Without this, `normalize_stale` would stay true FOREVER for that
     // group: this one known-bad frame can never earn a fresh `ln` row on
-    // its own. Every LN exclusion reason (`LnError`'s `Display`, and Task
-    // 7's own "sidecar unreadable" text) starts with the literal
+    // its own. Every LN exclusion reason (`LnError`'s `Display`, and
+    // `run.rs`'s own hand-built "writing .athln sidecar: reading it back
+    // failed: …" post-write read-back text) starts with the literal
     // "local normalization:" prefix — checked, never assumed, so an
     // unrelated exclusion (registration failure, manual list, weight floor)
     // is never mistaken for one. Same "fetch once per build, look up per
@@ -1312,8 +1320,20 @@ pub fn build_plan(
                     find_artifact(conn, frames_set_id, &g.key, "ln", Some(f.frame_id))?;
                 let ln_fresh = match (&ln_reference_info, &ln_artifact) {
                     (Some(ref_info), Some(row)) => {
-                        match ln_registration_by_frame.get(&f.frame_id).cloned().flatten() {
-                            Some(frame_registration_hash) => {
+                        match ln_registration_by_frame.get(&f.frame_id) {
+                            // M12 (final fix wave): a `NULL` stored
+                            // `config_hash` must hash as `""` here, exactly
+                            // the way `run.rs` writes it
+                            // (`record.config_hash.clone().unwrap_or_default()`)
+                            // — without this, a frame whose registration row
+                            // genuinely has no `config_hash` would cache-hit
+                            // correctly inside a real run but be reported
+                            // permanently stale by this gate. Only the
+                            // ABSENCE of a registration row at all (no entry
+                            // in the map) stays "can't verify".
+                            Some(hash_opt) => {
+                                let frame_registration_hash =
+                                    hash_opt.clone().unwrap_or_default();
                                 let expected = normalization_hash_for(
                                     &cfg,
                                     &frame_registration_hash,

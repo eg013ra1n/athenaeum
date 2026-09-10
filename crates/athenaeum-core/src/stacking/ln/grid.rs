@@ -587,13 +587,11 @@ mod tests {
         assert!(LnFrameGrids::read(&p).is_err());
     }
 
-    /// Patches a little-endian `u32` field at `offset` in a sidecar file
-    /// and recomputes the trailer, so a test can build a "corrupt but
-    /// checksum-consistent" file without hand-duplicating `encode`'s
-    /// layout.
-    fn patch_u32_and_rehash(path: &Path, offset: usize, new_value: u32) {
-        let mut bytes = std::fs::read(path).unwrap();
-        bytes[offset..offset + 4].copy_from_slice(&new_value.to_le_bytes());
+    /// Recomputes `bytes`' own trailer (the last 8 bytes) from everything
+    /// before it — shared by every "corrupt but checksum-consistent" test
+    /// helper below, so each one only has to describe the corruption, not
+    /// re-derive the trailer.
+    fn rehash(bytes: &mut [u8]) {
         let trailer_at = bytes.len() - 8;
         let hash = {
             let mut hasher = Xxh3::new();
@@ -601,6 +599,25 @@ mod tests {
             hasher.digest()
         };
         bytes[trailer_at..].copy_from_slice(&hash.to_le_bytes());
+    }
+
+    /// Patches a little-endian `u32` field at `offset` in a sidecar file
+    /// and recomputes the trailer, so a test can build a "corrupt but
+    /// checksum-consistent" file without hand-duplicating `encode`'s
+    /// layout.
+    fn patch_u32_and_rehash(path: &Path, offset: usize, new_value: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[offset..offset + 4].copy_from_slice(&new_value.to_le_bytes());
+        rehash(&mut bytes);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Same as [`patch_u32_and_rehash`] for a single byte — used for the
+    /// 8-byte `MAGIC` field, which is not a `u32`.
+    fn patch_byte_and_rehash(path: &Path, offset: usize, new_value: u8) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[offset] = new_value;
+        rehash(&mut bytes);
         std::fs::write(path, &bytes).unwrap();
     }
 
@@ -644,6 +661,73 @@ mod tests {
             err.to_string().contains("grid dims"),
             "error should describe the mismatch: {err}"
         );
+    }
+
+    /// M9 (final fix wave): `read_inner`'s `too short` bail — shorter than
+    /// `HEADER_LEN + 8` (the fixed header plus the trailer), caught before
+    /// the trailer is even read, so no rehash is needed.
+    #[test]
+    fn a_too_short_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let g = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        LnFrameGrids { channels: vec![g] }.write(&p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        std::fs::write(&p, &bytes[..HEADER_LEN]).unwrap();
+
+        let err = LnFrameGrids::read(&p).unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err}");
+    }
+
+    /// M9: `read_inner`'s `bad magic` bail — the first magic byte flipped,
+    /// trailer recomputed so the checksum still matches.
+    #[test]
+    fn a_bad_magic_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let g = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        LnFrameGrids { channels: vec![g] }.write(&p).unwrap();
+        patch_byte_and_rehash(&p, 0, b'X');
+
+        let err = LnFrameGrids::read(&p).unwrap_err();
+        assert!(err.to_string().contains("magic"), "{err}");
+    }
+
+    /// M9: `read_inner`'s `unsupported version` bail — `version` is the
+    /// first `u32` right after the 8-byte magic.
+    #[test]
+    fn an_unsupported_version_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let g = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        LnFrameGrids { channels: vec![g] }.write(&p).unwrap();
+        patch_u32_and_rehash(&p, 8, VERSION + 1);
+
+        let err = LnFrameGrids::read(&p).unwrap_err();
+        assert!(err.to_string().contains("version"), "{err}");
+    }
+
+    /// M9: `read_inner`'s `truncated grid data` bail — the payload cut off
+    /// a handful of bytes into the first channel's `a`/`b` arrays (well
+    /// short of `n * 8`), trailer recomputed over the truncated payload so
+    /// the checksum still matches and the truncation itself is what's
+    /// caught.
+    #[test]
+    fn truncated_grid_data_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.athln");
+        let g = LnGrid::constant(64, 48, 128, 1.0, 0.0);
+        LnFrameGrids { channels: vec![g] }.write(&p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+
+        let cut_at = HEADER_LEN + CHANNEL_HEADER_LEN + 4;
+        let mut truncated = bytes[..cut_at].to_vec();
+        truncated.extend_from_slice(&[0u8; 8]); // placeholder trailer, overwritten by rehash
+        rehash(&mut truncated);
+        std::fs::write(&p, &truncated).unwrap();
+
+        let err = LnFrameGrids::read(&p).unwrap_err();
+        assert!(err.to_string().contains("truncated grid data"), "{err}");
     }
 
     #[test]

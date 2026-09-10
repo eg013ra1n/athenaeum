@@ -66,7 +66,14 @@ impl Default for IntegrationConfig {
 /// (M2) means `integrate_group` applies the per-frame LN grids
 /// (`GroupInput.ln`) as the rejection-normalization pair instead of a
 /// global one; a frame with no grid falls back to its own global pair (see
-/// [`integrate_planes`]'s own doc).
+/// [`integrate_planes`]'s own doc). Note the asymmetry between the two
+/// normalization axes: local *output* normalization is `local.enabled`, a
+/// boolean sibling of `output` — when it doesn't apply, `output` is still
+/// there to fall back to. Local *rejection* normalization is instead a
+/// **variant of** `RejectionNormalization` itself (`Local`), so there is no
+/// separate field left to fall back to — `stats::rejection_pair` resolves
+/// `Local` to the same pair `ScaleZeroOffset` would give it, by construction
+/// rather than by a fallback field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NormalizationConfig {
@@ -1231,7 +1238,13 @@ mod tests {
         match result {
             Err(IntegrationError::BadInput(msg)) => {
                 assert!(msg.contains("10x10"), "{msg}");
-                assert!(msg.contains('1'), "error should name the frame: {msg}");
+                // A5: `msg.contains('1')` was vacuous — "10x10" itself
+                // contains '1'. Assert the frame index text precisely
+                // instead ("frame 1 (" — `format!("frame {i} (…")`).
+                assert!(
+                    msg.contains("frame 1 ("),
+                    "error should name frame 1 specifically: {msg}"
+                );
             }
             Err(other) => panic!("expected BadInput, got {other:?}"),
             Ok(_) => panic!("expected the mismatched grid to be refused"),

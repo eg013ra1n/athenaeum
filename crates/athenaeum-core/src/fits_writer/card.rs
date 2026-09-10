@@ -3,7 +3,11 @@
 
 pub const CARD_SIZE: usize = 80;
 pub const BLOCK_SIZE: usize = 2880;
-const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one card
+// M10 (final fix wave): `pub(crate)`, not private — `stacking::master_cards`
+// used to hard-code its own `ATH_STKC_MAX_CHARS = 68` copy of this same
+// number (with a comment naming this constant, which it could not actually
+// reference) so the two would silently drift if this one ever changed.
+pub(crate) const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one card
 
 #[derive(Debug)]
 pub enum FitsWriteError {
