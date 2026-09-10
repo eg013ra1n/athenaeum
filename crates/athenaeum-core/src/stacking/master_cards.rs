@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::archive::path_layout::sanitize_for_filename;
-use crate::calibration_library::paths::resolve_collision;
+use crate::calibration_library::paths::{fmt_num, resolve_collision};
 use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::wcs::wcs_cards;
 use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
@@ -40,8 +40,43 @@ pub struct MasterCardInputs<'a> {
     pub normalization: &'a str, // "<output>/<rejection>" serde names, e.g. "additiveWithScaling/scaleZeroOffset"
     pub reference_id: &'a str, // ATH_STKF — the reference frame's identity (Plan 5 decides the string)
     pub group_key: &'a str,    // ATH_STKG
-    pub run_id: &'a str,       // ATH_STKI
+    /// Every distinct camera in the group (`IntegrationGroup.cameras`,
+    /// already trimmed/sorted/deduped) — `ATH_STKC` (owner decision
+    /// 2026-09-10: groups are camera-agnostic, so a master's own header
+    /// must say which camera(s) actually contributed).
+    pub cameras: &'a [String],
+    pub run_id: &'a str, // ATH_STKI
     pub app_version: &'a str,
+}
+
+/// `ATH_STKC`'s FITS string-value budget: `MAX_STR_CONTENT`
+/// (`fits_writer::card`) — the printable characters inside the quotes of
+/// ONE 80-byte record with no comment, the same convention `ATH_STKG`/
+/// `ATH_STKR`/`ATH_STKO`/`ATH_STKF` already rely on below (no
+/// `.with_comment()` — a comment would need to fit in the same record as a
+/// caller string that can already be this long). `format_card` would
+/// happily chain a longer string across `CONTINUE` cards, but a camera list
+/// is auxiliary metadata, not worth that — truncated with `…` instead.
+const ATH_STKC_MAX_CHARS: usize = 68;
+
+/// Sorted, comma-joined camera list for `ATH_STKC`, truncated to
+/// [`ATH_STKC_MAX_CHARS`] with a trailing `…` when it would otherwise
+/// overflow one FITS card. Re-sorts/dedupes defensively rather than trusting
+/// the caller's own `IntegrationGroup.cameras` invariant.
+fn format_cameras_card(cameras: &[String]) -> String {
+    let mut sorted: Vec<&str> = cameras.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let joined = sorted.join(",");
+    if joined.chars().count() <= ATH_STKC_MAX_CHARS {
+        joined
+    } else {
+        let truncated: String = joined
+            .chars()
+            .take(ATH_STKC_MAX_CHARS.saturating_sub(1))
+            .collect();
+        format!("{truncated}…")
+    }
 }
 
 /// Build a master-light header: `IMAGETYP`/`SWCREATE`, the reference's
@@ -107,9 +142,11 @@ pub fn build_master_light_cards(
     // Variable-length values: no card comment — value + comment must fit one
     // 80-byte record and format_card errors otherwise (the same rule
     // register/writer.rs applies to ATH_REGT). ATH_STKG looks bounded
-    // (`<instrume>__<mono|osc>__<filter>__bin<n>__<w>x<h>[__<exp>s]`) but the
-    // sanitized INSTRUME/FILTER strings inside it are caller text, not fixed
-    // width, so it belongs here too.
+    // (`<mono|osc>__<filter>__bin<n>__<exposure cluster>`, owner decision
+    // 2026-09-10 — camera/geometry are no longer part of it) but the
+    // sanitized FILTER string inside it is caller text, not fixed width, so
+    // it belongs here too. ATH_STKC (below) is truncated instead — see
+    // `format_cameras_card`.
     cards.push(Card::new(
         "ATH_STKR",
         CardValue::Str(inputs.recipe.to_string()),
@@ -126,6 +163,10 @@ pub fn build_master_light_cards(
         "ATH_STKG",
         CardValue::Str(inputs.group_key.to_string()),
     )?);
+    cards.push(Card::new(
+        "ATH_STKC",
+        CardValue::Str(format_cameras_card(inputs.cameras)),
+    )?);
     cards.push(
         Card::new("ATH_STKI", CardValue::Str(inputs.run_id.to_string()))?
             .with_comment("stacking run"),
@@ -134,47 +175,39 @@ pub fn build_master_light_cards(
     Ok(cards)
 }
 
-/// Trim, then treat a blank result as absent — a `Some("  ")` filter/instrume
-/// must fall back to the default just like `None` does.
+/// Trim, then treat a blank result as absent — a `Some("  ")` filter must
+/// fall back to the default just like `None` does.
 fn blank(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn fmt_exposure_number(x: f64) -> String {
-    if x == x.trunc() {
-        format!("{x:.0}")
-    } else {
-        format!("{x:.1}")
-    }
-}
-
-/// §9.5: `<set slug>_<filter>_<instrume>_<n>x<exp>s.fits` when every exposure
-/// is within ±0.5 s of the first, else `<set slug>_<filter>_<instrume>_<n>f_<total>s.fits`;
-/// every part sanitized; `exp`/`total` printed as integers when whole, else
-/// one decimal. "Equal" means every exposure within ±0.5 s of the FIRST
-/// one — order-dependent by design (the first frame anchors the name).
+/// §9.5 (owner decision 2026-09-10 — groups are camera-agnostic, so the
+/// camera token is gone): `<set slug>_<filter>_<exp>s_<n>x.fits`, or
+/// `<set slug>_<filter>_unknown_<n>x.fits` for the group of frames with no
+/// `EXPTIME`; every part sanitized. `exp` reuses [`fmt_num`] — the SAME
+/// sub-second-exposure formatter the calibration library's own naming and
+/// `plan.rs`'s calibration-set label already use (`180s`, `0.39s`), so a
+/// calibration-set label, a group key and a master filename never format an
+/// exposure three different ways. There is no "equal vs mixed exposure"
+/// branch any more: the grouping rule itself already clustered every frame
+/// in `n` to within the group's own exposure tolerance, so one exposure
+/// value (the cluster's label) is always the honest answer.
 pub fn master_file_name(
     set_name: &str,
     filter: Option<&str>,
-    instrume: Option<&str>,
-    exposures_s: &[f64],
+    exposure_s: Option<f64>,
+    n: usize,
 ) -> String {
     let mut slug = sanitize_for_filename(set_name);
     if slug.is_empty() {
         slug = "set".to_string();
     }
     let filter = sanitize_for_filename(blank(filter).unwrap_or("NoFilter"));
-    let instrume = sanitize_for_filename(blank(instrume).unwrap_or("unknown"));
-    let n = exposures_s.len();
-    let e0 = exposures_s.first().copied().unwrap_or(0.0);
-    let equal = exposures_s.iter().all(|&e| (e - e0).abs() <= 0.5);
-    let tail = if equal {
-        format!("{n}x{}s", fmt_exposure_number(e0))
-    } else {
-        let total: f64 = exposures_s.iter().sum();
-        format!("{n}f_{}s", fmt_exposure_number(total))
+    let exp = match exposure_s {
+        Some(e) => format!("{}s", fmt_num(e)),
+        None => "unknown".to_string(),
     };
-    format!("{slug}_{filter}_{instrume}_{tail}.fits")
+    format!("{slug}_{filter}_{exp}_{n}x.fits")
 }
 
 pub struct WrittenMaster {
@@ -345,43 +378,35 @@ mod tests {
 
     #[test]
     fn master_name_follows_the_layout_rules() {
+        // The pin (owner decision 2026-09-10): no camera token, exposure
+        // before frame count.
         assert_eq!(
-            master_file_name(
-                "LDN 1272",
-                Some("NoFilter"),
-                Some("atr2600m"),
-                &[180.0; 208]
-            ),
-            "LDN_1272_NoFilter_atr2600m_208x180s.fits"
+            master_file_name("LDN 1272", Some("NoFilter"), Some(180.0), 208),
+            "LDN_1272_NoFilter_180s_208x.fits"
         );
         assert_eq!(
-            master_file_name(
-                "M 31",
-                Some("Ha"),
-                Some("ASI 2600MM"),
-                &[300.0, 300.4, 299.6]
-            ),
-            "M_31_Ha_ASI_2600MM_3x300s.fits"
+            master_file_name("M 31", Some("Ha"), Some(300.0), 3),
+            "M_31_Ha_300s_3x.fits"
+        );
+        // Sub-second exposure, `fmt_num`'s trimmed-decimal form.
+        assert_eq!(
+            master_file_name("a/b:c", Some("L"), Some(0.5), 2),
+            "a_b_c_L_0.5s_2x.fits"
+        );
+        // Blank filter falls back to NoFilter; an empty/whitespace set name
+        // falls back to "set".
+        assert_eq!(
+            master_file_name("M 31", Some("  "), Some(60.0), 2),
+            "M_31_NoFilter_60s_2x.fits"
         );
         assert_eq!(
-            master_file_name("M 31", None, None, &[120.0, 180.0, 300.0]),
-            "M_31_NoFilter_unknown_3f_600s.fits"
+            master_file_name("...", Some("L"), Some(60.0), 1),
+            "set_L_60s_1x.fits"
         );
+        // No EXPTIME anywhere in the cluster — the "unknown" token.
         assert_eq!(
-            master_file_name("a/b:c", Some("L"), Some("cam"), &[0.5, 0.5]),
-            "a_b_c_L_cam_2x0.5s.fits"
-        );
-        assert_eq!(
-            master_file_name("M 31", Some("  "), Some(""), &[60.0, 60.0]),
-            "M_31_NoFilter_unknown_2x60s.fits"
-        );
-        assert_eq!(
-            master_file_name("...", Some("L"), Some("cam"), &[60.0]),
-            "set_L_cam_1x60s.fits"
-        );
-        assert_eq!(
-            master_file_name("M 31", Some("Ha"), Some("cam"), &[300.0, 300.4, 300.4]),
-            "M_31_Ha_cam_3x300s.fits"
+            master_file_name("M 31", None, None, 3),
+            "M_31_NoFilter_unknown_3x.fits"
         );
     }
 
@@ -407,7 +432,8 @@ mod tests {
             weight_mode: "psfSignalWeight",
             normalization: "additiveWithScaling/scaleZeroOffset",
             reference_id: "frame:73",
-            group_key: "atr2600m__mono__NoFilter__bin1__6224x4168",
+            group_key: "mono__NoFilter__bin1__180s",
+            cameras: &["ATR2600M".to_string(), "ZWO ASI2600MC Duo".to_string()],
             run_id: "run-7",
             app_version: "0.5.7",
         })
@@ -452,9 +478,11 @@ mod tests {
         assert_eq!(kw("ATH_STKF"), Some(CardValue::Str("frame:73".into())));
         assert_eq!(
             kw("ATH_STKG"),
-            Some(CardValue::Str(
-                "atr2600m__mono__NoFilter__bin1__6224x4168".into()
-            ))
+            Some(CardValue::Str("mono__NoFilter__bin1__180s".into()))
+        );
+        assert_eq!(
+            kw("ATH_STKC"),
+            Some(CardValue::Str("ATR2600M,ZWO ASI2600MC Duo".into()))
         );
         assert_eq!(kw("ATH_STKI"), Some(CardValue::Str("run-7".into())));
         assert!(kw("SWCREATE").is_some());
@@ -486,7 +514,8 @@ mod tests {
             weight_mode: "psfSignalWeight",
             normalization: "multiplicativeWithScaling/scaleZeroOffset",
             reference_id: long_reference_id,
-            group_key: "zwoasi2600mcduo__osc__NoFilter__bin1__6248x4176__180s",
+            group_key: "osc__NoFilter__bin1__180s",
+            cameras: &["ZWO ASI2600MC Duo".to_string()],
             run_id: "run-7",
             app_version: "0.5.7",
         })
@@ -524,7 +553,8 @@ mod tests {
             weight_mode: "psfSignalWeight",
             normalization: "additiveWithScaling/scaleZeroOffset",
             reference_id: "frame:1",
-            group_key: "cam__mono__NoFilter__bin1__100x100",
+            group_key: "mono__NoFilter__bin1__180s",
+            cameras: &["cam".to_string()],
             run_id: "run-1",
             app_version: "0.5.7",
         })
@@ -564,7 +594,8 @@ mod tests {
             weight_mode: "psfSignalWeight",
             normalization: "additiveWithScaling/scaleZeroOffset",
             reference_id: "frame:73",
-            group_key: "atr2600m__mono__NoFilter__bin1__6224x4168",
+            group_key: "mono__NoFilter__bin1__180s",
+            cameras: &["ATR2600M".to_string()],
             run_id: "run-7",
             app_version: "0.5.7",
         })
@@ -584,6 +615,32 @@ mod tests {
                 .map(|c| c.value.clone().unwrap()),
             Some(CardValue::Logical(true))
         );
+    }
+
+    #[test]
+    fn ath_stkc_is_sorted_comma_joined_and_truncated() {
+        assert_eq!(
+            format_cameras_card(&["ZWO ASI2600MC Duo".to_string(), "ATR2600M".to_string()]),
+            "ATR2600M,ZWO ASI2600MC Duo",
+            "sorted regardless of input order"
+        );
+        assert_eq!(
+            format_cameras_card(&["cam".to_string(), "cam".to_string()]),
+            "cam",
+            "deduped"
+        );
+
+        // Enough distinct long names to blow well past the 68-char budget.
+        let many: Vec<String> = (0..10)
+            .map(|i| format!("Camera Model Long Name {i:02}"))
+            .collect();
+        let joined = format_cameras_card(&many);
+        assert!(
+            joined.chars().count() <= 68,
+            "{} chars: {joined}",
+            joined.chars().count()
+        );
+        assert!(joined.ends_with('…'), "{joined}");
     }
 
     #[test]

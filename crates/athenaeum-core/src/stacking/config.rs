@@ -62,20 +62,23 @@ impl Default for StackingConfig {
     }
 }
 
-/// spec §9.2 `grouping:`.
+/// spec §9.2 `grouping:` (owner decision 2026-09-10: groups are
+/// camera-agnostic — colour mode, filter, binning and exposure form the
+/// key; exposure ALWAYS splits a group now, so there is no toggle for it
+/// any more). Deliberately does NOT reject an unknown field — no type in
+/// this module opts into `#[serde(deny_unknown_fields)]` — so a per-set or
+/// global config JSON stored by an M1 build (which still carries
+/// `"splitByExposure": …`) decodes fine: serde silently drops a field this
+/// struct no longer declares.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GroupingConfig {
-    /// Split an otherwise-matching group by `EXPTIME` (within
-    /// `exposure_tolerance_sec`) instead of merging mixed exposures.
-    pub split_by_exposure: bool,
     pub exposure_tolerance_sec: f64,
 }
 
 impl Default for GroupingConfig {
     fn default() -> Self {
         GroupingConfig {
-            split_by_exposure: false,
             exposure_tolerance_sec: 2.0,
         }
     }
@@ -426,8 +429,11 @@ mod tests {
     #[test]
     fn serde_names_follow_the_spec() {
         let s = serde_json::to_string(&StackingConfig::default()).unwrap();
+        assert!(
+            !s.contains("splitByExposure"),
+            "the toggle is gone — exposure always splits: {s}"
+        );
         for needle in [
-            "\"splitByExposure\":false",
             "\"exposureToleranceSec\":2.0",
             "\"weightMode\":\"psfSignalWeight\"",
             "\"psfModel\":\"auto\"",
@@ -480,20 +486,50 @@ mod tests {
     #[test]
     fn precedence_is_whole_config() {
         let set = Some("{\"measurement\":{\"maxStars\":100}}");
-        let global =
-            Some("{\"measurement\":{\"maxStars\":200},\"grouping\":{\"splitByExposure\":true}}");
+        let global = Some(
+            "{\"measurement\":{\"maxStars\":200},\"grouping\":{\"exposureToleranceSec\":9.0}}",
+        );
         let c = resolve_config(set, global).unwrap();
         assert_eq!(c.measurement.max_stars, 100);
-        assert!(!c.grouping.split_by_exposure, "no field-level merge");
+        assert_eq!(
+            c.grouping.exposure_tolerance_sec, 2.0,
+            "no field-level merge — the set's own default, not the global's 9.0"
+        );
         assert_eq!(
             resolve_config(None, global).unwrap().measurement.max_stars,
             200
+        );
+        assert_eq!(
+            resolve_config(None, global)
+                .unwrap()
+                .grouping
+                .exposure_tolerance_sec,
+            9.0
         );
         assert_eq!(
             resolve_config(None, None).unwrap(),
             StackingConfig::default()
         );
         assert!(resolve_config(Some("{not json"), None).is_err());
+    }
+
+    /// An M1-stored per-set or global config JSON still carries
+    /// `"splitByExposure"` — the toggle it once turned. That field must
+    /// still deserialize (silently ignored, `GroupingConfig` no longer
+    /// declares it) and never reappear on re-serialization.
+    #[test]
+    fn legacy_split_by_exposure_field_is_ignored() {
+        let json = r#"{"grouping":{"splitByExposure":true,"exposureToleranceSec":5.0}}"#;
+        let c: StackingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.grouping.exposure_tolerance_sec, 5.0);
+        let out = serde_json::to_string(&c).unwrap();
+        assert!(!out.contains("splitByExposure"), "{out}");
+
+        // Same via the real precedence entry point, both roles.
+        let via_set = resolve_config(Some(json), None).unwrap();
+        assert_eq!(via_set.grouping.exposure_tolerance_sec, 5.0);
+        let via_global = resolve_config(None, Some(json)).unwrap();
+        assert_eq!(via_global.grouping.exposure_tolerance_sec, 5.0);
     }
 
     #[test]
@@ -621,6 +657,13 @@ mod tests {
         // Pinned once, on this task's implementation — guards every future
         // field reorder/rename in any config type. If this literal must
         // change in a later task, that task says why.
-        assert_eq!(default_hash, "268adcec1face673");
+        //
+        // Changed here (M2 Task 10, owner decision 2026-09-10): dropping
+        // `GroupingConfig.splitByExposure` changes the canonical JSON of
+        // every stored `StackingConfig`, so `config_hash` moves — no
+        // per-frame `stacking_artifacts` row goes stale over this (the
+        // calibrate/measure/register stage hashes never fold in
+        // `grouping`), only this whole-config fingerprint.
+        assert_eq!(default_hash, "b74baaa1e4322e9f");
     }
 }

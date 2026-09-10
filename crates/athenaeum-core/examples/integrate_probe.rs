@@ -995,11 +995,16 @@ fn main() {
         .iter()
         .map(|&i| stack_frames[i].exposure_s)
         .collect();
+    // Owner decision 2026-09-10: no camera token in the filename any more,
+    // and the naming input is one exposure (the group's own cluster label)
+    // rather than the whole per-frame list — this probe has no real
+    // cluster label of its own, so it reads the first included frame's
+    // exposure as a stand-in.
     let name = master_file_name(
         &set_name,
         filter.as_deref(),
-        instrume.as_deref(),
-        &included_exposures,
+        included_exposures.first().copied(),
+        stats.included,
     );
 
     let reference_cards = match source_cards_from_file(&processed[reference_index].path) {
@@ -1025,14 +1030,31 @@ fn main() {
     // stack, so naming it here would misdescribe the master's own header.
     let reference_id = normalization_reference_stem.clone();
     let mono_or_osc = if args.osc { "osc" } else { "mono" };
+    // Owner decision 2026-09-10: `<mono|osc>__<filter>__bin<n>__<exposure
+    // cluster>` — camera and geometry are no longer part of the key. This
+    // probe's own formatter for the exposure token, since the crate's own
+    // (`calibration_library::paths::fmt_num`) is `pub(crate)`, not visible
+    // from an example binary — display text only, never asserted anywhere.
+    let exposure_token = included_exposures.first().map_or_else(
+        || "unknown".to_string(),
+        |&e| {
+            if e == e.trunc() {
+                format!("{e:.0}s")
+            } else {
+                format!("{e}s")
+            }
+        },
+    );
     let group_key = format!(
-        "{}__{}__{}__bin1__{}x{}",
-        instrume.as_deref().unwrap_or("unknown"),
+        "{}__{}__bin1__{}",
         mono_or_osc,
         filter.as_deref().unwrap_or("NoFilter"),
-        output.width,
-        output.height
+        exposure_token,
     );
+    let cameras: Vec<String> = instrume
+        .as_deref()
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default();
     let normalization_str = normalization_string(&normalization);
 
     let cards = match build_master_light_cards(&MasterCardInputs {
@@ -1047,6 +1069,7 @@ fn main() {
         normalization: &normalization_str,
         reference_id: &reference_id,
         group_key: &group_key,
+        cameras: &cameras,
         run_id: "probe",
         app_version: env!("CARGO_PKG_VERSION"),
     }) {

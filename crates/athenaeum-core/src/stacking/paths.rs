@@ -454,27 +454,39 @@ pub struct EstimateInputs<'a> {
 /// Rough byte estimate for a run's working+output footprint: every group
 /// contributes its calibrated frames (one float32 plane per frame, three
 /// planes for OSC), the same again if registered frames are also kept, and
-/// one master plus (when maps are written) two rejection maps — all at the
-/// group's own `W x H`. This is a footprint estimate, not an exact
-/// accounting: it ignores compression, FITS header overhead, and the ln/
-/// intermediates M2 adds.
+/// one master plus (when maps are written) two rejection maps. The master/
+/// maps term uses the group's LARGEST member's native geometry (owner
+/// decision 2026-09-10: a group's members can carry different native
+/// geometry now that camera/geometry are not grouping keys — there is no
+/// single group-wide `W x H` any more; every registered frame actually
+/// lands on the ONE run-wide reference geometry, but that is not known this
+/// early, before any run has even started). This is a footprint estimate,
+/// not an exact accounting: it ignores compression, FITS header overhead,
+/// and the ln/intermediates M2 adds.
 pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
     let mut total = 0u64;
     for g in i.groups {
         let planes: u64 = if g.color_mode == ColorMode::Osc { 3 } else { 1 };
-        let w = g.width.max(0) as u64;
-        let h = g.height.max(0) as u64;
-        let plane_bytes = w * h * 4;
-        let per_frame_bytes = planes * plane_bytes;
 
-        let calibrated_bytes = g.frames.len() as u64 * per_frame_bytes;
+        let calibrated_bytes: u64 = g
+            .frames
+            .iter()
+            .map(|f| planes * f.width.max(0) as u64 * f.height.max(0) as u64 * 4)
+            .sum();
         total += calibrated_bytes;
         if i.write_registered {
             total += calibrated_bytes;
         }
 
+        let (max_w, max_h) = g
+            .frames
+            .iter()
+            .map(|f| (f.width.max(0) as u64, f.height.max(0) as u64))
+            .max_by_key(|&(w, h)| w * h)
+            .unwrap_or((0, 0));
+        let master_per_frame_bytes = planes * max_w * max_h * 4;
         let master_multiplier: u64 = if i.write_maps { 1 + 2 } else { 1 };
-        total += per_frame_bytes * master_multiplier;
+        total += master_per_frame_bytes * master_multiplier;
     }
     total
 }
@@ -950,7 +962,7 @@ mod tests {
 
     // ── estimate_bytes ───────────────────────────────────────────────────
 
-    fn frame(id: i64) -> GroupFrame {
+    fn frame(id: i64, w: i64, h: i64) -> GroupFrame {
         GroupFrame {
             frame_id: id,
             file_id: id,
@@ -960,6 +972,8 @@ mod tests {
             modified_at: "2025-01-01T00:00:00Z".to_string(),
             exposure_s: Some(60.0),
             date_obs: None,
+            width: w,
+            height: h,
         }
     }
 
@@ -970,10 +984,9 @@ mod tests {
             color_mode,
             filter: None,
             binning: 1,
-            width: w,
-            height: h,
+            cameras: vec![],
             exposure_s: Some(60.0),
-            frames: (0..n_frames).map(frame).collect(),
+            frames: (0..n_frames).map(|id| frame(id, w, h)).collect(),
             total_exposure_s: n_frames as f64 * 60.0,
         }
     }

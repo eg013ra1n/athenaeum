@@ -73,13 +73,28 @@ fingerprint test).
 | 8 | Drizzle (M3) | calibrated + transform + rejection bitmaps + weights + LN → `_drizzle<s>x` | drizzle off |
 | 9 | Output & finish | masters written, provenance rows, notification, cleanup policy | never |
 
-**Grouping keys.** `INSTRUME` (sanitized), colour mode (mono / CFA, from the
-Bayer cards), `FILTER` (sanitized, `NoFilter` when absent), `XBINNING`,
-width × height. `splitByExposure` (default **off**, tolerance 2 s) adds
-`EXPTIME`. The group key is a stable string
-`<instrume>__<mono|osc>__<filter>__bin<n>__<w>x<h>[__<exp>s]` used in paths and
-rows. Mixed exposures inside one group are handled by the weights and the
-normalization; users who want HDR-separate masters turn the split on.
+**Grouping keys (revised 2026-09-10, owner decision — "different cameras
+can be integrated together, as long as exposure (within the exposure
+threshold set in the integration settings), camera type and filter
+match").** Colour mode (mono / CFA, from the Bayer cards), `FILTER`
+(sanitized, `NoFilter` when absent), `XBINNING`, and an exposure cluster —
+exposure is now ALWAYS a key, there is no opt-out toggle. `INSTRUME` and
+native geometry (`NAXIS1`/`NAXIS2`) are **not** keys any more: a group may
+mix frames from several cameras and sensor sizes; registration warps every
+included frame onto the ONE run-wide reference regardless (§3.4 — no new
+gate). The exposure cluster: frames sorted by `EXPTIME`, greedy clustering —
+a frame joins the current cluster when its exposure is within
+`exposureToleranceSec` (default 2 s) of the cluster's own first value, not
+the previous frame's; a frame with no `EXPTIME` never joins a numeric
+cluster (a missing value is not "0 s") — it gets its own cluster, labelled
+`unknown`, and the plan carries a warning naming those frames (never a
+blocker). The group key is the stable string
+`<mono|osc>__<filter>__bin<n>__<exposure cluster>` used in paths and rows
+(`180s`, `0.39s`, or `unknown`). `IntegrationGroup`/`PlanGroup` carry
+`cameras: string[]` (every distinct camera actually present, sorted) and
+`instrume` as a DISPLAY-only value (the reference-anchor member's own
+camera — the best-weighted included member once weights exist, the first
+member by `(date_obs, id)` at plan time).
 
 **Gate** (stage 0, the one gate for the Run button and for `start_stacking`):
 
@@ -394,7 +409,10 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
   and the provenance cards `ATH_STK = 1`, `ATH_STKV` (format version),
   `ATH_STKN` (frames), `ATH_STKR` (recipe string), `ATH_STKW` (weight mode),
   `ATH_STKO` (normalization), `ATH_STKF` (reference frame uuid), `ATH_STKG`
-  (group key), `ATH_STKI` (run id; FITS keywords are eight characters).
+  (group key), `ATH_STKC` (2026-09-10 — groups are camera-agnostic: every
+  distinct camera in the group, comma-joined, sorted, e.g.
+  `'ATR2600M,ZWO ASI2600MC Duo'`, truncated with `…` past 68 chars),
+  `ATH_STKI` (run id; FITS keywords are eight characters).
 - Rejection maps: `<master stem>_rejlow.fits` / `_rejhigh.fits` (optional).
 - **Scanner rule**: a file carrying `ATH_STK` or `ATH_REG` is an Athenaeum
   artifact and is never cataloged, the same one-rule skip as
@@ -533,7 +551,10 @@ One `StackingConfig` JSON (camelCase, `version: 1`, every field optional on
 the wire with the defaults below; the same struct is exported to TS):
 
 ```
-grouping:      { splitByExposure: false, exposureToleranceSec: 2.0 }
+grouping:      { exposureToleranceSec: 2.0 }   -- exposure ALWAYS splits a group now (2026-09-10);
+                                                -- the old `splitByExposure` toggle is gone — a
+                                                -- stored document that still carries it decodes
+                                                -- fine, the field is just silently ignored
 calibration:   CalibratedLightOptions (the export's: flat norm, hot pixels on, debayer on)
 measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 24576,
                  formula: { fwhm: 15, eccentricity: 15, snr: 20, stars: 0, pedestal: 50 },
@@ -607,8 +628,9 @@ are reported by the cleanup action, never deleted silently.
   rej/run-<id>/<group key>/<stem>.rej            (drizzle runs only, temporary)
   runs/run-<id>.json
 <output>/
-  <set slug>_<filter>_<instrume>_<n>x<exp>s.fits            (equal exposures ±0.5 s)
-  <set slug>_<filter>_<instrume>_<n>f_<total>s.fits          (mixed exposures)
+  <set slug>_<filter>_<exp>s_<n>x.fits            (2026-09-10: no camera token — a group can
+                                                    mix cameras; <exp> is the group's own
+                                                    exposure-cluster label, or `unknown`)
   …_drizzle<s>x.fits, …_rejlow.fits, …_rejhigh.fits, …_drizzle<s>x_weight.fits
 ```
 

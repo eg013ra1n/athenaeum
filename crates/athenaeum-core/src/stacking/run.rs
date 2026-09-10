@@ -356,6 +356,24 @@ fn reference_mode_wire(mode: ReferenceMode) -> &'static str {
     }
 }
 
+/// `stacking_run_groups.width`/`height` at insert time (owner decision
+/// 2026-09-10: `IntegrationGroup` no longer carries a group-level
+/// width/height — a group's members can differ in native geometry now that
+/// camera/geometry are not grouping keys). The run's actual reference
+/// geometry (`RunContext::reference_width`/`height`) is not known this
+/// early — it is only resolved once stage 5 (register) picks the ONE
+/// run-wide reference frame — so this reads the group's own
+/// reference-anchor member's native `NAXIS1`/`NAXIS2` instead: the same
+/// "first member, `(date_obs, id)` order" convention `IntegrationGroup.instrume`
+/// already uses for its own display value. `None` only for an (unreachable
+/// in practice) empty group — the DB column stays nullable either way.
+fn group_anchor_geometry(g: &IntegrationGroup) -> (Option<i64>, Option<i64>) {
+    match g.frames.first() {
+        Some(f) => (Some(f.width), Some(f.height)),
+        None => (None, None),
+    }
+}
+
 /// `(size, modified_at)` for a just-written file, in the scanner's own shape
 /// (`scanner/mod.rs`'s `modified_dt.to_rfc3339()`) — the same identity
 /// [`crate::stacking::plan::calibration_hash_for`] reads back off a
@@ -637,6 +655,7 @@ pub fn start_stacking(
             .get(g.key.as_str())
             .copied()
             .unwrap_or(g.frames.len());
+        let (anchor_width, anchor_height) = group_anchor_geometry(g);
         let group_id = match insert_group(
             &conn,
             &NewGroup {
@@ -646,8 +665,8 @@ pub fn start_stacking(
                 color_mode: color_mode_wire(g.color_mode),
                 filter: g.filter.as_deref(),
                 binning: Some(g.binning),
-                width: Some(g.width),
-                height: Some(g.height),
+                width: anchor_width,
+                height: anchor_height,
                 exposure: g.exposure_s,
                 frame_count: g.frames.len() as i64,
                 included_count: included_count as i64,
@@ -1145,19 +1164,23 @@ fn stage_masters(rc: &mut RunContext) -> Result<(), RunError> {
 
 /// Calibrate-only byte footprint for progress's `bytes_total` (mirrors
 /// [`crate::stacking::paths::estimate_bytes`]'s calibrated-frame term, but
-/// scoped to just this stage rather than the whole run's estimate).
+/// scoped to just this stage rather than the whole run's estimate). Sums
+/// per FRAME rather than per group (owner decision 2026-09-10: a group's
+/// members can carry different native geometry now that camera/geometry
+/// are not grouping keys, so there is no single group-wide `W x H` any
+/// more).
 fn calibrate_bytes_total(groups: &[IntegrationGroup], excluded: &HashSet<i64>) -> u64 {
     let mut total = 0u64;
     for g in groups {
         let planes: u64 = if g.color_mode == ColorMode::Osc { 3 } else { 1 };
-        let w = g.width.max(0) as u64;
-        let h = g.height.max(0) as u64;
-        let included = g
-            .frames
-            .iter()
-            .filter(|f| !excluded.contains(&f.frame_id))
-            .count() as u64;
-        total += planes * w * h * 4 * included;
+        for f in &g.frames {
+            if excluded.contains(&f.frame_id) {
+                continue;
+            }
+            let w = f.width.max(0) as u64;
+            let h = f.height.max(0) as u64;
+            total += planes * w * h * 4;
+        }
     }
     total
 }
@@ -1634,6 +1657,22 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         let mut entries: Vec<MeasuredFrame> = Vec::with_capacity(group.frames.len());
         let mut to_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
         let mut max_planes = 1usize;
+        // Owner decision 2026-09-10: a group's members can carry different
+        // native geometry now, so admission sizing below uses the LARGEST
+        // frame in the group rather than a (now nonexistent) single
+        // group-wide width/height — conservative, never under-admits.
+        let group_max_w = group
+            .frames
+            .iter()
+            .map(|f| f.width.max(0) as u64)
+            .max()
+            .unwrap_or(0);
+        let group_max_h = group
+            .frames
+            .iter()
+            .map(|f| f.height.max(0) as u64)
+            .max()
+            .unwrap_or(0);
 
         for frame in &group.frames {
             if excluded_set.contains(&frame.frame_id) {
@@ -1833,9 +1872,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         }
 
         if !needing_measure.is_empty() {
-            let admission_n = admission(
-                8 * max_planes as u64 * group.width.max(0) as u64 * group.height.max(0) as u64 * 4,
-            );
+            let admission_n = admission(8 * max_planes as u64 * group_max_w * group_max_h * 4);
             let meta: Vec<(usize, GroupFrame)> = needing_measure
                 .iter()
                 .map(|(idx, f, _)| (*idx, f.clone()))
@@ -2416,7 +2453,11 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         }
 
-        let admission_n = admission(4 * group.width.max(0) as u64 * group.height.max(0) as u64 * 4);
+        // Registration warps every frame onto the ONE run-wide reference
+        // geometry (already resolved above, at the top of this stage) —
+        // the OUTPUT buffer size, and a more accurate admission bound than
+        // any per-frame native geometry would be.
+        let admission_n = admission(4 * rc.reference_width as u64 * rc.reference_height as u64 * 4);
         let meta: Vec<(usize, GroupFrame, String)> = to_register
             .iter()
             .map(|(idx, frame, _, _, hash)| (*idx, frame.clone(), hash.clone()))
@@ -3808,11 +3849,6 @@ fn process_group_output(
         .iter()
         .filter_map(|&i| members[i].date_obs.as_deref())
         .max();
-    let included_exposures: Vec<f64> = output
-        .included
-        .iter()
-        .map(|&i| members[i].exposure_s.unwrap_or(0.0))
-        .collect();
 
     // Fix round 1, item 3: `ATH_STKF` names the SOURCE frame, not the
     // calibrated artifact — Checkpoint B's own master reads
@@ -3845,6 +3881,7 @@ fn process_group_output(
         normalization: &normalization_str,
         reference_id: &reference_id,
         group_key: &group.key,
+        cameras: &group.cameras,
         run_id: &run_id_str,
         app_version: &rc.app_version,
     }) {
@@ -3863,8 +3900,8 @@ fn process_group_output(
     let name = master_file_name(
         &rc.set_name,
         group.filter.as_deref(),
-        group.instrume.as_deref(),
-        &included_exposures,
+        group.exposure_s,
+        output.stats.included,
     );
 
     let written = {
@@ -5514,6 +5551,7 @@ mod tests {
 
         let mut group_ids = HashMap::new();
         for g in plan_groups {
+            let (anchor_width, anchor_height) = group_anchor_geometry(g);
             let group_id = insert_group(
                 conn,
                 &NewGroup {
@@ -5523,8 +5561,8 @@ mod tests {
                     color_mode: color_mode_wire(g.color_mode),
                     filter: g.filter.as_deref(),
                     binning: Some(g.binning),
-                    width: Some(g.width),
-                    height: Some(g.height),
+                    width: anchor_width,
+                    height: anchor_height,
                     exposure: g.exposure_s,
                     frame_count: g.frames.len() as i64,
                     included_count: g.frames.len() as i64,

@@ -422,8 +422,10 @@ config hash — spec §9.3; `StackingPlan.stale_stages` lists which of the
 four a fresh run would have to redo).
 
 **The plan gate** (`stacking::plan::build_plan`, DB + cheap FS probes, no
-pixel I/O) returns a `StackingPlan`: groups (`stacking::groups`, catalog
-grouping by instrument/color-mode/filter/binning/geometry), the resolved
+pixel I/O) returns a `StackingPlan`: groups (`stacking::groups`, camera-
+agnostic since owner decision 2026-09-10 — catalog grouping by colour mode/
+filter/binning/exposure cluster; camera and native geometry are display
+facts only, `PlanGroup.cameras`/`instrume`, never keys), the resolved
 config + its hash, the reference, folder/space state, and ordered blockers
 (`code` ∈ `masters | links | masterFiles | reference | folders | space |
 frames | unsupported`) — reusing the calibrated-export readiness gate

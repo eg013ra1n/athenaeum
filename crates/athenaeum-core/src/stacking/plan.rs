@@ -135,6 +135,13 @@ pub struct PlanBlocker {
 /// own fields, plus how many of its frames are actually in scope
 /// (`included_count`, after manual exclusions) and how many already have a
 /// fresh cached artifact for the first two per-frame stages.
+///
+/// `instrume`/`cameras` (owner decision 2026-09-10): a group is
+/// camera-agnostic now — `cameras` lists every distinct camera actually
+/// present, `instrume` is a DISPLAY-only value (the reference-anchor
+/// member's own camera). There is no group-level `width`/`height` any
+/// more — a group's frames may differ in native geometry; see
+/// `GroupFrame.width`/`height` for the per-frame fact.
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanGroup {
@@ -143,8 +150,7 @@ pub struct PlanGroup {
     pub color_mode: ColorMode,
     pub filter: Option<String>,
     pub binning: i64,
-    pub width: i64,
-    pub height: i64,
+    pub cameras: Vec<String>,
     pub exposure_s: Option<f64>,
     pub frame_count: usize,
     pub included_count: usize,
@@ -982,6 +988,24 @@ pub fn build_plan(
     let mut blockers: Vec<PlanBlocker> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
+    // Owner decision 2026-09-10: exposure always splits a group now, and a
+    // frame with no EXPTIME lands in its own "unknown" cluster
+    // (`groups::cluster_indices`) rather than being silently folded in with
+    // a real 0 s exposure — but that frame's set is never actually excluded
+    // from stacking, so this is a WARNING, never a blocker, naming the
+    // frames so the operator can go fix the header if that was a mistake.
+    for g in &groups {
+        if g.exposure_s.is_none() {
+            let names: Vec<&str> = g.frames.iter().map(|f| f.filename.as_str()).collect();
+            warnings.push(format!(
+                "{} frame{} without EXPTIME grouped separately: {}",
+                names.len(),
+                if names.len() == 1 { "" } else { "s" },
+                names.join(", ")
+            ));
+        }
+    }
+
     // Gate 1: masters/links/masterFiles — reinterpreted 2026-09-09 (owner
     // requirement — "the pipeline should build the calibration masters
     // itself when they are missing"). The export-v2 gate
@@ -1300,8 +1324,7 @@ pub fn build_plan(
             color_mode: g.color_mode,
             filter: g.filter.clone(),
             binning: g.binning,
-            width: g.width,
-            height: g.height,
+            cameras: g.cameras.clone(),
             exposure_s: g.exposure_s,
             frame_count: g.frames.len(),
             included_count,
@@ -1449,6 +1472,84 @@ mod tests {
         assert!(
             plan.blockers.iter().any(|b| b.code == "links"),
             "{:?}",
+            plan.blockers
+        );
+    }
+
+    /// Owner decision 2026-09-10: groups are camera-agnostic — two lights
+    /// from different cameras, same colour mode/filter/binning and an
+    /// exposure within tolerance, land in ONE group; `cameras` lists both,
+    /// `instrume` is the first member's (by `date_obs`) display camera.
+    #[test]
+    fn plan_groups_are_camera_agnostic() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        test_fixtures::add_light(
+            &f,
+            &LightSpec {
+                instrume: "ATR2600M",
+                ..light_spec("a", "2025-01-01T00:00:00")
+            },
+        );
+        test_fixtures::add_light(
+            &f,
+            &LightSpec {
+                instrume: "Other",
+                ..light_spec("b", "2025-01-01T00:05:00")
+            },
+        );
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert_eq!(
+            plan.groups.len(),
+            1,
+            "two mono cameras, one exposure: one group: {:?}",
+            plan.groups
+        );
+        assert_eq!(
+            plan.groups[0].cameras,
+            vec!["ATR2600M".to_string(), "Other".to_string()]
+        );
+        assert_eq!(
+            plan.groups[0].instrume.as_deref(),
+            Some("ATR2600M"),
+            "the first member by date_obs anchors the display camera"
+        );
+    }
+
+    /// A frame with no `EXPTIME` never blocks the plan — it gets its own
+    /// "unknown" exposure cluster (`groups::cluster_indices`) and a
+    /// warning naming it.
+    #[test]
+    fn plan_warns_about_frames_without_exptime() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let (no_exp_id, _) =
+            test_fixtures::add_light(&f, &light_spec("noexp", "2025-01-01T00:00:00"));
+        f.conn
+            .execute(
+                "UPDATE frames SET exptime = NULL WHERE id = ?1",
+                params![no_exp_id],
+            )
+            .unwrap();
+        // Three known-EXPTIME frames so the "frames" gate (>= 3 included in
+        // ONE group) is satisfied by the known cluster alone — this test is
+        // about the warning, not about also tripping that unrelated gate.
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("known{i}"), t));
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("noexp.fits")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            !plan.blockers.iter().any(|b| b.code == "frames"),
+            "a missing EXPTIME is a warning, never a blocker: {:?}",
             plan.blockers
         );
     }

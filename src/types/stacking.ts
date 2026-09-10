@@ -110,12 +110,7 @@ hotPixelCorrection: boolean,
  */
 debayerOsc: boolean, };
 
-export type GroupingConfig = { 
-/**
- * Split an otherwise-matching group by `EXPTIME` (within
- * `exposure_tolerance_sec`) instead of merging mixed exposures.
- */
-splitByExposure: boolean, exposureToleranceSec: number, };
+export type GroupingConfig = { exposureToleranceSec: number, };
 
 export type MeasurementConfig = { weightMode: WeightMode, psfModel: PsfModel, 
 /**
@@ -159,7 +154,7 @@ export type PlanMaster = { setId: number, kind: MasterWork, imagetyp: string, fr
 
 export type PlanBlocker = { code: string, message: string, };
 
-export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, width: number, height: number, exposureS: number | null, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
+export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, cameras: Array<string>, exposureS: number | null, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
 /**
  * Frames (of `included_count`) whose `.athln` sidecar already exists on
  * disk (spec §9.3, M2) — `0` when local normalization is off. A

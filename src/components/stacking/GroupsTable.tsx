@@ -8,6 +8,14 @@ function formatExposure(totalExposureS: number): string {
   return `${minutes.toFixed(0)}m`;
 }
 
+/** The group key's own exposure-cluster token (`180s`, `0.39s`, `unknown`) —
+ *  mirrors the backend's `fmt_num` (2 decimals, trailing zeros trimmed). */
+function formatExposureToken(exposureS: number | null): string {
+  if (exposureS == null) return 'unknown';
+  const trimmed = exposureS.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return `${trimmed}s`;
+}
+
 export interface GroupsTableProps {
   groups: PlanGroup[];
 }
@@ -28,7 +36,7 @@ export function GroupsTable({ groups }: GroupsTableProps) {
             <th className="py-1.5 px-2 font-medium">Colour</th>
             <th className="py-1.5 px-2 font-medium">Filter</th>
             <th className="py-1.5 px-2 font-medium">Bin</th>
-            <th className="py-1.5 px-2 font-medium">Geometry</th>
+            <th className="py-1.5 px-2 font-medium">Exp</th>
             <th className="py-1.5 px-2 font-medium">Frames</th>
             <th className="py-1.5 px-2 font-medium">Exposure</th>
             <th className="py-1.5 px-2 font-medium">Cached</th>
@@ -38,11 +46,11 @@ export function GroupsTable({ groups }: GroupsTableProps) {
           {groups.map((g) => (
             <tr key={g.key} className="border-b border-border/50 last:border-0">
               <td className="py-1.5 px-2 text-content font-mono">{g.key}</td>
-              <td className="py-1.5 px-2 text-content-secondary">{g.instrume ?? '—'}</td>
+              <td className="py-1.5 px-2 text-content-secondary">{g.cameras.length > 0 ? g.cameras.join(' + ') : '—'}</td>
               <td className="py-1.5 px-2 text-content-secondary">{g.colorMode === 'osc' ? 'OSC' : 'Mono'}</td>
               <td className="py-1.5 px-2 text-content-secondary">{g.filter ?? '—'}</td>
               <td className="py-1.5 px-2 text-content-secondary tabular-nums">{g.binning}×{g.binning}</td>
-              <td className="py-1.5 px-2 text-content-secondary tabular-nums">{g.width}×{g.height}</td>
+              <td className="py-1.5 px-2 text-content-secondary tabular-nums">{formatExposureToken(g.exposureS)}</td>
               <td className="py-1.5 px-2 text-content-secondary tabular-nums">{g.includedCount}/{g.frameCount}</td>
               <td className="py-1.5 px-2 text-content-secondary tabular-nums">{formatExposure(g.totalExposureS)}</td>
               <td className="py-1.5 px-2 text-content-muted tabular-nums">

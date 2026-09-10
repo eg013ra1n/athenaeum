@@ -30,6 +30,7 @@ use athenaeum_core::db::Database;
 use athenaeum_core::geometry::{Linear, PixelMap};
 use athenaeum_core::integration::banded::BandPlanes;
 use athenaeum_core::integration::io_policy::IoPolicy;
+use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::integration::registered_source::{RegisteredFrame, RegisteredSource};
 use athenaeum_core::integration::source::FrameSource;
 use athenaeum_core::integration::storage_class::StorageClass;
@@ -360,8 +361,23 @@ registration row for each — run stacking through Register first); found {}",
         })
         .collect();
 
-    let width = group.width as usize;
-    let height = group.height as usize;
+    // Owner decision 2026-09-10: `IntegrationGroup` no longer carries a
+    // group-level width/height (a group's members can now differ in native
+    // geometry). This probe's own "reference" is `stack_frames[0]` (the
+    // best-weighted candidate, sorted above) — the same frame the real
+    // pipeline would pick a reference geometry from — so read ITS
+    // calibrated file's own dimensions, mirroring how `stacking::run`
+    // resolves `reference_width`/`reference_height` from the real
+    // reference frame.
+    let reference_plane = PlaneReader::open(&candidates[0].calibrated).unwrap_or_else(|e| {
+        eprintln!(
+            "opening reference candidate {}: {e}",
+            candidates[0].calibrated.display()
+        );
+        std::process::exit(1);
+    });
+    let width = reference_plane.width();
+    let height = reference_plane.height();
     let interpolation = cfg.registration.interpolation;
     let clamping = cfg.registration.clamping_threshold;
 
