@@ -864,7 +864,16 @@ export default function FrameSetDetail() {
           // Stacking is gated only on the set actually having light frames
           // (spec §11: "gated only on the set has lights"); the dev-only
           // flag came off with the M1 acceptance run (2026-09-10).
-          const stackingHasLights = (calibrationHierarchy?.total_frames ?? 0) > 0;
+          //
+          // Plan 5b final fix wave, review finding B6: gate on
+          // `stackingLightFrames` — the SAME LIGHT-frame list the tab itself
+          // reads (`detail.nights`, Light + FITS/XISF only) — not
+          // `calibrationHierarchy.total_frames` (a differently-scoped query
+          // through `imaging_nights` that can read zero, or fail to load,
+          // while the tab's own list is non-empty, and vice versa). A
+          // mismatch here disabled the tab with an untrue tooltip while
+          // `?tab=stacking` still rendered it — see the content branch below.
+          const stackingHasLights = stackingLightFrames.length > 0;
           const isStackingGated = key === 'stacking' && !stackingHasLights;
           const stackingTooltip =
             key === 'stacking' && !stackingHasLights ? 'This set has no light frames yet.' : undefined;
@@ -892,7 +901,13 @@ export default function FrameSetDetail() {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 min-h-0">
+      {/* Plan 5b final fix wave, review finding B7: `min-w-0` alongside the
+       *  existing `min-h-0` — a flex item's default `min-width: auto` lets a
+       *  wide descendant (the Stacking tab's Frames table) grow THIS
+       *  wrapper past the viewport instead of scrolling inside its own
+       *  `overflow-x-auto`, which is what left the whole page scrolled
+       *  horizontally after closing the provenance modal. */}
+      <div className="flex-1 min-h-0 min-w-0">
         {loadingCalibration ? (
           <div className="text-center py-12">
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto mb-4"></div>
@@ -902,19 +917,31 @@ export default function FrameSetDetail() {
           activeTab === 'history' ? (
             <FrameSetHistoryTab key={historyRefreshKey} frameSetId={parseInt(id!)} />
           ) : activeTab === 'stacking' ? (
-            // Fix round 1 (Task 3, Critical #2), belt-and-braces: `StackingTab`
-            // guards its own draft/persist state against a set switch
-            // internally (`draftForSetRef`), but a fresh mount per set is the
-            // simplest guarantee that a stale draft can never even momentarily
-            // exist under the new id. `ExportTab` below is NOT similarly keyed
-            // — verified, not matched here on purpose, since only `StackingTab`
-            // materializes a per-set override row a stale write could corrupt.
-            <StackingTab
-              key={id}
-              framesSetId={parseInt(id!)}
-              frameSetName={detail?.frames_set?.name ?? undefined}
-              lightFrames={stackingLightFrames}
-            />
+            // Plan 5b final fix wave, review finding B6: the tab-bar button
+            // above refuses to SELECT this tab with no light frames, but a
+            // `?tab=stacking` URL (initialTabFromUrl / the searchParams
+            // effect) sets `activeTab` directly and bypasses it — this
+            // branch is the actual content gate, checked against the same
+            // `stackingLightFrames` list the button and the tab itself use.
+            stackingLightFrames.length > 0 ? (
+              // Fix round 1 (Task 3, Critical #2), belt-and-braces: `StackingTab`
+              // guards its own draft/persist state against a set switch
+              // internally (`draftForSetRef`), but a fresh mount per set is the
+              // simplest guarantee that a stale draft can never even momentarily
+              // exist under the new id. `ExportTab` below is NOT similarly keyed
+              // — verified, not matched here on purpose, since only `StackingTab`
+              // materializes a per-set override row a stale write could corrupt.
+              <StackingTab
+                key={id}
+                framesSetId={parseInt(id!)}
+                frameSetName={detail?.frames_set?.name ?? undefined}
+                lightFrames={stackingLightFrames}
+              />
+            ) : (
+              <div className="text-center py-12 text-content-muted">
+                This set has no light frames yet.
+              </div>
+            )
           ) : activeTab === 'export' ? (
             <ExportTab
               frameSetId={parseInt(id!)}

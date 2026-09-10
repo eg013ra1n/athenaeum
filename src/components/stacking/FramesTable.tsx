@@ -172,6 +172,13 @@ export function buildFrameRows(
       // run, or one that's never survived to stage 1 in any run) — the
       // same "no run data yet" shape a row had before any run existed:
       // status comes from the manual-exclusion list alone.
+      //
+      // `group` is deliberately display-only here (Plan 5b final fix wave,
+      // click-through item A6): the plan's own groups know a frame's group
+      // only in aggregate (`PlanGroup.frameCount`, no per-frame membership),
+      // and `LightFrameRef` carries no instrument/filter/binning fields to
+      // derive it from client-side — the table's own tooltip on this cell
+      // ("assigned by the next run") is the fix, not a new backend call.
       const filename = filenameByFrameId.get(frameId) ?? `frame ${frameId}`;
       return {
         frameId,
@@ -343,7 +350,12 @@ export function FramesTable({
                     <td className="py-1.5 px-2 text-content font-mono truncate max-w-[220px]" title={r.filename}>
                       {r.filename}
                     </td>
-                    <td className="py-1.5 px-2 text-content-secondary font-mono">{r.group}</td>
+                    <td
+                      className="py-1.5 px-2 text-content-secondary font-mono"
+                      title={r.group === '—' ? 'assigned by the next run' : undefined}
+                    >
+                      {r.group}
+                    </td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.weight, 3)}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.fwhmPx, 2, ' px')}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.eccentricity, 3)}</td>

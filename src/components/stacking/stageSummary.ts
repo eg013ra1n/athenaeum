@@ -43,6 +43,24 @@ export const STAGES: readonly Stage[] = [
  *  `calibrate`'s own state (see `rowState` below). */
 export type BoardStage = Stage | 'debayer';
 
+/**
+ * The subset of `STAGES` that actually get their own `StageTiming` entry in
+ * `RunSummary.stages` (`run.rs`'s `rc.timings.push(…)` call sites) — used by
+ * `rowState`'s `finishedStages` derivation (A5). `normalize` has none (spec
+ * ruling 14: folded into `integrate_group` itself, only its own progress
+ * event exists) and `drizzle` is M3 work, always `off` in M1 — both are
+ * mirrored onto a real member below rather than included here.
+ */
+const TIMED_STAGES: readonly Stage[] = [
+  'masters',
+  'calibrate',
+  'measure',
+  'reference',
+  'register',
+  'integrate',
+  'output',
+];
+
 export type RowState =
   | 'ready'
   | 'blocked'
@@ -52,6 +70,7 @@ export type RowState =
   | 'done'
   | 'skipped'
   | 'failed'
+  | 'cancelled'
   | 'off';
 
 // ── Label maps ──────────────────────────────────────────────────────────
@@ -158,6 +177,16 @@ export function kernelLabel(v: DrizzleKernel): string {
   }
 }
 
+/**
+ * Up to 3 decimal places, trailing zeros trimmed — `0.005` stays `0.005`
+ * instead of rounding away to `0.01` (Plan 5b final fix wave, review item
+ * A1). Only `minWeight` needed this; every other number in `stageSummary`
+ * keeps its own `toFixed`.
+ */
+function formatUpTo3Decimals(v: number): string {
+  return Number(v.toFixed(3)).toString();
+}
+
 export function cleanupLabel(v: StackingConfig['output']['cleanup']): string {
   switch (v) {
     case 'keepAll': return 'keep all';
@@ -222,7 +251,7 @@ export function stageSummary(
       return `Global · ${outputNormLabel(config.normalization.output)} output · ${rejectionNormLabel(config.normalization.rejection)} rejection`;
     }
     case 'integrate':
-      return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${config.integration.minWeight.toFixed(2)}`;
+      return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${formatUpTo3Decimals(config.integration.minWeight)}`;
     case 'drizzle':
       if (!config.drizzle.enabled) return 'Off';
       return `${config.drizzle.scale}× · ${kernelLabel(config.drizzle.kernel)} kernel · drop ${config.drizzle.dropShrink.toFixed(2)}`;
@@ -283,8 +312,9 @@ function isBlockedBy(stage: BoardStage, blockers: readonly PlanBlocker[], config
  * | 2 | blockers   | no live run; the plan says this stage can't proceed.     |
  * | 3 | stale      | no live run, not blocked; a cached artifact is out of    |
  * |   |            | date and a re-run would redo this stage.                 |
- * | 4 | outcome    | no live run; the last finished run's coarse pass/fail/   |
- * |   |            | cancel (Task 4 refines this with per-group status).       |
+ * | 4 | outcome    | no live run; the last finished run's per-row status, from |
+ * |   |            | `finishedStages` when the caller has it (A5), else the    |
+ * |   |            | old coarse pass/fail/cancel.                               |
  * | 5 | ready      | nothing else applies.                                     |
  *
  * `progress` must be checked BEFORE `blockers`/`stale`: the backend's
@@ -292,6 +322,22 @@ function isBlockedBy(stage: BoardStage, blockers: readonly PlanBlocker[], config
  * register — `plan.rs`'s Gate 6 note), and the tab never re-plans mid-run,
  * so with the old order those three rows rendered "Stale" — and suppressed
  * their own live progress bar — for the whole run.
+ *
+ * `finishedStages` (Plan 5b final fix wave, click-through item A5) is the
+ * SAME run's `RunSummary.stages` list (just the `stage` field of each
+ * `StageTiming`), when the caller has it loaded — the caller's job to make
+ * sure it is the same run `outcome` describes, never a different one (an
+ * older run the user picked in the Results panel, say); pass `null`/
+ * `undefined` otherwise and step 4 falls back to the old coarse read.
+ * Typed example (no test runner for this file — see the skill's own note):
+ * ```ts
+ * // A run that got through Masters/Calibrate and was cancelled inside Measure:
+ * const finished: Stage[] = ['masters', 'calibrate'];
+ * rowState('masters', plan, undefined, cancelledOutcome, config, finished);   // 'done'
+ * rowState('calibrate', plan, undefined, cancelledOutcome, config, finished); // 'done'
+ * rowState('measure', plan, undefined, cancelledOutcome, config, finished);   // 'cancelled'
+ * rowState('reference', plan, undefined, cancelledOutcome, config, finished); // 'skipped'
+ * ```
  */
 export function rowState(
   stage: BoardStage,
@@ -299,13 +345,14 @@ export function rowState(
   progress: RunProgress | undefined,
   outcome: RunOutcome | undefined,
   config: StackingConfig,
+  finishedStages?: readonly Stage[] | null,
 ): RowState {
   // 0. Debayer is display-only — it mirrors `calibrate`'s own state for
   // sets that actually have an OSC group, and is `off` otherwise.
   if (stage === 'debayer') {
     const hasOsc = plan?.groups.some((g) => g.colorMode === 'osc') ?? false;
     if (!hasOsc) return 'off';
-    return rowState('calibrate', plan, progress, outcome, config);
+    return rowState('calibrate', plan, progress, outcome, config, finishedStages);
   }
 
   // 0. Drizzle is the only stage whose toggle turns the row fully off. Local
@@ -339,10 +386,35 @@ export function rowState(
   // 3. Staleness.
   if (plan?.staleStages.includes(stage)) return 'stale';
 
-  // 4. Coarse, run-wide fallback — Task 4's per-group/per-frame status (from
-  // `get_stacking_run`) will replace this with a real per-stage read.
+  // 4. The last finished run's per-row status.
   if (outcome) {
     if (outcome.success) return 'done';
+    // A5: a stage listed in `finishedStages` completed; the first one NOT
+    // listed (among the stages that actually GET a timing entry —
+    // `TIMED_STAGES`) is where the run stopped; everything after that
+    // never ran. `normalize` has no timing of its own (folded into
+    // `integrate_group`, spec ruling 14) — mirror `integrate`'s own read,
+    // same convention as `debayer` mirroring `calibrate` above. Known
+    // limitation, out of scope for this pass: `integrate` runs once PER
+    // GROUP, so a run cancelled mid-`integrate` on a LATER group still
+    // reads 'done' here if an EARLIER group's integrate already completed
+    // — a real per-group breakdown needs the run's own `groups` array
+    // (flagged as follow-up work before this fix existed).
+    if (finishedStages) {
+      const timedStage = stage === 'normalize' ? 'integrate' : stage;
+      const mine = TIMED_STAGES.indexOf(timedStage);
+      if (mine === -1) {
+        // Not one of the timeable stages (drizzle, still 'off' in M1) —
+        // fall through to the coarse read below rather than guess.
+      } else {
+        const firstUnfinished = TIMED_STAGES.findIndex((s) => !finishedStages.includes(s));
+        if (firstUnfinished === -1 || mine < firstUnfinished) return 'done';
+        if (mine === firstUnfinished) return outcome.cancelled ? 'cancelled' : 'failed';
+        return 'skipped';
+      }
+    }
+    // No matching run detail loaded yet (or a non-timeable stage) — old
+    // coarse read (every row the same state) rather than a wrong guess.
     if (outcome.cancelled) return 'skipped';
     return 'failed';
   }

@@ -1,6 +1,6 @@
 import { StageRow, type StageRowToggle } from './StageRow';
 import { rowState, stageSummary, type BoardStage } from './stageSummary';
-import type { StackingConfig, StackingPlan } from '../../types/stacking';
+import type { Stage, StackingConfig, StackingPlan } from '../../types/stacking';
 import type { RunOutcome, RunProgress } from '../../hooks/useStackingRuns';
 
 const ROWS: { stage: BoardStage; index: number; label: string }[] = [
@@ -21,6 +21,12 @@ export interface PipelineBoardProps {
   config: StackingConfig;
   progress: RunProgress | undefined;
   outcome: RunOutcome | undefined;
+  /** The `outcome` run's own finished-stage list (Plan 5b final fix wave,
+   *  click-through item A5) — `null`/`undefined` when the caller doesn't
+   *  have it loaded yet, or has a DIFFERENT run's detail loaded, in which
+   *  case `rowState` falls back to its old coarse per-row read. See
+   *  `rowState`'s own doc comment for the derivation. */
+  finishedStages?: readonly Stage[] | null;
   selectedStage: BoardStage;
   onSelectStage: (stage: BoardStage) => void;
   /** The Register row's only live control in M1 — everything else on the
@@ -36,6 +42,7 @@ export function PipelineBoard({
   config,
   progress,
   outcome,
+  finishedStages,
   selectedStage,
   onSelectStage,
   onToggleWriteRegisteredFrames,
@@ -72,7 +79,7 @@ export function PipelineBoard({
             index={index}
             stage={stage}
             label={label}
-            state={rowState(stage, plan, progress, outcome, config)}
+            state={rowState(stage, plan, progress, outcome, config, finishedStages)}
             summary={stageSummary(stage, config, plan)}
             progress={progress?.stage === stage ? progress : undefined}
             selected={selectedStage === stage}

@@ -108,6 +108,16 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const runOutcome = lastOutcome.get(framesSetId);
   const running = isRunning(framesSetId) || plan?.activeRunId != null;
 
+  // The board's per-row cancelled/failed derivation (A5) needs the SAME
+  // run's finished-stage list `outcome` describes — `selectedRunDetail`
+  // (Results panel's own fetch, shared here) only qualifies when its run id
+  // actually matches; a user browsing an OLDER run there must never leak
+  // into the board's read of the LATEST run's outcome.
+  const boardFinishedStages: Stage[] | null =
+    runOutcome && selectedRunDetail?.run.id === runOutcome.runId
+      ? (selectedRunDetail.summary?.stages.map((s) => s.stage) ?? [])
+      : null;
+
   // `refetchPlan` is called from four overlapping triggers (the mount
   // effect below calls the endpoint directly, not through here; but the
   // `library-updated` listener, the 300 ms debounce, and the outcome effect
@@ -556,7 +566,15 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
 
   return (
-    <div className="space-y-3">
+    // Plan 5b final fix wave, review finding B7 (supersedes click-through
+    // item A4): `min-w-0` on the tab's own root — a flex child (the tab
+    // content area FrameSetDetail.tsx renders this into) defaults to
+    // `min-width: auto`, which lets a wide descendant (the Frames table)
+    // grow the WHOLE PAGE instead of scrolling inside its own
+    // `overflow-x-auto` wrapper. The table already has that wrapper and
+    // `min-w-0`; this and the board/inspector split's own `min-w-0` below
+    // are what actually let it apply.
+    <div className="space-y-3 min-w-0">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-surface-elevated rounded-lg px-4 py-3">
         <div className="flex flex-wrap items-center gap-4 text-sm text-content-secondary">
@@ -699,6 +717,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             config={draftConfig}
             progress={runProgress}
             outcome={runOutcome}
+            finishedStages={boardFinishedStages}
             selectedStage={selectedStage}
             onSelectStage={handleSelectStage}
             onToggleWriteRegisteredFrames={handleToggleWriteRegisteredFrames}

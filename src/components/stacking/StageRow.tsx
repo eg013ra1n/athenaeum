@@ -34,6 +34,7 @@ const STATE_LABEL: Record<RowState, string> = {
   done: 'Done',
   skipped: 'Skipped',
   failed: 'Failed',
+  cancelled: 'Cancelled',
   off: 'Off',
 };
 
@@ -46,6 +47,7 @@ const STATE_CLASSES: Record<RowState, string> = {
   done: 'text-success',
   skipped: 'text-content-muted',
   failed: 'text-error',
+  cancelled: 'text-warning',
   off: 'text-content-muted',
 };
 
@@ -57,6 +59,7 @@ function StateGlyph({ state }: { state: RowState }) {
     case 'failed': return <XCircle size={14} className={cls} />;
     case 'blocked': return <AlertCircle size={14} className={cls} />;
     case 'stale': return <AlertCircle size={14} className={cls} />;
+    case 'cancelled':
     case 'off':
     case 'skipped':
       return <MinusCircle size={14} className={cls} />;
@@ -100,10 +103,25 @@ export function StageRow({ index, stage, label, state, summary, progress, select
                   style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }}
                 />
               </span>
-              <span className="tabular-nums">
-                {progress.current} / {progress.total} · {Math.round(progress.percent)}%
-              </span>
-              {progress.groupKey && <span className="truncate">{progress.groupKey}</span>}
+              {stage === 'integrate' ? (
+                // Plan 5b final fix wave, click-through item A3: Integrate's
+                // `current`/`total` are the PLANE/channel index within the
+                // group being integrated (`emit_integrate_tick`), not a
+                // frame count — pairing them with a per-group label read as
+                // a frame tally that never moved (`0 / 1 · 100 %`). One
+                // group integrates at a time, so the count adds nothing;
+                // show the group and the plane's own percent only.
+                <span className="tabular-nums truncate">
+                  {progress.groupKey ?? ''} · {Math.round(progress.percent)}%
+                </span>
+              ) : (
+                <>
+                  <span className="tabular-nums">
+                    {progress.current} / {progress.total} · {Math.round(progress.percent)}%
+                  </span>
+                  {progress.groupKey && <span className="truncate">{progress.groupKey}</span>}
+                </>
+              )}
             </span>
           ) : (
             summary
