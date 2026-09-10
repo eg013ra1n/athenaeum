@@ -331,9 +331,10 @@ function isBlockedBy(stage: BoardStage, blockers: readonly PlanBlocker[], config
  * `undefined` otherwise and step 4 falls back to the old coarse read.
  * Typed example (no test runner for this file — see the skill's own note):
  * ```ts
- * // A run that got through Masters/Calibrate and was cancelled inside Measure:
- * const finished: Stage[] = ['masters', 'calibrate'];
- * rowState('masters', plan, undefined, cancelledOutcome, config, finished);   // 'done'
+ * // A run that got through Calibrate (no masters work, so no `masters`
+ * // timing — that row is 'off') and was cancelled inside Measure:
+ * const finished: Stage[] = ['calibrate'];
+ * rowState('masters', plan, undefined, cancelledOutcome, config, finished);   // 'off'
  * rowState('calibrate', plan, undefined, cancelledOutcome, config, finished); // 'done'
  * rowState('measure', plan, undefined, cancelledOutcome, config, finished);   // 'cancelled'
  * rowState('reference', plan, undefined, cancelledOutcome, config, finished); // 'skipped'
@@ -389,17 +390,19 @@ export function rowState(
   // 4. The last finished run's per-row status.
   if (outcome) {
     if (outcome.success) return 'done';
-    // A5: a stage listed in `finishedStages` completed; the first one NOT
-    // listed (among the stages that actually GET a timing entry —
-    // `TIMED_STAGES`) is where the run stopped; everything after that
-    // never ran. `normalize` has no timing of its own (folded into
-    // `integrate_group`, spec ruling 14) — mirror `integrate`'s own read,
-    // same convention as `debayer` mirroring `calibrate` above. Known
-    // limitation, out of scope for this pass: `integrate` runs once PER
-    // GROUP, so a run cancelled mid-`integrate` on a LATER group still
-    // reads 'done' here if an EARLIER group's integrate already completed
-    // — a real per-group breakdown needs the run's own `groups` array
-    // (flagged as follow-up work before this fix existed).
+    // A5: the run stopped in the first timed stage AFTER the last one that
+    // has a timing entry — every stage up to and including the last timed
+    // one completed (a stage without an entry of its own counts as done
+    // when a later stage has one: `masters` pushes no timing when there is
+    // no masters work, which is most runs), the stop row reads
+    // 'cancelled'/'failed', everything after it never ran. `normalize` has
+    // no timing of its own (folded into `integrate_group`, spec ruling 14)
+    // — mirror `integrate`'s read, same convention as `debayer` mirroring
+    // `calibrate` above. `integrate`'s timing is pushed once after the
+    // whole group loop, so a cancel inside any group's integration reads
+    // 'cancelled' on the Integrate row. When nothing finished at all and
+    // the plan has no masters work, the stop row is `calibrate` — the
+    // Masters row is 'off' (returned above) and must not absorb the stop.
     if (finishedStages) {
       const timedStage = stage === 'normalize' ? 'integrate' : stage;
       const mine = TIMED_STAGES.indexOf(timedStage);
@@ -407,9 +410,15 @@ export function rowState(
         // Not one of the timeable stages (drizzle, still 'off' in M1) —
         // fall through to the coarse read below rather than guess.
       } else {
-        const firstUnfinished = TIMED_STAGES.findIndex((s) => !finishedStages.includes(s));
-        if (firstUnfinished === -1 || mine < firstUnfinished) return 'done';
-        if (mine === firstUnfinished) return outcome.cancelled ? 'cancelled' : 'failed';
+        let lastFinished = -1;
+        for (const s of finishedStages) {
+          lastFinished = Math.max(lastFinished, TIMED_STAGES.indexOf(s));
+        }
+        let stopAt = lastFinished + 1;
+        const mastersHasWork = (plan?.mastersToBuild.length ?? 0) > 0;
+        if (stopAt === 0 && !mastersHasWork) stopAt = 1;
+        if (stopAt >= TIMED_STAGES.length || mine < stopAt) return 'done';
+        if (mine === stopAt) return outcome.cancelled ? 'cancelled' : 'failed';
         return 'skipped';
       }
     }
