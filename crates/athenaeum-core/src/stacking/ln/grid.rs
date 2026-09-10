@@ -65,6 +65,17 @@ impl LnGrid {
         span.div_ceil(stride.max(1)) + 1
     }
 
+    /// `(gw, gh)` for a `width`×`height` plane at the given `stride` — the
+    /// same mesh geometry as [`Self::node_count`], shared with the M2
+    /// background model (`ln::background`) so the two never disagree about
+    /// where a node sits.
+    pub(crate) fn grid_dims(width: usize, height: usize, stride: usize) -> (usize, usize) {
+        (
+            Self::node_count(width, stride),
+            Self::node_count(height, stride),
+        )
+    }
+
     pub fn constant(ref_width: usize, ref_height: usize, scale: u32, a: f32, b: f32) -> LnGrid {
         let stride = (scale / 8).max(2) as usize;
         let gw = Self::node_count(ref_width, stride);
