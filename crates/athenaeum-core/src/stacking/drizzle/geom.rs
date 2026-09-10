@@ -34,6 +34,7 @@ pub const KERNEL_EPSILON: f64 = 0.025;
 /// output pixels `s·i .. s·i + s − 1`).
 #[inline]
 pub fn to_output(u: f64, scale: u32) -> f64 {
+    debug_assert!(scale >= 1, "drizzle scale must be >= 1 (R-M3-10), got 0");
     let s = scale as f64;
     s * u + (s - 1.0) / 2.0
 }
@@ -42,6 +43,7 @@ pub fn to_output(u: f64, scale: u32) -> f64 {
 /// [`to_output`].
 #[inline]
 pub fn to_reference(v: f64, scale: u32) -> f64 {
+    debug_assert!(scale >= 1, "drizzle scale must be >= 1 (R-M3-10), got 0");
     let s = scale as f64;
     (v - (s - 1.0) / 2.0) / s
 }
@@ -67,6 +69,26 @@ pub fn drop_corners(x: usize, y: usize, drop_shrink: f64) -> [(f64, f64); 4] {
 /// exactly on a pixel boundary contributes zero area on either side and is
 /// excluded from both) — or `None` when any mapped coordinate is not
 /// finite.
+///
+/// The single-point version of "the pixel whose extent contains a
+/// coordinate `v`" is `floor(v + 0.5)`, deliberately **not** `round(v)`:
+/// Rust's `f64::round` rounds half-away-from-zero, which disagrees with
+/// `floor(v + 0.5)` at every negative half-integer (`round(-0.5) == -1` but
+/// `floor(-0.5 + 0.5) == 0`), and this stage's mapped coordinates go
+/// negative routinely (an off-frame registration, or a mirrored frame like
+/// the `flipped_and_rotated_map_…` test below). The bbox itself goes one
+/// step further than either formula: it uses the stricter positive-overlap
+/// rule above for the whole continuous span (not just its two endpoints),
+/// which is what a boundary-exact span needs and neither `round` nor a
+/// bare `floor(v + 0.5)` resolves on its own — see `strict_ceil`/
+/// `strict_floor`.
+///
+/// The returned bbox is **not** clamped to any output-grid extent and may
+/// be empty (`x_max < x_min` / `y_max < y_min`, e.g. for `drop_shrink = 0`
+/// or a locally singular mapping whose span collapses onto an exact
+/// half-integer boundary) — callers must intersect it with their own
+/// bounds before iterating; the stage driver (a later task) intersects
+/// with its band rectangle.
 ///
 /// Signed-area orientation fix: [`clip_area`] assumes a counter-clockwise
 /// polygon; a flipped `PixelMap` mirrors the quad, so this reverses the
@@ -117,11 +139,15 @@ fn signed_area(pts: &[(f64, f64)]) -> f64 {
     if n < 3 {
         return 0.0;
     }
+    // Carry `prev` across the loop instead of an `(i + 1) % n` index per
+    // vertex: mathematically the same cyclic sum (shoelace is invariant
+    // under a cyclic shift of the starting vertex), just without the
+    // per-vertex modulo.
     let mut sum = 0.0;
-    for i in 0..n {
-        let (x0, y0) = pts[i];
-        let (x1, y1) = pts[(i + 1) % n];
-        sum += x0 * y1 - x1 * y0;
+    let mut prev = pts[n - 1];
+    for &curr in pts {
+        sum += prev.0 * curr.1 - curr.0 * prev.1;
+        prev = curr;
     }
     0.5 * sum
 }
@@ -161,20 +187,30 @@ fn strict_floor(v: f64) -> i64 {
 /// grows its vertex count by at most one, so four sequential half-plane
 /// clips of a 4-vertex quad never exceed 8 vertices — two fixed 16-slot
 /// buffers are ample headroom.
+///
+/// Ping-pongs between the two buffers by swapping the `&mut` REFERENCES
+/// (`cur`/`nxt`, each a pointer-sized `&mut [(f64, f64); 16]`), never the
+/// 256-byte arrays themselves — swapping the arrays by value defeated LLVM's
+/// SROA (the dynamic `count`/`n` indexing keeps them off the stack in
+/// registers either way) and cost a measured 2.4× per call in this stage's
+/// innermost loop (one call per source-pixel × overlapped-output-pixel
+/// pair).
 pub fn clip_area(quad: &Quad, px: i64, py: i64) -> f64 {
     let x_lo = px as f64 - 0.5;
     let x_hi = px as f64 + 0.5;
     let y_lo = py as f64 - 0.5;
     let y_hi = py as f64 + 0.5;
 
-    let mut cur: [(f64, f64); 16] = [(0.0, 0.0); 16];
-    let mut nxt: [(f64, f64); 16] = [(0.0, 0.0); 16];
-    cur[..4].copy_from_slice(&quad[..]);
+    let mut buf_a: [(f64, f64); 16] = [(0.0, 0.0); 16];
+    let mut buf_b: [(f64, f64); 16] = [(0.0, 0.0); 16];
+    buf_a[..4].copy_from_slice(&quad[..]);
+    let mut cur = &mut buf_a;
+    let mut nxt = &mut buf_b;
     let mut n = 4usize;
 
     macro_rules! clip_pass {
         ($inside:expr, $intersect:expr) => {{
-            n = clip_half_plane(&cur[..n], &mut nxt, $inside, $intersect);
+            n = clip_half_plane(&cur[..n], nxt, $inside, $intersect);
             std::mem::swap(&mut cur, &mut nxt);
             if n == 0 {
                 return 0.0;
@@ -228,12 +264,14 @@ fn clip_half_plane(
     if n == 0 {
         return 0;
     }
+    // Carry the previous vertex's `inside` flag across the loop instead of
+    // recomputing it for both `prev` and `curr` every iteration — `n + 1`
+    // evaluations instead of `2n`.
     let mut count = 0;
-    for i in 0..n {
-        let curr = input[i];
-        let prev = input[(i + n - 1) % n];
+    let mut prev = input[n - 1];
+    let mut prev_in = inside(prev);
+    for &curr in input {
         let curr_in = inside(curr);
-        let prev_in = inside(prev);
         if curr_in {
             if !prev_in {
                 output[count] = intersect(prev, curr);
@@ -245,6 +283,8 @@ fn clip_half_plane(
             output[count] = intersect(prev, curr);
             count += 1;
         }
+        prev = curr;
+        prev_in = curr_in;
     }
     count
 }
@@ -266,12 +306,22 @@ pub struct KernelTable {
 /// (circle: 1 inside radius `drop_shrink / 2`, 0 outside; gaussian:
 /// `exp(−r² / (2σ²))`, `σ = (drop_shrink / 2) / sqrt(−2·ln(KERNEL_EPSILON))`),
 /// then every weight is rescaled so the 256 of them sum to `drop_shrink²`
-/// (so the tabulated kernel carries the same total mass [`clip_area`] gives
-/// a square kernel).
+/// **in SOURCE-pixel units** — the drop's own area before any mapping.
+/// [`clip_area`] measures the mapped drop in OUTPUT-pixel units instead,
+/// i.e. `s²` times as much (ruling R-M3-2) — the two are not directly
+/// comparable, and the stage driver's `I`/`W` accumulator (`I += a·w·N`,
+/// `W += a·w`, final value `I / W`) cancels any constant factor common to
+/// every deposit, so this difference costs nothing in practice. It is
+/// flagged here so a later reader does not "fix" a perceived mismatch by
+/// inserting a stray `s²` into this function.
 pub fn kernel_table(kernel: DrizzleKernel, drop_shrink: f64) -> Option<KernelTable> {
     if kernel == DrizzleKernel::Square {
         return None;
     }
+    debug_assert!(
+        drop_shrink.is_finite() && drop_shrink > 0.0,
+        "drop_shrink must be finite and positive, got {drop_shrink}"
+    );
     let h = drop_shrink / 2.0;
     let cell = drop_shrink / KERNEL_GRID_SIZE as f64;
     let sigma = h / (-2.0 * KERNEL_EPSILON.ln()).sqrt();
@@ -331,14 +381,6 @@ mod tests {
         PixelMap::linear(Linear {
             kind: LinearKind::Affine,
             m: [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
-        })
-        .unwrap()
-    }
-
-    fn mirror_map() -> PixelMap {
-        PixelMap::linear(Linear {
-            kind: LinearKind::Affine,
-            m: [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         })
         .unwrap()
     }
@@ -426,14 +468,40 @@ mod tests {
 
     // (f)
     #[test]
-    fn flipped_map_reorders_to_ccw_and_still_conserves_area() {
-        let map = mirror_map();
+    fn flipped_and_rotated_map_reorders_to_ccw_and_conserves_area() {
+        // A pure axis-aligned mirror maps a square drop to another
+        // axis-aligned square, which can land entirely inside a single
+        // output pixel — a degenerate "conservation" check that would pass
+        // even if the clipping were badly broken, since no half-plane
+        // actually cuts anything. Composing the mirror with a 30° rotation
+        // (and a translation, for realism — the pipeline's own flipped
+        // maps always carry one) keeps the negative determinant but makes
+        // the mapped quad non-axis-aligned, so it genuinely straddles
+        // multiple output pixels and the clip + orientation fix are both
+        // really exercised.
+        let r = 30f64.to_radians();
+        let (s, c) = r.sin_cos();
+        let map = PixelMap::linear(Linear {
+            kind: LinearKind::Affine,
+            m: [[-c, -s, 0.3], [-s, c, -0.2], [0.0, 0.0, 1.0]],
+        })
+        .unwrap();
+        assert!(
+            map.is_flipped(),
+            "the composed map must keep a negative determinant"
+        );
+
         let corners = drop_corners(5, 5, 0.9);
         let (quad, (x_min, y_min, x_max, y_max)) = map_drop(&map, &corners, 1).expect("finite map");
         assert!(
             signed_area(&quad) > 0.0,
             "expected a CCW quad after the flip fix"
         );
+        assert!(
+            (x_max - x_min + 1) * (y_max - y_min + 1) > 1,
+            "expected the quad to straddle more than one output pixel: bbox=({x_min},{y_min},{x_max},{y_max})"
+        );
+
         let mut total = 0.0;
         for py in y_min..=y_max {
             for px in x_min..=x_max {
@@ -505,13 +573,31 @@ mod tests {
         // (r = h), so its weight is well under epsilon, not "~= epsilon" (an
         // inscribed-circle-vs-square-corner fact, not an implementation
         // choice) -- see task-1-report.md for the derivation. Pin the
-        // qualitative shape (center is the max, corner is a small, still
-        // nonzero, fraction of it) instead of a specific ratio to epsilon.
+        // qualitative shape first (center is the max, corner is a small,
+        // still nonzero, fraction of it)...
         assert!(
             corner_w < center_w * 0.05,
             "corner_w={corner_w} center_w={center_w}"
         );
         assert!(corner_w > 0.0, "the gaussian never hits an exact zero");
+
+        // ...then an exact, analytically derivable pin on top: the corner
+        // cell centres at i,j in {0,15} (r^2/h^2 = 2*(15/16)^2 = 1.7578125)
+        // and the centre-most cells at i,j in {7,8} (r^2/h^2 =
+        // 2*(0.5/16)^2 = 0.0078125), so corner_w/center_w =
+        // exp(-(r_corner^2 - r_centre^2)/(2*sigma^2)) =
+        // KERNEL_EPSILON^(delta(r^2)/h^2), and delta(r^2)/h^2 = 1.7578125
+        // - 0.0078125 = 1.75 exactly. This is the one pin that actually
+        // protects `sigma`/`KERNEL_EPSILON`: unlike the `< 5%` check above
+        // (or the weight-sum check, which any normalized sigma passes by
+        // construction), a wrong sigma such as `h/2` or `h/sqrt(-ln(eps))`
+        // still clears `< 5%` but fails this exact ratio.
+        let ratio = corner_w / center_w;
+        let expect = KERNEL_EPSILON.powf(1.75);
+        assert!(
+            (ratio - expect).abs() < 1e-9,
+            "ratio={ratio} expect={expect}"
+        );
     }
 
     #[test]
