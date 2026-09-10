@@ -289,6 +289,36 @@ pub struct GroupProgress<'a> {
     pub engine: EngineProgress<'a>,
 }
 
+/// The two `GroupInput` sanity checks every direct consumer of its
+/// `reference`/`channels` fields needs before it can safely index into
+/// `frames` with them: the reference index must be in range, and every
+/// frame's own measurement must carry as many channels as the group
+/// declares (a short one would silently index out of bounds inside
+/// `integrate_planes`'s per-plane loop otherwise). Shared by
+/// `integrate_group` and `stacking::ln::reference::build_reference` (M2
+/// Task 4) so the two checks — and their error texts — cannot drift apart.
+pub(crate) fn validate_group_input(input: &GroupInput<'_>) -> Result<(), IntegrationError> {
+    let frames = input.frames;
+    if input.reference >= frames.len() {
+        return Err(IntegrationError::BadInput(format!(
+            "reference index {} out of range for {} frames",
+            input.reference,
+            frames.len()
+        )));
+    }
+    for (i, f) in frames.iter().enumerate() {
+        if f.measurement.channels.len() != input.channels {
+            return Err(IntegrationError::BadInput(format!(
+                "frame {i} ({}) has {} measured channels, the group has {}",
+                f.path.display(),
+                f.measurement.channels.len(),
+                input.channels
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The per-plane engine loop shared by [`integrate_group`] and the LN
 /// reference builder (`stacking::ln::reference::build_reference`, M2 Task
 /// 4): for every plane, builds the rejection/output normalization pairs of
@@ -415,23 +445,7 @@ pub fn integrate_group(
             frames.len()
         )));
     }
-    if input.reference >= frames.len() {
-        return Err(IntegrationError::BadInput(format!(
-            "reference index {} out of range for {} frames",
-            input.reference,
-            frames.len()
-        )));
-    }
-    for (i, f) in frames.iter().enumerate() {
-        if f.measurement.channels.len() != input.channels {
-            return Err(IntegrationError::BadInput(format!(
-                "frame {i} ({}) has {} measured channels, the group has {}",
-                f.path.display(),
-                f.measurement.channels.len(),
-                input.channels
-            )));
-        }
-    }
+    validate_group_input(input)?;
     if input.normalization.rejection == RejectionNormalization::Local {
         return Err(IntegrationError::BadInput(
             "local normalization is M2; use scaleZeroOffset or equalizeFluxes".into(),
@@ -571,6 +585,17 @@ pub fn integrate_group(
     )?;
 
     for (p, out) in outputs.into_iter().enumerate() {
+        // `integrate_planes` already checks `cancel` before each plane's own
+        // engine work, but the tail below runs a real (non-trivial) master
+        // measurement per plane — without this check here, a cancel raised
+        // while `integrate_planes` was finishing its last plane would still
+        // let every remaining tail iteration run its measurement before this
+        // function notices, instead of stopping at the next plane boundary
+        // the way the pre-extraction single loop did.
+        if cancel.load(Ordering::Relaxed) {
+            warn!(plane = p, "group integration cancelled");
+            return Err(IntegrationError::Cancelled);
+        }
         // `integrate_planes` no longer exposes a per-plane wall-clock split
         // (it runs every plane's `RegisteredSource::open` + `integrate_stack`
         // before this tail even starts), so the logged `duration_ms` below is
@@ -643,9 +668,10 @@ pub fn integrate_group(
         };
         snr_gain.push(gain);
 
-        let plane_duration_ms =
-            (out.base.read_duration + out.base.combine_duration + stats_start.elapsed())
-                .as_millis() as u64;
+        let plane_duration_ms = (out.base.read_duration
+            + out.base.combine_duration
+            + stats_start.elapsed())
+        .as_millis() as u64;
         debug!(
             plane = p,
             rejected_low = out.rejected_low,

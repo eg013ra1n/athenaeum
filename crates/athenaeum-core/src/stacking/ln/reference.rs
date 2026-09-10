@@ -24,15 +24,15 @@ use anyhow::Context;
 use tracing::info;
 
 use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
-use crate::integration::band_budget::FALLBACK_BUDGET_BYTES;
 use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
 use crate::integration::engine::EngineProgress;
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{OutputNormalization, RejectionNormalization};
-use crate::integration::storage_class::{self, StorageClass};
 use crate::integration::IntegrationError;
-use crate::stacking::integrate::{integrate_planes, GroupInput, GroupProgress};
+use crate::stacking::integrate::{
+    integrate_planes, validate_group_input, GroupInput, GroupProgress,
+};
 use crate::stacking::master_cards::ATH_STK_VERSION;
 
 /// A group's LN reference: one `width × height` plane per channel, plus
@@ -76,19 +76,34 @@ pub struct LnReference {
 /// included frames falls back to global normalization with a warning,
 /// never a hard failure — but that fallback is the CALLER's job (Task 5),
 /// not this function's; `build_reference` only ever reports the refusal.
+/// [`validate_group_input`] runs first — the same reference-range and
+/// per-frame channel-count checks `integrate_group` performs, shared so a
+/// malformed `GroupInput` is refused here too instead of indexing out of
+/// bounds inside `integrate_planes`.
+///
+/// `io` is the run's own [`IoPolicy`] — the same one `integrate_group`
+/// takes, resolved once per run from the user's `integration.band_budget_mb`
+/// setting and the frames' storage class (`run.rs`'s
+/// `integration::io_policy::resolve` call, over the same calibrated files
+/// this reference reads) — never minted locally, so a network-classified
+/// group still gets its `Network` read-concurrency clamp and the user's
+/// configured band budget actually applies to a reference build too.
 ///
 /// `on_progress` receives `(plane_index, planes_total)` exactly like
 /// [`GroupProgress::on_plane`] — band/combine-level progress inside the
 /// engine is not surfaced (a no-op is passed through internally), since a
 /// reference build is a small, second-order piece of a group's work.
+#[allow(clippy::too_many_arguments)]
 pub fn build_reference(
     input: &GroupInput<'_>,
     included: &[usize],
     n: usize,
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
+    io: IoPolicy,
     on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<LnReference, IntegrationError> {
+    validate_group_input(input)?;
     if included.len() < 3 {
         return Err(IntegrationError::BadInput(format!(
             "{} included frames, need at least 3 for an LN reference",
@@ -125,14 +140,13 @@ pub fn build_reference(
     // normalization" — no weight scheme is named, and a reference meant to
     // be a plain, low-noise stand-in has no reason to favor one of its own
     // best-weighted members over another).
-    let weights: Vec<Vec<f32>> = vec![vec![1.0f32; input.channels]; frames_used.len()];
-    let recipe = IntegrationRecipe {
-        combination: Combination::Average,
-        rejection: Rejection::LinearFitClip {
-            sigma_low: 5.0,
-            sigma_high: 3.5,
-        },
-    };
+    let weights = reference_weights(input.channels, frames_used.len());
+    let ReferenceRecipe {
+        recipe,
+        output_mode,
+        rejection_mode,
+        write_maps,
+    } = reference_recipe();
 
     let on_band = |_: usize, _: usize, _: u64, _: u64| {};
     let progress = GroupProgress {
@@ -142,31 +156,15 @@ pub fn build_reference(
             on_combine: &on_band,
         },
     };
-    // No DB/settings connection reaches this layer — `build_reference`'s
-    // signature (M2 Task 4 brief) carries no `IoPolicy` for the caller to
-    // hand down, unlike `integrate_group`'s. A conservative local-disk
-    // default: the same `FALLBACK_BUDGET_BYTES` `io_policy::resolve` itself
-    // falls back to when settings are unreadable, and the same
-    // `read_concurrency` a `Local`-classified path with no configured
-    // override resolves to (`pool_threads.max(1)`).
-    let io = IoPolicy {
-        band_budget_bytes: FALLBACK_BUDGET_BYTES,
-        read_concurrency: storage_class::read_concurrency(
-            StorageClass::Local,
-            0,
-            pool.current_num_threads(),
-        ),
-        storage: StorageClass::Local,
-    };
 
     let outputs = integrate_planes(
         input,
         &frames_used,
         &weights,
-        OutputNormalization::AdditiveWithScaling,
-        RejectionNormalization::ScaleZeroOffset,
+        output_mode,
+        rejection_mode,
         recipe,
-        false, // no rejection maps
+        write_maps,
         pool,
         cancel,
         &progress,
@@ -181,6 +179,44 @@ pub fn build_reference(
         planes,
         frames_used,
     })
+}
+
+/// The fixed integration choices spec §5.2 mandates for a group's LN
+/// reference, independent of the group's own configured combination/
+/// rejection/normalization (`input.integration`/`input.normalization`):
+/// linear-fit rejection `5.0`/`3.5`, `Average` combination, output
+/// normalization `AdditiveWithScaling`, rejection normalization
+/// `ScaleZeroOffset`, no rejection maps. Pulled into one function — and
+/// pinned directly by a unit test — so a future refactor of
+/// `build_reference` can never let the group's own config leak into what
+/// must always be these same four choices.
+struct ReferenceRecipe {
+    recipe: IntegrationRecipe,
+    output_mode: OutputNormalization,
+    rejection_mode: RejectionNormalization,
+    write_maps: bool,
+}
+
+fn reference_recipe() -> ReferenceRecipe {
+    ReferenceRecipe {
+        recipe: IntegrationRecipe {
+            combination: Combination::Average,
+            rejection: Rejection::LinearFitClip {
+                sigma_low: 5.0,
+                sigma_high: 3.5,
+            },
+        },
+        output_mode: OutputNormalization::AdditiveWithScaling,
+        rejection_mode: RejectionNormalization::ScaleZeroOffset,
+        write_maps: false,
+    }
+}
+
+/// Equal (`1.0`) per-channel weight for every one of `n` selected frames —
+/// spec §5.2 names no weighting scheme for the reference, so every member
+/// counts the same regardless of its own weight in the group.
+fn reference_weights(channels: usize, n: usize) -> Vec<Vec<f32>> {
+    vec![vec![1.0f32; channels]; n]
 }
 
 /// The cards every LN reference carries regardless of caller: `IMAGETYP`
@@ -255,9 +291,12 @@ mod tests {
     use crate::fits_parser::FitsHeader;
     use crate::fits_writer::write_fits_f32;
     use crate::geometry::{Linear, PixelMap};
+    use crate::integration::storage_class::StorageClass;
     use crate::resample::Interpolation;
     use crate::stacking::integrate::{IntegrationConfig, NormalizationConfig, StackFrame};
-    use crate::stacking::measure::{measure_frame, MeasureOptions};
+    use crate::stacking::measure::{
+        measure_frame, ChannelMeasurement, FrameMeasurement, MeasureOptions,
+    };
     use crate::stacking::weights::FrameWeight;
     use crate::test_support::add_noise;
     use std::sync::Mutex;
@@ -267,6 +306,17 @@ mod tests {
             .num_threads(2)
             .build()
             .unwrap()
+    }
+
+    /// Same shape as `stacking::integrate::tests`'s own `io()` helper — a
+    /// generous local-storage policy that never becomes the bottleneck in a
+    /// small synthetic fixture.
+    fn io(band_budget_bytes: usize) -> IoPolicy {
+        IoPolicy {
+            band_budget_bytes,
+            read_concurrency: 2,
+            storage: StorageClass::Local,
+        }
     }
 
     fn identity_map() -> PixelMap {
@@ -354,7 +404,16 @@ mod tests {
         let seen = Mutex::new(Vec::new());
         let on_progress = |p: usize, total: usize| seen.lock().unwrap().push((p, total));
 
-        let r = build_reference(&input, &included, 3, &pool, &cancel, &on_progress).unwrap();
+        let r = build_reference(
+            &input,
+            &included,
+            3,
+            &pool,
+            &cancel,
+            io(20_000_000),
+            &on_progress,
+        )
+        .unwrap();
 
         // Weights: idx3=1.0, idx1=0.9, idx5=0.8, idx0=0.5, idx2=0.3, idx4=0.1
         // — the top three, sorted descending, are [3, 1, 5].
@@ -392,10 +451,95 @@ mod tests {
         let pool = pool();
         let cancel = AtomicBool::new(false);
         let on_progress = |_: usize, _: usize| {};
-        let err = build_reference(&input, &[0, 1], 3, &pool, &cancel, &on_progress).unwrap_err();
+        let err = build_reference(
+            &input,
+            &[0, 1],
+            3,
+            &pool,
+            &cancel,
+            io(20_000_000),
+            &on_progress,
+        )
+        .unwrap_err();
         match err {
             IntegrationError::BadInput(msg) => assert!(msg.contains("at least 3"), "{msg}"),
             other => panic!("expected BadInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_with_the_wrong_channel_count_is_refused_not_panicked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut frames, _raw) = six_frame_group(dir.path());
+        // Corrupt one frame's own measurement to claim 2 channels while the
+        // group (and every other frame) says 1 — `integrate_planes` would
+        // index `measurement.channels[p]` out of bounds on this frame for
+        // any `p >= 1` if `validate_group_input` didn't catch it first.
+        frames[2].measurement = FrameMeasurement {
+            width: 96,
+            height: 64,
+            channels: vec![ChannelMeasurement::default(); 2],
+            duration_ms: 0,
+        };
+        let included: Vec<usize> = (0..6).collect();
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: 96,
+            height: 64,
+            channels: 1,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+        };
+        let pool = pool();
+        let cancel = AtomicBool::new(false);
+        let on_progress = |_: usize, _: usize| {};
+        let err = build_reference(
+            &input,
+            &included,
+            3,
+            &pool,
+            &cancel,
+            io(20_000_000),
+            &on_progress,
+        )
+        .unwrap_err();
+        match err {
+            IntegrationError::BadInput(msg) => {
+                assert!(msg.contains("frame 2"), "{msg}");
+                assert!(msg.contains("measured channels"), "{msg}");
+            }
+            other => panic!("expected BadInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_recipe_is_pinned_to_the_fixed_choices() {
+        let r = reference_recipe();
+        assert_eq!(r.recipe.combination, Combination::Average);
+        assert_eq!(
+            r.recipe.rejection,
+            Rejection::LinearFitClip {
+                sigma_low: 5.0,
+                sigma_high: 3.5,
+            }
+        );
+        assert_eq!(r.output_mode, OutputNormalization::AdditiveWithScaling);
+        assert_eq!(r.rejection_mode, RejectionNormalization::ScaleZeroOffset);
+        assert!(
+            !r.write_maps,
+            "the LN reference never writes rejection maps"
+        );
+
+        // Equal weighting: every one of `n` rows is all-`1.0`, `channels` wide.
+        let w = reference_weights(3, 4);
+        assert_eq!(w.len(), 4);
+        for row in &w {
+            assert_eq!(row, &vec![1.0f32; 3]);
         }
     }
 
