@@ -275,6 +275,14 @@ fn to_group_frame(m: &LightMember) -> GroupFrame {
 /// indices are restored to `members`' own order (date_obs then id) before
 /// being handed back, so the exposure sort used to detect clusters never
 /// leaks into a group's frame order.
+///
+/// `cfg.exposure_tolerance_sec` itself is trusted here — `config::
+/// resolve_config` (fix round 1, minor 5) already clamps it to
+/// [`crate::stacking::config::MIN_EXPOSURE_TOLERANCE_SEC`] before a
+/// `GroupingConfig` ever reaches this function, so a zero/negative/NaN
+/// stored value (which would let two distinct clusters format to the same
+/// `fmt_num` token and collide on `stacking_run_groups`'s
+/// `UNIQUE(run_id, group_key)`) can never arrive here.
 fn cluster_indices(
     members: &[LightMember],
     cfg: &GroupingConfig,
@@ -410,6 +418,13 @@ pub fn group_frames(
                 .collect();
             cameras.sort();
             cameras.dedup();
+            // Fix round 1, minor 6: every member of this cluster carries no
+            // usable INSTRUME (NULL/blank) — the same "unknown" fallback
+            // the key itself used before camera left it, so `ATH_STKC` and
+            // the Camera cell say something honest instead of an empty list.
+            if cameras.is_empty() {
+                cameras.push("unknown".to_string());
+            }
 
             let key = compose_key(color, &filter_token, binning, label);
             groups.push(IntegrationGroup {
@@ -515,6 +530,47 @@ mod tests {
         );
         assert_eq!(g[0].instrume.as_deref(), Some("ATR2600M"));
         assert_eq!(g[0].key, "mono__NoFilter__bin1__180s");
+    }
+
+    /// Fix round 1, minor 6: every member of a cluster with no usable
+    /// `INSTRUME` (NULL, seeded here via a direct `UPDATE` — `LightSpec`'s
+    /// own `instrume` field is a plain `&str`, so a NULL row isn't
+    /// expressible through the shared fixture builder) must not leave
+    /// `cameras` empty — `ATH_STKC` and the Camera cell need something
+    /// honest to show, the same "unknown" fallback the key itself used to
+    /// fall back to before camera left it.
+    #[test]
+    fn all_null_instrume_group_falls_back_to_unknown_camera() {
+        let f = test_fixtures::frame_set("s");
+        let (id, _) = test_fixtures::add_light(
+            &f,
+            &LightSpec {
+                stem: "noinstrume",
+                instrume: "placeholder",
+                filter: None,
+                binning: 1,
+                width: 8,
+                height: 8,
+                exptime: 60.0,
+                date_obs: "2025-01-01T00:00:00",
+                bayerpat: None,
+                write_file: false,
+            },
+        );
+        f.conn
+            .execute(
+                "UPDATE frames SET instrume = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let g = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].cameras, vec!["unknown".to_string()]);
+        assert_eq!(
+            g[0].instrume, None,
+            "the display field stays honestly absent"
+        );
     }
 
     #[test]

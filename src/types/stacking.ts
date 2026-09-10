@@ -108,7 +108,12 @@ hotPixelCorrection: boolean,
  */
 debayerOsc: boolean, };
 
-export type GroupingConfig = { exposureToleranceSec: number, };
+export type GroupingConfig = { 
+/**
+ * Clamped to a floor of [`MIN_EXPOSURE_TOLERANCE_SEC`] by
+ * [`resolve_config`] — never trusted raw from a stored document.
+ */
+exposureToleranceSec: number, };
 
 export type MeasurementConfig = { weightMode: WeightMode, psfModel: PsfModel, 
 /**
@@ -177,7 +182,20 @@ mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number,
 
 export type StackingRunRow = { id: number, framesSetId: number, status: string, startedAt: string, finishedAt: string | null, configJson: string, configHash: string, referenceFrameId: number | null, referenceMode: string, workingDir: string, outputDir: string, summaryJson: string | null, error: string | null, };
 
-export type StackingRunGroupRow = { id: number, runId: number, groupKey: string, instrume: string | null, colorMode: string, filter: string | null, binning: number | null, width: number | null, height: number | null, exposure: number | null, frameCount: number, includedCount: number, masterPath: string | null, drizzlePath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, statsJson: string | null, status: string, error: string | null, };
+export type StackingRunGroupRow = { id: number, runId: number, groupKey: string, instrume: string | null, colorMode: string, filter: string | null, binning: number | null, 
+/**
+ * Owner decision 2026-09-10 (groups are camera-agnostic): the group's
+ * reference-ANCHOR member's own native `NAXIS1`/`NAXIS2`
+ * (`stacking::run::group_anchor_geometry`), recorded once at
+ * `insert_group` time — NOT the run's actual output/reference geometry
+ * (`RunContext::reference_width`/`height`, resolved later, in stage 5
+ * Register). There is no post-Register write-back today (`GroupUpdate`
+ * carries no width/height field), so a group whose reference frame
+ * ends up being a DIFFERENT camera than its anchor member will show
+ * this row's `width`/`height` as that anchor's size, not the actual
+ * master's.
+ */
+width: number | null, height: number | null, exposure: number | null, frameCount: number, includedCount: number, masterPath: string | null, drizzlePath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, statsJson: string | null, status: string, error: string | null, };
 
 export type StackingRunFrameRow = { id: number, runId: number, groupId: number, frameId: number, included: boolean, exclusionReason: string | null, weight: number | null, weightChannelsJson: string | null, metricsJson: string | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, };
 

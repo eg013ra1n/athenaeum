@@ -3819,6 +3819,7 @@ fn process_group_output(
     let name = master_file_name(
         &rc.set_name,
         group.filter.as_deref(),
+        group.color_mode,
         group.exposure_s,
         output.stats.included,
     );

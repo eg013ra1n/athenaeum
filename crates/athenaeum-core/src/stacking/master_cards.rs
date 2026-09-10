@@ -16,6 +16,7 @@ use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::wcs::wcs_cards;
 use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
 use crate::plate_solve::storage::PlateSolveRecord;
+use crate::stacking::groups::ColorMode;
 use crate::stacking::integrate::GroupOutput;
 use crate::stacking::register::writer::REGISTERED_COPY_THROUGH;
 
@@ -56,13 +57,19 @@ pub struct MasterCardInputs<'a> {
 /// `.with_comment()` — a comment would need to fit in the same record as a
 /// caller string that can already be this long). `format_card` would
 /// happily chain a longer string across `CONTINUE` cards, but a camera list
-/// is auxiliary metadata, not worth that — truncated with `…` instead.
+/// is auxiliary metadata, not worth that — truncated with `...` (three
+/// ASCII dots, fix round 1: `…` is non-ASCII — `fits_writer::card::
+/// sanitize_text` silently rewrites a non-ASCII byte to `?` and logs
+/// `warn!("non-ASCII characters in header value sanitized")` on every long
+/// camera list, which would have fired on every truncated `ATH_STKC`).
 const ATH_STKC_MAX_CHARS: usize = 68;
+const ATH_STKC_MARKER: &str = "...";
 
 /// Sorted, comma-joined camera list for `ATH_STKC`, truncated to
-/// [`ATH_STKC_MAX_CHARS`] with a trailing `…` when it would otherwise
-/// overflow one FITS card. Re-sorts/dedupes defensively rather than trusting
-/// the caller's own `IntegrationGroup.cameras` invariant.
+/// [`ATH_STKC_MAX_CHARS`] TOTAL (including the marker itself) with a
+/// trailing [`ATH_STKC_MARKER`] when it would otherwise overflow one FITS
+/// card. Re-sorts/dedupes defensively rather than trusting the caller's own
+/// `IntegrationGroup.cameras` invariant.
 fn format_cameras_card(cameras: &[String]) -> String {
     let mut sorted: Vec<&str> = cameras.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -71,11 +78,9 @@ fn format_cameras_card(cameras: &[String]) -> String {
     if joined.chars().count() <= ATH_STKC_MAX_CHARS {
         joined
     } else {
-        let truncated: String = joined
-            .chars()
-            .take(ATH_STKC_MAX_CHARS.saturating_sub(1))
-            .collect();
-        format!("{truncated}…")
+        let keep = ATH_STKC_MAX_CHARS.saturating_sub(ATH_STKC_MARKER.len());
+        let truncated: String = joined.chars().take(keep).collect();
+        format!("{truncated}{ATH_STKC_MARKER}")
     }
 }
 
@@ -182,19 +187,24 @@ fn blank(s: Option<&str>) -> Option<&str> {
 }
 
 /// §9.5 (owner decision 2026-09-10 — groups are camera-agnostic, so the
-/// camera token is gone): `<set slug>_<filter>_<exp>s_<n>x.fits`, or
-/// `<set slug>_<filter>_unknown_<n>x.fits` for the group of frames with no
-/// `EXPTIME`; every part sanitized. `exp` reuses [`fmt_num`] — the SAME
-/// sub-second-exposure formatter the calibration library's own naming and
-/// `plan.rs`'s calibration-set label already use (`180s`, `0.39s`), so a
-/// calibration-set label, a group key and a master filename never format an
-/// exposure three different ways. There is no "equal vs mixed exposure"
-/// branch any more: the grouping rule itself already clustered every frame
-/// in `n` to within the group's own exposure tolerance, so one exposure
-/// value (the cluster's label) is always the honest answer.
+/// camera token is gone; fix round 1, ruling — the colour-mode token stays
+/// ALWAYS in the name: with camera gone, a mono and an OSC group of the
+/// same filter and exposure would otherwise differ only by a `_2` collision
+/// suffix): `<set slug>_<filter>_<mono|osc>_<exp>s_<n>x.fits`, or
+/// `<set slug>_<filter>_<mono|osc>_unknown_<n>x.fits` for the group of
+/// frames with no `EXPTIME`; every part sanitized. `exp` reuses [`fmt_num`]
+/// — the SAME sub-second-exposure formatter the calibration library's own
+/// naming and `plan.rs`'s calibration-set label already use (`180s`,
+/// `0.39s`), so a calibration-set label, a group key and a master filename
+/// never format an exposure three different ways. There is no "equal vs
+/// mixed exposure" branch any more: the grouping rule itself already
+/// clustered every frame in `n` to within the group's own exposure
+/// tolerance, so one exposure value (the cluster's label) is always the
+/// honest answer.
 pub fn master_file_name(
     set_name: &str,
     filter: Option<&str>,
+    color_mode: ColorMode,
     exposure_s: Option<f64>,
     n: usize,
 ) -> String {
@@ -203,11 +213,15 @@ pub fn master_file_name(
         slug = "set".to_string();
     }
     let filter = sanitize_for_filename(blank(filter).unwrap_or("NoFilter"));
+    let color_tok = match color_mode {
+        ColorMode::Mono => "mono",
+        ColorMode::Osc => "osc",
+    };
     let exp = match exposure_s {
         Some(e) => format!("{}s", fmt_num(e)),
         None => "unknown".to_string(),
     };
-    format!("{slug}_{filter}_{exp}_{n}x.fits")
+    format!("{slug}_{filter}_{color_tok}_{exp}_{n}x.fits")
 }
 
 pub struct WrittenMaster {
@@ -378,36 +392,57 @@ mod tests {
 
     #[test]
     fn master_name_follows_the_layout_rules() {
-        // The pin (owner decision 2026-09-10): no camera token, exposure
-        // before frame count.
+        // The pin (owner decision 2026-09-10, fix round 1 ruling): no
+        // camera token, but the colour-mode token is ALWAYS present —
+        // exposure before frame count.
         assert_eq!(
-            master_file_name("LDN 1272", Some("NoFilter"), Some(180.0), 208),
-            "LDN_1272_NoFilter_180s_208x.fits"
+            master_file_name(
+                "LDN 1272",
+                Some("NoFilter"),
+                ColorMode::Mono,
+                Some(180.0),
+                208
+            ),
+            "LDN_1272_NoFilter_mono_180s_208x.fits"
         );
         assert_eq!(
-            master_file_name("M 31", Some("Ha"), Some(300.0), 3),
-            "M_31_Ha_300s_3x.fits"
+            master_file_name("M 31", Some("Ha"), ColorMode::Mono, Some(300.0), 3),
+            "M_31_Ha_mono_300s_3x.fits"
         );
         // Sub-second exposure, `fmt_num`'s trimmed-decimal form.
         assert_eq!(
-            master_file_name("a/b:c", Some("L"), Some(0.5), 2),
-            "a_b_c_L_0.5s_2x.fits"
+            master_file_name("a/b:c", Some("L"), ColorMode::Mono, Some(0.5), 2),
+            "a_b_c_L_mono_0.5s_2x.fits"
         );
         // Blank filter falls back to NoFilter; an empty/whitespace set name
         // falls back to "set".
         assert_eq!(
-            master_file_name("M 31", Some("  "), Some(60.0), 2),
-            "M_31_NoFilter_60s_2x.fits"
+            master_file_name("M 31", Some("  "), ColorMode::Mono, Some(60.0), 2),
+            "M_31_NoFilter_mono_60s_2x.fits"
         );
         assert_eq!(
-            master_file_name("...", Some("L"), Some(60.0), 1),
-            "set_L_60s_1x.fits"
+            master_file_name("...", Some("L"), ColorMode::Mono, Some(60.0), 1),
+            "set_L_mono_60s_1x.fits"
         );
         // No EXPTIME anywhere in the cluster — the "unknown" token.
         assert_eq!(
-            master_file_name("M 31", None, None, 3),
-            "M_31_NoFilter_unknown_3x.fits"
+            master_file_name("M 31", None, ColorMode::Mono, None, 3),
+            "M_31_NoFilter_mono_unknown_3x.fits"
         );
+    }
+
+    /// Fix round 1, ruling: without a camera token, a mono and an OSC group
+    /// sharing the same filter+exposure would otherwise collide (differing
+    /// only by an incidental `_2` collision suffix, which hides the actual
+    /// distinction instead of naming it). The colour-mode token keeps their
+    /// names honestly distinct.
+    #[test]
+    fn mono_and_osc_names_never_collide_on_the_same_filter_and_exposure() {
+        let mono = master_file_name("LDN 1272", None, ColorMode::Mono, Some(180.0), 208);
+        let osc = master_file_name("LDN 1272", None, ColorMode::Osc, Some(180.0), 160);
+        assert_eq!(mono, "LDN_1272_NoFilter_mono_180s_208x.fits");
+        assert_eq!(osc, "LDN_1272_NoFilter_osc_180s_160x.fits");
+        assert_ne!(mono, osc);
     }
 
     #[test]
@@ -640,7 +675,28 @@ mod tests {
             "{} chars: {joined}",
             joined.chars().count()
         );
-        assert!(joined.ends_with('…'), "{joined}");
+        assert!(joined.ends_with("..."), "{joined}");
+
+        // Fix round 1, item 1: the marker must be pure ASCII — build the
+        // actual `Card` and run it through the REAL writer path
+        // (`format_card`), which silently rewrites any non-ASCII byte to
+        // `?` (`fits_writer::card::sanitize_text`) and would otherwise
+        // corrupt every truncated ATH_STKC card without a compile-time or
+        // even a panicking runtime signal. Assert on the WRITTEN bytes, not
+        // just the pre-write string.
+        let card = Card::new("ATH_STKC", CardValue::Str(joined.clone())).unwrap();
+        let records = crate::fits_writer::card::format_card(&card).unwrap();
+        assert_eq!(records.len(), 1, "68 chars fits in one 80-byte record");
+        let written = String::from_utf8_lossy(&records[0]);
+        assert!(
+            !written.contains('?'),
+            "a '?' means sanitize_text silently rewrote a non-ASCII byte: {written}"
+        );
+        assert!(written.contains("..."), "{written}");
+        assert!(
+            joined.is_ascii(),
+            "format_cameras_card's own output must already be pure ASCII: {joined}"
+        );
     }
 
     #[test]

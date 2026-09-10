@@ -68,6 +68,16 @@ pub struct StackingRunGroupRow {
     pub color_mode: String,
     pub filter: Option<String>,
     pub binning: Option<i64>,
+    /// Owner decision 2026-09-10 (groups are camera-agnostic): the group's
+    /// reference-ANCHOR member's own native `NAXIS1`/`NAXIS2`
+    /// (`stacking::run::group_anchor_geometry`), recorded once at
+    /// `insert_group` time — NOT the run's actual output/reference geometry
+    /// (`RunContext::reference_width`/`height`, resolved later, in stage 5
+    /// Register). There is no post-Register write-back today (`GroupUpdate`
+    /// carries no width/height field), so a group whose reference frame
+    /// ends up being a DIFFERENT camera than its anchor member will show
+    /// this row's `width`/`height` as that anchor's size, not the actual
+    /// master's.
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub exposure: Option<f64>,
@@ -220,6 +230,9 @@ pub struct NewGroup<'a> {
     pub color_mode: &'a str,
     pub filter: Option<&'a str>,
     pub binning: Option<i64>,
+    /// See [`StackingRunGroupRow::width`]/`height`: the anchor member's
+    /// native geometry at plan time, not the run's eventual reference/
+    /// output geometry.
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub exposure: Option<f64>,

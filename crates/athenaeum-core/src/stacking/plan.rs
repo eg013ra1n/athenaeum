@@ -994,14 +994,29 @@ pub fn build_plan(
     // a real 0 s exposure — but that frame's set is never actually excluded
     // from stacking, so this is a WARNING, never a blocker, naming the
     // frames so the operator can go fix the header if that was a mistake.
+    // Fix round 1, minor 4: cap the inlined name list — a large "unknown"
+    // cluster (an import missing EXPTIME on hundreds of frames) must not
+    // turn one plan warning into a multi-KB string.
+    const EXPTIME_WARNING_NAME_CAP: usize = 5;
     for g in &groups {
         if g.exposure_s.is_none() {
             let names: Vec<&str> = g.frames.iter().map(|f| f.filename.as_str()).collect();
+            let shown = names
+                .iter()
+                .take(EXPTIME_WARNING_NAME_CAP)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remaining = names.len().saturating_sub(EXPTIME_WARNING_NAME_CAP);
+            let suffix = if remaining > 0 {
+                format!(" and {remaining} more")
+            } else {
+                String::new()
+            };
             warnings.push(format!(
-                "{} frame{} without EXPTIME grouped separately: {}",
+                "{} frame{} without EXPTIME grouped separately: {shown}{suffix}",
                 names.len(),
                 if names.len() == 1 { "" } else { "s" },
-                names.join(", ")
             ));
         }
     }

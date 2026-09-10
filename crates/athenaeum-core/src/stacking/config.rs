@@ -62,6 +62,13 @@ impl Default for StackingConfig {
     }
 }
 
+/// The floor `resolve_config` clamps [`GroupingConfig::exposure_tolerance_sec`]
+/// to (fix round 1, minor 5). Below this, two distinct exposure clusters
+/// (e.g. a genuine near-zero or negative stored value) can format to the
+/// SAME [`crate::calibration_library::paths::fmt_num`] token and collide on
+/// `stacking_run_groups`'s `UNIQUE(run_id, group_key)`.
+pub const MIN_EXPOSURE_TOLERANCE_SEC: f64 = 0.01;
+
 /// spec §9.2 `grouping:` (owner decision 2026-09-10: groups are
 /// camera-agnostic — colour mode, filter, binning and exposure form the
 /// key; exposure ALWAYS splits a group now, so there is no toggle for it
@@ -73,6 +80,8 @@ impl Default for StackingConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GroupingConfig {
+    /// Clamped to a floor of [`MIN_EXPOSURE_TOLERANCE_SEC`] by
+    /// [`resolve_config`] — never trusted raw from a stored document.
     pub exposure_tolerance_sec: f64,
 }
 
@@ -289,6 +298,18 @@ pub fn resolve_config(
             "stacking config version differs; decoding with the current defaults"
         );
         config.version = STACKING_CONFIG_VERSION;
+    }
+    // Fix round 1, minor 5: `!(x >= MIN)` rather than `x < MIN` so a NaN
+    // (still possible through a hand-edited/foreign JSON document — floats
+    // decode from any JSON number) clamps too; `x < MIN` would leave NaN
+    // unclamped, since every comparison against NaN is false.
+    if !(config.grouping.exposure_tolerance_sec >= MIN_EXPOSURE_TOLERANCE_SEC) {
+        warn!(
+            value = config.grouping.exposure_tolerance_sec,
+            min = MIN_EXPOSURE_TOLERANCE_SEC,
+            "stacking config: exposureToleranceSec below the minimum; clamped"
+        );
+        config.grouping.exposure_tolerance_sec = MIN_EXPOSURE_TOLERANCE_SEC;
     }
     Ok(config)
 }
@@ -530,6 +551,32 @@ mod tests {
         assert_eq!(via_set.grouping.exposure_tolerance_sec, 5.0);
         let via_global = resolve_config(None, Some(json)).unwrap();
         assert_eq!(via_global.grouping.exposure_tolerance_sec, 5.0);
+    }
+
+    /// Fix round 1, minor 5: zero, negative and sub-floor values all clamp
+    /// to [`MIN_EXPOSURE_TOLERANCE_SEC`] — a real value above the floor is
+    /// untouched. Below the floor, two distinct exposure clusters could
+    /// format to the same `fmt_num` token and collide on
+    /// `stacking_run_groups`'s `UNIQUE(run_id, group_key)`.
+    #[test]
+    fn exposure_tolerance_is_clamped_to_a_floor() {
+        let clamp = |v: &str| {
+            resolve_config(
+                Some(&format!(r#"{{"grouping":{{"exposureToleranceSec":{v}}}}}"#)),
+                None,
+            )
+            .unwrap()
+            .grouping
+            .exposure_tolerance_sec
+        };
+        assert_eq!(clamp("0.0"), MIN_EXPOSURE_TOLERANCE_SEC);
+        assert_eq!(clamp("-5.0"), MIN_EXPOSURE_TOLERANCE_SEC);
+        assert_eq!(clamp("0.005"), MIN_EXPOSURE_TOLERANCE_SEC);
+        assert_eq!(
+            clamp("1.5"),
+            1.5,
+            "a legitimate value above the floor is untouched"
+        );
     }
 
     #[test]

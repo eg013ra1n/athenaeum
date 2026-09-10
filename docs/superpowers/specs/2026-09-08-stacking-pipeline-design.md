@@ -628,9 +628,13 @@ are reported by the cleanup action, never deleted silently.
   rej/run-<id>/<group key>/<stem>.rej            (drizzle runs only, temporary)
   runs/run-<id>.json
 <output>/
-  <set slug>_<filter>_<exp>s_<n>x.fits            (2026-09-10: no camera token — a group can
-                                                    mix cameras; <exp> is the group's own
-                                                    exposure-cluster label, or `unknown`)
+  <set slug>_<filter>_<mono|osc>_<exp>s_<n>x.fits (2026-09-10, fix round 1 ruling: no camera
+                                                    token — a group can mix cameras — but the
+                                                    colour-mode token stays ALWAYS present, so a
+                                                    mono and an OSC group of the same filter and
+                                                    exposure never collide down to a bare `_2`;
+                                                    <exp> is the group's own exposure-cluster
+                                                    label, or `unknown`)
   …_drizzle<s>x.fits, …_rejlow.fits, …_rejhigh.fits, …_drizzle<s>x_weight.fits
 ```
 

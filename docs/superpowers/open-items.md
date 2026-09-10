@@ -187,6 +187,25 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M2 — camera-agnostic grouping (2026-09-10)
+
+M2 Task 10 (owner decision 2026-09-10): groups are now keyed by colour
+mode/filter/binning/exposure cluster, not camera/geometry — the group key
+string format changed (`<mono|osc>__<filter>__bin<n>__<exposure cluster>`,
+no camera/geometry token; master filenames now always carry a colour-mode
+token instead, fix round 1 ruling).
+
+- **Carry-over (no code, fix round 1 item 8):** the OLD key format's
+  `calibrated/<old key>/` working-folder trees and their `stacking_artifacts`
+  rows are orphaned by the key change — nothing looks them up under the new
+  key, and nothing cleans them up automatically. "Delete intermediates"
+  (Settings → Stacking → Cleanup, `output.cleanup`) clears them along with
+  everything else in the working folder; absent that, the first post-change
+  run on an affected set simply recalibrates (stage 1 finds no fresh
+  artifact under the new key and redoes the work — no correctness issue,
+  just a one-time cache miss and stale bytes left behind until a manual/
+  `cleanup_stacking_work` sweep).
+
 ### Stacking M1 — the Stacking tab (2026-09-10)
 
 M1 Plan 5b (the Stacking tab, Settings → Stacking, retirement of the

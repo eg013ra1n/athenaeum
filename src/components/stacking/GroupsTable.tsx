@@ -9,7 +9,11 @@ function formatExposure(totalExposureS: number): string {
 }
 
 /** The group key's own exposure-cluster token (`180s`, `0.39s`, `unknown`) —
- *  mirrors the backend's `fmt_num` (2 decimals, trailing zeros trimmed). */
+ *  hand-mirrors `crates/athenaeum-core/src/calibration_library/paths.rs`'s
+ *  `fmt_num` (2 decimals, trailing zeros trimmed) rather than calling it —
+ *  it is `pub(crate)`, backend-only. Display text only; the wire value
+ *  (`PlanGroup.exposureS`) is the number, never this formatted string, so
+ *  a drift here cannot desync anything the backend persists or matches on. */
 function formatExposureToken(exposureS: number | null): string {
   if (exposureS == null) return 'unknown';
   const trimmed = exposureS.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');

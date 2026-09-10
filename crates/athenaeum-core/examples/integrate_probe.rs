@@ -45,6 +45,7 @@ use athenaeum_core::integration::io_policy::IoPolicy;
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::integration::stats;
 use athenaeum_core::integration::storage_class::StorageClass;
+use athenaeum_core::stacking::groups::ColorMode;
 use athenaeum_core::stacking::integrate::{
     integrate_group, GroupInput, GroupProgress, GroupStats, IntegrationConfig, NormalizationConfig,
     RejectionChoice, StackFrame,
@@ -999,10 +1000,16 @@ fn main() {
     // and the naming input is one exposure (the group's own cluster label)
     // rather than the whole per-frame list — this probe has no real
     // cluster label of its own, so it reads the first included frame's
-    // exposure as a stand-in.
+    // exposure as a stand-in. Fix round 1 ruling: the colour-mode token is
+    // always present — this probe already carries `args.osc`.
     let name = master_file_name(
         &set_name,
         filter.as_deref(),
+        if args.osc {
+            ColorMode::Osc
+        } else {
+            ColorMode::Mono
+        },
         included_exposures.first().copied(),
         stats.included,
     );
