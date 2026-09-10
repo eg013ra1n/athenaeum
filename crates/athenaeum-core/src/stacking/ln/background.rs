@@ -3,44 +3,38 @@
 //! target frame), sampled on the same node grid [`super::grid::LnGrid`]
 //! evaluates over — node `(i, j)` at pixel `(i·stride, j·stride)`, `stride
 //! = (scale / 8).max(2)`, `(gw, gh)` from [`super::grid::LnGrid::grid_dims`]
-//! so this mesh and the B-spline evaluator's mesh can never disagree.
-//! Task 5 builds `B = B_ref − s·B_tgt` from a reference grid (`deviation_sigma
-//! = 3.0`) and a target grid (`TARGET_DEVIATION_SIGMA = 3.2`, slightly looser
+//! so this mesh and the B-spline evaluator's mesh can never disagree. The
+//! trailing node on each axis (`node_count` overshoots the plane by design,
+//! so the spline reaches the last pixel) is clamped into the plane before
+//! its window is built — its cell is the last stride×stride (half-open,
+//! clipped) region of the plane, not an empty, past-the-edge one. Task 5
+//! builds `B = B_ref − s·B_tgt` from a reference grid (`deviation_sigma =
+//! 3.0`) and a target grid (`TARGET_DEVIATION_SIGMA = 3.2`, slightly looser
 //! since a target frame carries its own noise/registration residual on top
 //! of the reference's).
 //!
-//! **The threshold semantics below are our reading of math §4.2, not a
-//! literal transcription — say so, per the task brief.** In particular:
-//! `low_clip`/`high_clip_rel` are read as a *global* pre-filter meant to
-//! drop genuinely anomalous pixels (saturation, cosmic rays, extended
-//! sources) relative to the plane's own bulk distribution — not a literal
-//! `value > high_clip_rel · raw_max`. A literal reading breaks on a plane
-//! whose own smooth background trend spans a sizeable fraction of its own
-//! maximum (no bright stars to set a sane scale) — exactly the case
-//! `vertical_gradient_is_tracked_per_cell` below exercises. So the "plane
-//! maximum" the high clip is relative to is a *robust* estimate of the
-//! bulk background's upper edge (median + a wide, hot-pixel-style
-//! deviation margin), not the single brightest raw pixel — a real
-//! saturated star or an extended source is still enormously past that
-//! margin, but a smooth low-contrast gradient with no bimodal population
-//! is not.
+//! `low_clip`/`high_clip_rel` are the literal thresholds from math §4.2: a
+//! pixel below `low_clip` or above `high_clip_rel · max(plane)` is excluded
+//! before any per-cell statistic sees it (controller ruling: on a real
+//! field the maximum is a near-saturated star, so `0.85 × max` removes
+//! only near-saturation; a robust median+MAD ceiling was tried and
+//! rejected here — on a real field with no separately-saturated
+//! population to set the scale it would clip bright nebulosity out of the
+//! background model along with the stars).
+//!
+//! `invalid_cells` is a per-frame count for the caller (Task 5) to log as
+//! `ln_cells_rejected` — this module does not log it itself.
 
 use super::grid::LnGrid;
-use crate::integration::stats::{mad_about, median_in_place};
+use crate::integration::stats::{mad_about, median_in_place, median_of, MAD_TO_SIGMA};
 
-/// σ-consistency factor for the median absolute deviation (same constant
-/// as [`crate::integration::stats::MAD_TO_SIGMA`], repeated locally so this
-/// module reads standalone next to the math it implements).
-const MAD_TO_SIGMA: f32 = 1.4826;
 /// Deviation multiple (in MAD-sigma) a pixel must exceed its local window
-/// median by before the hot-pixel pass replaces it, and the multiple the
-/// same window statistic uses to build a robust "bulk maximum" for the
-/// global high clip (see the module doc).
+/// median by before the hot-pixel pass replaces it.
 const HOT_PIXEL_SIGMA: f32 = 5.0;
-/// A cell above this many finite pixels is subsampled 2×2 before the
-/// iterative clip (§ algorithm step 3) — cheap without materially changing
-/// the robust statistics on a scale/8 mesh's largest cells (128×128 at the
-/// default scale).
+/// A cell whose window holds more than this many pixels is subsampled 2×2
+/// before the iterative clip (§ algorithm step 3) — cheap without
+/// materially changing the robust statistics on a scale/8 mesh's largest
+/// cells (128×128 at the default scale).
 const CELL_SUBSAMPLE_THRESHOLD: usize = 4096;
 /// Iterative per-cell median±sigma clipping stops after this many rounds
 /// even if the kept set has not yet stabilized.
@@ -79,11 +73,12 @@ pub const TARGET_DEVIATION_SIGMA: f32 = 3.2;
 /// `gw × gh`, row-major (`cells[j * gw + i]` = node `(i, j)`'s level) — the
 /// same layout [`LnGrid::a`]/[`LnGrid::b`] use, so a `BackgroundGrid` can
 /// feed the B-spline evaluator directly. `invalid_cells` is the number of
-/// nodes [`background_grid`] could not measure directly (see below) —
-/// reported per frame as `ln_cells_rejected`; those nodes are still filled
-/// in `cells` (from their valid neighbours) unless the WHOLE plane had no
-/// valid cell at all, in which case `invalid_cells == gw * gh` and the
-/// caller should refuse rather than trust the (all-zero) fallback grid.
+/// nodes [`background_grid`] could not measure directly (see below) — the
+/// per-frame caller (Task 5) logs it as `ln_cells_rejected`, not this
+/// module. Those nodes are still filled in `cells` (from their valid
+/// neighbours) unless the WHOLE plane had no valid cell at all, in which
+/// case `invalid_cells == gw * gh` and the caller should refuse rather
+/// than trust the (all-zero) fallback grid.
 #[derive(Debug, Clone)]
 pub struct BackgroundGrid {
     pub gw: usize,
@@ -94,8 +89,9 @@ pub struct BackgroundGrid {
 
 /// One plane → its large-scale background on the stride grid (node `(i,
 /// j)` = the robust level of the stride×stride cell centred on `(i·stride,
-/// j·stride)`, clipped to the plane). See the module doc for the clipping
-/// thresholds' meaning and algorithm steps.
+/// j·stride)`, clipped to the plane — the trailing node on either axis is
+/// clamped to the plane's last pixel first, see the module doc). See the
+/// module doc for the clipping thresholds' meaning and algorithm steps.
 pub fn background_grid(
     plane: &[f32],
     width: usize,
@@ -115,6 +111,9 @@ pub fn background_grid(
         };
     }
 
+    // Every pass below reads only `plane[..width * height]` — a longer
+    // input's tail is ignored everywhere, not just here.
+    let plane = &plane[..width * height];
     let cleaned = clean_plane(plane, width, height, p);
 
     let mut cells = vec![0f32; cell_count];
@@ -122,11 +121,16 @@ pub fn background_grid(
     let half = stride / 2;
     let half_hi = stride - half; // symmetric for even stride; keeps total width == stride for odd stride too
     for j in 0..gh {
-        let node_y = j * stride;
+        // The trailing node overshoots the plane by design (`node_count`
+        // guarantees the mesh reaches the last pixel for the spline) —
+        // clamp it into the plane before windowing, so its cell is the
+        // last stride×stride (clipped) region rather than landing at or
+        // past `height`/`width` and gathering nothing.
+        let node_y = (j * stride).min(height - 1);
         let y0 = node_y.saturating_sub(half);
         let y1 = (node_y + half_hi).min(height);
         for i in 0..gw {
-            let node_x = i * stride;
+            let node_x = (i * stride).min(width - 1);
             let x0 = node_x.saturating_sub(half);
             let x1 = (node_x + half_hi).min(width);
 
@@ -149,12 +153,27 @@ pub fn background_grid(
     }
 }
 
+/// The literal high clip from math §4.2: `high_clip_rel` of the plane's
+/// own maximum finite value. An allocation-free fold over `plane` (already
+/// sliced to `width * height` by the caller) — used both as the hot-pixel
+/// candidate cutoff and the global high clip below.
+fn high_clip_threshold(plane: &[f32], p: &BackgroundParams) -> f32 {
+    let max = plane
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::MIN, f32::max);
+    p.high_clip_rel * max
+}
+
 /// Steps 1–2 of the algorithm: a hot-pixel-corrected, clipped copy of
 /// `plane`. Values excluded by the clip are `NaN` in the returned copy;
 /// everything else is either the original value or its hot-pixel
-/// replacement.
+/// replacement. The only transient full-plane allocation beyond the
+/// returned copy is the small per-candidate hot-pixel window (at most
+/// `(2·hot_radius+1)²` samples), built only for pixels past the high clip.
 fn clean_plane(plane: &[f32], width: usize, height: usize, p: &BackgroundParams) -> Vec<f32> {
-    let high_thresh = robust_high_threshold(plane, p);
+    let high_thresh = high_clip_threshold(plane, p);
 
     let mut cleaned = plane.to_vec();
     for y in 0..height {
@@ -198,35 +217,9 @@ fn clean_plane(plane: &[f32], width: usize, height: usize, p: &BackgroundParams)
     cleaned
 }
 
-/// A robust "bulk maximum" for the plane, used both as the hot-pixel
-/// candidate cutoff and the global high clip (module doc): the plane's
-/// median plus a wide MAD-based margin, scaled by `high_clip_rel`. A
-/// genuinely anomalous population (a saturated star, an extended source)
-/// sits far past this regardless of its size; a smooth, unimodal
-/// background trend — with no separate bright population to set a scale —
-/// does not, so it survives untouched.
-fn robust_high_threshold(plane: &[f32], p: &BackgroundParams) -> f32 {
-    let finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.is_empty() {
-        return f32::INFINITY;
-    }
-    let mut sample = finite.clone();
-    let med = median_in_place(&mut sample);
-    let mad = mad_about(&finite, med);
-    let bulk_max = med + HOT_PIXEL_SIGMA * MAD_TO_SIGMA * mad;
-    // A perfectly flat plane (mad == 0, e.g. an all-zero test fixture) must
-    // still let its own value through — fall back to the plane's raw max
-    // scaled by `high_clip_rel` in that degenerate case.
-    if mad > 0.0 {
-        p.high_clip_rel * bulk_max.max(med)
-    } else {
-        let raw_max = finite.iter().copied().fold(f32::MIN, f32::max);
-        p.high_clip_rel * raw_max
-    }
-}
-
-/// The cell's finite pixels, stride-2 subsampled (both axes) when there
-/// are more than [`CELL_SUBSAMPLE_THRESHOLD`] of them.
+/// The window's finite pixels, stride-2 subsampled (both axes) when the
+/// window itself (before filtering to finite) holds more than
+/// [`CELL_SUBSAMPLE_THRESHOLD`] pixels.
 fn gather_cell(
     cleaned: &[f32],
     width: usize,
@@ -235,12 +228,8 @@ fn gather_cell(
     y0: usize,
     y1: usize,
 ) -> Vec<f32> {
-    let finite_count = (y0..y1)
-        .flat_map(|y| (x0..x1).map(move |x| cleaned[y * width + x]))
-        .filter(|v| v.is_finite())
-        .count();
-
-    let step = if finite_count > CELL_SUBSAMPLE_THRESHOLD {
+    let total = x1.saturating_sub(x0) * y1.saturating_sub(y0);
+    let step = if total > CELL_SUBSAMPLE_THRESHOLD {
         2
     } else {
         1
@@ -280,6 +269,13 @@ fn robust_cell_level(samples: Vec<f32>, p: &BackgroundParams) -> (f32, bool) {
         }
         let med = median_of(&kept);
         let mad = mad_about(&kept, med);
+        if mad <= 0.0 {
+            // Every kept sample already agrees with the median at MAD's
+            // resolution — a zero deviation bound would otherwise reject
+            // everything but exact ties, wrongly invalidating a quantized
+            // cell with one dominant value and a modest minority of noise.
+            break;
+        }
         let bound = p.deviation_sigma * MAD_TO_SIGMA * mad;
         let next: Vec<f32> = kept
             .iter()
@@ -299,11 +295,6 @@ fn robust_cell_level(samples: Vec<f32>, p: &BackgroundParams) -> (f32, bool) {
         return (0.0, false);
     }
     (median_of(&kept), true)
-}
-
-fn median_of(values: &[f32]) -> f32 {
-    let mut v = values.to_vec();
-    median_in_place(&mut v)
 }
 
 /// Algorithm step 4: repeatedly fill invalid cells from the mean of their
@@ -402,7 +393,8 @@ mod tests {
     #[test]
     fn vertical_gradient_is_tracked_per_cell() {
         let (w, h) = (256, 256);
-        let plane: Vec<f32> = (0..w * h).map(|i| 0.05 + (i / w) as f32 * 1e-4).collect(); // +0.0256 top to bottom
+        let mut plane: Vec<f32> = (0..w * h).map(|i| 0.05 + (i / w) as f32 * 1e-4).collect(); // +0.0256 top to bottom
+        plane[128 * w + 128] = 0.9; // one bright star; the literal high clip must remove only this
         let g = background_grid(
             &plane,
             w,
@@ -440,5 +432,42 @@ mod tests {
         );
         assert_eq!(g.invalid_cells, 1);
         assert!((g.cells[0] - 0.10).abs() < 1e-3);
+    }
+
+    /// The trailing node's raw pixel address (`(gw-1)·stride`/`(gh-1)·stride`)
+    /// overshoots the plane whenever `(extent - 1) mod stride` falls in
+    /// `1..=half-1` — half of all extents. At scale 256 (stride 32,
+    /// half 16), a width/height of 1026/514 hits it on both axes
+    /// (`1025 % 32 == 1`, `513 % 32 == 1`), matching the scale-1024/stride-128
+    /// case (`4097 % 128 == 1`, `2049 % 128 == 1`) the review flagged —
+    /// cheaper to run here. Before the clamp fix, the last row/column of
+    /// cells came out invalid (an inverted, empty window) and got
+    /// neighbour-filled instead of measured.
+    ///
+    /// One bright pixel is planted for the same reason
+    /// `vertical_gradient_is_tracked_per_cell` needs one: the literal high
+    /// clip is `high_clip_rel · max(plane)`, so a perfectly flat, star-less
+    /// plane has `max == the flat value itself` and `0.85 · max < max`
+    /// would clip the ENTIRE plane, not just the trailing edge — a
+    /// synthetic-test artifact, not a real frame (which always has some
+    /// near-saturated pixel setting the scale, per the module doc). The
+    /// hot-pixel pass corrects the single spike back to the local median
+    /// before any cell sees it, same as `flat_plane_with_stars_recovers_the_flat_level`.
+    #[test]
+    fn trailing_node_overshoot_gets_a_real_window() {
+        let (w, h) = (1026usize, 514usize);
+        let mut plane = vec![0.10f32; w * h];
+        plane[10 * w + 10] = 0.9; // sets the frame's scale; hot-pixel-corrected back to flat
+        let g = background_grid(
+            &plane,
+            w,
+            h,
+            &BackgroundParams {
+                scale: 256,
+                ..DEFAULT_PARAMS
+            },
+        );
+        assert_eq!(g.invalid_cells, 0, "cells: {:?}", g.cells);
+        assert!(g.cells.iter().all(|c| (c - 0.10).abs() < 1e-4));
     }
 }
