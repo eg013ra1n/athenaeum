@@ -195,11 +195,20 @@ impl From<IntegrationError> for DrizzleError {
     }
 }
 
-/// Peak RAM [`drizzle_group`] needs (ruling R-M3-7): the `channels`
-/// output-data planes plus the one `I`/`W` accumulator pair alive at a time
-/// (`(channels + 2) * out_w * out_h * 4` bytes), one full-resolution source
-/// plane in RAM (`width * height * 4`), and — when `ln` is set — two more
-/// reference-geometry planes for the per-frame `A`/`B` grids
+/// Peak RAM [`drizzle_group`] needs — ruling R-M3-7, AMENDED by ruling
+/// R-M3-15 (fix round 1) after review found the original formula
+/// under-counted real peak by up to ~75%, omitting two allocations the
+/// driver actually makes: the weight-map planes (real peak when
+/// `write_weight_map` is on — the shipped default) and
+/// `measure_plane`'s own ADU-scaled copy of the plane it is currently
+/// measuring, alive at the same time as `data`/`weight_all`/the last
+/// `i_buf`/`w_buf`. The full accounting: the `channels` output-data planes
+/// plus the one `I`/`W` accumulator pair alive at a time
+/// (`(channels + 2) * out_w * out_h * 4` bytes); the `channels` weight-map
+/// planes when `write_weight_map` is set (`channels * out_w * out_h * 4`);
+/// `measure_plane`'s scaled copy (`out_w * out_h * 4`); one full-resolution
+/// source plane in RAM (`width * height * 4`); and — when `ln` is set — two
+/// more reference-geometry planes for the per-frame `A`/`B` grids
 /// (`2 * width * height * 4`).
 pub fn estimate_memory_bytes(
     width: usize,
@@ -207,10 +216,15 @@ pub fn estimate_memory_bytes(
     channels: usize,
     scale: u32,
     ln: bool,
+    write_weight_map: bool,
 ) -> u64 {
     let out_w = width as u64 * scale as u64;
     let out_h = height as u64 * scale as u64;
     let mut need = (channels as u64 + 2) * out_w * out_h * 4;
+    if write_weight_map {
+        need += channels as u64 * out_w * out_h * 4;
+    }
+    need += out_w * out_h * 4; // measure_plane's own ADU-scaled copy
     need += width as u64 * height as u64 * 4;
     if ln {
         need += 2 * width as u64 * height as u64 * 4;
@@ -265,19 +279,49 @@ pub fn drizzle_group(
             input.width, input.height
         )));
     }
+    // Important 3 (fix round 1): a short `weight`/`output_pair` slice used
+    // to fall back silently (`.get(c).unwrap_or(..)`) to "this frame
+    // contributes nothing" / "this frame is normalized by the identity" —
+    // a caller bug that changed the master's pixels without a word.
+    // Validated up front, alongside the other geometry checks, before any
+    // allocation — every per-frame access below indexes directly, safe by
+    // construction. `weight` only matters when `use_weights` is on (the
+    // `else` branch below never reads it); `output_pair` is always the
+    // fallback normalization source (LN can be off globally, or absent for
+    // any individual frame), so it is always required.
+    for (idx, f) in input.frames.iter().enumerate() {
+        if input.use_weights && f.weight.len() != input.channels {
+            return Err(DrizzleError::BadInput(format!(
+                "frame {idx} ({}): weight has {} channel(s), need {}",
+                f.path.display(),
+                f.weight.len(),
+                input.channels
+            )));
+        }
+        if f.output_pair.len() != input.channels {
+            return Err(DrizzleError::BadInput(format!(
+                "frame {idx} ({}): output_pair has {} channel(s), need {}",
+                f.path.display(),
+                f.output_pair.len(),
+                input.channels
+            )));
+        }
+    }
 
     let group_start = Instant::now();
     let out_w = input.width * input.scale as usize;
     let out_h = input.height * input.scale as usize;
     let plane_out_pixels = out_w * out_h;
 
-    // Ruling R-M3-7: refused BEFORE any output-geometry allocation.
+    // Ruling R-M3-7 (amended by R-M3-15, fix round 1): refused BEFORE any
+    // output-geometry allocation.
     let need = estimate_memory_bytes(
         input.width,
         input.height,
         input.channels,
         input.scale,
         input.use_local_normalization,
+        input.write_weight_map,
     );
     let total = input
         .ram_total_bytes
@@ -308,16 +352,31 @@ pub fn drizzle_group(
     let mut noise = Vec::with_capacity(input.channels);
     let mut coverage = Vec::with_capacity(input.channels);
 
-    let mut read_ms_total = 0u64;
-    let mut deposit_ms_total = 0u64;
+    // Minor 12 (fix round 1): accumulate `Duration`s, not per-frame
+    // `as_millis() as u64` truncations — summing already-truncated
+    // millisecond counts loses up to 1ms per frame, which is not noise at
+    // a few hundred frames.
+    let mut read_duration_total = std::time::Duration::ZERO;
+    let mut deposit_duration_total = std::time::Duration::ZERO;
     let mut bytes_read_total = 0u64;
 
     // Reused across every (frame, plane) pair that needs local
     // normalization — one `read_plane`, at most one LN evaluation per
-    // frame per plane (perf shape, R-M3-6).
+    // frame per plane (perf shape, R-M3-6). Minor 4 (fix round 1): sized
+    // to `plane_pixels` only when the run can actually use them — an
+    // unconditional allocation here cost 208 MB on a full frame the R-M3-7
+    // estimate (correctly) never counts for the LN-off case.
     let plane_pixels = input.width * input.height;
-    let mut a_plane_buf = vec![0f32; plane_pixels];
-    let mut b_plane_buf = vec![0f32; plane_pixels];
+    let mut a_plane_buf = if input.use_local_normalization {
+        vec![0f32; plane_pixels]
+    } else {
+        Vec::new()
+    };
+    let mut b_plane_buf = if input.use_local_normalization {
+        vec![0f32; plane_pixels]
+    } else {
+        Vec::new()
+    };
 
     for c in 0..input.channels {
         let plane_start = Instant::now();
@@ -332,8 +391,11 @@ pub fn drizzle_group(
                 return Err(DrizzleError::Cancelled);
             }
 
+            // Safe direct index: validated up front (Important 3, above)
+            // that `frame.weight.len() == input.channels` whenever
+            // `use_weights` is on.
             let w = if input.use_weights {
-                frame.weight.get(c).copied().unwrap_or(0.0) as f32
+                frame.weight[c] as f32
             } else {
                 1.0
             };
@@ -364,7 +426,7 @@ pub fn drizzle_group(
             let read_bytes = (plane_pixels * 4) as u64;
             plane_bytes_read += read_bytes;
             bytes_read_total += read_bytes;
-            read_ms_total += read_start.elapsed().as_millis() as u64;
+            read_duration_total += read_start.elapsed();
 
             let rej_bitmap = if input.use_rejection {
                 match frame.rej {
@@ -410,11 +472,9 @@ pub fn drizzle_group(
                 }
             }
 
-            let pair = frame
-                .output_pair
-                .get(c)
-                .copied()
-                .unwrap_or(NormalizationPair::IDENTITY);
+            // Safe direct index: validated up front (Important 3, above)
+            // that `frame.output_pair.len() == input.channels`.
+            let pair = frame.output_pair[c];
 
             let ctx = FrameDepositCtx {
                 src: &src,
@@ -442,7 +502,7 @@ pub fn drizzle_group(
                         deposit_band(ib, wb, band_idx, out_w, &ctx);
                     });
             });
-            deposit_ms_total += deposit_start.elapsed().as_millis() as u64;
+            deposit_duration_total += deposit_start.elapsed();
 
             done_units += 1;
             (progress.on_frame)(done_units, total_units);
@@ -471,6 +531,14 @@ pub fn drizzle_group(
         eccentricity.push(cm.eccentricity);
         noise.push(cm.noise);
 
+        // Minor 14 (fix round 1): `duration_ms` covers this plane's whole
+        // pass — every frame's deposit AND the `measure_plane` call just
+        // above, not deposition alone (the event name says "deposited",
+        // not "measured", but the timer starts at `plane_start` before
+        // either); `frames` is `input.frames.len()`, i.e. every frame this
+        // plane WOULD have processed, including any skipped for `w <= 0`.
+        // Cosmetic today; split or rename if a later task budgets off this
+        // event specifically.
         debug!(
             plane = c,
             frames = input.frames.len(),
@@ -500,8 +568,8 @@ pub fn drizzle_group(
         eccentricity,
         noise,
         coverage,
-        read_ms: read_ms_total,
-        deposit_ms: deposit_ms_total,
+        read_ms: read_duration_total.as_millis() as u64,
+        deposit_ms: deposit_duration_total.as_millis() as u64,
         bytes_read: bytes_read_total,
     };
 
@@ -529,9 +597,19 @@ pub fn drizzle_group(
 /// (ruling R-M3-6): the band rect's four corners plus one sample every 32
 /// output px along its four edges, mapped output → reference
 /// ([`geom::to_reference`]) → subject (`map.inverse`), grown by
-/// `drop_shrink / 2 + 1` on every side. A non-finite map (or an empty
-/// sample set) falls back to the WHOLE source plane — correctness over
-/// speed on that degenerate path.
+/// `drop_shrink / 2 + 1` on every side. A non-finite map falls back to the
+/// WHOLE source plane — correctness over speed on that degenerate path.
+/// Returns `None` when the grown window has NO overlap with
+/// `[0, width) x [0, height)` at all (a band that maps entirely off-frame,
+/// e.g. the frame's own registration shifted it out of the reference —
+/// Minor 8, fix round 1: the previous clamp order (`.max(0.0)` applied
+/// AFTER `.min(width - 1.0)`) turned a negative upper bound into `0`
+/// instead of an empty range, scanning one stray source column/row per
+/// such band — harmless (nothing indexes out of range, nothing deposits,
+/// since the empty side of the intersection still empties out), but an
+/// explicit `None` is honest about the "there is nothing here" case rather
+/// than relying on an accidental 1-pixel window plus a separately-empty
+/// axis to make it a no-op).
 #[allow(clippy::too_many_arguments)]
 fn band_source_window(
     map: &PixelMap,
@@ -542,7 +620,7 @@ fn band_source_window(
     width: usize,
     height: usize,
     drop_shrink: f64,
-) -> (usize, usize, usize, usize) {
+) -> Option<(usize, usize, usize, usize)> {
     const STEP: f64 = 32.0;
     let x_lo = -0.5_f64;
     let x_hi = out_w as f64 - 0.5;
@@ -583,14 +661,23 @@ fn band_source_window(
     visit(x_hi, y_hi);
 
     if !sx_lo.is_finite() || !sy_lo.is_finite() {
-        return (0, 0, width.saturating_sub(1), height.saturating_sub(1));
+        return Some((0, 0, width.saturating_sub(1), height.saturating_sub(1)));
     }
     let margin = drop_shrink / 2.0 + 1.0;
-    let x0 = (sx_lo - margin).floor().max(0.0) as usize;
-    let x1 = (sx_hi + margin).ceil().min(width as f64 - 1.0).max(0.0) as usize;
-    let y0s = (sy_lo - margin).floor().max(0.0) as usize;
-    let y1 = (sy_hi + margin).ceil().min(height as f64 - 1.0).max(0.0) as usize;
-    (x0, y0s, x1, y1)
+    let (x_lo_grown, x_hi_grown) = (sx_lo - margin, sx_hi + margin);
+    let (y_lo_grown, y_hi_grown) = (sy_lo - margin, sy_hi + margin);
+    if x_hi_grown < 0.0
+        || x_lo_grown > width as f64 - 1.0
+        || y_hi_grown < 0.0
+        || y_lo_grown > height as f64 - 1.0
+    {
+        return None;
+    }
+    let x0 = x_lo_grown.floor().max(0.0) as usize;
+    let x1 = x_hi_grown.ceil().min(width as f64 - 1.0).max(0.0) as usize;
+    let y0s = y_lo_grown.floor().max(0.0) as usize;
+    let y1 = y_hi_grown.ceil().min(height as f64 - 1.0).max(0.0) as usize;
+    Some((x0, y0s, x1, y1))
 }
 
 /// Deposits one frame's plane into one band of the `I`/`W` accumulators
@@ -613,7 +700,7 @@ fn deposit_band(
     }
     let y1 = y0 + rows;
 
-    let (sx0, sy0, sx1, sy1) = band_source_window(
+    let Some((sx0, sy0, sx1, sy1)) = band_source_window(
         ctx.map,
         out_w,
         y0,
@@ -622,11 +709,21 @@ fn deposit_band(
         ctx.width,
         ctx.height,
         ctx.drop_shrink,
-    );
+    ) else {
+        return; // Minor 8: this band maps entirely off-frame — nothing to deposit.
+    };
     // Ruling R-M3-3's tabulated kernel weights sum to `drop_shrink²` in
     // SOURCE-pixel units (see `geom::kernel_table`'s own doc); scaled by
     // `scale²` here so `circle`/`gaussian` deposit the same mass per drop
-    // as `square`'s exact clipping does in OUTPUT-pixel units.
+    // as `square`'s exact clipping does in OUTPUT-pixel units. Minor 7
+    // (fix round 1): this factor is unit-hygiene only — `I / W` and
+    // `W / max(W)` both cancel any constant common to every deposit of a
+    // single kernel choice, so no output-level test can distinguish
+    // "present" from "missing" here. It is pinned directly instead, by
+    // `circle_kernel_deposits_the_same_total_mass_as_square_for_the_same_drop`
+    // below, which compares the RAW summed mass `deposit_band` writes into
+    // `wb` (bypassing the public API's normalization) between the two
+    // kernels for one isolated drop.
     let scale_sq = ctx.scale as f64 * ctx.scale as f64;
 
     for y in sy0..=sy1 {
@@ -640,16 +737,20 @@ fn deposit_band(
             if !u.is_finite() || !v.is_finite() {
                 continue;
             }
+            // Minor 10 (fix round 1): `floor(v + 0.5)`, not `f64::round`
+            // (ties-away-from-zero) — matches `geom::map_drop`'s own
+            // documented convention (geom.rs), rather than relying on the
+            // range guards below to make the two agree by construction.
+            let ix_f = (u + 0.5).floor();
+            let iy_f = (v + 0.5).floor();
 
             if let Some(rb) = ctx.rej {
                 // Ruling R-M3-4: out-of-range → not rejected.
-                let ix = u.round();
-                let iy = v.round();
-                let rejected = ix >= 0.0
-                    && iy >= 0.0
-                    && (ix as usize) < ctx.width
-                    && (iy as usize) < ctx.height
-                    && rb.is_rejected(ctx.plane, ix as usize, iy as usize);
+                let rejected = ix_f >= 0.0
+                    && iy_f >= 0.0
+                    && (ix_f as usize) < ctx.width
+                    && (iy_f as usize) < ctx.height
+                    && rb.is_rejected(ctx.plane, ix_f as usize, iy_f as usize);
                 if rejected {
                     continue;
                 }
@@ -658,13 +759,20 @@ fn deposit_band(
             let nd = if let Some((a_plane, b_plane)) = ctx.ln {
                 // Ruling R-M3-5: clamped (not skipped) to the reference
                 // extent.
-                let ix = (u.round() as i64).clamp(0, ctx.width as i64 - 1) as usize;
-                let iy = (v.round() as i64).clamp(0, ctx.height as i64 - 1) as usize;
+                let ix = (ix_f as i64).clamp(0, ctx.width as i64 - 1) as usize;
+                let iy = (iy_f as i64).clamp(0, ctx.height as i64 - 1) as usize;
                 let idx = iy * ctx.width + ix;
                 a_plane[idx] * d + b_plane[idx]
             } else {
                 ctx.pair.apply(d)
             };
+            // Minor 13 (fix round 1): a non-finite `nd` (a NaN/inf LN grid
+            // cell, or a degenerate `output_pair`) must not propagate — the
+            // source SAMPLE is already checked above, the NORMALIZED value
+            // was not.
+            if !nd.is_finite() {
+                continue;
+            }
 
             match ctx.kernel {
                 DrizzleKernel::Square => {
@@ -1020,9 +1128,8 @@ mod tests {
     // recovers a sharper (lower FWHM) star than the coarse drop_shrink=1.0
     // "shift-and-add" case, on the same output grid. ──
 
-    fn dithered_fwhm(drop_shrink: f64) -> f64 {
+    fn dithered_fwhm(sigma: f64, drop_shrink: f64) -> f64 {
         let dir = tempfile::tempdir().unwrap();
-        let sigma = 0.7f64;
         let mut paths = Vec::new();
         let mut maps = Vec::new();
         for j in 0..3usize {
@@ -1052,22 +1159,48 @@ mod tests {
         out.stats.fwhm_px[0]
     }
 
+    // R-M3-14 (fix round 1, review-confirmed): `measure_plane` runs on the
+    // OUTPUT grid (mod.rs's own `measure_plane(plane_data, out_w, out_h,
+    // ..)` call), so both `fwhm_drz(0.6)` and `fwhm_drz(1.0)` are already
+    // in the SAME (output-px) units — the original test divided only one
+    // side by 2 (a reference-px conversion applied to a single term), which
+    // made the assertion trivially true (49% margin) regardless of whether
+    // drop_shrink affected the deposit at all. The honest comparison never
+    // rescales either side.
     #[test]
     fn sharpening_recovers_sub_pixel_dither() {
-        let fwhm_shift_and_add = dithered_fwhm(1.0);
-        let fwhm_drizzled = dithered_fwhm(0.6);
+        let fwhm_07_06 = dithered_fwhm(0.7, 0.6);
+        let fwhm_07_10 = dithered_fwhm(0.7, 1.0);
+        let ratio_07 = fwhm_07_06 / fwhm_07_10;
+
+        // The undersampled variant: the drop's own blur is a LARGER
+        // fraction of an undersampled star's total width, so the coarser
+        // drop_shrink=1.0 deposit should hurt it more — ratio(0.45) should
+        // sit below ratio(0.7).
+        let fwhm_045_06 = dithered_fwhm(0.45, 0.6);
+        let fwhm_045_10 = dithered_fwhm(0.45, 1.0);
+        let ratio_045 = fwhm_045_06 / fwhm_045_10;
+
         eprintln!(
-            "sharpening test: fwhm_drizzled={fwhm_drizzled} fwhm_shift_and_add={fwhm_shift_and_add} \
-             fwhm_drizzled/2={} ratio_to_0.95x_threshold={}",
-            fwhm_drizzled / 2.0,
-            (fwhm_drizzled / 2.0) / (0.95 * fwhm_shift_and_add)
+            "sharpening test: sigma=0.7 fwhm(ds=0.6)={fwhm_07_06} fwhm(ds=1.0)={fwhm_07_10} ratio={ratio_07}; \
+             sigma=0.45 fwhm(ds=0.6)={fwhm_045_06} fwhm(ds=1.0)={fwhm_045_10} ratio={ratio_045}"
+        );
+
+        assert!(
+            fwhm_07_06 > 0.0 && fwhm_07_10 > 0.0,
+            "sigma=0.7: fwhm must be > 0 (star must be detected)"
         );
         assert!(
-            fwhm_drizzled / 2.0 < 0.95 * fwhm_shift_and_add,
-            "fwhm_drizzled/2={} fwhm_shift_and_add={}",
-            fwhm_drizzled / 2.0,
-            fwhm_shift_and_add
+            fwhm_045_06 > 0.0 && fwhm_045_10 > 0.0,
+            "sigma=0.45: fwhm must be > 0 (star must be detected)"
         );
+
+        assert!(ratio_07 < 0.985, "ratio_07={ratio_07}");
+        assert!(
+            ratio_045 < ratio_07,
+            "ratio_045={ratio_045} ratio_07={ratio_07}"
+        );
+        assert!(ratio_045 < 0.97, "ratio_045={ratio_045}");
     }
 
     // ── (f) LN ──
@@ -1116,6 +1249,98 @@ mod tests {
             "LN off, output_pair fallback: v={v}"
         );
         assert_eq!(out.stats.ln_frames, 0);
+    }
+
+    // Minor 5 (fix round 1): `LnGrid::constant` makes `a`/`b` uniform, so an
+    // index transpose (`ix*height+iy` instead of the correct
+    // `iy*width+ix`) would read the SAME value everywhere and the test
+    // above would not notice. Build a grid whose `b` genuinely varies with
+    // grid COLUMN (x) only, independently reproduce the SAME
+    // `evaluate_row_into` pass the driver runs internally to get ground
+    // truth, and check the driver's actual output against it at two points
+    // that differ only in x. `scale = 1` keeps output pixel `(x, y)` ==
+    // source pixel `(x, y)` exactly (identity map, a single frame, Square
+    // kernel with a drop fully inside its own output pixel), so the
+    // predicted value is reproduced exactly rather than merely
+    // approximately.
+    #[test]
+    fn local_normalization_index_is_not_transposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = 0.2f32;
+        let data = uniform(W, H, value);
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &data);
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+
+        // `LnGrid`'s own `scale` field is the LN tile size
+        // (`LnGrid::stride() = (scale/8).max(2)`) — unrelated to the
+        // drizzle output scale below despite the shared field name. 256
+        // gives stride 32, a real multi-node grid (gw=3, gh=3) across the
+        // 64x48 plane.
+        let mut grid = LnGrid::constant(W, H, 256, 1.0, 0.0);
+        let (gw, gh) = (grid.gw, grid.gh);
+        for j in 0..gh {
+            for i in 0..gw {
+                grid.b[j * gw + i] = i as f32 * 0.1;
+            }
+        }
+        let grids = LnFrameGrids {
+            channels: vec![grid.clone()],
+        };
+
+        let f_ln = DrizzleFrame {
+            path: &p0,
+            map: &map,
+            weight: &weight,
+            output_pair: &pair,
+            ln: Some(&grids),
+            rej: None,
+        };
+        let frames = [f_ln];
+        let measure = MeasureOptions::default();
+        let mut input = base_input(&frames, &measure);
+        input.scale = 1; // output pixel == source pixel, exactly
+        input.use_local_normalization = true;
+
+        // Ground truth: the SAME evaluator the driver calls, run
+        // independently against the same grid.
+        let mut expected_a = vec![0f32; W * H];
+        let mut expected_b = vec![0f32; W * H];
+        let mut scratch = LnScratch::for_grid(&grid);
+        for y in 0..H {
+            let start = y * W;
+            let end = start + W;
+            grid.evaluate_row_into(
+                y,
+                &mut expected_a[start..end],
+                &mut expected_b[start..end],
+                &mut scratch,
+            );
+        }
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        let out_w = W; // scale = 1
+
+        for &(x, y) in &[(10usize, 20usize), (50usize, 20usize)] {
+            let idx = y * W + x;
+            let expected = expected_a[idx] * value + expected_b[idx];
+            let actual = out.data[y * out_w + x];
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "x={x} y={y} actual={actual} expected={expected}"
+            );
+        }
+
+        // Not vacuous: the two predicted values must actually differ (the
+        // gradient is genuinely being read, not some constant fallback that
+        // would coincidentally satisfy the check above).
+        let e_left = expected_a[20 * W + 10] * value + expected_b[20 * W + 10];
+        let e_right = expected_a[20 * W + 50] * value + expected_b[20 * W + 50];
+        assert!(
+            (e_left - e_right).abs() > 0.01,
+            "e_left={e_left} e_right={e_right}"
+        );
     }
 
     // ── (g) rotation conservation ──
@@ -1195,23 +1420,34 @@ mod tests {
     // ── (i) memory ──
 
     #[test]
-    fn estimate_memory_bytes_matches_the_r_m3_7_formula() {
+    fn estimate_memory_bytes_matches_the_r_m3_15_formula() {
+        // R-M3-15 (fix round 1, amends R-M3-7): the weight-map planes and
+        // `measure_plane`'s own scaled copy are now counted too — checked
+        // across all four `(ln, write_weight_map)` combinations.
         let (width, height, channels, scale) = (6224usize, 4168usize, 3usize, 3u32);
         let out_w = width as u64 * scale as u64;
         let out_h = height as u64 * scale as u64;
-        let expected = (channels as u64 + 2) * out_w * out_h * 4
-            + width as u64 * height as u64 * 4
-            + 2 * width as u64 * height as u64 * 4;
-        assert_eq!(
-            estimate_memory_bytes(width, height, channels, scale, true),
-            expected
-        );
+        let base = (channels as u64 + 2) * out_w * out_h * 4;
+        let weight_map = channels as u64 * out_w * out_h * 4;
+        let measure_scratch = out_w * out_h * 4;
+        let source = width as u64 * height as u64 * 4;
+        let ln_planes = 2 * width as u64 * height as u64 * 4;
 
-        let expected_no_ln =
-            (channels as u64 + 2) * out_w * out_h * 4 + width as u64 * height as u64 * 4;
         assert_eq!(
-            estimate_memory_bytes(width, height, channels, scale, false),
-            expected_no_ln
+            estimate_memory_bytes(width, height, channels, scale, true, true),
+            base + weight_map + measure_scratch + source + ln_planes
+        );
+        assert_eq!(
+            estimate_memory_bytes(width, height, channels, scale, false, false),
+            base + measure_scratch + source
+        );
+        assert_eq!(
+            estimate_memory_bytes(width, height, channels, scale, true, false),
+            base + measure_scratch + source + ln_planes
+        );
+        assert_eq!(
+            estimate_memory_bytes(width, height, channels, scale, false, true),
+            base + weight_map + measure_scratch + source
         );
     }
 
@@ -1275,7 +1511,12 @@ mod tests {
             use_weights: true,
             use_rejection: false,
             use_local_normalization: false,
-            write_weight_map: false,
+            // Minor 6 (fix round 1): `write_weight_map: true` so this test
+            // can also check the RAW weight (not just the I/W ratio) is
+            // flat across a seam — I/W alone cannot tell a double deposit
+            // (I and W both doubled together, ratio unchanged) from a
+            // correct one; the weight map can.
+            write_weight_map: true,
             measure: &measure,
             ram_total_bytes: None,
         };
@@ -1294,5 +1535,224 @@ mod tests {
                 assert!((v - 0.4).abs() < 1e-6, "y={y} x={x} v={v}");
             }
         }
+
+        // Minor 6: the weight map must be FLAT (no doubling, no gap) at the
+        // exact seam rows and their immediate neighbours, compared against
+        // an unambiguously interior reference row.
+        let weight_map = out.weight.as_ref().expect("write_weight_map was on");
+        let x = 20usize;
+        let reference = weight_map[10 * out_w + x];
+        for &seam in &[
+            510usize, 511, 512, 513, 1022, 1023, 1024, 1025, 1534, 1535, 1536, 1537,
+        ] {
+            let v = weight_map[seam * out_w + x];
+            assert!(
+                (v - reference).abs() < 1e-6,
+                "seam={seam} x={x} weight={v} reference={reference}"
+            );
+        }
+    }
+
+    // ── Important 3 (fix round 1): a short `weight`/`output_pair` slice is
+    // loud, not a silent fallback. ──
+
+    #[test]
+    fn mismatched_weight_or_output_pair_length_is_bad_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = uniform(W, H, 0.2);
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &data);
+        let map = identity_map();
+        let measure = MeasureOptions::default();
+
+        // A `weight` slice shorter than `channels`, with `use_weights` on.
+        let short_weight: [f64; 0] = [];
+        let pair = identity_pair();
+        let f_bad_weight = DrizzleFrame {
+            path: &p0,
+            map: &map,
+            weight: &short_weight,
+            output_pair: &pair,
+            ln: None,
+            rej: None,
+        };
+        let frames = [f_bad_weight];
+        let mut input = base_input(&frames, &measure);
+        input.use_weights = true;
+        let err =
+            drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap_err();
+        assert!(matches!(err, DrizzleError::BadInput(_)), "{err:?}");
+        if let DrizzleError::BadInput(msg) = &err {
+            assert!(msg.contains("weight"), "{msg}");
+        }
+
+        // An `output_pair` slice shorter than `channels` — checked
+        // unconditionally, regardless of `use_weights`/LN settings.
+        let weight = [1.0f64];
+        let short_pair: [NormalizationPair; 0] = [];
+        let f_bad_pair = DrizzleFrame {
+            path: &p0,
+            map: &map,
+            weight: &weight,
+            output_pair: &short_pair,
+            ln: None,
+            rej: None,
+        };
+        let frames2 = [f_bad_pair];
+        let input2 = base_input(&frames2, &measure);
+        let err2 =
+            drizzle_group(&input2, &pool(), &AtomicBool::new(false), &no_progress()).unwrap_err();
+        assert!(matches!(err2, DrizzleError::BadInput(_)), "{err2:?}");
+        if let DrizzleError::BadInput(msg) = &err2 {
+            assert!(msg.contains("output_pair"), "{msg}");
+        }
+    }
+
+    // ── Minor 7 (fix round 1): make the `scale²` tabulated-kernel factor
+    // OBSERVABLE — a white-box test that calls `deposit_band` directly
+    // (bypassing `drizzle_group`'s public API, whose `I/W` and
+    // `W/max(W)` both cancel any constant common to every deposit of one
+    // kernel, which is exactly why the factor was unobservable through it)
+    // and compares the RAW summed mass in `wb` between `square` and
+    // `circle` for the SAME isolated drop. Both kernels must deposit the
+    // same total mass — `scale² · dropShrink²` — for a single source pixel:
+    // `square`'s exact-clip total is `scale² · dropShrink²` by construction
+    // (pinned independently by Task 1's own geometry tests); `circle`'s
+    // tabulated weights are renormalized to sum to `dropShrink²` in SOURCE
+    // units regardless of the hard radius cutoff (Task 1's own
+    // `circle_kernel_table_is_a_hard_radius_cutoff` pins the sum), so
+    // without the `scale²` factor at the deposit site circle's total would
+    // be `dropShrink²` alone — off by exactly `scale²` (4x at scale=2), a
+    // discrepancy this test would catch immediately. ──
+
+    #[test]
+    fn circle_kernel_deposits_the_same_total_mass_as_square_for_the_same_drop() {
+        let (width, height) = (20usize, 20usize);
+        let mut src = vec![0f32; width * height];
+        src[10 * width + 10] = 1.0;
+        let map = identity_map();
+        let scale = 2u32;
+        let out_w = width * scale as usize;
+        let out_h = height * scale as usize;
+        let drop_shrink = 0.9;
+        let pair = NormalizationPair::IDENTITY;
+
+        let mut ib_sq = vec![0f32; out_w * out_h];
+        let mut wb_sq = vec![0f32; out_w * out_h];
+        let ctx_sq = FrameDepositCtx {
+            src: &src,
+            width,
+            height,
+            map: &map,
+            scale,
+            drop_shrink,
+            kernel: DrizzleKernel::Square,
+            kernel_table: None,
+            rej: None,
+            ln: None,
+            pair,
+            w: 1.0,
+            plane: 0,
+        };
+        deposit_band(&mut ib_sq, &mut wb_sq, 0, out_w, &ctx_sq);
+        let mass_sq: f64 = wb_sq.iter().map(|&v| v as f64).sum();
+
+        let table = geom::kernel_table(DrizzleKernel::Circle, drop_shrink).unwrap();
+        let mut ib_c = vec![0f32; out_w * out_h];
+        let mut wb_c = vec![0f32; out_w * out_h];
+        let ctx_c = FrameDepositCtx {
+            src: &src,
+            width,
+            height,
+            map: &map,
+            scale,
+            drop_shrink,
+            kernel: DrizzleKernel::Circle,
+            kernel_table: Some(&table),
+            rej: None,
+            ln: None,
+            pair,
+            w: 1.0,
+            plane: 0,
+        };
+        deposit_band(&mut ib_c, &mut wb_c, 0, out_w, &ctx_c);
+        let mass_c: f64 = wb_c.iter().map(|&v| v as f64).sum();
+
+        let expected = (scale as f64).powi(2) * drop_shrink * drop_shrink;
+        assert!(
+            (mass_sq - expected).abs() < 1e-2,
+            "mass_sq={mass_sq} expected={expected}"
+        );
+        assert!(
+            (mass_c - expected).abs() < 1e-2,
+            "mass_c={mass_c} expected={expected}"
+        );
+        assert!(
+            (mass_sq - mass_c).abs() < 1e-2,
+            "mass_sq={mass_sq} mass_c={mass_c}"
+        );
+    }
+
+    // ── Minor 8 (fix round 1): `band_source_window` returns `None`, not an
+    // accidental 1-pixel window, when a band maps entirely off-frame. ──
+
+    #[test]
+    fn band_source_window_returns_none_when_the_band_is_entirely_off_frame() {
+        // A translation far enough that a band mapped through `inverse`
+        // lands well outside `[0, width) x [0, height)` on every axis.
+        let map = translation_map(-10_000.0, -10_000.0);
+        let result = band_source_window(&map, 64, 0, 48, 2, 32, 24, 0.9);
+        assert_eq!(
+            result, None,
+            "far off-frame band must be None, not a stray window"
+        );
+    }
+
+    // ── Minor 13 (fix round 1): a non-finite normalized value (`nd`) must
+    // be skipped, never propagate into `I`/`W`. ──
+
+    #[test]
+    fn non_finite_normalized_value_is_skipped_not_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        // One lit source pixel on a zero field (same shape as test (b)) so
+        // the non-finite `nd` only ever afflicts that single drop — any
+        // other pixel is already skipped for being exactly zero, so this
+        // isolates the `nd`-finiteness guard specifically.
+        let mut data = vec![0f32; W * H];
+        data[10 * W + 10] = 1.0;
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &data);
+        let map = identity_map();
+        let weight = [1.0f64];
+        // `NaN * d + 0.0` is NaN for the one nonzero sample.
+        let pair = [NormalizationPair {
+            scale: f32::NAN,
+            offset: 0.0,
+        }];
+        let frames = [frame(&p0, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let mut input = base_input(&frames, &measure);
+        input.scale = 2;
+        input.drop_shrink = 1.0;
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        assert!(
+            out.data.iter().all(|v| v.is_finite()),
+            "no NaN must reach `data`"
+        );
+        let weight_map = out.weight.as_ref().expect("write_weight_map was on");
+        assert!(
+            weight_map.iter().all(|v| v.is_finite()),
+            "no NaN must reach `weight`"
+        );
+        // The whole plane must be all-zero: the only nonzero source sample
+        // was skipped for a non-finite `nd`, so nothing was ever deposited.
+        assert!(
+            out.data.iter().all(|&v| v == 0.0),
+            "the skipped drop must leave the plane at zero"
+        );
+        assert_eq!(
+            out.stats.coverage[0], 0.0,
+            "coverage={}",
+            out.stats.coverage[0]
+        );
     }
 }
