@@ -9364,27 +9364,44 @@ mod tests {
         assert_eq!(completes[0]["cancelled"].as_bool(), Some(true));
     }
 
-    /// Fix round 1, Important I3: drizzle over a group where the weight
-    /// floor actually drops a frame, so the `k` (position in
-    /// `output.included`) vs `idx` (position in `stack_frames`/`members`)
-    /// split in the drizzle fan-out is genuinely exercised — every OTHER
-    /// drizzle test in this file uses a healthy 4-frame fixture where
-    /// `output.included == 0..4`, identity in both indexings, so a
-    /// same-length permutation bug would pass every one of them silently
-    /// (`integrate_group`'s own guard, `integrate.rs`, only compares
-    /// COUNTS). Frame 3 carries 10x the background level of the other
-    /// three (so a misaligned weight/output-pair leaking its data into a
-    /// KEPT frame's slot, or vice versa, would visibly shift the drizzled
-    /// output's level) and far higher noise, driving its computed
-    /// (`PsfSignalWeight` — signal²/noise²) normalized weight well under
-    /// `integration.min_weight`'s default (0.005) while
-    /// `selection.min_weight_fraction = 0.0` keeps stage 3 from excluding
-    /// it FIRST — it must reach `process_group_output`'s member list and
-    /// get dropped by `integrate_group`'s OWN gate (the one
-    /// `included_after_min_weight` computes and the run's `RejBitmapSet`
-    /// creation mirrors), not stage 3's runtime-exclusion path.
+
+    /// Fix round 2, Important I3 (re-review): the round-1 version of this
+    /// test dropped the fixture's LAST frame (index 3 of 4), which leaves
+    /// `output.included == [0, 1, 2]` — `k == idx` for every survivor, so a
+    /// hypothetical bug that swapped `k` (position in `output.included`)
+    /// for `idx` (position in `stack_frames`/`members`) anywhere in the
+    /// drizzle fan-out would have been COMPLETELY INVISIBLE (`stack_frames[k]`
+    /// and `stack_frames[idx]` are the same array access for every kept
+    /// frame). Reworked: 5 frames, DROP THE SECOND (index 1 of 5) — engine
+    /// order for the 4 survivors is `output.included == [0, 2, 3, 4]`, so
+    /// `k=1→idx=2`, `k=2→idx=3`, `k=3→idx=4` for every survivor past the
+    /// first (only `k=0→idx=0` still coincides, unavoidably, since the
+    /// FIRST kept frame is always its own position).
+    ///
+    /// Each kept frame gets a DISTINCT, exactly-known weight
+    /// (`measurement.weight_mode = Exposure`, so `weight == exptime`
+    /// directly — no noise/PSF-derived formula to fight for a precise
+    /// target) and a DISTINCT background level; `normalization.output =
+    /// None` makes every frame's output pair the identity (no scale/offset
+    /// warps the deposited value); `integration.rejection = None` disables
+    /// algorithm rejection outright, so nothing in the flat, noise-free
+    /// (well, near-zero-noise) background region this test samples is ever
+    /// flagged and skipped. Under those three settings, ruling R-M3-2's
+    /// `I = Σ a·w·N(d)`, `W = Σ a·w`, output `I/W` reduces EXACTLY to the
+    /// plain weighted mean `Σ w_i·v_i / Σ w_i` of the kept frames' own
+    /// calibrated levels at any interior, star-free output pixel — the `a`
+    /// (area) factor is identical across every frame at a given output
+    /// pixel (all frames share the SAME zero-shift geometry) and cancels.
+    /// The test measures each kept frame's own calibrated level directly
+    /// (reading the SAME file the drizzle stage itself reads, at the SAME
+    /// star-free coordinate) rather than assuming a calibration formula, so
+    /// the predicted level is independent of the calibration math entirely.
+    ///
+    /// See the task report for exactly which survivor pairs a `k`-instead-
+    /// of-`idx` bug would swap here, and by how much the predicted level
+    /// would move.
     #[test]
-    fn drizzle_over_a_min_weight_drop_excludes_the_dropped_frame_and_keeps_the_level_right() {
+    fn drizzle_over_a_min_weight_drop_matches_the_kept_frames_exact_weighted_mean() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
@@ -9392,27 +9409,40 @@ mod tests {
         let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
         let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
 
-        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-        // Frame 3 is the one meant to drop: 10x the background level and
-        // 60x the noise sigma of the other three.
-        let backgrounds = [600.0f32, 600.0, 600.0, 6000.0];
-        let noise = [5.0f32, 5.0, 5.0, 300.0];
+        // Index 1 (of 0..5) is the one that will be dropped by the
+        // min-weight gate — a middle member, not the tail, so every
+        // survivor past the first has k != idx (see the doc comment
+        // above). Zero relative shift for every frame: this test cares
+        // about weight/level alignment, not registration robustness (which
+        // every OTHER drizzle test already exercises with real shifts), and
+        // a flat background region's value is unaffected by interpolation
+        // under an identity map either way.
+        let exptimes = [60.0f64, 0.001, 30.0, 15.0, 7.5];
+        let backgrounds = [600.0f32, 9999.0, 900.0, 1200.0, 1500.0];
+        let noise = [2.0f32, 2.0, 2.0, 2.0, 2.0];
         let mut light_ids = Vec::new();
-        for (i, (&(dx, dy), (&bg, &sigma))) in shifts
-            .iter()
-            .zip(backgrounds.iter().zip(noise.iter()))
-            .enumerate()
-        {
-            let stars = shifted_stars(dx, dy);
-            let date_obs = date_obs_at(i);
+        for i in 0..5 {
             let stem = format!("f{i}");
-            let spec = star_light_spec(&stem, &date_obs);
+            let date_obs = date_obs_at(i);
+            let spec = LightSpec {
+                stem: &stem,
+                instrume: "cam",
+                filter: None,
+                binning: 1,
+                width: STAR_FIELD_WIDTH,
+                height: STAR_FIELD_HEIGHT,
+                exptime: exptimes[i],
+                date_obs: &date_obs,
+                bayerpat: None,
+                write_file: true,
+            };
+            let stars = shifted_stars(0.0, 0.0);
             let (id, _path) = test_fixtures::add_light_with_field(
                 &fixture,
                 &spec,
                 &stars,
-                bg,
-                sigma,
+                backgrounds[i],
+                noise[i],
                 100 + i as u64,
             );
             light_ids.push(id);
@@ -9441,12 +9471,32 @@ mod tests {
         );
 
         let mut cfg = StackingConfig::default();
-        // Stage 3 must NOT exclude frame 3 on weight — it has to survive
-        // selection and reach `integrate_group`'s OWN min-weight gate.
+        // Grouping clusters by exposure too (spec §2) — its anchor-relative
+        // rule (`cluster_indices`, `groups.rs`) compares every sorted
+        // exposure against the CLUSTER'S FIRST value, so the 0.001s..60s
+        // spread here needs a tolerance past the full span, or the 5
+        // frames would fragment into several undersized groups before this
+        // test's own weight gate ever runs.
+        cfg.grouping.exposure_tolerance_sec = 100.0;
+        // Exact, controllable weights: weight == exptime, nothing derived
+        // from noise/PSF fits (which fix round 1 found hard to hit a
+        // precise target with).
+        cfg.measurement.weight_mode = WeightMode::Exposure;
+        // Stage 3 must not exclude frame 1 on weight — it has to survive
+        // selection and reach `integrate_group`'s OWN gate.
         cfg.selection.min_weight_fraction = 0.0;
+        // Identity output pairs for every frame: the deposited value is
+        // each frame's own calibrated level, unscaled/unshifted.
+        cfg.normalization.output = crate::integration::stats::OutputNormalization::None;
+        // No algorithm rejection: nothing in the flat background region
+        // this test samples is ever flagged, whatever a real sigma-clip
+        // might make of four frames with deliberately different raw
+        // background levels.
+        cfg.integration.rejection = crate::stacking::integrate::RejectionChoice::None;
         cfg.drizzle.enabled = true;
         cfg.drizzle.scale = 2;
         cfg.drizzle.use_rejection = true;
+        cfg.drizzle.use_weights = true;
         cfg.output.cleanup = CleanupPolicy::KeepAll;
 
         let started = start_stacking(
@@ -9474,12 +9524,12 @@ mod tests {
             .stats
             .as_ref()
             .expect("group stats recorded");
-        assert_eq!(stats.frames, 4, "all 4 frames must reach integration: {stats:?}");
+        assert_eq!(stats.frames, 5, "all 5 frames must reach integration: {stats:?}");
         assert_eq!(
             stats.dropped_below_min_weight, 1,
             "expected exactly one frame dropped below the weight floor: {stats:?}"
         );
-        assert_eq!(stats.included, 3, "{stats:?}");
+        assert_eq!(stats.included, 4, "{stats:?}");
 
         let drizzle_stats = group_summary
             .drizzle
@@ -9490,54 +9540,102 @@ mod tests {
             "drizzle.frames must equal the group's own included count: {drizzle_stats:?}"
         );
 
+        // The 4 KEPT frames' own calibrated levels, measured directly from
+        // the SAME files the drizzle stage reads (`SummaryFrame.calibrated_path`),
+        // at a coordinate far from every star (`BASE_STARS` spans roughly
+        // x in [30, 150], y in [24, 102] on this 192x144 canvas — (165..185,
+        // 110..130) is comfortably outside any star's PSF wing at sigma
+        // 1.6px) and averaged over a 20x20 patch there to wash out the
+        // (small, near-zero) per-pixel noise.
+        let region_mean = |plane: &[f32], width: usize, x0: usize, y0: usize, w: usize, h: usize| -> f64 {
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    sum += plane[y * width + x] as f64;
+                    count += 1;
+                }
+            }
+            sum / count as f64
+        };
+
+        let kept_indices = [0usize, 2, 3, 4];
+        let kept_weights = [1.0f64, 0.5, 0.25, 0.125]; // exptime / max(exptime) = 60/60, 30/60, 15/60, 7.5/60
+        let mut kept_levels = Vec::with_capacity(4);
+        let mut kept_stems = Vec::with_capacity(4);
+        for &i in &kept_indices {
+            let frame_id = light_ids[i];
+            let sf = group_summary
+                .frames
+                .iter()
+                .find(|f| f.frame_id == frame_id)
+                .unwrap_or_else(|| panic!("frame {i} (id {frame_id}) not in summary"));
+            let calibrated_path = sf
+                .calibrated_path
+                .as_ref()
+                .unwrap_or_else(|| panic!("frame {i} has no calibrated_path: {sf:?}"));
+            let reader = PlaneReader::open(Path::new(calibrated_path)).unwrap();
+            let plane = reader.read_plane(0).unwrap();
+            let level = region_mean(&plane, reader.width(), 165, 110, 20, 20);
+            kept_levels.push(level);
+            kept_stems.push(
+                Path::new(calibrated_path)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+
+        let sum_w: f64 = kept_weights.iter().sum();
+        let sum_wv: f64 = kept_weights
+            .iter()
+            .zip(kept_levels.iter())
+            .map(|(&w, &v)| w * v)
+            .sum();
+        let expected_level = sum_wv / sum_w;
+
         let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
         let group = &groups[0];
-        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
-        let rej_dir = layout.rej_dir(started.run_id, &group.group_key);
-        let entries: Vec<String> = std::fs::read_dir(&rej_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            entries.len(),
-            stats.included,
-            "rej/ must hold exactly the INCLUDED frames' bitmaps: {entries:?}"
-        );
-        assert!(
-            !entries.iter().any(|e| e.contains('3')),
-            "the dropped frame's own .rej file must not exist among the kept ones: {entries:?}"
-        );
-
-        // The drizzled output's level: built from the SAME 3 kept frames
-        // (with the SAME weights/pairs) the regular master was, so the two
-        // should agree closely — a misaligned `k`/`idx` split that leaked
-        // frame 3's 10x-brighter data (or its weight/pair) into the
-        // drizzle deposit would show up as the drizzled mean diverging
-        // sharply from the master's own mean.
-        let master_path = group.master_path.clone().expect("master path recorded");
         let drizzle_path = group
             .drizzle_path
             .clone()
             .expect("drizzle path recorded");
-        let master_reader = PlaneReader::open(Path::new(&master_path)).unwrap();
         let drizzle_reader = PlaneReader::open(Path::new(&drizzle_path)).unwrap();
-        let mean = |v: &[f32]| -> f64 {
-            let sum: f64 = v.iter().map(|&x| x as f64).sum();
-            sum / v.len() as f64
-        };
-        let master_mean = mean(&master_reader.read_plane(0).unwrap());
-        let drizzle_mean = mean(&drizzle_reader.read_plane(0).unwrap());
+        let drizzle_plane = drizzle_reader.read_plane(0).unwrap();
+        // Scale-2 output: the same (165..185, 110..130) source patch maps
+        // to (330..370, 220..260) in output pixels.
+        let drizzled_level = region_mean(&drizzle_plane, drizzle_reader.width(), 330, 220, 40, 40);
+
         assert!(
-            master_mean > 0.0,
-            "master mean must be positive: {master_mean}"
+            (drizzled_level - expected_level).abs() < 1e-4,
+            "drizzled interior level does not match the kept frames' exact weighted mean: \
+             expected={expected_level} (levels={kept_levels:?}, weights={kept_weights:?}), \
+             drizzled={drizzled_level}, diff={}",
+            (drizzled_level - expected_level).abs()
         );
-        let ratio = drizzle_mean / master_mean;
-        assert!(
-            (0.4..2.5).contains(&ratio),
-            "drizzled output level diverges too far from the regular master's — \
-             a leaked/misaligned frame would show as a much higher ratio: \
-             master_mean={master_mean}, drizzle_mean={drizzle_mean}, ratio={ratio}"
+
+        // The .rej files: exactly the 4 KEPT frames' own calibrated stems,
+        // no more, no less — in particular never the dropped frame's.
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let rej_dir = layout.rej_dir(started.run_id, &group.group_key);
+        let mut actual_stems: Vec<String> = std::fs::read_dir(&rej_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                Path::new(&e.file_name())
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        actual_stems.sort();
+        let mut expected_stems = kept_stems.clone();
+        expected_stems.sort();
+        assert_eq!(
+            actual_stems, expected_stems,
+            "rej/ must hold exactly the kept frames' bitmaps, named by their own calibrated stems"
         );
     }
 }

@@ -127,19 +127,9 @@ pub fn get_stacking_plan(
     build_plan(&conn, &ctx.settings, policy, set_id, config)
 }
 
-/// Start a stacking run for `set_id`. Delegates straight to
-/// [`crate::stacking::run::start_stacking`], forwarding `policy` unchanged.
-///
-/// Fix round 1, item 1: a caller-supplied `config` can carry its OWN
-/// `paths.workingDir`/`paths.outputDir` override (spec §9.2) — those are not
-/// necessarily the already-stored settings paths, so `policy` must be the
-/// SAME host sandbox [`get_stacking_plan`] validates against, not
-/// [`PathPolicy::AllowAll`] hard-coded here. Without this, `get_stacking_plan`
-/// could refuse a sandbox-external folder with a `folders` blocker while
-/// `start_stacking` ran and wrote there anyway — plan and start must never
-/// disagree about what the host allows (spec §12).
-/// Ruling R-M3-9: drizzle has no cache of its own — the bitmaps it reads
-/// come from integration, so "re-run from drizzle" is really "re-run from
+/// Ruling R-M3-9: drizzle has no cache of its own — the bitmaps a re-run
+/// would want to reuse come from integration, not from anything drizzle
+/// itself wrote, so "re-run from drizzle" really means "re-run from
 /// integrate". `Some(Stage::Drizzle)` clamps to `Some(Stage::Integrate)`;
 /// every other value (including `None`) passes through unchanged.
 ///
