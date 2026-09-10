@@ -628,13 +628,17 @@ are reported by the cleanup action, never deleted silently.
   rej/run-<id>/<group key>/<stem>.rej            (drizzle runs only, temporary)
   runs/run-<id>.json
 <output>/
-  <set slug>_<filter>_<mono|osc>_<exp>s_<n>x.fits (2026-09-10, fix round 1 ruling: no camera
-                                                    token — a group can mix cameras — but the
-                                                    colour-mode token stays ALWAYS present, so a
-                                                    mono and an OSC group of the same filter and
+  <set slug>_<filter>_<mono|osc>[_bin<n>]_<exp>s_<n>x.fits (2026-09-10, fix round 1 ruling: no
+                                                    camera token — a group can mix cameras — but
+                                                    the colour-mode token stays ALWAYS present, so
+                                                    a mono and an OSC group of the same filter and
                                                     exposure never collide down to a bare `_2`;
                                                     <exp> is the group's own exposure-cluster
-                                                    label, or `unknown`)
+                                                    label, or `unknown`. M2 final fix wave, ruling
+                                                    M11: `_bin<n>` appears ONLY when the group's
+                                                    binning is >= 2 — bin-1 names are unchanged,
+                                                    so a bin-1/bin-2 pair of the same filter/
+                                                    colour-mode/exposure never collides either)
   …_drizzle<s>x.fits, …_rejlow.fits, …_rejhigh.fits, …_drizzle<s>x_weight.fits
 ```
 
@@ -938,16 +942,25 @@ one set** (co-registered and native modes, §15 — owner requirement).
   second telescope with another focal length, or a camera with another
   pixel size cannot join the set's masters today — the group key's
   binning × geometry split keeps them apart, and registration then drops
-  every frame of the foreign-scale group. Planned as an M4 item (after
-  drizzle, which changes the output scale for every group alike), with two
-  modes the owner picks per set: (a) **co-registered** — widen the scale
-  gate, resample every group into the reference geometry (the finer scale
-  loses resolution, the coarser is upsampled) and keep one master per group
-  in one geometry; (b) **native** — a per-group reference (the group's
-  best-weighted frame) and a master in the group's own geometry, no
-  cross-group registration. Both keep the group key. Until then the plan
-  gate should report a group whose scale the reference cannot accept as a
-  named blocker ("group `<key>` is at ×2.0 the reference's pixel scale —
-  not supported yet") instead of failing every frame at registration — an
-  M2 quick win, decided from the header's binning and, when both frames
-  have a plate solve, the ratio of their pixel scales.
+  every frame of the foreign-scale group, one at a time, with a visible
+  per-frame exclusion reason in the frames table. **Correction (M2 final
+  fix wave, ruling I4):** the paragraph below used to promise the plan-time
+  blocker as "an M2 quick win" — Task 10 (2026-09-10, camera-agnostic
+  grouping) explicitly ruled "no new gate" for that cycle, so it was never
+  built; the per-frame registration-gate drop above remains the ONLY
+  defence today. Planned as an M4 item (after drizzle, which changes the
+  output scale for every group alike), with two modes the owner picks per
+  set: (a) **co-registered** — widen the scale gate, resample every group
+  into the reference geometry (the finer scale loses resolution, the
+  coarser is upsampled) and keep one master per group in one geometry; (b)
+  **native** — a per-group reference (the group's best-weighted frame) and
+  a master in the group's own geometry, no cross-group registration. Both
+  keep the group key. **First item of this M4 work** (moved from the M2
+  promise above): the plan gate reports a group whose members' implied
+  pixel scales differ beyond the registration gate's tolerance as a named
+  WARNING, never a blocker (matching the missing-`EXPTIME` cluster's own
+  precedent) — "group `<key>` spans ×2.0 the reference's pixel scale —
+  some frames may be dropped at registration" — decided from the header's
+  binning and, when both frames have a plate solve, the ratio of their
+  pixel scales (`f.focallen` and a new pixel-size column in
+  `load_group_members`, `stacking/groups.rs`).

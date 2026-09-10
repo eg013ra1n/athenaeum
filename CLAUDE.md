@@ -490,18 +490,26 @@ built-in default.
 
 **Beyond M1** (spec §14): **M2** — local normalization (MMT background
 models, PSF-flux scale with RCR, `.athln` sidecars, `NormalizePanel`'s LN
-block goes live). **M3** — drizzle (exact clipping, forward mapping, M1's
-rejection bitmaps turned on, `DrizzlePanel` goes live). **M4** — polish:
-thin-plate-spline distortion, ESD/RCR/min-max/large-scale rejection, Bayer
-drizzle, XISF output, cataloging masters, preset management, and **mixed
-pixel scales in one set** (owner requirement 2026-09-09 — co-registered
-mode resamples every group into the reference geometry, native mode keeps a
-per-group reference with no cross-group registration; until M4 the plan gate
-names a foreign-scale group as a blocker instead of registration silently
-dropping its frames).
+block goes live) — SHIPPED, see below. **M3** — drizzle (exact clipping,
+forward mapping, M1's rejection bitmaps turned on, `DrizzlePanel` goes
+live). **M4** — polish: thin-plate-spline distortion, ESD/RCR/min-max/
+large-scale rejection, Bayer drizzle, XISF output, cataloging masters,
+preset management, and **mixed pixel scales in one set** (owner requirement
+2026-09-09 — co-registered mode resamples every group into the reference
+geometry, native mode keeps a per-group reference with no cross-group
+registration). **Correction (M2 final fix wave, ruling I4):** the sentence
+here used to claim the plan gate already names a foreign-scale group as a
+blocker — it does not (`grep` for pixel-scale terms in `plan.rs` returns 0
+hits). Today the ONLY defence is registration's own per-frame scale gate
+(`[0.8, 1.25]` of the reference), which drops such a frame one at a time
+with a visible exclusion reason in the frames table — no plan-time signal
+names the group itself yet. A plan-time WARNING (never a blocker) is the
+first item of the M4 mixed-pixel-scale work — see spec §15 and
+`docs/superpowers/open-items.md`'s Stacking M2 subsection.
 
-**M2 — local normalization** (spec §5.2, executed 2026-09-10): stage 6
-(`Stage::Normalize`) stops being a no-op the moment
+**M2 — local normalization** (spec §5.2, executed 2026-09-10 alongside Task
+10's camera-agnostic grouping rule — see "The plan gate" above, same
+cycle): stage 6 (`Stage::Normalize`) stops being a no-op the moment
 `normalization.local.enabled` is on or `normalization.rejection == "local"`.
 Per group it ranks included members by weight, integrates the best
 `referenceFrames` of them
@@ -545,18 +553,22 @@ size in px — 256–4096, step 256 in the UI), `referenceFrames` (3–50),
 is M4). On-disk layout: `<working_dir>/<set_slug>/ln/<group>/reference.fits`
 + `ln/<group>/<calibrated-stem>.athln`.
 
-**Known gap, not closed by this landing**: `build_plan`'s own Gate 6
-(`plan.rs`, code `"unsupported"`, message "Local normalization arrives in
-M2") still refuses any plan with `normalization.local.enabled = true`
-outright, and `integrate_group` (`stacking/integrate.rs`) still refuses
+**LN runs end to end through `start_stacking`.** The two M1-era guards that
+used to block it — `build_plan`'s Gate 6 (`plan.rs`, code `"unsupported"`)
+refusing any plan with `normalization.local.enabled = true`, and
+`integrate_group` (`stacking/integrate.rs`) refusing
 `normalization.rejection == "local"` with a `BadInput` before it ever
-reaches the engine — both are the M1-era guards this feature was built
-against, neither lifted yet. The wiring above is complete and covered by
-tests that drive `RunContext` directly (bypassing `build_plan`/
-`start_stacking`, the same pattern the stage-6 driver's own tests use),
-and by `examples/ln_probe.rs` against a real catalog — but `start_stacking`
-itself will not yet run a plan with local normalization on until a
-follow-up task removes both refusals.
+reached the engine — were both lifted in the same cycle; nothing routes
+around `start_stacking` to exercise LN any more. **Acceptance run
+2026-09-10** (`docs/superpowers/research/2026-09-10-m2-acceptance-run.md`):
+LN end to end on the real LDN 1272 catalog (368 frames across a mono and an
+OSC group), reference build + per-frame fan-out both verified against the
+external baseline (master noise 0.89–1.13× it, no mesh imprint at the grid
+stride); the residual rejected-fraction gap versus that baseline is
+attributed to the M4 robust-line-fit-dispersion calibration item (spec §14
+M4), not a defect in LN itself — see `docs/superpowers/open-items.md`'s
+Stacking M2 subsection for the full attribution and the owner smokes still
+owed.
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,robust,integrate,

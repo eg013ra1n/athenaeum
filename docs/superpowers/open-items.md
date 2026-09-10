@@ -203,7 +203,12 @@ misses, both recorded below.
   the per-frame fan-out admits one OSC frame at a time under the RAM probe,
   so the stage is memory-bound, not CPU-bound. Re-measure on a ≥ 32 GB
   machine before treating it as a performance defect; the M4 performance
-  item covers the algorithmic side (detect-once, shared star lists).
+  item covers the algorithmic side (detect-once, shared star lists). Partly
+  addressed in the M2 final fix wave: the reference's star fit was being
+  recomputed per frame (`relative_scale`); hoisted into a per-group
+  `PreparedReferenceChannel` so it now runs once per group, not once per
+  frame — the per-frame PSF cost roughly halves. Re-measure this stage's
+  wall time in M3's acceptance run.
 - **M4 follow-up: the linear-fit rejection dispersion is ≈ 1.4× the
   external reference's.** Run 6 (LN both sides, linear fit 5.0/3.5) rejected
   0.83 % (mono) / 0.74 % (OSC) where the external reference rejects
@@ -225,6 +230,29 @@ misses, both recorded below.
 - **Release-note lines owed** (drafted in the acceptance note §9): local
   normalization, the LN rejection option, camera-agnostic integration groups
   (below), the `Scale` column and the `LN: n/m` results line.
+- **M4 follow-up: plan-time pixel-scale warning.** Recorded as the FIRST
+  item of the M4 mixed-pixel-scales work (spec §15, ruling I4 option (a),
+  M2 final fix wave): today the ONLY defence against a foreign-pixel-scale
+  group member is registration's own per-frame scale gate (`[0.8, 1.25]` of
+  the reference, §3.6) — it drops such a frame one at a time with a visible
+  exclusion reason in the frames table; there is no plan-time signal naming
+  the group itself. The spec's earlier "M2 quick win" promise for this
+  blocker was never built (Task 10's own ruling was "no new gate" for the
+  camera-agnostic grouping cycle) — CLAUDE.md and spec §15 are corrected to
+  say so. M4 adds a WARNING (never a blocker, matching the missing-`EXPTIME`
+  cluster's own precedent) naming a group whose members' implied pixel
+  scales differ beyond the registration gate's tolerance, from `f.focallen`
+  and a new pixel-size column in `load_group_members` (`stacking/groups.rs`).
+- **M4 performance items (no code, report recommendation 6):**
+  `LnGrid::evaluate_row_into` recomputes the B-spline weights per output
+  pixel even though `fx = (x mod stride)/stride` only ever takes `stride`
+  distinct values (a power of two) — a `stride`-entry weight table
+  (128 × 4 f32 ≈ 2 KB) removes that per-pixel recomputation from the band
+  loop. `LnReferenceForDetection::build` clones every reference plane
+  unconditionally (`plane.clone()`, even when the plane is already fully
+  finite — the normal case for an integration output) — a `Cow` there gives
+  back ≈ 104 MB per channel on the acceptance geometry, on the machine the
+  LN-stage-time miss above already identifies as memory-bound.
 
 ### Stacking M2 — camera-agnostic grouping (2026-09-10)
 
