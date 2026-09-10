@@ -358,7 +358,7 @@ pub(crate) fn compute_export_readiness(
                 tracing::warn!(
                     master_set_id,
                     %error,
-                    "stacking: could not resolve a missing flat master's pre-calibration master; listing the flat only"
+                    "flat pre-calibration master unresolved; listing the flat only"
                 );
             }
         }

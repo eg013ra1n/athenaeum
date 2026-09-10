@@ -2009,6 +2009,22 @@ impl Drop for ActiveBuildGuard<'_> {
     }
 }
 
+/// A [`ProgressEmitter`] adapter that drops `master-build-progress` events
+/// and passes everything else through unchanged (Plan 5b final fix wave,
+/// review finding B1) — see [`build_master_inline`]'s doc comment for why.
+struct DropMasterBuildProgress<'a> {
+    inner: &'a dyn ProgressEmitter,
+}
+
+impl ProgressEmitter for DropMasterBuildProgress<'_> {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        if event_name == "master-build-progress" {
+            return;
+        }
+        self.inner.emit_json(event_name, payload);
+    }
+}
+
 /// Stage 0.5 (spec §2 row 0.5, owner requirement 2026-09-09): the validation
 /// `start_master_build`/`rebuild_master` do, PLUS a fresh Auto recipe
 /// resolution, run entirely on the STACKING RUN's own thread —
@@ -2042,9 +2058,19 @@ impl Drop for ActiveBuildGuard<'_> {
 ///
 /// `run_build` may still emit `master-build-progress` for this call — its
 /// per-band/per-combine callbacks are unconditional, so a build driven this
-/// way ticks the same event a manual build does. Harmless: nothing in the
-/// Stacking tab listens for `master-build-progress`; the stacking run's own
-/// `masters` progress row is what the UI actually shows.
+/// way ticks the same event a manual build does. NOT harmless (Plan 5b final
+/// fix wave, review finding B1): nothing in the Stacking tab listens for
+/// `master-build-progress`, but the master-build UI elsewhere DOES
+/// (`useMasterBuilds.ts`) — it sets `buildStates[set_id] = { phase:
+/// 'building' }` on the first tick and only clears it on a matching
+/// `master-build-complete`, which this call never emits (only
+/// `run_master_build_thread`'s spawned-thread flow does). Left unfiltered,
+/// every calibration set stage 0.5 touches would render a permanently
+/// disabled "Building…" for the rest of the session instead of "Create
+/// Master". [`DropMasterBuildProgress`] above strips exactly that one event
+/// name before handing the emitter to `run_build` — deliberately NOT
+/// synthesizing a fake `master-build-complete` instead, which would fire one
+/// extra master-build notification per master this stage builds.
 ///
 /// Returns the master's `calibration_set` id either way — `New`: the
 /// just-registered master (same as `run_build`'s own `New` return); `Rebuild`:
@@ -2086,9 +2112,10 @@ pub(crate) fn build_master_inline(
         synthetic_bias: None,
         archive_after: false,
     };
+    let filtered = DropMasterBuildProgress { inner: emitter };
     run_build(
         ctx,
-        emitter,
+        &filtered,
         app_version,
         set_id,
         &recipe,
@@ -4905,6 +4932,97 @@ mod tests {
                 .get(&set_id)
                 .is_none(),
             "the ActiveBuildGuard must release the handle on this early exit"
+        );
+    }
+
+    /// A `ProgressEmitter` that records every event name it was asked to
+    /// emit, in order — for asserting exactly which events reached the
+    /// stacking run's own emitter through [`DropMasterBuildProgress`].
+    struct RecordingEmitter {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ProgressEmitter for RecordingEmitter {
+        fn emit_json(&self, event_name: &str, _payload: serde_json::Value) {
+            self.events.lock().unwrap().push(event_name.to_string());
+        }
+    }
+
+    /// Plan 5b final fix wave, review finding B1: [`DropMasterBuildProgress`]
+    /// drops exactly `master-build-progress` and passes every other event
+    /// name through unchanged (`master-build-complete`, or the stacking
+    /// run's own `stacking-progress`, whichever this call's real emitter is
+    /// asked to carry).
+    #[test]
+    fn drop_master_build_progress_filters_only_the_named_event() {
+        let recording = RecordingEmitter {
+            events: std::sync::Mutex::new(Vec::new()),
+        };
+        let filtered = DropMasterBuildProgress { inner: &recording };
+
+        filtered.emit_json("master-build-progress", serde_json::json!({}));
+        filtered.emit_json("stacking-progress", serde_json::json!({}));
+        filtered.emit_json("master-build-progress", serde_json::json!({}));
+        filtered.emit_json("master-build-complete", serde_json::json!({}));
+
+        let events = recording.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "stacking-progress".to_string(),
+                "master-build-complete".to_string(),
+            ],
+            "every master-build-progress tick must be dropped; everything else must pass through"
+        );
+    }
+
+    /// Plan 5b final fix wave, review finding B1: `build_master_inline` runs
+    /// `run_build` with the STACKING run's own emitter — before the fix, a
+    /// real build's `master-build-progress` ticks (masters.rs's per-band/
+    /// per-combine callbacks are unconditional) reached that emitter with no
+    /// `master-build-complete` ever following, which the master-build UI
+    /// (`useMasterBuilds.ts`) reads as a permanently stuck "Building…" for
+    /// the touched calibration set. A real 3-frame dark build over a
+    /// recording emitter must show zero `master-build-progress` events.
+    #[test]
+    fn build_master_inline_never_leaks_master_build_progress_to_its_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            seed_buildable_dark_set(&conn, &src, 3)
+        };
+
+        let ctx = build_test_ctx(database);
+        let recording = RecordingEmitter {
+            events: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = build_master_inline(
+            &ctx,
+            &recording,
+            "0.5.1-test",
+            set_id,
+            BuildTarget::New,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        let events = recording.events.lock().unwrap();
+        assert!(
+            !events.iter().any(|e| e == "master-build-progress"),
+            "master-build-progress must never reach the stacking run's own emitter: {events:?}"
         );
     }
 

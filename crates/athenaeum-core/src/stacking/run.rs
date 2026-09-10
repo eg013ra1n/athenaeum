@@ -408,6 +408,83 @@ pub(crate) fn heal_interrupted_runs(
     Ok(healed)
 }
 
+/// RAII guard for [`start_stacking`]'s `active_stacks` handle (Plan 5b final
+/// fix wave, review finding B2) — same shape as
+/// [`crate::api::masters::ActiveBuildGuard`]. Armed the instant the handle is
+/// registered, covering everything from there through the thread spawn:
+/// `get_run`, the per-group `insert_group` loop, and the spawn itself can
+/// all still fail. Before this guard existed, such a failure returned via
+/// `?` straight past the handle-removal / row-finishing cleanup the
+/// spawn-failure path already had — the handle stayed in `active_stacks`
+/// and the `stacking_runs` row stayed `"planning"` forever, so
+/// [`heal_interrupted_runs`] (which only heals rows ABSENT from
+/// `active_stacks`) would never touch it and every later `start_stacking`
+/// for the same set answered `Conflict` until the process restarted.
+///
+/// Dropped while still armed: removes the handle and finishes the run row
+/// as `"failed"`, with [`Self::fail`]'s message when one was recorded (every
+/// call site on the risky path calls it right before returning `Err`) or a
+/// generic fallback otherwise. Disarmed once `spawn_result` is `Ok` — from
+/// there, [`run_thread`]'s own single exit path owns both.
+struct StartStackingGuard<'a> {
+    ctx: &'a ServiceContext,
+    run_id: i64,
+    armed: bool,
+    error: Option<String>,
+}
+
+impl<'a> StartStackingGuard<'a> {
+    fn new(ctx: &'a ServiceContext, run_id: i64) -> Self {
+        Self {
+            ctx,
+            run_id,
+            armed: true,
+            error: None,
+        }
+    }
+
+    /// Record the error that is about to unwind past this guard via `?` —
+    /// `Drop::drop` has no other way to see it.
+    fn fail(&mut self, error: impl std::fmt::Display) {
+        self.error = Some(error.to_string());
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartStackingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.ctx.active_stacks.lock().unwrap().remove(&self.run_id);
+        let error = self.error.clone().unwrap_or_else(|| {
+            "stacking run setup failed before the run thread could start".to_string()
+        });
+        match db(self.ctx) {
+            Ok(database) => {
+                let conn = database.conn();
+                if let Err(e) = finish_run(&conn, self.run_id, "failed", None, Some(&error)) {
+                    tracing::warn!(
+                        run_id = self.run_id,
+                        error = %e,
+                        "failed to mark stacking run failed after a setup failure"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id = self.run_id,
+                    error = %e,
+                    "failed to open a connection to mark stacking run failed after a setup failure"
+                );
+            }
+        }
+    }
+}
+
 /// Start a stacking run for `frames_set_id`: build the plan, refuse on the
 /// first blocker or an already-active run, insert the run + its group rows,
 /// register a cancel handle, and spawn the dedicated thread. Returns as soon
@@ -515,9 +592,19 @@ pub fn start_stacking(
         run_id
     };
 
-    let started_at = get_run(&conn, run_id)?
-        .map(|r| r.started_at)
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    // Fix round: Plan 5b final fix wave, review finding B2. Armed from here
+    // through the spawn below — see `StartStackingGuard`'s own doc comment.
+    let mut guard = StartStackingGuard::new(&ctx, run_id);
+
+    let started_at = match get_run(&conn, run_id) {
+        Ok(row) => row
+            .map(|r| r.started_at)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        Err(e) => {
+            guard.fail(&e);
+            return Err(e.into());
+        }
+    };
 
     let included_by_key: HashMap<&str, usize> = plan
         .groups
@@ -531,7 +618,7 @@ pub fn start_stacking(
             .get(g.key.as_str())
             .copied()
             .unwrap_or(g.frames.len());
-        let group_id = insert_group(
+        let group_id = match insert_group(
             &conn,
             &NewGroup {
                 run_id,
@@ -546,7 +633,13 @@ pub fn start_stacking(
                 frame_count: g.frames.len() as i64,
                 included_count: included_count as i64,
             },
-        )?;
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                guard.fail(&e);
+                return Err(e.into());
+            }
+        };
         group_ids.insert(g.key.clone(), group_id);
     }
 
@@ -621,26 +714,21 @@ pub fn start_stacking(
             run_thread(rc);
         });
 
-    if let Err(e) = spawn_result {
-        // The thread never started, so nothing will ever remove this handle,
-        // finish the run row, or emit stacking-complete — clean up right
-        // here instead (mirrors `start_master_build`'s spawn-failure path).
-        ctx.active_stacks.lock().unwrap().remove(&run_id);
-        if let Ok(db_handle) = db(&ctx) {
-            let conn = db_handle.conn();
-            if let Err(e2) = finish_run(
-                &conn,
-                run_id,
-                "failed",
-                None,
-                Some(&format!("failed to spawn stacking thread: {e}")),
-            ) {
-                tracing::warn!(run_id, error = %e2, "failed to mark run failed after spawn failure");
-            }
+    match spawn_result {
+        Ok(_) => {
+            // The thread started — from here on it owns handle removal /
+            // `finish_run` / `stacking-complete` via its own single exit
+            // path (`run_thread`). Disarm so this guard's `Drop` is a no-op.
+            guard.disarm();
         }
-        return Err(ApiError::Internal(format!(
-            "failed to spawn stacking thread: {e}"
-        )));
+        Err(e) => {
+            // The thread never started, so nothing will ever remove the
+            // handle, finish the run row, or emit stacking-complete —
+            // `guard`'s `Drop` (still armed) does that cleanup below.
+            let msg = format!("failed to spawn stacking thread: {e}");
+            guard.fail(&msg);
+            return Err(ApiError::Internal(msg));
+        }
     }
 
     Ok(StartedStacking { run_id })
@@ -3930,6 +4018,73 @@ mod tests {
         drop(hold_permit);
 
         wait_for_run(&ctx, started.run_id);
+    }
+
+    /// Plan 5b final fix wave, review finding B2: a failure AFTER the
+    /// `active_stacks` handle is registered but BEFORE the run thread
+    /// actually spawns must never wedge the frame set. Before
+    /// `StartStackingGuard` existed, such a failure (here: the per-group
+    /// `insert_group` loop, via the brief's own suggested fault — a
+    /// `stacking_run_groups` write failing) returned via `?` straight past
+    /// all cleanup: the handle stayed in `active_stacks` forever (a
+    /// process-memory map `heal_interrupted_runs` cannot see past) and the
+    /// `stacking_runs` row stayed `"planning"` forever, so every later
+    /// `start_stacking` for the same set answered `Conflict` until restart.
+    #[test]
+    fn start_stacking_never_wedges_a_set_when_insert_group_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids, _working, _output) = seed_ready(&db_path, SET_NAME);
+
+        // Fault injection: the per-group insert loop writes to
+        // `stacking_run_groups`; `insert_run` (the row that must NOT be
+        // left stuck) and the handle registration both land against
+        // `stacking_runs`, an untouched table, so they still succeed.
+        fixture
+            .conn
+            .execute("DROP TABLE stacking_run_groups", [])
+            .unwrap();
+
+        let err = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect_err("insert_group failing must surface as an error, not wedge the set");
+        assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
+
+        assert!(
+            ctx.active_stacks.lock().unwrap().is_empty(),
+            "the guard must remove the handle on this early-return path"
+        );
+
+        let rows = crate::db::stacking::list_runs(&fixture.conn, fixture.set_id, 10).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].status, "failed", "must never stay stuck planning");
+        assert!(rows[0].finished_at.is_some());
+        assert!(rows[0].error.is_some());
+
+        // Undo the fault and confirm the set is no longer wedged: a second
+        // `start_stacking` is admitted, not `Conflict`.
+        crate::db::init_db(&fixture.conn).unwrap();
+        let second = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            None,
+            None,
+        )
+        .expect("a second start on the same set must be admitted after the failed setup");
+
+        cancel_stacking(&ctx, second.run_id).unwrap();
+        wait_for_run(&ctx, second.run_id);
     }
 
     #[test]

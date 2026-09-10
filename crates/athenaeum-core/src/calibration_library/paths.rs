@@ -40,8 +40,11 @@ fn kind_stem(kind: FrameKind) -> &'static str {
     }
 }
 
-/// Trim trailing zeros: 300.0 -> "300", 1.55 -> "1.55".
-fn fmt_num(v: f64) -> String {
+/// Trim trailing zeros: 300.0 -> "300", 1.55 -> "1.55". `pub(crate)` (Plan 5b
+/// final fix wave, review item A2) so `stacking::plan`'s calibration-set
+/// label can reuse the same sub-second-exposure formatting this module's
+/// master filenames use, instead of a second hand-rolled one.
+pub(crate) fn fmt_num(v: f64) -> String {
     let s = format!("{v:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }

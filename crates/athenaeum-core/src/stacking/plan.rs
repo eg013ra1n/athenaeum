@@ -742,7 +742,13 @@ fn calibration_set_label(
         }
     }
     if let Some(e) = exptime {
-        parts.push(format!("{e:.0}s"));
+        // Plan 5b final fix wave, review item A2: reuse the calibration
+        // library's own sub-second-exposure formatter (`0.39s`, `180s`)
+        // instead of `{:.0}` truncating every flat under a second to `0s`.
+        parts.push(format!(
+            "{}s",
+            crate::calibration_library::paths::fmt_num(e)
+        ));
     }
     if let Some(t) = ccd_temp {
         parts.push(format!("{t:.0}\u{00B0}C"));
@@ -767,11 +773,19 @@ fn calibration_set_label(
 ///
 /// Read failures are logged and the item is dropped rather than failing the
 /// whole plan — a set/master the readiness split named moments ago should
-/// always resolve; if it somehow doesn't, the stage-0.5 run will simply not
-/// list it (and the run itself re-derives the SAME plan before executing, so
-/// a real inconsistency surfaces there instead of silently building nothing).
-fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> Vec<PlanMaster> {
+/// always resolve; if it somehow doesn't (a real inconsistency, e.g. a
+/// `master_provenance` row deleted between the readiness split and this
+/// collection), the second element of the returned tuple names it with a
+/// reason so [`build_plan`] can turn it into a `masters` blocker instead of
+/// letting it vanish from the plan silently — neither built nor blocked,
+/// discovered only when the run dies inside Calibrate (Plan 5b final fix
+/// wave, review finding B5).
+fn collect_masters_to_build(
+    conn: &Connection,
+    readiness: &ExportReadiness,
+) -> (Vec<PlanMaster>, Vec<(i64, String)>) {
     let mut items: Vec<PlanMaster> = Vec::new();
+    let mut dropped: Vec<(i64, String)> = Vec::new();
 
     for &raw_set_id in &readiness.raw_sets_buildable {
         match calibration_set_imagetyp_and_count(conn, raw_set_id) {
@@ -779,7 +793,11 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
                 let label = match calibration_set_label(conn, raw_set_id, &imagetyp) {
                     Ok(label) => label,
                     Err(error) => {
-                        tracing::warn!(raw_set_id, %error, "stacking: could not read calibration set label; dropped from masters_to_build");
+                        tracing::warn!(raw_set_id, %error, "masters_to_build: calibration set label unreadable");
+                        dropped.push((
+                            raw_set_id,
+                            format!("calibration set label unreadable: {error}"),
+                        ));
                         continue;
                     }
                 };
@@ -792,7 +810,8 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
                 });
             }
             Err(error) => {
-                tracing::warn!(raw_set_id, %error, "stacking: could not read buildable raw set; dropped from masters_to_build");
+                tracing::warn!(raw_set_id, %error, "masters_to_build: buildable raw set unreadable");
+                dropped.push((raw_set_id, format!("buildable raw set unreadable: {error}")));
             }
         }
     }
@@ -802,11 +821,23 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
             Ok(Some(prov)) => prov.source_set_id,
             Ok(None) => None,
             Err(error) => {
-                tracing::warn!(master_set_id, %error, "stacking: could not read master provenance; dropped from masters_to_build");
-                None
+                tracing::warn!(master_set_id, %error, "masters_to_build: master provenance unreadable");
+                dropped.push((
+                    master_set_id,
+                    format!("master provenance unreadable: {error}"),
+                ));
+                continue;
             }
         };
         let Some(source_set_id) = source_set_id else {
+            tracing::warn!(
+                master_set_id,
+                "masters_to_build: master provenance missing or has no source set"
+            );
+            dropped.push((
+                master_set_id,
+                "master provenance missing or has no source set".to_string(),
+            ));
             continue;
         };
         match calibration_set_imagetyp_and_count(conn, source_set_id) {
@@ -814,7 +845,11 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
                 let label = match calibration_set_label(conn, source_set_id, &imagetyp) {
                     Ok(label) => label,
                     Err(error) => {
-                        tracing::warn!(master_set_id, source_set_id, %error, "stacking: could not read calibration set label; dropped from masters_to_build");
+                        tracing::warn!(master_set_id, source_set_id, %error, "masters_to_build: calibration set label unreadable");
+                        dropped.push((
+                            master_set_id,
+                            format!("calibration set label unreadable: {error}"),
+                        ));
                         continue;
                     }
                 };
@@ -827,13 +862,36 @@ fn collect_masters_to_build(conn: &Connection, readiness: &ExportReadiness) -> V
                 });
             }
             Err(error) => {
-                tracing::warn!(master_set_id, source_set_id, %error, "stacking: could not read rebuild source set; dropped from masters_to_build");
+                tracing::warn!(master_set_id, source_set_id, %error, "masters_to_build: rebuild source set unreadable");
+                dropped.push((
+                    master_set_id,
+                    format!("rebuild source set unreadable: {error}"),
+                ));
             }
         }
     }
 
     items.sort_by_key(|m| (crate::api::masters::type_build_rank(&m.imagetyp), m.set_id));
-    items
+    (items, dropped)
+}
+
+/// A `masters` blocker for every calibration set/master [`collect_masters_to_build`]
+/// could not resolve, even though the readiness split said it was
+/// buildable/rebuildable moments ago (B5) — `None` when nothing was dropped,
+/// which is the overwhelming majority of plans.
+fn dropped_masters_blocker(dropped: &[(i64, String)]) -> Option<PlanBlocker> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let n = dropped.len();
+    let first_reason = dropped[0].1.as_str();
+    Some(PlanBlocker {
+        code: "masters".to_string(),
+        message: format!(
+            "Build masters first — {n} set{} could not be resolved while planning: {first_reason}",
+            if n == 1 { "" } else { "s" }
+        ),
+    })
 }
 
 /// Build the plan for a frame set: its groups, the resolved config, every
@@ -856,7 +914,7 @@ pub fn build_plan(
 
     let groups = group_frames(conn, frames_set_id, &cfg.grouping)?;
     let readiness = compute_export_readiness(conn, frames_set_id)?;
-    let masters_to_build = collect_masters_to_build(conn, &readiness);
+    let (masters_to_build, dropped_masters) = collect_masters_to_build(conn, &readiness);
 
     let mut blockers: Vec<PlanBlocker> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -883,6 +941,9 @@ pub fn build_plan(
                 if n == 1 { "" } else { "s" }
             ),
         });
+    }
+    if let Some(blocker) = dropped_masters_blocker(&dropped_masters) {
+        blockers.push(blocker);
     }
     if readiness.unlinked_lights > 0 {
         let n = readiness.unlinked_lights;
@@ -1390,6 +1451,26 @@ mod tests {
         assert_eq!(label, "Dark 180s -10°C ATR2600M");
     }
 
+    /// Plan 5b final fix wave, review item A2: a sub-second exposure must
+    /// not truncate to `0s` — `calibration_set_label` now reuses
+    /// `calibration_library::paths::fmt_num`, the same trailing-zero-trimmed
+    /// formatter the master filenames use.
+    #[test]
+    fn calibration_set_label_keeps_a_sub_second_flat_exposure() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set (imagetyp, date, exptime, ccd_temp, instrume, frame_count)
+                 VALUES ('Flat', '2025-01-01', 0.39, 0.0, 'ATR2600M', 3)",
+                [],
+            )
+            .unwrap();
+        let set_id = f.conn.last_insert_rowid();
+
+        let label = calibration_set_label(&f.conn, set_id, "Flat").unwrap();
+        assert_eq!(label, "Flat 0.39s 0°C ATR2600M");
+    }
+
     /// A built master whose FILE is missing but whose `master_provenance`
     /// row and raw source frames are intact becomes planned work
     /// (`masters_to_build == [Rebuild]`) instead of the `masterFiles`
@@ -1452,6 +1533,70 @@ mod tests {
         assert_eq!(plan.masters_to_build[0].set_id, dark_set);
         assert_eq!(plan.masters_to_build[0].kind, MasterWork::Rebuild);
         assert_eq!(plan.masters_to_build[0].imagetyp, "Dark");
+    }
+
+    /// Plan 5b final fix wave, review finding B5: a master the readiness
+    /// split just classified as rebuildable can still fail to resolve a
+    /// moment later — its `master_provenance` row deleted between the
+    /// readiness split and `collect_masters_to_build`'s own re-read (a real
+    /// TOCTOU window, simulated here by deleting it in between the two
+    /// calls). Before the fix such a master vanished from the plan
+    /// entirely — neither `masters_to_build` nor a blocker — and the run
+    /// would only discover it was missing once it reached Calibrate.
+    #[test]
+    fn collect_masters_to_build_drops_and_blocks_a_master_whose_provenance_vanished() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, _flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let dark_path: String = f
+            .conn
+            .query_row(
+                "SELECT fi.path FROM calibration_set_frames csf
+                 JOIN frames fr ON fr.id = csf.frame_id
+                 JOIN files fi ON fi.id = fr.file_id
+                 WHERE csf.set_id = ?1",
+                [dark_set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        std::fs::remove_file(&dark_path).unwrap();
+
+        let readiness = compute_export_readiness(&f.conn, f.set_id).unwrap();
+        assert!(
+            readiness.masters_rebuildable.contains(&dark_set),
+            "fixture must classify the dark master as rebuildable before the race: {:?}",
+            readiness.masters_rebuildable
+        );
+
+        // The race: another actor removes the provenance row after the
+        // readiness split already read it.
+        f.conn
+            .execute(
+                "DELETE FROM master_provenance WHERE master_set_id = ?1",
+                [dark_set],
+            )
+            .unwrap();
+
+        let (masters_to_build, dropped) = collect_masters_to_build(&f.conn, &readiness);
+        assert!(
+            masters_to_build.iter().all(|m| m.set_id != dark_set),
+            "a master whose provenance vanished must not be planned work: {:?}",
+            masters_to_build
+        );
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].0, dark_set);
+
+        let blocker = dropped_masters_blocker(&dropped).expect("dropped masters must block");
+        assert_eq!(blocker.code, "masters");
+        assert!(
+            blocker.message.contains("could not be resolved"),
+            "{:?}",
+            blocker
+        );
     }
 
     /// Task 8b: a missing MASTER FLAT's rebuild reads its own
