@@ -24,11 +24,15 @@
 //! `runs/run-<id>.json` are the same document) and `run` (the run thread:
 //! queue admission, `stacking-progress`/`stacking-complete` events, and
 //! stage 1 — calibrate, with artifact reuse; Tasks 7-8 add the rest of the
-//! pipeline to the same file).
+//! pipeline to the same file). M2 Task 1 adds `ln` (spec §5.2: `LnGrid`,
+//! the bicubic B-spline evaluator over its coarse stride grid, and the
+//! `.athln` sidecar one frame's per-channel grids round-trip through —
+//! the foundation local normalization's later M2 tasks build on).
 
 pub mod config;
 pub mod groups;
 pub mod integrate;
+pub mod ln;
 pub mod master_cards;
 pub mod measure;
 pub mod paths;

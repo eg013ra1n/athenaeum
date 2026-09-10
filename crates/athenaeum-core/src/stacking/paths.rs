@@ -76,6 +76,19 @@ impl WorkingLayout {
         self.ln_root().join(group_key)
     }
 
+    /// `root/ln/<group_key>/reference.fits` — the group's chosen local-
+    /// normalization reference plane, in the reference geometry every
+    /// frame's `LnGrid` (M2 Task 1) is defined over.
+    pub fn ln_reference_path(&self, group_key: &str) -> PathBuf {
+        self.ln_dir(group_key).join("reference.fits")
+    }
+
+    /// `root/ln/<group_key>/<stem>.athln` — one frame's local-normalization
+    /// sidecar (M2 Task 1's `LnFrameGrids::write`/`read`).
+    pub fn ln_sidecar_path(&self, group_key: &str, stem: &str) -> PathBuf {
+        self.ln_dir(group_key).join(format!("{stem}.athln"))
+    }
+
     /// `root/runs` — same as [`Self::runs_root`]; kept as its own name since
     /// it predates the other three `_root` accessors and is the one other
     /// tasks (e.g. [`Self::run_json`]) already call.
@@ -620,6 +633,24 @@ mod tests {
         assert_eq!(
             layout.run_json(42),
             PathBuf::from("/work/LDN_1272/runs/run-42.json")
+        );
+    }
+
+    #[test]
+    fn ln_reference_path_layout() {
+        let layout = WorkingLayout::new(Path::new("/work"), "LDN_1272");
+        assert_eq!(
+            layout.ln_reference_path("cam__mono__Ha__bin1__100x100"),
+            PathBuf::from("/work/LDN_1272/ln/cam__mono__Ha__bin1__100x100/reference.fits")
+        );
+    }
+
+    #[test]
+    fn ln_sidecar_path_layout() {
+        let layout = WorkingLayout::new(Path::new("/work"), "LDN_1272");
+        assert_eq!(
+            layout.ln_sidecar_path("g", "f1"),
+            PathBuf::from("/work/LDN_1272/ln/g/f1.athln")
         );
     }
 
