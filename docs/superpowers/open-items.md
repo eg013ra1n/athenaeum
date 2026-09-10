@@ -187,6 +187,60 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M3 — drizzle (2026-09-10)
+
+M3 (drizzle 1×/2×/3× with exact-clipping square drops or tabulated circle/
+gaussian ones, per-frame rejection bitmaps, weights and local normalization,
+the weight map, a scaled WCS, `DrizzlePanel` live) plus Task 8, the
+sky-penalized normalization anchor (ruling R-M3-17). Acceptance run on the
+real LDN 1272 catalog on 2026-09-10 — note
+`docs/superpowers/research/2026-09-10-m3-acceptance-run.md`: drizzle 2× on
+both groups, level-preserving, seam-free, fully covered; the mono
+drizzled/undrizzled FWHM ratio equals the external reference's to 0.05 %; the
+OSC master now matches the external one in level and background shape after
+Task 8. Two misses/gaps recorded below.
+
+- **M4 item (first): the OSC PSF Signal Weight sky penalty.** Per-frame
+  weights against the external tool's: mono Spearman 0.92 (top-20 overlap
+  18/20), OSC 0.77 (1/20) — the bright-sky/dark-sky night order is inverted on
+  OSC (ours 0.80 / 0.71, theirs 0.73 / 0.82; a near tie between a sharp bright
+  night and a soft dark one, decided oppositely). Task 8's `w / sqrt(bg)` rule
+  makes the normalization anchor and the LN-reference members robust to it;
+  the integration weights themselves are still ours. Audit the noise/flux
+  terms on debayered frames against the external per-frame values.
+- **M4 item: the OSC drizzle is ≈ 10 % broader than the external one by the
+  fitted FWHM** (G/B ratios 0.83 / 0.82 vs 0.75 / 0.74) while the same bright
+  stars' half-maximum radii are 4 % smaller in ours and our drizzle carries
+  26 % less pixel-scale noise at equal master noise. Ruled out: rejection
+  strength, level conventions, registration distortion (polynomial3 changed
+  nothing). Compare star by star across magnitudes; drizzle a common subset
+  with both weight sets.
+- **M4 item: two-pass registration-reference pick.** A best-by-weight
+  reference whose rotation/offset deviates from the set's median rotates the
+  whole master and loses corners; after a first registration, re-pick among
+  the top frames the one closest to the median transform and re-register
+  (≈ 1–2 min). Task 8's 97 % coverage filter protects the normalization
+  anchor and the LN members only.
+- **M4 item: `measure_probe`'s XISF branch is unreliable** — it disagrees with
+  the raw Float32 attachment on every external file tried (mono drizzle 4.35
+  vs 4.95 px). Select the integration `<Image>` explicitly and verify the plane
+  layout, or drop the branch; the acceptance note's numbers all come from
+  FITS conversions of the raw attachments.
+- **Provisional constant:** `DRIZZLE_SECONDS_PER_PLANE_AT_2X = 1.2` in
+  `stageSummary.ts` measured 1.17 s (mono) / 1.33 s (OSC per plane) on a
+  clean 16 GB machine — keep; revisit with the M4 performance work.
+- **Owed:** the owner's own click-through of the Drizzle panel, the board
+  toggle and the drizzled lines on the results card on the desktop build
+  (the acceptance click-through ran over the LAN and the Windows browser's
+  renderer refused screenshots after the notifications dialog — the results
+  card was verified through its accessible text only).
+- **Owed:** one drizzled run on Windows and one on Linux — the `.rej`
+  positional writes (`write_at` / `seek_write`) and the memory refusal are
+  the platform-specific parts.
+- **Release-note lines owed** (drafted in the acceptance note §9): drizzle,
+  the Drizzle panel/results, the "Maximum quality" preset now turning on LN
+  and 2× drizzle, the sky-penalized normalization anchor.
+
 ### Stacking M2 — local normalization (2026-09-10)
 
 M2 (local normalization: background-model grids, PSF-flux scale, `.athln`

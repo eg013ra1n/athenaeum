@@ -502,8 +502,13 @@ three review findings before merge: a group whose members' native geometry
 differs from the run's reference was refused outright rather than
 drizzled, the Output stage's own timing double-counted drizzle's whole
 duration, and a `.rej` write fault mid-integration failed the group
-instead of degrading to "drizzle skipped"); the LDN 1272 acceptance run is
-the remaining step. **M4** — polish:
+instead of degrading to "drizzle skipped"); acceptance run 2026-09-10 on
+LDN 1272 — `docs/superpowers/research/2026-09-10-m3-acceptance-run.md`:
+drizzle 2× on both groups, the mono drizzled/undrizzled FWHM ratio equal to
+the external reference's to 0.05 %, the OSC G/B ratio ≈ 10 % broader (an M4
+item), and the OSC master matching the external one in level and background
+shape after Task 8's sky-penalized normalization anchor (ruling R-M3-17).
+**M4** — polish:
 thin-plate-spline distortion, ESD/RCR/min-max/large-scale rejection,
 Bayer drizzle, XISF output, cataloging masters, preset management, and
 **mixed pixel scales in one set** (owner requirement
@@ -632,9 +637,17 @@ meant to be disjoint spans), and a `.rej` write fault mid-integration
 of degrading to "drizzle skipped, master kept" the way a bitmap-set
 `create` failure already did — `RejBitmapSet` now latches its first write
 failure and every later `record_band` call for that set becomes a no-op.
-The LDN 1272 acceptance run (drizzled/undrizzled FWHM ratio against the
-external 2× drizzled masters, both the mono and the OSC group) is the
-remaining step —
+Acceptance (2026-09-10, `docs/superpowers/research/2026-09-10-m3-acceptance-run.md`):
+drizzle 2× on both LDN 1272 groups is level-preserving (0.9987–0.99999 of
+the master), seam-free at the 512-row band period, fully covered, with sane
+weight maps; the mono drizzled/undrizzled FWHM ratio matches the external
+reference's (0.925 vs 0.926, both through our estimator on FITS
+conversions of the raw attachments — `measure_probe`'s XISF branch is not
+trustworthy, an M4 item); the OSC G/B ratio is ≈ 10 % broader than the
+external one for a reason that is neither rejection strength, level
+conventions nor registration distortion (M4 item, together with the OSC
+PSF-weight sky-penalty audit). Drizzle time on this 16 GB Mac: mono 4.2 min,
+OSC 13.5 min (three planes). Plan:
 `docs/superpowers/plans/2026-09-10-stacking-m3-plan-drizzle.md`.
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
