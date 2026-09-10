@@ -27,9 +27,15 @@
 //! pipeline to the same file). M2 Task 1 adds `ln` (spec §5.2: `LnGrid`,
 //! the bicubic B-spline evaluator over its coarse stride grid, and the
 //! `.athln` sidecar one frame's per-channel grids round-trip through —
-//! the foundation local normalization's later M2 tasks build on).
+//! the foundation local normalization's later M2 tasks build on). M3 Task 1
+//! adds `drizzle` (spec §7, rulings R-M3-1..R-M3-3: the reference ↔
+//! output-grid coordinate map, drop corners, forward mapping onto the
+//! scaled output grid, exact convex-quad ∩ unit-pixel clipping, and the
+//! 16×16 tabulated-kernel micro-drop table for `circle`/`gaussian`; the
+//! stage driver arrives in a later task).
 
 pub mod config;
+pub mod drizzle;
 pub mod groups;
 pub mod integrate;
 pub mod ln;
