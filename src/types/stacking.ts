@@ -52,9 +52,7 @@ export type NormalizationConfig = { output: OutputNormalization, rejection: Reje
  */
 scaleEstimator: ScaleEstimator, 
 /**
- * Local (small-scale) normalization settings (spec §5.2, M2). Carried
- * here as an opaque, defaulted block so a stored config round-trips
- * before M2 lands — `integrate_group` never reads it.
+ * Local (small-scale) normalization settings (spec §5.2, M2).
  */
 local: LocalNormalizationConfig, };
 

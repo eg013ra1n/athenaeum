@@ -292,15 +292,29 @@ fn main() {
         if reg.status == "failed" {
             continue;
         }
-        let map = reg
-            .transform_json
-            .as_deref()
-            .and_then(|j| PixelMap::from_json(j).ok())
-            .or_else(|| PixelMap::linear(Linear::identity()))
-            .unwrap_or_else(|| {
+        // Fix round 1, item 6: a `transform_json` that FAILS TO PARSE is a
+        // corrupt/unexpected row, not the same thing as "no transform_json
+        // at all" — silently falling back to identity for it would feed
+        // `build_reference`/`normalize_frame` a WRONG map for a frame that
+        // has a real (if unreadable) one, never named or logged. Skip the
+        // candidate loudly instead; a row with no `transform_json` at all
+        // (a genuinely absent value) keeps the identity fallback.
+        let map = match reg.transform_json.as_deref() {
+            Some(j) => match PixelMap::from_json(j) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "frame {}: transform_json failed to parse ({e}), skipping",
+                        gf.frame_id
+                    );
+                    continue;
+                }
+            },
+            None => PixelMap::linear(Linear::identity()).unwrap_or_else(|| {
                 eprintln!("frame {}: no usable transform, skipping", gf.frame_id);
                 std::process::exit(1);
-            });
+            }),
+        };
         let weight = weight_by_frame.get(&gf.frame_id).copied().unwrap_or(1.0);
         candidates.push(Candidate {
             frame: gf.clone(),
@@ -551,7 +565,12 @@ registration row for each — run stacking through Register first); found {}",
         // grid's raw stored node values (which would trivially reproduce
         // `B_ref` by construction and prove nothing).
         let grid: &LnGrid = &grids.channels[p];
-        let stride = (args.scale / 8).max(2) as usize;
+        // Fix round 1, item 6: the grid's own stride, not a re-derivation
+        // of the `(scale / 8).max(2)` formula from `args.scale` — the two
+        // agree today (this probe builds `local_cfg.scale = args.scale`),
+        // but reading it off the grid itself can never drift from what
+        // `evaluate_row` actually uses internally.
+        let stride = grid.stride();
         let mut before = Vec::with_capacity(target_bg.gw * target_bg.gh);
         let mut after = Vec::with_capacity(target_bg.gw * target_bg.gh);
         let mut a_row = vec![0f32; reference.width];

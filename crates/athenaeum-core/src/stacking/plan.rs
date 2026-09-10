@@ -1190,9 +1190,19 @@ pub fn build_plan(
     // below fetches the same last-run frame rows independently for its own
     // purpose — kept separate rather than threading a shared fetch through,
     // since the two staleness computations are otherwise unrelated.
+    //
+    // Fix round 1, item 4: gated on `last_run.config_hash == hash` (the
+    // CURRENT build's own resolved config hash, already in hand) — a frame
+    // excluded under an OLDER `normalization.local` config (a different
+    // `scale`/`referenceFrames`/`psfModel`, say) must not stay "not owed"
+    // forever once the user changes it; only an exclusion FROM A RUN THAT
+    // USED THIS EXACT CONFIG is trusted as "will fail again for the same
+    // reason". A config change makes the set empty, so the frame reverts to
+    // ordinary "no fresh `ln` artifact" staleness until a real run either
+    // re-excludes it (under the new config) or produces one.
     let ln_runtime_excluded_by_frame: HashSet<i64> = if local_normalization_active {
         match list_runs(conn, frames_set_id, 1)?.into_iter().next() {
-            Some(last_run) => list_frame_rows(conn, last_run.id)?
+            Some(last_run) if last_run.config_hash == hash => list_frame_rows(conn, last_run.id)?
                 .into_iter()
                 .filter(|row| {
                     !row.included
@@ -1203,7 +1213,7 @@ pub fn build_plan(
                 })
                 .map(|row| row.frame_id)
                 .collect(),
-            None => HashSet::new(),
+            _ => HashSet::new(),
         }
     } else {
         HashSet::new()
@@ -1361,13 +1371,11 @@ pub fn build_plan(
     }
 
     // Gate 6: unsupported — checked last, so a user only sees these once
-    // everything more fundamental is already in order.
-    if cfg.normalization.local.enabled {
-        blockers.push(PlanBlocker {
-            code: "unsupported".to_string(),
-            message: "Local normalization arrives in M2".to_string(),
-        });
-    }
+    // everything more fundamental is already in order. Local normalization
+    // (M2) is no longer blocked here — fix round 1: `integrate_group` (M2
+    // Task 7) has a real `GroupInput.ln` conduit for both output and
+    // rejection normalization now, so a plan with `normalization.local.
+    // enabled` (or `rejection == "local"`) runs like any other.
     if cfg.drizzle.enabled {
         blockers.push(PlanBlocker {
             code: "unsupported".to_string(),
@@ -2280,8 +2288,12 @@ mod tests {
         );
     }
 
+    /// M2 fix round 1, item 1(a): `build_plan` no longer refuses a plan with
+    /// `normalization.local.enabled` (or `rejection == "local"`, checked
+    /// below too) as `"unsupported"` — the M1-era Gate 6 predates
+    /// `integrate_group` having a real `GroupInput.ln` conduit (M2 Task 7).
     #[test]
-    fn local_normalization_is_unsupported_in_m1() {
+    fn local_normalization_is_allowed() {
         let f = test_fixtures::frame_set("LDN 1272");
         for (i, t) in [
             "2025-01-01T00:00:00",
@@ -2294,10 +2306,10 @@ mod tests {
             test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
         }
 
+        let settings = SettingsManager::new();
+
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
-
-        let settings = SettingsManager::new();
         let plan = build_plan(
             &f.conn,
             &settings,
@@ -2306,13 +2318,36 @@ mod tests {
             Some(cfg),
         )
         .unwrap();
+        assert!(
+            !plan
+                .blockers
+                .iter()
+                .any(|b| b.message == "Local normalization arrives in M2"),
+            "{:?}",
+            plan.blockers
+        );
 
-        let blocker = plan
-            .blockers
-            .iter()
-            .find(|b| b.code == "unsupported")
-            .expect("unsupported blocker");
-        assert_eq!(blocker.message, "Local normalization arrives in M2");
+        // The asymmetry the fix closes: `rejection == "local"` alone (no
+        // `local.enabled`) used to pass THIS gate and only die later inside
+        // `integrate_group`'s own now-removed refusal.
+        let mut cfg2 = StackingConfig::default();
+        cfg2.normalization.rejection = RejectionNormalization::Local;
+        let plan2 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg2),
+        )
+        .unwrap();
+        assert!(
+            !plan2
+                .blockers
+                .iter()
+                .any(|b| b.message == "Local normalization arrives in M2"),
+            "{:?}",
+            plan2.blockers
+        );
     }
 
     #[test]
@@ -2926,6 +2961,10 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
         cfg.normalization.local.enabled = true;
+        // Fix round 1, item 4: the seeded run's own `config_hash` must
+        // match `cfg`'s for the "not owed" gate to trust it at all —
+        // resolved once, before any later mutation of `cfg`.
+        let run_config_hash = config_hash(&cfg);
         set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
 
         let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
@@ -2994,7 +3033,7 @@ mod tests {
             &crate::db::stacking::NewRun {
                 frames_set_id: f.set_id,
                 config_json: "{}",
-                config_hash: "h",
+                config_hash: &run_config_hash,
                 reference_frame_id: Some(ids[0]),
                 reference_mode: "manual",
                 working_dir: "/w",
@@ -3169,13 +3208,52 @@ mod tests {
             &settings,
             &PathPolicy::AllowAll,
             f.set_id,
-            Some(cfg),
+            Some(cfg.clone()),
         )
         .unwrap();
         assert!(
             plan2.stale_stages.contains(&Stage::Normalize),
             "an included frame with no ln artifact and no LN exclusion reason must still be stale: {:?}",
             plan2.stale_stages
+        );
+
+        // Fix round 1, item 4: re-exclude ids[2] the same way as the first
+        // phase, but change a config field OUTSIDE the `normalization`/
+        // `measurement.{psfModel,maxStars}` subtree (`normalization_hash_for`'s
+        // own inputs — `local_normalization_reacts_to_a_config_change`
+        // already pins that changing `normalization.local.*` itself
+        // invalidates every frame's `ln` artifact, which would trivially
+        // pass this assertion for an unrelated reason and prove nothing
+        // about item 4 specifically). `integration.min_weight` changes the
+        // WHOLE-config `config_hash` (the run-vs-current-build comparison
+        // item 4 gates on) while leaving ids[0]/ids[1]'s own `ln` artifacts
+        // reading exactly as fresh as in the first phase (`ln_cached == 2`
+        // again below) — isolating that ids[2]'s reverted "not owed" status
+        // is what actually drives `Normalize` stale here.
+        seed_frame_row(
+            false,
+            Some("local normalization: 5 matched stars (< 20)"),
+            ids[2],
+        );
+        let mut cfg3 = cfg;
+        cfg3.integration.min_weight += 0.001;
+        let plan3 = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg3),
+        )
+        .unwrap();
+        assert_eq!(
+            plan3.groups[0].ln_cached, 2,
+            "the config change must not itself invalidate ids[0]/ids[1]'s own ln artifacts: {:?}",
+            plan3.groups[0]
+        );
+        assert!(
+            plan3.stale_stages.contains(&Stage::Normalize),
+            "an LN exclusion recorded under a DIFFERENT config must not be trusted: {:?}",
+            plan3.stale_stages
         );
     }
 
@@ -3419,7 +3497,10 @@ mod tests {
     /// Blocker order is stable and matches the gate order exactly (fix
     /// round 1 item 7): no calibration links (masters/links) fires first,
     /// then both folder sentences (in `working`, `output` order), then
-    /// `frames` (fewer than 3 included), then both `unsupported` toggles —
+    /// `frames` (fewer than 3 included), then drizzle's `unsupported`
+    /// toggle (the only one left — M2 fix round 1 item 1(a) removed local
+    /// normalization's own, `cfg.normalization.local.enabled` is set below
+    /// specifically to pin that it adds no blocker of its own) —
     /// `reference`/`space` never appear here (Auto mode; free space is
     /// never probed once the folders themselves are blocked).
     #[test]
@@ -3449,18 +3530,12 @@ mod tests {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
         assert_eq!(
             codes,
-            vec![
-                "links",
-                "folders",
-                "folders",
-                "frames",
-                "unsupported",
-                "unsupported"
-            ],
+            vec!["links", "folders", "folders", "frames", "unsupported"],
             "{:?}",
             plan.blockers
         );
         assert_eq!(plan.blockers[1].message, "Choose a working folder");
         assert_eq!(plan.blockers[2].message, "Choose an output folder");
+        assert_eq!(plan.blockers[4].message, "Drizzle arrives in M3");
     }
 }

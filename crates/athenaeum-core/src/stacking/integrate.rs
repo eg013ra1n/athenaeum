@@ -62,10 +62,11 @@ impl Default for IntegrationConfig {
     }
 }
 
-/// spec §9.2 `normalization:` (global part only; `local` rejection
-/// normalization is M2 — see [`RejectionNormalization::Local`] — and is
-/// carried here as an opaque, defaulted value so a stored config round-trips
-/// even though M1 refuses it at [`integrate_group`]).
+/// spec §9.2 `normalization:` — `rejection == `[`RejectionNormalization::Local`]`
+/// (M2) means `integrate_group` applies the per-frame LN grids
+/// (`GroupInput.ln`) as the rejection-normalization pair instead of a
+/// global one; a frame with no grid falls back to its own global pair (see
+/// [`integrate_planes`]'s own doc).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NormalizationConfig {
@@ -75,16 +76,16 @@ pub struct NormalizationConfig {
     /// stage-3 location/scale is `MeasureOptions::scale_estimator` — the
     /// orchestrator (Plan 5) keeps the two equal.
     pub scale_estimator: ScaleEstimator,
-    /// Local (small-scale) normalization settings (spec §5.2, M2). Carried
-    /// here as an opaque, defaulted block so a stored config round-trips
-    /// before M2 lands — `integrate_group` never reads it.
+    /// Local (small-scale) normalization settings (spec §5.2, M2).
     #[serde(default)]
     pub local: LocalNormalizationConfig,
 }
 
-/// spec §9.2 `normalization.local:` (M2). `enabled` stays `false` until the
-/// local-normalization stage exists; every other field is carried so the
-/// block round-trips through a stored config unchanged.
+/// spec §9.2 `normalization.local:` (M2). `enabled` turns LN into the
+/// OUTPUT normalization for a group; `local_scale` (a per-cell scale
+/// spline, not just the frame-global `A`) is M4 and stays `false` until
+/// then; every other field is carried so the block round-trips through a
+/// stored config unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {
@@ -563,11 +564,6 @@ pub fn integrate_group(
         )));
     }
     validate_group_input(input)?;
-    if input.normalization.rejection == RejectionNormalization::Local {
-        return Err(IntegrationError::BadInput(
-            "local normalization is M2; use scaleZeroOffset or equalizeFluxes".into(),
-        ));
-    }
 
     // Min-weight drop (spec §6.2): a frame whose lowest per-channel
     // normalized weight sits below the floor never joins the stack. The
@@ -1060,52 +1056,75 @@ mod tests {
         );
     }
 
+    /// M2 fix round 1, item 1(b): `integrate_group` no longer refuses
+    /// `normalization.rejection == Local` — the M1 guard predates the real
+    /// `GroupInput.ln` conduit (M2 Task 7) and `integrate_planes` already
+    /// derives `local_for_rejection` from `rejection_mode` and validates
+    /// every grid's shape up front, so there is nothing left for this
+    /// function to refuse. A real 4-frame group, every frame carrying a
+    /// (trivial, identity `A=1`/`B=0`) grid, integrates cleanly with
+    /// `Local` rejection normalization selected, and `GroupStats.ln_frames`
+    /// counts every included frame.
     #[test]
-    fn local_rejection_normalization_is_refused_in_m1() {
-        // No file I/O needed: validation rejects `Local` before any frame's
-        // path is ever opened, so dummy paths and measurements are enough.
-        let frames = vec![
-            StackFrame {
-                path: PathBuf::from("a.fits"),
+    fn a_local_rejection_group_integrates() {
+        const W: usize = 96;
+        const H: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..4)
+            .map(|i| {
+                let mut d = vec![0.1f32; W * H];
+                add_noise(&mut d, 0.003, 950 + i as u64);
+                let p = dir.path().join(format!("f{i}.fits"));
+                write_fits_f32(&p, W, H, 1, &d, &[]).unwrap();
+                p
+            })
+            .collect();
+        let measurements: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                measure_frame(p, &MeasureOptions::default(), None, &AtomicBool::new(false)).unwrap()
+            })
+            .collect();
+        let frames: Vec<StackFrame> = paths
+            .iter()
+            .cloned()
+            .zip(measurements)
+            .map(|(path, measurement)| StackFrame {
+                path,
                 map: identity_map(),
-                measurement: dummy_measurement(1),
+                measurement,
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
-            },
-            StackFrame {
-                path: PathBuf::from("b.fits"),
-                map: identity_map(),
-                measurement: dummy_measurement(1),
-                weight: weight(1.0, 1),
-                exposure_s: 60.0,
-                date_obs: None,
-            },
-            StackFrame {
-                path: PathBuf::from("c.fits"),
-                map: identity_map(),
-                measurement: dummy_measurement(1),
-                weight: weight(1.0, 1),
-                exposure_s: 60.0,
-                date_obs: None,
-            },
-        ];
+            })
+            .collect();
+
         let integration = IntegrationConfig::default();
         let normalization = NormalizationConfig {
             rejection: RejectionNormalization::Local,
             ..NormalizationConfig::default()
         };
+        // A grid per frame, every channel identity (`A = 1`, `B = 0`) — this
+        // test is about the M1 refusal being gone, not about LN's own
+        // numerical behaviour (Task 6's engine tests already cover that).
+        let grids: Vec<Option<LnFrameGrids>> = (0..frames.len())
+            .map(|_| {
+                Some(LnFrameGrids {
+                    channels: vec![LnGrid::constant(W, H, 128, 1.0, 0.0)],
+                })
+            })
+            .collect();
         let input = GroupInput {
             frames: &frames,
             reference: 0,
-            width: 10,
-            height: 10,
+            width: W,
+            height: H,
             channels: 1,
             interpolation: Interpolation::Bilinear,
             clamping: 0.3,
             integration: &integration,
             normalization: &normalization,
-            ln: None,
+            ln: Some(&grids),
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1117,21 +1136,21 @@ mod tests {
                 on_combine: &on_band,
             },
         };
-        let err = integrate_group(
+        let out = integrate_group(
             &input,
             &MeasureOptions::default(),
             &pool,
             &AtomicBool::new(false),
             &progress,
-            io(1_000_000),
+            io(20_000_000),
         )
-        .unwrap_err();
-        match err {
-            IntegrationError::BadInput(msg) => {
-                assert!(msg.contains("local normalization"), "{msg}")
-            }
-            other => panic!("expected BadInput, got {other:?}"),
-        }
+        .unwrap();
+        assert_eq!(out.stats.included, 4, "{:?}", out.stats);
+        assert_eq!(
+            out.stats.ln_frames, out.stats.included,
+            "every included frame carried a grid: {:?}",
+            out.stats
+        );
     }
 
     /// Fix round 1, item 4: an LN grid whose `ref_width`/`ref_height` don't
