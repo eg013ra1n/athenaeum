@@ -387,7 +387,8 @@ fn fit_all(
 /// Fit every seed with the chosen model. `Auto` fits the brightest
 /// `AUTO_SAMPLE` seeds with each β in `AUTO_BETAS`, keeps the β with the
 /// smallest median residual over its accepted fits (β = 4 when fewer than
-/// 8 fits are accepted for every candidate), then fits all seeds with it.
+/// 8 fits are accepted for every candidate), then fits all seeds with it —
+/// via [`fit_stars_with_beta`], once β is resolved to a number.
 /// Seeds are expected brightest-first (the detector's order).
 pub fn fit_stars(
     data: &[f32],
@@ -420,6 +421,32 @@ pub fn fit_stars(
             best.map_or(4.0, |(_, b)| b)
         }
     };
+    fit_stars_with_beta(data, w, h, seeds, beta, p)
+}
+
+/// Fit every seed at a caller-chosen, already-concrete β — the tail
+/// [`fit_stars`] itself runs once `Auto`'s search (or `Moffat4`'s fixed
+/// 4.0) has resolved a model to a number: `σ0` from the seeds (the same
+/// `initial_sigma` estimate `fit_stars` computes), then
+/// `dedupe(fit_all(..))`. `beta` is echoed back unchanged on the returned
+/// `FitOutcome`.
+///
+/// Exposed so a caller that must fit two independent planes at the SAME β
+/// — e.g. `stacking::ln::scale::relative_scale`, which resolves β from a
+/// reference frame via `fit_stars` and then has to fit its target at
+/// exactly that β rather than let `Auto` pick independently per plane
+/// (the FWTM-enclosed flux fraction depends on β, so two different
+/// per-plane β choices bias a flux ratio between them) — can reuse a
+/// resolved β without re-running the `Auto` search a second time.
+pub fn fit_stars_with_beta(
+    data: &[f32],
+    w: usize,
+    h: usize,
+    seeds: &[Seed],
+    beta: f64,
+    p: &FitParams,
+) -> FitOutcome {
+    let sigma0 = initial_sigma(seeds);
     let fits = dedupe(fit_all(data, w, h, seeds, sigma0, beta, p));
     FitOutcome {
         fits,
@@ -721,6 +748,70 @@ mod tests {
             "Gaussian stars under a Moffat model must still be accepted: {}",
             out.fits.len()
         );
+    }
+
+    #[test]
+    fn fit_stars_with_beta_matches_fit_stars_for_the_resolved_beta() {
+        // The same Gaussian field `auto_model_prefers_the_generating_beta`
+        // uses, which resolves to a NON-default β (10.0) under `Auto` — so
+        // this pins `fit_stars_with_beta` reproducing an arbitrary resolved
+        // β exactly, not just the β = 4.0 default.
+        let stars: Vec<MoffatStar> = (0..70)
+            .map(|i| {
+                round(
+                    20.0 + (i % 10) as f64 * 40.3,
+                    20.0 + (i / 10) as f64 * 40.7,
+                    0.2 + 0.05 * (i % 5) as f64,
+                )
+            })
+            .collect();
+        let data = gaussian_field(
+            420,
+            320,
+            &stars.iter().map(|s| (s.x, s.y, s.amp)).collect::<Vec<_>>(),
+            2.0,
+            0.05,
+        );
+        let seeds: Vec<Seed> = stars
+            .iter()
+            .map(|s| Seed {
+                x: s.x,
+                y: s.y,
+                peak: s.amp,
+                flux: 2.0 * std::f64::consts::PI * 4.0 * s.amp,
+            })
+            .collect();
+
+        let auto_out = fit_stars(
+            &data,
+            420,
+            320,
+            &seeds,
+            PsfModel::Auto,
+            &FitParams::default(),
+        );
+        let explicit_out = fit_stars_with_beta(
+            &data,
+            420,
+            320,
+            &seeds,
+            auto_out.beta,
+            &FitParams::default(),
+        );
+
+        assert_eq!(auto_out.beta, explicit_out.beta);
+        assert_eq!(auto_out.fits.len(), explicit_out.fits.len());
+        assert!(!auto_out.fits.is_empty());
+        for (a, b) in auto_out.fits.iter().zip(&explicit_out.fits) {
+            assert!((a.x - b.x).abs() < 1e-9, "x: {} vs {}", a.x, b.x);
+            assert!((a.y - b.y).abs() < 1e-9, "y: {} vs {}", a.y, b.y);
+            assert!(
+                (a.signal - b.signal).abs() < 1e-9,
+                "signal: {} vs {}",
+                a.signal,
+                b.signal
+            );
+        }
     }
 
     #[test]

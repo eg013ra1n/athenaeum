@@ -5,11 +5,14 @@
 //! the grid as the multiplicative `A`.
 //!
 //! Detection and PSF fitting run the same detection + fit path on both
-//! planes (`detect_and_fit`, `DetectionConfig::default()`, `max_stars`,
-//! one concrete PSF model, `FitParams::default()`, native units), which is
-//! what makes the ratios comparable — ruling R2. Both planes are assumed
-//! already in the reference geometry (registered), so a shared pixel
-//! position means the same sky position. Matching is a single
+//! planes (`detect_seeds`, `DetectionConfig::default()`, `max_stars`,
+//! `FitParams::default()`, native units) — except the model: the reference
+//! fits with the caller's own `psf` choice, and the target always fits at
+//! the reference's OWN resolved β via `psf_signal::fit_stars_with_beta`,
+//! never its own independent `Auto` search — which is what makes the
+//! ratios comparable (see `relative_scale`'s own doc for why). Both planes
+//! are assumed already in the reference geometry (registered), so a
+//! shared pixel position means the same sky position. Matching is a single
 //! nearest-neighbour pass: a [`crate::geometry::kdtree::KdTree2`] built
 //! over the reference fits' centroids, queried once per target fit within
 //! `match_radius_px`. The spec's "square half-side 4" window and this
@@ -27,7 +30,7 @@ use tracing::debug;
 
 use super::LnError;
 use crate::geometry::kdtree::KdTree2;
-use crate::stacking::psf_signal::{fit_stars, FitOutcome, FitParams, PsfModel, Seed};
+use crate::stacking::psf_signal::{fit_stars, fit_stars_with_beta, FitParams, PsfModel, Seed};
 use crate::stacking::register::detect::{detect_stars, Star};
 use crate::stacking::register::DetectionConfig;
 
@@ -45,26 +48,23 @@ pub struct ScaleResult {
     pub matches: usize,
     /// Of `matches`, how many RCR flagged as outliers.
     pub rejected: usize,
+    /// The Moffat β both planes were fitted with — whatever the reference
+    /// resolved (`psf::PsfModel::Moffat4`'s fixed 4.0, or `Auto`'s own
+    /// per-plane search run once, on the reference only).
+    pub beta: f64,
 }
 
-/// Detect + PSF-fit one plane at a concrete `model`: registration's own
-/// detector for star positions (its saturation/eccentricity/SNR cuts are
-/// exactly the ones a reliable flux match wants), converted to fit seeds
-/// and handed to the measurement fitter. Fits come back brightest-first
-/// (detection's own sort order, preserved by the fitter). `model` is
-/// always a concrete choice by the time this is called — see
-/// [`resolve_concrete_model`] — never re-resolved per plane.
-fn detect_and_fit(
-    data: &[f32],
-    width: usize,
-    height: usize,
-    model: PsfModel,
-    max_stars: usize,
-) -> FitOutcome {
+/// Detect star seeds on one plane: registration's own detector for
+/// positions (its saturation/eccentricity/SNR cuts are exactly the ones a
+/// reliable flux match wants), converted to fit seeds. Fits (not run
+/// here) come back brightest-first because detection's own sort order is
+/// preserved through `to_seed` and by `fit_stars`/`fit_stars_with_beta`.
+/// Shared by the reference's own-model fit and the target's
+/// reference-β fit in [`relative_scale`].
+fn detect_seeds(data: &[f32], width: usize, height: usize, max_stars: usize) -> Vec<Seed> {
     let cfg = DetectionConfig::default();
     let stars = detect_stars(data, width, height, &cfg, max_stars, None);
-    let seeds: Vec<Seed> = stars.iter().map(to_seed).collect();
-    fit_stars(data, width, height, &seeds, model, &FitParams::default())
+    stars.iter().map(to_seed).collect()
 }
 
 /// A fit seed from a registration [`Star`]. `Star` carries no peak
@@ -95,37 +95,6 @@ fn to_seed(star: &Star) -> Seed {
     }
 }
 
-/// One concrete `PsfModel` for both planes (ruling item 3): `Auto`'s
-/// adaptive per-plane β search picks whichever β best fits THAT plane's
-/// own residuals, so a seeing or SNR difference between reference and
-/// target can land the two planes on different β — and β changes the
-/// FWTM-enclosed flux fraction (math §1.4), biasing the ratio
-/// systematically even though [`StarFit::signal`] itself is otherwise
-/// width-independent for a fixed β. `Moffat4` is already concrete
-/// (nothing to resolve). For `Auto`, `resolved_beta` is whatever the
-/// REFERENCE plane's own `fit_stars` call picked
-/// ([`FitOutcome::beta`]) — reused here as `Moffat4` when it lands on
-/// exactly 4.0 (`fit_stars`'s own default/fallback β, and what a typical
-/// calibrated-light PSF resolves to), the only OTHER concrete value
-/// `PsfModel` can express. `PsfModel` has no variant for an arbitrary β
-/// (2.5/6/10), so on any other resolved value there is no way to pin the
-/// target to the same one through this public API — it falls back to its
-/// own independent `Auto` search, same as before this fix. A real fix for
-/// that case needs a `PsfModel` variant that carries a raw β, which is
-/// `psf_signal.rs`'s call, not this file's.
-fn resolve_concrete_model(psf: PsfModel, resolved_beta: f64) -> PsfModel {
-    match psf {
-        PsfModel::Moffat4 => PsfModel::Moffat4,
-        PsfModel::Auto => {
-            if resolved_beta == 4.0 {
-                PsfModel::Moffat4
-            } else {
-                PsfModel::Auto
-            }
-        }
-    }
-}
-
 /// Global relative scale `s = RCR_loc(z_k)`, `z_k = flux_ref,k / flux_tgt,k`
 /// over stars matched within `match_radius_px` of each other (math §4.3).
 /// `z_k` is built from [`StarFit::signal`] (background-subtracted flux
@@ -134,14 +103,21 @@ fn resolve_concrete_model(psf: PsfModel, resolved_beta: f64) -> PsfModel {
 /// regardless of FWHM, so `signal` is width-independent — `mean_flux`
 /// divides by the ellipse's own area (`π·(k/2)²·fwtm_x·fwtm_y`, which
 /// scales as FWTM²) and would leak the two planes' seeing difference
-/// straight into the scale. `reference`/`target` are row-major
-/// `width × height` planes already in the reference geometry (registered);
-/// `psf`/`max_stars` should be the same `measurement` config values the
-/// frame's own measurement pass used for `max_stars`, though the fit model
-/// itself is resolved once from the reference and reused on the target —
-/// see [`resolve_concrete_model`]. Fewer than [`MIN_MATCHES`] surviving
-/// pairs is [`LnError::TooFewMatches`] — the caller excludes the frame
-/// from the LN pass rather than trust a scale from a handful of stars.
+/// straight into the scale.
+///
+/// The reference fits with the caller's own `psf` choice (`fit_stars`);
+/// the TARGET always fits at the reference's OWN resolved β
+/// ([`psf_signal::fit_stars_with_beta`], never a second, independent
+/// `Auto` search) — because β changes the FWTM-enclosed flux fraction
+/// (math §1.4), fitting the two planes at two different β values would
+/// bias the ratio systematically even though `signal` itself is
+/// width-independent for a FIXED β (the original review's finding).
+/// `reference`/`target` are row-major `width × height` planes already in
+/// the reference geometry (registered); `max_stars` should be the same
+/// `measurement` config value the frame's own measurement pass used.
+/// Fewer than [`MIN_MATCHES`] surviving pairs is
+/// [`LnError::TooFewMatches`] — the caller excludes the frame from the LN
+/// pass rather than trust a scale from a handful of stars.
 pub fn relative_scale(
     reference: &[f32],
     target: &[f32],
@@ -152,9 +128,25 @@ pub fn relative_scale(
     match_radius_px: f64,
     rcr_limit: f64,
 ) -> Result<ScaleResult, LnError> {
-    let ref_outcome = detect_and_fit(reference, width, height, psf, max_stars);
-    let concrete = resolve_concrete_model(psf, ref_outcome.beta);
-    let tgt_outcome = detect_and_fit(target, width, height, concrete, max_stars);
+    let ref_seeds = detect_seeds(reference, width, height, max_stars);
+    let ref_outcome = fit_stars(
+        reference,
+        width,
+        height,
+        &ref_seeds,
+        psf,
+        &FitParams::default(),
+    );
+
+    let tgt_seeds = detect_seeds(target, width, height, max_stars);
+    let tgt_outcome = fit_stars_with_beta(
+        target,
+        width,
+        height,
+        &tgt_seeds,
+        ref_outcome.beta,
+        &FitParams::default(),
+    );
 
     let ref_points: Vec<(f64, f64)> = ref_outcome.fits.iter().map(|f| (f.x, f.y)).collect();
     let tree = KdTree2::build(&ref_points);
@@ -195,6 +187,7 @@ pub fn relative_scale(
         sigma: r.scale,
         matches: ratios.len(),
         rejected: r.rejected,
+        beta: ref_outcome.beta,
     })
 }
 
@@ -414,10 +407,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_resolves_one_beta_from_the_reference_for_both_planes() {
+    fn target_is_fitted_with_the_reference_beta() {
         let (reference, target) = seeing_difference_pair();
 
-        let via_auto = relative_scale(
+        let r = relative_scale(
             &reference,
             &target,
             WIDTH,
@@ -428,7 +421,33 @@ mod tests {
             0.3,
         )
         .expect("Auto must resolve on this clean, purely-Moffat4 field");
-        let via_explicit = relative_scale(
+
+        // Independently resolve what `Auto` picks for the REFERENCE alone,
+        // the exact same way `relative_scale` does internally — the
+        // target must have been fitted at this same β, not its own.
+        let ref_seeds = detect_seeds(&reference, WIDTH, HEIGHT, 200);
+        let ref_out = fit_stars(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            &ref_seeds,
+            PsfModel::Auto,
+            &FitParams::default(),
+        );
+
+        assert_eq!(r.beta, ref_out.beta);
+        assert!(
+            crate::stacking::psf_signal::AUTO_BETAS.contains(&r.beta),
+            "beta {} is not one of AUTO_BETAS",
+            r.beta
+        );
+    }
+
+    #[test]
+    fn explicit_moffat4_pins_beta_four() {
+        let (reference, target) = seeing_difference_pair();
+
+        let r = relative_scale(
             &reference,
             &target,
             WIDTH,
@@ -438,21 +457,8 @@ mod tests {
             4.0,
             0.3,
         )
-        .expect("the explicit-model call must match too");
+        .expect("a clean field differing only in seeing must still match");
 
-        // The field is generated at β = 4, so `fit_stars`'s own Auto
-        // search resolves the reference to exactly β = 4 (same as
-        // `psf_signal::tests::auto_model_prefers_the_generating_beta`) —
-        // `resolve_concrete_model` then reuses `Moffat4` for the target,
-        // making the two calls do IDENTICAL fitting work.
-        assert!(
-            (via_auto.scale - via_explicit.scale).abs() < 1e-6,
-            "{} vs {}",
-            via_auto.scale,
-            via_explicit.scale
-        );
-        assert!((via_auto.sigma - via_explicit.sigma).abs() < 1e-6);
-        assert_eq!(via_auto.matches, via_explicit.matches);
-        assert_eq!(via_auto.rejected, via_explicit.rejected);
+        assert_eq!(r.beta, 4.0);
     }
 }
