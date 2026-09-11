@@ -4183,18 +4183,6 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
     }
 }
 
-/// Whether stage 5 actually registered this group — at least one of its
-/// measured entries carries a registration outcome. `register_group_pass`
-/// returns before touching a single entry when it skips a group (fewer
-/// than 3 included frames), so an all-`None` group is exactly one the
-/// register stage never processed (M4b Task 3 fix round 1, m3).
-fn group_registered(rc: &RunContext, group_key: &str) -> bool {
-    rc.measured
-        .get(group_key)
-        .map(|entries| entries.iter().any(|e| e.registration.is_some()))
-        .unwrap_or(false)
-}
-
 /// Push one [`SummaryGroup`] for `group` onto `rc.summary.groups` — called
 /// exactly once per plan group, whatever its outcome (skipped/failed/
 /// written), so the run's provenance document always accounts for every
@@ -4233,6 +4221,27 @@ fn push_summary_group(
         })
         .unwrap_or_default();
 
+    // M4b ruling R-M4b-4: whichever frame this group actually registered
+    // onto — its `GroupGeometry` is the one place that knows, in either
+    // mode.
+    //
+    // Ruling R-T3-3 (fix round 2): reported ONLY for a group whose master
+    // was WRITTEN. Stage 4 resolves a `GroupGeometry` for every plan group,
+    // and a group can still end up with no master at several later points
+    // — fewer than 3 included frames at stage 5, fewer than 3 ALIGNED
+    // members at integration, a local-normalization narrowing, an
+    // integration or write failure. Every one of those reaches here with
+    // `master_path: None`, and reporting a reference for any of them would
+    // put a `reference #N` on a Results card with nothing behind it. The
+    // written-master flag is the one signal that covers them all; fix
+    // round 1's "did stage 5 touch this group" test did not (a `Failed`
+    // registration outcome is still an outcome).
+    let reference_frame_id = master_path.as_ref().and_then(|_| {
+        rc.group_geometry
+            .get(&group.key)
+            .map(|g| g.reference_frame_id)
+    });
+
     rc.summary.groups.push(SummaryGroup {
         key: group.key.clone(),
         frame_count: group.frames.len(),
@@ -4242,26 +4251,7 @@ fn push_summary_group(
         rejection_high_path,
         stats,
         normalization_reference_frame_id,
-        // M4b ruling R-M4b-4: whichever frame this group actually
-        // registered onto — its `GroupGeometry` is the one place that
-        // knows, in either mode.
-        //
-        // Fix round 1 (m3): `Some` ONLY for a group stage 5 really
-        // registered. Stage 4 resolves a `GroupGeometry` for every plan
-        // group, including ones the register stage then skips (fewer than
-        // 3 included frames), and reporting those would put a
-        // `reference #N` on a card whose master was never written. A
-        // registered group always carries a `registration` outcome on at
-        // least one of its entries — `register_group_pass` returns before
-        // touching any of them when it skips a group — so that is the
-        // signal, not a second copy of the viability rule.
-        reference_frame_id: group_registered(rc, &group.key)
-            .then(|| {
-                rc.group_geometry
-                    .get(&group.key)
-                    .map(|g| g.reference_frame_id)
-            })
-            .flatten(),
+        reference_frame_id,
         ln_reference_path,
         drizzle_path,
         weight_map_path,
@@ -9265,6 +9255,118 @@ mod tests {
                 "frame {id} must re-register after cfg.registration.max_stars changes"
             );
         }
+    }
+
+    /// Ruling R-T3-3: `SummaryGroup::reference_frame_id` is `Some` ONLY
+    /// when the group's master was WRITTEN — never for a group that got as
+    /// far as registration and then lost its master anyway.
+    ///
+    /// The fixture is the narrow path fix round 1's "did stage 5 touch this
+    /// group" test could not see: two real star frames plus two starless
+    /// ones, so the group IS viable at stage 5 (4 included ≥ 3), stage 5
+    /// registers all four and the two starless ones fail RANSAC, leaving 2
+    /// — below the member floor. The group is skipped at Output with no
+    /// master, and must therefore report no reference, even though its
+    /// frames carry real registration outcomes (both `aligned` and
+    /// `failed`, asserted below as the premise).
+    #[test]
+    fn a_group_that_loses_its_master_after_registering_reports_no_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0)];
+        let noise = [4.0f32; 2];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+
+        // Two flat-field frames: constant background + noise, no stars —
+        // the registration detector finds nothing on them, so RANSAC
+        // refuses both with too few inliers.
+        let mut all_ids = light_ids.clone();
+        for i in 0..2 {
+            let flat_date = date_obs_at(2 + i);
+            let stem = format!("flat{i}");
+            let flat_spec = star_light_spec(&stem, &flat_date);
+            let (flat_id, _path) = test_fixtures::add_light_with_field(
+                &fixture,
+                &flat_spec,
+                &[],
+                600.0,
+                4.0,
+                777 + i as u64,
+            );
+            all_ids.push(flat_id);
+        }
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &all_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        // `WeightMode::None` keeps stage 3's weight filter from dropping
+        // the starless frames before registration ever sees them (the
+        // sibling test's own reasoning); `best_by_weight`'s star-count
+        // tie-break still puts a real star frame in the reference seat.
+        let mut cfg = StackingConfig::default();
+        cfg.measurement.weight_mode = WeightMode::None;
+        cfg.registration.geometry = RegistrationGeometry::Native;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx,
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        // No group produced a master, so the Output stage itself fails —
+        // but it pushes every group's summary before it says so.
+        let result = stage_output(&mut rc);
+        assert!(result.is_err(), "the run has no master to hand back");
+
+        let group = summary_group(&rc, &group_key);
+        assert_eq!(group.master_path, None, "{group:?}");
+        assert_eq!(
+            group.reference_frame_id, None,
+            "a group with no master reports no reference: {group:?}"
+        );
+        // Premise: this group really did register — the two star frames
+        // aligned and the two starless ones failed, so "stage 5 never
+        // touched it" is NOT why the reference is absent.
+        assert!(
+            group
+                .frames
+                .iter()
+                .any(|f| f.reg_status.as_deref() == Some("aligned")),
+            "{:?}",
+            group.frames
+        );
+        assert!(
+            group
+                .frames
+                .iter()
+                .any(|f| f.reg_status.as_deref() == Some("failed")),
+            "{:?}",
+            group.frames
+        );
     }
 
     #[test]
