@@ -250,6 +250,20 @@ impl LnGrid {
         // EVERY pixel. `i0 = x / stride_usize` (integer division) is the
         // same value `tx.floor() as isize` would give for these input
         // ranges — see the module's Task 5 pin test.
+        //
+        // Fix round 1 (ruling R-M4a-19): `wx_table`'s own `fx = r /
+        // stride` (`r = 0..stride`, `LnScratch::for_grid`) is not always
+        // bit-identical to the old per-pixel `fx = tx - tx.floor()` this
+        // replaced. At a power-of-two stride (128, 256, …) both divide by
+        // a power of two — exact in binary floating point — so the two
+        // agree bit-for-bit. At a non-power-of-two stride (96, 160, every
+        // other LN scale step) the old formula re-derives the fractional
+        // part from `x / stride`, a division whose rounding error grows
+        // with `x`; the table divides the small integers `r` and `stride`
+        // directly and carries no such growth, so it is the MORE accurate
+        // of the two, not merely a different one — measured drift up to
+        // 8.1e-5 in `fx`, up to 6.3e-6 in the evaluated row values, both
+        // pinned (with the reasoning) in the module's Task 5 pin tests.
         for x in 0..self.ref_width {
             let i0 = (x / stride_usize) as isize;
             let wx = &scratch.wx_table[x % stride_usize];
@@ -616,12 +630,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn evaluate_row_into_matches_the_pre_table_reference_implementation() {
-        // A 7x5 node grid over an 800x600 reference at stride 128 (scale
-        // 1024) — deliberately not derived via `node_count`, since this
-        // test checks the evaluator's numbers, not the mesh geometry.
-        let (gw, gh, ref_width, ref_height, scale) = (7usize, 5usize, 800usize, 600usize, 1024u32);
+    /// Shared body for the Task 5 pin tests below: a 7x5 node grid over an
+    /// 800x600 reference at the given `scale` (deliberately not derived via
+    /// `node_count` — this checks the evaluator's numbers, not the mesh
+    /// geometry), checking `evaluate_row_into` (table-based) against
+    /// `evaluate_row_reference` (verbatim pre-Task-5 per-pixel loop) for
+    /// rows 0, 77 and `ref_height - 1`, both `a`/`b` outputs, at every `x`,
+    /// to the caller-supplied tolerance.
+    fn assert_pin_matches(scale: u32, tol: f32) {
+        let (gw, gh, ref_width, ref_height) = (7usize, 5usize, 800usize, 600usize);
         let mut rng = SplitMix64(0xC0FFEE_u64);
         let n = gw * gh;
         let a: Vec<f32> = (0..n).map(|_| (rng.next_f64() as f32 - 0.5) * 4.0).collect();
@@ -647,19 +664,52 @@ mod tests {
             evaluate_row_reference(&grid, y, &mut a_ref, &mut b_ref);
             for x in 0..ref_width {
                 assert!(
-                    (a_row[x] - a_ref[x]).abs() < 1e-6,
-                    "row {y}, x {x}: a table {} vs reference {}",
+                    (a_row[x] - a_ref[x]).abs() < tol,
+                    "scale {scale}, row {y}, x {x}: a table {} vs reference {}",
                     a_row[x],
                     a_ref[x]
                 );
                 assert!(
-                    (b_row[x] - b_ref[x]).abs() < 1e-6,
-                    "row {y}, x {x}: b table {} vs reference {}",
+                    (b_row[x] - b_ref[x]).abs() < tol,
+                    "scale {scale}, row {y}, x {x}: b table {} vs reference {}",
                     b_row[x],
                     b_ref[x]
                 );
             }
         }
+    }
+
+    #[test]
+    fn evaluate_row_into_matches_the_pre_table_reference_implementation() {
+        // Power-of-two stride (scale 1024 → stride 128): the old per-pixel
+        // `fx = tx - tx.floor()` and the table's `fx = r / stride` both
+        // divide by a power of two, which is EXACT in binary floating
+        // point — so `fx`, and every downstream weight/row value, is
+        // expected bit-identical here. See the fix-round-1 comment at
+        // `evaluate_row_into`'s x-loop (~L245) for why non-power-of-two
+        // strides (below) don't get this for free.
+        assert_pin_matches(1024, 1e-9);
+    }
+
+    #[test]
+    fn evaluate_row_into_matches_the_pre_table_reference_implementation_at_non_power_of_two_strides(
+    ) {
+        // M4a Task 5 fix round 1 (ruling R-M4a-19): at a non-power-of-two
+        // stride — scale 768 → stride 96, scale 1280 → stride 160, i.e.
+        // every LN scale step except 256/512/1024/2048/4096 — the old
+        // per-pixel `fx = x/stride - floor(x/stride)` re-derives the
+        // fractional part from a division whose f32 rounding error GROWS
+        // with `x`, while the table's `fx = (x % stride)/stride` divides
+        // the small integers `r` and `stride` directly and carries no such
+        // growth: the table is the MORE accurate of the two, not merely a
+        // different one. Review measured up to 8.1e-5 disagreement in `fx`
+        // and up to 6.3e-6 in the evaluated row values at these strides —
+        // both far below anything a pixel value can show (LN acceptance
+        // measures master noise at ~1e-5 absolute, level at 1%) — so the
+        // ruling accepts the drift and widens this pin's tolerance to
+        // 1e-4 instead of the power-of-two case's near-exact one above.
+        assert_pin_matches(768, 1e-4); // stride 96
+        assert_pin_matches(1280, 1e-4); // stride 160
     }
 
     #[test]
