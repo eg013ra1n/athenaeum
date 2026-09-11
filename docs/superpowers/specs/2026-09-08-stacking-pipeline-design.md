@@ -689,11 +689,22 @@ functions build calibration masters and their output is fingerprint-pinned:
   Master builds never select linear fit automatically (their Auto is
   Winsorized / percentile / median), so only a master built with an explicit
   linear-fit recipe changes; that test pin is re-measured in the same task.
-- `winsorizedSigma` keeps today's semantics in M1 (it is what every master
-  with n ≥ 15 is built with). Aligning it with the reference (Sn
-  initialization, the 1.5σ Winsorization with cutoff 5, the 1.134 factor)
-  is an M4 change with its own fingerprint re-pin and a before/after
-  measurement on the owner's masters.
+- `winsorizedSigma` kept today's semantics through M1–M3 (it is what every
+  master with n ≥ 15 is built with) and adopted the reference loop in M4c
+  Task 2 (ruling R-M4c-3): `μ = median`, initial `σ = 1.4826·MAD`, then the
+  1.5σ Winsorization with a first-pass cutoff of 5 (a sample beyond
+  `μ ± 5σ` becomes `μ`, not the neighbouring threshold), `σ = 1.134·stddev`,
+  `μ = mean`, to `|Δσ|/σ < 0.0005` after ≥ 2 passes and at most 20, then the
+  sigma clip about `(μ_w, σ_w)` repeated until stable. The one documented
+  deviation is the initial scale: `1.4826·MAD` instead of the reference's
+  `1.1926·Sn`, which is O(n²) per pixel stack — the first-pass cutoff makes
+  the start point nearly irrelevant and the loop reaches the same fixed
+  point from either. No fixture fingerprint pin moved (the two Winsorized
+  fixtures are tolerance- and survivor-set-based, and both fixed points
+  reject the same planted outlier there); the real move was measured on 21
+  calibrated LDN 1272 mono frames at 4.0/3.0 — rejected fraction
+  0.380 % → 0.963 %, master median −0.024 %, master MAD +0.50 %, master
+  noise +2.0 %, combine time +20 %.
 
 Three more shipped in M4c Task 1 (math reference §3.4, rulings R-M4c-1/2),
 all three USER choices the Auto rule below never selects:

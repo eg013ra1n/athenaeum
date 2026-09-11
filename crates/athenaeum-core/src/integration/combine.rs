@@ -12,7 +12,11 @@
 //! deserialize-only [`LegacyCombineMethod`] so old `recipe_json` blobs still
 //! parse (spec §3). Its equivalences: `Mean` = Average+None, `Median` =
 //! Median+None, `WinsorizedSigmaClip` = Average+WinsorizedSigma,
-//! `PercentileClip` = Average+PercentileClip — pinned bit-for-bit by the tests.
+//! `PercentileClip` = Average+PercentileClip. `Mean` and `PercentileClip`
+//! are still pinned bit-for-bit by the tests; `WinsorizedSigmaClip` maps to
+//! the same recipe but no longer to the same NUMBERS — ruling R-M4c-3 moved
+//! the winsorized fixed point onto the reference loop (see
+//! [`reject_winsorized`]).
 
 use super::student_t;
 use serde::{Deserialize, Serialize};
@@ -104,9 +108,11 @@ pub enum Rejection {
     /// [m − sigma_low·σ, m + sigma_high·σ] of the current survivor set until
     /// stable. Zero-dispersion sets converge immediately with no rejection.
     SigmaClip { sigma_low: f64, sigma_high: f64 },
-    /// Huber-style winsorized sigma clip (unchanged from the legacy master
-    /// recipe): a winsorized location/scale estimate, then reject original
-    /// samples outside [m − sigma_low·s, m + sigma_high·s].
+    /// Huber-style winsorized sigma clip, the reference loop (math reference
+    /// §3.4, ruling R-M4c-3): a winsorized location/scale estimate from the
+    /// median and the MAD, then reject original samples outside
+    /// [m − sigma_low·s, m + sigma_high·s], repeated until stable. Not the
+    /// pre-M4c fixed point — see [`reject_winsorized`].
     WinsorizedSigma { sigma_low: f64, sigma_high: f64 },
     /// Minimum-absolute-deviation ("robust") line fit over (rank, value);
     /// reject samples whose residual falls outside [−sigma_low·d,
@@ -467,49 +473,195 @@ fn reject_sigma_clip<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
     (kept, false)
 }
 
+/// Winsorization point: the working copy is clamped at `mu ± 1.5·sigma`
+/// (math reference §3.4).
+const WINSORIZE_CLAMP_SIGMA: f64 = 1.5;
+
+/// First-pass cutoff: a sample beyond `mu ± 5·sigma` is replaced by the
+/// CENTRE rather than by the neighbouring clamp threshold, so a gross
+/// outlier cannot prop the scale up from just outside the band. Later passes
+/// clamp plainly (nothing is left out that far).
+const WINSORIZE_CUTOFF_SIGMA: f64 = 5.0;
+
+/// Normal-distribution correction for the 1.5-sigma Winsorization point:
+/// the standard deviation of a winsorized standard normal is 0.88231, and
+/// `1/0.88231 = 1.1334` (math reference §3.4).
+const WINSORIZE_SCALE_CORRECTION: f64 = 1.134;
+
+/// `1.4826·MAD` is the σ-consistent MAD scale of a normal sample — the
+/// initial scale of the loop (ruling R-M4c-3: a documented deviation from
+/// the reference's `1.1926·Sn`, which is O(n²) per pixel stack. The
+/// first-pass cutoff above makes the start point nearly irrelevant, and the
+/// loop reaches the same fixed point from either one).
+const WINSORIZE_MAD_TO_SIGMA: f64 = 1.4826;
+
+/// Relative change in `sigma` below which the Winsorization loop has
+/// settled (math reference §3.4), honoured from the second pass on.
+const WINSORIZE_CONVERGENCE: f64 = 0.0005;
+
+/// Pass cap for the Winsorization loop (math reference §3.4).
+const WINSORIZE_MAX_PASSES: usize = 20;
+
+thread_local! {
+    // `reject_winsorized`'s working copy of the current survivor values, in
+    // the f32 the samples already are. Cleared and reused per call — this
+    // rejection runs inside the per-pixel band loop, so a fresh `Vec` per
+    // pixel is not acceptable.
+    static WINSORIZE_SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
+
+/// Median of `v`, which it reorders in place (`select_nth_unstable_by`, so
+/// no sortedness contract on the caller and no second buffer). Even lengths
+/// average the two middle samples, like [`median_sorted_f64`].
+fn median_in_place(v: &mut [f32]) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let (low, mid, _) =
+        v.select_nth_unstable_by(n / 2, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let upper = *mid as f64;
+    if n % 2 == 1 {
+        upper
+    } else {
+        // Everything left of the pivot is <= it, so the lower middle sample
+        // is the largest of that partition.
+        let lower = low.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        0.5 * (lower + upper)
+    }
+}
+
+/// Winsorized location and scale of a pixel stack — `(mu_w, sigma_w,
+/// passes)`, math reference §3.4 via ruling R-M4c-3.
+///
+/// Start `mu = median`, `sigma = 1.4826·MAD` about it, then loop: clamp the
+/// working copy to `[mu − 1.5σ, mu + 1.5σ]` — on the FIRST pass a sample
+/// beyond `mu ± 5σ` becomes `mu` instead (an extreme outlier goes to the
+/// centre, not to the neighbouring threshold, and stays there for the rest
+/// of the loop since the working copy is winsorized cumulatively) — then
+/// `mu = mean(v)`, `sigma = 1.134·stddev(v)`; stop once `sigma` moves by
+/// less than 0.05 % and at least two passes have run, or at 20 passes.
+///
+/// Allocation-free: `scratch` is the caller's reused buffer, used first for
+/// the two medians and then as the working copy. Zero dispersion (identical
+/// samples, or fewer than three of them) returns `sigma_w = 0`, which the
+/// caller reads as "nothing to reject".
+fn winsorized_location_scale<T: Sample>(values: &[T], scratch: &mut Vec<f32>) -> (f64, f64, usize) {
+    let n = values.len();
+    if n == 0 {
+        return (0.0, 0.0, 0);
+    }
+    if n < 3 {
+        return (mean_f64(values), 0.0, 0);
+    }
+    scratch.clear();
+    scratch.extend(values.iter().map(|s| s.value()));
+    let mut mu = median_in_place(&mut scratch[..]);
+    for (dst, src) in scratch.iter_mut().zip(values.iter()) {
+        *dst = (src.value() as f64 - mu).abs() as f32;
+    }
+    let mad = median_in_place(&mut scratch[..]);
+    let mut sigma = WINSORIZE_MAD_TO_SIGMA * mad;
+    scratch.clear();
+    scratch.extend(values.iter().map(|s| s.value()));
+
+    let mut passes = 0usize;
+    while passes < WINSORIZE_MAX_PASSES {
+        if !(sigma > 0.0) {
+            break; // zero dispersion (or a non-finite scale): nothing to do
+        }
+        passes += 1;
+        let t0 = mu - WINSORIZE_CLAMP_SIGMA * sigma;
+        let t1 = mu + WINSORIZE_CLAMP_SIGMA * sigma;
+        // The cutoff is a first-pass device: after one pass nothing sits
+        // beyond the clamp thresholds any more, let alone beyond 5 sigma.
+        let cutoff = passes == 1;
+        let (c0, c1) = (mu - WINSORIZE_CUTOFF_SIGMA * sigma, mu + WINSORIZE_CUTOFF_SIGMA * sigma);
+        for x in scratch.iter_mut() {
+            let v = *x as f64;
+            if v < t0 {
+                *x = if cutoff && v <= c0 { mu as f32 } else { t0 as f32 };
+            } else if v > t1 {
+                *x = if cutoff && v >= c1 { mu as f32 } else { t1 as f32 };
+            }
+        }
+        let new_mu = mean_f64(&scratch[..]);
+        let new_sigma = WINSORIZE_SCALE_CORRECTION * stddev(&scratch[..], new_mu);
+        let settled = passes >= 2 && (new_sigma - sigma).abs() < WINSORIZE_CONVERGENCE * sigma;
+        mu = new_mu;
+        sigma = new_sigma;
+        if settled {
+            break;
+        }
+    }
+    (mu, sigma, passes)
+}
+
+/// Winsorized sigma clipping (math reference §3.4, ruling R-M4c-3): the
+/// winsorized location/scale of the current survivors, a sigma clip of the
+/// ORIGINAL samples about `(mu_w, sigma_w)`, repeated until nothing more is
+/// rejected.
+///
+/// Before M4c this routine ran ONE clip about a location/scale seeded from
+/// the contaminated mean and standard deviation — byte-identical to the
+/// pre-2026-07-06 `WinsorizedSigmaClip` estimator, deliberately, so that
+/// masters built by older versions could be reproduced. Ruling R-M4c-3
+/// retires that fixed point: the old start point let a gross outlier inflate
+/// the scale it was supposed to be measured against (it converged ~5 % high
+/// on a 5 %-contaminated normal stack, against ~2.7 % low for the reference
+/// loop, whose centre-mapping cutoff removes the outlier's leverage
+/// entirely). Every Winsorized master fingerprint moved with it — the
+/// old/new numbers are in the M4c Task 2 commit body.
 fn reject_winsorized<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
         return (n, false);
     }
     sort_asc(values);
-    // 1) Winsorized estimate of location/scale (Huber-style iteration): clamp
-    //    the working copy at m±1.5σ, recompute, repeat to 0.5% change. This
-    //    block is byte-identical to the legacy `WinsorizedSigmaClip` estimator
-    //    so Average+WinsorizedSigma reproduces the old master exactly.
-    let mut work: Vec<f64> = values.iter().map(|s| s.value() as f64).collect();
-    let mut m = work.iter().sum::<f64>() / n as f64;
-    let mut s = stddev(values, m);
-    for _ in 0..10 {
-        if s <= f64::EPSILON {
-            break;
+    let mut kept = n;
+    WINSORIZE_SCRATCH.with(|cell| {
+        let scratch = &mut *cell.borrow_mut();
+        for iter in 0..MAX_REJECTION_ITERS {
+            let (m, s, _passes) = winsorized_location_scale(&values[..kept], scratch);
+            if !(s > 0.0) {
+                break; // zero dispersion → no (further) rejection
+            }
+            let (lo, hi) = (m - sigma_low * s, m + sigma_high * s);
+            // Stable compaction: survivors keep the ascending order the
+            // summation relies on (w <= r throughout, so the write never
+            // clobbers an unread slot).
+            let mut w = 0usize;
+            for r in 0..kept {
+                let xf = values[r].value() as f64;
+                if xf >= lo && xf <= hi {
+                    values[w] = values[r];
+                    w += 1;
+                }
+            }
+            if w == kept {
+                break; // converged
+            }
+            if w == 0 {
+                // Nothing survived. On the FIRST iteration no write has
+                // happened yet, so the full stack is intact and
+                // `combine_pixel`'s all-rejected fallback can take its median
+                // (the historical behaviour of this routine). On a later
+                // iteration an earlier compaction has already overwritten the
+                // tail — keep that iteration's intact survivor prefix rather
+                // than fabricating from clobbered memory, exactly as
+                // `reject_sigma_clip` does.
+                if iter == 0 {
+                    kept = 0;
+                }
+                break;
+            }
+            kept = w;
+            if kept < 3 {
+                break; // the winsorized estimate is not defined below 3
+            }
         }
-        let (lo, hi) = (m - 1.5 * s, m + 1.5 * s);
-        for x in work.iter_mut() {
-            *x = x.clamp(lo, hi);
-        }
-        let new_m = work.iter().sum::<f64>() / n as f64;
-        let new_s = 1.134
-            * (work.iter().map(|x| (x - new_m) * (x - new_m)).sum::<f64>() / (n - 1) as f64).sqrt();
-        let converged = (new_s - s).abs() <= 0.005 * s.abs();
-        m = new_m;
-        s = new_s;
-        if converged {
-            break;
-        }
-    }
-    // 2) Keep original samples inside [m − σ_low·s, m + σ_high·s]. Survivors
-    //    stay in the sorted order the summation relied on historically.
-    let (lo, hi) = (m - sigma_low * s, m + sigma_high * s);
-    let mut w = 0usize;
-    for r in 0..n {
-        let xf = values[r].value() as f64;
-        if xf >= lo && xf <= hi {
-            values[w] = values[r];
-            w += 1;
-        }
-    }
-    (w, true)
+    });
+    (kept, true)
 }
 
 /// Dispersion-scale knob for [`Rejection::LinearFitClip`]: the rejection band
@@ -1820,27 +1972,193 @@ mod tests {
         assert!(v < 10100.0, "{v}");
     }
 
+    // ── Winsorized location/scale (M4c Task 2, ruling R-M4c-3) ──────────────
+
+    /// Ruling R-M4c-3: the Winsorized estimator now follows the reference
+    /// loop — `mu = median`, initial `sigma = 1.4826·MAD`, then 1.5-sigma
+    /// Winsorization with a first-pass cutoff of 5 (a sample beyond
+    /// `mu ± 5·sigma` goes to the CENTRE, not to the neighbouring threshold),
+    /// `sigma = 1.134·stddev(v)`, `mu = mean(v)`, stopping at a 0.05 %
+    /// change in `sigma` after at least two passes.
+    ///
+    /// Measured on the fixture below — 100 draws of N(0.1, 0.002), whose own
+    /// sample scale is 0.00188190 (the draw runs 5.9 % under the nominal
+    /// 0.002, which is ordinary for n = 100: the sampling scatter of a
+    /// sample scale is `1/sqrt(2(n−1))` ≈ 7 %), plus 5 samples planted at
+    /// +10 nominal sigma:
+    ///
+    /// | estimator | stack        | mu         | sigma      | passes |
+    /// | --------- | ------------ | ---------- | ---------- | ------ |
+    /// | reference | contaminated | 0.10017748 | 0.00172028 | 6      |
+    /// | reference | clean        | 0.10015293 | 0.00181578 | 4      |
+    /// | retired   | contaminated | 0.10030463 | 0.00201002 | (≤ 10) |
+    /// | retired   | clean        | 0.10014012 | 0.00185773 | (≤ 10) |
+    ///
+    /// So the pin is NOT "sigma_w ≈ 0.002": neither estimator's fixed point
+    /// is the nominal scale, and on this draw the retired one lands within
+    /// 0.5 % of 0.002 purely by cancellation (its contamination bias of
+    /// +8.2 % against its own clean value cancels the draw's −5.9 %
+    /// deficit). What separates them is how far CONTAMINATION moves each
+    /// estimator from its own clean answer: the reference loop −5.3 %, the
+    /// retired one +8.2 %, and in opposite directions.
+    ///
+    /// The reference loop's downward move is by construction, not by error:
+    /// the 5 contaminating samples are beyond `mu ± 5·sigma`, so the first
+    /// pass maps them to the CENTRE, after which they contribute nothing to
+    /// the winsorized variance while still counting in its `n − 1`
+    /// denominator. The retired estimator instead started from the
+    /// CONTAMINATED mean and standard deviation — 2.4× the true scale here —
+    /// and its plain clamping pinned the outliers at `mu + 1.5·sigma` for
+    /// good, where they propped up the very scale they were supposed to be
+    /// measured against. That is why every Winsorized fingerprint moves in
+    /// this task.
+    ///
+    /// The fixed-point tolerance is 0.1 % rather than exact bits: the
+    /// fixture is generated through `ln`/`cos`, whose last ulp is allowed to
+    /// differ between platforms. It is still three orders of magnitude
+    /// tighter than the 17 % gap to the retired fixed point, so no change of
+    /// start point, cutoff or convergence rule can slip through it.
+    #[test]
+    fn winsorized_location_scale_lands_on_the_reference_fixed_point() {
+        const SEED: u64 = 0xD15_0001;
+        let clean = fixture_gaussian_stack(100, 0.1, 0.002, SEED);
+        let sd_clean = stddev(&clean[..], mean_f64(&clean[..]));
+        assert!(
+            (sd_clean - 0.001_881_90).abs() < 1e-6,
+            "the fixture's own scale is part of the pin: {sd_clean}"
+        );
+
+        let mut contaminated = clean.clone();
+        for _ in 0..5 {
+            contaminated.push(sample_from(0.12)); // +10 nominal sigma
+        }
+        let mut scratch: Vec<f32> = Vec::new();
+        let (mu, sigma, passes) = winsorized_location_scale(&contaminated[..], &mut scratch);
+        let (mu_clean, sigma_clean, passes_clean) =
+            winsorized_location_scale(&clean[..], &mut scratch);
+
+        assert!(
+            (mu - 0.1).abs() < 0.02 * 0.1,
+            "mu_w {mu} must land within 2 % of 0.1 (contamination moved it by \
+             {} of the clean answer {mu_clean})",
+            (mu - mu_clean).abs() / mu_clean
+        );
+        assert!(
+            (sigma - 0.001_720_28).abs() < 1e-3 * 0.001_720_28,
+            "the contaminated fixed point moved: sigma_w {sigma}"
+        );
+        assert!(
+            (sigma_clean - 0.001_815_78).abs() < 1e-3 * 0.001_815_78,
+            "the clean fixed point moved: sigma_w {sigma_clean}"
+        );
+        assert!(
+            (2..=6).contains(&passes) && (2..=6).contains(&passes_clean),
+            "the loop must settle in 2..=6 passes, took {passes} / {passes_clean}"
+        );
+
+        // The retired estimator's fixed point on the SAME fixtures, so the
+        // move every Winsorized fingerprint made is documented, not
+        // discovered. Its (m, s) is order-dependent through the f64
+        // summation, so it gets the sorted stacks it always got.
+        let mut sorted_contaminated = contaminated.clone();
+        sort_asc(&mut sorted_contaminated);
+        let mut sorted_clean = clean.clone();
+        sort_asc(&mut sorted_clean);
+        let (_, old_sigma) = legacy_winsorized_location_scale(&sorted_contaminated);
+        let (_, old_sigma_clean) = legacy_winsorized_location_scale(&sorted_clean);
+        assert!(
+            (old_sigma - 0.002_010_02).abs() < 1e-3 * 0.002_010_02,
+            "the retired fixed point is recorded, not asserted into existence: {old_sigma}"
+        );
+        assert!(
+            (sigma - sigma_clean).abs() < (old_sigma - old_sigma_clean).abs(),
+            "contamination must move the reference loop LESS than it moved the retired \
+             estimator: {} vs {}",
+            (sigma - sigma_clean).abs(),
+            (old_sigma - old_sigma_clean).abs()
+        );
+        assert!(
+            sigma < sigma_clean && old_sigma > old_sigma_clean,
+            "the reference loop errs low under contamination ({sigma} vs {sigma_clean}), the \
+             retired estimator errs high ({old_sigma} vs {old_sigma_clean}) — the whole point \
+             of the centre-mapping cutoff"
+        );
+
+        // All five planted outliers are rejected at 4.0/3.0, and the clean
+        // stack keeps (nearly) everything.
+        let mut work = planted_stack(100, 0.1, 0.002, SEED, &[0.12; 5]);
+        let (kept, sorted_prefix) = reject_winsorized(&mut work, 4.0, 3.0);
+        assert!(sorted_prefix, "the survivor prefix is left ascending");
+        let kept_ids = survivors(&work, kept);
+        for id in 100u16..105 {
+            assert!(!kept_ids.contains(&id), "planted outlier {id} survived");
+        }
+        assert!(kept >= 97, "kept {kept} of 105 — the clean bulk must survive");
+
+        let mut pure = planted_stack(100, 0.1, 0.002, SEED, &[]);
+        let (kept_pure, _) = reject_winsorized(&mut pure, 4.0, 3.0);
+        assert!(kept_pure >= 98, "a pure Gaussian may lose at most 2: kept {kept_pure}");
+    }
+
+    /// The all-rejected fallback survives the loop (it used to be reachable
+    /// from a single pass). Zero thresholds leave the band `[mu_w, mu_w]`, so
+    /// the FIRST iteration rejects everything before any survivor has been
+    /// written — the full stack is still intact and `combine_pixel` answers
+    /// with its median, the historical behaviour. (The late-iteration branch
+    /// of the same guard is unreachable by construction here: once the
+    /// median/MAD start is used, a scale small enough to empty a stack whose
+    /// own median exists needs a threshold this degenerate, and that empties
+    /// it on the first iteration. It mirrors `reject_sigma_clip`'s guard,
+    /// which has its own pin.)
+    #[test]
+    fn winsorized_all_rejected_keeps_the_intact_stack_for_the_median() {
+        let base = fixture_gaussian_stack(21, 100.0, 2.0, 0xD15_0002);
+        let mut sorted = base.clone();
+        sort_asc(&mut sorted);
+        let expected = median_sorted(&sorted);
+        let (v, rejected) = combine_pixel(
+            &mut base.clone(),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 0.0,
+                sigma_high: 0.0,
+            }),
+        );
+        assert_eq!(rejected, 21, "the whole stack is rejected");
+        assert_eq!(
+            v.to_bits(),
+            expected.to_bits(),
+            "the fallback must be the median of the INTACT stack: {v} vs {expected}"
+        );
+    }
+
     // ── Legacy equivalence, bit-for-bit (spec §5) ───────────────────────────
     //
     // The old flat-`CombineMethod` implementations, replicated verbatim as a
-    // recorded reference. Average+None must equal old `Mean` and
-    // Average+WinsorizedSigma must equal old `WinsorizedSigmaClip` on the same
-    // fixture stack, to the bit.
+    // recorded reference. Average+None must equal old `Mean` on the fixture
+    // stack, to the bit.
+    //
+    // Average+WinsorizedSigma still matches old `WinsorizedSigmaClip` on that
+    // same fixture, but INCIDENTALLY, not because the estimators agree: ruling
+    // R-M4c-3 moved the winsorized fixed point (see the pin above), and on
+    // this fixture both fixed points reject exactly the one planted outlier,
+    // so both average the same 24 survivors. The test below asserts the
+    // survivors AND asserts that the two estimators disagree, so it can never
+    // quietly turn back into a claim of estimator equivalence.
 
     fn legacy_mean(values: &[f32]) -> f32 {
         (values.iter().map(|&x| x as f64).sum::<f64>() / values.len() as f64) as f32
     }
 
-    fn legacy_winsorized(values: &[f32], sigma_low: f64, sigma_high: f64) -> (f32, usize) {
-        let n = values.len();
-        if n < 3 {
-            return (legacy_mean(values), 0);
-        }
-        let mut sorted = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    /// The retired estimator's location/scale, lifted verbatim out of
+    /// `legacy_winsorized` below (same f64 operations in the same order, so
+    /// that function's recorded arithmetic is unchanged): the CONTAMINATED
+    /// mean and standard deviation as the start point, plain clamping with no
+    /// cutoff, a 0.5 % convergence threshold and a 10-pass cap.
+    fn legacy_winsorized_location_scale(sorted: &[f32]) -> (f64, f64) {
+        let n = sorted.len();
+        let mut m = sorted.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+        let mut s = stddev(sorted, m);
         let mut work: Vec<f64> = sorted.iter().map(|&x| x as f64).collect();
-        let mut m = work.iter().sum::<f64>() / n as f64;
-        let mut s = stddev(&sorted, m);
         for _ in 0..10 {
             if s <= f64::EPSILON {
                 break;
@@ -1860,6 +2178,17 @@ mod tests {
                 break;
             }
         }
+        (m, s)
+    }
+
+    fn legacy_winsorized(values: &[f32], sigma_low: f64, sigma_high: f64) -> (f32, usize) {
+        let n = values.len();
+        if n < 3 {
+            return (legacy_mean(values), 0);
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (m, s) = legacy_winsorized_location_scale(&sorted);
         let (lo, hi) = (m - sigma_low * s, m + sigma_high * s);
         let mut sum = 0.0f64;
         let mut kept = 0usize;
@@ -1910,6 +2239,26 @@ mod tests {
             new_v.to_bits(),
             old_v.to_bits(),
             "Average+WinsorizedSigma must equal old WinsorizedSigmaClip bit-for-bit"
+        );
+        // ... and it does so only because both fixed points reject the same
+        // single outlier here. The estimators themselves are NOT the same any
+        // more (ruling R-M4c-3): on this very fixture the retired start point
+        // (the contaminated mean and standard deviation) lands somewhere else
+        // entirely, which is what moves real master fingerprints.
+        let mut sorted = base.clone();
+        sort_asc(&mut sorted);
+        let mut scratch: Vec<f32> = Vec::new();
+        let (new_m, new_s, _) = winsorized_location_scale(&sorted[..], &mut scratch);
+        let (old_m, old_s) = legacy_winsorized_location_scale(&sorted);
+        // Measured: new (1002.0553, 3.99583) vs retired (1002.2742, 4.30444)
+        // — the SCALE is 7.7 % higher on the retired side (the outlier's
+        // leverage), the centres agree to 0.02 % (the outlier barely moves a
+        // mean of clamped values either way). The scale is what decides
+        // survival, so that is what this asserts.
+        assert!(
+            (new_s - old_s).abs() > 0.01 * old_s.abs(),
+            "the two estimators must NOT agree: new ({new_m}, {new_s}) vs retired \
+             ({old_m}, {old_s}) — if they do, this test is no longer pinning what it says"
         );
     }
 
