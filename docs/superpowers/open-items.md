@@ -189,31 +189,10 @@ review; what is missing is a human running the flow on real data.
 
 ### Stacking M4a — measurement seeds and the PSF fitter (2026-09-11)
 
-The measurement's PSF-fit seeds became noise-relative
-(`measurement.detectionSigma`, calibrated to 20 on 368 external frames) and
-the fitter gained the reference's adaptive sampling region plus the
-inner-region acceptance rule. Both were graded against the external log by
-`examples/weight_audit` + `docs/superpowers/research/scripts/
-weight_audit_compare.py`: 10 PASS / 12 MISS against the baseline's 7/15, the
-minimum per-channel PSF-signal-weight Spearman up from 0.435 to 0.683, and
-both top-20 frame rankings agreeing with the reference. Report:
-`.superpowers/sdd/2026-09-10-stacking-m4a-plan-quality/task-2-report.md`.
+M4a (plan `docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`, rulings R-M4a-1…19): noise-relative measurement seeds (`measurement.detectionSigma`, calibrated to 20 on 368 external frames) with the reference's adaptive region and inner-region acceptance; the linear-fit rejection on the minimum-absolute-deviation line; the two-pass registration-reference pick; the LN row-evaluator weight table and borrowed reference planes; the XISF reader fixes; `PSF_FIT_VERSION` in both artifact hashes. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4a-acceptance-run.md`, run 13 on LDN 1272, 56 min): mono meets every target (fits 1.02/1.05/0.82 of the external tool's, PSFSW ρ 0.92, top-20 18/20, drizzle ratio equal to the external's to 0.6 %); rejected fractions 2.985 % / 2.733 % at the Auto 5.0/3.5 with `LINEAR_FIT_SIGMA_SCALE` left at 1.0; the two-pass pick switched the reference to the frame the owner had pinned by hand (`_0073`); LN 368/368 with no exclusions (the R-M4a-15 recompute confirmed against M2's numbers). Two residuals, both OSC, recorded below.
 
-- **LN sidecars recompute once, and Task 7 must re-measure what they contain.**
-  `stacking/ln/scale.rs` fits its matched stars through the same `fit_stars` /
-  `FitParams::default()` the measurement uses, so the region change moved
-  local normalization's PSF-flux scale too. `PSF_FIT_VERSION` (ruling
-  R-M4a-15) is folded into both `measurement_subtree` and
-  `normalization_subtree`, so every cached `.athln` and every cached measure
-  artifact is invalidated exactly once and rebuilt — that part is automatic
-  and needs no hand check. What needs one: Task 7's acceptance run has to
-  re-measure LN's matched-star counts (`ln_matches`) and its exclusions
-  against the M2 acceptance numbers — 368/368 sidecars written, no frame
-  excluded for "fewer than 20 matched stars". A quieter fitter could push a
-  marginal frame under that floor, and the M2 run is the only baseline that
-  would show it.
-- The OSC group's bright, undersampled night (measured FWHM 1.55 px) still
-  yields 3.8-6.9× the reference's fit count; two bounded experiments with a
+- **Residual (OSC weights):** the bright, undersampled night (measured FWHM 1.55 px)
+  still yields 3.8–7× the reference's fit count (run 13: OSC PSFSW ρ 0.93/0.82/0.68 against ≥ 0.90; top-20 15/20 passes; the M3 night inversion is gone); two bounded experiments with a
   3×3 median pre-filter on the detection image (rulings R-M4a-13/-14, the
   option ships off) closed ~20 % of it and cost the blue channel's weight
   correlation. Closing it properly needs the rest of the reference's
@@ -236,6 +215,27 @@ both top-20 frame rankings agreeing with the reference. Report:
   `sync::ingest_tests::ingest_releases_conn_between_frames` (a
   self-documented timing probe).
 
+- **Residual (OSC drizzle):** the G/B drizzled/undrizzled FWHM ratio is 0.836 / 0.819 against
+  the external tool's 0.744 / 0.737 under the same (new) estimator — +12 / +11 %, the M3 residual
+  unchanged in kind; the weight change moved it by ≈ +1 %. Ruled out so far: rejection strength,
+  level conventions, registration distortion, weights. M4c: a common-subset drizzle with both weight
+  sets and a star-by-star comparison across magnitudes (the external R plane is its own outlier, ecc 0.41).
+- **Integrate stage cost (ruling R-M4a-17):** run 13's Integrate took 10.85 min for both groups against
+  run 11's clean 5.01 (2.2×, at the revisit threshold) — measured while the controller's own comparison
+  scripts ran on the same machine, so an upper bound; the mono group alone was 1.7×. The hybrid option
+  (the robust line on the first rejection iteration, least squares afterwards) is the recorded fallback if a
+  clean re-measurement exceeds 2×.
+- **Owed:** the owner's own click-through on the desktop build of the Measure panel's `Detection threshold (σ)`
+  field, the Reference panel's `Two-pass pick` checkbox and the results card's `switched from #… (two-pass)` line
+  (the acceptance verified them through the LAN browser's accessible text only — the narrow viewport refused
+  screenshots again).
+- **Owed:** one M4a run on Windows and one on Linux (the web build) — the two-pass dry pass and the `.rej`
+  sink condition are the platform-neutral parts; nothing platform-specific was added, but the suite's two
+  load flakes (below) are worth watching there.
+- **Release-note lines owed** (drafted in the acceptance note §10): noise-relative star detection for frame
+  weighting with the new `Detection threshold (σ)` setting, the two-pass reference pick, the robust linear-fit
+  rejection (rejects ≈ 3 % at the default thresholds, like the reference), the faster local normalization.
+
 ### Stacking M3 — drizzle (2026-09-10)
 
 M3 (drizzle 1×/2×/3× with exact-clipping square drops or tabulated circle/
@@ -249,43 +249,13 @@ drizzled/undrizzled FWHM ratio equals the external reference's to 0.05 %; the
 OSC master now matches the external one in level and background shape after
 Task 8. Two misses/gaps recorded below.
 
-- **M4 item (first): the OSC PSF Signal Weight sky penalty.** Per-frame
-  weights against the external tool's: mono Spearman 0.92 (top-20 overlap
-  18/20), OSC 0.77 (1/20) — the bright-sky/dark-sky night order is inverted on
-  OSC (ours 0.80 / 0.71, theirs 0.73 / 0.82; a near tie between a sharp bright
-  night and a soft dark one, decided oppositely). Task 8's `w / sqrt(bg)` rule
-  makes the normalization anchor and the LN-reference members robust to it;
-  the integration weights themselves are still ours. Audit the noise/flux
-  terms on debayered frames against the external per-frame values.
-  → M4a Task 2 (landed `f37fea8a`) — noise-relative measurement seeds
-  address the root cause (ruling R-M4a-1); the residual is tracked in the
-  Stacking M4a section above. NOT deleted here — Task 7's acceptance run
-  confirms it.
 - **M4 item: the OSC drizzle is ≈ 10 % broader than the external one by the
-  fitted FWHM** (G/B ratios 0.83 / 0.82 vs 0.75 / 0.74) while the same bright
+  fitted FWHM** (G/B ratios 0.83 / 0.82 vs 0.75 / 0.74; re-measured under the M4a estimator in run 13: 0.836 / 0.819 vs 0.744 / 0.737 — see the M4a section) while the same bright
   stars' half-maximum radii are 4 % smaller in ours and our drizzle carries
   26 % less pixel-scale noise at equal master noise. Ruled out: rejection
   strength, level conventions, registration distortion (polynomial3 changed
   nothing). Compare star by star across magnitudes; drizzle a common subset
   with both weight sets.
-- **M4 item: two-pass registration-reference pick.** A best-by-weight
-  reference whose rotation/offset deviates from the set's median rotates the
-  whole master and loses corners; after a first registration, re-pick among
-  the top frames the one closest to the median transform and re-register
-  (≈ 1–2 min). Task 8's 97 % coverage filter protects the normalization
-  anchor and the LN members only.
-  → M4a Task 4 (landed `829f255c`, rulings R-M4a-5/6/18) — shipped as
-  described. NOT deleted here — Task 7's acceptance run confirms it.
-- **M4 item: `measure_probe`'s XISF branch is unreliable** — it disagrees with
-  the raw Float32 attachment on every external file tried (mono drizzle 4.35
-  vs 4.95 px). Select the integration `<Image>` explicitly and verify the plane
-  layout, or drop the branch; the acceptance note's numbers all come from
-  FITS conversions of the raw attachments.
-  → M4a Task 1 (landed `c20d7676`, ruling R-M4a-11) — the reader fix
-  ships (largest `<Image>` wins, `byteOrder`/`bounds` honoured); the two
-  probes' own `Float32` arm never dividing by 65535 was the actual bug,
-  fixed in `examples/measure_probe.rs` and `examples/weight_audit.rs`. NOT
-  deleted here — Task 7's acceptance run confirms it.
 - **Provisional constant:** `DRIZZLE_SECONDS_PER_PLANE_AT_2X = 1.2` in
   `stageSummary.ts` measured 1.17 s (mono) / 1.33 s (OSC per plane) on a
   clean 16 GB machine — keep; revisit with the M4 performance work.
@@ -323,17 +293,6 @@ misses, both recorded below.
   `PreparedReferenceChannel` so it now runs once per group, not once per
   frame — the per-frame PSF cost roughly halves. Re-measure this stage's
   wall time in M3's acceptance run.
-- **M4 follow-up: the linear-fit rejection dispersion is ≈ 1.4× the
-  external reference's.** Run 6 (LN both sides, linear fit 5.0/3.5) rejected
-  0.83 % (mono) / 0.74 % (OSC) where the external reference rejects
-  2.5–2.8 % with the same nominal thresholds; run 7 (identical inputs,
-  3.5/2.5) landed at 2.91 % / 2.67 % — the same numbers the external gets at
-  5.0/3.5. The under-rejection carried since M1 is therefore a dispersion
-  calibration of `2·adev·sqrt(1+b²)`, not an LN or reference problem. M4
-  calibrates the estimate so the shipped 5.0/3.5 reproduces ≈ 2.8 %.
-  → M4a Task 3 (landed `b931d657`) — the robust minimum-absolute-deviation
-  line ships with `LINEAR_FIT_SIGMA_SCALE = 1.0`; the calibration round
-  itself is Task 7's acceptance run. NOT deleted here — Task 7 confirms it.
 - **Owed:** the owner's own click-through of the LN block on the desktop
   build (Enable local normalization, scale, reference frames, the `local`
   rejection-normalization option and its 5 s reset notice, `LN: n/m frames`
@@ -360,17 +319,6 @@ misses, both recorded below.
   cluster's own precedent) naming a group whose members' implied pixel
   scales differ beyond the registration gate's tolerance, from `f.focallen`
   and a new pixel-size column in `load_group_members` (`stacking/groups.rs`).
-- **M4 performance items (no code, report recommendation 6):**
-  `LnGrid::evaluate_row_into` recomputes the B-spline weights per output
-  pixel even though `fx = (x mod stride)/stride` only ever takes `stride`
-  distinct values (a power of two) — a `stride`-entry weight table
-  (128 × 4 f32 ≈ 2 KB) removes that per-pixel recomputation from the band
-  loop. `LnReferenceForDetection::build` clones every reference plane
-  unconditionally (`plane.clone()`, even when the plane is already fully
-  finite — the normal case for an integration output) — a `Cow` there gives
-  back ≈ 104 MB per channel on the acceptance geometry, on the machine the
-  LN-stage-time miss above already identifies as memory-bound.
-
 ### Stacking M2 — camera-agnostic grouping (2026-09-10)
 
 M2 Task 10 (owner decision 2026-09-10): groups are now keyed by colour
