@@ -463,6 +463,75 @@ mod tests {
         assert_eq!(r.rejected, 500 + bulk_rejected);
     }
 
+    /// M4c Task 1: `integration::combine` carries a SECOND implementation of
+    /// this module's `erfc`, `erfinv` and `rcr` — the integration tree is
+    /// ungated and cannot import `stacking`, which is gated behind
+    /// `render + solver`. Hold the two copies to the same answers so they
+    /// cannot drift apart silently: the error functions bit-for-bit, and the
+    /// RCR rejection over 50 random contaminated samples (reached through
+    /// the public weighted combiner, whose survivor mask names exactly the
+    /// samples the pixel-stack routine kept).
+    #[test]
+    fn integration_copies_agree_with_this_module() {
+        use crate::integration::combine::{
+            combine_pixel_weighted, mask_get, mask_words, IntegrationRecipe, Rejection,
+        };
+        use crate::integration::student_t;
+
+        for i in -500..=500 {
+            let x = i as f64 / 100.0;
+            assert_eq!(
+                erfc(x).to_bits(),
+                student_t::erfc(x).to_bits(),
+                "erfc({x}): {} vs {}",
+                erfc(x),
+                student_t::erfc(x)
+            );
+        }
+        for i in -99..=99 {
+            let x = i as f64 / 100.0;
+            assert_eq!(
+                erfinv(x).to_bits(),
+                student_t::erfinv(x).to_bits(),
+                "erfinv({x}): {} vs {}",
+                erfinv(x),
+                student_t::erfinv(x)
+            );
+        }
+
+        let limit = 0.5;
+        let mut scratch: Vec<f32> = Vec::new();
+        for seed in 0..50u64 {
+            // A clean Gaussian plus four distinct planted outliers. The
+            // values come from an f32 buffer, so the f64 sample this module
+            // takes and the f32 sample the pixel path takes are the same
+            // number — any disagreement is the algorithm, not the width.
+            let mut values = gaussian(60, 1000 + seed);
+            for k in 0..4 {
+                values.push(6.0 + 0.5 * k as f64 + 0.01 * seed as f64);
+            }
+            let n = values.len();
+            let mine = rcr(&values, limit);
+
+            let out: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+            let mut work: Vec<(f32, u16)> =
+                out.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
+            let weights = vec![1.0f32; n];
+            let mut mask = vec![0u64; mask_words(n)];
+            let (_, rejected) = combine_pixel_weighted(
+                &mut work,
+                &out,
+                &weights,
+                IntegrationRecipe::average(Rejection::Rcr { limit }),
+                &mut mask,
+                &mut scratch,
+            );
+            let theirs: Vec<bool> = (0..n).map(|i| mask_get(&mask, i)).collect();
+            assert_eq!(rejected, mine.rejected, "seed {seed}: rejected count");
+            assert_eq!(theirs, mine.kept, "seed {seed}: survivor set");
+        }
+    }
+
     #[test]
     fn winsorize_replaces_rejects_with_the_nearest_survivor_extreme() {
         let v = [1.0, 2.0, 3.0, 4.0, 5.0, 100.0, -50.0];
