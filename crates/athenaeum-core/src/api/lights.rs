@@ -256,8 +256,12 @@ pub(crate) fn compute_export_readiness(
 /// excluded, blocked a run that would never touch it). `light_frame_ids` is
 /// trusted to already be LIGHT frame ids belonging to `set_id` — both
 /// callers derive it that way (`compute_export_readiness`'s whole-set list
-/// above, `build_plan`'s membership minus its exclusions); duplicates are
-/// harmless, everything below dedupes by frame/path id.
+/// above, `build_plan`'s membership minus its exclusions) — and to be
+/// DUPLICATE-FREE: both derive it from a `SELECT DISTINCT` over a
+/// membership where one frame belongs to exactly one group, so no id can
+/// appear twice. That matters because only the master/raw-set maps below
+/// dedupe (by set and by resolved path); `total` and `unlinked_lights` are
+/// plain per-id counters and a repeated id would simply be counted twice.
 pub(crate) fn compute_export_readiness_for_frames(
     conn: &Connection,
     set_id: i64,

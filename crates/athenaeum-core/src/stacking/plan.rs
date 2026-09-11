@@ -740,18 +740,26 @@ fn included_median_scale(g: &IntegrationGroup, excluded: &HashSet<i64>) -> Optio
     }
 }
 
-/// M4b ruling R-T6-7: the scale [`PlanGroup.pixel_scale_arcsec`] and every
-/// pixel-scale warning/ratio actually use — [`included_median_scale`] when
+/// M4b ruling R-T6-7: the scale [`PlanGroup.pixel_scale_arcsec`] and the
+/// stored `scale_ratio_to_reference` use — [`included_median_scale`] when
 /// the group has at least one included member with a scale, else the
 /// group's own all-member median ([`IntegrationGroup::pixel_scale_arcsec`],
 /// `groups.rs`) so a FULLY excluded group still shows something in the
-/// Scale column rather than a bare `None`. A fully excluded group never
-/// drives a warning either way — `build_plan`'s "mixes pixel scales" check
-/// already only looks at included members, and this group can never win
-/// [`largest_group_scale`]'s ranking (zero included members), so the only
-/// way this fallback value is even seen is the Scale column itself.
-fn group_display_scale(g: &IntegrationGroup, excluded: &HashSet<i64>) -> Option<f64> {
-    included_median_scale(g, excluded).or(g.pixel_scale_arcsec)
+/// Scale column rather than a bare `None`.
+///
+/// The returned flag says WHICH of the two it is, because they may not be
+/// used for the same things (ruling R-FR-1): only an included-member scale
+/// speaks for frames a run would actually touch, so only it may drive the
+/// far-from-reference warning. A fully excluded group keeps its Scale
+/// column value and its ratio and says nothing — matching `build_plan`'s
+/// "mixes pixel scales" check, which has only ever looked at included
+/// members, and [`largest_group_scale`]'s ranking, which skips a group
+/// with zero included members outright.
+fn group_display_scale(g: &IntegrationGroup, excluded: &HashSet<i64>) -> (Option<f64>, bool) {
+    match included_median_scale(g, excluded) {
+        Some(scale) => (Some(scale), true),
+        None => (g.pixel_scale_arcsec, false),
+    }
 }
 
 /// M4b ruling R-T1-1's second-choice fallback (no previous run at all): the
@@ -1377,11 +1385,16 @@ pub fn build_plan(
     // `IntegrationGroup::pixel_scale_arcsec`.
     let mut group_scale_ratios: HashMap<String, f64> = HashMap::new();
     for g in &groups {
-        let scale_ratio = group_display_scale(g, &excluded_set)
+        let (display_scale, from_included) = group_display_scale(g, &excluded_set);
+        let scale_ratio = display_scale
             .zip(reference_scale.filter(|&r| r > 0.0))
             .map(|(group_scale, ref_scale)| (group_scale, ref_scale, group_scale / ref_scale));
         if let Some((group_scale, ref_scale, ratio)) = scale_ratio {
-            if ratio > SCALE_TOLERANCE || ratio < 1.0 / SCALE_TOLERANCE {
+            // R-FR-1: the ratio and the Scale column are reported for every
+            // group, the WARNING only for one that still has an included
+            // member with a scale of its own — a fully excluded group's
+            // all-member fallback describes frames the run will never read.
+            if from_included && (ratio > SCALE_TOLERANCE || ratio < 1.0 / SCALE_TOLERANCE) {
                 warnings.push(format!(
                     "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the reference's {ref_scale:.2} \"/px; co-registered mode resamples it into the reference geometry, native mode keeps its own",
                     g.key
@@ -1722,8 +1735,9 @@ pub fn build_plan(
             anchor_width,
             anchor_height,
             // R-T6-7: included-only median, all-member fallback for a fully
-            // excluded group (`group_display_scale`'s own doc).
-            pixel_scale_arcsec: group_display_scale(g, &excluded_set),
+            // excluded group (`group_display_scale`'s own doc). The Scale
+            // column shows either; only the warning cares which (R-FR-1).
+            pixel_scale_arcsec: group_display_scale(g, &excluded_set).0,
             // Fix round 1: reused from `group_scale_ratios`, computed once
             // alongside the warning above — never recomputed here.
             scale_ratio_to_reference: group_scale_ratios.get(&g.key).copied(),
@@ -2117,6 +2131,103 @@ mod tests {
             "{:?}",
             ref_group.scale_ratio_to_reference
         );
+    }
+
+    /// Ruling R-FR-1 (final review): the sibling of the test above. A
+    /// group whose members are ALL manually excluded keeps its Scale
+    /// column value and its `scaleRatioToReference` — both fall back to
+    /// the group's own all-member median (R-T6-7) — but drives no
+    /// far-from-reference warning: that fallback describes frames the run
+    /// will never read.
+    #[test]
+    fn scale_warning_skips_a_fully_excluded_group() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ref_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("ref{i}");
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec_written(&stem, t));
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            ref_ids.push(id);
+        }
+        let mut other_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("other{i}");
+            let mut spec = light_spec(&stem, t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
+            other_ids.push(id);
+        }
+        let mut all_ids = ref_ids.clone();
+        all_ids.extend(&other_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        set_frame_set_reference(&f.conn, f.set_id, ref_ids[0]).unwrap();
+        let settings = SettingsManager::new();
+
+        // Premise: with the Ha group included, the warning fires.
+        let plan_all = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            plan_all.warnings.iter().any(|w| w.contains("\u{d7}2.0")),
+            "sanity: an INCLUDED group at 2x must warn: {:?}",
+            plan_all.warnings
+        );
+
+        // Now exclude every member of it.
+        set_set_config(&f.conn, f.set_id, "{}", &other_ids).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("\u{d7}2.0")),
+            "a fully excluded group must not warn: {:?}",
+            plan.warnings
+        );
+        let other_group = plan
+            .groups
+            .iter()
+            .find(|g| g.key.contains("Ha"))
+            .expect("the Ha group is still planned, just fully excluded");
+        assert_eq!(other_group.included_count, 0);
+        assert_eq!(
+            other_group.pixel_scale_arcsec,
+            Some(1.55),
+            "the Scale column still shows the all-member median"
+        );
+        let ratio = other_group
+            .scale_ratio_to_reference
+            .expect("and so does the ratio");
+        assert!((ratio - 1.55 / 0.78).abs() < 1e-9, "{ratio}");
     }
 
     /// M4b ruling R-T1-1, fix round 1: `Auto` reference mode (the default)

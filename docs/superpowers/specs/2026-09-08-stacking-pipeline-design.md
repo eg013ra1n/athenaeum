@@ -234,10 +234,21 @@ Three mechanisms carry it: every `GroupFrame` learns its pixel scale (§2)
 and the plan gate turns a scale spread into a named WARNING, never a
 blocker; registration's scale gate becomes per frame, centred on the frame's
 own implied ratio to its reference (§3.6); and, when both frames carry a
-stored plate solve, the alignment is SEEDED from the two WCS solutions
-(subject pixel → sky → reference pixel over a grid, an affine fit) and only
-refined with star pairs — quad matching, scale-invariant by construction,
-stays the seed whenever a solve is missing.
+stored plate solve, a seed built from the two WCS solutions (subject pixel →
+sky → reference pixel over a grid, an affine fit) is available to the
+aligner.
+
+**Which seed leads is decided per frame, and it is not the WCS one by
+default.** Quad matching — scale-invariant by construction — LEADS unless
+the frame's implied scale ratio to its reference differs from 1 by more than
+`WCS_SEED_RATIO_EPS` (5 %; within-rig solve-to-solve jitter reaches 1.6 % on
+real data, so a tighter trigger would put ordinary same-scale frames on the
+WCS path — R-T2-1/R-T6-4). When both frames are solved the plate-solve seed
+is built regardless of the ratio and serves as the FALLBACK: a quad-seed
+failure (`NoSeed`, too few correspondences, RANSAC/refit below
+`MIN_INLIERS`) gets one turn through it rather than costing the frame
+(R-T6-9). Whichever seed ships the alignment is recorded on the row — `+wcs`
+in `registration_results.model` when it was the plate-solve one.
 
 Rulings (M4b plan header, `docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`):
 
@@ -275,7 +286,8 @@ Rulings (M4b plan header, `docs/superpowers/plans/2026-09-10-stacking-m4b-plan-m
   records which one shipped; `registration_results` does not change shape —
   the seed kind rides `transform_json`'s sibling `model` string as a `+wcs`
   suffix (e.g. `homography+polynomial3+wcs`) so the frames table can show it
-  without a column.
+  without a column. [Superseded in part by R-T2-1/R-T6-4/R-T6-9 below: the
+  hint is first only above the 5 % ratio; otherwise it is the fallback.]
 
 - **R-M4b-4 Two modes, one config field.** `registration.geometry:
   "coRegistered" | "native"` (`RegistrationConfig.geometry:
@@ -332,6 +344,32 @@ refine it two-pass. `SummaryGroup.reference_frame_id` is filled only for a
 group that stage 5 actually registered — a group below the 3-frame
 viability floor never warped anything onto its resolved reference, so it
 reports `None`.
+
+**Ruling R-T2-1/R-T6-4 (the WCS-seed trigger is a ratio, with a measured
+tolerance).** Whether the plate-solve seed LEADS is decided by the frame's
+implied scale ratio `r` to its reference, never by comparing the resulting
+gate window against a constant: `r` is a quotient of two MEASURED scales
+(`pixel_scale_arcsec` prefers the stored solve), so an exact comparison puts
+every same-rig frame on the seed path. The seed leads when `|r − 1| >
+WCS_SEED_RATIO_EPS = 0.05` — ≈ 3× above the within-rig jitter measured on
+the owner's catalog (p50 1e-4–3e-4, tails to 1.6 %, nothing beyond 5e-2 in
+1 781 solved lights) and 5× below the `SCALE_TOLERANCE` step (1.25) that
+defines a foreign scale at all. `scale_gate_for` and the trigger read one
+`scale_ratio_for`, so they cannot disagree about `r`.
+
+**Ruling R-T6-9 (the plate-solve seed is also the quad seed's fallback).**
+Below that 5 % ratio the M1 order runs untouched — quad seed, same pairing,
+same RANSAC, same error messages — but when both frames are solved the seed
+is built anyway and gets ONE turn if the quad path fails (`NoSeed`, too few
+correspondences, RANSAC/refit below `MIN_INLIERS`), with the warning `quad
+seed failed (<why>); plate-solve seed used` and `+wcs` on the row. A retry
+that also fails leaves the quad path's verdict standing, so a frame that
+fails both ways reports the message it always did; a frame with no solve on
+either side keeps the M1 path with no fallback at all. The acceptance case:
+an H-alpha field against an O-filter reference of the SAME rig shares too
+few stars for the quad matcher — set 195 run 16 lost 14 of 30 448-mm H
+frames to "only 0 inliers", each carrying 456–465 matched stars in its own
+solve; run 20 on the fallback build aligned 30 of 30, the 14 through `+wcs`.
 
 ## 4. Measurement, weights, selection
 

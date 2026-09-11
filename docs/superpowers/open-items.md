@@ -224,6 +224,9 @@ seeded row's registration model.
 - **Deferred (final review, R-T6-9 re-review):** a solved reference frame that needs fresh registration
   builds one wasted `seed_from_solves`; when quads partially succeed, drop below `MIN_INLIERS`, and the
   hint fails to confirm too, no warning records the hint attempt.
+- **Deferred (final review):** the Stacking tab now shows two differently-scoped `Scale` columns — the
+  groups table's is the group's PIXEL scale in "/px (R-M4b-7), the frames table's is each frame's LN
+  RELATIVE scale — told apart only by their header tooltips; one of the two wants a clearer name.
 - **Owed (owner):** own look at the masters of a real mixed-scale set in both modes —
   the Ghost Nebula (set 195, ×1.27 within one group — masters `Ghost_Nebula_QHY_{H,O}_mono_300s_*`),
   M 78 (set 108, bin 1 + bin 2 — `M_78_L_mono_*`), and the ×7 / ×4.8 set 166 — and the desktop click-through of the Geometry radio, the
@@ -242,7 +245,10 @@ seeded row's registration model.
 - **Deferred (final review):** in native mode one group's `reference_stars` failure
   fails the whole run, consistent with stage 5's existing policy but a new blast
   radius since groups are otherwise independent — real data (Task 6) decides whether
-  it needs a per-group `fail_group` path.
+  it needs a per-group `fail_group` path. The same whole-run failure applies to
+  `resolve_group_geometry`'s per-group `frame_calibration_hash` at stage 4: one
+  group's unresolvable hash takes the run down with it, for the same reason and with
+  the same fix if one is wanted.
 - **Deferred (final review):** `run.rs` is ≈ 13 000 lines after M4b — a
   `stacking/register_stage.rs` extraction is due before M4c adds to stage 5.
 - **Deferred (final review):** `GroupsTable.tsx` hand-mirrors `SCALE_TOLERANCE = 1.25`.
