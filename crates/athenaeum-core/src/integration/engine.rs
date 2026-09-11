@@ -457,6 +457,17 @@ pub type LocalNormRow<'a> = dyn FnMut(usize, &mut [f32], &mut [f32]) + 'a;
 /// single shared `Fn` + `Mutex<LnScratch>` would.
 pub type LocalNormRowFactory<'a> = dyn Fn() -> Box<LocalNormRow<'a>> + Sync + 'a;
 
+/// One rayon WORKER's own state for `integrate_stack`'s band loop, built by
+/// `init_row_state` and reused across every row that worker handles in the
+/// band (`for_each_init`'s contract): the per-frame local-normalization
+/// evaluators with their row buffers (M2, fix round 1 items 2 + 3), and
+/// (M4c Task 3, fix round 1) the forced-rejection row cache — `n` row
+/// pointers refilled once per row, empty when no forced source is present.
+type RowState<'f, 'p> = (
+    Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)>,
+    Vec<Option<&'p [u64]>>,
+);
+
 /// Per-frame inputs of the stacking path, all indexed by the source's frame order.
 pub struct StackParams<'a, 'f> {
     /// Rejection-normalization pair per frame (applied to the working copy).
@@ -745,11 +756,24 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         // sharing one evaluator across workers, is what removes the need
         // for any lock on the hot path (a shared `Fn` + `Mutex<LnScratch>`
         // serialized every worker through one frame's scratch buffer).
-        let init_local_state = || -> Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)> {
-            local_factories
-                .iter()
-                .map(|&(i, factory)| (i, factory(), vec![0f32; width], vec![0f32; width]))
-                .collect()
+        // M4c Task 3, fix round 1 (m3): the per-worker state now also
+        // carries the forced-rejection row cache — `n` row pointers, filled
+        // once per ROW and read per (pixel, frame), allocated here with the
+        // rest of the worker's state instead of once per row. Empty (no
+        // allocation at all) when no forced source is present, which is
+        // every first-pass caller.
+        let init_row_state = || -> RowState<'f, 'p> {
+            (
+                local_factories
+                    .iter()
+                    .map(|&(i, factory)| (i, factory(), vec![0f32; width], vec![0f32; width]))
+                    .collect(),
+                if params.forced_rejection.is_some() {
+                    vec![None; n]
+                } else {
+                    Vec::new()
+                },
+            )
         };
         // M3 Task 2: the whole per-row body, factored out so it can be
         // called from either of the two zip chains below (one with a 4th
@@ -769,7 +793,8 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             low_row: &mut [f32],
                             high_row: &mut [f32],
                             mut bits_row: Option<&mut [u64]>,
-                            local_state: &mut Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)>| {
+                            row_state: &mut RowState<'f, 'p>| {
+                let (local_state, forced_rows) = row_state;
                 // Per-worker scratch, allocated once per ROW (not per pixel):
                 // `work`/`out_vals`/`mask` feed `combine_pixel_weighted`,
                 // `scratch` is its own reused survivor-value buffer (Task 1
@@ -813,15 +838,18 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                 // per frame per row — never once per (pixel, frame), which
                 // on a real stack would be billions of `&dyn` calls per
                 // plane (see `RejectionBitSource::forced_row`'s own doc).
+                // Fix round 1 (m3): into the worker's OWN buffer (allocated
+                // by `init_row_state`), not a fresh `Vec` per row.
                 // `has_forced` stays false for every caller that passes no
                 // source, and the per-pixel test below is then a `bool &&`
                 // the compiler folds away — the `None` path's instructions,
                 // and therefore its byte-identical output, are unchanged.
-                let forced_rows: Vec<Option<&[u64]>> = match params.forced_rejection {
-                    Some(src) => (0..n).map(|i| src.forced_row(i, y_abs)).collect(),
-                    None => Vec::new(),
-                };
                 let has_forced = !forced_rows.is_empty();
+                if let Some(src) = params.forced_rejection {
+                    for (i, slot) in forced_rows.iter_mut().enumerate() {
+                        *slot = src.forced_row(i, y_abs);
+                    }
+                }
                 for (x, out_px) in out_row.iter_mut().enumerate() {
                     work.clear();
                     combine::mask_clear(&mut mask);
@@ -1119,9 +1147,9 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                     .zip(band_bits.par_chunks_mut(n * bit_words))
                     .enumerate()
                     .for_each_init(
-                        init_local_state,
-                        |local_state, (row_in_band, (((out_row, low_row), high_row), bits_row))| {
-                            process_row(row_in_band, out_row, low_row, high_row, Some(bits_row), local_state);
+                        init_row_state,
+                        |row_state, (row_in_band, (((out_row, low_row), high_row), bits_row))| {
+                            process_row(row_in_band, out_row, low_row, high_row, Some(bits_row), row_state);
                         },
                     );
                 sink.record_band(y0, rows, &band_bits)?;
@@ -1132,8 +1160,8 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                     .zip(low_band.par_chunks_mut(width))
                     .zip(high_band.par_chunks_mut(width))
                     .enumerate()
-                    .for_each_init(init_local_state, |local_state, (row_in_band, ((out_row, low_row), high_row))| {
-                        process_row(row_in_band, out_row, low_row, high_row, None, local_state);
+                    .for_each_init(init_row_state, |row_state, (row_in_band, ((out_row, low_row), high_row))| {
+                        process_row(row_in_band, out_row, low_row, high_row, None, row_state);
                     });
             }
         }
@@ -2708,6 +2736,88 @@ mod tests {
             out.base.rejected_fraction, 0.0,
             "a forced rejection is not an ALGORITHM rejection"
         );
+    }
+
+    /// Fix round 1 (m2): the forced source is asked for ABSOLUTE image
+    /// rows, so a bit in the SECOND band must land on the row it names. A
+    /// tiny band budget forces several bands (the same shape
+    /// `rejection_maps_land_on_the_right_global_rows_across_bands` and the
+    /// sink test use), and the forced bit sits at row 40 — well past the
+    /// first band. A band-relative row would have hit row 40 of some later
+    /// band's chunk, i.e. a different output pixel entirely.
+    #[test]
+    fn forced_rejection_lands_on_the_right_absolute_row_across_bands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 64usize);
+        let (fx, fy) = (7usize, 40usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 0.10),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.40),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.20),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 3];
+        let weights = vec![1.0f32; 3];
+        let forced = ListSource::new(3, w, h, &[(1, fx, fy)]);
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: true,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: None,
+            forced_rejection: Some(&forced),
+        };
+        let out = integrate_stack(
+            &src,
+            &params,
+            IntegrationRecipe::average(Rejection::None),
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(4096),
+        )
+        .unwrap();
+        assert!(
+            out.base.bands >= 2,
+            "expected a multi-band run, got {}",
+            out.base.bands
+        );
+        let mean_of_two = (0.10 + 0.20) / 2.0;
+        let mean_of_three = (0.10 + 0.40 + 0.20) / 3.0;
+        assert!(
+            (out.base.data[fy * w + fx] - mean_of_two).abs() < 1e-6,
+            "the forced pixel ({fx}, {fy}) is the mean of frames 0 and 2, got {}",
+            out.base.data[fy * w + fx]
+        );
+        for y in 0..h {
+            for x in 0..w {
+                if (x, y) == (fx, fy) {
+                    continue;
+                }
+                assert!(
+                    (out.base.data[y * w + x] - mean_of_three).abs() < 1e-6,
+                    "pixel ({x}, {y}) must be untouched, got {}",
+                    out.base.data[y * w + x]
+                );
+            }
+        }
+        assert_eq!(out.rejection_high.as_ref().unwrap()[fy * w + fx], 1.0);
+        assert_eq!(
+            out.rejection_high
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|&&v| v != 0.0)
+                .count(),
+            1,
+            "exactly one pixel of the whole image carries a rejection"
+        );
+        assert_eq!(out.rejected_per_frame, vec![0, 1, 0]);
     }
 
     /// The forced samples must also reach the bitmap sink — so a `.rej`

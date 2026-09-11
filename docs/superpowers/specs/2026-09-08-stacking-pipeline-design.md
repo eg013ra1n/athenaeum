@@ -777,18 +777,27 @@ TWO passes:
    algorithm runs, the algorithm decides among what is left, and the forced
    samples count as rejections in the low/high maps and the per-frame
    counts (never in `rejected_fraction`, which stays algorithm-only —
-   same convention range rejection already has). Pass 2 writes no bitmaps
-   of its own. `GroupStats.largeScaleRejectedFraction` reports what the
-   processed bitmaps forced; it is `None` when the pass did not run.
+   same convention range rejection already has). Pass 2 writes its OWN
+   bitmap set, a freshly created one under
+   `rej/run-<id>/<group>/pass2/` (ruling R-T3-1) — never a rewrite of pass
+   1's files, whose band-level "nothing to write" skip trusts `create`'s
+   zero-fill and would leave pass 1's bits standing. Those bits are the
+   master's real rejected set: the forced structures plus whatever pass 2's
+   own tests rejected. `GroupStats.largeScaleRejectedFraction` reports what
+   the processed bitmaps forced; it is `None` when the pass did not run.
 
 `low`/`high` collapse into the single `enabled` (ruling R-M4c-4): the
 bitmap is one bit per pixel and does not carry which side a rejection fell
 on, so the side split is not a distinction this data can express, and a
 format bump to carry it would buy a difference no acceptance test can see.
-Cost: one more integration pass, plus one `.rejl` per included frame among
-the same per-run temporaries the `.rej` files live in (removed at the run's
-exit unless `output.cleanup = keepAll`). Drizzle, when both are on, reads
-the PROCESSED bits — the same set the master was built with.
+Cost: one more integration pass, plus one `.rejl` and one second-pass
+`.rej` per included frame among the same per-run temporaries the first
+pass's bitmaps live in (all under `rej/run-<id>`, removed at the run's exit
+unless `output.cleanup = keepAll`). Drizzle, when both are on, reads the
+SECOND pass's set — the same rejected set the master was built with; if
+that set is missing or incomplete, drizzle is skipped for the group rather
+than handed pass 1's bits, which describe the integration the second pass
+replaced.
 
 Auto (WBPP 3.0.1 as observed on the owner's data): n < 8 → percentile
 0.2/0.1; 8 ≤ n < 20 → Winsorized 4.0/3.0; n ≥ 20 → linear fit 5.0/3.5 —

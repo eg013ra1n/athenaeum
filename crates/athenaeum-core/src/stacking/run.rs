@@ -4542,6 +4542,39 @@ fn emit_integrate_tick(
 /// only ever increases, unlike Integrate's per-band ticks racing across
 /// worker threads. `Mutex` only because `DrizzleProgress::on_frame` must be
 /// `Sync` to satisfy the trait bound.
+/// Which per-frame rejection bitmaps the Drizzle stage reads (M4c Task 3,
+/// fix round 1, ruling R-T3-1): the bits the MASTER was built with, always.
+///
+/// With the large-scale second pass on, that is the SECOND pass's own set
+/// (`rej/run-<id>/<group>/pass2/…`, [`RejBitmapSet::second_pass_path`]) —
+/// the forced structures AND whatever pass 2's own per-pixel tests rejected,
+/// i.e. exactly the samples the returned master left out. Without it, the
+/// first pass's set is that record, unchanged from M3. The processed
+/// `.rejl` files are neither: they are the intermediate the forced set was
+/// derived FROM, and carry no algorithmic rejection at all.
+///
+/// `second_pass_rej_ok` false with the second pass having run means those
+/// files are missing or incomplete — the caller treats that as a bitmap
+/// failure and skips drizzle for the group rather than handing it pass 1's
+/// bits, which describe a different integration.
+fn drizzle_rejection_paths(
+    set: Option<&RejBitmapSet>,
+    included: usize,
+    second_pass_rej_ok: bool,
+) -> Vec<Option<PathBuf>> {
+    (0..included)
+        .map(|k| {
+            set.map(|s| {
+                if second_pass_rej_ok {
+                    s.second_pass_path(k)
+                } else {
+                    s.path(k).to_path_buf()
+                }
+            })
+        })
+        .collect()
+}
+
 struct DrizzleTickState {
     last_emit: Instant,
 }
@@ -5387,6 +5420,28 @@ fn process_group_output(
         ));
     }
 
+    // Fix round 1 (ruling R-T3-1): the second pass ran but left no usable
+    // bitmap set of its own, so nothing on disk describes THIS master's
+    // rejected samples — drizzle is skipped for the group rather than
+    // pointed at pass 1's bits, which describe the integration the second
+    // pass replaced. The master itself is untouched and already written.
+    if output.stats.large_scale_rejected_fraction.is_some()
+        && !output.second_pass_rej_ok
+        && rej_set_failure.is_none()
+    {
+        let msg = "the second pass's rejection bitmaps are unavailable".to_string();
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            error = %msg,
+            consumers = "drizzle",
+            "rejection bitmaps unavailable for this group"
+        );
+        rc.warnings
+            .push(format!("drizzle skipped for {}: {msg}", group.key));
+        rej_set_failure = Some(msg);
+    }
+
     let output_start = Instant::now();
 
     let group_reference_calibrated = members[reference_idx].calibrated.clone();
@@ -5674,32 +5729,14 @@ fn process_group_output(
                         .len())
                         .map(|k| (0..channels).map(|p| output.output_pairs[p][k]).collect())
                         .collect();
-                    // M4c Task 3 (ruling: drizzle reads the SAME bits the
-                    // master was built with): the PROCESSED `.rejl` set
-                    // when the large-scale second pass ran — those are the
-                    // samples the master actually forced out — and the raw
-                    // `.rej` set otherwise. Honest caveat, stated here
-                    // rather than discovered later: with the second pass on,
-                    // the master ALSO drops whatever that pass's own
-                    // per-pixel algorithm rejected, and those verdicts are
-                    // not written anywhere (the second pass runs without a
-                    // sink), so drizzle sees the forced structures but not
-                    // the second pass's speckle. Capturing both would cost
-                    // a second full bitmap set for a speckle-level
-                    // difference in the drizzled output.
-                    let drizzle_reads_processed =
-                        output.stats.large_scale_rejected_fraction.is_some();
-                    let rej_paths: Vec<Option<PathBuf>> = (0..output.included.len())
-                        .map(|k| {
-                            rej_set.as_ref().map(|s| {
-                                if drizzle_reads_processed {
-                                    s.processed_path(k)
-                                } else {
-                                    s.path(k).to_path_buf()
-                                }
-                            })
-                        })
-                        .collect();
+                    // M4c Task 3, fix round 1 (ruling R-T3-1): drizzle reads
+                    // exactly the bits the master was built with — see
+                    // `drizzle_rejection_paths`.
+                    let rej_paths = drizzle_rejection_paths(
+                        rej_set.as_ref(),
+                        output.included.len(),
+                        output.second_pass_rej_ok,
+                    );
                     let drizzle_frames: Vec<DrizzleFrame> = output
                         .included
                         .iter()
@@ -12094,6 +12131,135 @@ mod tests {
             assert!(
                 without.abs() < 0.02 && with.abs() < 0.02,
                 "row {y}: the core is rejected either way: {without} vs {with}"
+            );
+        }
+    }
+
+    /// Fix round 1 (ruling R-T3-1): WHICH bitmaps the Drizzle stage is
+    /// handed. With the large-scale second pass's own set present, its
+    /// files — the master's real rejected set; without it, the first
+    /// pass's, exactly as M3 did.
+    #[test]
+    fn drizzle_reads_the_second_passs_bitmaps_when_the_large_scale_pass_wrote_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let stems = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let set = crate::stacking::rej::RejBitmapSet::create(dir.path(), &stems, 32, 8, 1).unwrap();
+
+        let with_second = drizzle_rejection_paths(Some(&set), 3, true);
+        assert_eq!(with_second.len(), 3);
+        for (k, stem) in stems.iter().enumerate() {
+            let path = with_second[k].as_ref().expect("a path per frame");
+            assert_eq!(path, &set.second_pass_path(k));
+            assert_eq!(
+                path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()),
+                Some(crate::stacking::rej::SECOND_PASS_DIR),
+                "the second pass's own directory, not the first pass's"
+            );
+            assert_eq!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some(format!("{stem}.rej").as_str()),
+                "same stem as the first pass's file"
+            );
+        }
+
+        // M3's path, untouched: no second pass (or no usable set from it).
+        let without = drizzle_rejection_paths(Some(&set), 3, false);
+        for k in 0..3 {
+            assert_eq!(without[k].as_deref(), Some(set.path(k)));
+        }
+        // And no bitmaps at all when the run never made a set.
+        assert_eq!(drizzle_rejection_paths(None, 3, true), vec![None, None, None]);
+    }
+
+    /// Fix round 1 (ruling R-T3-1) end to end: drizzle and large-scale
+    /// rejection ON TOGETHER — the acceptance's own variant D. The run must
+    /// succeed, the second pass's bitmap set must be on disk (one file per
+    /// included frame, in `pass2/`, the same size as the first pass's), and
+    /// drizzle must have consumed it without being skipped: it opens every
+    /// path it is handed, so a drizzled master plus no skip warning is the
+    /// behavioural proof that those files are what it read.
+    #[test]
+    fn drizzle_and_large_scale_together_use_the_second_passs_bitmaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, _output) = seed_trail_group(&db_path, SET_NAME, 2);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.integration.rejection = RejectionChoice::PercentileClip {
+            low: 0.2,
+            high: 1.0,
+        };
+        cfg.integration.large_scale = LargeScaleRejection {
+            enabled: true,
+            protected_layers: 2,
+            growth: 2,
+        };
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.drizzle.use_rejection = true;
+        // KeepAll so the per-run bitmaps survive for this test to read.
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("the run should start");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        let drizzle_path = group
+            .drizzle_path
+            .clone()
+            .expect("drizzle ran with the second pass's bitmaps");
+        assert!(Path::new(&drizzle_path).exists(), "{drizzle_path}");
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("drizzle skipped")),
+            "drizzle must not have been skipped: {:?}",
+            summary.warnings
+        );
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let rej_dir = layout.rej_dir(started.run_id, &group.group_key);
+        let pass2 = rej_dir.join(crate::stacking::rej::SECOND_PASS_DIR);
+        let mut pass2_files: Vec<String> = std::fs::read_dir(&pass2)
+            .unwrap_or_else(|e| panic!("reading {pass2:?}: {e}"))
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        pass2_files.sort();
+        assert_eq!(
+            pass2_files.len(),
+            group.included_count as usize,
+            "one second-pass bitmap per included frame: {pass2_files:?}"
+        );
+        for name in &pass2_files {
+            let first = rej_dir.join(name);
+            assert!(first.exists(), "the first pass's sibling must exist too");
+            assert_eq!(
+                std::fs::metadata(pass2.join(name)).unwrap().len(),
+                std::fs::metadata(&first).unwrap().len(),
+                "both passes' sets have the same geometry, so the same file size"
             );
         }
     }

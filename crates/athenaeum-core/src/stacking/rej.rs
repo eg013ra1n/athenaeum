@@ -49,6 +49,10 @@ pub const REJ_MAGIC: &[u8; 8] = b"ATHREJ01";
 /// cost is a few megabytes, and refusing the feature outright on a machine
 /// that merely cannot report its RAM would be the worse answer.
 const UNKNOWN_RAM_FORCED_BUDGET_BYTES: u64 = 2_000_000_000;
+/// Subdirectory of a group's `rej/run-<id>/<group>/` holding the large-scale
+/// SECOND pass's own bitmaps (M4c Task 3 fix round 1, ruling R-T3-1) — see
+/// [`RejBitmapSet::second_pass_dir`].
+pub const SECOND_PASS_DIR: &str = "pass2";
 /// magic (8) + width + height + channels + words (4 × u32 = 16) = 24 bytes.
 const HEADER_LEN: u64 = 8 + 4 * 4;
 
@@ -262,6 +266,52 @@ impl RejBitmapSet {
     /// single exit path unless the user asked to keep everything).
     pub fn processed_path(&self, frame: usize) -> PathBuf {
         self.paths[frame].with_extension("rejl")
+    }
+
+    /// `<this set's dir>/pass2` — where the large-scale SECOND pass writes
+    /// its own bitmaps (M4c Task 3 fix round 1, ruling R-T3-1). A separate,
+    /// freshly-`create`d set rather than a rewrite of this one:
+    /// [`RejPlaneSink::record_band`] skips a frame with no bits in a band
+    /// on the strength of `create`'s zero-fill, so writing pass 2 over
+    /// pass 1's files would leave pass 1's bits standing wherever pass 2
+    /// had none. Inside `rej/run-<id>/…`, so the run's exit cleanup and
+    /// `work_usage`'s subtree walk take it with everything else.
+    pub fn second_pass_dir(&self) -> PathBuf {
+        self.dir.join(SECOND_PASS_DIR)
+    }
+
+    /// Frame `frame`'s file in the second-pass set — the SAME stem, in
+    /// [`Self::second_pass_dir`]. The one expression of that rule: the run
+    /// points drizzle at these paths, and `integrate_group` creates the set
+    /// they live in, without either restating the layout.
+    pub fn second_pass_path(&self, frame: usize) -> PathBuf {
+        self.second_pass_dir().join(
+            self.paths[frame]
+                .file_name()
+                .expect("a set's own path always has a file name"),
+        )
+    }
+
+    /// Creates the second-pass set: same stems, same geometry, fresh
+    /// zero-filled files in [`Self::second_pass_dir`].
+    pub fn create_second_pass(&self) -> Result<RejBitmapSet> {
+        let stems: Vec<String> = self
+            .paths
+            .iter()
+            .map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        RejBitmapSet::create(
+            &self.second_pass_dir(),
+            &stems,
+            self.width,
+            self.height,
+            self.channels,
+        )
     }
 
     /// The frame count this set was created for — `integrate_group` checks

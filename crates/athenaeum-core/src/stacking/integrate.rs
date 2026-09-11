@@ -412,6 +412,16 @@ pub struct GroupOutput {
     /// values it fed `StackParams::output`). Task 3's drizzle driver uses
     /// this as the ruling-R-M3-5 fallback pair for a frame with no LN grid.
     pub output_pairs: Vec<Vec<NormalizationPair>>,
+    /// M4c Task 3, fix round 1 (ruling R-T3-1): the large-scale SECOND pass
+    /// ran AND wrote a complete rejection-bitmap set of its own
+    /// ([`RejBitmapSet::second_pass_path`]). `true` is the ONLY state in
+    /// which those files describe the master this call returned — drizzle
+    /// reads them then, and nothing else (`stacking::run`); `false` covers
+    /// both "no second pass" (the pass-1 `.rej` set still describes the
+    /// master) and "the second pass ran but its own bitmaps are missing or
+    /// incomplete", which the run turns into a drizzle skip rather than
+    /// letting drizzle trust bits that describe a different integration.
+    pub second_pass_rej_ok: bool,
 }
 
 pub struct GroupProgress<'a> {
@@ -1022,6 +1032,7 @@ pub fn integrate_group(
     // I/O cost is folded into the group's totals below, so the group still
     // reports what the run actually paid.
     let mut large_scale_rejected_fraction: Option<f64> = None;
+    let mut second_pass_rej_ok = false;
     let mut pass_one_cost = (0u64, 0u64, 0u64);
     if passes > 1 {
         let rej_set = input
@@ -1065,10 +1076,33 @@ pub fn integrate_group(
                             on_combine: progress.engine.on_combine,
                         },
                     };
-                    // No sink on the second pass: the `.rej` files are pass
-                    // 1's own record, and the processed `.rejl` set is what
-                    // the master was actually built with (drizzle reads
-                    // that one — `stacking::run`).
+                    // Fix round 1, ruling R-T3-1: pass 2 gets a sink of its
+                    // OWN — a second, freshly-created set under
+                    // `rej/run-<id>/<group>/pass2/`. Its bits are the
+                    // master's real rejected set (the forced structures the
+                    // engine records as rejections, plus whatever pass 2's
+                    // own algorithm and range tests rejected), which is
+                    // what drizzle must see; the `.rejl` files stay as the
+                    // intermediate that produced the forced set. Never a
+                    // rewrite of pass 1's own files: `record_band` skips a
+                    // frame with no bits in a band, trusting `create`'s
+                    // zero-fill, so pass 1's bits would survive wherever
+                    // pass 2 had none. A create failure is not fatal — pass
+                    // 2 still runs and the master is still correct; only
+                    // drizzle loses its input, which `stacking::run` turns
+                    // into the same "drizzle skipped for this group"
+                    // degradation a pass-1 bitmap failure already gets.
+                    let second_set = match rej_set.create_second_pass() {
+                        Ok(set) => Some(set),
+                        Err(e) => {
+                            warn!(
+                                error = %format!("{e:#}"),
+                                "the second pass's rejection bitmaps could not be created; \
+                                 the master is unaffected"
+                            );
+                            None
+                        }
+                    };
                     let (second, pairs) = integrate_planes(
                         input,
                         &included,
@@ -1077,7 +1111,7 @@ pub fn integrate_group(
                         input.normalization.rejection,
                         input.normalization.local.enabled,
                         input.ln,
-                        None,
+                        second_set.as_ref(),
                         Some(&forced),
                         recipe,
                         input.integration.write_rejection_maps,
@@ -1086,6 +1120,20 @@ pub fn integrate_group(
                         &progress_pass2,
                         io,
                     )?;
+                    // A WRITE fault mid-pass-2 latches the same way pass
+                    // 1's does, and makes that set untrustworthy for the
+                    // same reason.
+                    second_pass_rej_ok = match second_set.as_ref().and_then(|s| s.failure()) {
+                        Some(reason) => {
+                            warn!(
+                                error = %reason,
+                                "the second pass's rejection bitmaps are incomplete; \
+                                 the master is unaffected"
+                            );
+                            false
+                        }
+                        None => second_set.is_some(),
+                    };
                     outputs = second;
                     output_pairs = pairs;
                     large_scale_rejected_fraction = Some(forced_fraction);
@@ -1256,6 +1304,7 @@ pub fn integrate_group(
         rejection_high,
         included,
         output_pairs,
+        second_pass_rej_ok,
         stats: GroupStats {
             frames: frames.len(),
             included: included_count,
@@ -2423,6 +2472,13 @@ mod tests {
         const SHOULDER_HIGH: std::ops::Range<usize> = 33..35;
         let dir = tempfile::tempdir().unwrap();
         let trail_idx = 3usize;
+        // Fix round 1 (ruling R-T3-1): one frame ALSO carries a lone hot
+        // pixel far from the trail — the per-pixel test rejects it in both
+        // passes, the large-scale filter erases it as speckle, so it is
+        // exactly the sample that separates "the forced set" from "the set
+        // the master was built with".
+        let hot_idx = 1usize;
+        let (hot_x, hot_y) = (10usize, 50usize);
         let paths: Vec<_> = (0..6)
             .map(|i| {
                 let mut d = vec![BASE; W * H];
@@ -2437,6 +2493,9 @@ mod tests {
                             d[y * W + x] = 0.12;
                         }
                     }
+                }
+                if i == hot_idx {
+                    d[hot_y * W + hot_x] = 0.9;
                 }
                 add_noise(&mut d, 0.0005, 7000 + i as u64);
                 let p = dir.path().join(format!("t{i}.fits"));
@@ -2550,6 +2609,60 @@ mod tests {
         assert!(
             (forced - expected).abs() < 1e-9,
             "forced fraction {forced} != {expected}"
+        );
+
+        // Fix round 1 (ruling R-T3-1): the SECOND pass writes a bitmap set
+        // of its own, and those bits are the master's real rejected set —
+        // the forced structures PLUS what pass 2's own algorithm rejected,
+        // which is what drizzle has to read. Checked three ways: it is a
+        // superset of the forced set, it carries the lone hot pixel the
+        // filter erased (so it is a STRICT superset — the distinction the
+        // ruling exists for), and every frame's own bit count matches the
+        // rejection `GroupStats` reports for that frame.
+        assert!(on.second_pass_rej_ok, "the second pass wrote its own set");
+        let mut second_total = 0u64;
+        for k in 0..6 {
+            let path = set.second_pass_path(k);
+            assert!(path.exists(), "missing second-pass bitmap: {path:?}");
+            let second = RejBitmap::read(&path, W, H, 1).unwrap();
+            let processed = RejBitmap::read(&set.processed_path(k), W, H, 1).unwrap();
+            for y in 0..H {
+                for x in 0..W {
+                    if processed.is_rejected(0, x, y) {
+                        assert!(
+                            second.is_rejected(0, x, y),
+                            "frame {k} ({x}, {y}): a forced sample must be recorded as rejected"
+                        );
+                    }
+                }
+            }
+            if k == hot_idx {
+                assert!(
+                    second.is_rejected(0, hot_x, hot_y),
+                    "the hot pixel is an ALGORITHM rejection of the second pass and must be recorded"
+                );
+                assert!(
+                    !processed.is_rejected(0, hot_x, hot_y),
+                    "…and the filter erased it, which is why the two sets differ"
+                );
+            }
+            // `rejected_fraction_per_frame` is that frame's rejected
+            // samples over its own samples; every sample here is finite
+            // (identity maps, one plane), so the denominator is `W · H`.
+            let reported = (on.stats.rejected_fraction_per_frame[k] * (W * H) as f64).round() as u64;
+            assert_eq!(
+                second.count(),
+                reported,
+                "frame {k}: {} recorded bits against {reported} rejected samples in the stats",
+                second.count()
+            );
+            second_total += second.count();
+        }
+        let forced_total = (forced * (6 * W * H) as f64).round() as u64;
+        assert!(
+            second_total > forced_total,
+            "the second pass's set ({second_total} bits) must be a STRICT superset of the \
+             forced set ({forced_total} bits)"
         );
 
         let row_mean = |data: &[f32], y: usize| -> f64 {
