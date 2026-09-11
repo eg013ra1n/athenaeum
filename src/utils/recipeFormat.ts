@@ -25,6 +25,13 @@ export function formatCombine(r: IntegrationRecipe): string {
     case 'sigma_clip': rejLabel = `Sigma clip (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
     case 'winsorized_sigma': rejLabel = `Winsorized sigma (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
     case 'linear_fit_clip': rejLabel = `Linear fit clip (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
+    // The three M4c algorithms. The Create-Master dialog does not offer them,
+    // but a recipe carrying one (hand-written, or a future stacking recipe
+    // read back through `describeRecipeJson`) must still render rather than
+    // fall through to the raw JSON.
+    case 'min_max': rejLabel = `Min/max (${rej.low}/${rej.high})`; break;
+    case 'esd': rejLabel = `ESD (${fmtParam(rej.outliers_fraction)}/${fmtParam(rej.alpha)}/${fmtParam(rej.low_relaxation)})`; break;
+    case 'rcr': rejLabel = `RCR (${fmtParam(rej.limit)})`; break;
   }
   return `${comb} | ${rejLabel}`;
 }

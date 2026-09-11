@@ -149,12 +149,35 @@ pub enum RejectionChoice {
         sigma_low: f64,
         sigma_high: f64,
     },
+    /// Min/max clipping (M4c, ruling R-M4c-1). Defaults when chosen:
+    /// `low = 1`, `high = 1`.
+    MinMax {
+        low: usize,
+        high: usize,
+    },
+    /// Generalized extreme studentized deviate test (M4c, ruling R-M4c-1).
+    /// Defaults when chosen: `outliersFraction = 0.3`, `alpha = 0.05`,
+    /// `lowRelaxation = 1.5`.
+    Esd {
+        outliers_fraction: f64,
+        alpha: f64,
+        low_relaxation: f64,
+    },
+    /// Robust Chauvenet Rejection (M4c, ruling R-M4c-1). Default when
+    /// chosen: `limit = 0.5` (Chauvenet's criterion).
+    Rcr {
+        limit: f64,
+    },
 }
 
 impl RejectionChoice {
     /// `n < 8` → percentile 0.2/0.1; `8 ≤ n < 20` → Winsorized 4.0/3.0;
     /// `n ≥ 20` → linear fit 5.0/3.5 (spec §6.3's Auto rule). Every other
     /// choice passes its parameters through unchanged.
+    ///
+    /// The ladder is deliberately unchanged by M4c (ruling R-M4c-1): min/max,
+    /// ESD and RCR are user choices only, so no existing group's rejection
+    /// moves because they exist.
     pub fn resolve(self, n: usize) -> Rejection {
         match self {
             RejectionChoice::Auto => {
@@ -200,6 +223,17 @@ impl RejectionChoice {
                 sigma_low,
                 sigma_high,
             },
+            RejectionChoice::MinMax { low, high } => Rejection::MinMax { low, high },
+            RejectionChoice::Esd {
+                outliers_fraction,
+                alpha,
+                low_relaxation,
+            } => Rejection::Esd {
+                outliers_fraction,
+                alpha,
+                low_relaxation,
+            },
+            RejectionChoice::Rcr { limit } => Rejection::Rcr { limit },
         }
     }
 }
@@ -1129,6 +1163,84 @@ mod tests {
                 sigma_high: 2.5
             }
         );
+    }
+
+    /// M4c Task 1 (ruling R-M4c-1): min/max, ESD and RCR are USER choices.
+    /// Each new arm passes its own parameters straight through, and the Auto
+    /// ladder above never resolves to one of them at any group size.
+    #[test]
+    fn the_new_rejection_choices_pass_through_and_auto_never_selects_them() {
+        assert_eq!(
+            RejectionChoice::MinMax { low: 1, high: 1 }.resolve(200),
+            Rejection::MinMax { low: 1, high: 1 }
+        );
+        assert_eq!(
+            RejectionChoice::Esd {
+                outliers_fraction: 0.3,
+                alpha: 0.05,
+                low_relaxation: 1.5
+            }
+            .resolve(64),
+            Rejection::Esd {
+                outliers_fraction: 0.3,
+                alpha: 0.05,
+                low_relaxation: 1.5
+            }
+        );
+        assert_eq!(
+            RejectionChoice::Rcr { limit: 0.5 }.resolve(9),
+            Rejection::Rcr { limit: 0.5 }
+        );
+        for n in [1usize, 2, 3, 7, 8, 19, 20, 64, 208, 1000] {
+            assert!(
+                matches!(
+                    RejectionChoice::Auto.resolve(n),
+                    Rejection::PercentileClip { .. }
+                        | Rejection::WinsorizedSigma { .. }
+                        | Rejection::LinearFitClip { .. }
+                ),
+                "Auto must not select a M4c algorithm (n = {n})"
+            );
+        }
+    }
+
+    /// camelCase on the wire with the R-M4c-1 defaults, and a round trip
+    /// through `serde_json` for each new arm.
+    #[test]
+    fn the_new_rejection_choices_use_the_spec_wire_names() {
+        let c: RejectionChoice =
+            serde_json::from_str(r#"{"method":"minMax","low":1,"high":1}"#).unwrap();
+        assert_eq!(c, RejectionChoice::MinMax { low: 1, high: 1 });
+        let c: RejectionChoice = serde_json::from_str(
+            r#"{"method":"esd","outliersFraction":0.3,"alpha":0.05,"lowRelaxation":1.5}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c,
+            RejectionChoice::Esd {
+                outliers_fraction: 0.3,
+                alpha: 0.05,
+                low_relaxation: 1.5
+            }
+        );
+        let c: RejectionChoice = serde_json::from_str(r#"{"method":"rcr","limit":0.5}"#).unwrap();
+        assert_eq!(c, RejectionChoice::Rcr { limit: 0.5 });
+        for choice in [
+            RejectionChoice::MinMax { low: 1, high: 1 },
+            RejectionChoice::Esd {
+                outliers_fraction: 0.3,
+                alpha: 0.05,
+                low_relaxation: 1.5,
+            },
+            RejectionChoice::Rcr { limit: 0.5 },
+        ] {
+            let v = serde_json::to_value(choice).unwrap();
+            assert_eq!(
+                serde_json::from_value::<RejectionChoice>(v.clone()).unwrap(),
+                choice,
+                "{v}"
+            );
+        }
     }
 
     #[test]

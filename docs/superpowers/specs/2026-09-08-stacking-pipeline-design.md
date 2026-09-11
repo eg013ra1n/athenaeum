@@ -695,12 +695,39 @@ functions build calibration masters and their output is fingerprint-pinned:
   is an M4 change with its own fingerprint re-pin and a before/after
   measurement on the owner's masters.
 
-M4 also adds `minMax`, `esd`, `rcr` and the `largeScale` low/high
-post-processing. Parameters keep the two-axis `IntegrationRecipe` shape
-(combination × rejection) the master builder uses.
+Three more shipped in M4c Task 1 (math reference §3.4, rulings R-M4c-1/2),
+all three USER choices the Auto rule below never selects:
+
+- `minMax { low, high }` (defaults 1/1) — drop the `low` smallest and `high`
+  largest samples outright; the counts are clamped so at least one sample
+  always survives.
+- `esd { outliersFraction, alpha, lowRelaxation }` (defaults 0.3/0.05/1.5) —
+  the generalized extreme studentized deviate test: up to
+  `clamp(trunc(f·n), 1, n−2)` sequential tests of the most extreme
+  studentized residual against Rosner's critical value `λ_i`, with
+  `lowRelaxation` inflating the scale used below the centre so the faint side
+  is rejected less eagerly. `λ_i` needs a Student's t quantile, computed
+  dependency-free from the regularized incomplete beta
+  (`integration/student_t.rs`) and memoised per `(n, alpha)` in a
+  thread-local (R-M4c-2).
+- `rcr { limit }` (default 0.5, Chauvenet's criterion) — Robust Chauvenet
+  Rejection: three phases of decreasing robustness, each rejecting the single
+  most extreme sample while `n·Q(|x − μ|/σ)` stays below `limit`. Implemented
+  a second time in `integration/combine.rs` for pixel stacks, because
+  `stacking::robust`'s copy is gated behind `render + solver` and
+  `integration` is not; a cross-check test in `stacking::robust` holds the
+  two to the same answers.
+
+Still M4: the `largeScale` low/high post-processing. Parameters keep the
+two-axis `IntegrationRecipe` shape (combination × rejection) the master
+builder uses; the three new ones are APPENDED to the persisted snake_case
+`Rejection` JSON (`min_max`, `esd`, `rcr`), which never renames or reorders
+what is already there.
 
 Auto (WBPP 3.0.1 as observed on the owner's data): n < 8 → percentile
-0.2/0.1; 8 ≤ n < 20 → Winsorized 4.0/3.0; n ≥ 20 → linear fit 5.0/3.5. Range
+0.2/0.1; 8 ≤ n < 20 → Winsorized 4.0/3.0; n ≥ 20 → linear fit 5.0/3.5 —
+unchanged by M4c (ruling R-M4c-1), so no existing group's rejection moves
+because the three algorithms above exist. Range
 rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
 `minWeight` 0.005 as the engine floor below the UI's selection threshold.
 

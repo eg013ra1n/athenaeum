@@ -14,7 +14,14 @@ interface CreateMasterDialogProps {
 // Two-axis integration recipe (spec §4): Combination × Rejection algorithm,
 // matching PixInsight's ImageIntegration mental model.
 type CombinationChoice = 'auto' | Combination;   // 'auto' | 'average' | 'median'
-type RejectionChoice = Rejection['method'];       // 'none' | 'percentile_clip' | 'sigma_clip' | …
+// The five rejection algorithms this dialog offers. `Rejection` also carries
+// the three stacking-side M4c algorithms (min/max, ESD, RCR — spec §6.3),
+// which master builds deliberately do not expose, so the local choice type
+// names its five rather than widening to every variant.
+type RejectionChoice = Extract<
+  Rejection['method'],
+  'none' | 'percentile_clip' | 'sigma_clip' | 'winsorized_sigma' | 'linear_fit_clip'
+>;
 
 // Per-algorithm parameters, kept independently so switching rejection algorithm
 // preserves each one's last-used low/high rather than clobbering a shared pair.

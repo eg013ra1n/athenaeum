@@ -72,7 +72,7 @@ local: LocalNormalizationConfig, };
 
 export type Combination = "average" | "median";
 
-export type RejectionChoice = { "method": "auto" } | { "method": "none" } | { "method": "percentileClip", low: number, high: number, } | { "method": "sigmaClip", sigmaLow: number, sigmaHigh: number, } | { "method": "winsorizedSigma", sigmaLow: number, sigmaHigh: number, } | { "method": "linearFitClip", sigmaLow: number, sigmaHigh: number, };
+export type RejectionChoice = { "method": "auto" } | { "method": "none" } | { "method": "percentileClip", low: number, high: number, } | { "method": "sigmaClip", sigmaLow: number, sigmaHigh: number, } | { "method": "winsorizedSigma", sigmaLow: number, sigmaHigh: number, } | { "method": "linearFitClip", sigmaLow: number, sigmaHigh: number, } | { "method": "minMax", low: number, high: number, } | { "method": "esd", outliersFraction: number, alpha: number, lowRelaxation: number, } | { "method": "rcr", limit: number, };
 
 export type IntegrationConfig = { 
 /**
@@ -157,6 +157,13 @@ seedPrefilter: SeedPrefilter,
  * R-M4c-11): the peak threshold `detectionSigma` steers, or the
  * structure map. A stored config written before M4c Task 0 has no such
  * field and decodes to the shipped default.
+ *
+ * `structure` reads neither `detectionSigma` nor `seedPrefilter` — it
+ * carries its own threshold and its own median — and it applies one
+ * stage the peak detector has no equivalent of: an automatic minimum
+ * structure size, derived per frame from the accepted candidates' own
+ * size distribution (see `structure::StructureParams::min_structure_size`).
+ * Its dials are calibrated constants, not config fields.
  */
 seedDetector: SeedDetector, };
 

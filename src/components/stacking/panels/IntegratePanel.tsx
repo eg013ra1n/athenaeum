@@ -18,6 +18,9 @@ const METHODS: RejectionMethod[] = [
   'sigmaClip',
   'winsorizedSigma',
   'linearFitClip',
+  'minMax',
+  'esd',
+  'rcr',
 ];
 
 const METHOD_LABEL: Record<RejectionMethod, string> = {
@@ -27,6 +30,9 @@ const METHOD_LABEL: Record<RejectionMethod, string> = {
   sigmaClip: 'Sigma clip',
   winsorizedSigma: 'Winsorized sigma',
   linearFitClip: 'Linear-fit clip',
+  minMax: 'Min/max',
+  esd: 'Generalized ESD',
+  rcr: 'Robust Chauvenet (RCR)',
 };
 
 /** A reasonable starting point when the user switches TO a parametric
@@ -46,7 +52,20 @@ function seedForMethod(method: RejectionMethod): RejectionChoice {
       return { method: 'winsorizedSigma', sigmaLow: 4.0, sigmaHigh: 3.0 };
     case 'linearFitClip':
       return { method: 'linearFitClip', sigmaLow: 5.0, sigmaHigh: 3.5 };
+    case 'minMax':
+      return { method: 'minMax', low: 1, high: 1 };
+    case 'esd':
+      return { method: 'esd', outliersFraction: 0.3, alpha: 0.05, lowRelaxation: 1.5 };
+    case 'rcr':
+      return { method: 'rcr', limit: 0.5 };
   }
+}
+
+/** `minMax`'s counts are `usize` on the wire — a fractional value would
+ *  fail to deserialize, and `NumericField` commits whatever parses. Round
+ *  and floor at zero on the way out. */
+function wholeCount(n: number): number {
+  return Math.max(0, Math.round(n));
 }
 
 export interface IntegratePanelProps {
@@ -96,7 +115,8 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
         </select>
         <p className="mt-1 text-[11px] text-content-muted">
           default {METHOD_LABEL[defaults.integration.rejection.method]} — resolves per group: n &lt; 8 percentile
-          0.2/0.1 · 8–19 Winsorized 4.0/3.0 · ≥ 20 linear fit 5.0/3.5.
+          0.2/0.1 · 8–19 Winsorized 4.0/3.0 · ≥ 20 linear fit 5.0/3.5. Min/max, ESD and RCR are
+          picked by hand only — Auto never resolves to them.
         </p>
       </div>
 
@@ -151,6 +171,62 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
           min={0}
           step={0.1}
           disabled={disabled}
+        />
+      )}
+      {i.rejection.method === 'minMax' && (
+        <ParamPair
+          leftLabel="Drop lowest"
+          leftValue={i.rejection.low}
+          onLeftCommit={(n) => patch({ rejection: { method: 'minMax', low: wholeCount(n), high: i.rejection.method === 'minMax' ? i.rejection.high : 1 } })}
+          rightLabel="Drop highest"
+          rightValue={i.rejection.high}
+          onRightCommit={(n) => patch({ rejection: { method: 'minMax', low: i.rejection.method === 'minMax' ? i.rejection.low : 1, high: wholeCount(n) } })}
+          min={0}
+          step={1}
+          help="frames per pixel stack; at least one sample always survives"
+          disabled={disabled}
+        />
+      )}
+      {i.rejection.method === 'esd' && (
+        <>
+          <ParamPair
+            leftLabel="Outliers fraction"
+            leftValue={i.rejection.outliersFraction}
+            onLeftCommit={(n) => patch({ rejection: { method: 'esd', outliersFraction: n, alpha: i.rejection.method === 'esd' ? i.rejection.alpha : 0.05, lowRelaxation: i.rejection.method === 'esd' ? i.rejection.lowRelaxation : 1.5 } })}
+            rightLabel="Significance α"
+            rightValue={i.rejection.alpha}
+            onRightCommit={(n) => patch({ rejection: { method: 'esd', outliersFraction: i.rejection.method === 'esd' ? i.rejection.outliersFraction : 0.3, alpha: n, lowRelaxation: i.rejection.method === 'esd' ? i.rejection.lowRelaxation : 1.5 } })}
+            leftMin={0.05}
+            leftMax={0.5}
+            leftStep={0.05}
+            rightMin={0.001}
+            rightMax={0.2}
+            rightStep={0.001}
+            help="the fraction of the stack that may be tested, and the test's significance"
+            disabled={disabled}
+          />
+          <NumericField
+            label="Low relaxation"
+            value={i.rejection.lowRelaxation}
+            onCommit={(n) => patch({ rejection: { method: 'esd', outliersFraction: i.rejection.method === 'esd' ? i.rejection.outliersFraction : 0.3, alpha: i.rejection.method === 'esd' ? i.rejection.alpha : 0.05, lowRelaxation: n } })}
+            min={1}
+            max={3}
+            step={0.1}
+            disabled={disabled}
+            help="above 1 the faint side is rejected less eagerly than the bright side"
+          />
+        </>
+      )}
+      {i.rejection.method === 'rcr' && (
+        <NumericField
+          label="Limit"
+          value={i.rejection.limit}
+          onCommit={(n) => patch({ rejection: { method: 'rcr', limit: n } })}
+          min={0.1}
+          max={1}
+          step={0.05}
+          disabled={disabled}
+          help="expected count at least as extreme; 0.5 is Chauvenet's criterion"
         />
       )}
 

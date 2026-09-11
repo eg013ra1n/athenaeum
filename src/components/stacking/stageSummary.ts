@@ -185,6 +185,9 @@ export function rejectionLabel(v: RejectionChoice): string {
     case 'sigmaClip': return `sigma clip ${v.sigmaLow}/${v.sigmaHigh}`;
     case 'winsorizedSigma': return `winsorized sigma ${v.sigmaLow}/${v.sigmaHigh}`;
     case 'linearFitClip': return `linear-fit clip ${v.sigmaLow}/${v.sigmaHigh}`;
+    case 'minMax': return `Min/max (${v.low}/${v.high})`;
+    case 'esd': return `ESD (${v.outliersFraction}, ${v.alpha}, ${v.lowRelaxation})`;
+    case 'rcr': return `RCR (${v.limit})`;
   }
 }
 

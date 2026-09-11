@@ -583,7 +583,7 @@ syncConfigured: boolean, };
 
 export type Combination = "average" | "median";
 
-export type Rejection = { "method": "none" } | { "method": "percentile_clip", low: number, high: number, } | { "method": "sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "winsorized_sigma", sigma_low: number, sigma_high: number, } | { "method": "linear_fit_clip", sigma_low: number, sigma_high: number, };
+export type Rejection = { "method": "none" } | { "method": "percentile_clip", low: number, high: number, } | { "method": "sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "winsorized_sigma", sigma_low: number, sigma_high: number, } | { "method": "linear_fit_clip", sigma_low: number, sigma_high: number, } | { "method": "min_max", low: number, high: number, } | { "method": "esd", outliers_fraction: number, alpha: number, low_relaxation: number, } | { "method": "rcr", limit: number, };
 
 export type IntegrationRecipe = { combination: Combination, rejection: Rejection, };
 
