@@ -215,8 +215,14 @@ impl LnGrid {
             self.gw,
             "scratch must match this grid's gw"
         );
+        let stride_usize = self.stride();
+        assert_eq!(
+            scratch.wx_table.len(),
+            stride_usize,
+            "scratch must match this grid's stride"
+        );
 
-        let stride = self.stride() as f32;
+        let stride = stride_usize as f32;
         let offset = Interpolation::BicubicBSpline.first_tap_offset();
 
         let ty = y as f32 / stride;
@@ -236,12 +242,17 @@ impl LnGrid {
             }
         }
 
+        // Task 5 (M4a): `fx` above takes exactly `stride_usize` distinct
+        // values as `x` sweeps `0..ref_width` — `x mod stride`, over
+        // `stride` — so `scratch.wx_table` (built once per grid by
+        // `LnScratch::for_grid`) already holds every 4-tap weight set this
+        // loop would otherwise recompute via `BicubicBSpline::weights` on
+        // EVERY pixel. `i0 = x / stride_usize` (integer division) is the
+        // same value `tx.floor() as isize` would give for these input
+        // ranges — see the module's Task 5 pin test.
         for x in 0..self.ref_width {
-            let tx = x as f32 / stride;
-            let i0 = tx.floor() as isize;
-            let fx = tx - i0 as f32;
-            let mut wx = [0f32; 8];
-            Interpolation::BicubicBSpline.weights(fx, &mut wx);
+            let i0 = (x / stride_usize) as isize;
+            let wx = &scratch.wx_table[x % stride_usize];
 
             let mut va = 0f32;
             let mut vb = 0f32;
@@ -266,20 +277,36 @@ impl LnGrid {
 /// caller (Task 6's band loop) evaluates many rows against the same grid.
 /// Fields are private: the only way to build one is [`Self::for_grid`],
 /// which sizes it correctly for the grid it will be used with.
+///
+/// `wx_table` (M4a Task 5) is the per-column 4-tap `BicubicBSpline` weight
+/// set for every `fx` value `evaluate_row_into`'s x-loop can ever see —
+/// `stride` entries, indexed by `x % stride` — built once here instead of
+/// recomputed on every one of a row's `ref_width` pixels.
 pub struct LnScratch {
     a: Vec<f32>,
     b: Vec<f32>,
+    wx_table: Vec<[f32; 4]>,
 }
 
 impl LnScratch {
-    /// Buffers sized for `grid`'s `gw`. Reusable across calls against any
-    /// grid that shares the same `gw` (typically every channel of one
-    /// frame, since they share one reference geometry — see
+    /// Buffers sized for `grid`'s `gw`, plus the `wx_table` for `grid`'s
+    /// `stride()`. Reusable across calls against any grid that shares the
+    /// same `gw` AND `stride` (typically every channel of one frame, since
+    /// they share one reference geometry and one LN scale — see
     /// [`LnFrameGrids`]'s doc).
     pub fn for_grid(grid: &LnGrid) -> LnScratch {
+        let stride = grid.stride();
+        let mut wx_table = Vec::with_capacity(stride);
+        for r in 0..stride {
+            let frac = r as f32 / stride as f32;
+            let mut w = [0f32; 8];
+            Interpolation::BicubicBSpline.weights(frac, &mut w);
+            wx_table.push([w[0], w[1], w[2], w[3]]);
+        }
         LnScratch {
             a: vec![0.0; grid.gw],
             b: vec![0.0; grid.gw],
+            wx_table,
         }
     }
 }
@@ -539,6 +566,101 @@ impl LnFrameGrids {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::ransac::SplitMix64;
+
+    /// M4a Task 5 pin: a VERBATIM copy of `evaluate_row_into`'s per-pixel
+    /// loop as it stood before this task — `BicubicBSpline::weights`
+    /// recomputed fresh for every output pixel instead of read from a
+    /// precomputed `wx_table` — kept only so
+    /// `evaluate_row_into_matches_the_pre_table_reference_implementation`
+    /// below can check the table-based version against it. Do not "clean
+    /// this up" to share code with the production loop: the whole point is
+    /// that it is independent of whatever `evaluate_row_into` does next.
+    fn evaluate_row_reference(grid: &LnGrid, y: usize, a_row: &mut [f32], b_row: &mut [f32]) {
+        let stride = grid.stride() as f32;
+        let offset = Interpolation::BicubicBSpline.first_tap_offset();
+
+        let ty = y as f32 / stride;
+        let j0 = ty.floor() as isize;
+        let fy = ty - j0 as f32;
+        let mut wy = [0f32; 8];
+        Interpolation::BicubicBSpline.weights(fy, &mut wy);
+
+        let mut a_scratch = vec![0f32; grid.gw];
+        let mut b_scratch = vec![0f32; grid.gw];
+        for k in 0..4usize {
+            let j = j0 + offset + k as isize;
+            let w = wy[k];
+            for i in 0..grid.gw {
+                a_scratch[i] += w * grid.node(&grid.a, j, i);
+                b_scratch[i] += w * grid.node(&grid.b, j, i);
+            }
+        }
+
+        for x in 0..grid.ref_width {
+            let tx = x as f32 / stride;
+            let i0 = tx.floor() as isize;
+            let fx = tx - i0 as f32;
+            let mut wx = [0f32; 8];
+            Interpolation::BicubicBSpline.weights(fx, &mut wx);
+
+            let mut va = 0f32;
+            let mut vb = 0f32;
+            for k in 0..4usize {
+                let i = i0 + offset + k as isize;
+                va += wx[k] * LnGrid::ghost_1d(&a_scratch, i);
+                vb += wx[k] * LnGrid::ghost_1d(&b_scratch, i);
+            }
+            a_row[x] = va;
+            b_row[x] = vb;
+        }
+    }
+
+    #[test]
+    fn evaluate_row_into_matches_the_pre_table_reference_implementation() {
+        // A 7x5 node grid over an 800x600 reference at stride 128 (scale
+        // 1024) — deliberately not derived via `node_count`, since this
+        // test checks the evaluator's numbers, not the mesh geometry.
+        let (gw, gh, ref_width, ref_height, scale) = (7usize, 5usize, 800usize, 600usize, 1024u32);
+        let mut rng = SplitMix64(0xC0FFEE_u64);
+        let n = gw * gh;
+        let a: Vec<f32> = (0..n).map(|_| (rng.next_f64() as f32 - 0.5) * 4.0).collect();
+        let b: Vec<f32> = (0..n).map(|_| (rng.next_f64() as f32 - 0.5) * 2.0).collect();
+        let grid = LnGrid {
+            ref_width,
+            ref_height,
+            scale,
+            gw,
+            gh,
+            a,
+            b,
+            global_scale: 1.0,
+            location_ref: 0.0,
+            location_tgt: 0.0,
+        };
+
+        let mut scratch = LnScratch::for_grid(&grid);
+        for &y in &[0usize, 77, ref_height - 1] {
+            let (mut a_row, mut b_row) = (vec![0f32; ref_width], vec![0f32; ref_width]);
+            let (mut a_ref, mut b_ref) = (vec![0f32; ref_width], vec![0f32; ref_width]);
+            grid.evaluate_row_into(y, &mut a_row, &mut b_row, &mut scratch);
+            evaluate_row_reference(&grid, y, &mut a_ref, &mut b_ref);
+            for x in 0..ref_width {
+                assert!(
+                    (a_row[x] - a_ref[x]).abs() < 1e-6,
+                    "row {y}, x {x}: a table {} vs reference {}",
+                    a_row[x],
+                    a_ref[x]
+                );
+                assert!(
+                    (b_row[x] - b_ref[x]).abs() < 1e-6,
+                    "row {y}, x {x}: b table {} vs reference {}",
+                    b_row[x],
+                    b_ref[x]
+                );
+            }
+        }
+    }
 
     #[test]
     fn constant_grid_evaluates_to_its_constants_everywhere() {

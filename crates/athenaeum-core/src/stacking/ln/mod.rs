@@ -26,6 +26,7 @@
 //! provenance — none of that DB/artifact bookkeeping belongs in this
 //! low-level module.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -169,33 +170,43 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 /// `sanitized_planes`/`locations` already are: the reference is immutable
 /// for the whole group, so this is built once and read by every frame's
 /// [`scale::relative_scale_against`] call instead.
-pub struct LnReferenceForDetection {
-    pub sanitized_planes: Vec<Vec<f32>>,
+///
+/// `sanitized_planes[p]` (M4a Task 5) borrows `reference`'s own plane
+/// (`Cow::Borrowed`) instead of unconditionally cloning it — the common
+/// case, since an all-finite reference plane (the overwhelming majority)
+/// needs no sanitizing at all. Only a plane that actually carries a
+/// non-finite pixel pays for an owned copy (`Cow::Owned`), exactly as
+/// before. This is why the struct now carries a lifetime tied to the
+/// `&'a LnReference` [`Self::build`] borrows from.
+pub struct LnReferenceForDetection<'a> {
+    pub sanitized_planes: Vec<Cow<'a, [f32]>>,
     pub locations: Vec<f64>,
     pub prepared: Vec<scale::PreparedReferenceChannel>,
 }
 
-impl LnReferenceForDetection {
+impl<'a> LnReferenceForDetection<'a> {
     /// `psf`/`max_stars` are the group's own LN config — the SAME values
     /// [`normalize_frame`]'s own `relative_scale_against` calls use, so the
     /// prepared reference channel matches what a direct (unhoisted)
     /// `relative_scale` call on this reference would have produced.
     pub fn build(
-        reference: &LnReference,
+        reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
         max_stars: usize,
-    ) -> LnReferenceForDetection {
+    ) -> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
         for plane in &reference.planes {
             let location = median_of_finite(plane);
-            let sanitized = if plane.iter().all(|v| v.is_finite()) {
-                plane.clone()
+            let sanitized: Cow<'a, [f32]> = if plane.iter().all(|v| v.is_finite()) {
+                Cow::Borrowed(plane.as_slice())
             } else {
-                plane
-                    .iter()
-                    .map(|&v| if v.is_finite() { v } else { location as f32 })
-                    .collect()
+                Cow::Owned(
+                    plane
+                        .iter()
+                        .map(|&v| if v.is_finite() { v } else { location as f32 })
+                        .collect(),
+                )
             };
             sanitized_planes.push(sanitized);
             locations.push(location);
@@ -251,7 +262,7 @@ impl LnReferenceForDetection {
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
-    reference_for_detection: &LnReferenceForDetection,
+    reference_for_detection: &LnReferenceForDetection<'_>,
     ref_backgrounds: &[BackgroundGrid],
     frame: &StackFrame,
     cfg: &LocalNormalizationConfig,
@@ -437,4 +448,63 @@ pub fn normalize_frame(
         matches: matches_total,
         cells_rejected: cells_rejected_total,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stacking::psf_signal::PsfModel;
+
+    /// Small enough that `register::detect::detect_stars` short-circuits
+    /// (`w < 8 || h < 8`) to an empty result deterministically, so
+    /// `LnReferenceForDetection::build`'s detect+fit path never has to find
+    /// a real star for these tests — they check the `Cow` sanitizing
+    /// behaviour only.
+    fn reference_with_planes(planes: Vec<Vec<f32>>) -> LnReference {
+        LnReference {
+            width: 4,
+            height: 3,
+            planes,
+            frames_used: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_all_finite_reference_borrows_every_plane() {
+        let planes = vec![
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            vec![0.5f32; 12],
+        ];
+        let reference = reference_with_planes(planes);
+        let for_detection = LnReferenceForDetection::build(&reference, PsfModel::default(), 50);
+        assert_eq!(for_detection.sanitized_planes.len(), 2);
+        for (p, plane) in for_detection.sanitized_planes.iter().enumerate() {
+            assert!(
+                matches!(plane, Cow::Borrowed(_)),
+                "channel {p}: expected a borrowed plane, got an owned copy"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plane_with_a_nan_is_sanitized_into_an_owned_copy() {
+        let mut plane = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        plane[5] = f32::NAN;
+        let reference = reference_with_planes(vec![plane.clone()]);
+        let location = median_of_finite(&plane);
+
+        let for_detection = LnReferenceForDetection::build(&reference, PsfModel::default(), 50);
+        assert_eq!(for_detection.sanitized_planes.len(), 1);
+        match &for_detection.sanitized_planes[0] {
+            Cow::Owned(v) => {
+                assert!(v.iter().all(|x| x.is_finite()), "sanitized plane must be all-finite");
+                assert!(
+                    (v[5] as f64 - location).abs() < 1e-9,
+                    "the NaN must be replaced by the plane's own finite median: {} vs {location}",
+                    v[5]
+                );
+            }
+            Cow::Borrowed(_) => panic!("a plane with a NaN must not be borrowed as-is"),
+        }
+    }
 }
