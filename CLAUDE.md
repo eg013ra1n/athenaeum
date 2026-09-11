@@ -757,8 +757,10 @@ run-wide value for every group, so the M1–M4a pins keep passing with the
 default config. The run-level `stacking_runs.reference_frame_id` stays the
 largest group's reference in `Auto` mode and IS the pin in `Manual` mode
 (ruling R-T3-2 — what the plan gate and the results header show);
-`SummaryGroup.reference_frame_id` carries each group's own, and is `None`
-for a group stage 5 never registered (fewer than 3 included frames); every master and drizzled master (and a drizzle weight map)
+`SummaryGroup.reference_frame_id` carries each group's own, and is `Some`
+ONLY for a group whose master was actually WRITTEN — `None` for a group
+skipped, failed, or dropped below the member floor at any stage (ruling
+R-T3-3); every master and drizzled master (and a drizzle weight map)
 carries `ATH_RGEO = 'coRegistered' | 'native'`, and in native mode the
 master's WCS is the GROUP reference's solve. `registration.geometry` rides
 `registration_subtree`, so flipping it re-registers every set on purpose.
@@ -797,13 +799,7 @@ star-based confirmation. The frames table (`FramesTable.tsx`) renders the
 as part of the string. In native mode a Manual reference pin IS the
 run-level `stacking_runs.reference_frame_id` (ruling R-T3-2); every other
 group still auto-picks and two-pass-refines its own best-weighted member
-independently of the pin. **Correction (Task 3 fix round 2, ruling
-R-T3-3):** `SummaryGroup.reference_frame_id` is `Some` ONLY for a group
-whose master was actually WRITTEN, not merely one stage 5 attempted (the
-"fewer than 3 included frames" wording above understates it) — it stays
-`None` for a group that registered but then dropped below the member
-floor, failed integration, or was skipped at any stage, and for a summary
-written before M4b. **Acceptance run:** pending (Task 6).
+independently of the pin. **Acceptance run:** pending (Task 6).
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,integrate,
