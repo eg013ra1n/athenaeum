@@ -41,6 +41,14 @@ export interface FrameRow {
    *  run's summary isn't loaded yet), same convention as every other
    *  summary-sourced metric column here. */
   lnScale: number | null;
+  /** Stage 5's alignment model string (`SummaryFrame.regModel` /
+   *  `StackingRunFrameRow.regModel`), e.g. `homography` or
+   *  `homography+polynomial3+wcs` — the trailing `+wcs` (M4b) marks a
+   *  frame whose correspondence search was seeded from the stored plate
+   *  solves instead of the quad matcher alone. `null` before the frame has
+   *  registered in the selected run. Rendered split in two: the model text
+   *  and, when present, a `WCS` chip for the suffix — see `splitRegModel`. */
+  regModel: string | null;
   statusLabel: string;
   statusTone: StatusTone;
 }
@@ -55,6 +63,7 @@ type SortKey =
   | 'regRmsPx'
   | 'lnScale'
   | 'regInliers'
+  | 'regModel'
   | 'statusLabel';
 
 const COLUMNS: { key: SortKey; label: string; numeric?: boolean; title?: string }[] = [
@@ -67,6 +76,7 @@ const COLUMNS: { key: SortKey; label: string; numeric?: boolean; title?: string 
   { key: 'regRmsPx', label: 'Reg RMS', numeric: true },
   { key: 'lnScale', label: 'Scale', numeric: true, title: 'Local-normalization relative scale' },
   { key: 'regInliers', label: 'Inliers', numeric: true },
+  { key: 'regModel', label: 'Model', title: 'Registration alignment model' },
   { key: 'statusLabel', label: 'Status' },
 ];
 
@@ -76,12 +86,26 @@ const STATUS_CHIP: Record<StatusTone, string> = {
   error: 'bg-error-muted text-error',
 };
 
+/** Same muted-chip tokens `ProvenanceModal.tsx` uses for its own "off"
+ *  state — the neutral pill in this stacking component family. */
+const WCS_CHIP = 'bg-surface-hover text-content-muted';
+
 function fmtNum(n: number | null, digits: number, suffix = ''): string {
   return n == null ? '—' : `${n.toFixed(digits)}${suffix}`;
 }
 
 function fmtInt(n: number | null): string {
   return n == null ? '—' : String(n);
+}
+
+/** Splits a `regModel` string on its optional trailing `+wcs` (M4b) so the
+ *  Model column can render the alignment model text and the WCS-seed chip
+ *  separately — e.g. `homography+polynomial3+wcs` → base
+ *  `homography+polynomial3`, `wcs: true`. */
+function splitRegModel(model: string | null): { base: string | null; wcs: boolean } {
+  if (model == null) return { base: null, wcs: false };
+  if (model.endsWith('+wcs')) return { base: model.slice(0, -'+wcs'.length), wcs: true };
+  return { base: model, wcs: false };
 }
 
 /** One row's status chip. A registration failure wins over a plain
@@ -199,6 +223,7 @@ export function buildFrameRows(
         regRmsPx: null,
         lnScale: null,
         regInliers: null,
+        regModel: null,
         statusLabel: manuallyExcluded ? 'Excluded (manual)' : 'Included',
         statusTone: manuallyExcluded ? 'warning' : 'success',
       };
@@ -223,6 +248,7 @@ export function buildFrameRows(
       regRmsPx: s?.regRmsPx ?? runRow.regRmsPx,
       lnScale: s?.lnScale ?? null,
       regInliers: s?.regInliers ?? runRow.regInliers,
+      regModel: s?.regModel ?? runRow.regModel,
       statusLabel,
       statusTone,
     };
@@ -373,6 +399,25 @@ export function FramesTable({
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.regRmsPx, 3, ' px')}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtNum(r.lnScale, 3)}</td>
                     <td className="py-1.5 px-2 text-content-secondary tabular-nums">{fmtInt(r.regInliers)}</td>
+                    <td className="py-1.5 px-2 text-content-secondary font-mono">
+                      {(() => {
+                        const { base, wcs } = splitRegModel(r.regModel);
+                        if (base == null) return '—';
+                        return (
+                          <span className="inline-flex items-center gap-1">
+                            <span>{base}</span>
+                            {wcs && (
+                              <span
+                                title="seeded from the plate solves"
+                                className={`inline-block px-1.5 py-0.5 rounded-full text-[10px] font-semibold ${WCS_CHIP}`}
+                              >
+                                WCS
+                              </span>
+                            )}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="py-1.5 px-2">
                       <span
                         className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold ${STATUS_CHIP[r.statusTone]}`}

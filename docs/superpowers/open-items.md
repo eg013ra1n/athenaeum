@@ -187,6 +187,51 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M4b — mixed pixel scales (2026-09-11)
+
+M4b (plan `docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`,
+rulings R-M4b-1…9): per-frame pixel scale from the stored plate solve or the header
+(`GroupFrame.pixel_scale_arcsec`/`scale_source`) feeding a plan-time WARNING (never a
+blocker) and a per-frame registration scale gate centred on the frame's own implied
+ratio to its reference; a WCS seed built from both frames' plate solves when both are
+solved, falling back to the quad matcher otherwise; a `registration.geometry:
+coRegistered | native` mode where native gives each group its own reference and
+geometry with no cross-group registration; and the frames table's `WCS` chip on a
+seeded row's registration model.
+
+- **Acceptance run:** pending — the controller records the results here (Task 6).
+- **Owed (owner):** own look at the masters of a real mixed-scale set in both modes —
+  the Ghost Nebula (set 195, ×1.27 within one group), M 78 (set 108, bin 1 + bin 2),
+  and the ×7 / ×4.8 set 166 — and the desktop click-through of the Geometry radio, the
+  `Scale` column with its `×r` badge and the frames table's `WCS` chip (the acceptance
+  verifies them through the web build only).
+- **Data limitation, recorded:** set 138's 352-mm 20 s groups have no flats at that
+  focal length and no 20 s darks in the catalog (the app's own matcher refuses the
+  30 s/−10 °C darks), so the ×2.82 case was swapped for set 166 (ruling R-T6-3 in the
+  plan's ledger); set 138 stays as the negative case — its plan must show the `links`
+  blocker.
+- **Deferred (final review):** native-mode register staleness reads only the last
+  done run's `summary_json` (the brief's stored-metrics best-by-weight first is not
+  implemented), and because `SummaryGroup.reference_frame_id` is `Some` only for a
+  written master, a group that registered but wrote no master reads stale — the
+  conservative direction (a redundant re-register, never a stale cache trusted).
+- **Deferred (final review):** in native mode one group's `reference_stars` failure
+  fails the whole run, consistent with stage 5's existing policy but a new blast
+  radius since groups are otherwise independent — real data (Task 6) decides whether
+  it needs a per-group `fail_group` path.
+- **Deferred (final review):** `run.rs` is ≈ 13 000 lines after M4b — a
+  `stacking/register_stage.rs` extraction is due before M4c adds to stage 5.
+- **Deferred (final review):** `GroupsTable.tsx` hand-mirrors `SCALE_TOLERANCE = 1.25`.
+- **Deferred (final review):** `groups.rs::median_f64` duplicates `weights::median_of`.
+- **Deferred (final review):** `align.rs::gate_center` reconstructs the applied gate
+  from `expected` (exact for both producers today).
+- **Deferred (final review):** the dead `order.clamp` in
+  `plate_solve/storage.rs::sip_pair`.
+- **Deferred (final review):** `drizzle/geom.rs` imports through `geometry::linear::`
+  instead of the re-export.
+- **Deferred (final review):** coverage gaps — the 500-id chunk boundary of the
+  solve-scale query, a reference frame without a scale, a partially-scaled group.
+
 ### Stacking M4a — measurement seeds and the PSF fitter (2026-09-11)
 
 M4a (plan `docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`, rulings R-M4a-1…19): noise-relative measurement seeds (`measurement.detectionSigma`, calibrated to 20 on 368 external frames) with the reference's adaptive region and inner-region acceptance; the linear-fit rejection on the minimum-absolute-deviation line; the two-pass registration-reference pick; the LN row-evaluator weight table and borrowed reference planes; the XISF reader fixes; `PSF_FIT_VERSION` in both artifact hashes. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4a-acceptance-run.md`, run 13 on LDN 1272, 56 min): mono meets every target (fits 1.02/1.05/0.82 of the external tool's, PSFSW ρ 0.92, top-20 18/20, drizzle ratio equal to the external's to 0.6 %); rejected fractions 2.985 % / 2.733 % at the Auto 5.0/3.5 with `LINEAR_FIT_SIGMA_SCALE` left at 1.0; the two-pass pick switched the reference to the frame the owner had pinned by hand (`_0073`); LN 368/368 with no exclusions (the R-M4a-15 recompute confirmed against M2's numbers). Two residuals, both OSC, recorded below.
@@ -306,19 +351,7 @@ misses, both recorded below.
 - **Release-note lines owed** (drafted in the acceptance note §9): local
   normalization, the LN rejection option, camera-agnostic integration groups
   (below), the `Scale` column and the `LN: n/m` results line.
-- **M4 follow-up: plan-time pixel-scale warning.** Recorded as the FIRST
-  item of the M4 mixed-pixel-scales work (spec §15, ruling I4 option (a),
-  M2 final fix wave): today the ONLY defence against a foreign-pixel-scale
-  group member is registration's own per-frame scale gate (`[0.8, 1.25]` of
-  the reference, §3.6) — it drops such a frame one at a time with a visible
-  exclusion reason in the frames table; there is no plan-time signal naming
-  the group itself. The spec's earlier "M2 quick win" promise for this
-  blocker was never built (Task 10's own ruling was "no new gate" for the
-  camera-agnostic grouping cycle) — CLAUDE.md and spec §15 are corrected to
-  say so. M4 adds a WARNING (never a blocker, matching the missing-`EXPTIME`
-  cluster's own precedent) naming a group whose members' implied pixel
-  scales differ beyond the registration gate's tolerance, from `f.focallen`
-  and a new pixel-size column in `load_group_members` (`stacking/groups.rs`).
+
 ### Stacking M2 — camera-agnostic grouping (2026-09-10)
 
 M2 Task 10 (owner decision 2026-09-10): groups are now keyed by colour

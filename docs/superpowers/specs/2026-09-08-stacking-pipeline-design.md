@@ -1259,7 +1259,10 @@ Split into four plans, each with its own acceptance re-run:
 - **M4b — mixed pixel scales** (`docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`):
   the plan-gate scale-spread warning, a per-frame registration scale gate,
   WCS-seeded alignment across scales, and the co-registered / native modes
-  (§15 — owner requirement).
+  (§15 — owner requirement). Tasks 1–5 (per-frame scale + plan-time
+  warning, per-frame gate + WCS seed, native mode, cross-scale pins, docs
+  and the frames-table `WCS` chip) landed 2026-09-11; the acceptance run on
+  real mixed-scale sets is Task 6.
 - **M4c — rejection and registration algorithms** (`docs/superpowers/plans/2026-09-10-stacking-m4c-plan-algorithms.md`,
   incl. Task 0, the structure-map seed detector): ESD, RCR, min/max and
   large-scale rejection, the Winsorized-sigma reference re-pin, thin-plate-spline

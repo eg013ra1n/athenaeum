@@ -773,7 +773,37 @@ when both frames are solved (`register/wcs_seed.rs`, the `+wcs` model
 suffix on the row, R-M4b-3) and the quad seed whenever a solve is missing.
 The plan gate's per-group staleness in native mode follows each group's own
 reference as the last run recorded it in its `summary_json`
-(`plan.rs::summary_group_references`).
+(`plan.rs::summary_group_references`). The plan-time warning surfaces in the
+tab as `GroupsTable.tsx`'s `Scale` column: the group's own measured or
+header-implied scale (a `~` prefix marks a header-only member) plus a `×r`
+ratio badge whenever the group sits outside `[0.8, 1.25]` of the resolved
+reference (ruling R-M4b-7, `text-warning`, mirroring the backend's
+`SCALE_TOLERANCE` client-side); in `Auto` reference mode the plan resolves
+that reference scale from the LAST DONE run's own recorded reference frame
+when one exists, else the median scale of the largest group by frame count
+(ruling R-T1-1) — the same fallback order `compute_register_stale` already
+uses for staleness. The WCS-seed trigger (R-M4b-3) is ratio-based, not
+window-based: `wcs_seed::WCS_SEED_RATIO_EPS = 0.05` (rulings
+R-T2-1/R-T6-4) — on real catalog data one rig's own solve-to-solve scale
+jitter reaches 0.8–1.6 %, so a same-rig frame's implied ratio never crosses
+the 5 % floor and always takes the quad seed, while a genuine 5–25 %
+optical step (a different focal length or binning) still triggers the WCS
+hint; a triggered hint that confirms fewer than `MIN_INLIERS` pairs at its
+own `WCS_SEED_RADIUS_PX` (≥ 8 px) is discarded with a warning and falls
+back to the quad seed — the hint only ever accelerates, never replaces, the
+star-based confirmation. The frames table (`FramesTable.tsx`) renders the
+`+wcs` suffix on a row's `regModel` as a small muted `WCS` chip (title
+"seeded from the plate solves") next to the plain model text, rather than
+as part of the string. In native mode a Manual reference pin IS the
+run-level `stacking_runs.reference_frame_id` (ruling R-T3-2); every other
+group still auto-picks and two-pass-refines its own best-weighted member
+independently of the pin. **Correction (Task 3 fix round 2, ruling
+R-T3-3):** `SummaryGroup.reference_frame_id` is `Some` ONLY for a group
+whose master was actually WRITTEN, not merely one stage 5 attempted (the
+"fewer than 3 included frames" wording above understates it) — it stays
+`None` for a group that registered but then dropped below the member
+floor, failed integration, or was skipped at any stage, and for a summary
+written before M4b. **Acceptance run:** pending (Task 6).
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,integrate,
