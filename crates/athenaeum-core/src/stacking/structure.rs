@@ -1058,13 +1058,30 @@ mod tests {
         );
     }
 
-    /// (c) The 33-px high-pass is what keeps extended objects out: a 40-px
-    /// blob never reaches the structure map.
+    /// (c) An extended object is not a star, and the 33-px high-pass is the
+    /// defence that makes it so. Both halves are pinned: what the high-pass
+    /// leaves of a 40-px blob, and that nothing which survives it passes the
+    /// per-candidate rules.
     #[test]
     fn an_extended_blob_is_not_a_structure() {
-        let blob = [(256.0, 256.0, 300.0)];
+        const AMP: f64 = 300.0;
+        let blob = [(256.0, 256.0, AMP)];
         let mut d = gaussian_field(W, H, &blob, 40.0 / FWHM_TO_SIGMA, BG);
         add_noise(&mut d, NOISE, 23);
+        // ~10 % of the blob's peak survives the high-pass (30 ADU of 300,
+        // barely the binarization level, and it fragments into a handful of
+        // structures none of which is a star). Reading the filter's "size"
+        // as a FWHM instead of the reference's truncation convention would
+        // make the kernel 2.7× wider and leave 42 % — five times the level,
+        // as one solid 1358-px structure.
+        let filtered = prefilter::median3(&d, W, H);
+        let radius = (1 + (1 << DEFAULT_STRUCTURE_LAYERS)) / 2;
+        let low = blur_separable(&filtered, W, H, &gaussian_kernel(radius));
+        let residual = (filtered[256 * W + 256] - low[256 * W + 256]) as f64;
+        assert!(
+            residual < 0.15 * AMP,
+            "the high-pass must flatten an extended object: {residual} of {AMP}"
+        );
         let seeds = detect_structures(&d, W, H, &params());
         assert!(
             seeds.is_empty(),
