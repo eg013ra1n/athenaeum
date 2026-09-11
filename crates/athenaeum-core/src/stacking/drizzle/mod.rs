@@ -1937,4 +1937,90 @@ mod tests {
             out.stats.coverage[0]
         );
     }
+
+    // ── Cross-scale pin (M4b Task 4, ruling R-M4b-6): the SAME ×2
+    // registration map the resampler pin uses
+    // (`integration::registered_source::tests`) — a coarse subject
+    // drizzled onto a finer reference. The forward-mapped drop already
+    // handles any registration scale through the existing `PixelMap`/
+    // `geom::clip_area` machinery: at drizzle scale 1× the drop is a
+    // ~2×2 output-pixel footprint, ~4×4 at drizzle scale 2× (the ×2
+    // registration scale composed with the drizzle output scale) — no new
+    // code needed for mixed pixel scales. ──
+
+    #[test]
+    fn a_coarse_frame_drizzles_level_preserving_at_a_double_registration_scale() {
+        const SUB_W: usize = 200;
+        const SUB_H: usize = 150;
+        const REF_W: usize = 400;
+        const REF_H: usize = 300;
+        const LEVEL: f32 = 0.25;
+
+        // Subject → reference: the same pure ×2 registration scale as the
+        // resampler pin — no rotation, no translation.
+        let fwd = Linear {
+            kind: LinearKind::Affine,
+            m: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+
+        for &scale in &[1u32, 2u32] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = uniform(SUB_W, SUB_H, LEVEL);
+            let p0 = write_mono(dir.path(), "f0.fits", SUB_W, SUB_H, &data);
+            let map = PixelMap::linear(fwd).unwrap();
+            let weight = [1.0f64];
+            let pair = identity_pair();
+            let frames = [frame(&p0, &map, &weight, &pair)];
+            let measure = MeasureOptions::default();
+            let input = DrizzleInput {
+                frames: &frames,
+                width: REF_W,
+                height: REF_H,
+                channels: 1,
+                scale,
+                drop_shrink: 1.0, // exact quad, no shrink
+                kernel: DrizzleKernel::Square,
+                use_weights: true,
+                use_rejection: false,
+                use_local_normalization: false,
+                write_weight_map: true,
+                measure: &measure,
+                ram_total_bytes: None,
+            };
+
+            let out =
+                drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+
+            let out_w = REF_W * scale as usize;
+            let out_h = REF_H * scale as usize;
+            assert_eq!((out.width, out.height), (out_w, out_h));
+            let weight_map = out.weight.as_ref().expect("write_weight_map was on");
+
+            // "coverage 1.0 inside the mapped rectangle": every output
+            // pixel a couple of pixels in from every edge (clear of the
+            // subject's own domain boundary, where a drop's overshoot or
+            // shortfall can leave a partial-weight sliver) must have
+            // positive weight — the ×2-scaled drops gaplessly tile the
+            // reference exactly like an identity-map drizzle does.
+            let margin = 2usize;
+            let mut checked = 0usize;
+            for y in margin..out_h - margin {
+                for x in margin..out_w - margin {
+                    let idx = y * out_w + x;
+                    let w = weight_map[idx];
+                    assert!(w > 0.0, "scale={scale} x={x} y={y}: uncovered (W=0)");
+                    checked += 1;
+
+                    // "I/W = 0.25 within 1e-5 wherever W > 0" — level-
+                    // preserving across the ×2 registration scale.
+                    let v = out.data[idx] as f64;
+                    assert!(
+                        (v - LEVEL as f64).abs() < 1e-5,
+                        "scale={scale} x={x} y={y} v={v}"
+                    );
+                }
+            }
+            assert!(checked > 0, "scale={scale}: the interior region was empty");
+        }
+    }
 }

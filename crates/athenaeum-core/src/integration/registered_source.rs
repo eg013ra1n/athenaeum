@@ -561,4 +561,155 @@ mod tests {
         planes.decode_frame_into(0, &mut got);
         assert!(got.iter().all(|v| v.is_nan()));
     }
+
+    // ── Cross-scale pin (M4b Task 4, ruling R-M4b-6): a coarse subject
+    // registered onto a finer reference is up-sampled by this resampler's
+    // own inverse-mapped gather at the frame's OWN level — no new code is
+    // needed for mixed pixel scales, the existing `PixelMap`/`warp_rows`
+    // machinery already does the right thing "by construction". ──
+
+    #[test]
+    fn a_coarse_frame_registered_at_double_scale_upsamples_level_and_resolution() {
+        const SUB_W: usize = 200;
+        const SUB_H: usize = 150;
+        const REF_W: usize = 400;
+        const REF_H: usize = 300;
+        const LEVEL: f32 = 0.25;
+        const BG: f32 = 100.0;
+        const SIGMA_SUB: f64 = 1.5;
+        const STAR: (f64, f64, f64) = (100.0, 75.0, 5000.0);
+
+        // Subject → reference: a pure ×2 registration scale (no rotation, no
+        // translation) — a coarse frame registered onto a reference of
+        // twice the linear resolution, the same shape a real WCS-seeded
+        // mixed-pixel-scale registration produces.
+        let fwd = Linear {
+            kind: LinearKind::Affine,
+            m: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let map = PixelMap::linear(fwd).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) level: a uniform 0.25 subject, read through the ×2 map.
+        let flat = vec![LEVEL; SUB_W * SUB_H];
+        let flat_path = dir.path().join("flat.fits");
+        write_fits_f32(&flat_path, SUB_W, SUB_H, 1, &flat, &[]).unwrap();
+        let flat_src = RegisteredSource::open(
+            &[RegisteredFrame {
+                path: flat_path,
+                map: map.clone(),
+            }],
+            REF_W,
+            REF_H,
+            0,
+            Interpolation::BicubicBSpline,
+            0.3,
+        )
+        .unwrap();
+        let mut flat_planes = BandPlanes::new(&flat_src);
+        flat_src
+            .read_band_with_progress(
+                0,
+                REF_H,
+                &mut flat_planes,
+                1,
+                &|_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let mut flat_out = vec![0f32; REF_H * REF_W];
+        flat_planes.decode_frame_into(0, &mut flat_out);
+
+        // The subject's own last valid pixel (199, 149) maps to (398, 298)
+        // — the interior — leaving a one-pixel margin (x=399 or y=299,
+        // subject x/y = 199.5) that must read NaN, never a wrong level.
+        for y in 0..REF_H {
+            for x in 0..REF_W {
+                let v = flat_out[y * REF_W + x];
+                if x <= 2 * SUB_W - 2 && y <= 2 * SUB_H - 2 {
+                    assert!(
+                        (v - LEVEL).abs() < 1e-6,
+                        "interior ({x},{y}) v={v}, expected {LEVEL}"
+                    );
+                } else {
+                    assert!(v.is_nan(), "margin ({x},{y}) v={v}, expected NaN");
+                }
+            }
+        }
+
+        // (b) resolution follows the scale — no sharpening: a subject-space
+        // Gaussian of sigma 1.5 px, read through the same ×2 map, lands at
+        // twice the subject position with sigma ≈ 3.0 px.
+        let star_data = gaussian_field(SUB_W, SUB_H, &[STAR], SIGMA_SUB, BG);
+        let star_path = dir.path().join("star.fits");
+        write_fits_f32(&star_path, SUB_W, SUB_H, 1, &star_data, &[]).unwrap();
+        let star_src = RegisteredSource::open(
+            &[RegisteredFrame {
+                path: star_path,
+                map,
+            }],
+            REF_W,
+            REF_H,
+            0,
+            Interpolation::BicubicBSpline,
+            0.3,
+        )
+        .unwrap();
+        let mut star_planes = BandPlanes::new(&star_src);
+        star_src
+            .read_band_with_progress(
+                0,
+                REF_H,
+                &mut star_planes,
+                1,
+                &|_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let mut star_out = vec![0f32; REF_H * REF_W];
+        star_planes.decode_frame_into(0, &mut star_out);
+
+        let (ex, ey) = (2.0 * STAR.0, 2.0 * STAR.1);
+        let (cx, cy) = centroid(&star_out, REF_W, ex, ey, 15, BG);
+        assert!(
+            (cx - ex).abs() < 0.05 && (cy - ey).abs() < 0.05,
+            "centroid ({cx},{cy}) vs expected ({ex},{ey})"
+        );
+
+        // Second-moment sigma estimate: for an isotropic 2-D Gaussian,
+        // E[r²] over the background-subtracted flux equals 2·sigma² — a
+        // window 5× the expected reference sigma wide, so the < 0.1% tail
+        // left outside it is negligible.
+        let r = (5.0 * 2.0 * SIGMA_SUB).round() as i64;
+        let (icx, icy) = (ex.round() as i64, ey.round() as i64);
+        let (mut sxx, mut syy, mut sw) = (0.0f64, 0.0f64, 0.0f64);
+        for y in (icy - r)..=(icy + r) {
+            for x in (icx - r)..=(icx + r) {
+                let v = star_out[y as usize * REF_W + x as usize];
+                if !v.is_finite() {
+                    continue;
+                }
+                let val = (v - BG).max(0.0) as f64;
+                let (dx, dy) = (x as f64 - ex, y as f64 - ey);
+                sxx += val * dx * dx;
+                syy += val * dy * dy;
+                sw += val;
+            }
+        }
+        let sigma_ref = (((sxx + syy) / sw) / 2.0).sqrt();
+        let expected_sigma = 2.0 * SIGMA_SUB;
+        // 0.25 px covers the ~0.21 px this measures (the BicubicBSpline
+        // kernel is the SMOOTHING B-spline — it does not interpolate
+        // exactly through the source samples, see `stacking::ln::grid`'s
+        // module doc for the same kernel's documented smoothing bias — so a
+        // few percent of broadening on top of the pure ×2 scale is
+        // expected, not a defect); a swapped or missing scale factor would
+        // miss by whole pixels, not a fraction of one.
+        assert!(
+            (sigma_ref - expected_sigma).abs() < 0.25,
+            "measured sigma {sigma_ref} (2nd-moment estimator) vs expected {expected_sigma} \
+             (subject sigma {SIGMA_SUB} × the ×2 registration scale)"
+        );
+    }
 }
