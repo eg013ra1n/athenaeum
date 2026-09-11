@@ -44,12 +44,13 @@ pub fn scale_gate_for(frame_scale: Option<f64>, reference_scale: Option<f64>) ->
 /// The scale ratio [`scale_gate_for`] centres its window on: `frame /
 /// reference` when both scales are known, finite and positive, else 1.0.
 ///
-/// It is public because the WCS-seed trigger (ruling R-T2-1) has to read
-/// the SAME number the gate is built from — deciding "is a scale step
-/// expected here?" by comparing the resulting window against
+/// It is public because the WCS-seed trigger (rulings R-T2-1, R-T6-4) has
+/// to read the SAME number the gate is built from — deciding "is a scale
+/// step expected here?" by comparing the resulting window against
 /// `align::SCALE_RANGE` would be exact float equality on a quotient of two
-/// measured quantities, and two plate solves of one rig differ in the
-/// fourth digit. One rule, two readers, no way for them to disagree; see
+/// measured quantities, and two plate solves of one rig disagree by
+/// anything from a part in ten thousand to well over a percent. One rule,
+/// two readers, no way for them to disagree; see
 /// `wcs_seed::ratio_wants_seed` for the tolerance the trigger applies.
 pub fn scale_ratio_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -> f64 {
     match (frame_scale, reference_scale) {

@@ -39,22 +39,32 @@ pub const WCS_SEED_RADIUS_FACTOR: f64 = 4.0;
 /// confirmation stricter than the seed's own accuracy).
 pub const WCS_SEED_RADIUS_MIN_PX: f64 = 8.0;
 /// How far a frame's implied scale ratio to the reference must sit from 1
-/// before the seed is worth building at all (ruling R-T2-1).
+/// before the seed is worth building at all (rulings R-T2-1, R-T6-4).
 ///
-/// The ratio is a quotient of two MEASURED pixel scales — and
-/// `GroupFrame::pixel_scale_arcsec` prefers the stored plate solve, so two
-/// independent solves of one rig land a few parts in ten thousand apart.
-/// Triggering on `ratio != 1.0` exactly would therefore send every frame
-/// of an ordinary same-scale set down the WCS path, which is precisely the
-/// path the M1–M4a pins were measured without. `1e-3` sits two orders
-/// below [`super::SCALE_TOLERANCE`]'s 0.25 and two orders above that
-/// solve-to-solve jitter, so it separates "the same rig, measured twice"
-/// from "genuinely a different sampling" with room on both sides.
-pub const WCS_SEED_RATIO_EPS: f64 = 1e-3;
+/// The ratio is a quotient of two MEASURED pixel scales, and
+/// `GroupFrame::pixel_scale_arcsec` prefers the stored plate solve, so the
+/// number moves between two solves of the SAME rig. Triggering on
+/// `ratio != 1.0` exactly would send every frame of an ordinary same-scale
+/// set down the WCS path — precisely the path M1–M4a's pins were measured
+/// without — so the trigger needs a tolerance, and the tolerance has to be
+/// bigger than that jitter actually is.
+///
+/// Measured on the owner's catalog (2026-09-11, 1 781 plate-solved lights):
+/// within one rig the solved scale scatters around its median with a
+/// median deviation of 1e-4–3e-4, but the tails run to 0.8–1.6 % — on the
+/// M4a acceptance set alone, 120 of 368 frames sit beyond 1e-3 of their
+/// own set's median, and one beyond 1e-2. Nothing anywhere in the catalog
+/// reached 5e-2. `0.05` is therefore ≈ 3× above the measured tail and 5×
+/// below the [`super::SCALE_TOLERANCE`] step (1.25) that defines a foreign
+/// scale in the first place: a same-rig frame never trips it, and a real
+/// 5–25 % optical step still gets the seed — which would be harmless even
+/// if it did not, since the seed is only ever an accelerator the aligner
+/// confirms against stars before trusting.
+pub const WCS_SEED_RATIO_EPS: f64 = 0.05;
 
 /// Whether a frame whose implied scale ratio to the reference is `ratio`
-/// is worth attempting a plate-solve seed for (ruling R-T2-1). See
-/// [`WCS_SEED_RATIO_EPS`]; a non-finite ratio is never worth it.
+/// is worth attempting a plate-solve seed for (rulings R-T2-1, R-T6-4).
+/// See [`WCS_SEED_RATIO_EPS`]; a non-finite ratio is never worth it.
 pub fn ratio_wants_seed(ratio: f64) -> bool {
     ratio.is_finite() && (ratio - 1.0).abs() > WCS_SEED_RATIO_EPS
 }
@@ -236,16 +246,35 @@ mod tests {
         assert!(WCS_SEED_SCALE_RANGE.0 > 0.0 && WCS_SEED_SCALE_RANGE.1 > WCS_SEED_SCALE_RANGE.0);
     }
 
-    /// Ruling R-T2-1: two solves of the SAME rig differ in the fourth or
-    /// fifth digit and must not be read as a scale step; a real one must.
+    /// Rulings R-T2-1 and R-T6-4: two solves of the SAME rig disagree —
+    /// typically in the fourth digit, but out to 1.6 % in the measured
+    /// tail — and none of that may be read as a scale step. A real one
+    /// must be. The tolerance is 5 %: ≈ 3× above that tail, 5× below the
+    /// 1.25 gate that defines a foreign scale.
     #[test]
     fn only_a_real_scale_step_wants_a_seed() {
-        assert_eq!(WCS_SEED_RATIO_EPS, 1e-3);
-        for same in [1.0, 0.7800 / 0.7803, 0.7803 / 0.7800, 1.0004, 0.9995] {
-            assert!(!ratio_wants_seed(same), "{same} is the same sampling");
+        assert_eq!(WCS_SEED_RATIO_EPS, 0.05);
+        for same in [
+            1.0,
+            0.7800 / 0.7803,
+            1.0004,
+            0.9995,
+            1.0011,
+            // The measured same-rig tail (2026-09-11, the owner's catalog).
+            1.016,
+            1.02,
+            0.98,
+        ] {
+            assert!(
+                !ratio_wants_seed(same),
+                "R-T6-4: {same} is one rig measured twice, not a scale step"
+            );
         }
-        for stepped in [2.0, 0.5, 1.27, 0.79, 1.0011] {
-            assert!(ratio_wants_seed(stepped), "{stepped} is a real step");
+        for stepped in [1.06, 1.27, 0.79, 2.0, 0.5] {
+            assert!(
+                ratio_wants_seed(stepped),
+                "R-T6-4: {stepped} is a real sampling step"
+            );
         }
         assert!(!ratio_wants_seed(f64::NAN));
         assert!(!ratio_wants_seed(f64::INFINITY));

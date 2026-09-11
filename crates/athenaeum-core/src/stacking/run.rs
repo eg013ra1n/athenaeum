@@ -2745,17 +2745,18 @@ fn solve_of(
 /// scale window it is judged against, and the optional plate-solve seed.
 ///
 /// The seed is only built when the frame's own implied ratio to the
-/// reference says a real scale step is expected — ruling R-T2-1, the
-/// [`ratio_wants_seed`] tolerance. Comparing the resulting WINDOW against
-/// `align::SCALE_RANGE` instead would be exact float equality on a
-/// quotient of two MEASURED pixel scales: `GroupFrame::pixel_scale_arcsec`
-/// prefers the stored plate solve, two solves of one rig differ in the
-/// fourth digit, and every frame of an ordinary same-scale set would take
-/// the WCS path — exactly the path M1–M4a's pins were measured without.
-/// Below the tolerance a same-scale set therefore makes no solve lookups
-/// and produces no hint, and the cross-scale case is the only one that
-/// pays for the seed. The gate itself stays centred on the exact ratio
-/// either way — the tolerance decides only whether a seed is worth
+/// reference says a real scale step is expected — rulings R-T2-1 and
+/// R-T6-4, the [`ratio_wants_seed`] tolerance. Comparing the resulting
+/// WINDOW against `align::SCALE_RANGE` instead would be exact float
+/// equality on a quotient of two MEASURED pixel scales:
+/// `GroupFrame::pixel_scale_arcsec` prefers the stored plate solve, two
+/// solves of one rig disagree (typically in the fourth digit, out to 1.6 %
+/// in the measured tail), and every frame of an ordinary same-scale set
+/// would take the WCS path — exactly the path M1–M4a's pins were measured
+/// without. Below the tolerance a same-scale set therefore makes no solve
+/// lookups and produces no hint, and the cross-scale case is the only one
+/// that pays for the seed. The gate itself stays centred on the exact
+/// ratio either way — the tolerance decides only whether a seed is worth
 /// building, never how the frame is judged.
 ///
 /// Both passes of stage 5 go through here — the dry two-pass run and the
@@ -8521,9 +8522,11 @@ mod tests {
     }
 
     /// What three independent solves of ONE rig look like: the same
-    /// sampling, measured to the fourth digit (ruling R-T2-1). The first
-    /// is [`FINE_SCALE_ARCSEC`] itself, since `fine_ids[0]` is the pinned
-    /// reference every ratio is taken against.
+    /// sampling, disagreeing in the fourth digit (rulings R-T2-1,
+    /// R-T6-4 — the measured median deviation; that ruling's tolerance
+    /// covers the 1.6 % tail too). The first is [`FINE_SCALE_ARCSEC`]
+    /// itself, since `fine_ids[0]` is the pinned reference every ratio is
+    /// taken against.
     const FINE_SOLVED_SCALES: [f64; 3] = [FINE_SCALE_ARCSEC, 0.7803, 0.7801];
 
     /// M4b Task 2 (rulings R-M4b-2/3): frames whose own pixel scale is
