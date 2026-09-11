@@ -314,12 +314,18 @@ pub enum StackingPreset {
 /// drizzle stage did not exist yet; both landed (M2's acceptance run, this
 /// plan's own Tasks 1-4) and pass with the SAME preset config, so the
 /// preset no longer needs to hide them.
+///
+/// `FastPreview` (M4a Task 4, ruling R-M4a-18) turns the two-pass reference
+/// pick OFF: the dry pass is a whole extra registration of the reference's
+/// group, and a preset whose entire promise is "fast" must not pay for a
+/// refinement a preview does not need.
 pub fn preset(p: StackingPreset) -> StackingConfig {
     match p {
         StackingPreset::Default => StackingConfig::default(),
         StackingPreset::FastPreview => {
             let mut c = StackingConfig::default();
             c.registration.interpolation = Interpolation::Bilinear;
+            c.reference.two_pass = false;
             c.integration.rejection = RejectionChoice::SigmaClip {
                 sigma_low: 4.0,
                 sigma_high: 3.0,
@@ -679,6 +685,9 @@ mod tests {
             }
         );
         assert_eq!(f.output.cleanup, CleanupPolicy::DeleteIntermediates);
+        // M4a Task 4, ruling R-M4a-18: a "fast" preset does not pay for the
+        // two-pass reference's dry registration pass.
+        assert!(!f.reference.two_pass);
         let m = preset(StackingPreset::MaximumQuality);
         assert_eq!(m.registration.distortion, DistortionChoice::Polynomial3);
         assert!(m.integration.write_rejection_maps);
@@ -688,7 +697,11 @@ mod tests {
         assert!(m.normalization.local.enabled);
         assert!(m.drizzle.enabled);
         assert_eq!(m.drizzle.scale, 2);
+        // …and the quality preset keeps the two-pass pick the default
+        // already has: only FastPreview opts out (R-M4a-18).
+        assert!(m.reference.two_pass);
         assert_eq!(preset(StackingPreset::Default), StackingConfig::default());
+        assert!(preset(StackingPreset::Default).reference.two_pass);
     }
 
     #[test]

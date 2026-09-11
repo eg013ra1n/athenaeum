@@ -889,6 +889,21 @@ fn run_thread(mut rc: RunContext) {
     let set_id = rc.set_id;
     let run_started = Instant::now();
 
+    // The de-registration itself is RAII (M4a Task 4 fix round 1, item 1):
+    // declared first, so it drops LAST — after `finish_run`, the provenance
+    // snapshot, the rejection-bitmap cleanup and the `stacking-complete`
+    // event — which is the ordering the tail needs (see this function's own
+    // doc), and it still happens if any of those panics. An explicit
+    // removal at the tail would have been skipped by such a panic, leaking
+    // the handle: `heal_interrupted_runs` only heals rows ABSENT from
+    // `active_stacks`, so every later `start_stacking` for that set would
+    // answer `Conflict` until the process restarted — the same failure mode
+    // [`StartStackingGuard`] exists to prevent on the setup path.
+    let _handle = RunHandleGuard {
+        ctx: rc.ctx.clone(),
+        run_id,
+    };
+
     let result =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pipeline(&mut rc))) {
             Ok(r) => r,
@@ -1035,20 +1050,38 @@ fn run_thread(mut rc: RunContext) {
         },
     );
 
-    // De-register LAST (M4a Task 4). `active_stacks` is what every observer
-    // — `start_stacking`'s double-start refusal, `cancel_stacking`, and the
-    // tests' own `wait_for_run` — reads as "is this run still in flight?",
-    // so the entry has to outlive everything the run still has to do:
-    // `runs/run-<id>.json`, the rejection-bitmap cleanup above, and the
-    // `stacking-complete` event. It used to be removed right after
-    // `finish_run`, which made "the run is gone from the registry" mean
-    // only "the DB row is final" — an observer that then looked at the
-    // provenance file or the working folder could legitimately find the run
-    // still writing them. The cost of holding it a few ms longer is that a
-    // cancel arriving in that window sets a flag nobody reads any more, and
-    // a new run for the same set queued in that window is refused — both
-    // already true for the whole `finish_run`-to-removal gap.
-    rc.ctx.active_stacks.lock().unwrap().remove(&run_id);
+    // `_handle`'s `Drop` de-registers the run from `active_stacks` here, as
+    // the last thing the thread does — see its construction at the top.
+}
+
+/// De-registers a running stack from [`ServiceContext::active_stacks`] when
+/// [`run_thread`] ends, however it ends (M4a Task 4 fix round 1, item 1).
+///
+/// `active_stacks` is what every observer — `start_stacking`'s double-start
+/// refusal, [`cancel_stacking`], `heal_interrupted_runs`, and the tests' own
+/// `wait_for_run` — reads as "is this run still in flight?", so the entry
+/// has to outlive everything the run still has to do: `finish_run`,
+/// `runs/run-<id>.json`, the rejection-bitmap cleanup and the
+/// `stacking-complete` event. The removal used to sit right after
+/// `finish_run`, which made "gone from the registry" mean only "the DB row
+/// is final" — an observer that then looked at the provenance file or the
+/// working folder could legitimately find the run still writing them. The
+/// cost of holding the entry those few extra ms is that a cancel arriving
+/// in the window sets a flag nobody reads any more, and a new run for the
+/// same set queued in the window is refused — both already true for the
+/// whole `finish_run`-to-removal gap this replaces.
+///
+/// Owns an `Arc<ServiceContext>` clone rather than borrowing `rc.ctx`: the
+/// guard has to outlive the `&mut rc` the pipeline call takes.
+struct RunHandleGuard {
+    ctx: Arc<ServiceContext>,
+    run_id: i64,
+}
+
+impl Drop for RunHandleGuard {
+    fn drop(&mut self) {
+        self.ctx.active_stacks.lock().unwrap().remove(&self.run_id);
+    }
 }
 
 /// The whole pipeline, run in order. Queue admission happens FIRST (ruling
@@ -2425,12 +2458,17 @@ fn included_count_of(rc: &RunContext, group_key: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// One frame's outcome from a single [`register_group_pass`] over one
+/// One frame's outcome from a single DRY [`register_group_pass`] over one
 /// group: the entry index into that group's `RunContext::measured` vector,
 /// the frame id, and either the alignment's `(rotation_deg, translation)`
-/// or the failure text. Only the frames the pass actually REGISTERED appear
-/// here — a persisting pass's cache reuses do not (nothing reads them, and
-/// the dry pass never consults the cache at all).
+/// or the failure text.
+///
+/// Only a `persist = false` pass produces these; a persisting pass returns
+/// an EMPTY vector, because it records each frame's outcome where the rest
+/// of the run reads it (`registration_results` and
+/// `MeasuredFrame::registration`) and nothing wants a second copy. Pinned
+/// by `a_dry_register_pass_writes_no_rows_and_no_outcomes`.
+#[derive(Debug)]
 struct PassResult {
     idx: usize,
     frame_id: i64,
@@ -2928,64 +2966,108 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
                     match picked {
                         Some((new_frame_id, new_filename, Some(new_calibrated), new_weight)) => {
                             let old = reference_frame_id;
-                            let new_group_frame = find_frame_in_groups(
-                                &rc.plan_groups,
-                                new_frame_id,
-                            )
-                            .ok_or_else(|| {
-                                RunError::Other(
-                                    "the re-picked reference frame is not in any group".to_string(),
-                                )
-                            })?;
-                            let new_ref_stars = {
-                                let pool_ref = &rc.ctx.image_pool;
-                                reference_stars(&new_calibrated, &cfg.registration, Some(pool_ref))
-                                    .map_err(|e| {
-                                        RunError::Other(format!(
-                                            "reference star detection failed: {e}"
-                                        ))
-                                    })?
-                            };
-                            let new_hash = {
-                                let conn = db(&rc.ctx)?.conn();
-                                rc.memo
-                                    .calibration_hash_checked(&conn, &cfg, &new_group_frame)?
-                            };
-                            {
-                                let conn = db(&rc.ctx)?.conn();
-                                set_run_reference(
-                                    &conn,
-                                    rc.run_id,
-                                    new_frame_id,
-                                    reference_mode_wire(cfg.reference.mode),
-                                )?;
+
+                            // Everything the switch needs from the chosen
+                            // frame, resolved before anything is mutated —
+                            // and DEGRADING, not fatal (fix round 1, item
+                            // 4). A switch is an improvement, never a
+                            // requirement: the current reference is already
+                            // resolved, already star-detected and perfectly
+                            // usable, so a frame whose calibrated file went
+                            // away or turned unreadable between the dry
+                            // pass and here must cost the run its
+                            // refinement, not its master. Every failure
+                            // below therefore falls through to the same
+                            // "keeping the current reference" warn as the
+                            // two sibling no-op paths above.
+                            //
+                            // No test forces this branch: the dry pass read
+                            // THIS SAME calibrated file through the same
+                            // `read_luminance` moments earlier, so the only
+                            // window is a genuine race (the working folder
+                            // swept, a volume unmounted, an SMB hiccup)
+                            // that no in-process fixture can open without a
+                            // fault-injection hook. It is guarded, logged
+                            // and non-fatal by construction instead.
+                            let prepared: Result<(ReferenceStars, String), String> =
+                                match find_frame_in_groups(&rc.plan_groups, new_frame_id) {
+                                    None => Err("it is not in any plan group".to_string()),
+                                    Some(new_group_frame) => {
+                                        let stars = {
+                                            let pool_ref = &rc.ctx.image_pool;
+                                            reference_stars(
+                                                &new_calibrated,
+                                                &cfg.registration,
+                                                Some(pool_ref),
+                                            )
+                                            .map_err(|e| format!("its star detection failed: {e}"))
+                                        };
+                                        match stars {
+                                            Err(e) => Err(e),
+                                            Ok(new_ref_stars) => {
+                                                let conn = db(&rc.ctx)?.conn();
+                                                match rc.memo.calibration_hash_checked(
+                                                    &conn,
+                                                    &cfg,
+                                                    &new_group_frame,
+                                                ) {
+                                                    Ok(new_hash) => Ok((new_ref_stars, new_hash)),
+                                                    Err(e) => Err(format!(
+                                                        "its calibration hash is unresolvable: {e}"
+                                                    )),
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+
+                            match prepared {
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        run_id = rc.run_id,
+                                        frame_id = new_frame_id,
+                                        reason = %reason,
+                                        "the two-pass pick chose a frame the run cannot adopt; keeping the current reference"
+                                    );
+                                }
+                                Ok((new_ref_stars, new_hash)) => {
+                                    {
+                                        let conn = db(&rc.ctx)?.conn();
+                                        set_run_reference(
+                                            &conn,
+                                            rc.run_id,
+                                            new_frame_id,
+                                            reference_mode_wire(cfg.reference.mode),
+                                        )?;
+                                    }
+
+                                    reference_frame_id = new_frame_id;
+                                    ref_stars = new_ref_stars;
+                                    reference_hash = new_hash;
+                                    rc.reference_width = ref_stars.width;
+                                    rc.reference_height = ref_stars.height;
+                                    rc.reference_frame_id = Some(new_frame_id);
+                                    rc.reference_calibrated = Some(new_calibrated);
+                                    rc.summary.reference.frame_id = Some(new_frame_id);
+                                    rc.summary.reference.filename = Some(new_filename);
+                                    rc.summary.reference.weight = new_weight;
+                                    rc.summary.reference.switched_from = Some(old);
+
+                                    tracing::info!(
+                                        run_id = rc.run_id,
+                                        from = old,
+                                        to = new_frame_id,
+                                        corner_px_before,
+                                        corner_px_after,
+                                        "reference switched by the two-pass pick"
+                                    );
+                                    rc.warnings.push(format!(
+                                        "reference switched by the two-pass pick: {old} → \
+                                         {new_frame_id} (corner displacement \
+                                         {corner_px_before:.1} → {corner_px_after:.1} px)"
+                                    ));
+                                }
                             }
-
-                            reference_frame_id = new_frame_id;
-                            ref_stars = new_ref_stars;
-                            reference_hash = new_hash;
-                            rc.reference_width = ref_stars.width;
-                            rc.reference_height = ref_stars.height;
-                            rc.reference_frame_id = Some(new_frame_id);
-                            rc.reference_calibrated = Some(new_calibrated);
-                            rc.summary.reference.frame_id = Some(new_frame_id);
-                            rc.summary.reference.filename = Some(new_filename);
-                            rc.summary.reference.weight = new_weight;
-                            rc.summary.reference.switched_from = Some(old);
-
-                            tracing::info!(
-                                run_id = rc.run_id,
-                                from = old,
-                                to = new_frame_id,
-                                corner_px_before,
-                                corner_px_after,
-                                "reference switched by the two-pass pick"
-                            );
-                            rc.warnings.push(format!(
-                                "reference switched by the two-pass pick: {old} → {new_frame_id} \
-                                 (corner displacement {corner_px_before:.1} → \
-                                 {corner_px_after:.1} px)"
-                            ));
                         }
                         _ => {
                             tracing::warn!(
@@ -7300,6 +7382,120 @@ mod tests {
         );
     }
 
+    /// Fix round 1, item 3 — the discriminating pin for the dry pass.
+    /// `upsert_registration` is `INSERT OR REPLACE`, so a run-level "pass 1
+    /// persisted nothing" assertion cannot tell a dry pass that wrote no
+    /// row from one whose rows pass 2 simply overwrote. This drives
+    /// [`register_group_pass`] DIRECTLY, both ways, over the same context:
+    /// with `persist = false` the `registration_results` table stays EMPTY
+    /// and no entry carries a registration outcome; the very next call with
+    /// `persist = true` produces both.
+    #[test]
+    fn a_dry_register_pass_writes_no_rows_and_no_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, fixture, light_ids, mut rc, _working, _output) =
+            two_pass_context(&tmp, StackingConfig::default());
+
+        // Everything `stage_register` resolves before its own group loop.
+        let cfg = rc.config.clone();
+        let group = rc.plan_groups[0].clone();
+        let reference_frame_id = rc.reference_frame_id.unwrap();
+        let reference_calibrated = rc.reference_calibrated.clone().unwrap();
+        let ref_stars = reference_stars(
+            &reference_calibrated,
+            &cfg.registration,
+            Some(&rc.ctx.image_pool),
+        )
+        .unwrap();
+        rc.reference_width = ref_stars.width;
+        rc.reference_height = ref_stars.height;
+        let reference_group_frame =
+            find_frame_in_groups(&rc.plan_groups, reference_frame_id).unwrap();
+        let reference_hash = {
+            let conn = db(&rc.ctx).unwrap().conn();
+            rc.memo
+                .calibration_hash_checked(&conn, &cfg, &reference_group_frame)
+                .unwrap()
+        };
+        // No stored rows exist yet, so the cache map is empty either way —
+        // the point here is what the pass WRITES, not what it reuses.
+        let by_frame: HashMap<i64, RegistrationRecord> = HashMap::new();
+        assert!(
+            get_registration_for_frame_set(&fixture.conn, fixture.set_id)
+                .unwrap()
+                .is_empty(),
+            "premise: nothing registered before this test runs"
+        );
+
+        let mut progress = (0usize, light_ids.len() * 2);
+        let dry = register_group_pass(
+            &mut rc,
+            &group,
+            &ref_stars,
+            reference_frame_id,
+            &reference_hash,
+            &by_frame,
+            false,
+            false,
+            &mut progress,
+        )
+        .unwrap();
+
+        assert_eq!(
+            dry.len(),
+            light_ids.len(),
+            "the dry pass reports every frame it registered: {dry:?}"
+        );
+        assert!(
+            dry.iter().all(|r| r.outcome.is_ok()),
+            "the fixture aligns every frame: {dry:?}"
+        );
+        assert!(
+            get_registration_for_frame_set(&fixture.conn, fixture.set_id)
+                .unwrap()
+                .is_empty(),
+            "a dry pass must write no registration_results row"
+        );
+        assert!(
+            rc.measured[&group.key]
+                .iter()
+                .all(|e| e.registration.is_none()),
+            "a dry pass must store no per-frame registration outcome"
+        );
+        assert_eq!(
+            progress.0,
+            light_ids.len(),
+            "the dry pass still ticks the shared Register progress"
+        );
+
+        // The same call with `persist = true`, on the SAME context: now the
+        // rows and the per-frame outcomes appear.
+        let wet = register_group_pass(
+            &mut rc,
+            &group,
+            &ref_stars,
+            reference_frame_id,
+            &reference_hash,
+            &by_frame,
+            false,
+            true,
+            &mut progress,
+        )
+        .unwrap();
+
+        assert!(
+            wet.is_empty(),
+            "a persisting pass records its outcomes where the run reads them, \
+             and returns none of its own: {wet:?}"
+        );
+        let rows = get_registration_for_frame_set(&fixture.conn, fixture.set_id).unwrap();
+        assert_eq!(rows.len(), light_ids.len(), "{rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.is_reference).count(), 1);
+        assert!(rc.measured[&group.key]
+            .iter()
+            .all(|e| e.registration.is_some()));
+        assert_eq!(progress.0, light_ids.len() * 2);
+    }
     /// The same fixture with the toggle off: nothing re-picks, frame A
     /// stays the reference, no warning is added and no switch is recorded.
     #[test]

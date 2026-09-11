@@ -3651,6 +3651,7 @@ mod tests {
             plan_off.stale_stages
         );
     }
+
     /// Final fix wave item 3, scenario (d): with no previous run at all,
     /// Register is always stale — nothing to compare against, regardless of
     /// reference mode.

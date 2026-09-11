@@ -91,6 +91,14 @@ export function ProvenanceModal({ summary, onClose }: ProvenanceModalProps) {
               {' · '}
               {summary.reference.mode === 'manual' ? 'manual selection' : 'auto (highest weight)'}
               {summary.reference.weight != null ? ` · weight ${summary.reference.weight.toFixed(3)}` : ''}
+              {/* M4a Task 4 (ruling R-M4a-5): stage 5's dry pass re-picked
+               *  the reference, so the frame above is NOT the one the
+               *  highest weight chose — provenance has to say which was.
+               *  `switchedFrom` is null on every run that kept its first
+               *  pick, the same guard `ResultsPanel.tsx` uses. */}
+              {summary.reference.switchedFrom != null
+                ? ` · switched from #${summary.reference.switchedFrom} (two-pass)`
+                : ''}
             </p>
             <p className="text-xs text-content-muted">
               Seed source: {summary.measurement.seedSource} · scale estimator: {summary.measurement.scaleEstimator}

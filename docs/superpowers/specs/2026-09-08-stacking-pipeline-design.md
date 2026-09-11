@@ -771,7 +771,9 @@ paths:         { workingDir: null, outputDir: null }     -- null = the global de
 Precedence: set config (`stacking_set_config`) > global defaults (settings key
 `stacking.defaults`, JSON) > built-in defaults. Presets are built-in
 transforms of the config: **Default** (above), **Fast preview** (bilinear,
-sigma clip 4.0/3.0, LN off, drizzle off, `deleteIntermediates`), **Maximum
+sigma clip 4.0/3.0, LN off, drizzle off, `twoPass` off — ruling R-M4a-18: a
+preset whose promise is "fast" does not pay for the dry registration pass,
+§4.4 — `deleteIntermediates`), **Maximum
 quality** (bicubic B-spline, polynomial-3 distortion, LN on, drizzle 2×,
 rejection maps written). Editing any field makes the preset **Custom**. Settings → Stacking edits the
 global defaults with the same inspector forms and holds the default folders
