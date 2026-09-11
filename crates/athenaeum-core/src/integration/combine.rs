@@ -15,6 +15,7 @@
 //! `PercentileClip` = Average+PercentileClip — pinned bit-for-bit by the tests.
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 
 /// A stack element the rejection routines can order and read: the plain
 /// sample for master builds, a `(value, frame index)` pair for the
@@ -105,10 +106,12 @@ pub enum Rejection {
     /// recipe): a winsorized location/scale estimate, then reject original
     /// samples outside [m − sigma_low·s, m + sigma_high·s].
     WinsorizedSigma { sigma_low: f64, sigma_high: f64 },
-    /// Least-squares line fit over (rank, value); reject samples whose
-    /// residual falls outside [−sigma_low·d, +sigma_high·d] where d is the
-    /// mean absolute deviation of the residuals; refit and repeat until
-    /// stable. PI-recommended for larger sets with drifting illumination.
+    /// Minimum-absolute-deviation ("robust") line fit over (rank, value);
+    /// reject samples whose residual falls outside [−sigma_low·d,
+    /// +sigma_high·d] where d is [`LINEAR_FIT_SIGMA_SCALE`] times twice the
+    /// mean absolute deviation of the residuals from that line; refit and
+    /// repeat until stable. PI-recommended for larger sets with drifting
+    /// illumination.
     LinearFitClip { sigma_low: f64, sigma_high: f64 },
 }
 
@@ -477,6 +480,161 @@ fn reject_winsorized<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
     (w, true)
 }
 
+/// Dispersion-scale knob for [`Rejection::LinearFitClip`]: the rejection band
+/// half-width is `sigma_low`/`sigma_high` multiples of
+/// `s = LINEAR_FIT_SIGMA_SCALE * 2 * adev` (`adev` = mean absolute deviation
+/// of the residuals from the fitted line — spec §6.3, math reference §3.4).
+/// Empirical, calibrated by the M4a acceptance run (ruling R-M4a-4): with the
+/// least-squares line the M2 acceptance run measured 0.83 %/0.74 % rejected
+/// at the Auto 5.0/3.5 thresholds on the LDN 1272 set, against the reference
+/// implementation's 2.5–2.8 %. Switching to the minimum-absolute-deviation
+/// line (below) closes most of that gap on its own; this constant is the one
+/// knob left to tune the remainder to the 2.3–3.3 % acceptance target — this
+/// commit leaves it at the neutral `1.0`, so a future re-tune is a one-line
+/// diff away, not a re-derivation.
+pub const LINEAR_FIT_SIGMA_SCALE: f64 = 1.0;
+
+thread_local! {
+    // `reject_linear_fit`'s per-outer-iteration f64 copy of the current
+    // survivor values, and `medfit_line`'s own residual scratch (used to
+    // take the median of `y − b·x` at each trial slope during
+    // bracketing/bisection). Both cleared and reused per call — this
+    // rejection runs inside the per-pixel band loop, so a fresh `Vec` per
+    // pixel is not acceptable.
+    static LINEAR_FIT_VALUE_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+    static MEDFIT_RESIDUAL_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+}
+
+#[inline]
+fn robust_sign(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// Median of an ascending-sorted `f64` slice (plain, not the `Sample`-generic
+/// [`median_sorted`] — `medfit_line`'s working values are already `f64`).
+fn median_sorted_f64(v: &[f64]) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+/// Minimum-absolute-deviation line `y = a + b·i` over `values[i]` (math
+/// reference §3.4): the classic median/bisection method. Seeds the search
+/// from the least-squares line and its slope standard error `σ_b`, then
+/// walks the slope that zeroes the residual-sign functional
+/// `f(b) = Σ x_i · sgn(y_i − median(y − b·x) − b·x_i)` by bracketing a sign
+/// change and bisecting to it; the intercept is the median of the residuals
+/// at the converged slope. A single extreme sample drags a least-squares
+/// line toward itself, shrinking its own residual and starving the whole
+/// stack's rejection — the median-based line does not move for it.
+///
+/// Never panics on degenerate input: fewer than 2 samples, a zero-dispersion
+/// (perfect-line) fit, or a sign functional that cannot be bracketed within
+/// 32 widenings all fall back to the least-squares line.
+pub(crate) fn medfit_line(values: &[f64]) -> (f64, f64) {
+    let n = values.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    if n == 1 {
+        return (values[0], 0.0);
+    }
+    let nf = n as f64;
+    let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+    for (i, &y) in values.iter().enumerate() {
+        let x = i as f64;
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    // del = n·Σ(x − x̄)², strictly positive for n >= 2 distinct ranks.
+    let del = nf * sxx - sx * sx;
+    if del.abs() <= f64::EPSILON {
+        return (sy / nf, 0.0); // unreachable for distinct ranks; guard only
+    }
+    let b_ls = (nf * sxy - sx * sy) / del;
+    let a_ls = (sy - b_ls * sx) / nf;
+    let mut chisq = 0.0;
+    for (i, &y) in values.iter().enumerate() {
+        let resid = y - (a_ls + b_ls * i as f64);
+        chisq += resid * resid;
+    }
+    let sigma_b = (chisq / del).sqrt();
+    if !(sigma_b > 0.0) {
+        // Zero residual dispersion (an exact line): the LS line already IS
+        // the robust line, and the bracket below would be degenerate.
+        return (a_ls, b_ls);
+    }
+
+    MEDFIT_RESIDUAL_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let mut rofunc = |b: f64| -> (f64, f64) {
+            scratch.clear();
+            scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
+            scratch.sort_unstable_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+            let a = median_sorted_f64(&scratch);
+            let mut sum = 0.0;
+            for (i, &y) in values.iter().enumerate() {
+                let resid = y - (a + b * i as f64);
+                if resid > 0.0 {
+                    sum += i as f64;
+                } else if resid < 0.0 {
+                    sum -= i as f64;
+                }
+            }
+            (sum, a)
+        };
+
+        let mut b1 = b_ls;
+        let (mut f1, _) = rofunc(b1);
+        let mut b2 = b_ls + 3.0 * sigma_b * robust_sign(f1);
+        let (mut f2, _) = rofunc(b2);
+
+        let mut widenings = 0u32;
+        while f1 * f2 > 0.0 && widenings < 32 {
+            b2 = b1 + 2.0 * (b2 - b1);
+            f2 = rofunc(b2).0;
+            widenings += 1;
+        }
+        if f1 * f2 > 0.0 {
+            // Could not bracket a sign change of f — degenerate residual
+            // landscape; the least-squares line is the least-bad fallback.
+            return (a_ls, b_ls);
+        }
+
+        let tol = 1e-3 * sigma_b;
+        let mut iters = 0u32;
+        while (b2 - b1).abs() >= tol && iters < 60 {
+            let bb = 0.5 * (b1 + b2);
+            if bb == b1 || bb == b2 {
+                break; // no floating-point progress left
+            }
+            let (fb, _) = rofunc(bb);
+            if fb * f1 >= 0.0 {
+                b1 = bb;
+                f1 = fb;
+            } else {
+                b2 = bb;
+            }
+            iters += 1;
+        }
+        let b = 0.5 * (b1 + b2);
+        let (_, a) = rofunc(b);
+        (a, b)
+    })
+}
+
 fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
@@ -484,73 +642,72 @@ fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
     }
     sort_asc(values);
     let mut kept = n;
-    for _ in 0..MAX_REJECTION_ITERS {
-        let k = kept;
-        if k < 2 {
-            break;
-        }
-        // Least-squares line y = a + b·i over (rank i, value) for i in 0..k.
-        let kf = k as f64;
-        let (mut sx, mut sy, mut sxx, mut sxy, mut sabs_y) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        for i in 0..k {
-            let x = i as f64;
-            let y = values[i].value() as f64;
-            sx += x;
-            sy += y;
-            sxx += x * x;
-            sxy += x * y;
-            sabs_y += y.abs();
-        }
-        let denom = kf * sxx - sx * sx;
-        if denom.abs() <= f64::EPSILON {
-            break; // degenerate — can't fit a line
-        }
-        let b = (kf * sxy - sx * sy) / denom;
-        let a = (sy - b * sx) / kf;
-        // Dispersion `s = 2·adev` (`adev` = mean absolute deviation of the residuals
-        // from the fitted line): doubled so the thresholds compare with sigma
-        // clipping (spec §6.3, math reference §3.4). The reference's additional
-        // slope term `sqrt(1 + b²)` is omitted — it is inert on [0, 1] input
-        // (`b ≈ 1e-3` per rank on real stacks) and dimensionally wrong on the
-        // ADU-scale stacks the master builder feeds, where it inflated `s` by up
-        // to three orders of magnitude and silenced the rejection; M4's robust
-        // minimum-absolute-deviation fit revisits it.
-        let mut abs_sum = 0.0;
-        for i in 0..k {
-            let resid = values[i].value() as f64 - (a + b * i as f64);
-            abs_sum += resid.abs();
-        }
-        let adev = abs_sum / kf;
-        let s = 2.0 * adev;
-        // Scale-relative zero-dispersion guard: on a perfectly (or near-)
-        // linear stack the residuals are floating-point noise, not signal —
-        // treat that as "no rejection" so a clean ramp is never eaten. Real
-        // dispersion (read noise, drift) is orders of magnitude above this.
-        let scale = (sabs_y / kf).max(1.0);
-        if adev <= 1e-9 * scale {
-            break;
-        }
-        let lo = -sigma_low * s;
-        let hi = sigma_high * s;
-        let mut w = 0usize;
-        for i in 0..k {
-            let resid = values[i].value() as f64 - (a + b * i as f64);
-            if resid >= lo && resid <= hi {
-                values[w] = values[i];
-                w += 1;
+    LINEAR_FIT_VALUE_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        for _ in 0..MAX_REJECTION_ITERS {
+            let k = kept;
+            if k < 2 {
+                break;
             }
+            // Minimum-absolute-deviation line y = a + b·i over (rank i,
+            // value) for i in 0..k — replaces the least-squares line (M4
+            // ruling R-M4a-4): a single extreme sample used to drag the LS
+            // line toward itself, shrinking its own residual and
+            // under-rejecting real stacks (M2 measured 0.83 %/0.74 %
+            // rejected against the reference's 2.5–2.8 % at the same
+            // 5.0/3.5 thresholds). The median-based line does not move for
+            // outliers.
+            let kf = k as f64;
+            scratch.clear();
+            scratch.extend(values[..k].iter().map(|s| s.value() as f64));
+            let (a, b) = medfit_line(&scratch);
+
+            let mut abs_sum = 0.0;
+            let mut sabs_y = 0.0;
+            for (i, &y) in scratch.iter().enumerate() {
+                let resid = y - (a + b * i as f64);
+                abs_sum += resid.abs();
+                sabs_y += y.abs();
+            }
+            let adev = abs_sum / kf;
+            // Dispersion `s = LINEAR_FIT_SIGMA_SCALE · 2·adev`: doubled so the
+            // thresholds compare with sigma clipping (spec §6.3, math
+            // reference §3.4). The reference's additional slope term
+            // `sqrt(1 + b²)` is still omitted — it is inert on [0, 1] input
+            // and dimensionally wrong on the ADU-scale stacks the master
+            // builder feeds; `LINEAR_FIT_SIGMA_SCALE` is the one knob the
+            // M4a acceptance run may turn instead (see its doc comment).
+            let s = LINEAR_FIT_SIGMA_SCALE * 2.0 * adev;
+            // Scale-relative zero-dispersion guard: on a perfectly (or near-)
+            // linear stack the residuals are floating-point noise, not signal —
+            // treat that as "no rejection" so a clean ramp is never eaten. Real
+            // dispersion (read noise, drift) is orders of magnitude above this.
+            let scale = (sabs_y / kf).max(1.0);
+            if adev <= 1e-9 * scale {
+                break;
+            }
+            let lo = -sigma_low * s;
+            let hi = sigma_high * s;
+            let mut w = 0usize;
+            for i in 0..k {
+                let resid = values[i].value() as f64 - (a + b * i as f64);
+                if resid >= lo && resid <= hi {
+                    values[w] = values[i];
+                    w += 1;
+                }
+            }
+            if w == kept {
+                break; // stable
+            }
+            if w == 0 {
+                // See reject_sigma_clip: keep the last valid survivor prefix rather
+                // than let combine_pixel fall back over the corrupted-tail full
+                // stack. kept holds the previous survivors (>= 2, or the initial n).
+                break;
+            }
+            kept = w;
         }
-        if w == kept {
-            break; // stable
-        }
-        if w == 0 {
-            // See reject_sigma_clip: keep the last valid survivor prefix rather
-            // than let combine_pixel fall back over the corrupted-tail full
-            // stack. kept holds the previous survivors (>= 2, or the initial n).
-            break;
-        }
-        kept = w;
-    }
+    });
     (kept, true)
 }
 
@@ -769,6 +926,11 @@ mod tests {
         // (2·adev), still over sigma_high 3.5. The old fixture (100 + 5·i ramp,
         // spike 100_000) had a value/rank slope no real stack can produce; it is
         // retired, not re-thresholded.
+        //
+        // Medfit line (M4a Task 3, ruling R-M4a-4): measured z ≈ 9.759
+        // (a=0.197581, b=0.00037280, adev=0.0152855) on the first-iteration
+        // fit — well clear of sigma_high 3.5, more decisively than the LS
+        // line's 3.647.
         let mut ramp: Vec<f32> = (0..20)
             .map(|i| 0.20 + 0.0001 * i as f32 + if i % 2 == 0 { 0.002 } else { -0.002 })
             .collect();
@@ -797,26 +959,32 @@ mod tests {
     #[test]
     fn linear_fit_all_rejected_uses_intact_stack_not_corruption() {
         // Same symmetric reproduction stack as the sigma-clip regression. The
-        // least-squares line over this ramp-like stack leaves every residual
-        // outside the tight rejection band, so iteration 1 rejects ALL 12 at
-        // once (w=0) BEFORE any in-place compaction — the array is never
-        // corrupted here. With the w==0 guard, kept stays at the initial 12
-        // and the survivors (== the intact stack) average to 5.0. (Pre-fix,
-        // kept fell to 0 and the fallback median of the still-intact stack
-        // was also 5.0 — value unchanged, now sourced from a real combine
-        // over survivors.)
+        // least-squares line over this ramp-like stack used to leave every
+        // residual outside the tight rejection band, so iteration 1 rejected
+        // ALL 12 at once (w=0) BEFORE any in-place compaction — the array is
+        // never corrupted here. With the w==0 guard, kept stays at the
+        // initial 12 and the survivors (== the intact stack) average to 5.0.
         //
-        // Dispersion doubled 2026-09-09: s = 2·adev is 2x the old adev-only
-        // dispersion on this stack, so the old ±0.5σ band no longer rejects
-        // everything. Threshold lowered from 0.5 to 0.15 (measured: rejects
-        // all 12 on iteration 1, reproducing the original
-        // all-rejected-on-first-pass case; the boundary where rejection
-        // starts sparing survivors, under this s = 2·adev formula, is
-        // ≈ 0.2807 — 0.15 keeps a comfortable margin below it).
+        // Medfit line (M4a Task 3, ruling R-M4a-4): the robust line for this
+        // exact symmetric stack is a ≈ 0.0001431, b ≈ 0.9090649 — a fit that
+        // (unlike least squares) runs almost exactly THROUGH the two extreme
+        // ranks (measured residual ≈ 1.431e-4 at ranks 0 and 11, versus
+        // ≈ 0.3636–1.8183 at every other rank), because the L1 line for this
+        // perfectly symmetric data hinges on those two points. adev is
+        // unchanged by the new fit (≈ 0.81823, s = 2·adev ≈ 1.63645) but the
+        // old ±0.15σ band (well above the old ≈0.2807 boundary) now excludes
+        // only 10 of 12 samples — the near-zero-residual extremes survive
+        // (kept=2, {0.0, 10.0}, which still average to 5.0 by symmetry: the
+        // guard is not what makes this one pass any more). To reproduce the
+        // FIRST-iteration all-reject case this test exists for, the band
+        // must be tighter than the ≈1.431e-4 extreme-rank residual: measured
+        // boundary sigma ≈ 8.744e-5; 1e-5 keeps a comfortable margin below
+        // it and rejects all 12 on iteration 1, same as before the fit
+        // changed.
         let mut stack = vec![0.0, 0.0, 0.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 10.0, 10.0, 10.0];
         let (v, rej) = combine_pixel(
             &mut stack,
-            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 0.15, sigma_high: 0.15 }),
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 1e-5, sigma_high: 1e-5 }),
         );
         assert_eq!(v, 5.0, "intact-stack combine, no corruption possible");
         assert_eq!(rej, 0, "guard keeps the full stack when iter 1 rejects everything");
@@ -834,11 +1002,21 @@ mod tests {
         // spike of +0.009 (case A) / +0.05 more (case B) — measured against
         // the routine's actual sorted-rank fit, that residual never exceeded
         // ~1.4x adev even under the OLD dispersion, so neither case changed
-        // behavior. Case A's spike raised +0.009 -> +0.13 (old z ≈ 4.605, new
-        // z ≈ 2.302) and case B's additional spike raised +0.05 -> +0.5 (old
-        // z ≈ 7.277, new z ≈ 3.638). The fitted slope `b` is tiny on this
-        // fixture, so these z values are unchanged from the (now-dropped)
-        // `sqrt(1 + b²)` slope-term formula.
+        // behavior. Case A's spike raised +0.009 -> +0.13, case B's
+        // additional spike raised +0.05 -> +0.5 (both still relative to the
+        // LS-line era, where the measured z was ≈4.605 / ≈2.302 for case A
+        // old/new and ≈7.277 / ≈3.638 for case B old/new dispersion).
+        //
+        // Medfit line (M4a Task 3, ruling R-M4a-4): the robust fit changes
+        // both the line AND adev on this fixture (its slope is no longer
+        // pinned to the LS value, unlike the near-degenerate stack above) —
+        // measured z ≈ 2.679 for case A (a=0.496476, b=0.010947,
+        // adev=0.0055106) and z ≈ 8.683 for case B (a=0.496908,
+        // b=0.010899, adev=0.0305202). Both land on the SAME side of the
+        // 3.0 threshold as the least-squares line did (A survives, B is
+        // rejected), so the assertions are unchanged, but the z values that
+        // make them true are not — a coincidence of this fixture's fitted
+        // slope being tiny either way, not a general property of the fit.
         let mut ramp: Vec<f32> = (0..20).map(|j| 0.5 + 0.01 * j as f32).collect();
         // deviations: ±0.004 alternating, plus the case-A spike below.
         for (j, v) in ramp.iter_mut().enumerate() {
@@ -850,9 +1028,9 @@ mod tests {
             &mut a,
             IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 3.0, sigma_high: 3.0 }),
         );
-        assert_eq!(rejected, 0, "a ~2.3x-dispersion deviation survives at 3.0 with the doubled dispersion");
+        assert_eq!(rejected, 0, "a ~2.68-dispersion deviation survives at 3.0 under the robust line");
         let mut b = ramp.clone();
-        b[10] += 0.5; // ~3.6x the doubled dispersion — still rejected
+        b[10] += 0.5; // ~8.68x the robust-line dispersion — still rejected
         let (_, rejected) = combine_pixel(
             &mut b,
             IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 3.0, sigma_high: 3.0 }),
@@ -867,6 +1045,11 @@ mod tests {
         // the sorted-rank slope (≈ 6 ADU/rank) inflated s six-fold and nothing
         // was rejected; with s = 2·adev the ray goes at 5.0/3.5 (measured z
         // ≈ 3.658, over sigma_high 3.5).
+        //
+        // Medfit line (M4a Task 3, ruling R-M4a-4): measured z ≈ 9.659
+        // (a=494.971, b=0.908741, adev=19.9226) on the first-iteration fit —
+        // well clear of sigma_high 3.5, more decisively than the LS line's
+        // 3.658.
         let mut col: Vec<f32> = (0..20)
             .map(|i| 500.0 + if i % 2 == 0 { 5.0 } else { -5.0 } + 0.3 * i as f32)
             .collect();
@@ -877,6 +1060,64 @@ mod tests {
         );
         assert_eq!(rej, 1, "the cosmic ray");
         assert!(v < 510.0, "{v}");
+    }
+
+    // ── medfit_line (M4a Task 3, ruling R-M4a-4) ────────────────────────────
+
+    /// Tiny deterministic PRNG for the contaminated-stack fixture below
+    /// (mirrors `geometry::ransac::SplitMix64`; no `rand` crate dependency).
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn next_f64(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// One N(0,1) draw off `rng` via the Box–Muller transform.
+    fn next_gaussian(rng: &mut SplitMix64) -> f64 {
+        let u1 = rng.next_f64().max(1e-12);
+        let u2 = rng.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// `n` samples of N(`mean`, `sigma`), seeded for reproducibility.
+    fn fixture_gaussian_stack(n: usize, mean: f64, sigma: f64, seed: u64) -> Vec<f32> {
+        let mut rng = SplitMix64(seed);
+        (0..n).map(|_| (mean + sigma * next_gaussian(&mut rng)) as f32).collect()
+    }
+
+    /// A single, explicitly-placed sample (no jitter) — used to drop known
+    /// outlier values into an otherwise-random fixture.
+    fn sample_from(value: f32) -> f32 {
+        value
+    }
+
+    #[test]
+    fn medfit_line_ignores_a_single_extreme_outlier_that_drags_least_squares() {
+        // a clean ramp 10 + 0.5·i for i in 0..40, plus values[39] = 1000
+        let mut v: Vec<f64> = (0..40).map(|i| 10.0 + 0.5 * i as f64).collect();
+        v[39] = 1000.0;
+        let (a, b) = medfit_line(&v);
+        assert!((a - 10.0).abs() < 0.05 && (b - 0.5).abs() < 0.01, "medfit ({a}, {b}) must recover the ramp");
+        // least squares on the same data does not: its slope is > 1.0 — the point of the test
+    }
+
+    #[test]
+    fn linear_fit_rejection_with_the_robust_line_rejects_the_contaminated_tail_ls_kept() {
+        // 200 samples: N(0.1, 0.002) + 6 high outliers at 0.13..0.16 (a satellite trail's stack column)
+        let mut vals = fixture_gaussian_stack(200, 0.1, 0.002, 12345);
+        for (k, x) in vals.iter_mut().rev().take(6).enumerate() {
+            *x = sample_from(0.13 + 0.005 * k as f32);
+        }
+        let (kept, _) = reject_linear_fit(&mut vals, 5.0, 3.5);
+        assert!(kept <= 194, "all six outliers rejected at 5.0/3.5, kept {kept}");
     }
 
     // ── WinsorizedSigma & PercentileClip carried over ───────────────────────
