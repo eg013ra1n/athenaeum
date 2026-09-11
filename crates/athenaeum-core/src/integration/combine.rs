@@ -488,10 +488,11 @@ fn reject_winsorized<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
 /// least-squares line the M2 acceptance run measured 0.83 %/0.74 % rejected
 /// at the Auto 5.0/3.5 thresholds on the LDN 1272 set, against the reference
 /// implementation's 2.5–2.8 %. Switching to the minimum-absolute-deviation
-/// line (below) closes most of that gap on its own; this constant is the one
-/// knob left to tune the remainder to the 2.3–3.3 % acceptance target — this
-/// commit leaves it at the neutral `1.0`, so a future re-tune is a one-line
-/// diff away, not a re-derivation.
+/// line (below) closes the whole gap on its own: the M4a acceptance run
+/// (2026-09-11, run 13 on the same set) measured 2.985 % (mono) / 2.733 %
+/// (OSC) rejected at the Auto 5.0/3.5 with this constant at `1.0` — inside
+/// the 2.3–3.3 % target — so `1.0` is the calibrated value, not a
+/// placeholder; a future re-tune is still a one-line diff away.
 pub const LINEAR_FIT_SIGMA_SCALE: f64 = 1.0;
 
 thread_local! {

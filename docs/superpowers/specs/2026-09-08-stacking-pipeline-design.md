@@ -513,8 +513,9 @@ functions build calibration masters and their output is fingerprint-pinned:
   feeds (it silenced the rejection there). The robust minimum-absolute-deviation
   line lands in M4a (`integration/combine.rs::medfit_line`, still omitting
   the slope term for the same reason); the dispersion constant
-  (`LINEAR_FIT_SIGMA_SCALE`) is calibrated by the M4a acceptance run
-  (Task 7), not fixed here.
+  (`LINEAR_FIT_SIGMA_SCALE`) was calibrated by the M4a acceptance run
+  (2026-09-11: 2.985 % / 2.733 % rejected at 5.0/3.5 with the constant at
+  `1.0`, inside the 2.3–3.3 % target — it stays `1.0`).
   Master builds never select linear fit automatically (their Auto is
   Winsorized / percentile / median), so only a master built with an explicit
   linear-fit recipe changes; that test pin is re-measured in the same task.

@@ -232,7 +232,7 @@ M4a (plan `docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`, ruli
 - **Owed:** one M4a run on Windows and one on Linux (the web build) — the two-pass dry pass and the `.rej`
   sink condition are the platform-neutral parts; nothing platform-specific was added, but the suite's two
   load flakes (below) are worth watching there.
-- **Release-note lines owed** (drafted in the acceptance note §10): noise-relative star detection for frame
+- **Release-note lines owed** (drafted in the acceptance note §11): noise-relative star detection for frame
   weighting with the new `Detection threshold (σ)` setting, the two-pass reference pick, the robust linear-fit
   rejection (rejects ≈ 3 % at the default thresholds, like the reference), the faster local normalization.
 

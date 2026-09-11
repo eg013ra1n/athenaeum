@@ -703,8 +703,9 @@ slope bracketed and bisected on the sign of `Σ x·sgn(residual)`,
 warm-started from the previous iteration, exact-root early return,
 `select_nth` median) instead of the least-squares one; dispersion `s =
 LINEAR_FIT_SIGMA_SCALE · 2 · adev` with `LINEAR_FIT_SIGMA_SCALE = 1.0`
-until Task 7 calibrates it once (target 2.3–3.3 % rejected at the Auto
-5.0/3.5; M2 measured 0.83/0.74 % with the least-squares line); cost ≈
+— calibrated by the acceptance run (2.985 / 2.733 % rejected at the Auto
+5.0/3.5, inside the 2.3–3.3 % target; M2 measured 0.83/0.74 % with the
+least-squares line), so it stays 1.0; cost ≈
 8.5× the old line at n = 200 end to end (≈ 16 µs per pixel stack, ≈ 40 s
 per 26 Mpx plane on this Mac), accepted by R-M4a-17. Reference resolution
 now includes the two-pass dry-run pick described under the `Reference`
@@ -741,13 +742,15 @@ plan's header (`docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`)
 cite it. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4a-acceptance-run.md`, run 13 on LDN 1272, 56 min end to end): the two-pass pick switched the reference from the best-weighted `_0080` (36 px off the median framing) to `_0073` — the frame the owner had pinned by hand in M2/M3; rejected fractions 2.985 % (mono) / 2.733 % (OSC) at the Auto 5.0/3.5 with `LINEAR_FIT_SIGMA_SCALE` left at 1.0 (M2: 0.83/0.74 %; the external tool 2.5–2.8 %); per-frame weights against the external log: mono ρ 0.92 / top-20 18/20, OSC ρ 0.93/0.82/0.68 / top-20 15/20 with the bright night no longer monopolising the top; the mono drizzled/undrizzled FWHM ratio equals the external tool's to 0.6 % under the new estimator, the OSC G/B ratio stays +11–12 % over it (the M3 residual, unchanged in kind — M4c Task 0); LN 368/368, measure −20 %, LN −7 %, drizzle −16 % vs M3.
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
-plan,run,provenance,measure,weights,psf_signal,robust,integrate,
+plan,run,provenance,measure,weights,psf_signal,prefilter,robust,integrate,
 master_cards}.rs`, `stacking/register/{mod,detect,align,frame,writer}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
 `crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
 fits_writer/wcs.rs`; dev probes
-`examples/{measure,register,integrate,ln}_probe.rs`.
+`examples/{measure,register,integrate,ln}_probe.rs` and the weight-audit
+harness `examples/weight_audit.rs` (+ `docs/superpowers/research/scripts/
+weight_audit_compare.py`).
 Frontend: `src/components/stacking/` (above),
 `src/hooks/useStackingRuns.ts`, `src/contexts/StackingContext.tsx`.
 

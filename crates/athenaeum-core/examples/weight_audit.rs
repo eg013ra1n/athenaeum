@@ -255,11 +255,7 @@ fn main() {
     }
     eprintln!(
         "weight_audit: detection_sigma {} min_snr {} max_stars {} psf {:?} prefilter {:?}",
-        opts.detection_sigma,
-        opts.min_snr,
-        opts.max_stars,
-        opts.psf_model,
-        opts.seed_prefilter
+        opts.detection_sigma, opts.min_snr, opts.max_stars, opts.psf_model, opts.seed_prefilter
     );
 
     if let Some(dump_path) = &args.dump_planes {

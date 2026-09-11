@@ -69,7 +69,7 @@ export function ReferencePanel({ config, onChange, plan, disabled }: ReferencePa
             className="w-4 h-4 mt-0.5 shrink-0 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
           />
           <span className={`text-sm ${mode === 'manual' ? 'text-content-muted' : 'text-content-secondary'}`}>
-            Two-pass pick (re-choose the reference closest to the set&rsquo;s median transform)
+            Two-pass pick (re-choose the reference closest to the set&rsquo;s median transform; costs one extra registration pass of the reference&rsquo;s group)
           </span>
         </label>
       </div>

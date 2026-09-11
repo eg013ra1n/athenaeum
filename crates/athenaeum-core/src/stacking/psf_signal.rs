@@ -238,7 +238,9 @@ fn region_median(
 /// settles sooner, and on a dark one it keeps growing.
 ///
 /// `r_max` is the caller's cap (twice the nominal stamp, and never past the
-/// image border). Returns the radius the growth stopped at.
+/// image border). Returns the radius the growth stopped at — the first
+/// radius whose median no longer dropped by `min_drop` (one step past the
+/// last dropping one), or `r_max` when every step kept dropping.
 fn sampling_radius(
     data: &[f32],
     w: usize,
