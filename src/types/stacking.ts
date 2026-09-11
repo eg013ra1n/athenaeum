@@ -7,6 +7,8 @@ export type Interpolation = "nearest" | "bilinear" | "bicubicSpline" | "bicubicB
 
 export type SeedPrefilter = "none" | "median3";
 
+export type SeedDetector = "peak" | "structure";
+
 export type PsfModel = "auto" | "moffat4";
 
 export type WeightMode = "psfSignalWeight" | "psfSnr" | "noise" | "formula" | "exposure" | "keyword" | "none";
@@ -147,9 +149,16 @@ detectionSigma: number,
 /**
  * What the seed detection runs on (math reference §5.1): the plane as
  * it is, or its 3×3 median. Everything downstream of detection always
- * measures the untouched plane.
+ * measures the untouched plane. Read by the peak detector only.
  */
-seedPrefilter: SeedPrefilter, };
+seedPrefilter: SeedPrefilter, 
+/**
+ * WHICH detector finds the seeds (math reference §5.1, ruling
+ * R-M4c-11): the peak threshold `detectionSigma` steers, or the
+ * structure map. A stored config written before M4c Task 0 has no such
+ * field and decodes to the shipped default.
+ */
+seedDetector: SeedDetector, };
 
 export type ReferenceMode = "auto" | "manual";
 

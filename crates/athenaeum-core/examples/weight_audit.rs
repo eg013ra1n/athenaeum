@@ -29,21 +29,29 @@
 //!
 //! `cargo run --release -p athenaeum-core --example weight_audit -- \
 //!     [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] [--max-stars <n>] \
-//!     [--min-snr <x>] [--prefilter none|median3] [--out <file.jsonl>] \
-//!     [--truncate] [--dump-planes <file.bin>] <file>…`
+//!     [--min-snr <x>] [--prefilter none|median3] \
+//!     [--seed-detector peak|structure] [--sensitivity <s>] \
+//!     [--out <file.jsonl>] [--truncate] [--dump-planes <file.bin>] <file>…`
 //!
 //! `--sigma` is `MeasureOptions::detection_sigma` — the seed-detection
 //! threshold in σ above the local background; `--min-snr` is
 //! `MeasureOptions::min_snr`, the flux-SNR floor a detection must clear to
 //! become a fit seed; `--prefilter` is `MeasureOptions::seed_prefilter`,
 //! what the seed DETECTION runs on (the fits and every other estimator
-//! always see the untouched plane). All three default to the production
-//! values.
+//! always see the untouched plane). `--seed-detector` is
+//! `MeasureOptions::seed_detector` — WHICH detector finds the seeds (M4c
+//! Task 0) — and `--sensitivity` is the structure detector's own
+//! `StructureParams::sensitivity`, ignored by the peak detector. All
+//! default to the production values.
+//!
+//! `--seed full` still wins over `--seed-detector`: it names a detector
+//! outright, while `--seed-detector` steers the production (`fast`) path.
 use athenaeum_core::stacking::measure::{
     measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedSource,
 };
 use athenaeum_core::stacking::prefilter::SeedPrefilter;
 use athenaeum_core::stacking::psf_signal::PsfModel;
+use athenaeum_core::stacking::structure::SeedDetector;
 use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
@@ -100,6 +108,8 @@ struct Args {
     max_stars: Option<usize>,
     min_snr: Option<f32>,
     prefilter: Option<SeedPrefilter>,
+    seed_detector: Option<SeedDetector>,
+    sensitivity: Option<f64>,
     out: Option<String>,
     truncate: bool,
     dump_planes: Option<String>,
@@ -107,7 +117,8 @@ struct Args {
 }
 
 const USAGE: &str = "usage: weight_audit [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] \
-[--max-stars <n>] [--min-snr <x>] [--prefilter none|median3] [--out <file.jsonl>] \
+[--max-stars <n>] [--min-snr <x>] [--prefilter none|median3] \
+[--seed-detector peak|structure] [--sensitivity <s>] [--out <file.jsonl>] \
 [--truncate] [--dump-planes <file.bin>] <file>…";
 
 /// Prints `usage:` context plus `msg` and exits 2 — used for every
@@ -126,6 +137,8 @@ fn parse_args() -> Args {
     let mut max_stars = None;
     let mut min_snr = None;
     let mut prefilter = None;
+    let mut seed_detector = None;
+    let mut sensitivity = None;
     let mut out = None;
     let mut truncate = false;
     let mut dump_planes = None;
@@ -193,6 +206,26 @@ fn parse_args() -> Args {
                     )),
                 });
             }
+            "--seed-detector" => {
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--seed-detector needs a value (peak|structure)"));
+                seed_detector = Some(match v.as_str() {
+                    "peak" => SeedDetector::Peak,
+                    "structure" => SeedDetector::Structure,
+                    other => bad_arg(&format!(
+                        "unknown --seed-detector value '{other}' (want peak|structure)"
+                    )),
+                });
+            }
+            "--sensitivity" => {
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--sensitivity needs a numeric value"));
+                sensitivity = Some(v.parse::<f64>().unwrap_or_else(|_| {
+                    bad_arg(&format!("--sensitivity value '{v}' is not a number"))
+                }));
+            }
             "--out" => {
                 out = Some(
                     it.next()
@@ -222,6 +255,8 @@ fn parse_args() -> Args {
         max_stars,
         min_snr,
         prefilter,
+        seed_detector,
+        sensitivity,
         out,
         truncate,
         dump_planes,
@@ -253,9 +288,22 @@ fn main() {
     if let Some(prefilter) = args.prefilter {
         opts.seed_prefilter = prefilter;
     }
+    if let Some(detector) = args.seed_detector {
+        opts.seed_detector = detector;
+    }
+    if let Some(sensitivity) = args.sensitivity {
+        opts.structure.sensitivity = sensitivity;
+    }
     eprintln!(
-        "weight_audit: detection_sigma {} min_snr {} max_stars {} psf {:?} prefilter {:?}",
-        opts.detection_sigma, opts.min_snr, opts.max_stars, opts.psf_model, opts.seed_prefilter
+        "weight_audit: detection_sigma {} min_snr {} max_stars {} psf {:?} prefilter {:?} \
+seed_detector {:?} sensitivity {}",
+        opts.detection_sigma,
+        opts.min_snr,
+        opts.max_stars,
+        opts.psf_model,
+        opts.seed_prefilter,
+        opts.seed_detector,
+        opts.structure.sensitivity
     );
 
     if let Some(dump_path) = &args.dump_planes {

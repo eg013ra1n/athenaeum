@@ -393,7 +393,13 @@ computed from the unfiltered plane's own noise and handed to the detector in
 ADU — a median attenuates the noise as well as the stars, so a level derived
 from the filtered copy would move with the peaks and the filter would cancel
 itself. The shipped default is `none`; see the M4a Task 2 fix rounds 1-2 for
-the two grids that left it off), PSF fitting with the
+the two grids that left it off) — or, with `measurement.seedDetector =
+"structure"`, from math reference §5.1's structure map instead of any peak
+threshold at all (`stacking::structure`, M4c Task 0: connected groups of
+pixels that survive a 33-px high-pass and a `median + 3σ` binarization, then
+the reference's per-candidate rules; it reproduces a structure detector's
+sharpness behaviour, which a peak threshold cannot, but it ships off — see
+§9.2), PSF fitting with the
 `psfModel` (`auto` = Moffat β ∈ {2.5, 4, 6, 10} best MAD, or `moffat4`), the
 hybrid PSF/aperture flux at FWTM, RCR-cleaned and Winsorized mean fluxes,
 `M*`/`N*` from the large-scale background residual (MMT residual, scale 256),
@@ -884,7 +890,7 @@ grouping:      { exposureToleranceSec: 2.0 }   -- exposure ALWAYS splits a group
                                                 -- fine, the field is just silently ignored
 calibration:   CalibratedLightOptions (the export's: flat norm, hot pixels on, debayer on)
 measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 24576,
-                 detectionSigma: 20.0, seedPrefilter: "none",
+                 detectionSigma: 20.0, seedPrefilter: "none", seedDetector: "peak",
                  formula: { fwhm: 15, eccentricity: 15, snr: 20, stars: 0, pedestal: 50 },
                  keyword: "SSWEIGHT" }
                 -- detectionSigma: star-detection threshold for the quality measurement in σ
@@ -907,6 +913,20 @@ measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 2457
                 -- 0.5-0.8 of the reference's and leaves the OSC blue channel's weight
                 -- correlation at ~0.4, so it ships off (M4a Task 2 fix rounds 1-2).
                 -- It rides the same stage hash.
+                -- seedDetector: "peak" | "structure" — WHICH detector finds the seeds
+                -- (math reference §5.1, M4c Task 0, ruling R-M4c-11). "peak" is the
+                -- threshold detector the two settings above steer; "structure" builds
+                -- the reference's structure map (median, 33-px high-pass, dilate,
+                -- binarize at `median + 3σ` of the UNFILTERED plane's noise, erode,
+                -- connected components, per-candidate rules) and ignores both of them.
+                -- On the 368-frame acceptance set the structure map is better on mono
+                -- (per-night fit ratios 1.02/0.81/1.00 vs 1.01/1.05/0.82, PSFSW ρ 0.977
+                -- vs 0.918) and halves the OSC bright-night excess (2.6-3.9× the
+                -- reference's fits vs 3.8-6.9×), but it leaves the OSC blue channel's
+                -- weight correlation at 0.42 and the OSC top-20 overlap at 11/20, so it
+                -- ships as an option and "peak" stays the default (12 of 22 R-M4a-2
+                -- targets vs 10 — the ruling's bar is all 22). It rides the same stage
+                -- hash.
 selection:     { minWeightFraction: 0.05, maxFwhmPx: null, maxEccentricity: null,
                  minStars: null, excludeOnRegistrationFailure: true }
 reference:     { mode: "auto", twoPass: true }

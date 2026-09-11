@@ -299,6 +299,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             decls![
             crate::resample::Interpolation,
             crate::stacking::prefilter::SeedPrefilter,
+            crate::stacking::structure::SeedDetector,
             crate::stacking::psf_signal::PsfModel,
             crate::stacking::weights::WeightMode,
             crate::stacking::weights::FormulaWeights,

@@ -16,6 +16,7 @@ use crate::resample::Interpolation;
 use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
+use crate::stacking::structure::SeedDetector;
 use crate::stacking::psf_signal::{PsfModel, PSF_FIT_VERSION};
 use crate::stacking::register::DistortionChoice;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
@@ -122,9 +123,15 @@ pub struct MeasurementConfig {
     pub detection_sigma: f64,
     /// What the seed detection runs on (math reference §5.1): the plane as
     /// it is, or its 3×3 median. Everything downstream of detection always
-    /// measures the untouched plane.
+    /// measures the untouched plane. Read by the peak detector only.
     #[serde(default)]
     pub seed_prefilter: SeedPrefilter,
+    /// WHICH detector finds the seeds (math reference §5.1, ruling
+    /// R-M4c-11): the peak threshold `detectionSigma` steers, or the
+    /// structure map. A stored config written before M4c Task 0 has no such
+    /// field and decodes to the shipped default.
+    #[serde(default)]
+    pub seed_detector: SeedDetector,
 }
 
 /// Serde default for [`MeasurementConfig::detection_sigma`] — a stored
@@ -144,6 +151,7 @@ impl Default for MeasurementConfig {
             keyword: "SSWEIGHT".to_string(),
             detection_sigma: default_detection_sigma(),
             seed_prefilter: crate::stacking::measure::DEFAULT_SEED_PREFILTER,
+            seed_detector: crate::stacking::measure::DEFAULT_SEED_DETECTOR,
         }
     }
 }
@@ -165,6 +173,10 @@ impl MeasurementConfig {
             min_snr: MeasureOptions::default().min_snr,
             detection_sigma: self.detection_sigma as f32,
             seed_prefilter: self.seed_prefilter,
+            seed_detector: self.seed_detector,
+            // Not a config field: a run picks the detector, not its dials
+            // (M4c Task 0, ruling R-M4c-11).
+            structure: MeasureOptions::default().structure,
         }
     }
 }
@@ -675,6 +687,7 @@ mod tests {
             "\"weightMode\":\"psfSignalWeight\"",
             "\"detectionSigma\":20.0",
             "\"seedPrefilter\":\"none\"",
+            "\"seedDetector\":\"peak\"",
             "\"psfModel\":\"auto\"",
             "\"minWeightFraction\":0.05",
             "\"excludeOnRegistrationFailure\":true",
@@ -890,6 +903,22 @@ mod tests {
             stage_hash(&measurement_subtree(&filtered), &[], &[]),
             "the measurement stage hash must follow seedPrefilter"
         );
+        // And for the detector itself (M4c Task 0, ruling R-M4c-11) — the
+        // strongest form of the same contract: a different detector is a
+        // different star population, whatever the other dials say.
+        let mut structure = cfg.clone();
+        structure.measurement.seed_detector = SeedDetector::Structure;
+        assert_ne!(config_hash(&cfg), config_hash(&structure));
+        assert_ne!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&structure), &[], &[]),
+            "the measurement stage hash must follow seedDetector"
+        );
+        assert_eq!(
+            structure.measurement.measure_options(ScaleEstimator::Bwmv).seed_detector,
+            SeedDetector::Structure,
+            "and the resolved measure options carry it"
+        );
     }
 
     /// Ruling R-M4a-15: the PSF fitter's own behaviour is not expressible
@@ -1079,12 +1108,18 @@ mod tests {
         // alone), so not one cached per-frame artifact goes stale over it —
         // only this whole-config fingerprint moves.
         //
+        // And again here (M4c Task 0, ruling R-M4c-11): `seedDetector`
+        // joins `MeasurementConfig`. It ships `peak`, i.e. today's
+        // behaviour, so no run changes — but it DOES ride
+        // `measurement_subtree`, so every set's cached measure artifact
+        // goes stale once more, exactly as `seedPrefilter` did.
+        //
         // And once more here (M4b Task 3, rulings R-M4b-4/R-M4b-5):
         // `registration.geometry` joins `RegistrationConfig`. It ships
         // `coRegistered`, i.e. today's behaviour, but it DOES ride
         // `registration_subtree`, so every set's cached registration rows
         // go stale once — deliberately: a row records which reference a
         // frame was warped onto, which is exactly what the mode decides.
-        assert_eq!(default_hash, "92bd15db24b841d4");
+        assert_eq!(default_hash, "7b2463cf8463926d");
     }
 }

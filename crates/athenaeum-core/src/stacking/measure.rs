@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use super::prefilter::{self, SeedPrefilter};
 use super::psf_signal::{self, FitParams, PsfModel, Seed};
+use super::structure::{self, SeedDetector, StructureParams};
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{self, LocationScale, ScaleEstimator, CLIP_HI, CLIP_LO};
 use crate::integration::IntegrationError;
@@ -59,6 +60,15 @@ pub struct MeasureOptions {
     /// inverted against the external reference (M4a Task 2, ruling
     /// R-M4a-1).
     pub detection_sigma: f32,
+    /// WHICH detector finds the seeds (spec §9.2 `measurement.seedDetector`,
+    /// ruling R-M4c-11). `Peak` reads `detection_sigma` and
+    /// `seed_prefilter`; `Structure` reads `structure` instead — the two
+    /// detectors share no dial.
+    pub seed_detector: SeedDetector,
+    /// The structure detector's own dials, used only when `seed_detector`
+    /// is `Structure`. Not a `StackingConfig` field: a run selects the
+    /// detector, never its internals (M4c Task 0 calibrated them once).
+    pub structure: StructureParams,
 }
 
 impl Default for MeasureOptions {
@@ -70,6 +80,8 @@ impl Default for MeasureOptions {
             min_snr: 5.0,
             seed_prefilter: DEFAULT_SEED_PREFILTER,
             detection_sigma: DEFAULT_DETECTION_SIGMA,
+            seed_detector: DEFAULT_SEED_DETECTOR,
+            structure: StructureParams::default(),
         }
     }
 }
@@ -99,6 +111,15 @@ pub const DEFAULT_DETECTION_SIGMA: f32 = 20.0;
 /// Default for [`MeasureOptions::seed_prefilter`] and
 /// [`crate::stacking::config::MeasurementConfig::seed_prefilter`].
 pub const DEFAULT_SEED_PREFILTER: SeedPrefilter = SeedPrefilter::None;
+
+/// Default for [`MeasureOptions::seed_detector`] and
+/// [`crate::stacking::config::MeasurementConfig::seed_detector`].
+///
+/// M4c Task 0 (ruling R-M4c-11) calibrated the structure detector against
+/// the same external per-frame log M4a's peak threshold was calibrated on,
+/// on the same 368 real frames; that task's report carries the grid and
+/// the verdict this constant is.
+pub const DEFAULT_SEED_DETECTOR: SeedDetector = SeedDetector::Peak;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -203,6 +224,11 @@ pub enum SeedSource {
     /// `ImageAnalyzer::analyze_data` — the full two-pass detect+measure
     /// pipeline; its per-star metrics become the seeds instead.
     Full,
+    /// [`crate::stacking::structure::detect_structures`] — the structure-map
+    /// detector (M4c Task 0). `Fast` resolves to this whenever
+    /// [`MeasureOptions::seed_detector`] says so, so a caller only passes it
+    /// explicitly to override a config that says `Peak`.
+    Structure,
 }
 
 /// Measure one plane. Detection, fitting, the background model and MRS run
@@ -260,6 +286,14 @@ pub fn measure_plane_with_seeds(
             );
             (n_star, NoiseSource::BackgroundResidual)
         }
+    };
+
+    // A run selects its detector through the config; `seed_source` is the
+    // probe-level override the dev harnesses pass. `Fast` means "whatever
+    // the options say", so the two never contradict each other silently.
+    let seed_source = match (seed_source, opts.seed_detector) {
+        (SeedSource::Fast, SeedDetector::Structure) => SeedSource::Structure,
+        (s, _) => s,
     };
 
     let seeds: Vec<Seed> = match seed_source {
@@ -360,6 +394,27 @@ pub fn measure_plane_with_seeds(
                     Vec::new()
                 }
             }
+        }
+        SeedSource::Structure => {
+            // The map is built from the same ADU-scaled copy everything
+            // else measures, so the saturation limit — a `[0, 1]` fraction
+            // in the config — is scaled with it. The detector carries the
+            // reference's own hot-pixel median internally, so
+            // `seed_prefilter` is NOT consulted here: a second median on
+            // top of that one would be a different filter, not a stronger
+            // one. `min_snr` is likewise inert — this detector's own
+            // sensitivity IS its SNR gate.
+            let p = StructureParams {
+                upper_limit: opts.structure.upper_limit * ADU_SCALE,
+                ..opts.structure
+            };
+            let mut seeds = match pool {
+                Some(pl) => pl.install(|| structure::detect_structures(&scaled, w, h, &p)),
+                None => structure::detect_structures(&scaled, w, h, &p),
+            };
+            // Brightest first already, so the cap keeps the brightest.
+            seeds.truncate(opts.max_stars.max(8));
+            seeds
         }
     };
     let stars_detected = seeds.len();
@@ -481,6 +536,7 @@ pub fn measure_frame_with_seeds(
             psf_snr = m.psf_snr,
             detection_sigma = opts.detection_sigma,
             seed_prefilter = opts.seed_prefilter.as_str(),
+            seed_detector = opts.seed_detector.as_str(),
             duration_ms = t.elapsed().as_millis() as u64,
             "frame plane measured"
         );
@@ -837,6 +893,45 @@ mod tests {
         assert_eq!(filtered.median, plain.median);
     }
 
+    /// The structure detector is a real, selectable second seed source:
+    /// it fits the fixture's stars, it is NOT the same measurement as the
+    /// peak detector's, and everything downstream of detection still reads
+    /// the untouched plane (so the noise, the background model and the
+    /// sample statistics are bit-identical between the two).
+    #[test]
+    fn the_structure_detector_seeds_a_measurement() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let peak = MeasureOptions::default();
+        let structure = MeasureOptions {
+            seed_detector: SeedDetector::Structure,
+            ..MeasureOptions::default()
+        };
+        let a = measure_plane(&data, w, h, &peak, None);
+        let b = measure_plane(&data, w, h, &structure, None);
+        assert!(
+            b.stars_fitted >= 100,
+            "the structure map must seed the fixture's field: {} fits of {} seeds",
+            b.stars_fitted,
+            b.stars_detected
+        );
+        assert_ne!(a, b, "the two detectors are different measurements");
+        assert_eq!(b.noise, a.noise);
+        assert_eq!((b.m_star, b.n_star), (a.m_star, a.n_star));
+        assert_eq!((b.median, b.mad, b.location), (a.median, a.mad, a.location));
+        assert!(b.psf_signal_weight > 0.0 && b.psf_snr > 0.0);
+        // The config selects the detector; `SeedSource::Fast` follows it,
+        // and naming the source explicitly is the same measurement.
+        assert_eq!(
+            b,
+            measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Structure)
+        );
+        // ... while an explicit `Full` still wins over the config.
+        assert_eq!(
+            measure_plane_with_seeds(&data, w, h, &structure, None, SeedSource::Full),
+            measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Full)
+        );
+    }
+
     #[test]
     fn options_serde_defaults() {
         let d = MeasureOptions::default();
@@ -852,6 +947,11 @@ mod tests {
         assert!(json.contains("\"detectionSigma\":20.0"));
         assert_eq!(d.seed_prefilter, DEFAULT_SEED_PREFILTER);
         assert!(json.contains("\"seedPrefilter\":\"none\""));
+        // M4c Task 0 (ruling R-M4c-11): which detector, and its own dials.
+        assert_eq!(d.seed_detector, DEFAULT_SEED_DETECTOR);
+        assert_eq!(d.seed_detector, SeedDetector::Peak);
+        assert!(json.contains("\"seedDetector\":\"peak\""));
+        assert_eq!(d.structure, StructureParams::default());
         assert_eq!(
             serde_json::from_str::<MeasureOptions>("{}").unwrap(),
             MeasureOptions::default()

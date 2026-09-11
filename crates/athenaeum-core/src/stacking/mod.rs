@@ -48,7 +48,14 @@
 //! 3×3 median on the image the seed DETECTION runs on, a
 //! sharpness-dependent suppression no single threshold can express. It
 //! ships off — see that task's report for the two grids that left it
-//! there.
+//! there. M4c Task 0 (ruling R-M4c-11) adds `structure`: the whole of math
+//! reference §5.1 — the structure map (median, 33-px high-pass, dilation,
+//! adaptive binarization, erosion), connected components and the
+//! reference's per-candidate rules — as the measurement's second,
+//! selectable seed detector (`measurement.seedDetector`). It ships off too:
+//! better than the peak threshold on the mono group and half the OSC
+//! bright-night excess, but not every R-M4a-2 target passes, which is that
+//! ruling's bar for taking the default.
 
 pub mod config;
 pub mod drizzle;
@@ -66,6 +73,7 @@ pub mod register;
 pub mod rej;
 pub mod robust;
 pub mod run;
+pub mod structure;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod weights;

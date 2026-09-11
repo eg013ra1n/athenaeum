@@ -4,8 +4,14 @@
 
 import { RefreshCw } from 'lucide-react';
 import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
-import { psfModelLabel, weightModeLabel } from '../stageSummary';
-import type { PsfModel, SeedPrefilter, StackingConfig, WeightMode } from '../../../types/stacking';
+import { psfModelLabel, seedDetectorLabel, weightModeLabel } from '../stageSummary';
+import type {
+  PsfModel,
+  SeedDetector,
+  SeedPrefilter,
+  StackingConfig,
+  WeightMode,
+} from '../../../types/stacking';
 
 const WEIGHT_MODES: WeightMode[] = [
   'psfSignalWeight',
@@ -20,6 +26,8 @@ const WEIGHT_MODES: WeightMode[] = [
 const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
 
 const SEED_PREFILTERS: SeedPrefilter[] = ['none', 'median3'];
+
+const SEED_DETECTORS: SeedDetector[] = ['peak', 'structure'];
 
 /** Label for the image the seed detection runs on. */
 function seedPrefilterLabel(v: SeedPrefilter): string {
@@ -87,6 +95,9 @@ export function MeasurePanel({
 }: MeasurePanelProps) {
   const m = config.measurement;
   const sel = config.selection;
+  // The peak detector's two dials mean nothing to the structure map, which
+  // carries its own threshold and its own pre-filter.
+  const peakOnlyDisabled = m.seedDetector === 'structure';
 
   const patchMeasurement = (patch: Partial<StackingConfig['measurement']>) => {
     onChange({ ...config, measurement: { ...m, ...patch } });
@@ -205,6 +216,28 @@ export function MeasurePanel({
         help={`default ${defaults.measurement.maxStars}`}
       />
 
+      <div>
+        <label className="block text-xs text-content-secondary mb-1">Seed detector</label>
+        <select
+          value={m.seedDetector}
+          disabled={disabled}
+          onChange={(e) => patchMeasurement({ seedDetector: e.target.value as SeedDetector })}
+          className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
+        >
+          {SEED_DETECTORS.map((v) => (
+            <option key={v} value={v}>
+              {seedDetectorLabel(v)}
+            </option>
+          ))}
+        </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {seedDetectorLabel(defaults.measurement.seedDetector)} — which stars the
+          fits start from. The structure map groups connected pixels instead of
+          thresholding single ones, so it finds fewer stars on an undersampled frame; it
+          has no threshold of its own and ignores the two settings below.
+        </p>
+      </div>
+
       <NumericField
         label="Detection threshold (σ)"
         value={m.detectionSigma}
@@ -212,7 +245,7 @@ export function MeasurePanel({
         min={1}
         max={100}
         step={0.5}
-        disabled={disabled}
+        disabled={disabled || peakOnlyDisabled}
         help={`default ${defaults.measurement.detectionSigma} — a star's peak above the local sky, in noise σ. Lower measures more, fainter stars.`}
       />
 
@@ -220,7 +253,7 @@ export function MeasurePanel({
         <label className="block text-xs text-content-secondary mb-1">Seed pre-filter</label>
         <select
           value={m.seedPrefilter}
-          disabled={disabled}
+          disabled={disabled || peakOnlyDisabled}
           onChange={(e) => patchMeasurement({ seedPrefilter: e.target.value as SeedPrefilter })}
           className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
         >
