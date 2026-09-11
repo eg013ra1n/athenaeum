@@ -1262,7 +1262,13 @@ Split into four plans, each with its own acceptance re-run:
   (§15 — owner requirement). Tasks 1–5 (per-frame scale + plan-time
   warning, per-frame gate + WCS seed, native mode, cross-scale pins, docs
   and the frames-table `WCS` chip) landed 2026-09-11; the acceptance run on
-  real mixed-scale sets is Task 6.
+  real mixed-scale sets is Task 6. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4b-acceptance-run.md`):
+  sets 166 (×7.0 / ×4.8), 108 (×2 binning) and 195 (×1.286 inside one group) at 30 best frames per
+  group, both modes — cross-scale groups register through the plate-solve seed at the expected scale
+  (rms ≤ 0.64 px), native mode keeps each group's own reference and geometry, the reference's own
+  master is bit-identical between the modes; rulings R-T6-4 (seed trigger 5 %), R-T6-6/7 (the plan
+  gate over the included frames) and R-T6-9 (the plate-solve seed as the quad seed's fallback) landed
+  from it.
 - **M4c — rejection and registration algorithms** (`docs/superpowers/plans/2026-09-10-stacking-m4c-plan-algorithms.md`,
   incl. Task 0, the structure-map seed detector): ESD, RCR, min/max and
   large-scale rejection, the Winsorized-sigma reference re-pin, thin-plate-spline

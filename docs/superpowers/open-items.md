@@ -199,10 +199,34 @@ coRegistered | native` mode where native gives each group its own reference and
 geometry with no cross-group registration; and the frames table's `WCS` chip on a
 seeded row's registration model.
 
-- **Acceptance run:** pending — the controller records the results here (Task 6).
+- **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4b-acceptance-run.md`, 7 runs on the
+  30-best-frames subsets of sets 166 / 108 / 195, both modes): every cross-scale group registered onto
+  its reference through the plate-solve seed at the expected scale — ×0.207 and ×1.457 (set 166, rms
+  ≤ 0.61 px), ×0.502 (set 108, rms ≤ 1.02 px, same-star centroids 0.15 px between the bin-1 and bin-2
+  masters), ×1.285 (set 195's 352-mm subsets, rms ≤ 0.64 px); native mode gave each group its own
+  reference, geometry and WCS with `ATH_RGEO = 'native'`; the reference's own master is bit-identical
+  between the modes on all three sets; the header convention R-M4b-1 held on 1 781 solved frames
+  (0 beyond 2 %). Four acceptance-time fixes landed: T6-F1 (plan-gate readiness and scale statistics
+  over the included frames, R-T6-6/7), R-T6-4 (seed trigger 5 %), R-T6-9 (the plate-solve seed as the
+  fallback after a quad failure), R-T6-8/10 recorded as data/target rulings.
+- **Residual (registration):** the quad seed does not converge for an H-alpha field against an O-filter
+  reference of the SAME rig (set 195: 14 of 30 frames, both field rotations, all well solved) — now
+  carried by the plate-solve fallback (R-T6-9); the quad matcher's own robustness across filters is an
+  M4c registration item (spec §14).
+- **Policy (M4c):** `failOnMaxRms` off lets a registration with rms 44 px into the stack with only a
+  warning (one H frame of set 195, an H→O quad mis-match that "succeeded") — treat an RMS beyond a hard
+  multiple of `maxRmsPx` as a registration FAILURE so the fallback and the exclusion apply.
+- **Calibration matcher (not M4b):** frame geometry (`NAXIS1/2`) is not a matching parameter — a
+  same-camera calibration set from another ROI links (set 166: a 9576×6388 flat matched a 6384×4258
+  master dark) and the master build refuses it at run time; the plan gate cannot see it.
+- **Noise:** the run emits one `skipped: fewer than 3 included frames` warning per excluded group (14 on
+  set 195) — fold them into one line.
+- **Deferred (final review, R-T6-9 re-review):** a solved reference frame that needs fresh registration
+  builds one wasted `seed_from_solves`; when quads partially succeed, drop below `MIN_INLIERS`, and the
+  hint fails to confirm too, no warning records the hint attempt.
 - **Owed (owner):** own look at the masters of a real mixed-scale set in both modes —
-  the Ghost Nebula (set 195, ×1.27 within one group), M 78 (set 108, bin 1 + bin 2),
-  and the ×7 / ×4.8 set 166 — and the desktop click-through of the Geometry radio, the
+  the Ghost Nebula (set 195, ×1.27 within one group — masters `Ghost_Nebula_QHY_{H,O}_mono_300s_*`),
+  M 78 (set 108, bin 1 + bin 2 — `M_78_L_mono_*`), and the ×7 / ×4.8 set 166 — and the desktop click-through of the Geometry radio, the
   `Scale` column with its `×r` badge and the frames table's `WCS` chip (the acceptance
   verifies them through the web build only).
 - **Data limitation, recorded:** set 138's 352-mm 20 s groups have no flats at that
