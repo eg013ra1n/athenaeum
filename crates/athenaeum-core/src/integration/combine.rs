@@ -6,7 +6,7 @@
 //! surviving samples) with a [`Rejection`] algorithm that decides which
 //! samples survive first. Rejection runs per pixel stack; the combination
 //! then applies to the survivors — every rejection composes with either
-//! combination (PI semantics).
+//! combination (the reference semantics).
 //!
 //! The pre-2026-07-06 flat `CombineMethod` enum is retained only as a private,
 //! deserialize-only [`LegacyCombineMethod`] so old `recipe_json` blobs still
@@ -110,8 +110,8 @@ pub enum Rejection {
     /// reject samples whose residual falls outside [−sigma_low·d,
     /// +sigma_high·d] where d is [`LINEAR_FIT_SIGMA_SCALE`] times twice the
     /// mean absolute deviation of the residuals from that line; refit and
-    /// repeat until stable. PI-recommended for larger sets with drifting
-    /// illumination.
+    /// repeat until stable. The reference's recommended choice for larger
+    /// sets with drifting illumination.
     LinearFitClip { sigma_low: f64, sigma_high: f64 },
 }
 
@@ -514,34 +514,35 @@ fn robust_sign(x: f64) -> f64 {
     }
 }
 
-/// Median of an ascending-sorted `f64` slice (plain, not the `Sample`-generic
-/// [`median_sorted`] — `medfit_line`'s working values are already `f64`).
-fn median_sorted_f64(v: &[f64]) -> f64 {
-    let n = v.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    }
-}
-
 /// Minimum-absolute-deviation line `y = a + b·i` over `values[i]` (math
 /// reference §3.4): the classic median/bisection method. Seeds the search
-/// from the least-squares line and its slope standard error `σ_b`, then
-/// walks the slope that zeroes the residual-sign functional
-/// `f(b) = Σ x_i · sgn(y_i − median(y − b·x) − b·x_i)` by bracketing a sign
-/// change and bisecting to it; the intercept is the median of the residuals
-/// at the converged slope. A single extreme sample drags a least-squares
-/// line toward itself, shrinking its own residual and starving the whole
-/// stack's rejection — the median-based line does not move for it.
+/// from `warm_start_b` when given (the caller's previous iteration's
+/// converged slope — fix round 1, ruling R-M4a-16: after the first
+/// iteration the bracket collapses to a handful of evaluations instead of
+/// walking out from the least-squares slope every time) or the
+/// least-squares slope otherwise; the bracket half-width always uses the
+/// least-squares slope standard error `σ_b` of the CURRENT survivors,
+/// regardless of which slope seeded `b1`. Walks the slope that zeroes the
+/// residual-sign functional `f(b) = Σ x_i · sgn(y_i − median(y − b·x) −
+/// b·x_i)` by bracketing a sign change and bisecting to it; the intercept is
+/// the median of the residuals at the converged slope. A single extreme
+/// sample drags a least-squares line toward itself, shrinking its own
+/// residual and starving the whole stack's rejection — the median-based
+/// line does not move for it.
+///
+/// Two fast paths (ruling R-M4a-16, finding 3): `f` is an integer-valued
+/// step function, so an exact root `f(b) == 0.0` is common (measured 2.8 %
+/// of n = 20 stacks) — the widening/bisection would otherwise walk AWAY
+/// from it (its `fb * f1 >= 0.0` tie-break shrinks toward the wrong side of
+/// an exact zero), returning a worse line than the seed. Both the seed and
+/// every bisection evaluation check for this and return immediately when
+/// found. The final answer is the last evaluated bisection point — no
+/// extra `f` evaluation at the converged midpoint.
 ///
 /// Never panics on degenerate input: fewer than 2 samples, a zero-dispersion
 /// (perfect-line) fit, or a sign functional that cannot be bracketed within
 /// 32 widenings all fall back to the least-squares line.
-pub(crate) fn medfit_line(values: &[f64]) -> (f64, f64) {
+pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
     let n = values.len();
     if n == 0 {
         return (0.0, 0.0);
@@ -579,11 +580,24 @@ pub(crate) fn medfit_line(values: &[f64]) -> (f64, f64) {
 
     MEDFIT_RESIDUAL_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
+        // O(n) selection instead of an O(n log n) sort per bracket
+        // evaluation (ruling R-M4a-16, finding 1) — this is the DEFAULT
+        // rejection path for every n >= 20 stack (`RejectionChoice::Auto`),
+        // ~26 M calls per plane. A single cold `medfit_line` call (no warm
+        // start) evaluates this up to ~14-90 times (widening + bisection);
+        // the warm start (b) below only shrinks evaluation count ACROSS
+        // `reject_linear_fit`'s outer iterations, not within one call.
         let mut rofunc = |b: f64| -> (f64, f64) {
             scratch.clear();
             scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
-            scratch.sort_unstable_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
-            let a = median_sorted_f64(&scratch);
+            let m = scratch.len();
+            let cmp = |p: &f64, q: &f64| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal);
+            let a = if m % 2 == 1 {
+                *scratch.select_nth_unstable_by(m / 2, cmp).1
+            } else {
+                let (lo, hi, _) = scratch.select_nth_unstable_by(m / 2, cmp);
+                0.5 * (lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + *hi)
+            };
             let mut sum = 0.0;
             for (i, &y) in values.iter().enumerate() {
                 let resid = y - (a + b * i as f64);
@@ -596,9 +610,14 @@ pub(crate) fn medfit_line(values: &[f64]) -> (f64, f64) {
             (sum, a)
         };
 
-        let mut b1 = b_ls;
-        let (mut f1, _) = rofunc(b1);
-        let mut b2 = b_ls + 3.0 * sigma_b * robust_sign(f1);
+        let mut b1 = warm_start_b.unwrap_or(b_ls);
+        let (mut f1, a1) = rofunc(b1);
+        if f1 == 0.0 {
+            // Exact root at the seed (finding 3): return immediately — any
+            // further widening/bisection would only walk away from it.
+            return (a1, b1);
+        }
+        let mut b2 = b1 + 3.0 * sigma_b * robust_sign(f1);
         let (mut f2, _) = rofunc(b2);
 
         let mut widenings = 0u32;
@@ -615,12 +634,27 @@ pub(crate) fn medfit_line(values: &[f64]) -> (f64, f64) {
 
         let tol = 1e-3 * sigma_b;
         let mut iters = 0u32;
+        // Last evaluated bisection point — returned as-is at the end
+        // instead of paying for one more `rofunc` at the converged midpoint
+        // (finding 1c). Seeded from the seed evaluation so a bracket that
+        // exits the loop on its very first `bb == b1 || bb == b2` guard
+        // (no floating-point room left) still returns a real evaluated
+        // point rather than a fabricated one.
+        let mut last_a = a1;
+        let mut last_b = b1;
         while (b2 - b1).abs() >= tol && iters < 60 {
             let bb = 0.5 * (b1 + b2);
             if bb == b1 || bb == b2 {
                 break; // no floating-point progress left
             }
-            let (fb, _) = rofunc(bb);
+            let (fb, ab) = rofunc(bb);
+            if fb == 0.0 {
+                // Exact root found mid-bisection (finding 3): stop here —
+                // continuing would shrink the interval away from it.
+                return (ab, bb);
+            }
+            last_a = ab;
+            last_b = bb;
             if fb * f1 >= 0.0 {
                 b1 = bb;
                 f1 = fb;
@@ -629,9 +663,7 @@ pub(crate) fn medfit_line(values: &[f64]) -> (f64, f64) {
             }
             iters += 1;
         }
-        let b = 0.5 * (b1 + b2);
-        let (_, a) = rofunc(b);
-        (a, b)
+        (last_a, last_b)
     })
 }
 
@@ -642,6 +674,14 @@ fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
     }
     sort_asc(values);
     let mut kept = n;
+    // Warm start (ruling R-M4a-16, finding 1b): after iteration 1 the
+    // survivor set has barely moved, so its converged slope is a much
+    // better bracket seed for the NEXT iteration than walking out from the
+    // least-squares slope again every time — the bracket collapses to a
+    // handful of evaluations instead of a fresh widening/bisection search.
+    // `None` on the first iteration seeds from the least-squares slope, as
+    // before.
+    let mut warm_start_b: Option<f64> = None;
     LINEAR_FIT_VALUE_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
         for _ in 0..MAX_REJECTION_ITERS {
@@ -660,7 +700,8 @@ fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
             let kf = k as f64;
             scratch.clear();
             scratch.extend(values[..k].iter().map(|s| s.value() as f64));
-            let (a, b) = medfit_line(&scratch);
+            let (a, b) = medfit_line(&scratch, warm_start_b);
+            warm_start_b = Some(b);
 
             let mut abs_sum = 0.0;
             let mut sabs_y = 0.0;
@@ -980,7 +1021,10 @@ mod tests {
         // must be tighter than the ≈1.431e-4 extreme-rank residual: measured
         // boundary sigma ≈ 8.744e-5; 1e-5 keeps a comfortable margin below
         // it and rejects all 12 on iteration 1, same as before the fit
-        // changed.
+        // changed. This 1e-5 σ is an artefact of the L1 line hinging on the
+        // two extreme ranks of this particular symmetric fixture, not a
+        // general property of the routine (fix round 1 review, ruling
+        // R-M4a-16).
         let mut stack = vec![0.0, 0.0, 0.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 10.0, 10.0, 10.0];
         let (v, rej) = combine_pixel(
             &mut stack,
@@ -1104,20 +1148,222 @@ mod tests {
         // a clean ramp 10 + 0.5·i for i in 0..40, plus values[39] = 1000
         let mut v: Vec<f64> = (0..40).map(|i| 10.0 + 0.5 * i as f64).collect();
         v[39] = 1000.0;
-        let (a, b) = medfit_line(&v);
+        let (a, b) = medfit_line(&v, None);
         assert!((a - 10.0).abs() < 0.05 && (b - 0.5).abs() < 0.01, "medfit ({a}, {b}) must recover the ramp");
         // least squares on the same data does not: its slope is > 1.0 — the point of the test
     }
 
     #[test]
-    fn linear_fit_rejection_with_the_robust_line_rejects_the_contaminated_tail_ls_kept() {
-        // 200 samples: N(0.1, 0.002) + 6 high outliers at 0.13..0.16 (a satellite trail's stack column)
-        let mut vals = fixture_gaussian_stack(200, 0.1, 0.002, 12345);
-        for (k, x) in vals.iter_mut().rev().take(6).enumerate() {
-            *x = sample_from(0.13 + 0.005 * k as f32);
+    fn medfit_line_returns_the_seed_when_the_seed_is_an_exact_root() {
+        // A palindrome (values[i] == values[19-i]) makes the least-squares
+        // slope exactly 0 by symmetry, and with equally many pairs above and
+        // below the median, f(b_ls) == 0 exactly too — `f` is an
+        // integer-valued step function, so this is common (fix round 1
+        // review, ruling R-M4a-16, finding 3: measured 2.8 % of n = 20
+        // stacks). Without the fix, the bisection's `fb * f1 >= 0.0`
+        // tie-break at an exact zero shrinks the bracket toward the WRONG
+        // side of the root, returning a worse line than the seed.
+        let half = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let values: Vec<f64> = half.iter().chain(half.iter().rev()).copied().collect();
+
+        // Verify the premise directly (reproduce medfit_line's own f(b_ls)):
+        // the seed IS an exact root on this fixture.
+        let n = values.len() as f64;
+        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+        for (i, &y) in values.iter().enumerate() {
+            let x = i as f64;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
         }
+        let del = n * sxx - sx * sx;
+        let b_ls = (n * sxy - sx * sy) / del;
+        let a_ls = (sy - b_ls * sx) / n;
+        let mut resid: Vec<f64> =
+            values.iter().enumerate().map(|(i, &y)| y - b_ls * i as f64).collect();
+        resid.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        let m = resid.len();
+        let med = if m % 2 == 1 { resid[m / 2] } else { 0.5 * (resid[m / 2 - 1] + resid[m / 2]) };
+        let mut f = 0.0;
+        for (i, &y) in values.iter().enumerate() {
+            let r = y - (med + b_ls * i as f64);
+            if r > 0.0 {
+                f += i as f64;
+            } else if r < 0.0 {
+                f -= i as f64;
+            }
+        }
+        assert_eq!(f, 0.0, "premise: f(b_ls) must be an exact root on this fixture");
+        assert_eq!(med, a_ls, "sanity: median residual equals the LS intercept on this symmetric fixture");
+
+        let (a, b) = medfit_line(&values, None);
+        assert_eq!((a, b), (a_ls, b_ls), "an exact root at the seed must be returned as-is, not walked away from");
+    }
+
+    /// Copied verbatim (module-level helpers substituted, generic `T: Sample`
+    /// specialized to `f32`) from the pre-Task-3 `reject_linear_fit`
+    /// (`git show d6361615:crates/athenaeum-core/src/integration/combine.rs`)
+    /// — the least-squares routine this task replaced. Test-only: proves the
+    /// discrimination in the test below is real, not assumed (fix round 1
+    /// review, ruling R-M4a-16, finding 2).
+    fn old_reject_linear_fit_ls(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
+        let n = values.len();
+        if n < 3 {
+            return (n, false);
+        }
+        sort_asc(values);
+        let mut kept = n;
+        for _ in 0..MAX_REJECTION_ITERS {
+            let k = kept;
+            if k < 2 {
+                break;
+            }
+            let kf = k as f64;
+            let (mut sx, mut sy, mut sxx, mut sxy, mut sabs_y) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for i in 0..k {
+                let x = i as f64;
+                let y = values[i] as f64;
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
+                sabs_y += y.abs();
+            }
+            let denom = kf * sxx - sx * sx;
+            if denom.abs() <= f64::EPSILON {
+                break;
+            }
+            let b = (kf * sxy - sx * sy) / denom;
+            let a = (sy - b * sx) / kf;
+            let mut abs_sum = 0.0;
+            for i in 0..k {
+                let resid = values[i] as f64 - (a + b * i as f64);
+                abs_sum += resid.abs();
+            }
+            let adev = abs_sum / kf;
+            let s = 2.0 * adev;
+            let scale = (sabs_y / kf).max(1.0);
+            if adev <= 1e-9 * scale {
+                break;
+            }
+            let lo = -sigma_low * s;
+            let hi = sigma_high * s;
+            let mut w = 0usize;
+            for i in 0..k {
+                let resid = values[i] as f64 - (a + b * i as f64);
+                if resid >= lo && resid <= hi {
+                    values[w] = values[i];
+                    w += 1;
+                }
+            }
+            if w == kept {
+                break;
+            }
+            if w == 0 {
+                break;
+            }
+            kept = w;
+        }
+        (kept, true)
+    }
+
+    #[test]
+    fn linear_fit_rejection_with_the_robust_line_rejects_the_contaminated_tail_ls_kept() {
+        // 200 samples: N(0.1, 0.002) + 6 high outliers at 0.106..0.136 — INSIDE
+        // the old least-squares line's blind spot (fix round 1 review, ruling
+        // R-M4a-16, finding 2): outliers at 0.13..0.16 sit at 15-28σ, which the
+        // old LS routine already rejects on its own, so that fixture did not
+        // discriminate between the two routines. The lowered tail drags the LS
+        // line toward itself just enough that its own (inflated) dispersion
+        // hides it — pinned below as a red-state assertion, not assumed.
+        let mut tail = fixture_gaussian_stack(200, 0.1, 0.002, 12345);
+        for (k, x) in tail.iter_mut().rev().take(6).enumerate() {
+            *x = sample_from(0.106 + 0.006 * k as f32);
+        }
+
+        let mut old_copy = tail.clone();
+        let (old_kept, _) = old_reject_linear_fit_ls(&mut old_copy, 5.0, 3.5);
+        assert_eq!(
+            old_kept, 195,
+            "red-state pin: the least-squares routine must NOT discriminate this tail"
+        );
+
+        // Green: measured kept == 189 for the new medfit-based routine on
+        // this exact fixture (versus the LS routine's 195 above) — a real
+        // discrimination, not a coincidence of the threshold.
+        let mut vals = tail;
         let (kept, _) = reject_linear_fit(&mut vals, 5.0, 3.5);
         assert!(kept <= 194, "all six outliers rejected at 5.0/3.5, kept {kept}");
+    }
+
+    /// The single least-squares line fit `medfit_line` replaces, copied from
+    /// the pre-Task-3 `reject_linear_fit`'s LS block (`git show
+    /// d6361615:crates/athenaeum-core/src/integration/combine.rs`),
+    /// generalized from the per-iteration inline computation to a standalone
+    /// `&[f64] -> (f64, f64)` function for this cost-ratio benchmark (fix
+    /// round 1 review, ruling R-M4a-16, finding 1).
+    fn old_least_squares_line(values: &[f64]) -> (f64, f64) {
+        let k = values.len();
+        let kf = k as f64;
+        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+        for (i, &y) in values.iter().enumerate() {
+            let x = i as f64;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+        let denom = kf * sxx - sx * sx;
+        if denom.abs() <= f64::EPSILON {
+            return (sy / kf, 0.0);
+        }
+        let b = (kf * sxy - sx * sy) / denom;
+        let a = (sy - b * sx) / kf;
+        (a, b)
+    }
+
+    /// Cost of one cold (no warm start) `medfit_line` call relative to one
+    /// `old_least_squares_line` call, at n = 20 (the `RejectionChoice::Auto`
+    /// threshold) and n = 200 (a typical real stack) — ruling R-M4a-16,
+    /// finding 1: the review measured 13-44x against the brief's 5-10x bar
+    /// before `select_nth_unstable_by` replaced the per-bracket sort. Not
+    /// run by default (timing tests are flaky under CI/parallel load) — run
+    /// with `-- --ignored --nocapture` and read the printed ratios.
+    #[test]
+    #[ignore]
+    fn medfit_cost_relative_to_least_squares() {
+        use std::time::Instant;
+        for &n in &[20usize, 200usize] {
+            let mut rng = SplitMix64(0x9E37_79B9 ^ n as u64);
+            // A real per-pixel stack, in the shape `reject_linear_fit`
+            // actually hands `medfit_line`: SORTED ascending (`sort_asc`
+            // runs before every call in production), a baseline plus
+            // per-frame read noise.
+            let mut values: Vec<f64> =
+                (0..n).map(|_| 100.0 + 5.0 * next_gaussian(&mut rng)).collect();
+            values.sort_by(|p, q| p.partial_cmp(q).unwrap());
+
+            let iters = 20_000u32;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(old_least_squares_line(std::hint::black_box(&values)));
+            }
+            let old_elapsed = t0.elapsed();
+
+            let t1 = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(medfit_line(std::hint::black_box(&values), None));
+            }
+            let new_elapsed = t1.elapsed();
+
+            let old_ns = old_elapsed.as_secs_f64() * 1e9 / iters as f64;
+            let new_ns = new_elapsed.as_secs_f64() * 1e9 / iters as f64;
+            eprintln!(
+                "n={n}: old={old_ns:.1} ns/call new={new_ns:.1} ns/call ratio={:.2}x",
+                new_ns / old_ns
+            );
+        }
     }
 
     // ── WinsorizedSigma & PercentileClip carried over ───────────────────────
