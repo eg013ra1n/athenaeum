@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use super::align::{align, model_name, AlignError, Alignment, SeedKind, SeedPolicy};
+use super::align::{align, model_name, AlignError, Alignment, DistortionFit, SeedKind, SeedPolicy};
 use super::detect::{detect_stars, luminance, Star};
 use super::RegistrationConfig;
 use crate::geometry::{Linear, LinearKind, PixelMap};
@@ -107,7 +107,7 @@ pub fn register_frame(
                 detections = stars.len(),
                 inliers = a.inliers,
                 rms_px = a.rms_px,
-                model = %model_name(a.model, a.distortion_order, a.seed),
+                model = %model_name(a.model, a.distortion, a.seed),
                 flipped = a.flipped,
                 duration_ms,
                 "frame registered"
@@ -139,7 +139,7 @@ pub fn identity_registration(reference: &ReferenceStars) -> FrameRegistration {
         outcome: Ok(Alignment {
             map,
             model: LinearKind::Similarity,
-            distortion_order: None,
+            distortion: DistortionFit::None,
             seed: SeedKind::Quads,
             seed_matches: 0,
             pairs: reference.stars.len(),
@@ -158,6 +158,7 @@ pub fn identity_registration(reference: &ReferenceStars) -> FrameRegistration {
             regularity: 1.0,
             ransac_iterations: 0,
             refit_rounds: 0,
+            local_rounds: 0,
             warnings: Vec::new(),
         }),
         duration_ms: 0,
@@ -207,7 +208,7 @@ pub fn to_record(
                 "aligned"
             }
             .to_string();
-            rec.model = Some(model_name(a.model, a.distortion_order, a.seed));
+            rec.model = Some(model_name(a.model, a.distortion, a.seed));
             rec.transform_json = Some(a.map.to_json());
             rec.inlier_ratio = Some(a.inlier_ratio);
             rec.peak_error_px = Some(a.peak_px.0.max(a.peak_px.1));

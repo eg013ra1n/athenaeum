@@ -164,9 +164,61 @@ configurable). For RGB frames detection runs on the luminance
 | `affine` | 6 | auto for 12–29 inliers; the legacy `registration_results` shape |
 | `homography` | 8 | **default**; normalized DLT (Hartley); flips are a negative determinant, nothing special |
 | `polynomial2..4` | + (order+1)(order+2)−6 per axis, per direction | fitted on the residuals of the linear model; forward and inverse fitted independently (the plate solver's SIP convention); auto-enabled for a subject whose geometry differs from the reference's (the `INSTRUME` half of the cross-camera rule waits for the orchestrator to pass it — Plan 5) with ≥ 200 inliers whose inliers are consistent (overlap index ≥ 0.6 — inlier hull over the matched pairs' hull) and cover the frame (regularity index ≥ 0.6 — fraction of a 4×4 grid holding an inlier); an explicit order is always honoured |
-| `tps` (M4) | ≤ 4000 nodes | regularized thin-plate spline, smoothing λ, node pruning by surface simplification, outlier removal |
+| `tps` | ≤ 600 nodes | regularized thin-plate spline over the refit inliers; smoothing λ (`registration.tpsSmoothing`); nodes chosen grid-stratified, never the first N; evaluated through a cached 8 px displacement grid — M4c, rulings R-M4c-5/6 |
 
 `model: auto` resolves per frame as above; the resolved model is recorded.
+
+**Thin-plate-spline distortion (M4c, rulings R-M4c-5/6/7).** The polynomial
+layer is a GLOBAL surface: a degree-3 fit cannot follow a residual field that
+changes sign twice across the frame, however many stars it is fitted on
+(measured on a 1.5 px checkerboard field: cubic 0.93 px RMS at the inliers and
+1.19 px off them, spline 0.001 px and 0.108 px). The spline is local by
+construction. `geometry/tps.rs` fits the classic order-2 RBF `φ(r) = r² ln r`
+with an affine part — two independent scalar splines (the x and the y
+displacement) over one node set, Bookstein's bordered system, coordinates
+normalized to the node cloud's own bounding-box diagonal so `λ` is
+sensor-independent. The bordered system is INDEFINITE (`φ(0) = 0`, so the
+kernel block has zero trace and eigenvalues of both signs; `r² ln r` is only
+conditionally positive definite), so it is solved by dense Gaussian
+elimination with partial pivoting, `O(n³/3)` — there is no Cholesky of that
+block to Schur-complement against, and a diagonal ridge cannot create one.
+Forward and inverse are fitted independently, each at its OWN evaluation
+points in reference space (`L(sub)` and `ref`), exactly as the polynomial arm
+does. Nodes are capped at `TPS_MAX_NODES = 600` and chosen grid-stratified
+over a 30×20 cell grid (best-σ pair per occupied cell first, then round-robin);
+a frame with fewer than `4 · MIN_INLIERS = 32` refit inliers keeps the linear
+model with a warning, since a local model fitted on a handful of stars says
+nothing about the rest of the frame. `distortion: auto` never resolves to the
+spline — it is always a deliberate choice. Pixel work never evaluates the
+spline (600 logarithms per pixel per direction): `PixelMap`'s distortion is an
+explicitly tagged enum (`{"kind": "polynomial" | "tps", …}`, an untagged
+`transform_json` — every row written before M4c — decoding as polynomial), and
+its `tps` arm samples both splines onto a `TPS_GRID_PX = 8` px grid over the
+fitted domain, cached in memory on first use and never serialized. `λ` is the
+weight of the `λ · wᵀw` penalty in px² of the normalized frame; its useful
+range grows with the node count (≈ 0.01 for a few dozen nodes, roughly an
+order of magnitude higher at the cap), and the shipped default is `0.0` — the
+interpolating spline — until Task 7's acceptance run picks one from real
+frames.
+
+**Local distortion correction loop (M4c, ruling R-M4c-7).** With
+`registration.localDistortion` on and any distortion model selected, up to
+`LOCAL_DISTORTION_ROUNDS = 3` rounds of: re-pair every subject star THROUGH
+the current map (linear part and distortion together) at tolerance
+`ransacTolerancePx · (1 + round)`; RANSAC a corrector homography `H_c` on what
+the map still gets wrong (predicted reference position → actual reference
+position); stop once `‖H_c − I‖_F < LOCAL_DISTORTION_STOP = 1e-3`; otherwise
+compose `H_c` into the linear part and refit the distortion around it. A round
+is KEPT only when it does not raise the RMS — our guard, not the ruling's,
+because a round changes both the model and the pair set it is measured over.
+`Alignment.local_rounds` counts the rounds that ran (`refit_rounds` keeps its
+own meaning: the σ-clip rounds inside one `refit_weighted` call). On
+well-conditioned data the corrector converges on the FIRST round for a
+structural reason worth recording: the refit has already least-squares-fitted
+the linear part over these pairs and `Distortion::fit_joint` has already folded
+the residual's affine term back into it, so what is left is orthogonal to what
+a homography can represent. The loop is therefore a safety net for maps whose
+first pairing was partial, which is a real-frame situation.
 
 ### 3.4 Output geometry and coverage
 
@@ -1041,11 +1093,25 @@ reference:     { mode: "auto", twoPass: true }
                 -- part of any stage hash, so flipping it never invalidates a
                 -- cached artifact.
 registration:  { geometry: "coRegistered",
-                 model: "auto", distortion: "off", interpolation: "bicubicBSpline",
+                 model: "auto", distortion: "off",
+                 tpsSmoothing: 0.0, localDistortion: false,
+                 interpolation: "bicubicBSpline",
                  clampingThreshold: 0.30, maxStars: 2000, ransacTolerancePx: 1.9,
                  ransacMaxIterations: 2000, maxRmsPx: 2.0, failOnMaxRms: false,
                  detection: { minSnr: 10, maxEccentricity: 0.8 },
                  writeRegisteredFrames: false }
+                -- distortion (M4c, ruling R-M4c-5): "tps" joins the polynomial
+                -- orders and "auto" (§3.3). `auto` never resolves to it.
+                -- tpsSmoothing (M4c, ruling R-M4c-5): the spline's λ, in px² of
+                -- the normalized frame. 0.0 = interpolating, which lands every
+                -- inlier exactly. Read only by distortion: "tps". The useful
+                -- range grows with the node count (≈ 0.01 for a few dozen nodes,
+                -- roughly 10× that at the 600-node cap); Task 7's acceptance run
+                -- picks the shipped default from real frames.
+                -- localDistortion (M4c, ruling R-M4c-7): the local distortion
+                -- loop (§3.3). A no-op with distortion: "off" — there is nothing
+                -- to refit. Both fields ride `registration_subtree`, so either
+                -- one re-registers the set, exactly as `geometry` does.
                 -- geometry (M4b, ruling R-M4b-4): "coRegistered" | "native" (§3.8).
                 -- Co-registered is M1-M4a's behaviour: ONE reference for the set,
                 -- every group resampled into its geometry. Native gives each group

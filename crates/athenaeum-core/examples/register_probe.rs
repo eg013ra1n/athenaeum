@@ -244,7 +244,7 @@ fn main() {
     } else {
         "aligned"
     });
-    out["model"] = serde_json::json!(model_name(a.model, a.distortion_order, a.seed));
+    out["model"] = serde_json::json!(model_name(a.model, a.distortion, a.seed));
     out["seedMatches"] = serde_json::json!(a.seed_matches);
     out["pairs"] = serde_json::json!(a.pairs);
     out["repaired"] = serde_json::json!(a.repaired);
@@ -313,7 +313,7 @@ fn main() {
                 &src,
                 &RegisteredCards {
                     reference_name: ref_name,
-                    model: &model_name(a.model, a.distortion_order, a.seed),
+                    model: &model_name(a.model, a.distortion, a.seed),
                     transform_json: &json,
                     interpolation: args.cfg.interpolation,
                     clamping: args.cfg.clamping_threshold,

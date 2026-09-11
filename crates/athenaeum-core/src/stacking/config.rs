@@ -692,6 +692,52 @@ mod tests {
         );
     }
 
+    /// M4c rulings R-M4c-5/7: the two new registration fields change what
+    /// a stored registration artifact IS — a different distortion surface
+    /// under the same linear model, or a linear model a corrector was
+    /// composed into — so both must move the registration stage hash and
+    /// re-register the set on purpose, exactly as `registration.geometry`
+    /// does. They ride `cfg.registration`, so they move the run
+    /// fingerprint too, and nothing upstream of registration follows
+    /// them.
+    #[test]
+    fn the_tps_fields_move_the_registration_stage_hash() {
+        let cfg = StackingConfig::default();
+        for other in [
+            {
+                let mut c = cfg.clone();
+                c.registration.distortion =
+                    crate::stacking::register::DistortionChoice::Tps;
+                c
+            },
+            {
+                let mut c = cfg.clone();
+                c.registration.tps_smoothing = 2.0;
+                c
+            },
+            {
+                let mut c = cfg.clone();
+                c.registration.local_distortion = true;
+                c
+            },
+        ] {
+            assert_ne!(config_hash(&cfg), config_hash(&other));
+            assert_ne!(
+                stage_hash(&registration_subtree(&cfg), &[], &[]),
+                stage_hash(&registration_subtree(&other), &[], &[]),
+                "the registration stage hash must follow every registration field"
+            );
+            assert_eq!(
+                stage_hash(&measurement_subtree(&cfg), &[], &[]),
+                stage_hash(&measurement_subtree(&other), &[], &[]),
+            );
+            assert_eq!(
+                stage_hash(&calibration_subtree(&cfg), &[], &[]),
+                stage_hash(&calibration_subtree(&other), &[], &[]),
+            );
+        }
+    }
+
     /// M4b ruling R-M4b-4/5: flipping `registration.geometry` changes what
     /// every stored registration artifact MEANS (which reference the frame
     /// was warped onto, and into which geometry), so it must move the
@@ -1203,6 +1249,16 @@ mod tests {
         // (`calibration`/`measurement`/`registration`/`normalization` are
         // the four), so not one cached per-frame artifact goes stale over
         // it — only this whole-config fingerprint moves.
-        assert_eq!(default_hash, "33c13c606bcf6426");
+        //
+        // And once more here (M4c Task 4, rulings R-M4c-5/R-M4c-7):
+        // `registration.tpsSmoothing` and `registration.localDistortion`
+        // join `RegistrationConfig`. They ship `0.0` / `false`, i.e.
+        // today's behaviour (and `distortion` still defaults to `off`, so
+        // neither is even read by a default run), but they DO ride
+        // `registration_subtree`, so every set's cached registration rows
+        // go stale once — deliberately, per the same reasoning as
+        // `geometry` above: the fields decide what surface a stored
+        // `transform_json` describes.
+        assert_eq!(default_hash, "4c0cdc66be4b9284");
     }
 }

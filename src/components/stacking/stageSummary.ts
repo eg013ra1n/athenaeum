@@ -101,6 +101,8 @@ export function distortionLabel(v: DistortionChoice): string {
     case 'polynomial2': return 'polynomial-2';
     case 'polynomial3': return 'polynomial-3';
     case 'polynomial4': return 'polynomial-4';
+    // M4c ruling R-M4c-5: the thin-plate spline.
+    case 'tps': return 'thin-plate spline';
     case 'auto': return 'auto';
   }
 }
@@ -280,7 +282,18 @@ export function stageSummary(
       // delivers — a reference and a geometry per group — so it leads the
       // row; co-registered is the default and says nothing.
       const geometry = config.registration.geometry === 'native' ? 'native · ' : '';
-      return `${geometry}${modelLabel(config.registration.model)} model · distortion ${distortionLabel(config.registration.distortion)} · ${interpolationLabel(config.registration.interpolation)} · clamp ${config.registration.clampingThreshold.toFixed(2)} · ${config.registration.maxStars} stars`;
+      // M4c (rulings R-M4c-5/7): the spline's λ only means anything when
+      // the spline is the chosen distortion, and the loop only runs with
+      // a distortion to refit — so neither is mentioned otherwise.
+      const smoothing =
+        config.registration.distortion === 'tps'
+          ? ` λ ${formatUpTo3Decimals(config.registration.tpsSmoothing)}`
+          : '';
+      const localLoop =
+        config.registration.localDistortion && config.registration.distortion !== 'off'
+          ? ' · local loop'
+          : '';
+      return `${geometry}${modelLabel(config.registration.model)} model · distortion ${distortionLabel(config.registration.distortion)}${smoothing}${localLoop} · ${interpolationLabel(config.registration.interpolation)} · clamp ${config.registration.clampingThreshold.toFixed(2)} · ${config.registration.maxStars} stars`;
     }
     case 'normalize': {
       const local = config.normalization.local;

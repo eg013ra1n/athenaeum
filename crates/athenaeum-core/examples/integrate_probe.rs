@@ -705,7 +705,7 @@ fn main() {
             }
         };
         let (rms_px, inliers, pairs) = (a.rms_px, a.inliers, a.pairs);
-        let model_str = model_name(a.model, a.distortion_order, a.seed);
+        let model_str = model_name(a.model, a.distortion, a.seed);
         let map = a.map;
 
         let measurement =

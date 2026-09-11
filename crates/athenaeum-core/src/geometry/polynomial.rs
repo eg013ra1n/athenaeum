@@ -653,6 +653,11 @@ mod tests {
         }
         // The domain survives the JSON round trip.
         let back = PixelMap::from_json(&map.to_json()).unwrap();
-        assert_eq!(back.distortion.unwrap().domain, Some(dom));
+        match back.distortion.unwrap() {
+            crate::geometry::pixel_map::DistortionModel::Polynomial(p) => {
+                assert_eq!(p.domain, Some(dom))
+            }
+            other => panic!("expected a polynomial: {other:?}"),
+        }
     }
 }

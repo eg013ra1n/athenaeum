@@ -82,6 +82,12 @@ pub enum DistortionChoice {
     Polynomial2,
     Polynomial3,
     Polynomial4,
+    /// A regularized thin-plate spline over the refit inliers (M4c,
+    /// ruling R-M4c-5): local by construction, so it follows a residual
+    /// field a global polynomial of order 2..=4 cannot — at the cost of a
+    /// dense solve and a cached displacement grid per frame. `Auto` never
+    /// picks it; it is always a deliberate user choice.
+    Tps,
     /// Order 3 for a subject whose geometry differs from the reference's,
     /// when the refit keeps at least `align::AUTO_DISTORTION_MIN_INLIERS`
     /// inliers whose overlap and regularity indices both reach
@@ -95,7 +101,7 @@ impl DistortionChoice {
             DistortionChoice::Polynomial2 => Some(2),
             DistortionChoice::Polynomial3 => Some(3),
             DistortionChoice::Polynomial4 => Some(4),
-            DistortionChoice::Off | DistortionChoice::Auto => None,
+            DistortionChoice::Off | DistortionChoice::Tps | DistortionChoice::Auto => None,
         }
     }
 }
@@ -153,6 +159,28 @@ pub struct RegistrationConfig {
     pub geometry: RegistrationGeometry,
     pub model: ModelChoice,
     pub distortion: DistortionChoice,
+    /// The thin-plate spline's regularization weight `λ` (M4c, ruling
+    /// R-M4c-5) — `0.0` is the interpolating spline, which lands on every
+    /// inlier exactly, and a larger value trades node fidelity for a
+    /// smoother surface that generalizes between them.
+    ///
+    /// Unit: px² of the NORMALIZED frame. The kernel is evaluated on
+    /// coordinates divided by the node cloud's own diagonal, so `|φ|` is
+    /// bounded by 0.184 whatever the sensor, and `λ` is the weight of the
+    /// `λ · wᵀw` penalty against displacements measured in pixels. The
+    /// useful range therefore depends on the node count (the kernel
+    /// block's eigenvalues grow with it): around 0.01 for a few dozen
+    /// nodes, roughly an order of magnitude higher at the 600-node cap.
+    /// Read only by [`DistortionChoice::Tps`]; ignored by every other
+    /// choice.
+    pub tps_smoothing: f64,
+    /// The local distortion loop (M4c, ruling R-M4c-7): after the first
+    /// map, up to `align::LOCAL_DISTORTION_ROUNDS` rounds of re-pairing
+    /// every subject star THROUGH the current map at a widening
+    /// tolerance, fitting a corrector homography on what is left and
+    /// refitting the distortion around it. Needs a distortion model to
+    /// refit, so it is a no-op with `distortion: off`.
+    pub local_distortion: bool,
     pub interpolation: Interpolation,
     pub clamping_threshold: f32,
     pub max_stars: usize,
@@ -170,6 +198,8 @@ impl Default for RegistrationConfig {
             geometry: RegistrationGeometry::CoRegistered,
             model: ModelChoice::Auto,
             distortion: DistortionChoice::Off,
+            tps_smoothing: 0.0,
+            local_distortion: false,
             interpolation: Interpolation::BicubicBSpline,
             clamping_threshold: 0.30,
             max_stars: 2000,
@@ -262,12 +292,46 @@ mod tests {
         assert_eq!(native.max_stars, 2000);
     }
 
+    /// M4c rulings R-M4c-5/7: two fields, both `#[serde(default)]`
+    /// through the struct-level `default`, so a config document written
+    /// before M4c decodes to exactly today's behaviour (interpolating
+    /// spline weight, loop off) and no `STACKING_CONFIG_VERSION` bump is
+    /// needed. `tps` is a valid `distortion`, and `Auto` never resolves
+    /// to it.
+    #[test]
+    fn tps_smoothing_and_the_local_loop_default_to_off() {
+        let d = RegistrationConfig::default();
+        assert_eq!(d.tps_smoothing, 0.0);
+        assert!(!d.local_distortion);
+
+        let pre_m4c: RegistrationConfig =
+            serde_json::from_str("{\"distortion\":\"polynomial3\"}").unwrap();
+        assert_eq!(pre_m4c.tps_smoothing, 0.0);
+        assert!(!pre_m4c.local_distortion);
+
+        let tps: RegistrationConfig = serde_json::from_str(
+            "{\"distortion\":\"tps\",\"tpsSmoothing\":2.5,\"localDistortion\":true}",
+        )
+        .unwrap();
+        assert_eq!(tps.distortion, DistortionChoice::Tps);
+        assert_eq!(tps.tps_smoothing, 2.5);
+        assert!(tps.local_distortion);
+
+        assert_eq!(
+            serde_json::to_string(&DistortionChoice::Tps).unwrap(),
+            "\"tps\""
+        );
+        assert_eq!(DistortionChoice::Tps.order(), None, "a spline has no order");
+    }
+
     #[test]
     fn defaults_match_the_spec() {
         let d = RegistrationConfig::default();
         assert_eq!(d.geometry, RegistrationGeometry::CoRegistered);
         assert_eq!(d.model, ModelChoice::Auto);
         assert_eq!(d.distortion, DistortionChoice::Off);
+        assert_eq!(d.tps_smoothing, 0.0);
+        assert!(!d.local_distortion);
         assert_eq!(d.interpolation, Interpolation::BicubicBSpline);
         assert_eq!(d.clamping_threshold, 0.30);
         assert_eq!(d.max_stars, 2000);
@@ -288,6 +352,8 @@ mod tests {
             "\"geometry\":\"coRegistered\"",
             "\"model\":\"auto\"",
             "\"distortion\":\"off\"",
+            "\"tpsSmoothing\":0.0",
+            "\"localDistortion\":false",
             "\"interpolation\":\"bicubicBSpline\"",
             "\"clampingThreshold\":0.3",
             "\"maxStars\":2000",

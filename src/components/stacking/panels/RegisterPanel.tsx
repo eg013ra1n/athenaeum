@@ -1,5 +1,6 @@
 // Stage 5 (Register) inspector panel: the geometry mode (M4b),
-// model/distortion/interpolation, clamping, star cap, RANSAC
+// model/distortion (including the M4c thin-plate spline and its λ, plus
+// the local distortion loop) /interpolation, clamping, star cap, RANSAC
 // tolerance/iterations, max RMS + fail-on-max-rms, write-registered-frames,
 // and the detection pair under an Advanced disclosure.
 
@@ -30,7 +31,16 @@ const GEOMETRIES: { value: RegistrationGeometry; label: string }[] = [
 ];
 
 const MODELS: ModelChoice[] = ['auto', 'similarity', 'affine', 'homography'];
-const DISTORTIONS: DistortionChoice[] = ['off', 'polynomial2', 'polynomial3', 'polynomial4', 'auto'];
+const DISTORTIONS: DistortionChoice[] = [
+  'off',
+  'polynomial2',
+  'polynomial3',
+  'polynomial4',
+  // M4c (ruling R-M4c-5). `auto` stays last: it is the resolved-by-inlier
+  // -count option, not another model.
+  'tps',
+  'auto',
+];
 const INTERPOLATIONS: Interpolation[] = [
   'nearest',
   'bilinear',
@@ -118,6 +128,46 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
           default {distortionLabel(defaults.registration.distortion)}
         </p>
       </div>
+
+      {/* M4c (ruling R-M4c-5): λ is the spline's own knob and means
+       *  nothing for the polynomial arms, so it only appears with the
+       *  spline selected. */}
+      {r.distortion === 'tps' && (
+        <NumericField
+          label="TPS smoothing (λ)"
+          value={r.tpsSmoothing}
+          onCommit={(n) => patch({ tpsSmoothing: n })}
+          min={0}
+          max={10}
+          step={0.5}
+          disabled={disabled}
+          help={`0 = interpolating (lands every inlier exactly); default ${defaults.registration.tpsSmoothing}`}
+        />
+      )}
+
+      {/* M4c (ruling R-M4c-7): the loop refits the distortion, so with
+       *  none selected there is nothing for it to do. */}
+      <label
+        className={`flex items-center gap-2 ${
+          r.distortion === 'off' ? 'cursor-default' : 'cursor-pointer'
+        }`}
+      >
+        <input
+          type="checkbox"
+          checked={r.localDistortion}
+          disabled={disabled || r.distortion === 'off'}
+          onChange={(e) => patch({ localDistortion: e.target.checked })}
+          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+        />
+        <span
+          className={`text-sm ${
+            r.distortion === 'off' ? 'text-content-muted' : 'text-content-secondary'
+          }`}
+        >
+          Local distortion loop
+          {r.distortion === 'off' ? ' (needs a distortion model)' : ''}
+        </span>
+      </label>
 
       <div>
         <label className="block text-xs text-content-secondary mb-1">Interpolation</label>

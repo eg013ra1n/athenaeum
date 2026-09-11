@@ -32,7 +32,7 @@ export type RegistrationGeometry = "coRegistered" | "native";
 
 export type ModelChoice = "auto" | "similarity" | "affine" | "homography";
 
-export type DistortionChoice = "off" | "polynomial2" | "polynomial3" | "polynomial4" | "auto";
+export type DistortionChoice = "off" | "polynomial2" | "polynomial3" | "polynomial4" | "tps" | "auto";
 
 export type DetectionConfig = { minSnr: number, maxEccentricity: number, };
 
@@ -44,7 +44,33 @@ export type RegistrationConfig = {
  * `default`, so every stored config written before M4b decodes as
  * co-registered and no `STACKING_CONFIG_VERSION` bump is needed.
  */
-geometry: RegistrationGeometry, model: ModelChoice, distortion: DistortionChoice, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, writeRegisteredFrames: boolean, };
+geometry: RegistrationGeometry, model: ModelChoice, distortion: DistortionChoice, 
+/**
+ * The thin-plate spline's regularization weight `λ` (M4c, ruling
+ * R-M4c-5) — `0.0` is the interpolating spline, which lands on every
+ * inlier exactly, and a larger value trades node fidelity for a
+ * smoother surface that generalizes between them.
+ *
+ * Unit: px² of the NORMALIZED frame. The kernel is evaluated on
+ * coordinates divided by the node cloud's own diagonal, so `|φ|` is
+ * bounded by 0.184 whatever the sensor, and `λ` is the weight of the
+ * `λ · wᵀw` penalty against displacements measured in pixels. The
+ * useful range therefore depends on the node count (the kernel
+ * block's eigenvalues grow with it): around 0.01 for a few dozen
+ * nodes, roughly an order of magnitude higher at the 600-node cap.
+ * Read only by [`DistortionChoice::Tps`]; ignored by every other
+ * choice.
+ */
+tpsSmoothing: number, 
+/**
+ * The local distortion loop (M4c, ruling R-M4c-7): after the first
+ * map, up to `align::LOCAL_DISTORTION_ROUNDS` rounds of re-pairing
+ * every subject star THROUGH the current map at a widening
+ * tolerance, fitting a corrector homography on what is left and
+ * refitting the distortion around it. Needs a distortion model to
+ * refit, so it is a no-op with `distortion: off`.
+ */
+localDistortion: boolean, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, writeRegisteredFrames: boolean, };
 
 export type OutputNormalization = "none" | "additive" | "additiveWithScaling" | "multiplicative" | "multiplicativeWithScaling";
 
