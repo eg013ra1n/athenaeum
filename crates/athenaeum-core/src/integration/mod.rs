@@ -13,6 +13,7 @@ pub mod registered_source;
 pub mod source;
 pub mod stats;
 pub mod storage_class;
+pub mod student_t;
 
 #[derive(Debug)]
 pub enum IntegrationError {
