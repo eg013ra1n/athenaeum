@@ -1,4 +1,4 @@
-//! Per-pixel robust integration recipes — PixInsight's two-axis model
+//! Per-pixel robust integration recipes — the reference's two-axis model
 //! (Combination × Rejection). Spec:
 //! `docs/superpowers/specs/2026-07-06-master-integration-pi-model-design.md`.
 //!
@@ -70,7 +70,7 @@ impl IntegrationRecipe {
 }
 
 /// How the surviving samples are collapsed into the output pixel. `Average`
-/// is PI's name for our historical `Mean`.
+/// is the reference's name for our historical `Mean`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Combination {
@@ -94,7 +94,7 @@ impl Combination {
 pub enum Rejection {
     /// Keep every sample.
     None,
-    /// PixInsight-style percentile clipping around the median m: reject x when
+    /// Reference-style percentile clipping around the median m: reject x when
     /// (m - x)/|m| > low or (x - m)/|m| > high. Deviations normalized by |m|
     /// so thresholds are sign-agnostic.
     PercentileClip { low: f64, high: f64 },
