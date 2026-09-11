@@ -37,6 +37,29 @@
 //! (`measure::ADU_SCALE`), not the `[0, 1]` default. The noise estimator
 //! carries an absolute floor tuned for 16-bit data, which is the other
 //! reason the map is never rescaled into `[0, 1]` first.
+//!
+//! Where this implementation differs from §5.1's summary, all of it
+//! deliberate and each measured where a number is claimed:
+//!
+//! * **Two rules §5.1 does not list**, both the reference's own: a
+//!   structure whose bounding box is one pixel wide in either axis is
+//!   rejected outright (it has no centre — a hot pixel, a read-out streak's
+//!   tail, a noise residual), and after the size floor a candidate with
+//!   another candidate within one pixel is dropped (two seeds on one star
+//!   would count its signal twice).
+//! * **Two different pixel counts.** The size floor
+//!   ([`StructureParams::min_structure_size`]) counts the structure's OWN
+//!   pixels; the coverage rule counts only the SIGNIFICANT ones (those above
+//!   the local background). The reference makes the same distinction, and it
+//!   matters: coverage asks how solidly a source fills its box, while the
+//!   size floor asks how big the source is at all.
+//! * **Local maxima are counted on the raw plane**, per significant pixel,
+//!   instead of building a whole-plane maxima map first. Identical answer —
+//!   a pixel is a maximum when it is strictly greater than all 24 of its
+//!   neighbours and below `0.75·upper_limit` — for a few per mille of the
+//!   work, since structures cover a tiny fraction of a frame.
+//! * The noise estimator, the high-pass width and the missing rescale: see
+//!   [`map_noise`], [`FILTER_EPSILON`] and [`structure_map`].
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -96,9 +119,20 @@ pub struct StructureParams {
     /// A structure whose `snr/snr_threshold` reaches this is bright enough
     /// to skip the kurtosis rule.
     pub bright_threshold: f64,
-    /// Structures smaller than this in pixels are not stars. `0` selects the
-    /// reference's automatic mode: the size floor is derived from the
-    /// detected population's own size distribution.
+    /// Structures smaller than this in pixels are not stars.
+    ///
+    /// `0` — the default — selects the reference's AUTOMATIC floor, which is
+    /// an extra rejection stage derived from the field's own star-size
+    /// statistic: the accepted candidates' sizes are sorted, their
+    /// strictly-increasing gaps collected, and the median of those gaps
+    /// becomes a clustering bandwidth; the floor is then the smallest size
+    /// in the first cluster, or — when that first cluster has fewer members
+    /// than the second — the smallest size in the SECOND, on the reading
+    /// that a small minority of tiny structures is a hot-pixel/noise
+    /// population rather than stars. With one tight population (or fewer
+    /// than two distinct sizes) it evaluates to 0 and nothing is dropped,
+    /// which is what it does on this module's own fixture at the shipped
+    /// settings. Set it to `1` for an explicit "no floor".
     pub min_structure_size: usize,
     /// Coverage floor `(π/4)·(1 − max_distortion)`: the fraction of its own
     /// bounding box a structure's significant pixels must fill. A perfect
@@ -282,9 +316,10 @@ fn structure_map(plane: &[f32], w: usize, h: usize, p: &StructureParams) -> (Vec
     // (≈ 0.42×) as well as the stars, so a level taken from the filtered
     // map would fall with the very peaks the filter suppressed, and the
     // detector would lose most of the sharpness behaviour it exists for.
-    // Measured on this module's fixture: anchored on the plane, an
-    // undersampled field yields 0.52× the well-sampled field's stars;
-    // anchored on the map, 0.73×.
+    // Measured on this module's fixture (the two numbers its sharpness pin
+    // asserts): anchored on the plane, an undersampled field yields 0.56×
+    // the well-sampled field's stars; anchored on the map, 0.91× — and at
+    // the reference's own sensitivity of 0.5, 0.56× against 0.73×.
     let noise = map_noise(plane, w, h);
     let threshold = if noise > 0.0 {
         median + 3.0 * noise
@@ -301,21 +336,36 @@ fn structure_map(plane: &[f32], w: usize, h: usize, p: &StructureParams) -> (Vec
     (erode3(&bin, w, h), threshold, noise)
 }
 
-/// σ of a plane's noise, in that plane's own units: the K-sigma dispersion of
-/// the SECOND B3-spline à-trous detail layer, divided by that layer's
-/// noise-propagation factor [`B3_LAYER2_GAIN`].
+/// σ of a plane's noise, in that plane's own units: the K-sigma dispersion
+/// of the SECOND B3-spline à-trous detail layer, divided by that layer's
+/// noise-propagation factor [`B3_LAYER2_GAIN`] — the estimator the reference
+/// takes its binarization level from.
 ///
-/// Why not the first layer (which the crate's own 4-layer MRS estimator and
-/// `estimate_noise_mrs(.., 1)` report, over [`MRS_LAYER1_GAIN`]): by the
-/// time the threshold is taken, the map has been through a 3×3 median and a
-/// 3×3 dilation, and both of those are smoothers — every pixel is the max of
-/// its neighbourhood, so the finest scale carries almost nothing left of the
-/// original noise. Measured on this module's own 512×512 fixture the first
-/// layer answers 1.04 ADU where the second answers 4.4 ADU for the same
-/// 8 ADU input noise, i.e. the first-layer route would set the binarization
-/// level four times too low and let the whole noise field into the structure
-/// map. The second layer sits above the smoothing and is what the reference
-/// reads.
+/// Why not `psf_signal::noise_mrs`, which is two lines away in the same
+/// measurement and reports the FIRST layer over
+/// `psf_signal::MRS_LAYER1_GAIN`: because on real frames the two do not
+/// measure the same number. Both estimators were run on the SAME unfiltered
+/// ADU-scaled plane over the 94-frame calibration subset (176 planes, M4c
+/// Task 0 fix round 1, ruling R-T0-2), `layer2/noise_mrs`:
+///
+/// | planes | n | median | min | max | within 10 % |
+/// | ------ | - | ------ | --- | --- | ----------- |
+/// | mono | 53 | 1.108 | 1.071 | 1.136 | 19/53 |
+/// | OSC R | 41 | 1.666 | 1.554 | 1.710 | 0/41 |
+/// | OSC G | 41 | 2.201 | 2.152 | 2.243 | 0/41 |
+/// | OSC B | 41 | 2.041 | 1.991 | 2.106 | 0/41 |
+/// | all | 176 | 1.676 | 1.071 | 2.243 | 19/176 (10.8 %) |
+///
+/// They agree to ~11 % on the mono planes and diverge by up to 2.24× on the
+/// debayered colour planes, and the reason is the thing that matters here:
+/// the noise in those planes is spatially CORRELATED (each missing colour is
+/// interpolated from its neighbours), so the finest wavelet scale carries
+/// less of it and a layer-1 estimate under-reports the dispersion of the
+/// BLOBS the noise actually forms. A structure detector mistakes blobs for
+/// stars, so the level has to follow them — which is exactly what the
+/// second layer does, and why the reference reads it. The whole calibration
+/// grid was measured through this estimator; swapping it would move the
+/// OSC levels by 1.6-2.2× and invalidate that grid.
 fn map_noise(map: &[f32], w: usize, h: usize) -> f32 {
     let c1 = b3_smooth(map, w, h, 1);
     let c2 = b3_smooth(&c1, w, h, 2);
@@ -733,6 +783,15 @@ fn evaluate(
 fn ring_background(plane: &[f32], w: usize, h: usize, s: &Structure) -> Option<(f64, f64)> {
     let mut m0 = f64::INFINITY;
     let mut ring: Vec<f32> = Vec::new();
+    // 200 growth steps is the reference's own guard against an ill-posed
+    // field (one whose ring median never settles). It is not a cost worry:
+    // the ring stops growing as soon as two successive medians agree to
+    // 1 %, which on a flat sky is the second step, and a ring that reached
+    // the image bounds stops changing and therefore also settles. The
+    // worst case is a structure on a steep gradient, where the ring grows
+    // to ~200 px around its box and the loop costs O(200 · ring) — bounded
+    // by the plane, and `None` at the end of it rejects the candidate
+    // rather than guessing a background.
     for delta in BKG_DELTA..BKG_DELTA + 200 {
         ring.clear();
         let rx0 = s.x0.saturating_sub(delta);
@@ -1037,25 +1096,80 @@ mod tests {
     /// population — the hot-pixel median suppresses a narrow star's core far
     /// harder than a soft one's while the binarization level, taken from the
     /// unfiltered noise, stays where it is.
+    ///
+    /// 159 vs 285 when this was written — a 44 % drop. Where it comes from,
+    /// measured on this fixture at the shipped settings: the soft field
+    /// forms 300 structures and 285 of them pass the candidate rules, the
+    /// sharp field forms only 222 (78 of its stars never clear the
+    /// binarization level, or clear it in a one-pixel-wide box) and 159
+    /// pass. The automatic size floor contributes NOTHING to that: it lands
+    /// at 3 px in both fields, which is the smallest surviving candidate's
+    /// own size, so the same run with the floor forced off
+    /// (`min_structure_size = 1`) gives the same 159/285 — which is why this
+    /// pin asserts the bar in both configurations. (At the reference's own
+    /// `sensitivity` of 0.5 the floor does bite — 5 px on the soft field, 3
+    /// on the sharp — and the drop is 159/267.) A peak threshold moves the
+    /// other way entirely, finding MORE stars on the sharper frame.
     #[test]
     fn an_undersampled_field_yields_far_fewer_detections() {
         let stars = star_grid();
         let soft = detect_structures(&field(&stars, 3.0, 17), W, H, &params()).len();
         let sharp = detect_structures(&field(&stars, 1.5, 17), W, H, &params()).len();
         assert!(soft > 0, "the soft field must detect something");
-        // 159 vs 285 when this was written — a 44 % drop. The two
-        // mechanisms behind it: the hot-pixel median suppresses
-        // a narrow star's core to ~0.29 of its peak against ~0.73 for a soft
-        // one while the binarization level, taken from the UNFILTERED
-        // plane's noise, stays where it is (so 78 of the sharp field's stars
-        // never form a structure at all or form a one-pixel-wide one), and
-        // the automatic size floor then cuts the smallest survivors. It is
-        // the behaviour the whole detector exists for: a peak threshold
-        // moves the other way, finding MORE stars on the sharper frame.
         assert!(
             (sharp as f64) <= 0.6 * soft as f64,
             "sharp {sharp} vs soft {soft} — the drop must be at least 40 %"
         );
+        // Without the automatic floor, so the drop is pinned to the map and
+        // the candidate rules rather than to a size statistic.
+        let nofloor = StructureParams {
+            min_structure_size: 1,
+            ..params()
+        };
+        let soft_nf = detect_structures(&field(&stars, 3.0, 17), W, H, &nofloor).len();
+        let sharp_nf = detect_structures(&field(&stars, 1.5, 17), W, H, &nofloor).len();
+        assert!(
+            (sharp_nf as f64) <= 0.6 * soft_nf as f64,
+            "with no size floor: sharp {sharp_nf} vs soft {soft_nf} — the bar must hold without it"
+        );
+    }
+
+    /// The automatic size floor, on size distributions whose answer is known
+    /// by hand. It is an extra rejection stage the reference has and §5.1's
+    /// summary does not list, so it gets its own pin.
+    #[test]
+    fn the_automatic_size_floor_drops_a_minority_hot_pixel_cluster() {
+        let of = |sizes: &[usize]| -> Vec<Candidate> {
+            sizes
+                .iter()
+                .map(|&area| Candidate {
+                    x: 0.0,
+                    y: 0.0,
+                    peak: 1.0,
+                    flux: 1.0,
+                    area,
+                })
+                .collect()
+        };
+        // Three one-ish-pixel structures beside six real stars: the gaps are
+        // [1, 18], the bandwidth is their median 18, the clusters are
+        // {1,1,2} and {20..25}, and the first is the minority — so the floor
+        // moves up to the second cluster's smallest member and the hot
+        // pixels are dropped.
+        assert_eq!(
+            automatic_min_star_size(&of(&[1, 1, 2, 20, 21, 22, 23, 24, 25])),
+            20
+        );
+        // The same shape with the populations swapped: six real stars of
+        // 3 px and two big ones. The first cluster is the majority, so it
+        // IS the star population and the floor stays at its smallest member
+        // — nothing is dropped.
+        assert_eq!(automatic_min_star_size(&of(&[3, 3, 3, 3, 3, 3, 40, 41])), 3);
+        // One tight population: the floor is its smallest member, i.e. inert.
+        assert_eq!(automatic_min_star_size(&of(&[7, 7, 7, 7])), 0);
+        // Nothing detected, or one candidate: no statistic, no floor.
+        assert_eq!(automatic_min_star_size(&[]), 0);
+        assert_eq!(automatic_min_star_size(&of(&[9])), 0);
     }
 
     /// (c) An extended object is not a star, and the 33-px high-pass is the

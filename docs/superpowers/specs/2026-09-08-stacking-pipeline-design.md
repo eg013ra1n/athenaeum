@@ -397,9 +397,11 @@ the two grids that left it off) — or, with `measurement.seedDetector =
 "structure"`, from math reference §5.1's structure map instead of any peak
 threshold at all (`stacking::structure`, M4c Task 0: connected groups of
 pixels that survive a 33-px high-pass and a `median + 3σ` binarization, then
-the reference's per-candidate rules; it reproduces a structure detector's
-sharpness behaviour, which a peak threshold cannot, but it ships off — see
-§9.2), PSF fitting with the
+the reference's per-candidate rules, plus an automatic minimum structure
+size derived per frame from the accepted candidates' own size distribution —
+the reference's, and the one stage of it with no peak-detector equivalent;
+it reproduces a structure detector's sharpness behaviour, which a peak
+threshold cannot, but it ships off — see §9.2), PSF fitting with the
 `psfModel` (`auto` = Moffat β ∈ {2.5, 4, 6, 10} best MAD, or `moffat4`), the
 hybrid PSF/aperture flux at FWTM, RCR-cleaned and Winsorized mean fluxes,
 `M*`/`N*` from the large-scale background residual (MMT residual, scale 256),

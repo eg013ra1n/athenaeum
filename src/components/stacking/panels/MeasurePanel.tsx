@@ -234,7 +234,11 @@ export function MeasurePanel({
           default {seedDetectorLabel(defaults.measurement.seedDetector)} — which stars the
           fits start from. The structure map groups connected pixels instead of
           thresholding single ones, so it finds fewer stars on an undersampled frame; it
-          has no threshold of its own and ignores the two settings below.
+          has no threshold of its own, ignores the two settings below, and drops the
+          smallest structures using a size floor it derives from each frame. Measured
+          better than the peak threshold on mono frames and worse on colour ones — it
+          takes the blue channel's weight correlation from 0.68 to 0.42 and the
+          frame-ranking overlap from 14/20 to 11/20 (spec §9.2).
         </p>
       </div>
 
