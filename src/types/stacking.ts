@@ -26,13 +26,23 @@ minWeightFraction: number, maxFwhmPx: number | null, maxEccentricity: number | n
  */
 excludeOnRegistrationFailure: boolean, };
 
+export type RegistrationGeometry = "coRegistered" | "native";
+
 export type ModelChoice = "auto" | "similarity" | "affine" | "homography";
 
 export type DistortionChoice = "off" | "polynomial2" | "polynomial3" | "polynomial4" | "auto";
 
 export type DetectionConfig = { minSnr: number, maxEccentricity: number, };
 
-export type RegistrationConfig = { model: ModelChoice, distortion: DistortionChoice, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, writeRegisteredFrames: boolean, };
+export type RegistrationConfig = { 
+/**
+ * M4b (ruling R-M4b-4): co-registered (the default — one reference and
+ * one geometry for the whole set) or native (a reference and a
+ * geometry per group). `#[serde(default)]` rides the struct-level
+ * `default`, so every stored config written before M4b decodes as
+ * co-registered and no `STACKING_CONFIG_VERSION` bump is needed.
+ */
+geometry: RegistrationGeometry, model: ModelChoice, distortion: DistortionChoice, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, writeRegisteredFrames: boolean, };
 
 export type OutputNormalization = "none" | "additive" | "additiveWithScaling" | "multiplicative" | "multiplicativeWithScaling";
 
@@ -312,6 +322,15 @@ lnScale: number | null,
 cachedLn: boolean, };
 
 export type SummaryGroup = { key: string, frameCount: number, includedCount: number, masterPath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, stats: GroupStats | null, normalizationReferenceFrameId: number | null, 
+/**
+ * M4b (ruling R-M4b-4): the frame every member of THIS group was
+ * registered onto — the run-wide reference in `coRegistered` mode
+ * (the same id `RunSummary::reference` carries), the group's own in
+ * `native` mode. `None` only on a summary written before M4b, or for
+ * a group that never reached stage 5. `#[serde(default)]`, see
+ * [`SummaryFrame::ln_scale`]'s own doc.
+ */
+referenceFrameId: number | null, 
 /**
  * Stage 6 (local normalization, M2): the group's LN reference file
  * (`ln/<group>/reference.fits`, spec §9.5), when local normalization

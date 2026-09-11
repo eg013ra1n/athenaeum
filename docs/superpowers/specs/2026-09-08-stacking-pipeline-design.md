@@ -202,7 +202,10 @@ coefficients), evaluated per pixel with Horner-form polynomials.
 Recorded per frame: inliers, inlier ratio, RMS, σ_RMS, peak error x/y,
 scale, rotation, translation, flipped, quality score, model resolved, time.
 A frame **fails** registration when RANSAC yields < 8 inliers, when the
-linear fit's scale is outside `[0.8, 1.25]`, or when RMS > `maxRmsPx` (2.0)
+linear fit's scale is outside the frame's own acceptance window — `[r /
+1.25, r · 1.25]` around its implied ratio `r` to its reference, which is
+`1.0`, i.e. M1's fixed `[0.8, 1.25]`, whenever either scale is unknown
+(M4b, ruling R-M4b-2, §3.8) — or when RMS > `maxRmsPx` (2.0)
 with `failOnMaxRms` on (default off: warn, keep). A failed frame is excluded
 from the run with reason `registration failed: …` when
 `excludeOnRegistrationFailure` is on (default on), else the run fails.
@@ -210,10 +213,112 @@ from the run with reason `registration failed: …` when
 ### 3.7 Optional registered frames
 
 `writeRegisteredFrames` (default off) writes `registered/<group>/r_<stem>.fits`
-(float32, reference geometry, NaN coverage, copy-through cards + `ATH_REG`
+(float32, its group's reference geometry — §3.8, the run-wide one in
+co-registered mode — NaN coverage, copy-through cards + `ATH_REG`
 cards with the transform) after registration, resampling once with the
 configured kernel. They are artifacts (§9.3), never cataloged, and are not
 read by later stages — the lazy source stays the single code path.
+
+### 3.8 Mixed pixel scales (M4b)
+
+One frame set may hold groups — or members of one group — shot at different
+pixel scales: a bin-2 group, a second telescope, another camera. The
+pipeline integrates all of them, in one of two modes the owner picks per set
+through `registration.geometry` (§9.2): **co-registered** (every group
+resampled into the set reference's geometry, one master per group in one
+geometry) or **native** (a per-group reference, one master per group in its
+own geometry, no cross-group registration at all). Nothing about group keys
+changes — camera and native geometry have not been keys since 2026-09-10.
+
+Three mechanisms carry it: every `GroupFrame` learns its pixel scale (§2)
+and the plan gate turns a scale spread into a named WARNING, never a
+blocker; registration's scale gate becomes per frame, centred on the frame's
+own implied ratio to its reference (§3.6); and, when both frames carry a
+stored plate solve, the alignment is SEEDED from the two WCS solutions
+(subject pixel → sky → reference pixel over a grid, an affine fit) and only
+refined with star pairs — quad matching, scale-invariant by construction,
+stays the seed whenever a solve is missing.
+
+Rulings (M4b plan header, `docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`):
+
+- **R-M4b-1 Scale per frame, two sources, one field.**
+  `GroupFrame.pixel_scale_arcsec: Option<f64>` and `GroupFrame.scale_source:
+  ScaleSource { Solve, Header }` (`None` when neither exists). Solve wins
+  over header (a solve measures, a header assumes). Header formula:
+  `206.2648 · xpixsz_um / focallen_mm` — NO binning factor: `XPIXSZ` is
+  written by every capture program in this catalog as the EFFECTIVE pixel
+  size after binning (verified 2026-09-11 on the owner's catalog: the
+  ASI294MM bin-2 lights carry `XPIXSZ = 4.63 = 2 × 2.315`, the ASI6200MM
+  bin-2 lights `7.52 = 2 × 3.76`, both with `XBINNING = 2`; multiplying by
+  the binning would double-count and report ×2 the true scale). `None` when
+  `xpixsz` or `focallen` is missing, non-finite or ≤ 0. `xbinning` is still
+  read (the group key and the display need it) but never enters the scale.
+
+- **R-M4b-2 The gate is per frame and centred on the implied ratio.** `r =
+  scale_frame / scale_reference` when both are known, else `1.0`; the
+  accepted refit scale is `[r / 1.25, r · 1.25]` (`SCALE_TOLERANCE = 1.25`,
+  the existing constant's half-width kept). A frame whose refit scale falls
+  outside is refused with `ScaleOutOfRange { scale, expected: r }` (the
+  message names both). Nothing else about registration's success criteria
+  changes.
+
+- **R-M4b-3 WCS seed when both frames are solved.** `seed_from_solves` maps
+  a 5×5 grid of subject pixel centres (inset 5 % from each edge) through the
+  subject's `WcsSolution::pixel_to_sky` and the reference's `sky_to_pixel`,
+  least-squares-fits an affine, and returns it when every mapped point is
+  finite and the affine's scale is within `[0.05, 20]`. `align` pairs
+  through the hint with radius `WCS_SEED_RADIUS_PX = max(4 ·
+  ransac_tolerance_px, 8.0)` (a stored solve's own residual is ≤ 1 px; a bad
+  solve pairs nothing); fewer than `MIN_INLIERS` pairs → the hint is
+  discarded with a warning `wcs seed rejected (<n> pairs); quad seed used`
+  and the quad seed runs as today. `Alignment.seed: SeedKind { Wcs, Quads }`
+  records which one shipped; `registration_results` does not change shape —
+  the seed kind rides `transform_json`'s sibling `model` string as a `+wcs`
+  suffix (e.g. `homography+polynomial3+wcs`) so the frames table can show it
+  without a column.
+
+- **R-M4b-4 Two modes, one config field.** `registration.geometry:
+  "coRegistered" | "native"` (`RegistrationConfig.geometry:
+  RegistrationGeometry`, default `CoRegistered`). Co-registered = the
+  run-wide reference (spec §4.4, two-pass per M4a); native = per group: the
+  group's `best_by_weight` member (a manual reference applies to its own
+  group only; every other group picks auto), two-pass re-pick per group. The
+  run-level `stacking_runs.reference_frame_id` stays the largest group's
+  reference in both modes (it is what the plan gate and the results header
+  show); `SummaryGroup.reference_frame_id: Option<i64>`
+  (`#[serde(default)]`) carries each group's own.
+
+- **R-M4b-5 Geometry follows the reference.** `RunContext` grows
+  `group_geometry: HashMap<String, GroupGeometry { reference_frame_id,
+  width, height, calibrated: PathBuf, hash: String }>`; every consumer of
+  `rc.reference_width/height` (the register admission bound, the LN driver,
+  `process_group_output`'s integration and drizzle geometry, the coverage
+  filter, the master's WCS lookup) reads `rc.geometry_of(&group.key)`. In
+  co-registered mode every entry equals the run-wide one — the M1–M4a
+  byte-identical pins therefore keep passing with the default config.
+
+- **R-M4b-6 Level and resolution across scales are the resampler's business,
+  not new code.** A coarse frame registered onto a finer reference is
+  up-sampled by `RegisteredSource`'s existing inverse-mapped gather (bicubic
+  B-spline by default) at the frame's OWN level (normalization runs after
+  resampling, per pixel, as today); drizzle's forward-mapped drops map a
+  coarse source pixel onto a `r × r` output-pixel quad through the same
+  `PixelMap` — the exact clipping already handles any quad, and `I / W`
+  stays level-preserving (Task 4 pins both). A finer frame onto a coarser
+  reference is down-sampled by the same gather (aliasing accepted — the spec
+  says "the finer scale loses resolution"; a pre-filter is M4c's
+  interpolating-prefilter item).
+
+- **R-M4b-7 Warnings, never blockers.** The plan gate emits at most one
+  warning per group: a group whose scale is outside `[0.8, 1.25]` of the
+  reference's, and a group whose members spread beyond ×1.25. Wording in
+  Task 1. A group with NO known scale on any member gets no warning (nothing
+  to compare).
+
+- **R-M4b-8 Master header.** `ATH_RGEO = 'coRegistered' | 'native'` on every
+  master (and drizzled master); in native mode the master's WCS is the GROUP
+  reference's solve; `bin<n>` in the filename stays the group's own binning
+  in both modes (M11) — the WCS says the delivered scale.
 
 ## 4. Measurement, weights, selection
 
@@ -760,11 +865,21 @@ reference:     { mode: "auto", twoPass: true }
                 -- group (§4.4). Auto only — a manual pin never moves. It is NOT
                 -- part of any stage hash, so flipping it never invalidates a
                 -- cached artifact.
-registration:  { model: "auto", distortion: "off", interpolation: "bicubicBSpline",
+registration:  { geometry: "coRegistered",
+                 model: "auto", distortion: "off", interpolation: "bicubicBSpline",
                  clampingThreshold: 0.30, maxStars: 2000, ransacTolerancePx: 1.9,
                  ransacMaxIterations: 2000, maxRmsPx: 2.0, failOnMaxRms: false,
                  detection: { minSnr: 10, maxEccentricity: 0.8 },
                  writeRegisteredFrames: false }
+                -- geometry (M4b, ruling R-M4b-4): "coRegistered" | "native" (§3.8).
+                -- Co-registered is M1-M4a's behaviour: ONE reference for the set,
+                -- every group resampled into its geometry. Native gives each group
+                -- its own reference (its best-weighted member, two-pass re-picked
+                -- per group) and its own geometry for LN, integration, drizzle, the
+                -- master's WCS and the rejection bitmaps. It rides
+                -- `registration_subtree`, so flipping it re-registers every set —
+                -- deliberately: a stored row records WHICH reference a frame was
+                -- warped onto.
 normalization: { output: "additiveWithScaling", rejection: "scaleZeroOffset",
                  scaleEstimator: "bwmv",
                  local: { enabled: false, scale: 1024, referenceFrames: 20,
@@ -1150,11 +1265,15 @@ Split into four plans, each with its own acceptance re-run:
   values, to be set from the M4 acceptance run.
 - Whether masters should be cataloged and how they appear in the Objects
   page: M4 decision, after the owner has used M1–M3 output for a while.
-- **Mixed pixel scales in one set — required (owner, 2026-09-09).** M1
-  registers every group onto the set's one reference and refuses a frame
+- **Mixed pixel scales in one set — required (owner, 2026-09-09), DONE in
+  M4b** (`docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`;
+  the shipped design is §3.8 above, the config field §9.2's
+  `registration.geometry`). Everything below describes the state BEFORE that
+  plan and is kept for the reasoning: M1
+  registered every group onto the set's one reference and refused a frame
   whose fitted scale is outside `[0.8, 1.25]` (§3.6), so a bin-2 group, a
   second telescope with another focal length, or a camera with another
-  pixel size cannot join the set's masters today — the group key's
+  pixel size could not join the set's masters — the group key's
   binning × geometry split keeps them apart, and registration then drops
   every frame of the foreign-scale group, one at a time, with a visible
   per-frame exclusion reason in the frames table. **Correction (M2 final

@@ -255,8 +255,13 @@ export function stageSummary(
       return config.reference.twoPass
         ? 'Auto (highest-weight frame · two-pass)'
         : 'Auto (highest-weight frame)';
-    case 'register':
-      return `${modelLabel(config.registration.model)} model · distortion ${distortionLabel(config.registration.distortion)} · ${interpolationLabel(config.registration.interpolation)} · clamp ${config.registration.clampingThreshold.toFixed(2)} · ${config.registration.maxStars} stars`;
+    case 'register': {
+      // M4b (ruling R-M4b-4): native mode changes what the whole stage
+      // delivers — a reference and a geometry per group — so it leads the
+      // row; co-registered is the default and says nothing.
+      const geometry = config.registration.geometry === 'native' ? 'native · ' : '';
+      return `${geometry}${modelLabel(config.registration.model)} model · distortion ${distortionLabel(config.registration.distortion)} · ${interpolationLabel(config.registration.interpolation)} · clamp ${config.registration.clampingThreshold.toFixed(2)} · ${config.registration.maxStars} stars`;
+    }
     case 'normalize': {
       const local = config.normalization.local;
       if (local.enabled) {

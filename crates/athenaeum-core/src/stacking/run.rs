@@ -90,7 +90,7 @@ use crate::stacking::register::wcs_seed::{ratio_wants_seed, seed_from_solves};
 use crate::stacking::register::writer::{
     build_registered_cards, source_cards_from_file, write_registered_frame, RegisteredCards,
 };
-use crate::stacking::register::{scale_gate_for, scale_ratio_for};
+use crate::stacking::register::{scale_gate_for, scale_ratio_for, RegistrationGeometry};
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{
     best_by_weight, compute_weights, reference_coverage, select_frames, sky_penalized_order,
@@ -276,13 +276,29 @@ pub(crate) struct RunContext {
     /// The reference frame's own calibrated file (stage 4 looks this up from
     /// `measured`, once, so stage 5 does not need to search for it again).
     pub(crate) reference_calibrated: Option<PathBuf>,
-    /// The reference's own measured geometry (ruling 6: every group's master
-    /// adopts this geometry) — set by stage 5 from `reference_stars`'s own
-    /// read of the reference's calibrated file (the natural place: stage 5
-    /// is what calls `reference_stars`; stage 4 only picks WHICH frame is
-    /// the reference, not its pixel geometry).
+    /// The RUN-wide reference's own measured geometry — set by stage 5 from
+    /// `reference_stars`'s own read of that frame's calibrated file (the
+    /// natural place: stage 5 is what calls `reference_stars`; stage 4 only
+    /// picks WHICH frame is the reference, not its pixel geometry).
+    ///
+    /// M4b (ruling R-M4b-5): no stage reads this pair for its own geometry
+    /// any more — every consumer goes through
+    /// [`RunContext::geometry_of`] instead. It survives as the run-wide
+    /// fact [`adopt_co_registered_geometry`] copies into every group's
+    /// entry in co-registered mode, and as the geometry of whichever group
+    /// holds the run's reference in native mode.
     pub(crate) reference_width: usize,
     pub(crate) reference_height: usize,
+    /// Every group's own registration reference and delivered geometry
+    /// (M4b ruling R-M4b-5) — one entry per `plan_groups` group, inserted
+    /// by [`resolve_group_geometry`] at the end of stage 4 and refreshed
+    /// from each reference's own `reference_stars` in stage 5.
+    ///
+    /// In `coRegistered` mode every entry names the SAME (run-wide)
+    /// reference and the same geometry, so every consumer below reads one
+    /// number whichever mode the run is in and the M1–M4a behaviour is
+    /// reproduced exactly; in `native` mode each group carries its own.
+    pub(crate) group_geometry: HashMap<String, GroupGeometry>,
     /// M3 Task 5, fix round 1 (Minor M6): incremented once per group that
     /// actually reaches an attempt at `drizzle_group` (i.e. drizzle is on
     /// AND the group's `RejBitmapSet` — when wanted — was created
@@ -302,7 +318,33 @@ pub(crate) struct RunContext {
     pub(crate) fail_after_stage: Option<Stage>,
 }
 
+/// One group's registration reference and the geometry everything from
+/// stage 5 on works in (M4b ruling R-M4b-5): the frame every member of the
+/// group is warped onto, the pixel grid the master is delivered in, that
+/// reference's own calibrated file and its stage-1 hash (the two inputs
+/// `registration_hash_for` needs beyond the frame's own).
+#[derive(Debug, Clone)]
+pub(crate) struct GroupGeometry {
+    pub(crate) reference_frame_id: i64,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) calibrated: PathBuf,
+    pub(crate) hash: String,
+}
+
 impl RunContext {
+    /// This group's [`GroupGeometry`]. Panics — with the key — when the
+    /// group has no entry: [`resolve_group_geometry`] inserts one for EVERY
+    /// `plan_groups` group at the end of stage 4 (including a group with no
+    /// included frame, which falls back to the run-wide reference), so a
+    /// miss is a programming error in the pipeline's own wiring, not a
+    /// condition any run can reach.
+    pub(crate) fn geometry_of(&self, key: &str) -> &GroupGeometry {
+        self.group_geometry
+            .get(key)
+            .unwrap_or_else(|| panic!("no group geometry resolved for group {key}"))
+    }
+
     /// `Err(RunError::Cancelled)` iff the run's cancel flag is set. Called
     /// between frames and between groups so a cancel lands promptly without
     /// polling inside the hot per-frame loop.
@@ -831,6 +873,7 @@ pub fn start_stacking(
         reference_calibrated: None,
         reference_width: 0,
         reference_height: 0,
+        group_geometry: HashMap::new(),
         drizzle_attempted: 0,
         #[cfg(test)]
         fail_after_stage: None,
@@ -2259,6 +2302,179 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 
+/// The best-weighted INCLUDED entry of one group — [`best_by_weight`] over
+/// the three vectors it wants, built from that group's own
+/// `RunContext::measured` entries (weight, inclusion, star count; a frame
+/// whose weight never computed ranks last rather than dropping out, the
+/// same convention stage 4 has always used). `None` when the group has no
+/// included entry at all.
+///
+/// Factored out of [`stage_reference`]'s `Auto` branch by M4b Task 3: in
+/// native mode the SAME pick runs once per group, not once per run
+/// (ruling R-M4b-4), and the two must not be two different rules.
+fn best_included_idx(entries: &[MeasuredFrame]) -> Option<usize> {
+    let weights: Vec<FrameWeight> = entries
+        .iter()
+        .map(|e| {
+            e.weight.clone().unwrap_or(FrameWeight {
+                channels: Vec::new(),
+                normalized: Vec::new(),
+                mean: 0.0,
+                normalized_mean: 0.0,
+                missing: None,
+            })
+        })
+        .collect();
+    let included: Vec<bool> = entries.iter().map(|e| e.included).collect();
+    let star_counts: Vec<usize> = entries
+        .iter()
+        .map(|e| e.measurement.as_ref().map(|m| m.min_stars()).unwrap_or(0))
+        .collect();
+    best_by_weight(&weights, &included, &star_counts)
+}
+
+/// One frame's measured pixel geometry, falling back to the catalog's own
+/// `NAXIS1`/`NAXIS2` when stage 3 never produced a measurement for it —
+/// the provisional [`GroupGeometry`] dimensions stage 4 records, refreshed
+/// from the reference's own `reference_stars` read once stage 5 runs.
+fn measured_geometry(rc: &RunContext, frame_id: i64) -> (usize, usize) {
+    for entries in rc.measured.values() {
+        let Some(entry) = entries.iter().find(|e| e.frame.frame_id == frame_id) else {
+            continue;
+        };
+        if let Some(m) = entry.measurement.as_ref() {
+            return (m.width, m.height);
+        }
+        return (
+            entry.frame.width.max(0) as usize,
+            entry.frame.height.max(0) as usize,
+        );
+    }
+    (0, 0)
+}
+
+/// Stage 4's own tail (M4b ruling R-M4b-4/5): one [`GroupGeometry`] per
+/// plan group.
+///
+/// `coRegistered` gives every group the SAME entry — the run-wide
+/// reference this stage just resolved — which is exactly M1–M4a's
+/// behaviour written down; `native` gives each group its own: the manual
+/// reference for ITS OWN group (a pin applies nowhere else), the group's
+/// best-weighted included member everywhere else. A group with no included
+/// member at all (it never registers or integrates) falls back to the
+/// run-wide entry so [`RunContext::geometry_of`] stays total.
+///
+/// Width/height here are the reference's MEASURED geometry; stage 5
+/// refreshes them from that reference's own `reference_stars` read, which
+/// is the authoritative pixel grid the registration warps onto.
+fn resolve_group_geometry(rc: &mut RunContext) -> Result<(), RunError> {
+    let cfg = rc.config.clone();
+    let native = cfg.registration.geometry == RegistrationGeometry::Native;
+    let run_reference_frame_id = rc
+        .reference_frame_id
+        .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
+    let run_reference_calibrated = rc
+        .reference_calibrated
+        .clone()
+        .ok_or_else(|| RunError::Other("reference frame has no calibrated file".to_string()))?;
+    let run_reference_hash = frame_calibration_hash(rc, &cfg, run_reference_frame_id)?;
+    let (run_width, run_height) = measured_geometry(rc, run_reference_frame_id);
+    let run_geometry = GroupGeometry {
+        reference_frame_id: run_reference_frame_id,
+        width: run_width,
+        height: run_height,
+        calibrated: run_reference_calibrated,
+        hash: run_reference_hash,
+    };
+
+    let keys: Vec<String> = rc.plan_groups.iter().map(|g| g.key.clone()).collect();
+    for key in keys {
+        let geometry = if native {
+            match group_reference_idx(rc, &key, &cfg, run_reference_frame_id) {
+                Some(idx) => {
+                    let picked = rc
+                        .measured
+                        .get(&key)
+                        .and_then(|v| v.get(idx))
+                        .map(|e| (e.frame.clone(), e.calibrated.clone()));
+                    match picked {
+                        Some((frame, Some(calibrated))) => {
+                            let hash = frame_calibration_hash(rc, &cfg, frame.frame_id)?;
+                            let (width, height) = measured_geometry(rc, frame.frame_id);
+                            GroupGeometry {
+                                reference_frame_id: frame.frame_id,
+                                width,
+                                height,
+                                calibrated,
+                                hash,
+                            }
+                        }
+                        // An included frame always has a calibrated file
+                        // (stage 1 excludes the ones it could not write),
+                        // so this is unreachable in practice — it degrades
+                        // to the run-wide reference with a warning rather
+                        // than failing a run over a pick it can survive.
+                        _ => {
+                            tracing::warn!(
+                                run_id = rc.run_id,
+                                group_key = %key,
+                                "the group's own reference has no calibrated file;                                  using the run reference for it"
+                            );
+                            run_geometry.clone()
+                        }
+                    }
+                }
+                None => run_geometry.clone(),
+            }
+        } else {
+            run_geometry.clone()
+        };
+        tracing::debug!(
+            run_id = rc.run_id,
+            group_key = %key,
+            frame_id = geometry.reference_frame_id,
+            "group reference resolved"
+        );
+        rc.group_geometry.insert(key, geometry);
+    }
+
+    Ok(())
+}
+
+/// One frame's stage-1 hash through the run's own [`HashMemo`].
+fn frame_calibration_hash(
+    rc: &mut RunContext,
+    cfg: &StackingConfig,
+    frame_id: i64,
+) -> Result<String, RunError> {
+    let frame = find_frame_in_groups(&rc.plan_groups, frame_id)
+        .ok_or_else(|| RunError::Other(format!("frame {frame_id} is not in any plan group")))?;
+    let conn = db(&rc.ctx)?.conn();
+    Ok(rc.memo.calibration_hash_checked(&conn, cfg, &frame)?)
+}
+
+/// Which entry of one group is that group's own registration reference in
+/// native mode (ruling R-M4b-4): the run's MANUAL pin when it is a member
+/// of this very group — a pin applies to its own group only — and the
+/// group's best-weighted included member otherwise.
+fn group_reference_idx(
+    rc: &RunContext,
+    key: &str,
+    cfg: &StackingConfig,
+    run_reference_frame_id: i64,
+) -> Option<usize> {
+    let entries = rc.measured.get(key)?;
+    if cfg.reference.mode == ReferenceMode::Manual {
+        if let Some(idx) = entries
+            .iter()
+            .position(|e| e.frame.frame_id == run_reference_frame_id)
+        {
+            return Some(idx);
+        }
+    }
+    best_included_idx(entries)
+}
+
 /// Stage 4 (reference, spec §4.4): pick the run's ONE reference frame.
 /// `Manual` reads the Analysis page's stored choice (the plan already
 /// verified it exists); `Auto` is the best-weighted frame (ties by star
@@ -2266,6 +2482,11 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 /// total exposure). Stores the choice (`set_run_reference`,
 /// `rc.summary.reference`, `rc.reference_frame_id`/`reference_calibrated`)
 /// and emits a single `Reference 1/1` progress event.
+///
+/// M4b (ruling R-M4b-4): the run-wide pick above is unchanged in BOTH
+/// geometry modes — it is what `stacking_runs.reference_frame_id`, the
+/// plan gate and the results header show — and [`resolve_group_geometry`]
+/// then resolves each group's own reference from it.
 fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
     let cfg = rc.config.clone();
@@ -2377,24 +2598,7 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                 .measured
                 .get(&group.key)
                 .expect("a group with an included frame has measured entries");
-            let weights: Vec<FrameWeight> = entries
-                .iter()
-                .map(|e| {
-                    e.weight.clone().unwrap_or(FrameWeight {
-                        channels: Vec::new(),
-                        normalized: Vec::new(),
-                        mean: 0.0,
-                        normalized_mean: 0.0,
-                        missing: None,
-                    })
-                })
-                .collect();
-            let included: Vec<bool> = entries.iter().map(|e| e.included).collect();
-            let star_counts: Vec<usize> = entries
-                .iter()
-                .map(|e| e.measurement.as_ref().map(|m| m.min_stars()).unwrap_or(0))
-                .collect();
-            let idx = best_by_weight(&weights, &included, &star_counts).ok_or_else(|| {
+            let idx = best_included_idx(entries).ok_or_else(|| {
                 RunError::Other("no included frame in the largest group".to_string())
             })?;
             let entry = &entries[idx];
@@ -2431,6 +2635,10 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
     };
     rc.reference_frame_id = Some(reference_frame_id);
     rc.reference_calibrated = Some(calibrated);
+
+    // M4b ruling R-M4b-5: every group's own reference and geometry, from
+    // the run-wide pick above — one entry per group in both modes.
+    resolve_group_geometry(rc)?;
 
     rc.progress(
         Stage::Reference,
@@ -2738,11 +2946,16 @@ fn register_group_pass(
         return Ok(pass);
     }
 
-    // Registration warps every frame onto the ONE run-wide reference
-    // geometry (already resolved by the caller) — the OUTPUT buffer size,
-    // and a more accurate admission bound than any per-frame native
-    // geometry would be.
-    let admission_n = admission(4 * rc.reference_width as u64 * rc.reference_height as u64 * 4);
+    // Registration warps every frame onto its GROUP's reference geometry
+    // (already resolved by the caller — the run-wide one in co-registered
+    // mode, the group's own in native) — the OUTPUT buffer size, and a
+    // more accurate admission bound than any per-frame native geometry
+    // would be.
+    let (ref_w, ref_h) = {
+        let geometry = rc.geometry_of(&group.key);
+        (geometry.width, geometry.height)
+    };
+    let admission_n = admission(4 * ref_w as u64 * ref_h as u64 * 4);
     let meta: Vec<(usize, GroupFrame, String)> = to_register
         .iter()
         .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone()))
@@ -2941,6 +3154,457 @@ fn register_group_pass(
     Ok(pass)
 }
 
+/// The frame ONE group's two-pass dry pass chose, with everything the
+/// caller needs to adopt it (M4a ruling R-M4a-5; per group since M4b's
+/// native mode, ruling R-M4b-4). `None` means "keep the current
+/// reference" — no candidate beat it by [`TWO_PASS_MIN_GAIN_PX`], the dry
+/// pass never saw the reference itself, or the winner turned out to be a
+/// frame this run cannot adopt (every such case is warned about inside
+/// [`two_pass_refine`] and is degrading, never fatal).
+struct TwoPassSwitch {
+    /// The reference this replaces.
+    from: i64,
+    frame_id: i64,
+    filename: String,
+    calibrated: PathBuf,
+    weight: Option<f64>,
+    stars: ReferenceStars,
+    hash: String,
+}
+
+/// ONE group's two-pass dry pass and re-pick (M4a ruling R-M4a-5, factored
+/// out of `stage_register` by M4b Task 3 so both geometry modes run the
+/// SAME pick: co-registered runs it once, over the run reference's own
+/// group; native runs it per group, over that group's own members).
+///
+/// Registers the group once with `persist = false` — no rows, no
+/// artifacts, no exclusions — measures each frame's rotation/translation
+/// against the CURRENT reference, and asks [`two_pass_pick`] whether one of
+/// the top-weighted candidates sits closer to the group's median framing.
+/// A winner is only returned once its star detection and stage-1 hash have
+/// both been resolved: a switch is an improvement, never a requirement, so
+/// a frame whose calibrated file went away between the dry pass and here
+/// costs the run its refinement, not its master.
+///
+/// The `info!` and the run warning that record a switch are emitted here —
+/// identical in both modes — while everything a switch IMPLIES for the
+/// run-level reference (the `stacking_runs` row, `RunSummary.reference`)
+/// stays with the caller, which alone knows whether this group's reference
+/// is also the run's.
+#[allow(clippy::too_many_arguments)]
+fn two_pass_refine(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    ref_stars: &ReferenceStars,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    by_frame: &HashMap<i64, RegistrationRecord>,
+    force_fresh: bool,
+    progress: &mut (usize, usize),
+    solves: &mut SolveCache,
+) -> Result<Option<TwoPassSwitch>, RunError> {
+    let cfg = rc.config.clone();
+    let pass = register_group_pass(
+        rc,
+        group,
+        ref_stars,
+        reference_frame_id,
+        reference_hash,
+        by_frame,
+        force_fresh,
+        false,
+        progress,
+        solves,
+    )?;
+
+    let candidates: Vec<TwoPassCandidate> = {
+        let entries = rc.measured.get(&group.key);
+        pass.iter()
+            .filter_map(|r| {
+                let (rotation_deg, translation) = r.outcome.as_ref().ok()?;
+                // A frame whose weight never computed ranks last rather
+                // than dropping out — it is still a legitimate geometry
+                // candidate, just never a top-N one.
+                let weight = entries
+                    .and_then(|v| v.get(r.idx))
+                    .and_then(|e| e.weight.as_ref())
+                    .map(|w| w.normalized_mean)
+                    .unwrap_or(0.0);
+                Some(TwoPassCandidate {
+                    idx: r.idx,
+                    weight,
+                    rotation_deg: *rotation_deg,
+                    translation: *translation,
+                })
+            })
+            .collect()
+    };
+
+    let reference_idx = pass
+        .iter()
+        .find(|r| r.frame_id == reference_frame_id)
+        .map(|r| r.idx);
+    // The CURRENT reference's own geometry — `ref_stars` is the very read
+    // `rc.reference_width`/`height` (co-registered) and this group's
+    // `GroupGeometry` (native) were both filled from.
+    let diagonal_px = (ref_stars.width as f64).hypot(ref_stars.height as f64);
+
+    let Some(reference_idx) = reference_idx else {
+        // The reference's own identity row is produced by the same
+        // fan-out as everything else, so this only happens if the
+        // dry pass never saw the reference at all (it lost its
+        // calibrated file between stages) — say so, keep it.
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            frame_id = reference_frame_id,
+            "the two-pass dry pass produced no alignment for the reference itself; keeping it"
+        );
+        return Ok(None);
+    };
+
+    let Some(new_idx) = two_pass_pick(
+        &candidates,
+        reference_idx,
+        diagonal_px,
+        TWO_PASS_MIN_GAIN_PX,
+    ) else {
+        return Ok(None);
+    };
+
+    let corner_px_before =
+        two_pass_deviation_px(&candidates, reference_idx, diagonal_px).unwrap_or(f64::NAN);
+    let corner_px_after =
+        two_pass_deviation_px(&candidates, new_idx, diagonal_px).unwrap_or(f64::NAN);
+    let picked = rc
+        .measured
+        .get(&group.key)
+        .and_then(|v| v.get(new_idx))
+        .map(|e| {
+            (
+                e.frame.frame_id,
+                e.frame.filename.clone(),
+                e.calibrated.clone(),
+                e.weight.as_ref().map(|w| w.normalized_mean),
+            )
+        });
+    let Some((new_frame_id, new_filename, Some(new_calibrated), new_weight)) = picked else {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            "the two-pass pick chose a frame with no calibrated file; keeping the current reference"
+        );
+        return Ok(None);
+    };
+
+    // Everything the switch needs from the chosen frame, resolved before
+    // anything is mutated — and DEGRADING, not fatal (fix round 1, item
+    // 4). A switch is an improvement, never a requirement: the current
+    // reference is already resolved, already star-detected and perfectly
+    // usable, so a frame whose calibrated file went away or turned
+    // unreadable between the dry pass and here must cost the run its
+    // refinement, not its master. Every failure below therefore falls
+    // through to the same "keeping the current reference" warn as the two
+    // sibling no-op paths above.
+    //
+    // No test forces this branch: the dry pass read THIS SAME calibrated
+    // file through the same `read_luminance` moments earlier, so the only
+    // window is a genuine race (the working folder swept, a volume
+    // unmounted, an SMB hiccup) that no in-process fixture can open
+    // without a fault-injection hook. It is guarded, logged and non-fatal
+    // by construction instead.
+    let prepared: Result<(ReferenceStars, String), String> =
+        match find_frame_in_groups(&rc.plan_groups, new_frame_id) {
+            None => Err("it is not in any plan group".to_string()),
+            Some(new_group_frame) => {
+                let stars = {
+                    let pool_ref = &rc.ctx.image_pool;
+                    reference_stars(&new_calibrated, &cfg.registration, Some(pool_ref))
+                        .map_err(|e| format!("its star detection failed: {e}"))
+                };
+                match stars {
+                    Err(e) => Err(e),
+                    Ok(new_ref_stars) => {
+                        let conn = db(&rc.ctx)?.conn();
+                        match rc
+                            .memo
+                            .calibration_hash_checked(&conn, &cfg, &new_group_frame)
+                        {
+                            Ok(new_hash) => Ok((new_ref_stars, new_hash)),
+                            Err(e) => Err(format!("its calibration hash is unresolvable: {e}")),
+                        }
+                    }
+                }
+            }
+        };
+
+    let (new_ref_stars, new_hash) = match prepared {
+        Err(reason) => {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                frame_id = new_frame_id,
+                reason = %reason,
+                "the two-pass pick chose a frame the run cannot adopt; keeping the current reference"
+            );
+            return Ok(None);
+        }
+        Ok(prepared) => prepared,
+    };
+
+    tracing::info!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        from = reference_frame_id,
+        to = new_frame_id,
+        corner_px_before,
+        corner_px_after,
+        "reference switched by the two-pass pick"
+    );
+    rc.warnings.push(format!(
+        "reference switched by the two-pass pick: {reference_frame_id} → \
+         {new_frame_id} (corner displacement \
+         {corner_px_before:.1} → {corner_px_after:.1} px)"
+    ));
+
+    Ok(Some(TwoPassSwitch {
+        from: reference_frame_id,
+        frame_id: new_frame_id,
+        filename: new_filename,
+        calibrated: new_calibrated,
+        weight: new_weight,
+        stars: new_ref_stars,
+        hash: new_hash,
+    }))
+}
+
+/// Point EVERY group's [`GroupGeometry`] at the run-wide reference and its
+/// just-detected geometry (M4b ruling R-M4b-5, co-registered mode only):
+/// the run has ONE reference, so a group's entry can never differ from it
+/// — not when stage 5 first reads the reference's stars, and not after the
+/// two-pass pick moves the reference mid-stage.
+///
+/// `rc.reference_frame_id`/`reference_width`/`reference_height` are the
+/// source of truth here; the calibrated path and stage-1 hash come from
+/// the caller, which has just resolved both.
+fn adopt_co_registered_geometry(rc: &mut RunContext, calibrated: &Path, hash: &str) {
+    let Some(reference_frame_id) = rc.reference_frame_id else {
+        return;
+    };
+    let (width, height) = (rc.reference_width, rc.reference_height);
+    for entry in rc.group_geometry.values_mut() {
+        entry.reference_frame_id = reference_frame_id;
+        entry.width = width;
+        entry.height = height;
+        entry.calibrated = calibrated.to_path_buf();
+        entry.hash = hash.to_string();
+    }
+}
+
+/// Whether one group's own reference is still open to the two-pass
+/// re-pick: the toggle is on and this group's reference was AUTO-chosen. A
+/// `Manual` reference never moves (M4a ruling R-M4a-5) — but it pins its
+/// OWN group only (M4b ruling R-M4b-4), so in native mode every other
+/// group's auto pick is refined exactly as it is in `Auto` mode.
+fn group_two_pass_wanted(
+    cfg: &StackingConfig,
+    group_reference_frame_id: i64,
+    manual_reference_frame_id: Option<i64>,
+) -> bool {
+    cfg.reference.two_pass && manual_reference_frame_id != Some(group_reference_frame_id)
+}
+
+/// Stage 5 in `native` geometry mode (M4b rulings R-M4b-4/5): every group
+/// registers onto ITS OWN reference, in its own geometry, with no
+/// cross-group registration at all.
+///
+/// Per viable group, in plan order: read that group's reference's stars
+/// (which fixes the geometry its master, its `.athln` sidecars, its
+/// rejection bitmaps and its drizzled output are all delivered in),
+/// optionally run the two-pass re-pick over the group's OWN members, then
+/// register the group persistently against whatever came out. A switch in
+/// the group that also holds the RUN's reference moves the run-level
+/// record with it (`stacking_runs.reference_frame_id` stays the largest
+/// group's reference, ruling R-M4b-4).
+///
+/// The co-registered path's one up-front `reference_stars` read has no
+/// counterpart here on purpose: each group reads its own, and the run-wide
+/// reference is always some group's reference too, so nothing is detected
+/// twice.
+fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
+    let cfg = rc.config.clone();
+    let run_reference_frame_id = rc
+        .reference_frame_id
+        .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
+    let manual_reference_frame_id =
+        (cfg.reference.mode == ReferenceMode::Manual).then_some(run_reference_frame_id);
+
+    let by_frame: HashMap<i64, RegistrationRecord> = {
+        let conn = db(&rc.ctx)?.conn();
+        get_registration_for_frame_set(&conn, rc.set_id)?
+            .into_iter()
+            .map(|r| (r.frame_id, r))
+            .collect()
+    };
+
+    let groups = rc.plan_groups.clone();
+    let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Register);
+    let mut solves: SolveCache = SolveCache::new();
+
+    // One progress total for both passes of every group, the same way the
+    // co-registered path counts them.
+    let mut total = 0usize;
+    for g in &groups {
+        let included = included_count_of(rc, &g.key);
+        if included < 3 {
+            continue;
+        }
+        total += included;
+        if group_two_pass_wanted(
+            &cfg,
+            rc.geometry_of(&g.key).reference_frame_id,
+            manual_reference_frame_id,
+        ) {
+            total += included;
+        }
+    }
+    let mut progress = (0usize, total);
+    rc.progress(
+        Stage::Register,
+        None,
+        progress.0,
+        progress.1,
+        0,
+        0,
+        None,
+        None,
+    );
+
+    for group in &groups {
+        rc.check_cancel()?;
+        if included_count_of(rc, &group.key) < 3 {
+            continue;
+        }
+
+        let geometry = rc.geometry_of(&group.key).clone();
+        let mut reference_frame_id = geometry.reference_frame_id;
+        let mut reference_hash = geometry.hash.clone();
+        let mut ref_stars = {
+            let pool_ref = &rc.ctx.image_pool;
+            reference_stars(&geometry.calibrated, &cfg.registration, Some(pool_ref))
+                .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
+        };
+        set_group_geometry(
+            rc,
+            &group.key,
+            reference_frame_id,
+            &ref_stars,
+            &geometry.calibrated,
+            &reference_hash,
+        );
+
+        // Every cross-scale frame of this group needs its reference's own
+        // stored solve; warming the cache once here keeps the per-frame
+        // lookups to one query for the whole group (including the negative
+        // answer).
+        {
+            let conn = db(&rc.ctx)?.conn();
+            solve_of(&mut solves, &conn, reference_frame_id);
+        }
+
+        if group_two_pass_wanted(&cfg, reference_frame_id, manual_reference_frame_id) {
+            if let Some(switch) = two_pass_refine(
+                rc,
+                group,
+                &ref_stars,
+                reference_frame_id,
+                &reference_hash,
+                &by_frame,
+                force_fresh,
+                &mut progress,
+                &mut solves,
+            )? {
+                let previous = reference_frame_id;
+                reference_frame_id = switch.frame_id;
+                ref_stars = switch.stars;
+                reference_hash = switch.hash;
+                set_group_geometry(
+                    rc,
+                    &group.key,
+                    reference_frame_id,
+                    &ref_stars,
+                    &switch.calibrated,
+                    &reference_hash,
+                );
+                // The run-level reference is the largest group's (ruling
+                // R-M4b-4) — when THAT group's own reference moves, the run
+                // row and the summary header move with it; every other
+                // group's switch is a per-group fact only.
+                if previous == run_reference_frame_id {
+                    {
+                        let conn = db(&rc.ctx)?.conn();
+                        set_run_reference(
+                            &conn,
+                            rc.run_id,
+                            reference_frame_id,
+                            reference_mode_wire(cfg.reference.mode),
+                        )?;
+                    }
+                    rc.reference_frame_id = Some(reference_frame_id);
+                    rc.reference_calibrated = Some(switch.calibrated.clone());
+                    rc.reference_width = ref_stars.width;
+                    rc.reference_height = ref_stars.height;
+                    rc.summary.reference.frame_id = Some(reference_frame_id);
+                    rc.summary.reference.filename = Some(switch.filename);
+                    rc.summary.reference.weight = switch.weight;
+                    rc.summary.reference.switched_from = Some(switch.from);
+                }
+            }
+        }
+
+        register_group_pass(
+            rc,
+            group,
+            &ref_stars,
+            reference_frame_id,
+            &reference_hash,
+            &by_frame,
+            force_fresh,
+            true,
+            &mut progress,
+            &mut solves,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Rewrite ONE group's [`GroupGeometry`] from its resolved reference (M4b
+/// native mode): the frame, the geometry its own `reference_stars` read
+/// reports, its calibrated file and its stage-1 hash. Also refreshes the
+/// run-wide `reference_width`/`height` when this group's reference is the
+/// run's, so the two never disagree about the same frame.
+fn set_group_geometry(
+    rc: &mut RunContext,
+    key: &str,
+    reference_frame_id: i64,
+    ref_stars: &ReferenceStars,
+    calibrated: &Path,
+    hash: &str,
+) {
+    if let Some(entry) = rc.group_geometry.get_mut(key) {
+        entry.reference_frame_id = reference_frame_id;
+        entry.width = ref_stars.width;
+        entry.height = ref_stars.height;
+        entry.calibrated = calibrated.to_path_buf();
+        entry.hash = hash.to_string();
+    }
+    if rc.reference_frame_id == Some(reference_frame_id) {
+        rc.reference_width = ref_stars.width;
+        rc.reference_height = ref_stars.height;
+    }
+}
+
 /// Stage 5 (register, spec §3, ruling 10): register every included frame of
 /// every VIABLE group (≥ 3 included, per stage 3) onto the ONE global
 /// reference (its stars computed once), reusing an existing
@@ -2965,6 +3629,16 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
     let cfg = rc.config.clone();
 
+    if cfg.registration.geometry == RegistrationGeometry::Native {
+        register_native_groups(rc)?;
+        write_frame_rows(rc)?;
+        rc.timings.push(crate::stacking::provenance::StageTiming {
+            stage: Stage::Register,
+            duration_ms: stage_start.elapsed().as_millis() as u64,
+        });
+        return Ok(());
+    }
+
     let mut reference_frame_id = rc
         .reference_frame_id
         .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
@@ -2988,6 +3662,11 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         rc.memo
             .calibration_hash_checked(&conn, &cfg, &reference_group_frame)?
     };
+
+    // M4b ruling R-M4b-5: co-registered means every group's geometry IS the
+    // run-wide reference's — the measured dimensions stage 4 recorded are
+    // replaced here by the authoritative `reference_stars` read.
+    adopt_co_registered_geometry(rc, &reference_calibrated, &reference_hash);
 
     let by_frame: HashMap<i64, RegistrationRecord> = {
         let conn = db(&rc.ctx)?.conn();
@@ -3051,7 +3730,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
 
     if let Some(group) = &dry_group {
         rc.check_cancel()?;
-        let pass = register_group_pass(
+        if let Some(switch) = two_pass_refine(
             rc,
             group,
             &ref_stars,
@@ -3059,191 +3738,34 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
             &reference_hash,
             &by_frame,
             force_fresh,
-            false,
             &mut progress,
             &mut solves,
-        )?;
-
-        let candidates: Vec<TwoPassCandidate> = {
-            let entries = rc.measured.get(&group.key);
-            pass.iter()
-                .filter_map(|r| {
-                    let (rotation_deg, translation) = r.outcome.as_ref().ok()?;
-                    // A frame whose weight never computed ranks last rather
-                    // than dropping out — it is still a legitimate geometry
-                    // candidate, just never a top-N one.
-                    let weight = entries
-                        .and_then(|v| v.get(r.idx))
-                        .and_then(|e| e.weight.as_ref())
-                        .map(|w| w.normalized_mean)
-                        .unwrap_or(0.0);
-                    Some(TwoPassCandidate {
-                        idx: r.idx,
-                        weight,
-                        rotation_deg: *rotation_deg,
-                        translation: *translation,
-                    })
-                })
-                .collect()
-        };
-
-        let reference_idx = pass
-            .iter()
-            .find(|r| r.frame_id == reference_frame_id)
-            .map(|r| r.idx);
-        let diagonal_px = (rc.reference_width as f64).hypot(rc.reference_height as f64);
-
-        match reference_idx {
-            None => {
-                // The reference's own identity row is produced by the same
-                // fan-out as everything else, so this only happens if the
-                // dry pass never saw the reference at all (it lost its
-                // calibrated file between stages) — say so, keep it.
-                tracing::warn!(
-                    run_id = rc.run_id,
-                    frame_id = reference_frame_id,
-                    "the two-pass dry pass produced no alignment for the reference itself; keeping it"
-                );
+        )? {
+            {
+                let conn = db(&rc.ctx)?.conn();
+                set_run_reference(
+                    &conn,
+                    rc.run_id,
+                    switch.frame_id,
+                    reference_mode_wire(cfg.reference.mode),
+                )?;
             }
-            Some(reference_idx) => {
-                if let Some(new_idx) = two_pass_pick(
-                    &candidates,
-                    reference_idx,
-                    diagonal_px,
-                    TWO_PASS_MIN_GAIN_PX,
-                ) {
-                    let corner_px_before =
-                        two_pass_deviation_px(&candidates, reference_idx, diagonal_px)
-                            .unwrap_or(f64::NAN);
-                    let corner_px_after = two_pass_deviation_px(&candidates, new_idx, diagonal_px)
-                        .unwrap_or(f64::NAN);
-                    let picked = rc
-                        .measured
-                        .get(&group.key)
-                        .and_then(|v| v.get(new_idx))
-                        .map(|e| {
-                            (
-                                e.frame.frame_id,
-                                e.frame.filename.clone(),
-                                e.calibrated.clone(),
-                                e.weight.as_ref().map(|w| w.normalized_mean),
-                            )
-                        });
-                    match picked {
-                        Some((new_frame_id, new_filename, Some(new_calibrated), new_weight)) => {
-                            let old = reference_frame_id;
 
-                            // Everything the switch needs from the chosen
-                            // frame, resolved before anything is mutated —
-                            // and DEGRADING, not fatal (fix round 1, item
-                            // 4). A switch is an improvement, never a
-                            // requirement: the current reference is already
-                            // resolved, already star-detected and perfectly
-                            // usable, so a frame whose calibrated file went
-                            // away or turned unreadable between the dry
-                            // pass and here must cost the run its
-                            // refinement, not its master. Every failure
-                            // below therefore falls through to the same
-                            // "keeping the current reference" warn as the
-                            // two sibling no-op paths above.
-                            //
-                            // No test forces this branch: the dry pass read
-                            // THIS SAME calibrated file through the same
-                            // `read_luminance` moments earlier, so the only
-                            // window is a genuine race (the working folder
-                            // swept, a volume unmounted, an SMB hiccup)
-                            // that no in-process fixture can open without a
-                            // fault-injection hook. It is guarded, logged
-                            // and non-fatal by construction instead.
-                            let prepared: Result<(ReferenceStars, String), String> =
-                                match find_frame_in_groups(&rc.plan_groups, new_frame_id) {
-                                    None => Err("it is not in any plan group".to_string()),
-                                    Some(new_group_frame) => {
-                                        let stars = {
-                                            let pool_ref = &rc.ctx.image_pool;
-                                            reference_stars(
-                                                &new_calibrated,
-                                                &cfg.registration,
-                                                Some(pool_ref),
-                                            )
-                                            .map_err(|e| format!("its star detection failed: {e}"))
-                                        };
-                                        match stars {
-                                            Err(e) => Err(e),
-                                            Ok(new_ref_stars) => {
-                                                let conn = db(&rc.ctx)?.conn();
-                                                match rc.memo.calibration_hash_checked(
-                                                    &conn,
-                                                    &cfg,
-                                                    &new_group_frame,
-                                                ) {
-                                                    Ok(new_hash) => Ok((new_ref_stars, new_hash)),
-                                                    Err(e) => Err(format!(
-                                                        "its calibration hash is unresolvable: {e}"
-                                                    )),
-                                                }
-                                            }
-                                        }
-                                    }
-                                };
-
-                            match prepared {
-                                Err(reason) => {
-                                    tracing::warn!(
-                                        run_id = rc.run_id,
-                                        frame_id = new_frame_id,
-                                        reason = %reason,
-                                        "the two-pass pick chose a frame the run cannot adopt; keeping the current reference"
-                                    );
-                                }
-                                Ok((new_ref_stars, new_hash)) => {
-                                    {
-                                        let conn = db(&rc.ctx)?.conn();
-                                        set_run_reference(
-                                            &conn,
-                                            rc.run_id,
-                                            new_frame_id,
-                                            reference_mode_wire(cfg.reference.mode),
-                                        )?;
-                                    }
-
-                                    reference_frame_id = new_frame_id;
-                                    ref_stars = new_ref_stars;
-                                    reference_hash = new_hash;
-                                    rc.reference_width = ref_stars.width;
-                                    rc.reference_height = ref_stars.height;
-                                    rc.reference_frame_id = Some(new_frame_id);
-                                    rc.reference_calibrated = Some(new_calibrated);
-                                    rc.summary.reference.frame_id = Some(new_frame_id);
-                                    rc.summary.reference.filename = Some(new_filename);
-                                    rc.summary.reference.weight = new_weight;
-                                    rc.summary.reference.switched_from = Some(old);
-
-                                    tracing::info!(
-                                        run_id = rc.run_id,
-                                        from = old,
-                                        to = new_frame_id,
-                                        corner_px_before,
-                                        corner_px_after,
-                                        "reference switched by the two-pass pick"
-                                    );
-                                    rc.warnings.push(format!(
-                                        "reference switched by the two-pass pick: {old} → \
-                                         {new_frame_id} (corner displacement \
-                                         {corner_px_before:.1} → {corner_px_after:.1} px)"
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                run_id = rc.run_id,
-                                "the two-pass pick chose a frame with no calibrated file; keeping the current reference"
-                            );
-                        }
-                    }
-                }
-            }
+            reference_frame_id = switch.frame_id;
+            ref_stars = switch.stars;
+            reference_hash = switch.hash;
+            rc.reference_width = ref_stars.width;
+            rc.reference_height = ref_stars.height;
+            rc.reference_frame_id = Some(switch.frame_id);
+            rc.reference_calibrated = Some(switch.calibrated.clone());
+            rc.summary.reference.frame_id = Some(switch.frame_id);
+            rc.summary.reference.filename = Some(switch.filename);
+            rc.summary.reference.weight = switch.weight;
+            rc.summary.reference.switched_from = Some(switch.from);
+            // Co-registered: every group registers onto the run's ONE
+            // reference, so the switch moves every group's geometry with it
+            // (ruling R-M4b-5).
+            adopt_co_registered_geometry(rc, &switch.calibrated, &reference_hash);
         }
     }
 
@@ -3313,13 +3835,22 @@ fn write_registered_artifact(
     let stem = calibrated_file_stem(group, frame);
     let out = out_dir.join(registered_file_name(&stem, planes == 3));
 
-    let reference_name = rc
-        .reference_calibrated
-        .as_deref()
-        .and_then(|p| p.file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("reference")
-        .to_string();
+    // M4b ruling R-M4b-5: the registered artifact is written in — and
+    // names — its GROUP's reference, which in co-registered mode is the
+    // run-wide one and in native mode the group's own.
+    let (reference_name, ref_width, ref_height) = {
+        let geometry = rc.geometry_of(group_key);
+        (
+            geometry
+                .calibrated
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("reference")
+                .to_string(),
+            geometry.width,
+            geometry.height,
+        )
+    };
     let transform_json = map.to_json();
     let model = rec.model.clone().unwrap_or_default();
 
@@ -3339,8 +3870,8 @@ fn write_registered_artifact(
     write_registered_frame(
         &calibrated,
         map,
-        rc.reference_width,
-        rc.reference_height,
+        ref_width,
+        ref_height,
         cfg.registration.interpolation,
         cfg.registration.clamping_threshold,
         &cards,
@@ -3699,6 +4230,13 @@ fn push_summary_group(
         rejection_high_path,
         stats,
         normalization_reference_frame_id,
+        // M4b ruling R-M4b-4: whichever frame this group actually
+        // registered onto — its `GroupGeometry` is the one place that
+        // knows, in either mode.
+        reference_frame_id: rc
+            .group_geometry
+            .get(&group.key)
+            .map(|g| g.reference_frame_id),
         ln_reference_path,
         drizzle_path,
         weight_map_path,
@@ -4183,8 +4721,10 @@ fn process_group_output(
     // pushes the run warning itself (the closure can only `tracing::warn!`,
     // never touch `rc.warnings`).
     let run_id = rc.run_id;
-    let ref_width = rc.reference_width;
-    let ref_height = rc.reference_height;
+    let (ref_width, ref_height) = {
+        let geometry = rc.geometry_of(&group.key);
+        (geometry.width, geometry.height)
+    };
     let pick_reference_idx = |members: &[GroupMember]| -> Option<AnchorPick> {
         let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
         let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
@@ -4315,12 +4855,13 @@ fn process_group_output(
     };
     let mut normalization_reference_frame_id = members[reference_idx].frame_id;
 
-    // Ruling 6: every group's master adopts the GLOBAL reference's geometry;
-    // the group's OWN plane count (mono vs. debayered OSC) is whatever this
-    // group's own measurements actually carry.
+    // Ruling 6, generalized by M4b ruling R-M4b-5: every group's master
+    // adopts ITS OWN reference's geometry — the run-wide reference's in
+    // co-registered mode (where every group's entry is that same one), the
+    // group's own in native mode. The group's OWN plane count (mono vs.
+    // debayered OSC) is whatever this group's own measurements carry.
     let mut channels = members[reference_idx].measurement.channels.len();
-    let width = rc.reference_width;
-    let height = rc.reference_height;
+    let (width, height) = (ref_width, ref_height);
 
     let mut stack_frames: Vec<StackFrame> = build_stack_frames(&members);
 
@@ -4817,6 +5358,7 @@ fn process_group_output(
         cameras: &group.cameras,
         run_id: &run_id_str,
         app_version: &rc.app_version,
+        geometry: rc.config.registration.geometry,
     }) {
         Ok(c) => c,
         Err(e) => {
@@ -5156,6 +5698,7 @@ fn process_group_output(
                             scale,
                             drop_shrink,
                             drizzle_cfg.kernel,
+                            rc.config.registration.geometry,
                         ) {
                             Ok(c) => c,
                             Err(e) => break 'attempt Err(DrizzleFailure::Other(e.to_string())),
@@ -5411,6 +5954,10 @@ fn run_group_normalization(
     let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
     let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
     let sky: Vec<f64> = members.iter().map(|m| m.measurement.mean_median()).collect();
+    let (ref_width, ref_height) = {
+        let geometry = rc.geometry_of(&group.key);
+        (geometry.width, geometry.height)
+    };
     let coverage: Vec<f64> = members
         .iter()
         .map(|m| {
@@ -5418,8 +5965,8 @@ fn run_group_normalization(
                 &m.map,
                 m.measurement.width,
                 m.measurement.height,
-                rc.reference_width,
-                rc.reference_height,
+                ref_width,
+                ref_height,
             )
         })
         .collect();
@@ -6031,25 +6578,13 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         .measurement
         .measure_options(cfg.normalization.scale_estimator);
 
-    let reference_frame_id = rc
-        .reference_frame_id
-        .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
-
-    // Ruling 6: every group's master shares the GLOBAL reference's WCS —
-    // fetched once, not per group.
-    let wcs = {
-        let conn = db(&rc.ctx)?.conn();
-        get_plate_solve(&conn, reference_frame_id)?
-    };
-    if wcs.is_none() {
-        tracing::warn!(
-            run_id = rc.run_id,
-            frame_id = reference_frame_id,
-            "no plate solve on the reference frame; the master has no WCS"
-        );
-        rc.warnings
-            .push("no plate solve on the reference frame; the master has no WCS".to_string());
-    }
+    // M4b ruling R-M4b-8: a master carries ITS OWN reference's WCS — the
+    // run-wide reference's in co-registered mode (where every group names
+    // the same frame, so this resolves once and the missing-solve warning
+    // is emitted once, exactly as before), the group's own in native mode.
+    // Keyed by frame id so the lookup AND the warning happen once per
+    // distinct reference, never once per group.
+    let mut solves: HashMap<i64, Option<PlateSolveRecord>> = HashMap::new();
 
     // Fix round 1, Minor M2: the `dropShrink` clamp (ruling R-M3-10) runs
     // ONCE here, for the whole run, instead of once per group — `drizzle.
@@ -6098,8 +6633,30 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
 
     for group in &groups {
         rc.check_cancel()?;
-        let (outcome, n, i, d, o) =
-            process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
+        let reference_frame_id = rc.geometry_of(&group.key).reference_frame_id;
+        if let std::collections::hash_map::Entry::Vacant(slot) = solves.entry(reference_frame_id) {
+            let solve = {
+                let conn = db(&rc.ctx)?.conn();
+                get_plate_solve(&conn, reference_frame_id)?
+            };
+            let missing = solve.is_none();
+            slot.insert(solve);
+            if missing {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id = reference_frame_id,
+                    "no plate solve on the reference frame; the master has no WCS"
+                );
+                rc.warnings.push(
+                    "no plate solve on the reference frame; the master has no WCS".to_string(),
+                );
+            }
+        }
+        let wcs = solves
+            .get(&reference_frame_id)
+            .and_then(|s| s.as_ref())
+            .cloned();
+        let (outcome, n, i, d, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
         normalize_total += n;
         integrate_total += i;
         drizzle_total += d;
@@ -6259,6 +6816,7 @@ pub(crate) fn test_context(
         reference_calibrated: None,
         reference_width: 0,
         reference_height: 0,
+        group_geometry: HashMap::new(),
         drizzle_attempted: 0,
         fail_after_stage: None,
     }
@@ -8065,6 +8623,357 @@ mod tests {
                 .expect("every frame has an entry");
             assert!(entry.included, "{id}: {:?}", entry.reason);
         }
+    }
+
+    // ── M4b Task 3: native geometry mode ─────────────────────────────────
+
+    /// Two groups in ONE set, at two pixel scales and two native
+    /// geometries: four fine frames ([`FINE_W`]x[`FINE_H`],
+    /// [`FINE_SCALE_ARCSEC`]) under one filter and three coarse ones
+    /// ([`COARSE_W`]x[`COARSE_H`], [`COARSE_SCALE_ARCSEC`]) under another.
+    /// The group key is colour mode + filter + binning + exposure, so the
+    /// filter alone splits them — geometry and camera never do (M2 Task
+    /// 10) — and the fine group is the larger, so `Auto` resolves the
+    /// RUN-wide reference into it.
+    ///
+    /// Frame 0 of each group is the cleanest of its own group (noise 3.0
+    /// against 5.0), so each group's own best-by-weight pick is
+    /// deterministic. Every frame is plate-solved: that is what lets the
+    /// coarse group register onto the FINE reference at all in
+    /// co-registered mode (a ×2 scale step needs the WCS seed, M4b Task
+    /// 2) — the very comparison these tests rest on.
+    fn seed_two_geometry_groups(
+        db_path: &Path,
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+
+        let mut fine_ids = Vec::new();
+        let mut coarse_ids = Vec::new();
+        for (i, (dx, dy)) in [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)]
+            .iter()
+            .enumerate()
+        {
+            let date_obs = date_obs_at(i);
+            let stem = format!("fine{i}");
+            let mut spec = mixed_light_spec(&stem, &date_obs, FINE_W, FINE_H);
+            spec.filter = Some("Ha");
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &scaled_stars(2.0, *dx, *dy),
+                600.0,
+                if i == 0 { 3.0 } else { 5.0 },
+                300 + i as u64,
+            );
+            fine_ids.push(id);
+        }
+        for (i, (dx, dy)) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)].iter().enumerate() {
+            let date_obs = date_obs_at(i + 4);
+            let stem = format!("coarse{i}");
+            let mut spec = mixed_light_spec(&stem, &date_obs, COARSE_W, COARSE_H);
+            spec.filter = Some("OIII");
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &scaled_stars(1.0, *dx, *dy),
+                600.0,
+                if i == 0 { 3.0 } else { 5.0 },
+                310 + i as u64,
+            );
+            coarse_ids.push(id);
+        }
+
+        test_fixtures::add_master_dark_and_flat(&fixture, &fine_ids, FINE_W, FINE_H);
+        test_fixtures::add_master_dark_and_flat(&fixture, &coarse_ids, COARSE_W, COARSE_H);
+
+        for &id in &fine_ids {
+            test_fixtures::seed_plate_solve_wcs(
+                &fixture.conn,
+                id,
+                FINE_W,
+                FINE_H,
+                MIXED_RA_DEG,
+                MIXED_DEC_DEG,
+                FINE_SCALE_ARCSEC,
+            );
+        }
+        for &id in &coarse_ids {
+            test_fixtures::seed_plate_solve_wcs(
+                &fixture.conn,
+                id,
+                COARSE_W,
+                COARSE_H,
+                MIXED_RA_DEG,
+                MIXED_DEC_DEG,
+                COARSE_SCALE_ARCSEC,
+            );
+        }
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        (fixture, fine_ids, coarse_ids, working, output)
+    }
+
+    /// Drives stages 1-9 over [`seed_two_geometry_groups`] with `cfg`, and
+    /// hands back the finished context.
+    fn run_two_geometry_groups(
+        fixture: &test_fixtures::Fixture,
+        ctx: Arc<ServiceContext>,
+        cfg: StackingConfig,
+        working: &tempfile::TempDir,
+        output: &tempfile::TempDir,
+    ) -> RunContext {
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(
+            plan_groups.len(),
+            2,
+            "premise: one group per filter: {plan_groups:?}"
+        );
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx,
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+        stage_output(&mut rc).unwrap();
+        rc
+    }
+
+    /// The group key of the group holding `frame_id`.
+    fn group_key_of(rc: &RunContext, frame_id: i64) -> String {
+        rc.plan_groups
+            .iter()
+            .find(|g| g.frames.iter().any(|f| f.frame_id == frame_id))
+            .map(|g| g.key.clone())
+            .unwrap_or_else(|| panic!("frame {frame_id} is in no group"))
+    }
+
+    /// One group's summary, by key.
+    fn summary_group<'a>(rc: &'a RunContext, key: &str) -> &'a SummaryGroup {
+        rc.summary
+            .groups
+            .iter()
+            .find(|g| g.key == key)
+            .unwrap_or_else(|| panic!("no summary for group {key}"))
+    }
+
+    /// A written master's own `NAXIS1`/`NAXIS2` and `ATH_RGEO`.
+    fn master_geometry(group: &SummaryGroup) -> (i64, i64, String) {
+        let path = group
+            .master_path
+            .clone()
+            .unwrap_or_else(|| panic!("group {} wrote no master", group.key));
+        let header = FitsHeader::from_path(Path::new(&path)).unwrap();
+        (
+            header.get_i32("NAXIS1").expect("NAXIS1") as i64,
+            header.get_i32("NAXIS2").expect("NAXIS2") as i64,
+            header.get_str("ATH_RGEO").expect("ATH_RGEO"),
+        )
+    }
+
+    /// M4b rulings R-M4b-4/5/8, (a): in `native` mode each group registers
+    /// onto its OWN best-weighted member and its master is delivered in
+    /// that member's geometry — the two groups here are 2x apart in
+    /// sampling, so a co-registered run would have to resample one into
+    /// the other. The run-level reference row stays the LARGEST group's
+    /// (ruling R-M4b-4), and every master says `ATH_RGEO = 'native'`.
+    #[test]
+    fn native_geometry_gives_each_group_its_own_reference_and_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, fine_ids, coarse_ids, working, output) = seed_two_geometry_groups(&db_path);
+
+        let mut cfg = StackingConfig::default();
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        // The two-pass re-pick has its own test below; this one pins the
+        // best-by-weight pick itself, so it must not move.
+        cfg.reference.two_pass = false;
+
+        let rc = run_two_geometry_groups(&fixture, ctx, cfg, &working, &output);
+
+        let fine_key = group_key_of(&rc, fine_ids[0]);
+        let coarse_key = group_key_of(&rc, coarse_ids[0]);
+        assert_ne!(fine_key, coarse_key);
+
+        // Each group's own reference is its own cleanest member …
+        let fine = summary_group(&rc, &fine_key);
+        let coarse = summary_group(&rc, &coarse_key);
+        assert_eq!(fine.reference_frame_id, Some(fine_ids[0]), "{fine:?}");
+        assert_eq!(coarse.reference_frame_id, Some(coarse_ids[0]), "{coarse:?}");
+
+        // … and each master is delivered in that member's own geometry.
+        let (fw, fh, fgeo) = master_geometry(fine);
+        assert_eq!((fw, fh), (FINE_W as i64, FINE_H as i64));
+        assert_eq!(fgeo, "native");
+        let (cw, ch, cgeo) = master_geometry(coarse);
+        assert_eq!((cw, ch), (COARSE_W as i64, COARSE_H as i64));
+        assert_eq!(cgeo, "native");
+
+        // The run-level reference is still the largest group's — what the
+        // plan gate and the results header show (ruling R-M4b-4).
+        assert_eq!(rc.reference_frame_id, Some(fine_ids[0]));
+        let row = crate::db::stacking::get_run(&fixture.conn, rc.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reference_frame_id, Some(fine_ids[0]));
+
+        // Every persisted registration row names its own group's
+        // reference, and the coarse frames were never warped onto the fine
+        // one.
+        let rows: HashMap<i64, RegistrationRecord> =
+            get_registration_for_frame_set(&fixture.conn, fixture.set_id)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.frame_id, r))
+                .collect();
+        for &id in &fine_ids {
+            assert_eq!(rows[&id].reference_frame_id, fine_ids[0], "{id}");
+        }
+        for &id in &coarse_ids {
+            assert_eq!(rows[&id].reference_frame_id, coarse_ids[0], "{id}");
+            let scale = rows[&id].scale.expect("an aligned row carries its scale");
+            assert!(
+                (scale - 1.0).abs() < 0.02,
+                "{id}: a native-mode frame registers at its own sampling: {scale}"
+            );
+        }
+    }
+
+    /// (b) The SAME set in the default `coRegistered` mode: one reference
+    /// for the whole run, both masters in its geometry (the coarse group
+    /// resampled ×2 into it), and every group's summary reference equal to
+    /// the run's. `ATH_RGEO = 'coRegistered'`.
+    #[test]
+    fn co_registered_geometry_keeps_one_reference_for_every_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, fine_ids, coarse_ids, working, output) = seed_two_geometry_groups(&db_path);
+
+        let mut cfg = StackingConfig::default();
+        assert_eq!(
+            cfg.registration.geometry,
+            RegistrationGeometry::CoRegistered,
+            "the default is co-registered"
+        );
+        cfg.reference.two_pass = false;
+
+        let rc = run_two_geometry_groups(&fixture, ctx, cfg, &working, &output);
+
+        let run_reference = rc.reference_frame_id.expect("a reference");
+        assert_eq!(run_reference, fine_ids[0], "the largest group's best frame");
+
+        let fine_key = group_key_of(&rc, fine_ids[0]);
+        let coarse_key = group_key_of(&rc, coarse_ids[0]);
+        for key in [&fine_key, &coarse_key] {
+            let group = summary_group(&rc, key);
+            assert_eq!(
+                group.reference_frame_id,
+                Some(run_reference),
+                "co-registered: every group names the run's reference: {group:?}"
+            );
+            let (w, h, geo) = master_geometry(group);
+            assert_eq!(
+                (w, h),
+                (FINE_W as i64, FINE_H as i64),
+                "co-registered: every master is in the run reference's geometry ({key})"
+            );
+            assert_eq!(geo, "coRegistered");
+        }
+
+        // The coarse frames really were resampled ×2 onto the fine grid.
+        let rows: HashMap<i64, RegistrationRecord> =
+            get_registration_for_frame_set(&fixture.conn, fixture.set_id)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.frame_id, r))
+                .collect();
+        for &id in &coarse_ids {
+            assert_eq!(rows[&id].reference_frame_id, run_reference, "{id}");
+            let scale = rows[&id].scale.expect("an aligned row carries its scale");
+            assert!((scale - 2.0).abs() < 0.02, "{id}: scale {scale}");
+        }
+    }
+
+    /// (c) Native mode with the two-pass re-pick ON (the default): the
+    /// pick runs over each group's OWN members, so whatever it chooses is
+    /// still a member of that same group — it can never wander into the
+    /// other group's frames, which have a different geometry entirely.
+    #[test]
+    fn native_two_pass_picks_within_each_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, fine_ids, coarse_ids, working, output) = seed_two_geometry_groups(&db_path);
+
+        let mut cfg = StackingConfig::default();
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        assert!(cfg.reference.two_pass, "the default must be on");
+
+        let rc = run_two_geometry_groups(&fixture, ctx, cfg, &working, &output);
+
+        let fine_key = group_key_of(&rc, fine_ids[0]);
+        let coarse_key = group_key_of(&rc, coarse_ids[0]);
+
+        let fine = summary_group(&rc, &fine_key);
+        let fine_reference = fine.reference_frame_id.expect("a group reference");
+        assert!(
+            fine_ids.contains(&fine_reference),
+            "the fine group's reference must be one of its own frames: {fine_reference}"
+        );
+        let coarse = summary_group(&rc, &coarse_key);
+        let coarse_reference = coarse.reference_frame_id.expect("a group reference");
+        assert!(
+            coarse_ids.contains(&coarse_reference),
+            "the coarse group's reference must be one of its own frames: {coarse_reference}"
+        );
+
+        // … and each master still comes out in its own group's geometry.
+        assert_eq!(
+            master_geometry(fine),
+            (FINE_W as i64, FINE_H as i64, "native".to_string())
+        );
+        assert_eq!(
+            master_geometry(coarse),
+            (COARSE_W as i64, COARSE_H as i64, "native".to_string())
+        );
     }
 
     #[test]

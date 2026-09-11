@@ -99,6 +99,28 @@ impl DistortionChoice {
     }
 }
 
+/// Which geometry a run's masters are delivered in (spec §3.8, M4b ruling
+/// R-M4b-4).
+///
+/// `CoRegistered` is M1–M4a's behaviour generalized: ONE reference for the
+/// whole set, every group resampled into its geometry, so every master of
+/// the run shares one pixel grid (and one WCS) whatever pixel scale its own
+/// frames were shot at.
+///
+/// `Native` gives each group its own reference — the group's best-weighted
+/// member, two-pass re-picked per group — and therefore its own geometry
+/// for local normalization, integration, drizzle, the master's WCS and the
+/// rejection bitmaps. No cross-group registration happens at all: a set
+/// mixing a bin-1 and a bin-2 train delivers one master per train at its
+/// own sampling instead of resampling one into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum RegistrationGeometry {
+    #[default]
+    CoRegistered,
+    Native,
+}
+
 /// Detection cuts. There is no detection sigma: the fast detector's
 /// adaptive ladder is threshold-free (it targets `maxStars`), so `minSnr`
 /// is the sensitivity dial.
@@ -122,6 +144,12 @@ impl Default for DetectionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RegistrationConfig {
+    /// M4b (ruling R-M4b-4): co-registered (the default — one reference and
+    /// one geometry for the whole set) or native (a reference and a
+    /// geometry per group). `#[serde(default)]` rides the struct-level
+    /// `default`, so every stored config written before M4b decodes as
+    /// co-registered and no `STACKING_CONFIG_VERSION` bump is needed.
+    pub geometry: RegistrationGeometry,
     pub model: ModelChoice,
     pub distortion: DistortionChoice,
     pub interpolation: Interpolation,
@@ -138,6 +166,7 @@ pub struct RegistrationConfig {
 impl Default for RegistrationConfig {
     fn default() -> Self {
         RegistrationConfig {
+            geometry: RegistrationGeometry::CoRegistered,
             model: ModelChoice::Auto,
             distortion: DistortionChoice::Off,
             interpolation: Interpolation::BicubicBSpline,
@@ -208,9 +237,34 @@ mod tests {
         assert_eq!(scale_ratio_for(None, None), 1.0);
     }
 
+    /// M4b ruling R-M4b-4: the geometry mode is one config field, default
+    /// co-registered — a stored document written before M4b decodes to
+    /// today's behaviour, and the serde spelling is the spec §9.2 one.
+    #[test]
+    fn geometry_defaults_to_co_registered_and_spells_itself_in_camel_case() {
+        assert_eq!(
+            RegistrationGeometry::default(),
+            RegistrationGeometry::CoRegistered
+        );
+        assert_eq!(
+            serde_json::to_string(&RegistrationGeometry::CoRegistered).unwrap(),
+            "\"coRegistered\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RegistrationGeometry::Native).unwrap(),
+            "\"native\""
+        );
+        let native: RegistrationConfig = serde_json::from_str("{\"geometry\":\"native\"}").unwrap();
+        assert_eq!(native.geometry, RegistrationGeometry::Native);
+        // … and every other field still carries its own default.
+        assert_eq!(native.model, ModelChoice::Auto);
+        assert_eq!(native.max_stars, 2000);
+    }
+
     #[test]
     fn defaults_match_the_spec() {
         let d = RegistrationConfig::default();
+        assert_eq!(d.geometry, RegistrationGeometry::CoRegistered);
         assert_eq!(d.model, ModelChoice::Auto);
         assert_eq!(d.distortion, DistortionChoice::Off);
         assert_eq!(d.interpolation, Interpolation::BicubicBSpline);
@@ -230,6 +284,7 @@ mod tests {
     fn serde_names_and_partial_json() {
         let json = serde_json::to_string(&RegistrationConfig::default()).unwrap();
         for needle in [
+            "\"geometry\":\"coRegistered\"",
             "\"model\":\"auto\"",
             "\"distortion\":\"off\"",
             "\"interpolation\":\"bicubicBSpline\"",

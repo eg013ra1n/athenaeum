@@ -37,7 +37,7 @@ use crate::stacking::config::{
 };
 use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup, ScaleSource};
 use crate::stacking::paths::{self, EstimateInputs};
-use crate::stacking::register::SCALE_TOLERANCE;
+use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
 
 /// One pipeline stage (spec §10.2's `stage` enum, minus the `Ok`-only
@@ -679,6 +679,21 @@ fn find_group_frame<'a>(groups: &'a [IntegrationGroup], frame_id: i64) -> Option
         .find(|f| f.frame_id == frame_id)
 }
 
+/// [`find_group_frame`] plus the group the frame was found in — M4b's
+/// per-group staleness needs to know which group's reference a frame is
+/// judged against.
+fn find_group_of<'a>(
+    groups: &'a [IntegrationGroup],
+    frame_id: i64,
+) -> Option<(&'a IntegrationGroup, &'a GroupFrame)> {
+    groups.iter().find_map(|g| {
+        g.frames
+            .iter()
+            .find(|f| f.frame_id == frame_id)
+            .map(|f| (g, f))
+    })
+}
+
 /// M4b ruling R-T1-1: the plan-time comparison point for the pixel-scale
 /// warning in `Auto` reference mode, first choice — the last run's OWN
 /// recorded `reference_frame_id`, the SAME lookup [`compute_register_stale`]
@@ -793,25 +808,62 @@ fn compute_register_stale(
         return Ok(true);
     };
 
-    let reference_frame_id = match reference.mode {
+    let manual_reference = match reference.mode {
         ReferenceMode::Manual => {
             let (Some(id), true) = (reference.frame_id, reference.on_disk) else {
                 return Ok(true);
             };
-            id
+            Some(id)
         }
-        ReferenceMode::Auto => match last_run.reference_frame_id {
-            Some(id) => id,
-            None => return Ok(true),
-        },
+        ReferenceMode::Auto => None,
     };
 
-    let Some(reference_group_frame) = find_group_frame(groups, reference_frame_id) else {
-        return Ok(true);
-    };
-    let Some(reference_calib_hash) = memo.calibration_hash(conn, cfg, reference_group_frame) else {
-        return Ok(true);
-    };
+    // The reference each GROUP is expected to be registered onto next time
+    // (M4b ruling R-M4b-4). Co-registered: the one run-wide reference, for
+    // every group alike — the rule this function has always applied.
+    // Native: each group's own, as the last run itself recorded it in its
+    // summary, since the plan cannot re-derive a per-group best-by-weight
+    // without measuring the set first (the same approximation `Auto` mode
+    // has always made run-wide).
+    let expected_reference: HashMap<String, i64> =
+        if cfg.registration.geometry == RegistrationGeometry::Native {
+            // A manual pin that has MOVED since that run invalidates every
+            // group's recorded reference, not only its own group's: the
+            // group that lost the pin now auto-picks a frame no run has
+            // ever recorded.
+            if let Some(id) = manual_reference {
+                if last_run.reference_frame_id != Some(id) {
+                    return Ok(true);
+                }
+            }
+            summary_group_references(last_run.summary_json.as_deref())
+        } else {
+            let id = match manual_reference {
+                Some(id) => id,
+                None => match last_run.reference_frame_id {
+                    Some(id) => id,
+                    None => return Ok(true),
+                },
+            };
+            groups.iter().map(|g| (g.key.clone(), id)).collect()
+        };
+
+    // Every distinct expected reference's own stage-1 hash, resolved up
+    // front: one unresolvable reference makes the whole stage stale, the
+    // same way it always has.
+    let mut reference_hashes: HashMap<i64, String> = HashMap::new();
+    for &reference_frame_id in expected_reference.values() {
+        if reference_hashes.contains_key(&reference_frame_id) {
+            continue;
+        }
+        let Some(reference_group_frame) = find_group_frame(groups, reference_frame_id) else {
+            return Ok(true);
+        };
+        let Some(hash) = memo.calibration_hash(conn, cfg, reference_group_frame) else {
+            return Ok(true);
+        };
+        reference_hashes.insert(reference_frame_id, hash);
+    }
 
     let rows = get_registration_for_frame_set(conn, frames_set_id)?;
     let by_frame: HashMap<i64, &RegistrationRecord> =
@@ -824,7 +876,13 @@ fn compute_register_stale(
         .collect();
 
     for frame_id in included_frame_ids {
-        let Some(f) = find_group_frame(groups, frame_id) else {
+        let Some((group, f)) = find_group_of(groups, frame_id) else {
+            return Ok(true);
+        };
+        let Some(&reference_frame_id) = expected_reference.get(&group.key) else {
+            return Ok(true);
+        };
+        let Some(reference_calib_hash) = reference_hashes.get(&reference_frame_id) else {
             return Ok(true);
         };
         let Some(frame_calib_hash) = memo.calibration_hash(conn, cfg, f) else {
@@ -833,7 +891,7 @@ fn compute_register_stale(
         let expected = registration_hash_for(
             cfg,
             reference_frame_id,
-            &reference_calib_hash,
+            reference_calib_hash,
             &frame_calib_hash,
         );
         let Some(row) = by_frame.get(&frame_id) else {
@@ -845,6 +903,47 @@ fn compute_register_stale(
     }
 
     Ok(false)
+}
+
+/// `group key -> that group's OWN registration reference`, read out of the
+/// last run's stored `summary_json` (M4b ruling R-M4b-4 — `SummaryGroup::
+/// reference_frame_id`).
+///
+/// Parsed as a bare `Value`, not through `RunSummary`: this needs two
+/// fields per group, and a summary written by an older build — or a newer
+/// one with fields this build has never heard of — must not cost the plan
+/// its answer. A group the map has no entry for reads as stale at the call
+/// site, which is the honest verdict: nothing recorded what that group was
+/// registered onto.
+fn summary_group_references(summary_json: Option<&str>) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    let Some(text) = summary_json else {
+        return out;
+    };
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "stacking: the last run's summary could not be parsed; \
+                 treating registration as stale"
+            );
+            return out;
+        }
+    };
+    let Some(groups) = value.get("groups").and_then(|g| g.as_array()) else {
+        return out;
+    };
+    for group in groups {
+        let (Some(key), Some(reference_frame_id)) = (
+            group.get("key").and_then(|k| k.as_str()),
+            group.get("referenceFrameId").and_then(|v| v.as_i64()),
+        ) else {
+            continue;
+        };
+        out.insert(key.to_string(), reference_frame_id);
+    }
+    out
 }
 
 // ── Stage 0.5: masters to build (spec §2 row 0.5) ───────────────────────────
@@ -4135,6 +4234,95 @@ mod tests {
             plan2.stale_stages.contains(&Stage::Register),
             "a reference change the registration rows don't reflect must be stale: {:?}",
             plan2.stale_stages
+        );
+    }
+
+    /// M4b ruling R-M4b-4: in `native` mode a group's expected reference is
+    /// the one the LAST RUN itself recorded for that group
+    /// (`SummaryGroup.reference_frame_id` in its stored `summary_json`) —
+    /// there is no run-wide reference every frame can be judged against any
+    /// more. Rows written against that reference read fresh; the same rows
+    /// read stale the moment the summary names a different frame for the
+    /// group.
+    #[test]
+    fn register_stale_native_mode_follows_each_groups_own_reference() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let mut cfg = StackingConfig::default();
+        cfg.registration.geometry = RegistrationGeometry::Native;
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+        let group_key = groups[0].key.clone();
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        // Every row registered onto `ids[1]` — deliberately NOT the run
+        // row's own `reference_frame_id`, so only the per-group summary can
+        // explain them.
+        let group_reference = ids[1];
+        let reference_hash = calib_hashes.get(&group_reference).unwrap().clone();
+        for &frame_id in &ids {
+            let frame_hash = calib_hashes.get(&frame_id).unwrap();
+            let expected =
+                registration_hash_for(&cfg, group_reference, &reference_hash, frame_hash);
+            let is_reference = frame_id == group_reference;
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id,
+                reference_frame_id: group_reference,
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan_with_summary = |summary_reference: i64| -> Vec<Stage> {
+            let run_id = seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "auto", &ids);
+            let summary = serde_json::json!({
+                "groups": [{ "key": group_key, "referenceFrameId": summary_reference }]
+            })
+            .to_string();
+            crate::db::stacking::finish_run(&f.conn, run_id, "done", Some(&summary), None).unwrap();
+            build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                f.set_id,
+                Some(cfg.clone()),
+            )
+            .unwrap()
+            .stale_stages
+        };
+
+        let fresh = plan_with_summary(group_reference);
+        assert!(
+            !fresh.contains(&Stage::Register),
+            "rows written against the group's own recorded reference must read fresh: {fresh:?}"
+        );
+
+        let moved = plan_with_summary(ids[2]);
+        assert!(
+            moved.contains(&Stage::Register),
+            "a group whose recorded reference no longer matches its rows must be stale: {moved:?}"
         );
     }
 

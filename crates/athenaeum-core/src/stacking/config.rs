@@ -634,6 +634,35 @@ mod tests {
         );
     }
 
+    /// M4b ruling R-M4b-4/5: flipping `registration.geometry` changes what
+    /// every stored registration artifact MEANS (which reference the frame
+    /// was warped onto, and into which geometry), so it must move the
+    /// registration stage hash — a set switched to native mode
+    /// re-registers instead of reusing co-registered rows. It rides
+    /// `cfg.registration`, so it moves the run fingerprint too.
+    #[test]
+    fn geometry_moves_the_registration_stage_hash() {
+        let cfg = StackingConfig::default();
+        let mut other = cfg.clone();
+        other.registration.geometry = crate::stacking::register::RegistrationGeometry::Native;
+        assert_ne!(cfg.registration.geometry, other.registration.geometry);
+        assert_ne!(config_hash(&cfg), config_hash(&other));
+        assert_ne!(
+            stage_hash(&registration_subtree(&cfg), &[], &[]),
+            stage_hash(&registration_subtree(&other), &[], &[]),
+            "the registration stage hash must follow registration.geometry"
+        );
+        // Nothing upstream of registration depends on it.
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&other), &[], &[]),
+        );
+        assert_eq!(
+            stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            stage_hash(&calibration_subtree(&other), &[], &[]),
+        );
+    }
+
     #[test]
     fn serde_names_follow_the_spec() {
         let s = serde_json::to_string(&StackingConfig::default()).unwrap();
@@ -1049,6 +1078,13 @@ mod tests {
         // in `reference` (`registration_subtree` is `cfg.registration`
         // alone), so not one cached per-frame artifact goes stale over it —
         // only this whole-config fingerprint moves.
-        assert_eq!(default_hash, "766fa93652078e3f");
+        //
+        // And once more here (M4b Task 3, rulings R-M4b-4/R-M4b-5):
+        // `registration.geometry` joins `RegistrationConfig`. It ships
+        // `coRegistered`, i.e. today's behaviour, but it DOES ride
+        // `registration_subtree`, so every set's cached registration rows
+        // go stale once — deliberately: a row records which reference a
+        // frame was warped onto, which is exactly what the mode decides.
+        assert_eq!(default_hash, "92bd15db24b841d4");
     }
 }

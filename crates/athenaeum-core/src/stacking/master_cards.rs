@@ -21,6 +21,7 @@ use crate::stacking::drizzle::{DrizzleKernel, DrizzleOutput};
 use crate::stacking::groups::ColorMode;
 use crate::stacking::integrate::GroupOutput;
 use crate::stacking::register::writer::REGISTERED_COPY_THROUGH;
+use crate::stacking::register::RegistrationGeometry;
 
 /// `ATH_STKV`: the master-light header format version.
 pub const ATH_STK_VERSION: i64 = 1;
@@ -29,6 +30,15 @@ pub const ATH_STK_VERSION: i64 = 1;
 pub const ATH_DRZ: &str = "ATH_DRZ"; // integer scale
 pub const ATH_DRZP: &str = "ATH_DRZP"; // drop shrink (real)
 pub const ATH_DRZK: &str = "ATH_DRZK"; // kernel serde name
+
+/// `ATH_RGEO` (M4b ruling R-M4b-8): which geometry mode delivered this
+/// master — the [`RegistrationGeometry`] serde name, `coRegistered` or
+/// `native`. Stamped on every master light AND every drizzled master (and
+/// copied onto a drizzle weight map), because the two modes answer
+/// different questions about what the pixel grid MEANS: a co-registered
+/// master shares the whole run's grid, a native one carries its own
+/// group's.
+pub const ATH_RGEO: &str = "ATH_RGEO";
 
 pub struct MasterCardInputs<'a> {
     /// Copy-through cards of the REFERENCE frame (`source_cards_from_file`).
@@ -65,6 +75,8 @@ pub struct MasterCardInputs<'a> {
     pub cameras: &'a [String],
     pub run_id: &'a str, // ATH_STKI
     pub app_version: &'a str,
+    /// The run's geometry mode — `ATH_RGEO` (M4b ruling R-M4b-8).
+    pub geometry: RegistrationGeometry,
 }
 
 /// `ATH_STKC`'s FITS string-value budget: `MAX_STR_CONTENT`
@@ -198,8 +210,32 @@ pub fn build_master_light_cards(
         Card::new("ATH_STKI", CardValue::Str(inputs.run_id.to_string()))?
             .with_comment("stacking run"),
     );
+    cards.push(
+        Card::new(
+            ATH_RGEO,
+            CardValue::Str(registration_geometry_serde_name(inputs.geometry)?),
+        )?
+        .with_comment("registration geometry mode"),
+    );
 
     Ok(cards)
+}
+
+/// The serde wire name of a [`RegistrationGeometry`] variant — the value
+/// [`ATH_RGEO`] carries. Goes through `serde_json` for the same reason
+/// [`drizzle_kernel_serde_name`] does: the card can then never drift from
+/// the config's own wire representation, and a future non-unit variant
+/// surfaces as a caller-visible error rather than a panic inside the
+/// header writer.
+fn registration_geometry_serde_name(
+    geometry: RegistrationGeometry,
+) -> Result<String, FitsWriteError> {
+    match serde_json::to_value(geometry) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        other => Err(FitsWriteError::Malformed(format!(
+            "RegistrationGeometry did not serialize to a JSON string: {other:?}"
+        ))),
+    }
 }
 
 /// Whether `keyword` is one [`wcs_cards`] can emit — used by
@@ -263,18 +299,24 @@ fn drizzle_kernel_serde_name(kernel: DrizzleKernel) -> Result<String, FitsWriteE
 /// The master's cards with its original (un-scaled) WCS block — every card
 /// [`is_wcs_keyword`] recognizes — stripped, `wcs_cards(scaled)` appended
 /// when `scaled` is `Some` (nothing appended, i.e. no WCS at all, when
-/// `None`), then the `ATH_DRZ`/`ATH_DRZP`/`ATH_DRZK` provenance cards.
-/// `NAXIS*` are the writer's business, never cards here.
+/// `None`), then the `ATH_DRZ`/`ATH_DRZP`/`ATH_DRZK` provenance cards and
+/// M4b's [`ATH_RGEO`]. `NAXIS*` are the writer's business, never cards here.
+///
+/// `geometry` is stamped from the ARGUMENT, and the master's own
+/// [`ATH_RGEO`] card is stripped alongside the WCS block first: the master
+/// header already carries one, and a drizzled header must end up with
+/// exactly one card, not two (ruling R-M4b-8).
 pub fn build_drizzle_cards(
     master_cards: &[Card],
     scaled: Option<&PlateSolveRecord>,
     scale: u32,
     drop_shrink: f64,
     kernel: DrizzleKernel,
+    geometry: RegistrationGeometry,
 ) -> Result<Vec<Card>, FitsWriteError> {
     let mut cards: Vec<Card> = master_cards
         .iter()
-        .filter(|c| !is_wcs_keyword(&c.keyword))
+        .filter(|c| !is_wcs_keyword(&c.keyword) && c.keyword != ATH_RGEO)
         .cloned()
         .collect();
 
@@ -291,6 +333,13 @@ pub fn build_drizzle_cards(
     cards.push(
         Card::new(ATH_DRZK, CardValue::Str(drizzle_kernel_serde_name(kernel)?))?
             .with_comment("drizzle kernel"),
+    );
+    cards.push(
+        Card::new(
+            ATH_RGEO,
+            CardValue::Str(registration_geometry_serde_name(geometry)?),
+        )?
+        .with_comment("registration geometry mode"),
     );
 
     Ok(cards)
@@ -394,9 +443,10 @@ fn rejection_map_cards(label: &str, master_cards: &[Card]) -> Result<Vec<Card>, 
 
 /// Header cards for the drizzle weight map (`IMAGETYP = 'Drizzle Weight'`,
 /// `ATH_STK`/`ATH_STKV`, `BUNIT = 'relative weight'`, and the drizzle
-/// output's own `ATH_STKI`/`ATH_STKG`/`ATH_DRZ` cards copied through so the
-/// map can be traced back to its run/group/scale without opening the
-/// drizzled master too) — the [`rejection_map_cards`] pattern.
+/// output's own `ATH_STKI`/`ATH_STKG`/`ATH_DRZ`/[`ATH_RGEO`] cards copied
+/// through so the map can be traced back to its run/group/scale/geometry
+/// mode without opening the drizzled master too) — the
+/// [`rejection_map_cards`] pattern.
 pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
     let mut cards = vec![
         Card::new("IMAGETYP", CardValue::Str("Drizzle Weight".into()))?,
@@ -418,7 +468,7 @@ pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteEr
     for c in drizzle_cards.iter().filter(|c| is_wcs_keyword(&c.keyword)) {
         cards.push(c.clone());
     }
-    for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ] {
+    for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ, ATH_RGEO] {
         if let Some(c) = drizzle_cards.iter().find(|c| c.keyword == kw) {
             cards.push(c.clone());
         }
@@ -768,6 +818,7 @@ mod tests {
             cameras: &["ATR2600M".to_string(), "ZWO ASI2600MC Duo".to_string()],
             run_id: "run-7",
             app_version: "0.5.7",
+            geometry: RegistrationGeometry::CoRegistered,
         })
         .unwrap();
         let kw = |k: &str| {
@@ -817,6 +868,10 @@ mod tests {
             Some(CardValue::Str("ATR2600M,ZWO ASI2600MC Duo".into()))
         );
         assert_eq!(kw("ATH_STKI"), Some(CardValue::Str("run-7".into())));
+        // M4b ruling R-M4b-8: every master says which geometry mode built
+        // it, in the config's own serde spelling.
+        assert_eq!(kw(ATH_RGEO), Some(CardValue::Str("coRegistered".into())));
+        assert_eq!(cards.iter().filter(|c| c.keyword == ATH_RGEO).count(), 1);
         assert!(kw("SWCREATE").is_some());
         // exactly one of each — the reference's EXPTIME/DATE-OBS were replaced, not duplicated
         assert_eq!(cards.iter().filter(|c| c.keyword == "EXPTIME").count(), 1);
@@ -852,6 +907,7 @@ mod tests {
             cameras: &["ZWO ASI2600MC Duo".to_string()],
             run_id: "run-7",
             app_version: "0.5.7",
+            geometry: RegistrationGeometry::CoRegistered,
         })
         .unwrap();
         for c in &long_cards {
@@ -891,6 +947,7 @@ mod tests {
             cameras: &["cam".to_string()],
             run_id: "run-1",
             app_version: "0.5.7",
+            geometry: RegistrationGeometry::Native,
         })
         .unwrap();
         let kw = |k: &str| {
@@ -905,6 +962,9 @@ mod tests {
         );
         assert_eq!(kw("DATE-END"), None);
         assert_eq!(cards.iter().filter(|c| c.keyword == "DATE-OBS").count(), 1);
+        // M4b ruling R-M4b-8: the card follows the caller's mode, whatever
+        // the rest of the header says.
+        assert_eq!(kw(ATH_RGEO), Some(CardValue::Str("native".into())));
     }
 
     #[test]
@@ -932,6 +992,7 @@ mod tests {
             cameras: &["ATR2600M".to_string()],
             run_id: "run-7",
             app_version: "0.5.7",
+            geometry: RegistrationGeometry::CoRegistered,
         })
         .unwrap();
         let forbidden_prefixes = ["CTYPE", "CRPIX", "CRVAL", "CD", "A_", "PLTSOLVD"];
@@ -1108,13 +1169,29 @@ mod tests {
             Card::new("OBJECT", CardValue::Str("LDN 1272".into())).unwrap(),
             Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
             Card::new("ATH_STKG", CardValue::Str("group-1".into())).unwrap(),
+            // M4b: the master's own geometry card — the drizzled header
+            // must carry ONE, from the argument, never both.
+            Card::new(ATH_RGEO, CardValue::Str("coRegistered".into())).unwrap(),
         ];
         master_cards.extend(wcs_cards(&solve).unwrap());
 
         let scaled = crate::fits_writer::wcs::scale_plate_solve(&solve, 2).unwrap();
-        let cards =
-            build_drizzle_cards(&master_cards, Some(&scaled), 2, 0.9, DrizzleKernel::Square)
-                .unwrap();
+        let cards = build_drizzle_cards(
+            &master_cards,
+            Some(&scaled),
+            2,
+            0.9,
+            DrizzleKernel::Square,
+            RegistrationGeometry::Native,
+        )
+        .unwrap();
+
+        // M4b ruling R-M4b-8: exactly one geometry card, the caller's.
+        assert_eq!(cards.iter().filter(|c| c.keyword == ATH_RGEO).count(), 1);
+        assert_eq!(
+            cards.iter().find(|c| c.keyword == ATH_RGEO).unwrap().value,
+            Some(CardValue::Str("native".into()))
+        );
 
         // exactly one CRPIX1 card, equal to the SCALED value
         let crpix1: Vec<&Card> = cards.iter().filter(|c| c.keyword == "CRPIX1").collect();
@@ -1191,8 +1268,15 @@ mod tests {
             vec![Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap()];
         master_cards.extend(wcs_cards(&solve).unwrap());
 
-        let cards =
-            build_drizzle_cards(&master_cards, None, 3, 0.7, DrizzleKernel::Circle).unwrap();
+        let cards = build_drizzle_cards(
+            &master_cards,
+            None,
+            3,
+            0.7,
+            DrizzleKernel::Circle,
+            RegistrationGeometry::CoRegistered,
+        )
+        .unwrap();
         for c in &cards {
             assert!(
                 !is_wcs_keyword(&c.keyword),
@@ -1221,9 +1305,15 @@ mod tests {
         master_cards.extend(wcs_cards(&solve).unwrap());
 
         let scaled = crate::fits_writer::wcs::scale_plate_solve(&solve, 2).unwrap();
-        let drizzle_cards =
-            build_drizzle_cards(&master_cards, Some(&scaled), 2, 0.9, DrizzleKernel::Square)
-                .unwrap();
+        let drizzle_cards = build_drizzle_cards(
+            &master_cards,
+            Some(&scaled),
+            2,
+            0.9,
+            DrizzleKernel::Square,
+            RegistrationGeometry::Native,
+        )
+        .unwrap();
 
         let weight_cards = weight_map_cards(&drizzle_cards).unwrap();
 
@@ -1249,8 +1339,9 @@ mod tests {
             );
         }
 
-        // The provenance trio still survives too.
-        for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ] {
+        // The provenance trio still survives too — plus M4b's geometry
+        // card, which a weight map is as entitled to as its own master.
+        for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ, ATH_RGEO] {
             assert_eq!(
                 weight_cards.iter().filter(|c| c.keyword == kw).count(),
                 1,

@@ -148,6 +148,14 @@ pub struct SummaryGroup {
     pub rejection_high_path: Option<String>,
     pub stats: Option<GroupStats>,
     pub normalization_reference_frame_id: Option<i64>,
+    /// M4b (ruling R-M4b-4): the frame every member of THIS group was
+    /// registered onto — the run-wide reference in `coRegistered` mode
+    /// (the same id `RunSummary::reference` carries), the group's own in
+    /// `native` mode. `None` only on a summary written before M4b, or for
+    /// a group that never reached stage 5. `#[serde(default)]`, see
+    /// [`SummaryFrame::ln_scale`]'s own doc.
+    #[serde(default)]
+    pub reference_frame_id: Option<i64>,
     /// Stage 6 (local normalization, M2): the group's LN reference file
     /// (`ln/<group>/reference.fits`, spec §9.5), when local normalization
     /// ran for this group at all — `None` when it is disabled, the group

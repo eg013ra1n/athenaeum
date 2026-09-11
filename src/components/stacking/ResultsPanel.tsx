@@ -157,11 +157,18 @@ type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 
 function MasterCard({
   group,
   lnReferencePath,
+  groupReferenceFrameId,
   drizzleSummary,
   drizzleConfigEnabled,
 }: {
   group: StackingRunGroupRow;
   lnReferencePath: string | null;
+  /** M4b (ruling R-M4b-4): this group's OWN registration reference, shown
+   *  only when the run was in native geometry mode — in co-registered mode
+   *  it is the run reference the header already names, and repeating it per
+   *  card would say nothing. `null` on a co-registered run, a run whose
+   *  summary hasn't loaded, or a pre-M4b summary. */
+  groupReferenceFrameId: number | null;
   /** `null` when the run's `summary` hasn't loaded yet (or this group has
    *  none in it) — the drizzle stats/weight-map path below are simply
    *  omitted in that case; `group.drizzlePath` alone still drives whether
@@ -187,7 +194,10 @@ function MasterCard({
         </div>
       </div>
 
-      <p className="text-xs text-content-secondary tabular-nums">{group.includedCount} frames</p>
+      <p className="text-xs text-content-secondary tabular-nums">
+        {group.includedCount} frames
+        {groupReferenceFrameId != null && ` · reference #${groupReferenceFrameId}`}
+      </p>
 
       {/* Fix round 1, Important #7: omit the stats line entirely when
        *  `statsJson` is absent or fails shape validation — no "—"
@@ -490,6 +500,11 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
                     key={g.id}
                     group={g}
                     lnReferencePath={sg?.lnReferencePath ?? null}
+                    groupReferenceFrameId={
+                      runDetail.summary?.config.registration.geometry === 'native'
+                        ? (sg?.referenceFrameId ?? null)
+                        : null
+                    }
                     drizzleSummary={
                       sg ? { drizzlePath: sg.drizzlePath, weightMapPath: sg.weightMapPath, drizzle: sg.drizzle } : null
                     }

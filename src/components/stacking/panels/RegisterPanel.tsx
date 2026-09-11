@@ -1,14 +1,33 @@
-// Stage 5 (Register) inspector panel: model/distortion/interpolation,
-// clamping, star cap, RANSAC tolerance/iterations, max RMS + fail-on-max-rms,
-// write-registered-frames, and the detection pair under an Advanced
-// disclosure.
+// Stage 5 (Register) inspector panel: the geometry mode (M4b),
+// model/distortion/interpolation, clamping, star cap, RANSAC
+// tolerance/iterations, max RMS + fail-on-max-rms, write-registered-frames,
+// and the detection pair under an Advanced disclosure.
 
 import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { NumericField } from '../NumericField';
 import { ParamPair } from '../ParamPair';
 import { distortionLabel, interpolationLabel, modelLabel } from '../stageSummary';
-import type { DistortionChoice, Interpolation, ModelChoice, StackingConfig } from '../../../types/stacking';
+import type {
+  DistortionChoice,
+  Interpolation,
+  ModelChoice,
+  RegistrationGeometry,
+  StackingConfig,
+} from '../../../types/stacking';
+
+/** M4b ruling R-M4b-4: the two geometry modes, with the sentence that
+ *  explains what each one does to the delivered masters. */
+const GEOMETRIES: { value: RegistrationGeometry; label: string }[] = [
+  {
+    value: 'coRegistered',
+    label: "Co-registered — every group is resampled into the set reference's geometry (one geometry for all masters)",
+  },
+  {
+    value: 'native',
+    label: 'Native — each group keeps its own reference and geometry (no cross-group registration)',
+  },
+];
 
 const MODELS: ModelChoice[] = ['auto', 'similarity', 'affine', 'homography'];
 const DISTORTIONS: DistortionChoice[] = ['off', 'polynomial2', 'polynomial3', 'polynomial4', 'auto'];
@@ -42,6 +61,32 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
 
   return (
     <div className="space-y-3">
+      {/* Geometry (M4b, ruling R-M4b-4) — a radio, not a select: the two
+       *  labels carry the whole explanation and there will never be a
+       *  third. */}
+      <div>
+        <span className="block text-xs text-content-secondary mb-1">Geometry</span>
+        <div className="space-y-1.5">
+          {GEOMETRIES.map((g) => (
+            <label key={g.value} className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="stacking-registration-geometry"
+                value={g.value}
+                checked={r.geometry === g.value}
+                disabled={disabled}
+                onChange={() => patch({ geometry: g.value })}
+                className="mt-0.5 w-4 h-4 border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+              />
+              <span className="text-sm text-content-secondary">{g.label}</span>
+            </label>
+          ))}
+        </div>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {defaults.registration.geometry === 'native' ? 'Native' : 'Co-registered'}
+        </p>
+      </div>
+
       <div>
         <label className="block text-xs text-content-secondary mb-1">Model</label>
         <select

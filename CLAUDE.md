@@ -530,17 +530,12 @@ shape after Task 8's sky-penalized normalization anchor (ruling R-M3-17).
 thin-plate-spline distortion, ESD/RCR/min-max/large-scale rejection,
 Bayer drizzle, XISF output, cataloging masters, preset management, and
 **mixed pixel scales in one set** (owner requirement
-2026-09-09 — co-registered mode resamples every group into the reference
-geometry, native mode keeps a per-group reference with no cross-group
-registration). **Correction (M2 final fix wave, ruling I4):** the sentence
-here used to claim the plan gate already names a foreign-scale group as a
-blocker — it does not (`grep` for pixel-scale terms in `plan.rs` returns 0
-hits). Today the ONLY defence is registration's own per-frame scale gate
-(`[0.8, 1.25]` of the reference), which drops such a frame one at a time
-with a visible exclusion reason in the frames table — no plan-time signal
-names the group itself yet. A plan-time WARNING (never a blocker) is the
-first item of the M4 mixed-pixel-scale work — see spec §15 and
-`docs/superpowers/open-items.md`'s Stacking M2 subsection.
+2026-09-09) — that last item SHIPPED as M4b, see its own paragraph below:
+the plan-time scale WARNING, the per-frame scale gate, the WCS seed and the
+co-registered / native modes all landed together, so the M2-era correction
+that used to stand here ("the only defence is registration's fixed
+`[0.8, 1.25]` gate, no plan-time signal names the group") no longer
+describes the code.
 
 **M2 — local normalization** (spec §5.2, executed 2026-09-10 alongside Task
 10's camera-agnostic grouping rule — see "The plan gate" above, same
@@ -741,9 +736,47 @@ fix round — the old early removal raced tests waiting on
 plan's header (`docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`);
 cite it. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4a-acceptance-run.md`, run 13 on LDN 1272, 56 min end to end): the two-pass pick switched the reference from the best-weighted `_0080` (36 px off the median framing) to `_0073` — the frame the owner had pinned by hand in M2/M3; rejected fractions 2.985 % (mono) / 2.733 % (OSC) at the Auto 5.0/3.5 with `LINEAR_FIT_SIGMA_SCALE` left at 1.0 (M2: 0.83/0.74 %; the external tool 2.5–2.8 %); per-frame weights against the external log: mono ρ 0.92 / top-20 18/20, OSC ρ 0.93/0.82/0.68 / top-20 15/20 with the bright night no longer monopolising the top; the mono drizzled/undrizzled FWHM ratio equals the external tool's to 0.6 % under the new estimator, the OSC G/B ratio stays +11–12 % over it (the M3 residual, unchanged in kind — M4c Task 0); LN 368/368, measure −20 %, LN −7 %, drizzle −16 % vs M3.
 
+**M4b — mixed pixel scales** (spec §3.8, plan
+`docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`,
+rulings R-M4b-1…9): one set may hold groups — or members of one group —
+shot at different pixel scales (a bin-2 group, a second telescope, another
+camera), and the pipeline integrates all of them in one of two modes the
+owner picks per set through `registration.geometry`
+(`"coRegistered" | "native"`, default co-registered, `#[serde(default)]`,
+no `STACKING_CONFIG_VERSION` bump). **Co-registered** is M1–M4a's
+behaviour: ONE run-wide reference, every group resampled into its geometry.
+**Native** gives each group its own reference — the group's best-weighted
+member, two-pass re-picked per group (a Manual pin applies to its OWN group
+only) — and its own geometry for local normalization, integration,
+drizzle, the master's WCS and the `.rej` bitmaps, with no cross-group
+registration at all. `RunContext.group_geometry` (`GroupGeometry`, resolved
+at the end of stage 4 by `resolve_group_geometry`) is the one place that
+knows; every former reader of `rc.reference_width/height` now reads
+`rc.geometry_of(&group.key)`, which in co-registered mode holds the
+run-wide value for every group, so the M1–M4a pins keep passing with the
+default config. The run-level `stacking_runs.reference_frame_id` stays the
+largest group's reference in both modes (what the plan gate and the
+results header show); `SummaryGroup.reference_frame_id` carries each
+group's own; every master and drizzled master (and a drizzle weight map)
+carries `ATH_RGEO = 'coRegistered' | 'native'`, and in native mode the
+master's WCS is the GROUP reference's solve. `registration.geometry` rides
+`registration_subtree`, so flipping it re-registers every set on purpose.
+Two supporting mechanisms ship in the same plan: every `GroupFrame` carries
+`pixel_scale_arcsec`/`scale_source` (the stored plate solve when the frame
+is solved, else `206.2648 · XPIXSZ / FOCALLEN` — no binning factor,
+R-M4b-1) and the plan gate turns a scale spread into a named WARNING,
+never a blocker (R-M4b-7); and registration's scale gate is per frame,
+centred on the frame's own implied ratio to its reference (`[r/1.25,
+r·1.25]`, R-M4b-2), with the alignment SEEDED from the two WCS solutions
+when both frames are solved (`register/wcs_seed.rs`, the `+wcs` model
+suffix on the row, R-M4b-3) and the quad seed whenever a solve is missing.
+The plan gate's per-group staleness in native mode follows each group's own
+reference as the last run recorded it in its `summary_json`
+(`plan.rs::summary_group_references`).
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,integrate,
-master_cards}.rs`, `stacking/register/{mod,detect,align,frame,writer}.rs`,
+master_cards}.rs`, `stacking/register/{mod,detect,align,frame,wcs_seed,writer}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
 `crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/

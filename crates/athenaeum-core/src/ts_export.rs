@@ -303,6 +303,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::weights::WeightMode,
             crate::stacking::weights::FormulaWeights,
             crate::stacking::weights::SelectionConfig,
+            crate::stacking::register::RegistrationGeometry,
             crate::stacking::register::ModelChoice,
             crate::stacking::register::DistortionChoice,
             crate::stacking::register::DetectionConfig,
