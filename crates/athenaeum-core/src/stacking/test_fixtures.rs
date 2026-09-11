@@ -436,6 +436,53 @@ pub(crate) fn seed_plate_solve_scale(conn: &Connection, frame_id: i64, pixel_sca
     .unwrap();
 }
 
+/// As [`seed_plate_solve_scale`], but with a WCS a caller can actually
+/// project through (M4b Task 2's plate-solve seed reads exactly these
+/// columns): `crpix` at the frame's own centre in 0-based pixel
+/// coordinates, `crval` at `(ra_deg, dec_deg)`, and an unrotated CD matrix
+/// for `pixel_scale_arcsec` in the usual sky handedness. Two frames seeded
+/// at the same `crval` with different scales therefore describe the same
+/// sky at different samplings — which is exactly the mixed-scale case.
+pub(crate) fn seed_plate_solve_wcs(
+    conn: &Connection,
+    frame_id: i64,
+    width: usize,
+    height: usize,
+    ra_deg: f64,
+    dec_deg: f64,
+    pixel_scale_arcsec: f64,
+) {
+    let deg_per_px = pixel_scale_arcsec / 3600.0;
+    conn.execute(
+        "INSERT INTO plate_solves (
+            frame_id, crpix1, crpix2, crval1, crval2,
+            cd1_1, cd1_2, cd2_1, cd2_2,
+            matched_stars, total_detected,
+            rms_residual_px, rms_residual_arcsec,
+            pixel_scale_arcsec, field_rotation_deg,
+            solve_time_ms, catalog_used, algorithm_used, solved_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, 0.0, 0.0, ?7,
+            50, 200,
+            0.3, 0.2,
+            ?8, 0.0,
+            0, 'test', 'test', '2025-01-01T00:00:00Z'
+         )",
+        params![
+            frame_id,
+            width as f64 / 2.0,
+            height as f64 / 2.0,
+            ra_deg,
+            dec_deg,
+            -deg_per_px,
+            deg_per_px,
+            pixel_scale_arcsec,
+        ],
+    )
+    .unwrap();
+}
+
 // ── Real 16-bit FITS for a LIGHT fixture ────────────────────────────────────
 
 /// Write a real 16-bit (`BITPIX 16`, `BZERO 32768`, `BSCALE 1`) FITS with a

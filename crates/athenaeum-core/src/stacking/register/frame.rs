@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use super::align::{align, model_name, AlignError, Alignment};
+use super::align::{align, model_name, AlignError, Alignment, SeedKind};
 use super::detect::{detect_stars, luminance, Star};
 use super::RegistrationConfig;
 use crate::geometry::{Linear, LinearKind, PixelMap};
@@ -63,12 +63,18 @@ pub fn reference_stars(
 /// Register one subject onto the reference. I/O errors and cancellation
 /// are `Err`; an alignment failure is a successful measurement of a frame
 /// that cannot be registered (`outcome: Err(AlignError)`).
+///
+/// `hint` and `scale_gate` are M4b's two per-frame inputs, passed straight
+/// through to [`align`]: an optional plate-solve seed, and the scale
+/// window this particular frame is judged against.
 pub fn register_frame(
     reference: &ReferenceStars,
     subject: &Path,
     cfg: &RegistrationConfig,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
+    hint: Option<&Linear>,
+    scale_gate: (f64, f64),
 ) -> Result<FrameRegistration, IntegrationError> {
     let start = Instant::now();
     if cancel.load(Ordering::Relaxed) {
@@ -86,6 +92,8 @@ pub fn register_frame(
         (reference.width, reference.height),
         (width, height),
         cfg,
+        hint,
+        scale_gate,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
     match &outcome {
@@ -95,7 +103,7 @@ pub fn register_frame(
                 detections = stars.len(),
                 inliers = a.inliers,
                 rms_px = a.rms_px,
-                model = %model_name(a.model, a.distortion_order),
+                model = %model_name(a.model, a.distortion_order, a.seed),
                 flipped = a.flipped,
                 duration_ms,
                 "frame registered"
@@ -128,6 +136,7 @@ pub fn identity_registration(reference: &ReferenceStars) -> FrameRegistration {
             map,
             model: LinearKind::Similarity,
             distortion_order: None,
+            seed: SeedKind::Quads,
             seed_matches: 0,
             pairs: reference.stars.len(),
             repaired: 0,
@@ -194,7 +203,7 @@ pub fn to_record(
                 "aligned"
             }
             .to_string();
-            rec.model = Some(model_name(a.model, a.distortion_order));
+            rec.model = Some(model_name(a.model, a.distortion_order, a.seed));
             rec.transform_json = Some(a.map.to_json());
             rec.inlier_ratio = Some(a.inlier_ratio);
             rec.peak_error_px = Some(a.peak_px.0.max(a.peak_px.1));
@@ -212,6 +221,7 @@ pub fn to_record(
 
 #[cfg(test)]
 mod tests {
+    use super::super::align::SCALE_RANGE;
     use super::*;
     use crate::fits_writer::write_fits_f32;
     use crate::geometry::ransac::SplitMix64;
@@ -277,7 +287,16 @@ mod tests {
         let reference = reference_stars(&r, &cfg, None).unwrap();
         assert!(reference.stars.len() >= 110, "{}", reference.stars.len());
         assert_eq!((reference.width, reference.height), (640, 480));
-        let reg = register_frame(&reference, &s, &cfg, None, &AtomicBool::new(false)).unwrap();
+        let reg = register_frame(
+            &reference,
+            &s,
+            &cfg,
+            None,
+            &AtomicBool::new(false),
+            None,
+            SCALE_RANGE,
+        )
+        .unwrap();
         let a = reg.outcome.as_ref().expect("registration succeeded");
         assert!(
             a.inliers >= 100 && a.rms_px < 0.15,
@@ -331,7 +350,16 @@ mod tests {
         let (r, s, _) = pair(dir.path(), 22, -3.0, 2.5, 0.0, 3);
         let cfg = RegistrationConfig::default();
         let reference = reference_stars(&r, &cfg, None).unwrap();
-        let reg = register_frame(&reference, &s, &cfg, None, &AtomicBool::new(false)).unwrap();
+        let reg = register_frame(
+            &reference,
+            &s,
+            &cfg,
+            None,
+            &AtomicBool::new(false),
+            None,
+            SCALE_RANGE,
+        )
+        .unwrap();
         let a = reg.outcome.as_ref().unwrap();
         assert!(
             (a.translation.0 - 3.0).abs() < 0.05 && (a.translation.1 + 2.5).abs() < 0.05,
@@ -339,13 +367,29 @@ mod tests {
             a.translation
         );
         assert!(matches!(
-            register_frame(&reference, &s, &cfg, None, &AtomicBool::new(true)),
+            register_frame(
+                &reference,
+                &s,
+                &cfg,
+                None,
+                &AtomicBool::new(true),
+                None,
+                SCALE_RANGE
+            ),
             Err(IntegrationError::Cancelled)
         ));
         let bad = dir.path().join("nope.txt");
         std::fs::write(&bad, b"x").unwrap();
         assert!(matches!(
-            register_frame(&reference, &bad, &cfg, None, &AtomicBool::new(false)),
+            register_frame(
+                &reference,
+                &bad,
+                &cfg,
+                None,
+                &AtomicBool::new(false),
+                None,
+                SCALE_RANGE
+            ),
             Err(IntegrationError::BadInput(_))
         ));
     }
@@ -359,7 +403,16 @@ mod tests {
         let (_, s2, _) = pair(&other, 99, 0.0, 0.0, 0.0, 1);
         let cfg = RegistrationConfig::default();
         let reference = reference_stars(&r, &cfg, None).unwrap();
-        let reg = register_frame(&reference, &s2, &cfg, None, &AtomicBool::new(false)).unwrap();
+        let reg = register_frame(
+            &reference,
+            &s2,
+            &cfg,
+            None,
+            &AtomicBool::new(false),
+            None,
+            SCALE_RANGE,
+        )
+        .unwrap();
         let err = reg
             .outcome
             .as_ref()

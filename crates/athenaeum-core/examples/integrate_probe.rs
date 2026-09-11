@@ -57,7 +57,7 @@ use athenaeum_core::stacking::measure::{
     measure_frame_with_seeds, measure_plane, measure_plane_with_seeds, MeasureOptions, NoiseSource,
     SeedSource, ADU_SCALE,
 };
-use athenaeum_core::stacking::register::align::model_name;
+use athenaeum_core::stacking::register::align::{model_name, SCALE_RANGE};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, Star};
 use athenaeum_core::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, FrameRegistration,
@@ -649,8 +649,16 @@ fn main() {
         let reg_result: Result<FrameRegistration, String> = if is_reference {
             Ok(identity_registration(&reference))
         } else {
-            register_frame(&reference, path, &args.reg, Some(&pool), &cancel)
-                .map_err(|e| e.to_string())
+            register_frame(
+                &reference,
+                path,
+                &args.reg,
+                Some(&pool),
+                &cancel,
+                None,
+                SCALE_RANGE,
+            )
+            .map_err(|e| e.to_string())
         };
         let reg = match reg_result {
             Ok(r) => r,
@@ -694,7 +702,7 @@ fn main() {
             }
         };
         let (rms_px, inliers, pairs) = (a.rms_px, a.inliers, a.pairs);
-        let model_str = model_name(a.model, a.distortion_order);
+        let model_str = model_name(a.model, a.distortion_order, a.seed);
         let map = a.map;
 
         let measurement =

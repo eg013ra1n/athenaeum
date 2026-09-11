@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use athenaeum_core::geometry::PixelMap;
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::resample::{warp_rows, Plane};
-use athenaeum_core::stacking::register::align::model_name;
+use athenaeum_core::stacking::register::align::{model_name, SCALE_RANGE};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, Star};
 use athenaeum_core::stacking::register::frame::{reference_stars, register_frame};
 use athenaeum_core::stacking::register::writer::{
@@ -215,6 +215,8 @@ fn main() {
         &args.cfg,
         None,
         &AtomicBool::new(false),
+        None,
+        SCALE_RANGE,
     )
     .unwrap_or_else(|e| {
         eprintln!("subject: {e}");
@@ -241,7 +243,7 @@ fn main() {
     } else {
         "aligned"
     });
-    out["model"] = serde_json::json!(model_name(a.model, a.distortion_order));
+    out["model"] = serde_json::json!(model_name(a.model, a.distortion_order, a.seed));
     out["seedMatches"] = serde_json::json!(a.seed_matches);
     out["pairs"] = serde_json::json!(a.pairs);
     out["repaired"] = serde_json::json!(a.repaired);
@@ -310,7 +312,7 @@ fn main() {
                 &src,
                 &RegisteredCards {
                     reference_name: ref_name,
-                    model: &model_name(a.model, a.distortion_order),
+                    model: &model_name(a.model, a.distortion_order, a.seed),
                     transform_json: &json,
                     interpolation: args.cfg.interpolation,
                     clamping: args.cfg.clamping_threshold,

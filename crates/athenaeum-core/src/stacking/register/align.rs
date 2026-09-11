@@ -1,7 +1,8 @@
 //! Subject → reference alignment (spec §3.2–3.3, §3.6): a quad-matched
-//! seed, KD-tree correspondences, RANSAC on the configured linear model,
-//! a σ-weighted refit, optional polynomial distortion and the QA gates.
-//! Pure geometry over star lists; no I/O.
+//! seed (or, from M4b, a seed handed in from the two frames' plate solves
+//! — see [`super::wcs_seed`]), KD-tree correspondences, RANSAC on the
+//! configured linear model, a σ-weighted refit, optional polynomial
+//! distortion and the QA gates. Pure geometry over star lists; no I/O.
 
 use std::fmt;
 
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use solvemyastro::quad::{build_quads, fit_affine, group_size_for, match_quads};
 
 use super::detect::Star;
+use super::wcs_seed::{WCS_SEED_RADIUS_FACTOR, WCS_SEED_RADIUS_MIN_PX};
 use super::{DistortionChoice, ModelChoice, RegistrationConfig, SCALE_TOLERANCE};
 use crate::geometry::{
     ransac_fit, refit_weighted, Distortion, KdTree2, Linear, LinearKind, Pair, PixelMap,
@@ -60,7 +62,13 @@ pub enum AlignError {
     TooFewMatches { matches: usize },
     TooFewInliers { inliers: usize },
     Degenerate,
-    ScaleOutOfRange { scale: f64 },
+    /// M4b: `expected` is the scale ratio the gate was centred on (1.0 for
+    /// a same-scale set, the frame's own `pixel_scale / reference scale`
+    /// otherwise — see [`super::scale_gate_for`]). The applied window is
+    /// `expected` ± [`SCALE_TOLERANCE`], which is what [`fmt::Display`]
+    /// prints, so the message names the gate the frame was actually judged
+    /// against rather than a constant that may not have been used.
+    ScaleOutOfRange { scale: f64, expected: f64 },
     RmsTooHigh { rms_px: f64, max_rms_px: f64 },
 }
 
@@ -79,10 +87,11 @@ impl fmt::Display for AlignError {
             }
             AlignError::TooFewInliers { inliers } => write!(f, "only {inliers} inliers"),
             AlignError::Degenerate => write!(f, "degenerate transform"),
-            AlignError::ScaleOutOfRange { scale } => write!(
+            AlignError::ScaleOutOfRange { scale, expected } => write!(
                 f,
-                "scale {scale:.4} outside [{}, {}]",
-                SCALE_RANGE.0, SCALE_RANGE.1
+                "scale {scale:.2} outside [{:.2}, {:.2}] (expected {expected:.2})",
+                expected / SCALE_TOLERANCE,
+                expected * SCALE_TOLERANCE
             ),
             AlignError::RmsTooHigh { rms_px, max_rms_px } => {
                 write!(f, "RMS {rms_px:.2} px above {max_rms_px:.2}")
@@ -93,12 +102,28 @@ impl fmt::Display for AlignError {
 
 impl std::error::Error for AlignError {}
 
+/// Where an alignment's initial transform came from (M4b, ruling
+/// R-M4b-3). It rides in [`Alignment`] and in [`model_name`] so a stored
+/// `registration_results.model` says which of the two produced the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedKind {
+    /// The quad matcher over both star lists (the M1–M4a path).
+    Quads,
+    /// A transform handed in by the caller, built from the two frames'
+    /// stored plate solves.
+    Wcs,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alignment {
     /// Subject → reference (with the stored inverse).
     pub map: PixelMap,
     pub model: LinearKind,
     pub distortion_order: Option<u8>,
+    /// Which seed produced the initial transform (M4b).
+    pub seed: SeedKind,
+    /// Quad matches behind a [`SeedKind::Quads`] seed; 0 for a WCS seed,
+    /// which pairs nothing to arrive at its transform.
     pub seed_matches: usize,
     /// Correspondences in the final pairing (the seed's, or the re-paired set).
     pub pairs: usize,
@@ -159,16 +184,29 @@ pub fn auto_distortion_order(
 }
 
 /// `registration_results.model`: the linear kind's serde name, plus
-/// `+polynomial<o>` when a distortion was fitted.
-pub fn model_name(kind: LinearKind, distortion_order: Option<u8>) -> String {
+/// `+polynomial<o>` when a distortion was fitted, plus `+wcs` (M4b) when
+/// the alignment started from a plate-solve seed rather than the quads.
+pub fn model_name(kind: LinearKind, distortion_order: Option<u8>, seed: SeedKind) -> String {
     let base = serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
-    match distortion_order {
+    let mut name = match distortion_order {
         Some(o) => format!("{base}+polynomial{o}"),
         None => base,
+    };
+    if seed == SeedKind::Wcs {
+        name.push_str("+wcs");
     }
+    name
+}
+
+/// The ratio a scale gate is centred on. Every producer builds the window
+/// as `(r / SCALE_TOLERANCE, r * SCALE_TOLERANCE)` (see
+/// [`super::scale_gate_for`] and [`SCALE_RANGE`]), so the geometric mean
+/// recovers `r` exactly — including `1.0` for the fixed M1 window.
+fn gate_center(gate: (f64, f64)) -> f64 {
+    (gate.0 * gate.1).sqrt()
 }
 
 /// A polynomial of `order` needs `(order+1)(order+2)` pairs (twice its
@@ -323,12 +361,25 @@ fn fit_distortion(
     Some((lin, dist))
 }
 
+/// `hint` (M4b) is an optional subject → reference transform the caller
+/// already believes — today the [`super::wcs_seed`] affine built from both
+/// frames' plate solves. It replaces the quad seed when it pairs at least
+/// [`MIN_INLIERS`] stars within [`WCS_SEED_RADIUS_FACTOR`] × the RANSAC
+/// tolerance (floor [`WCS_SEED_RADIUS_MIN_PX`]); otherwise the quad seed
+/// runs as before and a warning records that the hint was not confirmed.
+///
+/// `scale_gate` is the window the refitted linear scale must land in —
+/// [`super::scale_gate_for`] centres it on the frame's own expected ratio
+/// to the reference, so a genuinely binned frame is judged against 2.0
+/// rather than 1.0.
 pub fn align(
     subject: &[Star],
     reference: &[Star],
     reference_geometry: (usize, usize),
     subject_geometry: (usize, usize),
     cfg: &RegistrationConfig,
+    hint: Option<&Linear>,
+    scale_gate: (f64, f64),
 ) -> Result<Alignment, AlignError> {
     if subject.len() < MIN_INLIERS || reference.len() < MIN_INLIERS {
         return Err(AlignError::TooFewStars {
@@ -338,13 +389,39 @@ pub fn align(
     }
     let sub_pts: Vec<(f64, f64)> = subject.iter().map(|s| (s.x, s.y)).collect();
     let ref_pts: Vec<(f64, f64)> = reference.iter().map(|s| (s.x, s.y)).collect();
-
-    // 1. Seed.
-    let (seed, seed_matches) = seed_affine(&sub_pts, &ref_pts)?;
-
-    // 2. Correspondences through the seed, nearest reference star within 2·tol.
     let tree = KdTree2::build(&ref_pts);
     let radius = 2.0 * cfg.ransac_tolerance_px;
+    let mut warnings = Vec::new();
+
+    // 1. Seed. A hint is taken on trust only once it has paired enough
+    // stars on its own — a plate solve for a different night, a stale
+    // solve, or two frames that simply do not overlap all look like a
+    // perfectly well-formed transform until it is asked to land on stars.
+    // An unconfirmed one costs the quad seed's own work and a warning, not
+    // the frame.
+    let (seed, seed_matches, seed_kind) = match hint {
+        Some(h) => {
+            let radius_wcs =
+                (WCS_SEED_RADIUS_FACTOR * cfg.ransac_tolerance_px).max(WCS_SEED_RADIUS_MIN_PX);
+            let confirm = pair_through(h, subject, reference, &tree, radius_wcs);
+            if confirm.pairs.len() >= MIN_INLIERS {
+                (*h, 0, SeedKind::Wcs)
+            } else {
+                warnings.push(format!(
+                    "wcs seed rejected ({} pairs); quad seed used",
+                    confirm.pairs.len()
+                ));
+                let (s, m) = seed_affine(&sub_pts, &ref_pts)?;
+                (s, m, SeedKind::Quads)
+            }
+        }
+        None => {
+            let (s, m) = seed_affine(&sub_pts, &ref_pts)?;
+            (s, m, SeedKind::Quads)
+        }
+    };
+
+    // 2. Correspondences through the seed, nearest reference star within 2·tol.
     let mut pairing = pair_through(&seed, subject, reference, &tree, radius);
     if pairing.pairs.len() < MIN_INLIERS {
         return Err(AlignError::TooFewMatches {
@@ -354,7 +431,6 @@ pub fn align(
 
     // 3–4. RANSAC and the σ-weighted refit.
     let (mut ransac, mut refit, mut kind) = ransac_and_refit(&pairing, cfg, reference_geometry)?;
-    let mut warnings = Vec::new();
 
     // 4b. Re-pair through the refit model: the seed is an affine fitted on
     // the matched quads and its accuracy falls off with distance from them
@@ -382,8 +458,11 @@ pub fn align(
     let all_sigmas = pairing.all_sigmas;
     let mut linear = refit.linear;
     let refit_scale = refit.linear.scale();
-    if !(refit_scale >= SCALE_RANGE.0 && refit_scale <= SCALE_RANGE.1) {
-        return Err(AlignError::ScaleOutOfRange { scale: refit_scale });
+    if !(refit_scale >= scale_gate.0 && refit_scale <= scale_gate.1) {
+        return Err(AlignError::ScaleOutOfRange {
+            scale: refit_scale,
+            expected: gate_center(scale_gate),
+        });
     }
 
     // 5. Optional distortion on the refit inliers.
@@ -475,6 +554,7 @@ pub fn align(
         map,
         model: kind,
         distortion_order,
+        seed: seed_kind,
         seed_matches,
         pairs: pairs.len(),
         repaired,
@@ -554,6 +634,27 @@ mod tests {
         )
     }
 
+    /// The M1–M4a call shape: no plate-solve hint, the fixed
+    /// [`SCALE_RANGE`] gate. Every test written before M4b keeps its
+    /// original meaning by going through here.
+    fn align_default(
+        subject: &[Star],
+        reference: &[Star],
+        reference_geometry: (usize, usize),
+        subject_geometry: (usize, usize),
+        cfg: &RegistrationConfig,
+    ) -> Result<Alignment, AlignError> {
+        align(
+            subject,
+            reference,
+            reference_geometry,
+            subject_geometry,
+            cfg,
+            None,
+            SCALE_RANGE,
+        )
+    }
+
     /// Reference stars = `truth.forward(subject)` + jitter, dropped when they
     /// leave the reference frame; `outliers` extra unmatched stars on each
     /// side; both lists shuffled.
@@ -603,7 +704,7 @@ mod tests {
         let subject = field(1, 300, W, H);
         let truth = similarity(1.002, 3.0, 12.3, -7.7);
         let (sub, refs) = scene(&subject, &truth, 0.05, 90, W, H, 7);
-        let a = align(
+        let a = align_default(
             &sub,
             &refs,
             (W as usize, H as usize),
@@ -634,7 +735,11 @@ mod tests {
         let (fx, fy) = a.map.forward(500.0, 400.0);
         let (tx, ty) = truth.apply(500.0, 400.0);
         assert!((fx - tx).abs() < 0.05 && (fy - ty).abs() < 0.05);
-        assert_eq!(model_name(a.model, a.distortion_order), "homography");
+        assert_eq!(a.seed, SeedKind::Quads);
+        assert_eq!(
+            model_name(a.model, a.distortion_order, a.seed),
+            "homography"
+        );
     }
 
     #[test]
@@ -645,7 +750,7 @@ mod tests {
             [-1.0, 0.0, W - 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         );
         let (sub, refs) = scene(&subject, &truth, 0.05, 60, W, H, 8);
-        let a = align(
+        let a = align_default(
             &sub,
             &refs,
             (W as usize, H as usize),
@@ -668,7 +773,7 @@ mod tests {
         ] {
             let subject = field(3, n, W, H);
             let (sub, refs) = scene(&subject, &truth, 0.02, 0, W, H, 9);
-            let a = align(
+            let a = align_default(
                 &sub,
                 &refs,
                 (W as usize, H as usize),
@@ -686,7 +791,7 @@ mod tests {
         let subject = field(3, 60, W, H);
         let (sub, refs) = scene(&subject, &truth, 0.02, 0, W, H, 9);
         assert_eq!(
-            align(
+            align_default(
                 &sub,
                 &refs,
                 (W as usize, H as usize),
@@ -705,14 +810,14 @@ mod tests {
         let geo = (W as usize, H as usize);
         let few = field(4, 5, W, H);
         assert!(matches!(
-            align(&few, &few, geo, geo, &cfg),
+            align_default(&few, &few, geo, geo, &cfg),
             Err(AlignError::TooFewStars { .. })
         ));
         let subject = field(5, 200, W, H);
         let big = similarity(1.5, 0.0, 0.0, 0.0);
         let (sub, refs) = scene(&subject, &big, 0.02, 0, W, H, 10);
         assert!(matches!(
-            align(&sub, &refs, geo, geo, &cfg),
+            align_default(&sub, &refs, geo, geo, &cfg),
             Err(AlignError::ScaleOutOfRange { .. })
         ));
         let noisy = similarity(1.0, 1.0, 5.0, 5.0);
@@ -724,7 +829,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            align(&sub, &refs, geo, geo, &strict),
+            align_default(&sub, &refs, geo, geo, &strict),
             Err(AlignError::RmsTooHigh { .. })
         ));
         let lenient = RegistrationConfig {
@@ -732,14 +837,14 @@ mod tests {
             ransac_tolerance_px: 4.0,
             ..Default::default()
         };
-        let a = align(&sub, &refs, geo, geo, &lenient).unwrap();
+        let a = align_default(&sub, &refs, geo, geo, &lenient).unwrap();
         assert!(
             a.warnings.iter().any(|w| w.contains("RMS")),
             "{:?}",
             a.warnings
         );
         let unrelated = field(6, 200, W, H);
-        assert!(align(&subject, &unrelated, geo, geo, &cfg).is_err());
+        assert!(align_default(&subject, &unrelated, geo, geo, &cfg).is_err());
         assert_eq!(
             format!("{}", AlignError::TooFewInliers { inliers: 5 }),
             "only 5 inliers"
@@ -769,7 +874,7 @@ mod tests {
             })
             .collect();
         let geo = (W as usize, H as usize);
-        let linear_only = align(
+        let linear_only = align_default(
             &subject,
             &reference,
             geo,
@@ -786,11 +891,11 @@ mod tests {
             distortion: DistortionChoice::Polynomial3,
             ..Default::default()
         };
-        let a = align(&subject, &reference, geo, geo, &cfg).unwrap();
+        let a = align_default(&subject, &reference, geo, geo, &cfg).unwrap();
         assert_eq!(a.distortion_order, Some(3));
         assert!(a.rms_px < 0.05, "polynomial rms {}", a.rms_px);
         assert_eq!(
-            model_name(a.model, a.distortion_order),
+            model_name(a.model, a.distortion_order, a.seed),
             "homography+polynomial3"
         );
         let auto = RegistrationConfig {
@@ -798,14 +903,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            align(&subject, &reference, geo, geo, &auto)
+            align_default(&subject, &reference, geo, geo, &auto)
                 .unwrap()
                 .distortion_order,
             None,
             "same geometry: auto stays linear"
         );
         assert_eq!(
-            align(&subject, &reference, geo, (1010, 800), &auto)
+            align_default(&subject, &reference, geo, (1010, 800), &auto)
                 .unwrap()
                 .distortion_order,
             Some(3),
@@ -889,7 +994,7 @@ mod tests {
         // End to end. On this benign scene the quad seed already pairs the
         // field (`repaired` measured 0), so this only guards completeness;
         // the mechanism proof is the check above.
-        let a = align(
+        let a = align_default(
             &subject,
             &reference,
             (w as usize, h as usize),
@@ -905,5 +1010,199 @@ mod tests {
             a.repaired
         );
         assert!(a.rms_px < 0.1, "rms {}", a.rms_px);
+    }
+
+    // ── M4b: the per-frame gate and the plate-solve seed ──────────────────
+
+    /// A similarity of `scale` and `rot_deg` taking `src_c` onto `dst_c` —
+    /// the relation a software-binned subject has to its reference, with
+    /// both frames' centres coincident on the sky.
+    fn centred_similarity(
+        scale: f64,
+        rot_deg: f64,
+        src_c: (f64, f64),
+        dst_c: (f64, f64),
+    ) -> Linear {
+        let (s, c) = rot_deg.to_radians().sin_cos();
+        let (a, b) = (scale * c, -scale * s);
+        let (d, e) = (scale * s, scale * c);
+        Linear::from_flat(
+            LinearKind::Similarity,
+            [
+                a,
+                b,
+                dst_c.0 - a * src_c.0 - b * src_c.1,
+                d,
+                e,
+                dst_c.1 - d * src_c.0 - e * src_c.1,
+                0.0,
+                0.0,
+                1.0,
+            ],
+        )
+    }
+
+    const SUB_W: f64 = 2000.0;
+    const SUB_H: f64 = 1500.0;
+    const REF_W: f64 = 4000.0;
+    const REF_H: f64 = 3000.0;
+
+    /// A 2000x1500 subject and the SAME stars at twice the pixel scale,
+    /// rotated 3 deg, in a 4000x3000 reference — a binned frame against a
+    /// native-scale reference. The subject stars are inset far enough that
+    /// the rotated, doubled field still lands wholly inside the reference,
+    /// so `scene` drops none of them.
+    fn binned_scene() -> (Vec<Star>, Vec<Star>, Linear) {
+        let mut subject = field(31, 300, 1800.0, 1350.0);
+        for s in &mut subject {
+            s.x += 100.0;
+            s.y += 75.0;
+        }
+        let truth = centred_similarity(
+            2.0,
+            3.0,
+            (SUB_W / 2.0, SUB_H / 2.0),
+            (REF_W / 2.0, REF_H / 2.0),
+        );
+        let (sub, refs) = scene(&subject, &truth, 0.05, 0, REF_W, REF_H, 33);
+        assert_eq!(sub.len(), 300, "no subject star may be dropped");
+        assert_eq!(refs.len(), 300, "no reference star may be dropped");
+        (sub, refs, truth)
+    }
+
+    fn binned_geometry() -> ((usize, usize), (usize, usize)) {
+        (
+            (REF_W as usize, REF_H as usize),
+            (SUB_W as usize, SUB_H as usize),
+        )
+    }
+
+    /// (a) The M1 fixed gate refuses a genuinely binned frame — and it is
+    /// the GATE that refuses it, not the seed: the quad matcher is
+    /// scale-invariant and finds the field perfectly well.
+    #[test]
+    fn the_fixed_gate_refuses_a_two_times_binned_frame() {
+        let (sub, refs, _) = binned_scene();
+        let (ref_geo, sub_geo) = binned_geometry();
+        let err = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            None,
+            SCALE_RANGE,
+        )
+        .expect_err("2x is outside [0.8, 1.25]");
+        match err {
+            AlignError::ScaleOutOfRange { scale, expected } => {
+                assert!((scale - 2.0).abs() < 0.01, "scale {scale}");
+                assert_eq!(expected, 1.0);
+            }
+            other => panic!("expected the gate to refuse it, got {other}"),
+        }
+        assert_eq!(
+            format!(
+                "{}",
+                AlignError::ScaleOutOfRange {
+                    scale: 2.0,
+                    expected: 1.0
+                }
+            ),
+            "scale 2.00 outside [0.80, 1.25] (expected 1.00)"
+        );
+    }
+
+    /// (b) The per-frame gate, centred on the frame's own 2x ratio, lets
+    /// the same alignment through on the quad seed alone.
+    #[test]
+    fn the_per_frame_gate_admits_the_binned_frame() {
+        let (sub, refs, _) = binned_scene();
+        let (ref_geo, sub_geo) = binned_geometry();
+        let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
+        assert_eq!(gate, (1.6, 2.5));
+        let a = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            None,
+            gate,
+        )
+        .expect("the widened gate admits it");
+        assert!((a.scale - 2.0).abs() < 0.01, "scale {}", a.scale);
+        assert_eq!(a.seed, SeedKind::Quads);
+        assert!(a.inliers >= 200, "inliers {}", a.inliers);
+    }
+
+    /// (c) A hint that pairs the field replaces the quad seed outright.
+    #[test]
+    fn a_confirmed_hint_replaces_the_quad_seed() {
+        let (sub, refs, truth) = binned_scene();
+        let (ref_geo, sub_geo) = binned_geometry();
+        let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
+        let a = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&truth),
+            gate,
+        )
+        .expect("the hint pairs the field");
+        assert_eq!(a.seed, SeedKind::Wcs);
+        assert_eq!(a.seed_matches, 0, "a WCS seed pairs no quads");
+        assert!(
+            a.inliers as f64 >= 0.9 * sub.len() as f64,
+            "inliers {} of {}",
+            a.inliers,
+            sub.len()
+        );
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        assert_eq!(
+            model_name(a.model, a.distortion_order, a.seed),
+            "homography+wcs"
+        );
+    }
+
+    /// (d) A hint that does NOT pair falls back to the quad seed and says
+    /// so, rather than failing the frame on a bad guess.
+    #[test]
+    fn an_unconfirmed_hint_falls_back_to_the_quad_seed() {
+        let (sub, refs, truth) = binned_scene();
+        let (ref_geo, sub_geo) = binned_geometry();
+        let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
+        let mut wrong = truth;
+        wrong.m[0][2] += 30.0;
+        let a = align(
+            &sub,
+            &refs,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&wrong),
+            gate,
+        )
+        .expect("the quad seed carries the frame");
+        assert_eq!(a.seed, SeedKind::Quads);
+        assert!(
+            a.warnings.iter().any(|w| w.contains("wcs seed rejected")),
+            "{:?}",
+            a.warnings
+        );
+        assert!((a.scale - 2.0).abs() < 0.01, "scale {}", a.scale);
+    }
+
+    /// The gate's centre is recoverable from the window itself — the
+    /// invariant `AlignError::ScaleOutOfRange`'s message rests on.
+    #[test]
+    fn a_gates_centre_is_its_geometric_mean() {
+        assert_eq!(gate_center(SCALE_RANGE), 1.0);
+        for ratio in [0.5, 1.0, 2.0, 3.7] {
+            let gate = super::super::scale_gate_for(Some(ratio), Some(1.0));
+            assert!((gate_center(gate) - ratio).abs() < 1e-12, "{ratio}");
+        }
     }
 }

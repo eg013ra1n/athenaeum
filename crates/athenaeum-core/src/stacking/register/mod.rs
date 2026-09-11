@@ -9,6 +9,7 @@
 pub mod align;
 pub mod detect;
 pub mod frame;
+pub mod wcs_seed;
 pub mod writer;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,29 @@ use crate::resample::Interpolation;
 /// situation the per-frame registration gate would refuse a frame over, so
 /// both read one constant rather than risking two numbers drifting apart.
 pub const SCALE_TOLERANCE: f64 = 1.25;
+
+/// The acceptance window one frame's fitted linear scale must land in
+/// (M4b Task 2, ruling R-M4b-2). M1 compared every frame against a fixed
+/// `[0.8, 1.25]`, which silently assumed the whole set shares one pixel
+/// scale; a set that genuinely mixes scales expects a RATIO, so the window
+/// is centred on the frame's own implied ratio to the reference and keeps
+/// the same [`SCALE_TOLERANCE`] either side of it.
+///
+/// The ratio is `frame / reference` when both scales are known, finite and
+/// positive — otherwise 1.0, which reproduces `align::SCALE_RANGE` bit for
+/// bit, so a set whose frames carry no pixel scale at all behaves exactly
+/// as it did before M4b.
+pub fn scale_gate_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -> (f64, f64) {
+    let ratio = match (frame_scale, reference_scale) {
+        (Some(frame), Some(reference))
+            if frame.is_finite() && reference.is_finite() && frame > 0.0 && reference > 0.0 =>
+        {
+            frame / reference
+        }
+        _ => 1.0,
+    };
+    (ratio / SCALE_TOLERANCE, ratio * SCALE_TOLERANCE)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -118,6 +142,31 @@ impl Default for RegistrationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4b ruling R-M4b-2: the gate is a window around the frame's own
+    /// implied scale ratio, and collapses to the M1 fixed window whenever
+    /// that ratio is unknown or 1.
+    #[test]
+    fn the_scale_gate_is_centred_on_the_frames_own_ratio() {
+        let fixed = (1.0 / SCALE_TOLERANCE, SCALE_TOLERANCE);
+        assert_eq!(scale_gate_for(None, None), fixed);
+        assert_eq!(scale_gate_for(Some(0.78), None), fixed);
+        assert_eq!(scale_gate_for(None, Some(0.78)), fixed);
+        assert_eq!(scale_gate_for(Some(0.78), Some(0.78)), fixed);
+
+        // A software-binned frame against a native-scale reference.
+        assert_eq!(scale_gate_for(Some(1.56), Some(0.78)), (1.6, 2.5));
+        // … and the other way round.
+        let (lo, hi) = scale_gate_for(Some(0.78), Some(1.56));
+        assert!((lo - 0.4).abs() < 1e-12 && (hi - 0.625).abs() < 1e-12, "{lo} {hi}");
+
+        // Nonsense scales fall back to the fixed window rather than
+        // producing a gate nothing can satisfy.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(scale_gate_for(Some(bad), Some(0.78)), fixed, "{bad}");
+            assert_eq!(scale_gate_for(Some(0.78), Some(bad)), fixed, "{bad}");
+        }
+    }
 
     #[test]
     fn defaults_match_the_spec() {

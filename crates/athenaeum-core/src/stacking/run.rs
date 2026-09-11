@@ -41,7 +41,7 @@ use crate::export::{execute_generation, resolve_generation_cached};
 use crate::fits_parser::FitsHeader;
 use crate::fits_writer::wcs::scale_plate_solve;
 use crate::fits_writer::{Card, CardValue};
-use crate::geometry::PixelMap;
+use crate::geometry::{Linear, PixelMap};
 use crate::integration::band_budget::total_ram_bytes;
 use crate::integration::engine::EngineProgress;
 use crate::integration::io_policy::IoPolicy;
@@ -83,9 +83,12 @@ use crate::stacking::plan::{
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
+use crate::stacking::register::align::SCALE_RANGE;
 use crate::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, to_record, ReferenceStars,
 };
+use crate::stacking::register::scale_gate_for;
+use crate::stacking::register::wcs_seed::seed_from_solves;
 use crate::stacking::register::writer::{
     build_registered_cards, source_cards_from_file, write_registered_frame, RegisteredCards,
 };
@@ -2475,6 +2478,100 @@ struct PassResult {
     outcome: Result<(f64, (f64, f64)), String>,
 }
 
+/// One frame [`register_group_pass`] has decided to register afresh (no
+/// fresh cached row), with everything resolved for it on the run thread
+/// before the fan-out starts.
+struct PendingRegistration {
+    /// Index into the group's `RunContext::measured` vector.
+    idx: usize,
+    frame: GroupFrame,
+    path: PathBuf,
+    is_reference: bool,
+    expected_hash: String,
+    /// M4b: this frame's own scale window and optional plate-solve seed.
+    scale_gate: (f64, f64),
+    hint: Option<Linear>,
+}
+
+/// What one fan-out worker needs — the pixel-side half of a
+/// [`PendingRegistration`]. The bookkeeping half stays on the run thread.
+struct RegisterItem {
+    path: PathBuf,
+    is_reference: bool,
+    scale_gate: (f64, f64),
+    hint: Option<Linear>,
+}
+
+/// Stage 5's stored-plate-solve memo (M4b Task 2): `frame_id` → its
+/// `plate_solves` row, or `None` for a frame that has never been solved.
+/// One lookup per frame for the whole stage, including the reference's,
+/// which every other frame's seed needs again and again — and including
+/// the negative answers, so an unsolved set does not re-query per frame.
+type SolveCache = HashMap<i64, Option<PlateSolveRecord>>;
+
+/// [`SolveCache`]'s lazy fill. A read failure is a warning, not a run
+/// failure: the WCS seed is an accelerator, and losing it costs the quad
+/// seed's work, nothing else.
+fn solve_of(
+    solves: &mut SolveCache,
+    conn: &rusqlite::Connection,
+    frame_id: i64,
+) -> Option<PlateSolveRecord> {
+    if !solves.contains_key(&frame_id) {
+        let row = match get_plate_solve(conn, frame_id) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    frame_id,
+                    error = %e,
+                    "failed to read the stored plate solve; registering without a wcs seed"
+                );
+                None
+            }
+        };
+        solves.insert(frame_id, row);
+    }
+    solves.get(&frame_id).cloned().flatten()
+}
+
+/// One frame's registration inputs (M4b Task 2, rulings R-M4b-2/3): the
+/// scale window it is judged against, and the optional plate-solve seed.
+///
+/// The seed is only built when the gate is NOT the fixed M1 window — i.e.
+/// when this frame's own pixel scale says a scale step is expected. A
+/// same-scale set therefore walks the exact M1–M4a code path (no solve
+/// lookups, no hint, byte-identical alignments), and the cross-scale case
+/// is the only one that pays for the seed.
+///
+/// Both passes of stage 5 go through here — the dry two-pass run and the
+/// persisting one — so a frame is never measured against one gate and
+/// registered against another.
+fn registration_gate_and_hint(
+    solves: &mut SolveCache,
+    conn: &rusqlite::Connection,
+    frame: &GroupFrame,
+    reference_frame_id: i64,
+    reference_scale: Option<f64>,
+) -> ((f64, f64), Option<Linear>) {
+    let scale_gate = scale_gate_for(frame.pixel_scale_arcsec, reference_scale);
+    let hint = if scale_gate == SCALE_RANGE {
+        None
+    } else {
+        match (
+            solve_of(solves, conn, frame.frame_id),
+            solve_of(solves, conn, reference_frame_id),
+        ) {
+            (Some(subject), Some(reference)) => seed_from_solves(
+                &subject,
+                &reference,
+                (frame.width.max(0) as usize, frame.height.max(0) as usize),
+            ),
+            _ => None,
+        }
+    };
+    (scale_gate, hint)
+}
+
 /// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
 /// body [`stage_register`]'s per-group loop used to inline).
 ///
@@ -2508,6 +2605,7 @@ fn register_group_pass(
     force_fresh: bool,
     persist: bool,
     progress: &mut (usize, usize),
+    solves: &mut SolveCache,
 ) -> Result<Vec<PassResult>, RunError> {
     let cfg = rc.config.clone();
     let mut pass: Vec<PassResult> = Vec::new();
@@ -2537,7 +2635,14 @@ fn register_group_pass(
         })
         .unwrap_or_default();
 
-    let mut to_register: Vec<(usize, GroupFrame, PathBuf, bool, String)> = Vec::new();
+    // The reference's OWN pixel scale, re-read here rather than passed in:
+    // the two-pass pick can move the reference between this function's two
+    // callers, and looking it up per pass keeps the gate honest without a
+    // second parameter to keep in step.
+    let reference_scale = find_frame_in_groups(&rc.plan_groups, reference_frame_id)
+        .and_then(|f| f.pixel_scale_arcsec);
+
+    let mut to_register: Vec<PendingRegistration> = Vec::new();
     for (idx, frame, path, is_reference) in snapshot {
         let frame_hash = {
             let conn = db(&rc.ctx)?.conn();
@@ -2587,7 +2692,37 @@ fn register_group_pass(
                 None,
             );
         } else {
-            to_register.push((idx, frame, path, is_reference, expected_hash));
+            // M4b Task 2: resolved only for the frames this pass will
+            // actually register, so a fully cached group pays nothing for
+            // the seed and the log line never claims a gate for a frame
+            // that is not being judged.
+            let (scale_gate, hint) = {
+                let conn = db(&rc.ctx)?.conn();
+                registration_gate_and_hint(
+                    solves,
+                    &conn,
+                    &frame,
+                    reference_frame_id,
+                    reference_scale,
+                )
+            };
+            tracing::debug!(
+                run_id = rc.run_id,
+                frame_id = frame.frame_id,
+                scale_gate_low = scale_gate.0,
+                scale_gate_high = scale_gate.1,
+                hint = hint.is_some(),
+                "registration gate"
+            );
+            to_register.push(PendingRegistration {
+                idx,
+                frame,
+                path,
+                is_reference,
+                expected_hash,
+                scale_gate,
+                hint,
+            });
         }
     }
 
@@ -2602,11 +2737,16 @@ fn register_group_pass(
     let admission_n = admission(4 * rc.reference_width as u64 * rc.reference_height as u64 * 4);
     let meta: Vec<(usize, GroupFrame, String)> = to_register
         .iter()
-        .map(|(idx, frame, _, _, hash)| (*idx, frame.clone(), hash.clone()))
+        .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone()))
         .collect();
-    let items: Vec<(PathBuf, bool)> = to_register
+    let items: Vec<RegisterItem> = to_register
         .into_iter()
-        .map(|(_, _, path, is_reference, _)| (path, is_reference))
+        .map(|p| RegisterItem {
+            path: p.path,
+            is_reference: p.is_reference,
+            scale_gate: p.scale_gate,
+            hint: p.hint,
+        })
         .collect();
 
     let cancel_ref: &AtomicBool = &rc.cancel;
@@ -2618,12 +2758,20 @@ fn register_group_pass(
         items,
         admission_n,
         cancel_ref,
-        move |(path, is_reference)| {
-            if is_reference {
+        move |item: RegisterItem| {
+            if item.is_reference {
                 Ok(identity_registration(ref_stars_ref))
             } else {
-                register_frame(ref_stars_ref, &path, reg_cfg, Some(pool_ref), cancel_ref)
-                    .map_err(|e| format!("registration failed: {e}"))
+                register_frame(
+                    ref_stars_ref,
+                    &item.path,
+                    reg_cfg,
+                    Some(pool_ref),
+                    cancel_ref,
+                    item.hint.as_ref(),
+                    item.scale_gate,
+                )
+                .map_err(|e| format!("registration failed: {e}"))
             }
         },
     );
@@ -2844,6 +2992,15 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     let groups = rc.plan_groups.clone();
     let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Register);
 
+    // M4b Task 2: one stored-solve lookup per frame for the WHOLE stage,
+    // shared by the dry pass and the persisting one. The reference's own
+    // row goes in first — every cross-scale frame's seed needs it.
+    let mut solves: SolveCache = SolveCache::new();
+    {
+        let conn = db(&rc.ctx)?.conn();
+        solve_of(&mut solves, &conn, reference_frame_id);
+    }
+
     let mut viable_total = 0usize;
     for g in &groups {
         let included = included_count_of(rc, &g.key);
@@ -2896,6 +3053,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
             force_fresh,
             false,
             &mut progress,
+            &mut solves,
         )?;
 
         let candidates: Vec<TwoPassCandidate> = {
@@ -3093,6 +3251,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
             force_fresh,
             true,
             &mut progress,
+            &mut solves,
         )?;
     }
 
@@ -7438,6 +7597,7 @@ mod tests {
             false,
             false,
             &mut progress,
+            &mut SolveCache::new(),
         )
         .unwrap();
 
@@ -7480,6 +7640,7 @@ mod tests {
             false,
             true,
             &mut progress,
+            &mut SolveCache::new(),
         )
         .unwrap();
 
@@ -7586,6 +7747,286 @@ mod tests {
         assert_eq!(row.reference_frame_id, Some(light_ids[0]));
         assert_eq!(row.reference_mode, "manual");
     }
+
+    // ── M4b Task 2: mixed pixel scales inside one group ──────────────────
+
+    /// The coarse half of the mixed-scale fixture: [`BASE_STARS`] as they
+    /// are, in a [`STAR_FIELD_WIDTH`]x[`STAR_FIELD_HEIGHT`] frame …
+    const COARSE_W: usize = STAR_FIELD_WIDTH;
+    const COARSE_H: usize = STAR_FIELD_HEIGHT;
+    /// … and the fine half: the SAME sky sampled twice as finely — every
+    /// star at twice the pixel coordinate, in a frame twice the size.
+    const FINE_W: usize = STAR_FIELD_WIDTH * 2;
+    const FINE_H: usize = STAR_FIELD_HEIGHT * 2;
+    const FINE_SCALE_ARCSEC: f64 = 0.78;
+    const COARSE_SCALE_ARCSEC: f64 = 1.56;
+    const MIXED_RA_DEG: f64 = 300.0;
+    const MIXED_DEC_DEG: f64 = 60.0;
+
+    /// [`BASE_STARS`] scaled about the pixel origin and dithered — the
+    /// same sky at `factor` times the sampling.
+    fn scaled_stars(factor: f64, dx: f64, dy: f64) -> Vec<(f64, f64, f64)> {
+        BASE_STARS
+            .iter()
+            .map(|&(x, y, a)| (x * factor + dx, y * factor + dy, a))
+            .collect()
+    }
+
+    fn mixed_light_spec<'a>(
+        stem: &'a str,
+        date_obs: &'a str,
+        width: usize,
+        height: usize,
+    ) -> LightSpec<'a> {
+        LightSpec {
+            stem,
+            instrume: "cam",
+            filter: None,
+            binning: 1,
+            width,
+            height,
+            exptime: 60.0,
+            date_obs,
+            bayerpat: None,
+            write_file: true,
+        }
+    }
+
+    /// Six lights that land in ONE group — same filter, binning and
+    /// exposure — but at two pixel scales: three shot at
+    /// [`FINE_SCALE_ARCSEC`] in a [`FINE_W`]x[`FINE_H`] frame and three at
+    /// [`COARSE_SCALE_ARCSEC`] in a [`COARSE_W`]x[`COARSE_H`] one, of the
+    /// same field. That is the M4b case: one target, two optical trains,
+    /// nothing about camera or native geometry in the group key.
+    ///
+    /// Each frame is dithered a pixel or two so the six are not literally
+    /// the same image; the dither stays well inside the WCS seed's own
+    /// confirmation radius, which is deliberate — the fixture's plate
+    /// solves all name one `crval`, so the seed knows the scale step but
+    /// not the dither, exactly as a real solve pair does to within its
+    /// residual. Returns `(fixture, fine_ids, coarse_ids, working,
+    /// output)`; masters for BOTH geometries are already linked.
+    fn seed_mixed_scale_group(
+        db_path: &Path,
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+
+        let mut fine_ids = Vec::new();
+        let mut coarse_ids = Vec::new();
+        for (i, (dx, dy)) in [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0)].iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("fine{i}");
+            let spec = mixed_light_spec(&stem, &date_obs, FINE_W, FINE_H);
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &scaled_stars(2.0, *dx, *dy),
+                600.0,
+                5.0,
+                200 + i as u64,
+            );
+            fine_ids.push(id);
+        }
+        for (i, (dx, dy)) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)].iter().enumerate() {
+            let date_obs = date_obs_at(i + 3);
+            let stem = format!("coarse{i}");
+            let spec = mixed_light_spec(&stem, &date_obs, COARSE_W, COARSE_H);
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &scaled_stars(1.0, *dx, *dy),
+                600.0,
+                5.0,
+                210 + i as u64,
+            );
+            coarse_ids.push(id);
+        }
+
+        test_fixtures::add_master_dark_and_flat(&fixture, &fine_ids, FINE_W, FINE_H);
+        test_fixtures::add_master_dark_and_flat(&fixture, &coarse_ids, COARSE_W, COARSE_H);
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            fine_ids[0],
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        (fixture, fine_ids, coarse_ids, working, output)
+    }
+
+    /// Drives stages 1-5 over [`seed_mixed_scale_group`] with the fine
+    /// frame `fine_ids[0]` pinned as the manual reference, and hands back
+    /// the context plus every `registration_results` row by frame id.
+    fn run_mixed_scale_register(
+        fixture: &test_fixtures::Fixture,
+        ctx: Arc<ServiceContext>,
+        working: &tempfile::TempDir,
+        output: &tempfile::TempDir,
+    ) -> (RunContext, HashMap<i64, RegistrationRecord>) {
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(
+            plan_groups.len(),
+            1,
+            "premise: two pixel scales, one group: {plan_groups:?}"
+        );
+        assert_eq!(plan_groups[0].frames.len(), 6);
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx,
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+
+        let rows = get_registration_for_frame_set(&fixture.conn, fixture.set_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.frame_id, r))
+            .collect();
+        (rc, rows)
+    }
+
+    /// M4b Task 2 (rulings R-M4b-2/3): frames whose own pixel scale is
+    /// twice the reference's are judged against a gate centred on 2.0 and
+    /// register, and the plate-solve seed is what carried them there.
+    #[test]
+    fn mixed_scale_frames_register_through_the_per_frame_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, fine_ids, coarse_ids, working, output) = seed_mixed_scale_group(&db_path);
+
+        for &id in &fine_ids {
+            test_fixtures::seed_plate_solve_wcs(
+                &fixture.conn,
+                id,
+                FINE_W,
+                FINE_H,
+                MIXED_RA_DEG,
+                MIXED_DEC_DEG,
+                FINE_SCALE_ARCSEC,
+            );
+        }
+        for &id in &coarse_ids {
+            test_fixtures::seed_plate_solve_wcs(
+                &fixture.conn,
+                id,
+                COARSE_W,
+                COARSE_H,
+                MIXED_RA_DEG,
+                MIXED_DEC_DEG,
+                COARSE_SCALE_ARCSEC,
+            );
+        }
+
+        let (rc, rows) = run_mixed_scale_register(&fixture, ctx, &working, &output);
+
+        let group_key = rc.plan_groups[0].key.clone();
+        for entry in &rc.measured[&group_key] {
+            assert!(
+                entry.included,
+                "frame {} excluded: {:?}",
+                entry.frame.frame_id, entry.reason
+            );
+        }
+
+        for &id in &coarse_ids {
+            let row = rows.get(&id).unwrap_or_else(|| panic!("no row for {id}"));
+            assert_eq!(row.status, "aligned", "{id}: {row:?}");
+            let scale = row.scale.expect("an aligned row carries its scale");
+            assert!((scale - 2.0).abs() < 0.02, "{id}: scale {scale}");
+            assert!(
+                row.model.as_deref().unwrap_or_default().ends_with("+wcs"),
+                "{id}: the plate-solve seed should have carried it: {:?}",
+                row.model
+            );
+        }
+        for &id in &fine_ids {
+            let row = rows.get(&id).unwrap_or_else(|| panic!("no row for {id}"));
+            let scale = row.scale.expect("an aligned row carries its scale");
+            assert!((scale - 1.0).abs() < 0.02, "{id}: scale {scale}");
+            // Same-scale frames keep the M1 path: the fixed gate, no seed.
+            assert!(
+                !row.model.as_deref().unwrap_or_default().contains("wcs"),
+                "{id}: {:?}",
+                row.model
+            );
+        }
+        assert_eq!(rows[&fine_ids[0]].status, "reference");
+    }
+
+    /// The same six frames with NO pixel scale recorded anywhere: the gate
+    /// collapses to M1's fixed window and the binned three are refused by
+    /// name — the regression this task exists to lift.
+    #[test]
+    fn mixed_scale_frames_without_a_known_scale_hit_the_fixed_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, fine_ids, coarse_ids, working, output) = seed_mixed_scale_group(&db_path);
+
+        let (rc, rows) = run_mixed_scale_register(&fixture, ctx, &working, &output);
+
+        let group_key = rc.plan_groups[0].key.clone();
+        let expected = "registration failed: scale 2.00 outside [0.80, 1.25] (expected 1.00)";
+        for &id in &coarse_ids {
+            let entry = rc.measured[&group_key]
+                .iter()
+                .find(|e| e.frame.frame_id == id)
+                .expect("every frame has an entry");
+            assert!(!entry.included, "{id} should have been excluded");
+            assert_eq!(entry.reason.as_deref(), Some(expected), "{id}");
+            assert_eq!(rows[&id].status, "failed");
+        }
+        for &id in &fine_ids {
+            let entry = rc.measured[&group_key]
+                .iter()
+                .find(|e| e.frame.frame_id == id)
+                .expect("every frame has an entry");
+            assert!(entry.included, "{id}: {:?}", entry.reason);
+        }
+    }
+
     #[test]
     fn registration_rows_are_written_and_reused() {
         let tmp = tempfile::tempdir().unwrap();

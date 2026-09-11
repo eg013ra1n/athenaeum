@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use solvemyastro::wcs::{SipCoefficients, WcsSolution};
+use tracing::warn;
 
 use crate::coordinates::{format_dec_sexagesimal, format_ra_sexagesimal};
 
@@ -40,6 +42,60 @@ pub struct PlateSolveRecord {
     /// signal independent of absolute star count. Closer to 1.0 = stronger
     /// match. None for pre-density-aware solves.
     pub inlier_ratio: Option<f64>,
+}
+
+impl PlateSolveRecord {
+    /// The stored row as the [`WcsSolution`] the solver produced (M4b):
+    /// `crpix` 0-based on both sides — no ±1 anywhere — the CD matrix as
+    /// stored, and the SIP tables re-parsed from the JSON `service.rs`
+    /// wrote (`serde_json::to_string(&coeffs)` of a `Vec<Vec<f64>>`).
+    ///
+    /// `None` when a stored SIP table fails to parse: a solve whose
+    /// distortion we cannot read is not the same solve, and silently
+    /// dropping the polynomial would hand the caller a transform that is
+    /// wrong by exactly the distortion it was fitted to absorb. A record
+    /// with no SIP tables at all is a perfectly good linear solution and
+    /// converts.
+    pub fn to_solution(&self) -> Option<WcsSolution> {
+        let sip_forward = self
+            .sip_pair(self.sip_a_coeffs.as_deref(), self.sip_b_coeffs.as_deref())
+            .map_err(|e| {
+                warn!(frame_id = self.frame_id, error = %e, "stored SIP forward coefficients failed to parse")
+            })
+            .ok()?;
+        let sip_reverse = self
+            .sip_pair(self.sip_ap_coeffs.as_deref(), self.sip_bp_coeffs.as_deref())
+            .map_err(|e| {
+                warn!(frame_id = self.frame_id, error = %e, "stored SIP reverse coefficients failed to parse")
+            })
+            .ok()?;
+        Some(WcsSolution {
+            crpix: (self.crpix1, self.crpix2),
+            crval: (self.crval1, self.crval2),
+            cd: [[self.cd1_1, self.cd1_2], [self.cd2_1, self.cd2_2]],
+            sip_forward,
+            sip_reverse,
+        })
+    }
+
+    /// One SIP half-pair. `Ok(None)` = nothing stored (no order, or either
+    /// table missing); `Err` = a table is there but unreadable.
+    fn sip_pair(
+        &self,
+        a: Option<&str>,
+        b: Option<&str>,
+    ) -> std::result::Result<Option<(SipCoefficients, SipCoefficients)>, serde_json::Error> {
+        let (order, a, b) = match (self.sip_order, a, b) {
+            (Some(order), Some(a), Some(b)) => (order.clamp(0, u8::MAX as i32) as u8, a, b),
+            _ => return Ok(None),
+        };
+        let a: Vec<Vec<f64>> = serde_json::from_str(a)?;
+        let b: Vec<Vec<f64>> = serde_json::from_str(b)?;
+        Ok(Some((
+            SipCoefficients { order, coeffs: a },
+            SipCoefficients { order, coeffs: b },
+        )))
+    }
 }
 
 /// Insert or replace a plate solve result.
@@ -226,4 +282,93 @@ pub fn update_frame_object_if_missing(
         )
         .context("Failed to update frame object")?;
     Ok(changed > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record carrying the M4b test WCS: 0-based `crpix`, a CD matrix and
+    /// whichever SIP tables the caller supplies.
+    fn record(
+        sip_a: Option<&str>,
+        sip_b: Option<&str>,
+        sip_order: Option<i32>,
+    ) -> PlateSolveRecord {
+        PlateSolveRecord {
+            id: None,
+            frame_id: 77,
+            crpix1: 1234.5,
+            crpix2: 678.9,
+            crval1: 83.82,
+            crval2: -5.39,
+            cd1_1: 5.5e-5,
+            cd1_2: 1.1e-7,
+            cd2_1: -1.1e-7,
+            cd2_2: 5.5e-5,
+            sip_order,
+            sip_a_coeffs: sip_a.map(str::to_string),
+            sip_b_coeffs: sip_b.map(str::to_string),
+            sip_ap_coeffs: None,
+            sip_bp_coeffs: None,
+            matched_stars: 40,
+            total_detected: 120,
+            rms_residual_px: 0.4,
+            rms_residual_arcsec: 0.1,
+            pixel_scale_arcsec: 0.78,
+            field_rotation_deg: 0.0,
+            solve_time_ms: 10,
+            catalog_used: "test".to_string(),
+            algorithm_used: "test".to_string(),
+            solved_at: "2025-01-01T00:00:00Z".to_string(),
+            expected_catalog_stars_in_fov: None,
+            inlier_ratio: None,
+        }
+    }
+
+    #[test]
+    fn to_solution_rebuilds_the_wcs_and_its_sip_tables() {
+        let a = serde_json::to_string(&vec![vec![0.0, 0.0, 1e-6], vec![0.0, 2e-6], vec![3e-6]])
+            .unwrap();
+        let b = serde_json::to_string(&vec![vec![0.0, 0.0, 4e-6], vec![0.0, 5e-6], vec![6e-6]])
+            .unwrap();
+        let rec = record(Some(&a), Some(&b), Some(2));
+        let w = rec.to_solution().expect("a well-formed record converts");
+
+        assert_eq!(w.crpix, (1234.5, 678.9));
+        assert_eq!(w.crval, (83.82, -5.39));
+        assert_eq!(w.cd, [[5.5e-5, 1.1e-7], [-1.1e-7, 5.5e-5]]);
+        // The reference pixel projects back onto CRVAL (SIP is zero there).
+        let (ra, dec) = w.pixel_to_sky(1234.5, 678.9);
+        assert!(
+            (ra - 83.82).abs() < 1e-9 && (dec + 5.39).abs() < 1e-9,
+            "{ra} {dec}"
+        );
+
+        let (fa, fb) = w.sip_forward.as_ref().expect("forward SIP present");
+        assert_eq!((fa.order, fb.order), (2, 2));
+        assert_eq!(fa.coeffs[0][2], 1e-6);
+        assert_eq!(fb.coeffs[2][0], 6e-6);
+        assert!(w.sip_reverse.is_none(), "no reverse tables stored");
+    }
+
+    #[test]
+    fn to_solution_is_none_on_unparseable_sip_and_sip_less_records_still_convert() {
+        assert!(record(Some("not json"), Some("[[0.0]]"), Some(2))
+            .to_solution()
+            .is_none());
+        assert!(record(Some("[[0.0]]"), Some("not json"), Some(2))
+            .to_solution()
+            .is_none());
+        // No SIP at all is a perfectly good linear solution.
+        let plain = record(None, None, None)
+            .to_solution()
+            .expect("linear solve");
+        assert!(plain.sip_forward.is_none() && plain.sip_reverse.is_none());
+        // An order with no tables behind it is likewise just linear.
+        let orphan = record(None, None, Some(3))
+            .to_solution()
+            .expect("linear solve");
+        assert!(orphan.sip_forward.is_none());
+    }
 }
