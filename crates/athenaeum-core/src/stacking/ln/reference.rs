@@ -186,6 +186,9 @@ pub fn build_reference(
         false,
         None,
         None,
+        // M4c Task 3: and it never runs the large-scale second pass either
+        // — `forced: None`, signature change only.
+        None,
         recipe,
         write_maps,
         pool,

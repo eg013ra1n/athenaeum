@@ -291,7 +291,11 @@ export function stageSummary(
     }
     case 'integrate': {
       const lnRejection = config.normalization.rejection === 'local' ? ' · LN rejection' : '';
-      return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${formatUpTo3Decimals(config.integration.minWeight)}${lnRejection}`;
+      const large = config.integration.largeScale;
+      const largeScale = large.enabled
+        ? ` · large-scale ${large.protectedLayers} layers, grow ${large.growth}`
+        : '';
+      return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${formatUpTo3Decimals(config.integration.minWeight)}${lnRejection}${largeScale}`;
     }
     case 'drizzle':
       if (!config.drizzle.enabled) return 'Off';

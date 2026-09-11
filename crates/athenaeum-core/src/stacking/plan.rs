@@ -1495,6 +1495,10 @@ pub fn build_plan(
             cfg.drizzle.write_weight_map,
             cfg.drizzle.use_rejection,
         )),
+        // M4c Task 3: large-scale rejection creates the same per-frame
+        // bitmaps drizzle's `useRejection` does, plus a processed sibling
+        // of each — even with drizzle off.
+        large_scale: cfg.integration.large_scale.enabled,
     });
 
     // Gate 4: space.

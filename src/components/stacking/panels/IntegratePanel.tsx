@@ -68,6 +68,18 @@ function wholeCount(n: number): number {
   return Math.max(0, Math.round(n));
 }
 
+/** `largeScale.protectedLayers`/`growth` are `u8` on the wire, and the
+ *  backend clamps both to these ranges anyway (`resolve_config`) — round
+ *  and clamp here so the field never sends a value the run would silently
+ *  move. */
+function layerCount(n: number): number {
+  return Math.min(6, Math.max(1, Math.round(n)));
+}
+
+function growthRadius(n: number): number {
+  return Math.min(4, Math.max(0, Math.round(n)));
+}
+
 export interface IntegratePanelProps {
   config: StackingConfig;
   onChange: (next: StackingConfig) => void;
@@ -275,6 +287,59 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
         />
         <span className="text-sm text-content-secondary">Write rejection maps</span>
       </label>
+
+      {/* Large-scale rejection (M4c): a second integration pass that treats
+          the filtered, grown per-pixel rejection map as forced rejections,
+          so a satellite trail is removed as one object instead of as the
+          speckle the per-pixel tests leave of it. */}
+      <div className="pt-2 border-t border-border">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={i.largeScale.enabled}
+            disabled={disabled}
+            onChange={(e) =>
+              patch({ largeScale: { ...i.largeScale, enabled: e.target.checked } })
+            }
+            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+          />
+          <span className="text-sm text-content-secondary">Large-scale rejection</span>
+        </label>
+        <p className="mt-1 text-[11px] text-content-muted">
+          Keeps only the large rejected structures — trails, aircraft — grows them, and
+          re-integrates with those samples forced out. Doubles the integration time.
+        </p>
+        {i.largeScale.enabled && (
+          <div className="mt-2 space-y-2">
+            <NumericField
+              label="Protected layers"
+              value={i.largeScale.protectedLayers}
+              onCommit={(n) =>
+                patch({
+                  largeScale: { ...i.largeScale, protectedLayers: layerCount(n) },
+                })
+              }
+              min={1}
+              max={6}
+              step={1}
+              disabled={disabled}
+              help="scale selector: a structure survives from about 2^layers / 2 px thick — 3 px at 2, 5 px at 3, 9 px at 4"
+            />
+            <NumericField
+              label="Growth"
+              value={i.largeScale.growth}
+              onCommit={(n) =>
+                patch({ largeScale: { ...i.largeScale, growth: growthRadius(n) } })
+              }
+              min={0}
+              max={4}
+              step={1}
+              disabled={disabled}
+              help="radius in px every surviving structure is grown by, to cover its own faint edges"
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

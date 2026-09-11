@@ -145,9 +145,36 @@ pub(crate) fn add_light_with_field(
     noise_sigma: f32,
     noise_seed: u64,
 ) -> (i64, PathBuf) {
+    add_light_with_field_and_bands(f, spec, stars, background, noise_sigma, noise_seed, &[])
+}
+
+/// As [`add_light_with_field`], plus full-width horizontal BANDS — each
+/// `(y_start, y_end, excess_adu)` adds `excess_adu` to every pixel of rows
+/// `[y_start, y_end)` before the noise goes on top. A flat-topped trail,
+/// in other words: M4c Task 3's large-scale-rejection test needs an
+/// artifact that is present in ONE frame, has a bright core the per-pixel
+/// rejection catches and a faint shoulder it does not, and whose exact rows
+/// the test can then measure in the master.
+pub(crate) fn add_light_with_field_and_bands(
+    f: &Fixture,
+    spec: &LightSpec<'_>,
+    stars: &[(f64, f64, f64)],
+    background: f32,
+    noise_sigma: f32,
+    noise_seed: u64,
+    bands: &[(usize, usize, f32)],
+) -> (i64, PathBuf) {
     let filename = format!("{}.fits", spec.stem);
     let path = f.dir.path().join(&filename);
-    write_light_fits_field(&path, spec, stars, background, noise_sigma, noise_seed);
+    write_light_fits_field(
+        &path,
+        spec,
+        stars,
+        background,
+        noise_sigma,
+        noise_seed,
+        bands,
+    );
     let (size, modified_at) = file_identity(&path);
     let frame_id = insert_light_row(f, spec, &path, &filename, size, &modified_at);
     (frame_id, path)
@@ -534,7 +561,7 @@ fn write_light_fits(path: &Path, spec: &LightSpec<'_>) {
         (w as f64 * 0.62, h as f64 * 0.55, 14000.0),
         (w as f64 * 0.45, h as f64 * 0.72, 2500.0),
     ];
-    write_light_fits_field(path, spec, &stars, 500.0, 0.0, 0);
+    write_light_fits_field(path, spec, &stars, 500.0, 0.0, 0, &[]);
 }
 
 /// [`write_light_fits`]'s body, generalized over the star field/background/
@@ -546,9 +573,17 @@ fn write_light_fits_field(
     background: f32,
     noise_sigma: f32,
     noise_seed: u64,
+    bands: &[(usize, usize, f32)],
 ) {
     let (w, h) = (spec.width, spec.height);
     let mut plane = gaussian_field(w, h, stars, 1.6, background);
+    for &(y0, y1, excess) in bands {
+        for y in y0..y1.min(h) {
+            for x in 0..w {
+                plane[y * w + x] += excess;
+            }
+        }
+    }
     if noise_sigma > 0.0 {
         crate::test_support::add_noise(&mut plane, noise_sigma, noise_seed);
     }

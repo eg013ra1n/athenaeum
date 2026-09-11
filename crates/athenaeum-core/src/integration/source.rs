@@ -30,6 +30,47 @@ pub trait RejectionBitSink: Sync {
     fn record_band(&self, y0: usize, rows: usize, bits: &[u64]) -> Result<(), IntegrationError>;
 }
 
+/// Forced rejections the band loop applies BEFORE any per-pixel rejection
+/// algorithm runs (M4c Task 3, spec §6.2's large-scale paragraph, ruling
+/// R-M4c-4): a set bit means "this frame's sample at this pixel is not a
+/// survivor, whatever the algorithm would have decided". One instance is
+/// bound to ONE plane by its own producer — exactly like
+/// [`RejectionBitSink`], since `integrate_stack` also consumes one plane at
+/// a time (`StackParams` is a per-plane struct, so neither trait carries a
+/// plane index).
+///
+/// [`Self::forced_row`], not a bare per-pixel accessor, is what the band
+/// loop calls: the loop visits `pixels × frames` samples, so a `&dyn` call
+/// per SAMPLE would cost billions of virtual calls per plane on a real
+/// stack (26 Mpx × 200 frames). Fetched once per (frame, row) instead, the
+/// bit test that remains is a load and a shift. [`Self::forced`] is the
+/// per-pixel convenience over it, for callers and tests that want one
+/// pixel's answer rather than a row.
+///
+/// Lives here, next to [`RejectionBitSink`], for the same reason that trait
+/// does: `integration/` never depends on `stacking`, so the trait the
+/// engine calls through must be defined on the `integration` side of that
+/// boundary (the implementation — `stacking::rej::RejForcedSource`, over a
+/// group's `.rejl` files — is on the other).
+pub trait RejectionBitSource: Sync {
+    /// `== ceil(width / 64)` — the source image's full width, checked
+    /// against the frame source's own geometry before the band loop starts.
+    fn words_per_row(&self) -> usize;
+    /// `== n`, the frame source's own frame count.
+    fn frames(&self) -> usize;
+    /// Frame `frame`'s forced bits for the ABSOLUTE image row `y`:
+    /// [`Self::words_per_row`] u64 words, bit `x % 64` of word `x / 64` set
+    /// when that pixel is forced. `None` when nothing is forced for that
+    /// (frame, row) — the common case by a wide margin, and the one the
+    /// band loop answers without touching any bits at all.
+    fn forced_row(&self, frame: usize, y: usize) -> Option<&[u64]>;
+    /// One pixel's answer, derived from [`Self::forced_row`].
+    fn forced(&self, frame: usize, x: usize, y: usize) -> bool {
+        self.forced_row(frame, y)
+            .is_some_and(|words| (words[x / 64] >> (x % 64)) & 1 != 0)
+    }
+}
+
 pub trait FrameSource: Sync {
     fn width(&self) -> usize;
     fn height(&self) -> usize;

@@ -408,8 +408,47 @@ pub fn resolve_config(
         config.grouping.exposure_tolerance_sec = MIN_EXPOSURE_TOLERANCE_SEC;
     }
     config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
+    // M4c Task 3: the same backend guard for the large-scale filter's two
+    // integers. Out of range these are not preferences but a broken filter
+    // — the window doubles with every layer, so a hand-edited
+    // `protectedLayers: 40` would ask for a 2^41-wide window (and shift a
+    // `usize` past its width), and a large `growth` grows every structure
+    // by a disc of that radius. The UI's own fields already offer exactly
+    // these ranges.
+    if !(MIN_PROTECTED_LAYERS..=MAX_PROTECTED_LAYERS)
+        .contains(&config.integration.large_scale.protected_layers)
+    {
+        let clamped = config
+            .integration
+            .large_scale
+            .protected_layers
+            .clamp(MIN_PROTECTED_LAYERS, MAX_PROTECTED_LAYERS);
+        warn!(
+            value = config.integration.large_scale.protected_layers,
+            clamped, "stacking config: protectedLayers out of range; clamped"
+        );
+        config.integration.large_scale.protected_layers = clamped;
+    }
+    if config.integration.large_scale.growth > MAX_GROWTH {
+        warn!(
+            value = config.integration.large_scale.growth,
+            clamped = MAX_GROWTH,
+            "stacking config: growth above the maximum; clamped"
+        );
+        config.integration.large_scale.growth = MAX_GROWTH;
+    }
     Ok(config)
 }
+
+/// [`crate::stacking::integrate::LargeScaleRejection::protected_layers`]
+/// bounds (M4c Task 3): 1 (the cascade's first median, window 3) to 6
+/// (window 65, effective support ≈ 127 px) — the range the Integrate
+/// panel's field offers.
+pub const MIN_PROTECTED_LAYERS: u8 = 1;
+pub const MAX_PROTECTED_LAYERS: u8 = 6;
+/// [`crate::stacking::integrate::LargeScaleRejection::growth`]'s maximum
+/// (0 — no dilation — is legitimate).
+pub const MAX_GROWTH: u8 = 4;
 
 /// [`MeasurementConfig::detection_sigma`] into
 /// `[MIN_DETECTION_SIGMA, MAX_DETECTION_SIGMA]`, warning when it moves.
@@ -961,6 +1000,36 @@ mod tests {
         );
     }
 
+    /// M4c Task 3: the large-scale filter's two integers are clamped to the
+    /// ranges the Integrate panel offers — an unclamped `protectedLayers`
+    /// would ask for a window of `2^(n+1)` pixels (and shift a `usize` past
+    /// its own width on the way).
+    #[test]
+    fn the_large_scale_integers_are_clamped_to_their_ranges() {
+        let large = |doc: &str| resolve_config(Some(doc), None).unwrap().integration.large_scale;
+        assert_eq!(
+            large("{\"integration\":{\"largeScale\":{\"protectedLayers\":0}}}").protected_layers,
+            MIN_PROTECTED_LAYERS
+        );
+        assert_eq!(
+            large("{\"integration\":{\"largeScale\":{\"protectedLayers\":40}}}").protected_layers,
+            MAX_PROTECTED_LAYERS
+        );
+        assert_eq!(
+            large("{\"integration\":{\"largeScale\":{\"growth\":9}}}").growth,
+            MAX_GROWTH
+        );
+        // In range, untouched — including `growth: 0` (no dilation).
+        let ok = large("{\"integration\":{\"largeScale\":{\"protectedLayers\":6,\"growth\":0}}}");
+        assert_eq!((ok.protected_layers, ok.growth), (6, 0));
+        let shipped = resolve_config(None, None).unwrap().integration.large_scale;
+        assert_eq!(
+            shipped,
+            crate::stacking::integrate::LargeScaleRejection::default(),
+            "the shipped default is inside both ranges and must not move"
+        );
+    }
+
     /// `detectionSigma` reaches the detector as a raw level multiplier, so a
     /// stored or hand-edited document must not be able to hand it a zero, a
     /// negative or a non-finite value (fix round 3, Important 3).
@@ -1127,6 +1196,13 @@ mod tests {
         // `registration_subtree`, so every set's cached registration rows
         // go stale once — deliberately: a row records which reference a
         // frame was warped onto, which is exactly what the mode decides.
-        assert_eq!(default_hash, "7b2463cf8463926d");
+        //
+        // And here (M4c Task 3, ruling R-M4c-4): `integration.largeScale`
+        // joins `IntegrationConfig`. It ships disabled, i.e. today's
+        // behaviour, and NO stage subtree folds in `integration` at all
+        // (`calibration`/`measurement`/`registration`/`normalization` are
+        // the four), so not one cached per-frame artifact goes stale over
+        // it — only this whole-config fingerprint moves.
+        assert_eq!(default_hash, "33c13c606bcf6426");
     }
 }

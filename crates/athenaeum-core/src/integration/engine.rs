@@ -8,7 +8,7 @@ use super::banded::{BandPlanes, BandSource};
 use super::combine::{self, combine_pixel, IntegrationRecipe};
 use super::io_policy::IoPolicy;
 use super::registered_source::RegisteredSource;
-use super::source::{FrameSource, RejectionBitSink};
+use super::source::{FrameSource, RejectionBitSink, RejectionBitSource};
 use super::stats::NormalizationPair;
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
@@ -506,6 +506,18 @@ pub struct StackParams<'a, 'f> {
     /// the `Some`/`None` cases are split so the `None` path pays no cost
     /// for a feature it isn't using.
     pub rejection_bits: Option<&'a (dyn RejectionBitSink + 'a)>,
+    /// M4c Task 3 (spec §6.2's large-scale paragraph, ruling R-M4c-4):
+    /// samples this source marks are dropped BEFORE any rejection algorithm
+    /// runs — the algorithm then decides among what is left, and the forced
+    /// samples are counted as rejected in the low/high maps, in
+    /// `rejected_per_frame` and (when a sink is present) in the bitmaps,
+    /// exactly the way a RANGE rejection is. They are NOT counted in
+    /// `base.rejected_fraction`, which stays algorithm-only (see
+    /// `StackOutput`'s own doc). `None` — every caller before this field
+    /// existed, and every first-pass caller — leaves the per-pixel loop
+    /// byte-identical: the forced test is a `bool && …` over a local the
+    /// compiler proves false.
+    pub forced_rejection: Option<&'a (dyn RejectionBitSource + 'a)>,
 }
 
 /// `base.rejected_fraction` counts ALGORITHM rejections only, exactly like
@@ -585,6 +597,25 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
             return Err(IntegrationError::BadInput(format!(
                 "rejection bit sink words_per_row {} != expected {expected_words} for width {w}",
                 sink.words_per_row()
+            )));
+        }
+    }
+    // M4c Task 3: the same two checks for the forced-rejection source, for
+    // the same reason — a mismatched `frames()` would answer another
+    // frame's question and a mismatched `words_per_row()` would index past
+    // a row's own words.
+    if let Some(forced) = params.forced_rejection {
+        if forced.frames() != n {
+            return Err(IntegrationError::BadInput(format!(
+                "forced-rejection source expects {} frames, source has {n}",
+                forced.frames()
+            )));
+        }
+        let expected_words = w.div_ceil(64);
+        if forced.words_per_row() != expected_words {
+            return Err(IntegrationError::BadInput(format!(
+                "forced-rejection source words_per_row {} != expected {expected_words} for width {w}",
+                forced.words_per_row()
             )));
         }
     }
@@ -778,6 +809,19 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                 for (_, eval, a_row, b_row) in local_state.iter_mut() {
                     eval(y_abs, a_row, b_row);
                 }
+                // M4c Task 3: this row's forced-rejection bits, fetched ONCE
+                // per frame per row — never once per (pixel, frame), which
+                // on a real stack would be billions of `&dyn` calls per
+                // plane (see `RejectionBitSource::forced_row`'s own doc).
+                // `has_forced` stays false for every caller that passes no
+                // source, and the per-pixel test below is then a `bool &&`
+                // the compiler folds away — the `None` path's instructions,
+                // and therefore its byte-identical output, are unchanged.
+                let forced_rows: Vec<Option<&[u64]>> = match params.forced_rejection {
+                    Some(src) => (0..n).map(|i| src.forced_row(i, y_abs)).collect(),
+                    None => Vec::new(),
+                };
+                let has_forced = !forced_rows.is_empty();
                 for (x, out_px) in out_row.iter_mut().enumerate() {
                     work.clear();
                     combine::mask_clear(&mut mask);
@@ -785,6 +829,10 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                     let idx = row_in_band * width + x;
                     let mut low_here = 0u32;
                     let mut high_here = 0u32;
+                    // Set when at least one sample at THIS pixel was forced
+                    // out: the side/bitmap/per-frame attribution below then
+                    // runs even if the algorithm itself rejected nothing.
+                    let mut forced_any = false;
                     if local_state.is_empty() {
                         // Fix round 1, item 1: frames with NO active local
                         // override run the EXACT pre-M2 instructions — no
@@ -837,7 +885,19 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             out_vals[i] = outv;
                             rej_vals[i] = rej;
                             combine::mask_set(&mut present, i);
-                            work.push((rej, i as u16));
+                            // M4c Task 3: a forced sample is PRESENT (so the
+                            // attribution below can decide its side against
+                            // the survivors' median, exactly as an
+                            // algorithm rejection's is) but never enters
+                            // `work`, so no rejection routine ever sees it.
+                            if has_forced
+                                && forced_rows[i]
+                                    .is_some_and(|wd| (wd[x / 64] >> (x % 64)) & 1 != 0)
+                            {
+                                forced_any = true;
+                            } else {
+                                work.push((rej, i as u16));
+                            }
                         }
                     } else {
                         // A5 (final fix wave): frames visited `0..n` in
@@ -903,12 +963,53 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             out_vals[i] = outv;
                             rej_vals[i] = rej;
                             combine::mask_set(&mut present, i);
-                            work.push((rej, i as u16));
+                            // M4c Task 3, same rule as the no-local branch
+                            // above (this loop's own doc explains why the
+                            // two are kept textually apart).
+                            if has_forced
+                                && forced_rows[i]
+                                    .is_some_and(|wd| (wd[x / 64] >> (x % 64)) & 1 != 0)
+                            {
+                                forced_any = true;
+                            } else {
+                                work.push((rej, i as u16));
+                            }
                         }
                     }
                     if work.is_empty() {
                         *out_px = 0.0;
                         row_all_bad += 1;
+                        // M4c Task 3: every sample forced out (or every one
+                        // range-rejected before this field existed) leaves
+                        // nothing to combine — the pixel is `all_bad`, the
+                        // same verdict an all-range-rejected pixel has
+                        // always had. The forced samples are still counted
+                        // as rejections, against the median of every
+                        // present value, since no survivor exists to
+                        // compare them with.
+                        if forced_any {
+                            scratch.clear();
+                            for i in 0..n {
+                                if combine::mask_get(&present, i) {
+                                    scratch.push(rej_vals[i]);
+                                }
+                            }
+                            scratch.sort_by(|a, b| a.total_cmp(b));
+                            let median = scratch[scratch.len() / 2];
+                            for i in 0..n {
+                                if combine::mask_get(&present, i) {
+                                    row_rejected[i] += 1;
+                                    if let Some(bits) = &mut bits_row {
+                                        bits[i * bit_words + x / 64] |= 1u64 << (x % 64);
+                                    }
+                                    if rej_vals[i] < median {
+                                        low_here += 1
+                                    } else {
+                                        high_here += 1
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         let (val, rej_count) = combine::combine_pixel_weighted(
                             &mut work,
@@ -919,7 +1020,14 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             &mut scratch,
                         );
                         *out_px = val;
-                        if rej_count > 0 {
+                        // M4c Task 3: `|| forced_any` — a pixel whose only
+                        // rejection is a FORCED one still needs the
+                        // attribution below (`rejected_per_frame`, the
+                        // low/high maps, the bitmaps). `row_rej_total`
+                        // stays algorithm-only: `rej_count` is 0 in that
+                        // case, so `base.rejected_fraction` keeps its
+                        // meaning.
+                        if rej_count > 0 || forced_any {
                             row_rej_total += rej_count;
                             // Survivors are the compacted prefix; the rejected
                             // entries were overwritten by the compaction, so the
@@ -1096,6 +1204,7 @@ pub fn integrate_registered(
         local_for_rejection: false,
         local_for_output: false,
         rejection_bits: None,
+        forced_rejection: None,
     };
     Ok(integrate_stack(src, &params, recipe, pool, cancel, progress, io)?.base)
 }
@@ -1916,6 +2025,7 @@ mod tests {
             local_for_rejection: false,
             local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let progress = EngineProgress { on_band: &nop(), on_combine: &nop() };
         // sigma_high 1.0, not the brief's 2.0 (measured deviation, Task 3):
@@ -1980,6 +2090,7 @@ mod tests {
             range_low: None, range_high: None, rejection_maps: false,
             local: None, local_for_rejection: false, local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let stack = integrate_stack(&src, &params, recipe, &pool(), &AtomicBool::new(false),
             EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap();
@@ -2019,6 +2130,7 @@ mod tests {
             local_for_rejection: false,
             local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let out = integrate_stack(
             &src,
@@ -2068,6 +2180,7 @@ mod tests {
             local_for_rejection: false,
             local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let out = integrate_stack(
             &src,
@@ -2151,6 +2264,7 @@ mod tests {
             local_for_rejection: false,
             local_for_output: true,
             rejection_bits: None,
+            forced_rejection: None,
         };
         // budget: `per_row_bytes` for 2 f32 frames at width 16 is
         // 2*16*4 + 16*8 = 256; 2_000 / 256 -> 7-row bands, so 12 rows run
@@ -2225,6 +2339,7 @@ mod tests {
             local_for_rejection: false,
             local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let out_global = integrate_stack(
             &src,
@@ -2273,6 +2388,7 @@ mod tests {
             local_for_rejection: true,
             local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let out_local = integrate_stack(
             &src,
@@ -2383,6 +2499,7 @@ mod tests {
             local_for_rejection: false,
             local_for_output: false,
             rejection_bits: None,
+            forced_rejection: None,
         };
         let out_none = integrate_stack(
             &src,
@@ -2459,5 +2576,332 @@ mod tests {
             vec![(hot_idx, hot_y, hot_x)],
             "expected exactly one bit at (frame {hot_idx}, row {hot_y}, col {hot_x}): {found:?}"
         );
+    }
+
+    /// One frame's forced bits, from an explicit `(frame, x, y)` list.
+    struct ListSource {
+        frames: usize,
+        words: usize,
+        /// `[frame][y]` → that row's words, `None` when the row is clear.
+        rows: Vec<Vec<Option<Vec<u64>>>>,
+    }
+
+    impl ListSource {
+        fn new(frames: usize, width: usize, height: usize, forced: &[(usize, usize, usize)]) -> Self {
+            let words = width.div_ceil(64);
+            let mut rows: Vec<Vec<Option<Vec<u64>>>> =
+                (0..frames).map(|_| (0..height).map(|_| None).collect()).collect();
+            for &(frame, x, y) in forced {
+                let row = rows[frame][y].get_or_insert_with(|| vec![0u64; words]);
+                row[x / 64] |= 1u64 << (x % 64);
+            }
+            ListSource { frames, words, rows }
+        }
+    }
+
+    impl RejectionBitSource for ListSource {
+        fn words_per_row(&self) -> usize {
+            self.words
+        }
+        fn frames(&self) -> usize {
+            self.frames
+        }
+        fn forced_row(&self, frame: usize, y: usize) -> Option<&[u64]> {
+            self.rows[frame][y].as_deref()
+        }
+    }
+
+    /// M4c Task 3 (ruling R-M4c-4): a forced sample is dropped BEFORE any
+    /// rejection algorithm runs — the survivors are combined as usual, and
+    /// the forced sample is counted as a rejection in `rejected_low`/
+    /// `rejected_high`, in `rejected_per_frame`, in the low/high maps and
+    /// in the bitmaps, but NOT in `base.rejected_fraction` (algorithm-only,
+    /// exactly like a range rejection). Three frames at three DIFFERENT
+    /// levels with `Rejection::None`, so the output pixel alone says which
+    /// samples were combined.
+    #[test]
+    fn forced_rejection_drops_a_sample_before_the_algorithm_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 0.10),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.40),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.20),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 3];
+        let weights = vec![1.0f32; 3];
+        let recipe = IntegrationRecipe::average(Rejection::None);
+        let params_none = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: true,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: None,
+            forced_rejection: None,
+        };
+        let out_none = integrate_stack(
+            &src,
+            &params_none,
+            recipe,
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        let mean_of_three = (0.10 + 0.40 + 0.20) / 3.0;
+        assert!(
+            (out_none.base.data[5 * w + 5] - mean_of_three).abs() < 1e-6,
+            "baseline pixel {} != {mean_of_three}",
+            out_none.base.data[5 * w + 5]
+        );
+        assert_eq!((out_none.rejected_low, out_none.rejected_high), (0, 0));
+
+        // Frame 1 (the 0.40 one) forced out at (5, 5) only.
+        let forced = ListSource::new(3, w, h, &[(1, 5, 5)]);
+        let params = StackParams {
+            forced_rejection: Some(&forced),
+            ..params_none
+        };
+        let out = integrate_stack(
+            &src,
+            &params,
+            recipe,
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        let mean_of_two = (0.10 + 0.20) / 2.0;
+        assert!(
+            (out.base.data[5 * w + 5] - mean_of_two).abs() < 1e-6,
+            "forced pixel {} != the mean of frames 0 and 2 ({mean_of_two})",
+            out.base.data[5 * w + 5]
+        );
+        // Every OTHER pixel is untouched.
+        for y in 0..h {
+            for x in 0..w {
+                if (x, y) == (5, 5) {
+                    continue;
+                }
+                assert_eq!(
+                    out.base.data[y * w + x].to_bits(),
+                    out_none.base.data[y * w + x].to_bits(),
+                    "pixel ({x}, {y}) moved without being forced"
+                );
+            }
+        }
+        assert_eq!(out.rejected_per_frame, vec![0, 1, 0]);
+        assert_eq!(out.samples_per_frame, vec![128, 128, 128]);
+        // 0.40 sits above the survivors' median (0.20) → the high side.
+        assert_eq!((out.rejected_low, out.rejected_high), (0, 1));
+        assert_eq!(out.rejection_high.as_ref().unwrap()[5 * w + 5], 1.0);
+        assert_eq!(out.rejection_low.as_ref().unwrap()[5 * w + 5], 0.0);
+        assert_eq!(
+            out.base.rejected_fraction, 0.0,
+            "a forced rejection is not an ALGORITHM rejection"
+        );
+    }
+
+    /// The forced samples must also reach the bitmap sink — so a `.rej`
+    /// written during a pass that itself forces rejections describes what
+    /// that pass actually combined.
+    #[test]
+    fn forced_rejections_reach_the_bitmap_sink() {
+        struct Collect {
+            frames: usize,
+            words: usize,
+            bits: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+        }
+        impl RejectionBitSink for Collect {
+            fn words_per_row(&self) -> usize {
+                self.words
+            }
+            fn frames(&self) -> usize {
+                self.frames
+            }
+            fn record_band(&self, y0: usize, rows: usize, bits: &[u64]) -> Result<(), IntegrationError> {
+                let mut out = self.bits.lock().unwrap();
+                for row in 0..rows {
+                    for frame in 0..self.frames {
+                        for word in 0..self.words {
+                            let set = bits[(row * self.frames + frame) * self.words + word];
+                            for bit in 0..64 {
+                                if set & (1u64 << bit) != 0 {
+                                    out.push((frame, word * 64 + bit, y0 + row));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 8usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 0.10),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.40),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.20),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 3];
+        let weights = vec![1.0f32; 3];
+        let forced = ListSource::new(3, w, h, &[(1, 5, 5), (2, 0, 0)]);
+        let sink = Collect {
+            frames: 3,
+            words: w.div_ceil(64),
+            bits: std::sync::Mutex::new(Vec::new()),
+        };
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: false,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: Some(&sink),
+            forced_rejection: Some(&forced),
+        };
+        integrate_stack(
+            &src,
+            &params,
+            IntegrationRecipe::average(Rejection::None),
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        let mut got = sink.bits.lock().unwrap().clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, 5, 5), (2, 0, 0)]);
+    }
+
+    /// Forcing EVERY sample at a pixel leaves nothing to combine: the pixel
+    /// is `all_bad` (the same verdict an all-range-rejected pixel has always
+    /// had) and every forced sample is still counted.
+    #[test]
+    fn forcing_every_sample_leaves_an_all_bad_pixel_with_the_rejections_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 4usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 0.10),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.30),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 3];
+        let weights = vec![1.0f32; 3];
+        let forced = ListSource::new(3, w, h, &[(0, 2, 1), (1, 2, 1), (2, 2, 1)]);
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: false,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: None,
+            forced_rejection: Some(&forced),
+        };
+        let out = integrate_stack(
+            &src,
+            &params,
+            IntegrationRecipe::average(Rejection::None),
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        assert_eq!(out.base.data[1 * w + 2], 0.0);
+        assert_eq!(out.base.all_bad_pixels, 1);
+        assert_eq!(out.rejected_per_frame, vec![1, 1, 1]);
+        // Median of the three present values is 0.20: 0.10 low, 0.20 and
+        // 0.30 high (the `< median` test puts a tie on the high side).
+        assert_eq!((out.rejected_low, out.rejected_high), (1, 2));
+    }
+
+    /// A forced-rejection source that disagrees with the frame source about
+    /// either dimension is refused up front, not silently misindexed.
+    #[test]
+    fn a_mismatched_forced_rejection_source_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 4usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 0.10),
+            write(dir.path(), "b.fits", w, h, |_, _| 0.20),
+            write(dir.path(), "c.fits", w, h, |_, _| 0.30),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 3];
+        let weights = vec![1.0f32; 3];
+        let base = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: false,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: None,
+            forced_rejection: None,
+        };
+        let run = |params: &StackParams<'_, '_>| {
+            integrate_stack(
+                &src,
+                params,
+                IntegrationRecipe::average(Rejection::None),
+                &pool(),
+                &AtomicBool::new(false),
+                EngineProgress { on_band: &nop(), on_combine: &nop() },
+                io(1 << 20),
+            )
+        };
+
+        let wrong_frames = ListSource::new(2, w, h, &[]);
+        match run(&StackParams { forced_rejection: Some(&wrong_frames), ..base }) {
+            Err(IntegrationError::BadInput(msg)) => {
+                assert!(msg.contains("expects 2 frames"), "{msg}")
+            }
+            Err(e) => panic!("expected a frame-count refusal, got {e}"),
+            Ok(_) => panic!("expected a frame-count refusal, the run succeeded"),
+        }
+
+        struct WrongWords;
+        impl RejectionBitSource for WrongWords {
+            fn words_per_row(&self) -> usize {
+                7
+            }
+            fn frames(&self) -> usize {
+                3
+            }
+            fn forced_row(&self, _frame: usize, _y: usize) -> Option<&[u64]> {
+                None
+            }
+        }
+        match run(&StackParams { forced_rejection: Some(&WrongWords), ..base }) {
+            Err(IntegrationError::BadInput(msg)) => {
+                assert!(msg.contains("words_per_row 7"), "{msg}")
+            }
+            Err(e) => panic!("expected a words-per-row refusal, got {e}"),
+            Ok(_) => panic!("expected a words-per-row refusal, the run succeeded"),
+        }
     }
 }

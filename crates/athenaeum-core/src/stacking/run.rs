@@ -63,7 +63,8 @@ use crate::stacking::drizzle::{
 };
 use crate::stacking::groups::{group_frames, set_slug, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::integrate::{
-    included_after_min_weight, integrate_group, GroupInput, GroupProgress, GroupStats, StackFrame,
+    included_after_min_weight, integrate_group, large_scale_passes, GroupInput, GroupProgress,
+    GroupStats, StackFrame,
 };
 use crate::stacking::ln::{
     background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
@@ -1060,12 +1061,15 @@ fn run_thread(mut rc: RunContext) {
         "stacking run finished"
     );
 
-    // M3 Task 5 (ruling R-M3-8): `.rej` bitmaps are per-run temporaries —
-    // removed HERE, at the run's single exit path, for EVERY outcome
-    // (success, cancel, failure, panic-recovery all reach this line) unless
-    // the user asked to keep everything. A missing dir (drizzle never ran
-    // for this run, or it never wanted rejection bitmaps) is not an error; a
-    // removal failure is a `warn!`, never fails the already-decided run.
+    // M3 Task 5 (ruling R-M3-8): `.rej` bitmaps — and, since M4c Task 3,
+    // the `.rejl` siblings the large-scale filter writes next to them —
+    // are per-run temporaries, removed HERE, at the run's single exit path,
+    // for EVERY outcome (success, cancel, failure, panic-recovery all reach
+    // this line) unless the user asked to keep everything. Both kinds live
+    // in the same `rej/run-<id>/<group>/` directory, so the one
+    // `remove_dir_all` below takes them together. A missing dir (neither
+    // drizzle nor large-scale rejection ran for this run) is not an error;
+    // a removal failure is a `warn!`, never fails the already-decided run.
     if rc.config.output.cleanup != CleanupPolicy::KeepAll {
         let rej_run_dir = rc.layout.rej_run_dir(run_id);
         match std::fs::remove_dir_all(&rej_run_dir) {
@@ -5144,9 +5148,24 @@ fn process_group_output(
     // with a warning below (ruling text: "the master still integrates,
     // rej: None") — `rej_set_failure` carries the reason for that later
     // warning.
+    //
+    // M4c Task 3 (ruling R-M4c-4) widens the condition: large-scale
+    // rejection derives its structures from the SAME bitmaps, so it needs
+    // the set even with drizzle off. `group_integration` (not
+    // `rc.config.integration`) is read for the flag on purpose — it is the
+    // config `integrate_group` itself will see, so its own
+    // `large_scale_passes` answer can never disagree with this one.
+    let bitmaps_for_drizzle = rc.config.drizzle.enabled && rc.config.drizzle.use_rejection;
+    let bitmaps_for_large_scale = group_integration.large_scale.enabled;
+    // Which consumer(s) a bitmap failure would cost, for an honest warning.
+    let bitmap_consumers = match (bitmaps_for_drizzle, bitmaps_for_large_scale) {
+        (true, true) => "drizzle and large-scale rejection",
+        (true, false) => "drizzle",
+        _ => "large-scale rejection",
+    };
     let mut rej_set: Option<RejBitmapSet> = None;
     let mut rej_set_failure: Option<String> = None;
-    if rc.config.drizzle.enabled && rc.config.drizzle.use_rejection {
+    if bitmaps_for_drizzle || bitmaps_for_large_scale {
         let included_for_rej = included_after_min_weight(
             &stack_frames,
             reference_idx,
@@ -5177,10 +5196,11 @@ fn process_group_output(
                     run_id = rc.run_id,
                     group_key = %group.key,
                     error = %msg,
-                    "drizzle skipped for this group"
+                    consumers = bitmap_consumers,
+                    "rejection bitmaps unavailable for this group"
                 );
                 rc.warnings.push(format!(
-                    "group {}: drizzle skipped — {msg}",
+                    "group {}: {bitmap_consumers} skipped — {msg}",
                     group.key
                 ));
                 rej_set_failure = Some(msg);
@@ -5220,6 +5240,15 @@ fn process_group_output(
     // the current plane (fired at plane start, `band_fraction = 0`);
     // `on_band`/`on_combine` read it back and derive `band_fraction` from
     // the engine's own `bytes_done/bytes_total` pair for that plane.
+    //
+    // M4c Task 3: the plane space is `channels × passes` wide — large-scale
+    // rejection integrates the group TWICE, and `integrate_group` reports
+    // pass 2's planes offset by `channels` (see `large_scale_passes`, the
+    // one place that rule lives; called here with the same inputs
+    // `integrate_group` will use, so the denominator below and the plane
+    // indices it receives can never disagree).
+    let integrate_planes_total =
+        channels * large_scale_passes(&group_integration, rej_set.is_some());
     let current_plane = std::sync::atomic::AtomicUsize::new(0);
     let tick_state: Mutex<IntegrateTickState> = Mutex::new(IntegrateTickState::new());
     let emitter = rc.emitter.clone();
@@ -5235,7 +5264,7 @@ fn process_group_output(
             run_id,
             set_id,
             &group_key_for_progress,
-            channels,
+            integrate_planes_total,
             p,
             0.0,
             0,
@@ -5256,7 +5285,7 @@ fn process_group_output(
             run_id,
             set_id,
             &group_key_for_progress,
-            channels,
+            integrate_planes_total,
             plane,
             frac,
             bytes_done,
@@ -5272,7 +5301,7 @@ fn process_group_output(
             run_id,
             set_id,
             &group_key_for_progress,
-            channels,
+            integrate_planes_total,
             plane,
             1.0,
             bytes_done,
@@ -5316,8 +5345,8 @@ fn process_group_output(
         run_id,
         set_id,
         &group_key_for_progress,
-        channels,
-        channels,
+        integrate_planes_total,
+        integrate_planes_total,
         0.0,
         0,
         0,
@@ -5335,10 +5364,27 @@ fn process_group_output(
     // stays untouched.
     if let Some(reason) = rej_set.as_ref().and_then(|s| s.failure()) {
         rc.warnings.push(format!(
-            "drizzle skipped for {}: rejection bitmaps could not be written: {reason}",
+            "{bitmap_consumers} skipped for {}: rejection bitmaps could not be written: {reason}",
             group.key
         ));
         rej_set_failure = Some(reason);
+    }
+
+    // M4c Task 3: large-scale rejection was asked for but did not run for
+    // this group — `integrate_group` logged WHY (an unusable first-pass
+    // bitmap set, or a processing failure) and kept the first pass's
+    // master; the user is told here, since the warning list is the run's
+    // own user-visible channel. The bitmap-write fault above already has
+    // its own line, so this one covers the remaining causes only.
+    if bitmaps_for_large_scale
+        && output.stats.large_scale_rejected_fraction.is_none()
+        && rej_set_failure.is_none()
+    {
+        rc.warnings.push(format!(
+            "group {}: large-scale rejection did not run — the master is the per-pixel result \
+             (see the log for the reason)",
+            group.key
+        ));
     }
 
     let output_start = Instant::now();
@@ -5628,8 +5674,31 @@ fn process_group_output(
                         .len())
                         .map(|k| (0..channels).map(|p| output.output_pairs[p][k]).collect())
                         .collect();
+                    // M4c Task 3 (ruling: drizzle reads the SAME bits the
+                    // master was built with): the PROCESSED `.rejl` set
+                    // when the large-scale second pass ran — those are the
+                    // samples the master actually forced out — and the raw
+                    // `.rej` set otherwise. Honest caveat, stated here
+                    // rather than discovered later: with the second pass on,
+                    // the master ALSO drops whatever that pass's own
+                    // per-pixel algorithm rejected, and those verdicts are
+                    // not written anywhere (the second pass runs without a
+                    // sink), so drizzle sees the forced structures but not
+                    // the second pass's speckle. Capturing both would cost
+                    // a second full bitmap set for a speckle-level
+                    // difference in the drizzled output.
+                    let drizzle_reads_processed =
+                        output.stats.large_scale_rejected_fraction.is_some();
                     let rej_paths: Vec<Option<PathBuf>> = (0..output.included.len())
-                        .map(|k| rej_set.as_ref().map(|s| s.path(k).to_path_buf()))
+                        .map(|k| {
+                            rej_set.as_ref().map(|s| {
+                                if drizzle_reads_processed {
+                                    s.processed_path(k)
+                                } else {
+                                    s.path(k).to_path_buf()
+                                }
+                            })
+                        })
                         .collect();
                     let drizzle_frames: Vec<DrizzleFrame> = output
                         .included
@@ -6888,6 +6957,7 @@ pub(crate) fn test_context(
 mod tests {
     use super::*;
     use crate::events::NullEmitter;
+    use crate::stacking::integrate::{LargeScaleRejection, RejectionChoice};
     use crate::stacking::rej::RejBitmap;
     use crate::stacking::test_fixtures::{self, LightSpec};
 
@@ -11722,6 +11792,309 @@ mod tests {
                     "plane {p} pixel {i}: rejection-only fallback {a} vs global-normalization {b}"
                 );
             }
+        }
+    }
+
+    // ── M4c Task 3: large-scale rejection wired into the run ────────────
+
+    /// The trail fixture's geometry, chosen so the band sits in a
+    /// star-free strip of the 192x144 field (the stars span rows 24..102)
+    /// and so the whole affected span plus the growth disc stays inside the
+    /// frame.
+    const TRAIL_CORE: std::ops::Range<usize> = 115..120;
+    const TRAIL_SHOULDER_LOW: std::ops::Range<usize> = 113..115;
+    const TRAIL_SHOULDER_HIGH: std::ops::Range<usize> = 120..122;
+    /// Raw ADU. Calibration subtracts the fixture's constant master dark
+    /// (100) and divides by the flat's own normalization (1.0), so the
+    /// calibrated background is 300 ADU and every excess below survives
+    /// unchanged.
+    const TRAIL_BACKGROUND: f32 = 400.0;
+    const TRAIL_NOISE: f32 = 30.0;
+    /// 450/300 = 1.5x the background: past the percentile clip's `high =
+    /// 1.0` (so the per-pixel pass rejects it outright), and 5 sigma short
+    /// of the star detector's own `background + 20 sigma` level (so it is
+    /// not mistaken for a source by stage 3).
+    const TRAIL_CORE_EXCESS: f32 = 450.0;
+    /// 240/300 = 0.8x — INSIDE the percentile clip's threshold, i.e. the
+    /// residual a real trail's faint edges leave in the master, and 2 sigma
+    /// clear of it so noise does not reject it by accident.
+    const TRAIL_SHOULDER_EXCESS: f32 = 240.0;
+
+    /// Six frames of the same star field (no shift: the trail is an
+    /// artifact of ONE frame's own pixel grid, and identity registration
+    /// keeps its rows where the test put them), one of which — `f2` —
+    /// carries a flat-topped trail: a 5-px core with a 2-px shoulder on
+    /// each side.
+    fn seed_trail_group(
+        db_path: &Path,
+        set_name: &str,
+        trail_idx: usize,
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, set_name);
+        let bands = vec![
+            (TRAIL_CORE.start, TRAIL_CORE.end, TRAIL_CORE_EXCESS),
+            (
+                TRAIL_SHOULDER_LOW.start,
+                TRAIL_SHOULDER_LOW.end,
+                TRAIL_SHOULDER_EXCESS,
+            ),
+            (
+                TRAIL_SHOULDER_HIGH.start,
+                TRAIL_SHOULDER_HIGH.end,
+                TRAIL_SHOULDER_EXCESS,
+            ),
+        ];
+
+        let mut light_ids = Vec::new();
+        for i in 0..6usize {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = star_light_spec(&stem, &date_obs);
+            let (id, _path) = test_fixtures::add_light_with_field_and_bands(
+                &fixture,
+                &spec,
+                &shifted_stars(0.0, 0.0),
+                TRAIL_BACKGROUND,
+                TRAIL_NOISE,
+                400 + i as u64,
+                if i == trail_idx { &bands } else { &[] },
+            );
+            light_ids.push(id);
+        }
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        (fixture, light_ids, working, output)
+    }
+
+    /// M4c Task 3 (ruling R-M4c-4) through the whole run: one frame of six
+    /// carries a flat-topped trail whose CORE the per-pixel rejection
+    /// catches and whose 2-px SHOULDER it cannot see (the shoulder deviates
+    /// 0.8x the background, the percentile clip's high threshold is 1.0x).
+    ///
+    /// With `integration.largeScale` off, the master keeps 1/6 of that
+    /// shoulder — measurably high. With it on, the run produces the
+    /// rejection bitmaps even though drizzle is off (the widened sink
+    /// condition), the core's own rejected rows survive the filter, the
+    /// disc dilation covers the shoulders, and the second pass forces them
+    /// out: the master's shoulder rows come out at the other five frames'
+    /// level. The `.rejl` siblings ride the same per-run removal as the
+    /// `.rej` files.
+    #[test]
+    fn large_scale_rejection_removes_a_trails_shoulder_from_the_master() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let trail_idx = 2usize;
+        let (fixture, light_ids, working, _output) =
+            seed_trail_group(&db_path, SET_NAME, trail_idx);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let base_config = || {
+            let mut cfg = StackingConfig::default();
+            // The Auto rule at n = 6 is percentile 0.2/0.1, which would
+            // reject the shoulder too — this pin needs a per-pixel test the
+            // shoulder genuinely survives, which is the situation a real
+            // trail's faint edges create at any threshold.
+            cfg.integration.rejection = RejectionChoice::PercentileClip {
+                low: 0.2,
+                high: 1.0,
+            };
+            cfg.output.cleanup = CleanupPolicy::DeleteIntermediates;
+            cfg
+        };
+
+        let run_off = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(base_config()),
+            None,
+        )
+        .expect("the baseline run should start");
+        wait_for_run(&ctx, run_off.run_id);
+        let row_off = crate::db::stacking::get_run(&fixture.conn, run_off.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row_off.status, "done", "{row_off:?}");
+        let groups_off = crate::db::stacking::list_groups(&fixture.conn, run_off.run_id).unwrap();
+        assert_eq!(groups_off.len(), 1, "{groups_off:?}");
+        let master_off = groups_off[0]
+            .master_path
+            .clone()
+            .expect("the baseline run wrote a master");
+        let stats_off: GroupStats =
+            serde_json::from_str(groups_off[0].stats_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            stats_off.large_scale_rejected_fraction, None,
+            "large-scale rejection is off for the baseline run"
+        );
+
+        let mut cfg_on = base_config();
+        cfg_on.integration.large_scale = LargeScaleRejection {
+            enabled: true,
+            protected_layers: 2,
+            growth: 2,
+        };
+        let recorder = Arc::new(Recording::new());
+        let run_on = start_stacking(
+            ctx.clone(),
+            recorder.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg_on),
+            None,
+        )
+        .expect("the large-scale run should start");
+        wait_for_run(&ctx, run_on.run_id);
+        let row_on = crate::db::stacking::get_run(&fixture.conn, run_on.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row_on.status, "done", "{row_on:?}");
+        let groups_on = crate::db::stacking::list_groups(&fixture.conn, run_on.run_id).unwrap();
+        assert_eq!(groups_on.len(), 1, "{groups_on:?}");
+        let master_on = groups_on[0]
+            .master_path
+            .clone()
+            .expect("the large-scale run wrote a master");
+        assert_ne!(master_on, master_off, "two runs, two master files");
+        let stats_on: GroupStats =
+            serde_json::from_str(groups_on[0].stats_json.as_deref().unwrap()).unwrap();
+        let forced = stats_on
+            .large_scale_rejected_fraction
+            .expect("the second pass ran");
+        // 9 affected rows of one frame in six, over the group's own
+        // geometry — the filter keeps the 5-px core and grows it by 2. A
+        // relative tolerance rather than an exact count: the trail frame's
+        // own registration transform is identity only to within what the
+        // star fit resolves, and a sub-pixel warp leaves the outermost
+        // column without coverage — a sample with no coverage is not a
+        // rejection (the engine's own rule), so it never enters the
+        // first-pass bitmap the filter reads. Measured shortfall: 8 px of
+        // 1728.
+        let expected_forced = 9.0 * STAR_FIELD_WIDTH as f64
+            / (6.0 * STAR_FIELD_WIDTH as f64 * STAR_FIELD_HEIGHT as f64);
+        assert!(
+            (forced - expected_forced).abs() / expected_forced < 0.01,
+            "forced fraction {forced} != {expected_forced} (within 1 %)"
+        );
+
+        // The Integrate stage reported TWICE the planes (one pass each) and
+        // still reached 100 %.
+        let integrate_events: Vec<_> = recorder
+            .events(STACKING_PROGRESS_EVENT)
+            .into_iter()
+            .filter(|e| e["stage"] == "integrate")
+            .collect();
+        assert!(!integrate_events.is_empty(), "no integrate progress events");
+        let last = integrate_events.last().unwrap();
+        assert_eq!(
+            last["total"].as_u64(),
+            Some(2),
+            "one mono plane x two passes: {integrate_events:?}"
+        );
+        assert_eq!(last["current"].as_u64(), Some(2), "{integrate_events:?}");
+
+        // The per-run temporaries — `.rej` AND the `.rejl` siblings — are
+        // gone with the rest of the run's `rej/run-<id>` tree.
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        assert!(
+            !layout.rej_run_dir(run_on.run_id).exists(),
+            "rej/run-<id> (with its .rejl siblings) must be removed after the run"
+        );
+
+        let reader_off = PlaneReader::open(Path::new(&master_off)).unwrap();
+        let reader_on = PlaneReader::open(Path::new(&master_on)).unwrap();
+        assert_eq!(reader_off.channels(), 1);
+        assert_eq!(reader_on.width(), reader_off.width());
+        let plane_off = reader_off.read_plane(0).unwrap();
+        let plane_on = reader_on.read_plane(0).unwrap();
+        let w = reader_off.width();
+        let row_mean = |data: &[f32], y: usize| -> f64 {
+            data[y * w..(y + 1) * w].iter().map(|&v| v as f64).sum::<f64>() / w as f64
+        };
+        // A star-free control row from the same strip as the trail.
+        let control_off = row_mean(&plane_off, 108);
+        let control_on = row_mean(&plane_on, 108);
+        assert!(
+            ((control_on - control_off) / control_off).abs() < 0.01,
+            "the control row must not move: {control_on} vs {control_off}"
+        );
+        // The headline comparison is over ALL FOUR shoulder rows together
+        // (768 px): a single row's mean carries ≈ 0.3 % of master noise
+        // (30 ADU per frame over five surviving frames, 192 px), so a
+        // 1 % per-row bound would sit only ~3 sigma clear of it. Measured
+        // on this fixture: without 11.70 %, with 0.40 % over the four rows
+        // (row 113 alone: without 9.98 %, with 0.54 %).
+        let shoulder_rows: Vec<usize> = TRAIL_SHOULDER_LOW.chain(TRAIL_SHOULDER_HIGH).collect();
+        let band_mean = |data: &[f32], control: f64| -> f64 {
+            let sum: f64 = shoulder_rows.iter().map(|&y| row_mean(data, y)).sum();
+            (sum / shoulder_rows.len() as f64 - control) / control
+        };
+        let without_band = band_mean(&plane_off, control_off);
+        let with_band = band_mean(&plane_on, control_on);
+        assert!(
+            without_band > 0.05,
+            "without large-scale rejection the shoulder must be >= 5 % high, got {:.2} %",
+            without_band * 100.0
+        );
+        assert!(
+            with_band.abs() < 0.01,
+            "with large-scale rejection the shoulder must be within 1 % of the other frames' \
+             level, got {:.2} %",
+            with_band * 100.0
+        );
+        for y in shoulder_rows.iter().copied() {
+            let without = (row_mean(&plane_off, y) - control_off) / control_off;
+            let with = (row_mean(&plane_on, y) - control_on) / control_on;
+            assert!(
+                without > 0.05,
+                "row {y}: without large-scale rejection the shoulder must be >= 5 % high, \
+                 got {:.2} %",
+                without * 100.0
+            );
+            assert!(
+                with.abs() < 0.02,
+                "row {y}: with large-scale rejection the shoulder must land at the other \
+                 frames' level, got {:.2} %",
+                with * 100.0
+            );
+        }
+        // The core rows are rejected per-pixel either way.
+        for y in TRAIL_CORE {
+            let without = (row_mean(&plane_off, y) - control_off) / control_off;
+            let with = (row_mean(&plane_on, y) - control_on) / control_on;
+            assert!(
+                without.abs() < 0.02 && with.abs() < 0.02,
+                "row {y}: the core is rejected either way: {without} vs {with}"
+            );
         }
     }
 

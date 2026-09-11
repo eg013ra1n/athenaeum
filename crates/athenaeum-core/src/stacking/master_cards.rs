@@ -672,6 +672,7 @@ mod tests {
             combine_ms: 0,
             bytes_read: 0,
             ln_frames: 0,
+            large_scale_rejected_fraction: None,
         }
     }
 

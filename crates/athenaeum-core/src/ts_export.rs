@@ -316,6 +316,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::integrate::NormalizationConfig,
             crate::integration::combine::Combination,
             crate::stacking::integrate::RejectionChoice,
+            crate::stacking::integrate::LargeScaleRejection,
             crate::stacking::integrate::IntegrationConfig,
             crate::export::models::CalibratedLightOptions,
             crate::stacking::config::GroupingConfig,

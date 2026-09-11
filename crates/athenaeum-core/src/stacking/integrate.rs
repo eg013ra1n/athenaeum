@@ -21,7 +21,7 @@ use crate::integration::engine::{
 };
 use crate::integration::io_policy::IoPolicy;
 use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
-use crate::integration::source::RejectionBitSink;
+use crate::integration::source::{RejectionBitSink, RejectionBitSource};
 use crate::integration::stats::{
     output_pair, rejection_pair, NormalizationPair, OutputNormalization, RejectionNormalization,
     ScaleEstimator,
@@ -31,7 +31,7 @@ use crate::resample::Interpolation;
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::{LnFrameGrids, LnGrid};
 use crate::stacking::measure::{measure_plane, FrameMeasurement, MeasureOptions};
-use crate::stacking::rej::RejBitmapSet;
+use crate::stacking::rej::{process_large_scale, RejBitmap, RejBitmapSet, RejForcedSource};
 use crate::stacking::weights::{best_by_weight, FrameWeight};
 
 /// spec §9.2 `integration:`; every field defaulted, camelCase on the wire.
@@ -50,6 +50,10 @@ pub struct IntegrationConfig {
     /// Reject `raw >= range_high`; `None` until the user turns it on.
     pub range_high: Option<f64>,
     pub write_rejection_maps: bool,
+    /// Large-scale (structure-aware) pixel rejection, M4c (spec §6.2,
+    /// ruling R-M4c-4).
+    #[serde(default)]
+    pub large_scale: LargeScaleRejection,
 }
 
 impl Default for IntegrationConfig {
@@ -61,6 +65,45 @@ impl Default for IntegrationConfig {
             range_low: Some(0.0),
             range_high: None,
             write_rejection_maps: false,
+            large_scale: LargeScaleRejection::default(),
+        }
+    }
+}
+
+/// spec §9.2 `integration.largeScale:` (M4c, ruling R-M4c-4). When
+/// `enabled`, integration runs TWICE: the first pass writes every included
+/// frame's per-pixel rejection bitmap, those bitmaps are filtered to the
+/// structures big enough to be real (a satellite trail, an aircraft) and
+/// grown by `growth` px, and the second pass forces exactly those samples
+/// out before any per-pixel algorithm runs — so a trail is removed as the
+/// one object it is, not as the speckle the per-pixel tests leave of it.
+///
+/// **One bit, no side split.** The spec's own `low`/`high` pair collapses
+/// into this single `enabled` (ruling R-M4c-4): the per-frame bitmap format
+/// is one bit per pixel — rejected or not — so it does not carry which SIDE
+/// a rejection fell on, and processing the two sides separately is not a
+/// distinction this data can express. A format bump to carry it would buy a
+/// difference no acceptance test can see.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LargeScaleRejection {
+    pub enabled: bool,
+    /// The scale selector: structures thinner than roughly `2^layers / 2`
+    /// pixels are erased (see [`process_large_scale`]'s own doc for the
+    /// exact thresholds — 3 px at `2`, 5 px at `3`, 9 px at `4`). 1–6.
+    pub protected_layers: u8,
+    /// Radius in pixels of the disc every surviving structure is grown by,
+    /// so the structure's own faint edges — which the per-pixel test never
+    /// reached — are covered too. 0–4.
+    pub growth: u8,
+}
+
+impl Default for LargeScaleRejection {
+    fn default() -> Self {
+        LargeScaleRejection {
+            enabled: false,
+            protected_layers: 2,
+            growth: 2,
         }
     }
 }
@@ -342,6 +385,13 @@ pub struct GroupStats {
     /// any), otherwise the count of included frames whose own `ln[i]` was
     /// `Some`.
     pub ln_frames: usize,
+    /// M4c Task 3: the fraction of all (frame, plane, pixel) samples the
+    /// PROCESSED bitmaps forced out before the second pass's algorithm ran
+    /// — `None` when large-scale rejection did not run for this group at
+    /// all (off, no bitmap set, or the first pass's bitmaps could not be
+    /// trusted; `stacking::run` turns the last two into a run warning).
+    #[serde(default)]
+    pub large_scale_rejected_fraction: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -478,6 +528,7 @@ pub(crate) fn integrate_planes<'g>(
     local_for_output: bool,
     ln: Option<&'g [Option<LnFrameGrids>]>,
     rej: Option<&RejBitmapSet>,
+    forced: Option<&RejForcedSource>,
     recipe: IntegrationRecipe,
     write_maps: bool,
     pool: &rayon::ThreadPool,
@@ -597,6 +648,10 @@ pub(crate) fn integrate_planes<'g>(
         // borrow a `&dyn RejectionBitSink` from it for the `integrate_stack`
         // call just below.
         let sink = rej.map(|r| r.plane_sink(p));
+        // M4c Task 3: and this plane's forced-rejection source, when the
+        // caller is running the SECOND pass over a group's processed
+        // (`.rejl`) bitmaps — owned here for the same borrow reason.
+        let forced_plane = forced.map(|f| f.plane_source(p));
         let params = StackParams {
             rejection: &rejection_pairs,
             output: &output_pairs,
@@ -608,6 +663,9 @@ pub(crate) fn integrate_planes<'g>(
             local_for_rejection,
             local_for_output,
             rejection_bits: sink.as_ref().map(|s| s as &dyn RejectionBitSink),
+            // M4c Task 3: the second pass's forced bits, bound to this
+            // plane the same way the sink above is.
+            forced_rejection: forced_plane.as_ref().map(|f| f as &dyn RejectionBitSource),
         };
         // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
         // fields are — so it must be rebuilt (not read) from
@@ -655,6 +713,75 @@ pub(crate) fn included_after_min_weight(
             (wmin >= min_weight || i == reference).then_some(i)
         })
         .collect()
+}
+
+/// How many times [`integrate_planes`] runs for a group (M4c Task 3,
+/// ruling R-M4c-4): twice when large-scale rejection is on AND the run
+/// created a rejection-bitmap set for the group to derive the structures
+/// from (without one there is nothing to filter), once otherwise.
+///
+/// The ONE place the rule is expressed — `stacking::run` calls it too, to
+/// size the Integrate stage's own progress space before `integrate_group`
+/// runs, so the two can never disagree about how many plane-slots a group's
+/// integration will report.
+pub(crate) fn large_scale_passes(integration: &IntegrationConfig, has_rej: bool) -> usize {
+    if integration.large_scale.enabled && has_rej {
+        2
+    } else {
+        1
+    }
+}
+
+/// Filters every included frame's first-pass bitmap to its large-scale
+/// structures, writes each as its `.rejl` sibling and reads the set back as
+/// the engine's forced-rejection source (M4c Task 3).
+///
+/// Parallel over FRAMES on the caller's pool, one frame's bitmap in RAM per
+/// worker at a time (a 6248x4176 mono bitmap is ≈ 3.3 MB, and
+/// [`process_large_scale`] works in two `u8` scratch planes of the same
+/// geometry) — never every frame's at once. The `.rejl` files are written
+/// rather than kept in memory because they are also what the drizzle stage
+/// reads back (the same bits the master was built with) and what a
+/// `keepAll` run leaves behind for inspection.
+/// `IntegrationError::Cancelled` is returned distinctly — it is the RUN's
+/// own cancel, which must propagate rather than degrade into "large-scale
+/// rejection skipped"; every other failure comes back as
+/// [`IntegrationError::Decode`] carrying the `anyhow` chain, and the caller
+/// keeps the first pass's master.
+fn build_forced_source(
+    rej_set: &RejBitmapSet,
+    input: &GroupInput<'_>,
+    included_count: usize,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+) -> Result<RejForcedSource, IntegrationError> {
+    use rayon::prelude::*;
+    let cfg = input.integration.large_scale;
+    let (w, h, c) = (input.width, input.height, input.channels);
+    pool.install(|| {
+        (0..included_count)
+            .into_par_iter()
+            .map(|k| {
+                // Checked per FRAME: the filter is a couple of O(pixels)
+                // passes per plane, so this bounds how long a cancel waits
+                // to a single frame's own filtering.
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(IntegrationError::Cancelled);
+                }
+                let bits = RejBitmap::read(rej_set.path(k), w, h, c)
+                    .map_err(|e| IntegrationError::Decode(format!("{e:#}")))?;
+                let processed = process_large_scale(&bits, cfg.protected_layers, cfg.growth);
+                processed
+                    .write(rej_set.processed_path(k).as_path())
+                    .map_err(|e| IntegrationError::Decode(format!("{e:#}")))
+            })
+            .collect::<Result<(), IntegrationError>>()
+    })?;
+    let paths: Vec<PathBuf> = (0..included_count)
+        .map(|k| rej_set.processed_path(k))
+        .collect();
+    RejForcedSource::load(&paths, w, h, c)
+        .map_err(|e| IntegrationError::Decode(format!("{e:#}")))
 }
 
 /// Integrates one group, plane by plane (spec §6.1–6.3): resolves the Auto
@@ -847,7 +974,24 @@ pub fn integrate_group(
         })
         .collect();
 
-    let (outputs, output_pairs) = integrate_planes(
+    // M4c Task 3: with large-scale rejection on, `integrate_planes` runs
+    // twice and the plane-progress space is twice as wide — pass 1 reports
+    // planes `0..channels`, pass 2 `channels..2·channels`, both against the
+    // same doubled total. `stacking::run` derives the SAME total from
+    // [`large_scale_passes`], so its own band/combine ticks (which read the
+    // plane index this `on_plane` stamps) stay on one scale.
+    let passes = large_scale_passes(input.integration, input.rej.is_some());
+    let planes_total = input.channels * passes;
+    let on_plane_pass1 = |p: usize, _total: usize| (progress.on_plane)(p, planes_total);
+    let progress_pass1 = GroupProgress {
+        on_plane: &on_plane_pass1,
+        engine: EngineProgress {
+            on_band: progress.engine.on_band,
+            on_combine: progress.engine.on_combine,
+        },
+    };
+
+    let (mut outputs, mut output_pairs) = integrate_planes(
         input,
         &included,
         &weights_per_frame,
@@ -862,13 +1006,107 @@ pub fn integrate_group(
         input.normalization.local.enabled,
         input.ln,
         input.rej,
+        None,
         recipe,
         input.integration.write_rejection_maps,
         pool,
         cancel,
-        progress,
+        &progress_pass1,
         io,
     )?;
+
+    // M4c Task 3, the second pass (spec §6.2, ruling R-M4c-4): every
+    // included frame's first-pass bitmap is filtered to its large-scale
+    // structures, written as a `.rejl` sibling, and forced out of a fresh
+    // integration — whose output REPLACES the first pass's. Pass 1's own
+    // I/O cost is folded into the group's totals below, so the group still
+    // reports what the run actually paid.
+    let mut large_scale_rejected_fraction: Option<f64> = None;
+    let mut pass_one_cost = (0u64, 0u64, 0u64);
+    if passes > 1 {
+        let rej_set = input
+            .rej
+            .expect("large_scale_passes only returns 2 when a bitmap set exists");
+        // B3's latch (M3): a WRITE fault mid-pass-1 means the bitmaps are
+        // incomplete, so the structures derived from them would be wrong —
+        // the group keeps pass 1's master, with the reason logged here and
+        // surfaced as a run warning by `stacking::run` (which sees
+        // `large_scale_rejected_fraction: None` against an enabled config).
+        if let Some(reason) = rej_set.failure() {
+            warn!(
+                error = %reason,
+                "large-scale rejection skipped: the first pass's rejection bitmaps are incomplete"
+            );
+        } else {
+            match build_forced_source(rej_set, input, included_count, pool, cancel) {
+                Ok(forced) => {
+                    pass_one_cost = outputs.iter().fold((0, 0, 0), |acc, o| {
+                        (
+                            acc.0 + o.base.read_duration.as_millis() as u64,
+                            acc.1 + o.base.combine_duration.as_millis() as u64,
+                            acc.2 + o.base.bytes_read,
+                        )
+                    });
+                    let forced_fraction = forced.forced_fraction();
+                    info!(
+                        frames = included_count,
+                        protected_layers = input.integration.large_scale.protected_layers,
+                        growth = input.integration.large_scale.growth,
+                        large_scale_forced = forced_fraction,
+                        "large-scale rejection: re-integrating with the processed bitmaps"
+                    );
+                    let channels = input.channels;
+                    let on_plane_pass2 =
+                        |p: usize, _total: usize| (progress.on_plane)(channels + p, planes_total);
+                    let progress_pass2 = GroupProgress {
+                        on_plane: &on_plane_pass2,
+                        engine: EngineProgress {
+                            on_band: progress.engine.on_band,
+                            on_combine: progress.engine.on_combine,
+                        },
+                    };
+                    // No sink on the second pass: the `.rej` files are pass
+                    // 1's own record, and the processed `.rejl` set is what
+                    // the master was actually built with (drizzle reads
+                    // that one — `stacking::run`).
+                    let (second, pairs) = integrate_planes(
+                        input,
+                        &included,
+                        &weights_per_frame,
+                        input.normalization.output,
+                        input.normalization.rejection,
+                        input.normalization.local.enabled,
+                        input.ln,
+                        None,
+                        Some(&forced),
+                        recipe,
+                        input.integration.write_rejection_maps,
+                        pool,
+                        cancel,
+                        &progress_pass2,
+                        io,
+                    )?;
+                    outputs = second;
+                    output_pairs = pairs;
+                    large_scale_rejected_fraction = Some(forced_fraction);
+                }
+                // The run's own cancel propagates; anything else keeps the
+                // first pass's master with a warning (`stacking::run`
+                // turns the `None` fraction into a run warning).
+                Err(IntegrationError::Cancelled) => {
+                    warn!("group integration cancelled");
+                    return Err(IntegrationError::Cancelled);
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "large-scale rejection skipped: the rejection bitmaps could not be processed"
+                ),
+            }
+        }
+    }
+    read_ms_total += pass_one_cost.0;
+    combine_ms_total += pass_one_cost.1;
+    bytes_read_total += pass_one_cost.2;
 
     for (p, out) in outputs.into_iter().enumerate() {
         // `integrate_planes` already checks `cancel` before each plane's own
@@ -1041,6 +1279,7 @@ pub fn integrate_group(
             combine_ms: combine_ms_total,
             bytes_read: bytes_read_total,
             ln_frames,
+            large_scale_rejected_fraction,
         },
     })
 }
@@ -1252,10 +1491,29 @@ mod tests {
         assert_eq!(d.range_low, Some(0.0));
         assert_eq!(d.range_high, None);
         assert!(!d.write_rejection_maps);
+        assert_eq!(d.large_scale, LargeScaleRejection::default());
         let j = serde_json::to_value(&d).unwrap();
         assert_eq!(j["rejection"]["method"], "auto");
         assert_eq!(j["minWeight"], 0.005);
         assert_eq!(j["writeRejectionMaps"], false);
+        // M4c Task 3 (spec §9.2, ruling R-M4c-4): one `enabled`, not the
+        // spec's original `low`/`high` pair — the bitmap is one bit per
+        // pixel and cannot carry the side (see `LargeScaleRejection`).
+        assert_eq!(j["largeScale"]["enabled"], false);
+        assert_eq!(j["largeScale"]["protectedLayers"], 2);
+        assert_eq!(j["largeScale"]["growth"], 2);
+        let with_large: IntegrationConfig = serde_json::from_str(
+            r#"{"largeScale":{"enabled":true,"protectedLayers":3,"growth":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_large.large_scale,
+            LargeScaleRejection {
+                enabled: true,
+                protected_layers: 3,
+                growth: 1
+            }
+        );
         let explicit: IntegrationConfig = serde_json::from_str(
             r#"{"rejection":{"method":"linearFitClip","sigmaLow":5.0,"sigmaHigh":3.5},"rangeHigh":0.98}"#,
         )
@@ -1468,6 +1726,7 @@ mod tests {
             RejectionNormalization::default(),
             false,
             Some(&grids),
+            None,
             None,
             IntegrationRecipe::average(Rejection::None),
             false,
@@ -1958,6 +2217,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             recipe,
             false,
             &pool,
@@ -2118,6 +2378,219 @@ mod tests {
                 assert!(msg.contains("geometry"), "{msg}");
             }
             other => panic!("expected BadInput, got {other:?}"),
+        }
+    }
+
+    // ── M4c Task 3: the large-scale second pass ─────────────────────────
+
+    /// `large_scale_passes` is the ONE expression of "does this group
+    /// integrate twice" — `stacking::run` reads it too, for the Integrate
+    /// stage's progress space.
+    #[test]
+    fn large_scale_passes_needs_both_the_flag_and_a_bitmap_set() {
+        let mut cfg = IntegrationConfig::default();
+        assert_eq!(large_scale_passes(&cfg, false), 1);
+        assert_eq!(large_scale_passes(&cfg, true), 1, "off by default");
+        cfg.large_scale.enabled = true;
+        assert_eq!(
+            large_scale_passes(&cfg, false),
+            1,
+            "no bitmaps to derive structures from → no second pass"
+        );
+        assert_eq!(large_scale_passes(&cfg, true), 2);
+    }
+
+    /// M4c Task 3 (ruling R-M4c-4) end to end through `integrate_group`: one
+    /// frame of six carries a 5-px band at 6x the background with a 2-px
+    /// SHOULDER on each side that the per-pixel test cannot see (the
+    /// shoulder deviates 20 %, the percentile clip's high threshold is
+    /// 50 %) — exactly the residual a real trail's faint edges leave.
+    ///
+    /// Without large-scale rejection the master keeps 1/6 of that shoulder;
+    /// with it on, the band's own rejected rows survive the filter, the
+    /// disc dilation by 2 px covers the shoulders, and the second pass
+    /// forces them out — the master's shoulder rows come out at the other
+    /// five frames' own level. Every `.rejl` sibling is written, and the
+    /// pixels the forced set never touched stay BIT-identical between the
+    /// two runs.
+    #[test]
+    fn large_scale_rejection_removes_a_bands_shoulder_that_the_per_pixel_test_misses() {
+        const W: usize = 64;
+        const H: usize = 64;
+        const BASE: f32 = 0.1;
+        const CORE: std::ops::Range<usize> = 28..33;
+        const SHOULDER_LOW: std::ops::Range<usize> = 26..28;
+        const SHOULDER_HIGH: std::ops::Range<usize> = 33..35;
+        let dir = tempfile::tempdir().unwrap();
+        let trail_idx = 3usize;
+        let paths: Vec<_> = (0..6)
+            .map(|i| {
+                let mut d = vec![BASE; W * H];
+                if i == trail_idx {
+                    for y in CORE {
+                        for x in 0..W {
+                            d[y * W + x] = 0.6;
+                        }
+                    }
+                    for y in SHOULDER_LOW.chain(SHOULDER_HIGH) {
+                        for x in 0..W {
+                            d[y * W + x] = 0.12;
+                        }
+                    }
+                }
+                add_noise(&mut d, 0.0005, 7000 + i as u64);
+                let p = dir.path().join(format!("t{i}.fits"));
+                write_fits_f32(&p, W, H, 1, &d, &[]).unwrap();
+                p
+            })
+            .collect();
+        let frames: Vec<StackFrame> = paths
+            .iter()
+            .map(|p| StackFrame {
+                path: p.clone(),
+                map: identity_map(),
+                measurement: measure_frame(
+                    p,
+                    &MeasureOptions::default(),
+                    None,
+                    &AtomicBool::new(false),
+                )
+                .unwrap(),
+                weight: weight(1.0, 1),
+                exposure_s: 60.0,
+                date_obs: None,
+            })
+            .collect();
+
+        let mut integration = IntegrationConfig::default();
+        // 50 % high threshold: the 0.6 core (500 %) is rejected, the 0.12
+        // shoulder (20 %) is not.
+        integration.rejection = RejectionChoice::PercentileClip { low: 0.2, high: 0.5 };
+        let normalization = NormalizationConfig::default();
+        let pool = pool();
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+        };
+        let input_off = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: W,
+            height: H,
+            channels: 1,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+        };
+
+        let off = integrate_group(
+            &input_off,
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(20_000_000),
+        )
+        .unwrap();
+        assert_eq!(off.included.len(), 6);
+        assert_eq!(
+            off.stats.large_scale_rejected_fraction, None,
+            "large-scale rejection is off for this run"
+        );
+
+        let mut integration_on = integration.clone();
+        integration_on.large_scale = LargeScaleRejection {
+            enabled: true,
+            protected_layers: 2,
+            growth: 2,
+        };
+        let rej_dir = dir.path().join("rej");
+        let stems: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        let set = RejBitmapSet::create(&rej_dir, &stems, W, H, 1).unwrap();
+        let input_on = GroupInput {
+            integration: &integration_on,
+            rej: Some(&set),
+            ..input_off
+        };
+        let on = integrate_group(
+            &input_on,
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(20_000_000),
+        )
+        .unwrap();
+
+        // Every included frame got a `.rejl` sibling, and only the trail
+        // frame's own carries bits (the others' speckle is erased).
+        for k in 0..6 {
+            let path = set.processed_path(k);
+            assert!(path.exists(), "missing processed sibling: {path:?}");
+            let bm = RejBitmap::read(&path, W, H, 1).unwrap();
+            let bits = bm.count();
+            if k == trail_idx {
+                assert!(bits > 0, "the trail frame's processed bitmap must carry bits");
+            } else {
+                assert_eq!(bits, 0, "frame {k}'s speckle must be erased, got {bits} bits");
+            }
+        }
+
+        let forced = on
+            .stats
+            .large_scale_rejected_fraction
+            .expect("the second pass ran");
+        // 9 rows (5 core + 2 + 2 shoulder) x 64 px of one frame in six.
+        let expected = 9.0 * W as f64 / (6.0 * W as f64 * H as f64);
+        assert!(
+            (forced - expected).abs() < 1e-9,
+            "forced fraction {forced} != {expected}"
+        );
+
+        let row_mean = |data: &[f32], y: usize| -> f64 {
+            data[y * W..(y + 1) * W].iter().map(|&v| v as f64).sum::<f64>() / W as f64
+        };
+        let control = row_mean(&off.data, 5);
+        for y in SHOULDER_LOW.chain(SHOULDER_HIGH) {
+            let without = row_mean(&off.data, y);
+            let with = row_mean(&on.data, y);
+            assert!(
+                (without - control) / control > 0.02,
+                "row {y}: without large-scale rejection the shoulder must stay HIGH: \
+                 {without} vs control {control}"
+            );
+            assert!(
+                ((with - control) / control).abs() < 0.005,
+                "row {y}: with large-scale rejection the shoulder must match the other frames: \
+                 {with} vs control {control}"
+            );
+        }
+        // The core rows were rejected per-pixel either way.
+        for y in CORE {
+            let without = row_mean(&off.data, y);
+            let with = row_mean(&on.data, y);
+            assert!(
+                ((with - without) / control).abs() < 0.005,
+                "row {y}: the core is rejected either way: {with} vs {without}"
+            );
+        }
+        // Nothing outside the forced band moved at all.
+        for y in 0..H {
+            if (24..37).contains(&y) {
+                continue;
+            }
+            for x in 0..W {
+                assert_eq!(
+                    on.data[y * W + x].to_bits(),
+                    off.data[y * W + x].to_bits(),
+                    "pixel ({x}, {y}) moved outside the forced band"
+                );
+            }
         }
     }
 }

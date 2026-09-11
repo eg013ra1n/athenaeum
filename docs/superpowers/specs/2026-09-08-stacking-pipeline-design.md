@@ -737,11 +737,58 @@ all three USER choices the Auto rule below never selects:
   `integration` is not; a cross-check test in `stacking::robust` holds the
   two to the same answers.
 
-Still M4: the `largeScale` low/high post-processing. Parameters keep the
+Parameters keep the
 two-axis `IntegrationRecipe` shape (combination × rejection) the master
 builder uses; the three new ones are APPENDED to the persisted snake_case
 `Rejection` JSON (`min_max`, `esd`, `rcr`), which never renames or reorders
 what is already there.
+
+**Large-scale (structure-aware) rejection** shipped in M4c Task 3 (math
+reference §3.5, ruling R-M4c-4). The per-pixel algorithms above judge each
+pixel stack alone, so a satellite trail survives in the master as the
+speckle they leave of it — and its faint edges, which no per-pixel test
+reaches at all, survive whole. `integration.largeScale { enabled,
+protectedLayers, growth }` (defaults `false`, 2, 2) turns integration into
+TWO passes:
+
+1. Pass 1 integrates as usual and writes every included frame's per-frame
+   rejection bitmap (`stacking::rej`, the M3 `.rej` format — one bit per
+   pixel per plane). The M3 sink condition widens accordingly: the bitmaps
+   are produced when `drizzle.enabled && drizzle.useRejection` **or**
+   `integration.largeScale.enabled`.
+2. Each bitmap is filtered to the structures big enough to be real and
+   grown by `growth` px, then written as a `.rejl` sibling
+   (`process_large_scale`): a cascade of binary median filters of windows
+   3, 5, …, `2^protectedLayers + 1`, each keeping a pixel when more than
+   half of its window is rejected, followed by a dilation with a disc of
+   diameter `2·growth + 1`. This is OUR formulation of the reference's
+   "MMT keeping only the residual erases rejected blobs smaller than
+   ~2^layers px" — the cascade's combined support is the
+   `2^(protectedLayers+1)+1` window the ruling names, to within a pixel,
+   and it is run as the cascade rather than as one median of that whole
+   window because a single wide median's majority rule only keeps a
+   structure at least half the window THICK, i.e. it would erase exactly
+   the thin trails this stage exists to keep. What survives, exactly: a
+   band at least `2^layers / 2 + 1` px thick (3 px at the default 2, 5 px
+   at 3, 9 px at 4) and a compact blob larger than the widest window.
+   `protectedLayers` is a scale selector, not a strength knob.
+3. Pass 2 re-integrates with those bits as FORCED rejections
+   (`StackParams.forced_rejection`): a set bit is dropped before any
+   algorithm runs, the algorithm decides among what is left, and the forced
+   samples count as rejections in the low/high maps and the per-frame
+   counts (never in `rejected_fraction`, which stays algorithm-only —
+   same convention range rejection already has). Pass 2 writes no bitmaps
+   of its own. `GroupStats.largeScaleRejectedFraction` reports what the
+   processed bitmaps forced; it is `None` when the pass did not run.
+
+`low`/`high` collapse into the single `enabled` (ruling R-M4c-4): the
+bitmap is one bit per pixel and does not carry which side a rejection fell
+on, so the side split is not a distinction this data can express, and a
+format bump to carry it would buy a difference no acceptance test can see.
+Cost: one more integration pass, plus one `.rejl` per included frame among
+the same per-run temporaries the `.rej` files live in (removed at the run's
+exit unless `output.cleanup = keepAll`). Drizzle, when both are on, reads
+the PROCESSED bits — the same set the master was built with.
 
 Auto (WBPP 3.0.1 as observed on the owner's data): n < 8 → percentile
 0.2/0.1; 8 ≤ n < 20 → Winsorized 4.0/3.0; n ≥ 20 → linear fit 5.0/3.5 —
@@ -1005,7 +1052,14 @@ normalization: { output: "additiveWithScaling", rejection: "scaleZeroOffset",
                           psfModel: "auto", localScale: false } }      -- stays false (§14 M2)
 integration:   { combination: "average", rejection: { method: "auto" },
                  minWeight: 0.005, rangeLow: 0.0, rangeHigh: null,
-                 writeRejectionMaps: false }
+                 writeRejectionMaps: false,
+                 largeScale: { enabled: false, protectedLayers: 2, growth: 2 } }
+                -- largeScale (M4c Task 3, ruling R-M4c-4, §6.2): structure-aware
+                -- rejection. ONE `enabled`, not the low/high pair the ruling started
+                -- from — the rejection bitmap is one bit per pixel and cannot carry
+                -- the side. `protectedLayers` 1-6 is a scale selector (a band
+                -- survives from ~2^layers / 2 px thick), `growth` 0-4 the disc radius
+                -- every survivor is grown by. On, integration runs TWICE.
 drizzle:       { enabled: false, scale: 2, dropShrink: 0.9, kernel: "square",
                  useRejection: true, useWeights: true, useLocalNormalization: true,
                  writeWeightMap: false }

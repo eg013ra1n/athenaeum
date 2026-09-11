@@ -481,6 +481,10 @@ pub struct EstimateInputs<'a> {
     /// `DrizzleConfig::enabled` — `None` when drizzle is off, adding
     /// nothing to the estimate.
     pub drizzle: Option<(u32, bool, bool)>,
+    /// M4c Task 3: `integration.largeScale.enabled` — it needs the same
+    /// per-frame rejection bitmaps drizzle's `use_rejection` does, plus one
+    /// PROCESSED `.rejl` sibling per frame of exactly the same size.
+    pub large_scale: bool,
 }
 
 /// Rough byte estimate for a run's working+output footprint: every group
@@ -500,7 +504,9 @@ pub struct EstimateInputs<'a> {
 /// use the SAME largest-member geometry the master term above does —
 /// rejection bitmaps (`use_rejection`, one `.rej` per included frame,
 /// `ceil(W/64)` u64 words per row per plane, per `rej.rs`'s own layout:
-/// `included * planes * ceil(W/64) * 8 * H`) and the drizzled output itself
+/// `included * planes * ceil(W/64) * 8 * H`; doubled when `i.large_scale`
+/// is on, for its `.rejl` sibling of each — M4c Task 3) and the drizzled
+/// output itself
 /// (`planes * (W*scale) * (H*scale) * 4`, doubled when `write_weight_map` is
 /// on — the weight map is the same geometry). "included" here is the
 /// group's own frame count (`g.frames.len()`), the same approximation the
@@ -531,11 +537,20 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
         let master_multiplier: u64 = if i.write_maps { 1 + 2 } else { 1 };
         total += master_per_frame_bytes * master_multiplier;
 
-        if let Some((scale, write_weight_map, use_rejection)) = i.drizzle {
-            if use_rejection {
-                let words_per_row = max_w.div_ceil(64);
-                total += g.frames.len() as u64 * planes * words_per_row * 8 * max_h;
-            }
+        // Rejection-bitmap temporaries: one `.rej` per included frame when
+        // drizzle wants the survivor mask, and (M4c Task 3) one `.rej` PLUS
+        // one same-sized `.rejl` sibling per frame when large-scale
+        // rejection is on — whichever asks for them, they are created once.
+        let bitmap_copies = match (i.drizzle.is_some_and(|(_, _, rej)| rej), i.large_scale) {
+            (_, true) => 2,
+            (true, false) => 1,
+            (false, false) => 0,
+        };
+        if bitmap_copies > 0 {
+            let words_per_row = max_w.div_ceil(64);
+            total += bitmap_copies * g.frames.len() as u64 * planes * words_per_row * 8 * max_h;
+        }
+        if let Some((scale, write_weight_map, _use_rejection)) = i.drizzle {
             let s = scale as u64;
             let drizzle_output_bytes = planes * (max_w * s) * (max_h * s) * 4;
             total += drizzle_output_bytes;
@@ -1073,6 +1088,7 @@ mod tests {
             write_registered: false,
             write_maps: true,
             drizzle: None,
+            large_scale: false,
         };
         let expected = 2 * 400 + 1 * 1200 + (400 * 3) + (1200 * 3);
         assert_eq!(estimate_bytes(&inputs), expected);
@@ -1086,12 +1102,14 @@ mod tests {
             write_registered: false,
             write_maps: false,
             drizzle: None,
+            large_scale: false,
         });
         let on = estimate_bytes(&EstimateInputs {
             groups: &groups,
             write_registered: true,
             write_maps: false,
             drizzle: None,
+            large_scale: false,
         });
         assert_eq!(
             on,
@@ -1114,12 +1132,14 @@ mod tests {
             write_registered: false,
             write_maps: false,
             drizzle: None,
+            large_scale: false,
         });
         let with_drizzle = estimate_bytes(&EstimateInputs {
             groups: &groups,
             write_registered: false,
             write_maps: false,
             drizzle: Some((2, true, true)),
+            large_scale: false,
         });
         assert_eq!(
             with_drizzle,
@@ -1133,6 +1153,7 @@ mod tests {
             write_registered: false,
             write_maps: false,
             drizzle: Some((2, false, true)),
+            large_scale: false,
         });
         assert_eq!(with_drizzle_no_weight_map, without_drizzle + 240 + 1600);
 
@@ -1142,8 +1163,48 @@ mod tests {
             write_registered: false,
             write_maps: false,
             drizzle: Some((2, true, false)),
+            large_scale: false,
         });
         assert_eq!(with_drizzle_no_rejection, without_drizzle + 3200);
+    }
+
+    /// M4c Task 3: large-scale rejection adds the same bitmap term with
+    /// drizzle off entirely (it needs the bitmaps itself), and doubles it —
+    /// a `.rejl` sibling of every `.rej` — when both are on.
+    #[test]
+    fn estimate_counts_the_large_scale_bitmaps_with_and_without_drizzle() {
+        let groups = vec![group(ColorMode::Mono, 3, 10, 10)];
+        let base = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: None,
+            large_scale: false,
+        });
+        let large_scale_only = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: None,
+            large_scale: true,
+        });
+        assert_eq!(
+            large_scale_only,
+            base + 2 * 240,
+            "one .rej plus one .rejl per frame, with no drizzle at all"
+        );
+        let both = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: Some((2, true, true)),
+            large_scale: true,
+        });
+        assert_eq!(
+            both,
+            base + 2 * 240 + 3200,
+            "the bitmaps are created once, not once per consumer"
+        );
     }
 
     // ── usage + cleanup ──────────────────────────────────────────────────
@@ -1331,20 +1392,26 @@ mod tests {
 
         let rej_file = layout.rej_dir(7, "g").join("f1.rej");
         write_bytes(&rej_file, 64);
+        // M4c Task 3: the large-scale filter's processed sibling lives in
+        // the same directory, so the same whole-subtree walk counts it and
+        // the same cleanup removes it — no second path rule to keep in sync.
+        let rejl_file = layout.rej_dir(7, "g").join("f1.rejl");
+        write_bytes(&rejl_file, 32);
 
         let usage = work_usage(&layout);
-        assert_eq!(usage.rej_bytes, 64);
-        assert_eq!(usage.total_bytes, 64, "the only bytes on disk are under rej/");
+        assert_eq!(usage.rej_bytes, 96, ".rejl siblings are counted too");
+        assert_eq!(usage.total_bytes, 96, "the only bytes on disk are under rej/");
 
         // Registered: rej/ survives — it sits at the same level as
         // calibrated/ and ln/, not registered/'s narrower level.
         let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Registered).unwrap();
         assert_eq!(freed, 0);
         assert!(rej_file.exists(), "Registered must not remove rej/");
+        assert!(rejl_file.exists(), "Registered must not remove rej/ either");
 
         // Intermediates: rej/ is removed alongside calibrated/ and ln/.
         let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
-        assert_eq!(freed, 64);
+        assert_eq!(freed, 96);
         assert!(!layout.rej_root().exists());
         assert_eq!(work_usage(&layout).rej_bytes, 0);
 

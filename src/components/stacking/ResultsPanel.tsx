@@ -211,6 +211,16 @@ function MasterCard({
           {stats.masterNoise.length > 0 ? `noise ${stats.masterNoise[0].toExponential(3)}` : 'noise —'}
           {' · '}
           {stats.snrGain.length > 0 ? `SNR gain ${stats.snrGain[0].toFixed(2)}×` : 'SNR gain —'}
+          {/* M4c Task 3: only when the large-scale second pass actually
+           *  ran — `null` means it was off, or it was asked for and could
+           *  not run (the run's warnings say so), and a "0.000%" line
+           *  would read as "it ran and found nothing". */}
+          {typeof stats.largeScaleRejectedFraction === 'number' && (
+            <>
+              {' · '}
+              {`large-scale ${(stats.largeScaleRejectedFraction * 100).toFixed(3)}% forced`}
+            </>
+          )}
         </p>
       )}
 

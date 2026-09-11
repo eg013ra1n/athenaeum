@@ -74,6 +74,20 @@ export type Combination = "average" | "median";
 
 export type RejectionChoice = { "method": "auto" } | { "method": "none" } | { "method": "percentileClip", low: number, high: number, } | { "method": "sigmaClip", sigmaLow: number, sigmaHigh: number, } | { "method": "winsorizedSigma", sigmaLow: number, sigmaHigh: number, } | { "method": "linearFitClip", sigmaLow: number, sigmaHigh: number, } | { "method": "minMax", low: number, high: number, } | { "method": "esd", outliersFraction: number, alpha: number, lowRelaxation: number, } | { "method": "rcr", limit: number, };
 
+export type LargeScaleRejection = { enabled: boolean, 
+/**
+ * The scale selector: structures thinner than roughly `2^layers / 2`
+ * pixels are erased (see [`process_large_scale`]'s own doc for the
+ * exact thresholds — 3 px at `2`, 5 px at `3`, 9 px at `4`). 1–6.
+ */
+protectedLayers: number, 
+/**
+ * Radius in pixels of the disc every surviving structure is grown by,
+ * so the structure's own faint edges — which the per-pixel test never
+ * reached — are covered too. 0–4.
+ */
+growth: number, };
+
 export type IntegrationConfig = { 
 /**
  * The master builder's `Combination` — one enum, one spelling
@@ -92,7 +106,12 @@ rangeLow: number | null,
 /**
  * Reject `raw >= range_high`; `None` until the user turns it on.
  */
-rangeHigh: number | null, writeRejectionMaps: boolean, };
+rangeHigh: number | null, writeRejectionMaps: boolean, 
+/**
+ * Large-scale (structure-aware) pixel rejection, M4c (spec §6.2,
+ * ruling R-M4c-4).
+ */
+largeScale: LargeScaleRejection, };
 
 export type CalibratedLightOptions = { 
 /**
@@ -477,7 +496,15 @@ weightedExposureS: number, totalExposureS: number, readMs: number, combineMs: nu
  * any), otherwise the count of included frames whose own `ln[i]` was
  * `Some`.
  */
-lnFrames: number, };
+lnFrames: number, 
+/**
+ * M4c Task 3: the fraction of all (frame, plane, pixel) samples the
+ * PROCESSED bitmaps forced out before the second pass's algorithm ran
+ * — `None` when large-scale rejection did not run for this group at
+ * all (off, no bitmap set, or the first pass's bitmaps could not be
+ * trusted; `stacking::run` turns the last two into a run warning).
+ */
+largeScaleRejectedFraction: number | null, };
 
 export type DrizzleStats = { scale: number, outWidth: number, outHeight: number, 
 /**
