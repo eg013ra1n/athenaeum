@@ -50,23 +50,27 @@ impl PlateSolveRecord {
     /// stored, and the SIP tables re-parsed from the JSON `service.rs`
     /// wrote (`serde_json::to_string(&coeffs)` of a `Vec<Vec<f64>>`).
     ///
-    /// `None` when a stored SIP table fails to parse: a solve whose
-    /// distortion we cannot read is not the same solve, and silently
-    /// dropping the polynomial would hand the caller a transform that is
-    /// wrong by exactly the distortion it was fitted to absorb. A record
-    /// with no SIP tables at all is a perfectly good linear solution and
-    /// converts.
+    /// `None` when a stored SIP table is unusable — either it fails to
+    /// parse, or the pair is half-stored (one table present without its
+    /// partner or without an order, which `insert_plate_solve` never
+    /// writes). A solve whose distortion we cannot read is not the same
+    /// solve, and silently dropping the polynomial would hand the caller a
+    /// transform wrong by exactly the distortion it was fitted to absorb,
+    /// so both cases refuse the whole solution rather than degrade it.
+    /// A record with no SIP tables at all is a perfectly good linear
+    /// solution and converts (as does a forward-only pair — the solver
+    /// stores the reverse tables only when it has them).
     pub fn to_solution(&self) -> Option<WcsSolution> {
         let sip_forward = self
             .sip_pair(self.sip_a_coeffs.as_deref(), self.sip_b_coeffs.as_deref())
             .map_err(|e| {
-                warn!(frame_id = self.frame_id, error = %e, "stored SIP forward coefficients failed to parse")
+                warn!(frame_id = self.frame_id, error = %e, "stored SIP forward coefficients unusable; the solve is refused")
             })
             .ok()?;
         let sip_reverse = self
             .sip_pair(self.sip_ap_coeffs.as_deref(), self.sip_bp_coeffs.as_deref())
             .map_err(|e| {
-                warn!(frame_id = self.frame_id, error = %e, "stored SIP reverse coefficients failed to parse")
+                warn!(frame_id = self.frame_id, error = %e, "stored SIP reverse coefficients unusable; the solve is refused")
             })
             .ok()?;
         Some(WcsSolution {
@@ -78,19 +82,28 @@ impl PlateSolveRecord {
         })
     }
 
-    /// One SIP half-pair. `Ok(None)` = nothing stored (no order, or either
-    /// table missing); `Err` = a table is there but unreadable.
+    /// One SIP half-pair. `Ok(None)` = neither table stored, which is how
+    /// a linear solve (and every forward-only solve's reverse half) looks;
+    /// `Err` = a table is there but unreadable, or the pair is half there.
     fn sip_pair(
         &self,
         a: Option<&str>,
         b: Option<&str>,
-    ) -> std::result::Result<Option<(SipCoefficients, SipCoefficients)>, serde_json::Error> {
+    ) -> std::result::Result<Option<(SipCoefficients, SipCoefficients)>, String> {
         let (order, a, b) = match (self.sip_order, a, b) {
             (Some(order), Some(a), Some(b)) => (order.clamp(0, u8::MAX as i32) as u8, a, b),
-            _ => return Ok(None),
+            (_, None, None) => return Ok(None),
+            (order, a, b) => {
+                return Err(format!(
+                    "half-stored SIP pair (order {}, first table {}, second table {})",
+                    if order.is_some() { "set" } else { "missing" },
+                    if a.is_some() { "set" } else { "missing" },
+                    if b.is_some() { "set" } else { "missing" },
+                ))
+            }
         };
-        let a: Vec<Vec<f64>> = serde_json::from_str(a)?;
-        let b: Vec<Vec<f64>> = serde_json::from_str(b)?;
+        let a: Vec<Vec<f64>> = serde_json::from_str(a).map_err(|e| format!("first table: {e}"))?;
+        let b: Vec<Vec<f64>> = serde_json::from_str(b).map_err(|e| format!("second table: {e}"))?;
         Ok(Some((
             SipCoefficients { order, coeffs: a },
             SipCoefficients { order, coeffs: b },
@@ -370,5 +383,33 @@ mod tests {
             .to_solution()
             .expect("linear solve");
         assert!(orphan.sip_forward.is_none());
+    }
+
+    /// Fix round 1 (m3): a half-stored pair is something
+    /// `insert_plate_solve` cannot produce, so seeing one means the row is
+    /// damaged. It is refused exactly like an unparseable table rather
+    /// than quietly converted as a linear solve — the caller loses an
+    /// accelerator, never gains a transform missing its distortion.
+    #[test]
+    fn a_half_stored_sip_pair_refuses_the_solution() {
+        for (a, b, order) in [
+            (Some("[[0.0]]"), None, Some(2)),
+            (None, Some("[[0.0]]"), Some(2)),
+            // Tables with no order behind them are the same damage.
+            (Some("[[0.0]]"), Some("[[0.0]]"), None),
+            (Some("[[0.0]]"), None, None),
+        ] {
+            assert!(
+                record(a, b, order).to_solution().is_none(),
+                "{a:?} {b:?} {order:?}"
+            );
+        }
+        // A forward-only solve is NOT damage: `record` leaves the reverse
+        // tables unset, and the solver stores those only when it has
+        // fitted them.
+        let w = record(Some("[[0.0]]"), Some("[[0.0]]"), Some(2))
+            .to_solution()
+            .expect("forward-only converts");
+        assert!(w.sip_forward.is_some() && w.sip_reverse.is_none());
     }
 }

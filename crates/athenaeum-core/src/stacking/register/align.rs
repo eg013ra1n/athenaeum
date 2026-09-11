@@ -58,7 +58,10 @@ pub const DISTORTION_ROUNDS: usize = 2;
 )]
 pub enum AlignError {
     TooFewStars { subject: usize, reference: usize },
-    NoSeed { matches: usize },
+    /// M4b: `after_wcs` marks a quad-seed failure that followed a
+    /// plate-solve seed the aligner had already tried and refused — the
+    /// frame's stored reason would otherwise lose that fact entirely.
+    NoSeed { matches: usize, after_wcs: bool },
     TooFewMatches { matches: usize },
     TooFewInliers { inliers: usize },
     Degenerate,
@@ -79,9 +82,20 @@ impl fmt::Display for AlignError {
                 f,
                 "too few stars (subject {subject}, reference {reference})"
             ),
-            AlignError::NoSeed { matches } => {
+            AlignError::NoSeed {
+                matches,
+                after_wcs: false,
+            } => {
                 write!(f, "quad seed failed ({matches} quad matches)")
             }
+            AlignError::NoSeed {
+                matches,
+                after_wcs: true,
+            } => write!(
+                f,
+                "quad seed failed ({matches} quad matches) \
+                 after a plate-solve seed was tried and refused"
+            ),
             AlignError::TooFewMatches { matches } => {
                 write!(f, "only {matches} correspondences within tolerance")
             }
@@ -218,12 +232,22 @@ fn min_pairs_for(order: u8) -> usize {
 
 /// Seed subject → reference from quad matching (subject plays "image",
 /// reference plays "catalog"; the fitted affine maps image → catalog).
-fn seed_affine(sub: &[(f64, f64)], refp: &[(f64, f64)]) -> Result<(Linear, usize), AlignError> {
+///
+/// `after_wcs` marks a run that only reached the quad matcher because a
+/// plate-solve seed was tried first and did not survive (M4b): the frame's
+/// stored reason is `AlignError`'s `Display`, so without the flag a
+/// failure here would read as though the WCS seed had never been offered.
+fn seed_affine(
+    sub: &[(f64, f64)],
+    refp: &[(f64, f64)],
+    after_wcs: bool,
+) -> Result<(Linear, usize), AlignError> {
     let sub_q = build_quads(sub, sub.len(), group_size_for(sub.len()));
     let ref_q = build_quads(refp, refp.len(), group_size_for(refp.len()));
     let matches = match_quads(&sub_q, &ref_q, QUAD_TOLERANCE);
     let a = fit_affine(&matches, &sub_q, &ref_q).ok_or(AlignError::NoSeed {
         matches: matches.len(),
+        after_wcs,
     })?;
     Ok((
         Linear::from_flat(
@@ -294,6 +318,31 @@ fn pair_through(
         }
     }
     p
+}
+
+/// Everything one seed has to survive: the correspondences it produces at
+/// the pairing radius, then the RANSAC and refit on them. The [`Pairing`]
+/// comes back either way, so a caller that wants to try a different seed
+/// (M4b's quad fallback) can say how far this one got.
+fn pair_and_fit(
+    seed: &Linear,
+    subject: &[Star],
+    reference: &[Star],
+    tree: &KdTree2,
+    radius: f64,
+    cfg: &RegistrationConfig,
+    reference_geometry: (usize, usize),
+) -> (
+    Pairing,
+    Result<(RansacResult, RefitResult, LinearKind), AlignError>,
+) {
+    let pairing = pair_through(seed, subject, reference, tree, radius);
+    if pairing.pairs.len() < MIN_INLIERS {
+        let matches = pairing.pairs.len();
+        return (pairing, Err(AlignError::TooFewMatches { matches }));
+    }
+    let fitted = ransac_and_refit(&pairing, cfg, reference_geometry);
+    (pairing, fitted)
 }
 
 /// Steps 3–4: RANSAC on the model resolved from the pair count, then the
@@ -399,7 +448,7 @@ pub fn align(
     // perfectly well-formed transform until it is asked to land on stars.
     // An unconfirmed one costs the quad seed's own work and a warning, not
     // the frame.
-    let (seed, seed_matches, seed_kind) = match hint {
+    let (seed, mut seed_matches, mut seed_kind) = match hint {
         Some(h) => {
             let radius_wcs =
                 (WCS_SEED_RADIUS_FACTOR * cfg.ransac_tolerance_px).max(WCS_SEED_RADIUS_MIN_PX);
@@ -411,26 +460,55 @@ pub fn align(
                     "wcs seed rejected ({} pairs); quad seed used",
                     confirm.pairs.len()
                 ));
-                let (s, m) = seed_affine(&sub_pts, &ref_pts)?;
+                let (s, m) = seed_affine(&sub_pts, &ref_pts, true)?;
                 (s, m, SeedKind::Quads)
             }
         }
         None => {
-            let (s, m) = seed_affine(&sub_pts, &ref_pts)?;
+            let (s, m) = seed_affine(&sub_pts, &ref_pts, false)?;
             (s, m, SeedKind::Quads)
         }
     };
 
-    // 2. Correspondences through the seed, nearest reference star within 2·tol.
-    let mut pairing = pair_through(&seed, subject, reference, &tree, radius);
-    if pairing.pairs.len() < MIN_INLIERS {
-        return Err(AlignError::TooFewMatches {
-            matches: pairing.pairs.len(),
-        });
+    // 2–4. Correspondences through the seed (nearest reference star within
+    // 2·tol), then RANSAC and the σ-weighted refit.
+    //
+    // A confirmed WCS seed clears a radius several times wider than the
+    // pairing one, so a seed accurate to 4–8 px — a solve taken before the
+    // rig was touched, a frame re-pointed since — can pass confirmation and
+    // still pair almost nothing here. That is not a reason to fail a frame
+    // the quad matcher would have carried, so the quad seed gets one turn
+    // before the failure is believed.
+    let (mut pairing, mut fitted) = pair_and_fit(
+        &seed,
+        subject,
+        reference,
+        &tree,
+        radius,
+        cfg,
+        reference_geometry,
+    );
+    if fitted.is_err() && seed_kind == SeedKind::Wcs {
+        warnings.push(format!(
+            "wcs seed pairing failed ({} pairs); quad seed used",
+            pairing.pairs.len()
+        ));
+        let (quad, matches) = seed_affine(&sub_pts, &ref_pts, true)?;
+        seed_matches = matches;
+        seed_kind = SeedKind::Quads;
+        let retry = pair_and_fit(
+            &quad,
+            subject,
+            reference,
+            &tree,
+            radius,
+            cfg,
+            reference_geometry,
+        );
+        pairing = retry.0;
+        fitted = retry.1;
     }
-
-    // 3–4. RANSAC and the σ-weighted refit.
-    let (mut ransac, mut refit, mut kind) = ransac_and_refit(&pairing, cfg, reference_geometry)?;
+    let (mut ransac, mut refit, mut kind) = fitted?;
 
     // 4b. Re-pair through the refit model: the seed is an affine fitted on
     // the matched quads and its accuracy falls off with distance from them
@@ -1193,6 +1271,104 @@ mod tests {
             a.warnings
         );
         assert!((a.scale - 2.0).abs() < 0.01, "scale {}", a.scale);
+    }
+
+    /// Fix round 1 (m1): a seed accurate to a few pixels clears the WCS
+    /// confirmation radius (8 px) and then pairs nothing at the tighter
+    /// pairing radius (2 · 1.9 px). The quad seed gets one turn before the
+    /// frame is failed, and the record says what happened.
+    #[test]
+    fn a_hint_that_confirms_but_cannot_pair_falls_back_to_the_quad_seed() {
+        let (sub, refs, truth) = binned_scene();
+        let (ref_geo, sub_geo) = binned_geometry();
+        let cfg = RegistrationConfig::default();
+        let gate = super::super::scale_gate_for(Some(1.56), Some(0.78));
+
+        let mut stale = truth;
+        stale.m[0][2] += 5.0;
+        let radius_wcs =
+            (WCS_SEED_RADIUS_FACTOR * cfg.ransac_tolerance_px).max(WCS_SEED_RADIUS_MIN_PX);
+        let ref_pts: Vec<(f64, f64)> = refs.iter().map(|s| (s.x, s.y)).collect();
+        let tree = KdTree2::build(&ref_pts);
+        // Fixture premise: 5 px confirms at 8 px and pairs at neither 3.8.
+        assert!(
+            pair_through(&stale, &sub, &refs, &tree, radius_wcs).pairs.len() >= MIN_INLIERS,
+            "the stale seed must clear confirmation"
+        );
+        assert!(
+            pair_through(&stale, &sub, &refs, &tree, 2.0 * cfg.ransac_tolerance_px)
+                .pairs
+                .len()
+                < MIN_INLIERS,
+            "…and then fail the pairing radius"
+        );
+
+        let a = align(&sub, &refs, ref_geo, sub_geo, &cfg, Some(&stale), gate)
+            .expect("the quad seed carries the frame");
+        assert_eq!(a.seed, SeedKind::Quads);
+        assert!(a.seed_matches > 0, "the quad seed's own match count");
+        assert!(
+            a.warnings
+                .iter()
+                .any(|w| w.contains("wcs seed pairing failed")),
+            "{:?}",
+            a.warnings
+        );
+        assert!((a.scale - 2.0).abs() < 0.01, "scale {}", a.scale);
+    }
+
+    /// Fix round 1 (m2): when the WCS seed is discarded AND the quad seed
+    /// then fails, the frame's stored reason (an `AlignError`'s `Display`)
+    /// must still say a plate-solve seed was offered first.
+    #[test]
+    fn a_quad_seed_failure_after_a_discarded_hint_says_so() {
+        assert_eq!(
+            format!(
+                "{}",
+                AlignError::NoSeed {
+                    matches: 3,
+                    after_wcs: false
+                }
+            ),
+            "quad seed failed (3 quad matches)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                AlignError::NoSeed {
+                    matches: 3,
+                    after_wcs: true
+                }
+            ),
+            "quad seed failed (3 quad matches) \
+             after a plate-solve seed was tried and refused"
+        );
+
+        // End to end: an unrelated reference field, with a hint that
+        // cannot confirm — the quad seed has nothing to match either.
+        let subject = field(41, 200, SUB_W, SUB_H);
+        let unrelated = field(42, 200, REF_W, REF_H);
+        let (ref_geo, sub_geo) = binned_geometry();
+        let hint = centred_similarity(
+            2.0,
+            0.0,
+            (SUB_W / 2.0, SUB_H / 2.0),
+            (REF_W * 4.0, REF_H * 4.0),
+        );
+        let err = align(
+            &subject,
+            &unrelated,
+            ref_geo,
+            sub_geo,
+            &RegistrationConfig::default(),
+            Some(&hint),
+            SCALE_RANGE,
+        )
+        .expect_err("nothing can align these");
+        assert!(
+            format!("{err}").contains("plate-solve seed"),
+            "the reason must name the discarded seed: {err}"
+        );
     }
 
     /// The gate's centre is recoverable from the window itself — the

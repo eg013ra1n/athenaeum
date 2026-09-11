@@ -15,7 +15,7 @@
 //! Coordinates are 0-based pixel centres on both sides (`PlateSolveRecord`
 //! and `WcsSolution` agree on this) — there is no ±1 anywhere in here.
 
-use crate::geometry::linear::{fit_affine, Linear, Pair};
+use crate::geometry::{fit_affine, Linear, Pair};
 use crate::plate_solve::PlateSolveRecord;
 
 /// The seed samples a `WCS_SEED_GRID` x `WCS_SEED_GRID` grid of subject
@@ -38,6 +38,26 @@ pub const WCS_SEED_RADIUS_FACTOR: f64 = 4.0;
 /// … with this floor in pixels (a tight RANSAC tolerance must not make the
 /// confirmation stricter than the seed's own accuracy).
 pub const WCS_SEED_RADIUS_MIN_PX: f64 = 8.0;
+/// How far a frame's implied scale ratio to the reference must sit from 1
+/// before the seed is worth building at all (ruling R-T2-1).
+///
+/// The ratio is a quotient of two MEASURED pixel scales — and
+/// `GroupFrame::pixel_scale_arcsec` prefers the stored plate solve, so two
+/// independent solves of one rig land a few parts in ten thousand apart.
+/// Triggering on `ratio != 1.0` exactly would therefore send every frame
+/// of an ordinary same-scale set down the WCS path, which is precisely the
+/// path the M1–M4a pins were measured without. `1e-3` sits two orders
+/// below [`super::SCALE_TOLERANCE`]'s 0.25 and two orders above that
+/// solve-to-solve jitter, so it separates "the same rig, measured twice"
+/// from "genuinely a different sampling" with room on both sides.
+pub const WCS_SEED_RATIO_EPS: f64 = 1e-3;
+
+/// Whether a frame whose implied scale ratio to the reference is `ratio`
+/// is worth attempting a plate-solve seed for (ruling R-T2-1). See
+/// [`WCS_SEED_RATIO_EPS`]; a non-finite ratio is never worth it.
+pub fn ratio_wants_seed(ratio: f64) -> bool {
+    ratio.is_finite() && (ratio - 1.0).abs() > WCS_SEED_RATIO_EPS
+}
 
 /// Subject → reference as an affine, from both frames' stored plate
 /// solves. `subject_geometry` is the subject frame's own `(width, height)`
@@ -214,6 +234,21 @@ mod tests {
         let tiny = solved(4, (1556.0, 1042.0), (300.0, 60.0), 0.0195, 0.0);
         assert!(seed_from_solves(&reference(), &tiny, (6224, 4168)).is_none());
         assert!(WCS_SEED_SCALE_RANGE.0 > 0.0 && WCS_SEED_SCALE_RANGE.1 > WCS_SEED_SCALE_RANGE.0);
+    }
+
+    /// Ruling R-T2-1: two solves of the SAME rig differ in the fourth or
+    /// fifth digit and must not be read as a scale step; a real one must.
+    #[test]
+    fn only_a_real_scale_step_wants_a_seed() {
+        assert_eq!(WCS_SEED_RATIO_EPS, 1e-3);
+        for same in [1.0, 0.7800 / 0.7803, 0.7803 / 0.7800, 1.0004, 0.9995] {
+            assert!(!ratio_wants_seed(same), "{same} is the same sampling");
+        }
+        for stepped in [2.0, 0.5, 1.27, 0.79, 1.0011] {
+            assert!(ratio_wants_seed(stepped), "{stepped} is a real step");
+        }
+        assert!(!ratio_wants_seed(f64::NAN));
+        assert!(!ratio_wants_seed(f64::INFINITY));
     }
 
     #[test]

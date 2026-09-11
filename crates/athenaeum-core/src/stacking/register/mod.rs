@@ -37,15 +37,29 @@ pub const SCALE_TOLERANCE: f64 = 1.25;
 /// bit, so a set whose frames carry no pixel scale at all behaves exactly
 /// as it did before M4b.
 pub fn scale_gate_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -> (f64, f64) {
-    let ratio = match (frame_scale, reference_scale) {
+    let ratio = scale_ratio_for(frame_scale, reference_scale);
+    (ratio / SCALE_TOLERANCE, ratio * SCALE_TOLERANCE)
+}
+
+/// The scale ratio [`scale_gate_for`] centres its window on: `frame /
+/// reference` when both scales are known, finite and positive, else 1.0.
+///
+/// It is public because the WCS-seed trigger (ruling R-T2-1) has to read
+/// the SAME number the gate is built from — deciding "is a scale step
+/// expected here?" by comparing the resulting window against
+/// `align::SCALE_RANGE` would be exact float equality on a quotient of two
+/// measured quantities, and two plate solves of one rig differ in the
+/// fourth digit. One rule, two readers, no way for them to disagree; see
+/// `wcs_seed::ratio_wants_seed` for the tolerance the trigger applies.
+pub fn scale_ratio_for(frame_scale: Option<f64>, reference_scale: Option<f64>) -> f64 {
+    match (frame_scale, reference_scale) {
         (Some(frame), Some(reference))
             if frame.is_finite() && reference.is_finite() && frame > 0.0 && reference > 0.0 =>
         {
             frame / reference
         }
         _ => 1.0,
-    };
-    (ratio / SCALE_TOLERANCE, ratio * SCALE_TOLERANCE)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
@@ -166,6 +180,32 @@ mod tests {
             assert_eq!(scale_gate_for(Some(bad), Some(0.78)), fixed, "{bad}");
             assert_eq!(scale_gate_for(Some(0.78), Some(bad)), fixed, "{bad}");
         }
+    }
+
+    /// Ruling R-T2-1: the gate and the WCS-seed trigger read ONE ratio, so
+    /// they cannot disagree about whether a scale step is expected.
+    #[test]
+    fn the_gate_is_built_from_the_shared_ratio() {
+        for (frame, reference) in [
+            (None, None),
+            (Some(0.78), None),
+            (None, Some(0.78)),
+            (Some(0.78), Some(0.78)),
+            (Some(1.56), Some(0.78)),
+            (Some(0.78), Some(1.56)),
+            (Some(0.7800), Some(0.7803)),
+            (Some(f64::NAN), Some(0.78)),
+            (Some(0.0), Some(0.78)),
+        ] {
+            let r = scale_ratio_for(frame, reference);
+            assert_eq!(
+                scale_gate_for(frame, reference),
+                (r / SCALE_TOLERANCE, r * SCALE_TOLERANCE),
+                "{frame:?} / {reference:?}"
+            );
+        }
+        assert_eq!(scale_ratio_for(Some(1.56), Some(0.78)), 2.0);
+        assert_eq!(scale_ratio_for(None, None), 1.0);
     }
 
     #[test]

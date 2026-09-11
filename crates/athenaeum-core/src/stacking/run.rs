@@ -83,15 +83,14 @@ use crate::stacking::plan::{
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
-use crate::stacking::register::align::SCALE_RANGE;
 use crate::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, to_record, ReferenceStars,
 };
-use crate::stacking::register::scale_gate_for;
-use crate::stacking::register::wcs_seed::seed_from_solves;
+use crate::stacking::register::wcs_seed::{ratio_wants_seed, seed_from_solves};
 use crate::stacking::register::writer::{
     build_registered_cards, source_cards_from_file, write_registered_frame, RegisteredCards,
 };
+use crate::stacking::register::{scale_gate_for, scale_ratio_for};
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{
     best_by_weight, compute_weights, reference_coverage, select_frames, sky_penalized_order,
@@ -2537,11 +2536,19 @@ fn solve_of(
 /// One frame's registration inputs (M4b Task 2, rulings R-M4b-2/3): the
 /// scale window it is judged against, and the optional plate-solve seed.
 ///
-/// The seed is only built when the gate is NOT the fixed M1 window — i.e.
-/// when this frame's own pixel scale says a scale step is expected. A
-/// same-scale set therefore walks the exact M1–M4a code path (no solve
-/// lookups, no hint, byte-identical alignments), and the cross-scale case
-/// is the only one that pays for the seed.
+/// The seed is only built when the frame's own implied ratio to the
+/// reference says a real scale step is expected — ruling R-T2-1, the
+/// [`ratio_wants_seed`] tolerance. Comparing the resulting WINDOW against
+/// `align::SCALE_RANGE` instead would be exact float equality on a
+/// quotient of two MEASURED pixel scales: `GroupFrame::pixel_scale_arcsec`
+/// prefers the stored plate solve, two solves of one rig differ in the
+/// fourth digit, and every frame of an ordinary same-scale set would take
+/// the WCS path — exactly the path M1–M4a's pins were measured without.
+/// Below the tolerance a same-scale set therefore makes no solve lookups
+/// and produces no hint, and the cross-scale case is the only one that
+/// pays for the seed. The gate itself stays centred on the exact ratio
+/// either way — the tolerance decides only whether a seed is worth
+/// building, never how the frame is judged.
 ///
 /// Both passes of stage 5 go through here — the dry two-pass run and the
 /// persisting one — so a frame is never measured against one gate and
@@ -2554,7 +2561,8 @@ fn registration_gate_and_hint(
     reference_scale: Option<f64>,
 ) -> ((f64, f64), Option<Linear>) {
     let scale_gate = scale_gate_for(frame.pixel_scale_arcsec, reference_scale);
-    let hint = if scale_gate == SCALE_RANGE {
+    let ratio = scale_ratio_for(frame.pixel_scale_arcsec, reference_scale);
+    let hint = if !ratio_wants_seed(ratio) {
         None
     } else {
         match (
@@ -7926,9 +7934,21 @@ mod tests {
         (rc, rows)
     }
 
+    /// What three independent solves of ONE rig look like: the same
+    /// sampling, measured to the fourth digit (ruling R-T2-1). The first
+    /// is [`FINE_SCALE_ARCSEC`] itself, since `fine_ids[0]` is the pinned
+    /// reference every ratio is taken against.
+    const FINE_SOLVED_SCALES: [f64; 3] = [FINE_SCALE_ARCSEC, 0.7803, 0.7801];
+
     /// M4b Task 2 (rulings R-M4b-2/3): frames whose own pixel scale is
     /// twice the reference's are judged against a gate centred on 2.0 and
     /// register, and the plate-solve seed is what carried them there.
+    ///
+    /// Ruling R-T2-1 rides on the same run: the three fine frames carry
+    /// solve-to-solve scale jitter (0.7800 / 0.7803 / 0.7801 — ratios
+    /// within 4e-4 of 1), which must NOT be read as a scale step. They
+    /// keep the M1–M4a path: no seed built, no `+wcs` on the row, no
+    /// wcs-seed warning anywhere in the run.
     #[test]
     fn mixed_scale_frames_register_through_the_per_frame_gate() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7936,7 +7956,7 @@ mod tests {
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let (fixture, fine_ids, coarse_ids, working, output) = seed_mixed_scale_group(&db_path);
 
-        for &id in &fine_ids {
+        for (&id, &scale) in fine_ids.iter().zip(FINE_SOLVED_SCALES.iter()) {
             test_fixtures::seed_plate_solve_wcs(
                 &fixture.conn,
                 id,
@@ -7944,7 +7964,7 @@ mod tests {
                 FINE_H,
                 MIXED_RA_DEG,
                 MIXED_DEC_DEG,
-                FINE_SCALE_ARCSEC,
+                scale,
             );
         }
         for &id in &coarse_ids {
@@ -7981,17 +8001,37 @@ mod tests {
                 row.model
             );
         }
+        // Ruling R-T2-1: solve-to-solve jitter is not a scale step.
+        // Fixture premise first — these really are different numbers, and
+        // they really are within the tolerance.
+        for (i, &scale) in FINE_SOLVED_SCALES.iter().enumerate().skip(1) {
+            let ratio = scale / FINE_SOLVED_SCALES[0];
+            assert_ne!(scale, FINE_SOLVED_SCALES[0], "frame {i} must differ");
+            assert!(
+                !ratio_wants_seed(ratio),
+                "frame {i}: ratio {ratio} must read as the same sampling"
+            );
+        }
         for &id in &fine_ids {
             let row = rows.get(&id).unwrap_or_else(|| panic!("no row for {id}"));
             let scale = row.scale.expect("an aligned row carries its scale");
             assert!((scale - 1.0).abs() < 0.02, "{id}: scale {scale}");
-            // Same-scale frames keep the M1 path: the fixed gate, no seed.
+            // Same-scale frames keep the M1-M4a path: no seed was built,
+            // so the row cannot name one …
             assert!(
                 !row.model.as_deref().unwrap_or_default().contains("wcs"),
                 "{id}: {:?}",
                 row.model
             );
         }
+        // … and no hint was even attempted, so no frame reported one being
+        // rejected either (which is what a built-then-refused seed would
+        // have left behind).
+        assert!(
+            !rc.warnings.iter().any(|w| w.contains("wcs seed")),
+            "{:?}",
+            rc.warnings
+        );
         assert_eq!(rows[&fine_ids[0]].status, "reference");
     }
 
