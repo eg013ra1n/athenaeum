@@ -29,16 +29,20 @@
 //!
 //! `cargo run --release -p athenaeum-core --example weight_audit -- \
 //!     [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] [--max-stars <n>] \
-//!     [--min-snr <x>] [--out <file.jsonl>] [--truncate] \
-//!     [--dump-planes <file.bin>] <file>…`
+//!     [--min-snr <x>] [--prefilter none|median3] [--out <file.jsonl>] \
+//!     [--truncate] [--dump-planes <file.bin>] <file>…`
 //!
 //! `--sigma` is `MeasureOptions::detection_sigma` — the seed-detection
 //! threshold in σ above the local background; `--min-snr` is
 //! `MeasureOptions::min_snr`, the flux-SNR floor a detection must clear to
-//! become a fit seed. Both default to the production values.`
+//! become a fit seed; `--prefilter` is `MeasureOptions::seed_prefilter`,
+//! what the seed DETECTION runs on (the fits and every other estimator
+//! always see the untouched plane). All three default to the production
+//! values.`
 use athenaeum_core::stacking::measure::{
     measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedSource,
 };
+use athenaeum_core::stacking::prefilter::SeedPrefilter;
 use athenaeum_core::stacking::psf_signal::PsfModel;
 use serde::Serialize;
 use std::io::Write;
@@ -95,6 +99,7 @@ struct Args {
     psf: PsfModel,
     max_stars: Option<usize>,
     min_snr: Option<f32>,
+    prefilter: Option<SeedPrefilter>,
     out: Option<String>,
     truncate: bool,
     dump_planes: Option<String>,
@@ -102,8 +107,8 @@ struct Args {
 }
 
 const USAGE: &str = "usage: weight_audit [--seed fast|full] [--sigma <k>] [--psf auto|moffat4] \
-[--max-stars <n>] [--min-snr <x>] [--out <file.jsonl>] [--truncate] \
-[--dump-planes <file.bin>] <file>…";
+[--max-stars <n>] [--min-snr <x>] [--prefilter none|median3] [--out <file.jsonl>] \
+[--truncate] [--dump-planes <file.bin>] <file>…";
 
 /// Prints `usage:` context plus `msg` and exits 2 — used for every
 /// argument-parsing failure so a typo'd flag or a missing/non-numeric
@@ -120,6 +125,7 @@ fn parse_args() -> Args {
     let mut psf = PsfModel::Auto;
     let mut max_stars = None;
     let mut min_snr = None;
+    let mut prefilter = None;
     let mut out = None;
     let mut truncate = false;
     let mut dump_planes = None;
@@ -175,6 +181,18 @@ fn parse_args() -> Args {
                     bad_arg(&format!("--min-snr value '{v}' is not a number"))
                 }));
             }
+            "--prefilter" => {
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| bad_arg("--prefilter needs a value (none|median3)"));
+                prefilter = Some(match v.as_str() {
+                    "none" => SeedPrefilter::None,
+                    "median3" => SeedPrefilter::Median3,
+                    other => bad_arg(&format!(
+                        "unknown --prefilter value '{other}' (want none|median3)"
+                    )),
+                });
+            }
             "--out" => {
                 out = Some(
                     it.next()
@@ -203,6 +221,7 @@ fn parse_args() -> Args {
         psf,
         max_stars,
         min_snr,
+        prefilter,
         out,
         truncate,
         dump_planes,
@@ -231,9 +250,16 @@ fn main() {
     if let Some(min_snr) = args.min_snr {
         opts.min_snr = min_snr;
     }
+    if let Some(prefilter) = args.prefilter {
+        opts.seed_prefilter = prefilter;
+    }
     eprintln!(
-        "weight_audit: detection_sigma {} min_snr {} max_stars {} psf {:?}",
-        opts.detection_sigma, opts.min_snr, opts.max_stars, opts.psf_model
+        "weight_audit: detection_sigma {} min_snr {} max_stars {} psf {:?} prefilter {:?}",
+        opts.detection_sigma,
+        opts.min_snr,
+        opts.max_stars,
+        opts.psf_model,
+        opts.seed_prefilter
     );
 
     if let Some(dump_path) = &args.dump_planes {

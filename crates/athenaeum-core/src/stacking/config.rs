@@ -15,6 +15,7 @@ use crate::integration::stats::ScaleEstimator;
 use crate::resample::Interpolation;
 use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
+use crate::stacking::prefilter::SeedPrefilter;
 use crate::stacking::psf_signal::PsfModel;
 use crate::stacking::register::DistortionChoice;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
@@ -112,6 +113,11 @@ pub struct MeasurementConfig {
     /// bright-pixel budget (M4a Task 2, ruling R-M4a-1).
     #[serde(default = "default_detection_sigma")]
     pub detection_sigma: f64,
+    /// What the seed detection runs on (math reference §5.1): the plane as
+    /// it is, or its 3×3 median. Everything downstream of detection always
+    /// measures the untouched plane.
+    #[serde(default)]
+    pub seed_prefilter: SeedPrefilter,
 }
 
 /// Serde default for [`MeasurementConfig::detection_sigma`] — a stored
@@ -130,6 +136,7 @@ impl Default for MeasurementConfig {
             formula: FormulaWeights::default(),
             keyword: "SSWEIGHT".to_string(),
             detection_sigma: default_detection_sigma(),
+            seed_prefilter: crate::stacking::measure::DEFAULT_SEED_PREFILTER,
         }
     }
 }
@@ -150,6 +157,7 @@ impl MeasurementConfig {
             scale_estimator,
             min_snr: MeasureOptions::default().min_snr,
             detection_sigma: self.detection_sigma as f32,
+            seed_prefilter: self.seed_prefilter,
         }
     }
 }
@@ -485,6 +493,7 @@ mod tests {
             "\"exposureToleranceSec\":2.0",
             "\"weightMode\":\"psfSignalWeight\"",
             "\"detectionSigma\":20.0",
+            "\"seedPrefilter\":\"none\"",
             "\"psfModel\":\"auto\"",
             "\"minWeightFraction\":0.05",
             "\"excludeOnRegistrationFailure\":true",
@@ -673,7 +682,7 @@ mod tests {
     /// population, so a cached `stacking_artifacts` row from the other
     /// value must not be reused (spec §9.3).
     #[test]
-    fn config_hash_changes_when_detection_sigma_changes() {
+    fn config_hash_changes_when_the_seed_population_rules_change() {
         let cfg = StackingConfig::default();
         let mut other = cfg.clone();
         other.measurement.detection_sigma += 1.0;
@@ -682,6 +691,16 @@ mod tests {
             stage_hash(&measurement_subtree(&cfg), &[], &[]),
             stage_hash(&measurement_subtree(&other), &[], &[]),
             "the measurement stage hash must follow detectionSigma"
+        );
+        // Same contract for the seed pre-filter: a different detection image
+        // is a different star population.
+        let mut filtered = cfg.clone();
+        filtered.measurement.seed_prefilter = SeedPrefilter::Median3;
+        assert_ne!(config_hash(&cfg), config_hash(&filtered));
+        assert_ne!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&filtered), &[], &[]),
+            "the measurement stage hash must follow seedPrefilter"
         );
     }
 
@@ -768,6 +787,11 @@ mod tests {
         // `MeasurementConfig`, so every cached per-frame measure artifact
         // is recomputed once, which is the point: the old ones were
         // measured with the rank-budget seed population.
-        assert_eq!(default_hash, "fa9fda4f16439679");
+        //
+        // And again in that task's fix round 1 (R-M4a-13): `seedPrefilter`
+        // joins the same subtree. It ships `none`, i.e. today's behaviour,
+        // so nothing about a run changes — but the stored JSON does, so the
+        // fingerprint and the measure-stage hash move once more.
+        assert_eq!(default_hash, "43453e18b82b6b31");
     }
 }

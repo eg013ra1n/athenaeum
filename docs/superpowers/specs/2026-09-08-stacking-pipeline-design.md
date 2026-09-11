@@ -221,7 +221,13 @@ Star detection (noise-relative levels at `background + detectionSigma·noise`
 and half that — spec §9.2 `measurement.detectionSigma`; the rank-budget
 levels this replaced were blind to sky brightness and handed a sharp,
 bright-sky night several times the seed population a soft one got, which
-inverted the frame ranking — M4a Task 2), PSF fitting with the
+inverted the frame ranking — M4a Task 2), optionally on a 3×3 median of the
+plane instead of the plane itself (`measurement.seedPrefilter`, math
+reference §5.1's "hot-pixel filter radius 1" — it suppresses an undersampled
+star's peak ~2.5× harder than a well-sampled one's, which no single
+threshold can express; everything downstream of detection always measures
+the untouched plane, and the shipped default is `none` — see the M4a Task 2
+fix-round-1 report for the grid that left it off), PSF fitting with the
 `psfModel` (`auto` = Moffat β ∈ {2.5, 4, 6, 10} best MAD, or `moffat4`), the
 hybrid PSF/aperture flux at FWTM, RCR-cleaned and Winsorized mean fluxes,
 `M*`/`N*` from the large-scale background residual (MMT residual, scale 256),
@@ -668,7 +674,7 @@ grouping:      { exposureToleranceSec: 2.0 }   -- exposure ALWAYS splits a group
                                                 -- fine, the field is just silently ignored
 calibration:   CalibratedLightOptions (the export's: flat norm, hot pixels on, debayer on)
 measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 24576,
-                 detectionSigma: 20.0,
+                 detectionSigma: 20.0, seedPrefilter: "none",
                  formula: { fwhm: 15, eccentricity: 15, snr: 20, stars: 0, pedestal: 50 },
                  keyword: "SSWEIGHT" }
                 -- detectionSigma: star-detection threshold for the quality measurement in σ
@@ -681,6 +687,11 @@ measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 2457
                 -- the external reference's own on 368 real frames. Changing it changes the
                 -- measurement stage hash, so every cached measure artifact is recomputed
                 -- (R-M4a-9).
+                -- seedPrefilter: "none" | "median3" — the image seed DETECTION runs on
+                -- (math reference §5.1). "median3" trades a genuinely better mono
+                -- measurement and star-count ranking for a much worse OSC blue-channel
+                -- weight correlation, so it ships off (M4a Task 2 fix round 1,
+                -- ruling R-M4a-13). It rides the same stage hash.
 selection:     { minWeightFraction: 0.05, maxFwhmPx: null, maxEccentricity: null,
                  minStars: null, excludeOnRegistrationFailure: true }
 reference:     { mode: "auto" }

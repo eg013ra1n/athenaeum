@@ -298,6 +298,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             "{HEADER}import type {{ ExportReadiness, FlatNormMode, LightCalParams, PathSetting }} from './models';\n\n{}",
             decls![
             crate::resample::Interpolation,
+            crate::stacking::prefilter::SeedPrefilter,
             crate::stacking::psf_signal::PsfModel,
             crate::stacking::weights::WeightMode,
             crate::stacking::weights::FormulaWeights,

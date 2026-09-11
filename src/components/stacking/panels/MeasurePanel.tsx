@@ -5,7 +5,7 @@
 import { RefreshCw } from 'lucide-react';
 import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
 import { psfModelLabel, weightModeLabel } from '../stageSummary';
-import type { PsfModel, StackingConfig, WeightMode } from '../../../types/stacking';
+import type { PsfModel, SeedPrefilter, StackingConfig, WeightMode } from '../../../types/stacking';
 
 const WEIGHT_MODES: WeightMode[] = [
   'psfSignalWeight',
@@ -18,6 +18,13 @@ const WEIGHT_MODES: WeightMode[] = [
 ];
 
 const PSF_MODELS: PsfModel[] = ['auto', 'moffat4'];
+
+const SEED_PREFILTERS: SeedPrefilter[] = ['none', 'median3'];
+
+/** Label for the image the seed detection runs on. */
+function seedPrefilterLabel(v: SeedPrefilter): string {
+  return v === 'median3' ? '3×3 median' : 'none';
+}
 
 /** A formula-weight slider — a plain `<input type="range">`, always a valid
  *  number on every change, so it needs none of `NumericField`'s partial-edit
@@ -208,6 +215,26 @@ export function MeasurePanel({
         disabled={disabled}
         help={`default ${defaults.measurement.detectionSigma} — a star's peak above the local sky, in noise σ. Lower measures more, fainter stars.`}
       />
+
+      <div>
+        <label className="block text-xs text-content-secondary mb-1">Seed pre-filter</label>
+        <select
+          value={m.seedPrefilter}
+          disabled={disabled}
+          onChange={(e) => patchMeasurement({ seedPrefilter: e.target.value as SeedPrefilter })}
+          className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
+        >
+          {SEED_PREFILTERS.map((v) => (
+            <option key={v} value={v}>
+              {seedPrefilterLabel(v)}
+            </option>
+          ))}
+        </select>
+        <p className="mt-1 text-[11px] text-content-muted">
+          default {seedPrefilterLabel(defaults.measurement.seedPrefilter)} — what star
+          detection runs on. The fits themselves always measure the untouched frame.
+        </p>
+      </div>
 
       <div className="pt-3 border-t border-border/60 space-y-3">
         <h4 className="text-xs font-medium text-content-secondary">Selection filters</h4>

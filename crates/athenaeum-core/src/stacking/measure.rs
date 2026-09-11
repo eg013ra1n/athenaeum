@@ -13,6 +13,7 @@ use astroimage::{DetectionLevels, ImageAnalyzer};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use super::prefilter::{self, SeedPrefilter};
 use super::psf_signal::{self, FitParams, PsfModel, Seed};
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{self, LocationScale, ScaleEstimator, CLIP_HI, CLIP_LO};
@@ -34,7 +35,16 @@ pub struct MeasureOptions {
     pub scale_estimator: ScaleEstimator,
     /// The sensitivity dial — a flux-SNR floor on the detections the fitter
     /// is seeded with (the detector's own `flux / sqrt(flux + pi*r_ap^2*sigma^2)`).
+    ///
+    /// Any value at or below 10 is inert: the detector's own scan already
+    /// refuses a detection unless `snr > 10`, so the shipped default of 5
+    /// never removes anything (measured — `--min-snr 10` is bit-identical to
+    /// `--min-snr 5` on 94 real frames). Only a value above 10 cuts.
     pub min_snr: f32,
+    /// What the seed DETECTION runs on (math reference §5.1). The PSF fits,
+    /// the aperture flux, the background model and the noise estimate always
+    /// see the untouched plane, whatever this says.
+    pub seed_prefilter: SeedPrefilter,
     /// Star-detection threshold for the seed population, in sigma above the
     /// LOCAL background (spec §9.2 `measurement.detectionSigma`). The
     /// detector's two ladder levels become `background + k*noise` with
@@ -58,6 +68,7 @@ impl Default for MeasureOptions {
             max_stars: 24576,
             scale_estimator: ScaleEstimator::Bwmv,
             min_snr: 5.0,
+            seed_prefilter: DEFAULT_SEED_PREFILTER,
             detection_sigma: DEFAULT_DETECTION_SIGMA,
         }
     }
@@ -84,6 +95,10 @@ impl Default for MeasureOptions {
 /// night is pushed off the top entirely and the soft nights start losing
 /// more than a quarter of their stars.
 pub const DEFAULT_DETECTION_SIGMA: f32 = 20.0;
+
+/// Default for [`MeasureOptions::seed_prefilter`] and
+/// [`crate::stacking::config::MeasurementConfig::seed_prefilter`].
+pub const DEFAULT_SEED_PREFILTER: SeedPrefilter = SeedPrefilter::None;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -216,6 +231,14 @@ pub fn measure_plane_with_seeds(
 
     let seeds: Vec<Seed> = match seed_source {
         SeedSource::Fast => {
+            // Detection may run on a pre-filtered copy; EVERYTHING after it
+            // (the fits below, `background_residual`, `noise_mrs`, the
+            // sample statistics) stays on the untouched plane.
+            let detect_on = match opts.seed_prefilter {
+                SeedPrefilter::None => None,
+                SeedPrefilter::Median3 => Some(prefilter::median3(&scaled, w, h)),
+            };
+            let detect_data: &[f32] = detect_on.as_deref().unwrap_or(&scaled);
             let mut analyzer = ImageAnalyzer::new()
                 .with_max_stars(opts.max_stars.max(8))
                 .with_centroid_refine(false)
@@ -230,7 +253,7 @@ pub fn measure_plane_with_seeds(
             if let Some(p) = pool {
                 analyzer = analyzer.with_thread_pool(Arc::clone(p));
             }
-            match analyzer.detect_fast_data(&scaled, w, h, 1) {
+            match analyzer.detect_fast_data(detect_data, w, h, 1) {
                 Ok(r) => r
                     .stars
                     .iter()
@@ -424,6 +447,7 @@ pub fn measure_frame_with_seeds(
             psf_signal_weight = m.psf_signal_weight,
             psf_snr = m.psf_snr,
             detection_sigma = opts.detection_sigma,
+            seed_prefilter = ?opts.seed_prefilter,
             duration_ms = t.elapsed().as_millis() as u64,
             "frame plane measured"
         );
@@ -724,6 +748,8 @@ mod tests {
         // now — this used to assert the field's ABSENCE.
         assert_eq!(d.detection_sigma, DEFAULT_DETECTION_SIGMA);
         assert!(json.contains("\"detectionSigma\":20.0"));
+        assert_eq!(d.seed_prefilter, DEFAULT_SEED_PREFILTER);
+        assert!(json.contains("\"seedPrefilter\":\"none\""));
         assert_eq!(
             serde_json::from_str::<MeasureOptions>("{}").unwrap(),
             MeasureOptions::default()

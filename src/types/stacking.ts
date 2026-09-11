@@ -5,6 +5,8 @@ import type { ExportReadiness, FlatNormMode, LightCalParams, PathSetting } from 
 
 export type Interpolation = "nearest" | "bilinear" | "bicubicSpline" | "bicubicBSpline" | "lanczos3" | "lanczos4" | "mitchellNetravali";
 
+export type SeedPrefilter = "none" | "median3";
+
 export type PsfModel = "auto" | "moffat4";
 
 export type WeightMode = "psfSignalWeight" | "psfSnr" | "noise" | "formula" | "exposure" | "keyword" | "none";
@@ -131,7 +133,13 @@ keyword: string,
  * so the seed population follows THIS frame's sky instead of a fixed
  * bright-pixel budget (M4a Task 2, ruling R-M4a-1).
  */
-detectionSigma: number, };
+detectionSigma: number, 
+/**
+ * What the seed detection runs on (math reference §5.1): the plane as
+ * it is, or its 3×3 median. Everything downstream of detection always
+ * measures the untouched plane.
+ */
+seedPrefilter: SeedPrefilter, };
 
 export type ReferenceMode = "auto" | "manual";
 
