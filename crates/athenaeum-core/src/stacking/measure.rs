@@ -229,6 +229,39 @@ pub fn measure_plane_with_seeds(
 ) -> ChannelMeasurement {
     let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
 
+    // The background model and the noise σ are measured FIRST, and on the
+    // UNFILTERED plane, because the seed detection below may need that σ:
+    // a pre-filtered detection copy has its own, smaller noise, and a level
+    // derived from it would move down with the stars the filter attenuates
+    // (M4a Task 2 fix round 2, ruling R-M4a-14). Same numbers as before —
+    // both are pure functions of `scaled` — computed once and reused for
+    // the reported `noise`/`m_star`/`n_star` further down.
+    let bg = match pool {
+        Some(p) => p.install(|| psf_signal::background_residual(&scaled, w, h)),
+        None => psf_signal::background_residual(&scaled, w, h),
+    };
+    let (m_star, n_star) = match bg {
+        Some(v) => v,
+        None => {
+            warn!(
+                width = w,
+                height = h,
+                "large-scale background model unavailable; M* and N* are zero"
+            );
+            (0.0, 0.0)
+        }
+    };
+    let (noise_adu, noise_source) = match psf_signal::noise_mrs(&scaled, w, h) {
+        Some(n) => (n as f64, NoiseSource::Mrs),
+        None => {
+            warn!(
+                n_star,
+                "MRS noise unavailable; using the background residual scale"
+            );
+            (n_star, NoiseSource::BackgroundResidual)
+        }
+    };
+
     let seeds: Vec<Seed> = match seed_source {
         SeedSource::Fast => {
             // Detection may run on a pre-filtered copy; EVERYTHING after it
@@ -239,17 +272,43 @@ pub fn measure_plane_with_seeds(
                 SeedPrefilter::Median3 => Some(prefilter::median3(&scaled, w, h)),
             };
             let detect_data: &[f32] = detect_on.as_deref().unwrap_or(&scaled);
+            // Noise-relative levels, not the detector's default rank budget:
+            // the seed population has to be set by how far above THIS
+            // frame's sky a star stands, not by a bright-pixel count that a
+            // brighter sky silently deepens.
+            //
+            // With a pre-filter on, the σ must come from the UNFILTERED
+            // plane and the levels are handed over in ADU: the 3×3 median
+            // attenuates the noise (≈ 0.42×) as well as the stars, so a
+            // level the detector measured on the filtered copy would fall
+            // with the peaks and the filter would cancel itself — which is
+            // exactly what fix round 1 measured (ruling R-M4a-14).
+            let levels = match opts.seed_prefilter {
+                SeedPrefilter::None => DetectionLevels::NoiseRelative {
+                    k1: opts.detection_sigma,
+                    k2: opts.detection_sigma * 0.5,
+                },
+                SeedPrefilter::Median3 if noise_adu > 0.0 => DetectionLevels::Absolute {
+                    above_bg_1: opts.detection_sigma * noise_adu as f32,
+                    above_bg_2: opts.detection_sigma * 0.5 * noise_adu as f32,
+                },
+                SeedPrefilter::Median3 => {
+                    // Neither MRS nor the background residual produced a
+                    // scale — there is no unfiltered σ to hold the level
+                    // still, so fall back to the filtered copy's own.
+                    warn!(
+                        "no unfiltered noise estimate; the pre-filtered detection loses its threshold anchor"
+                    );
+                    DetectionLevels::NoiseRelative {
+                        k1: opts.detection_sigma,
+                        k2: opts.detection_sigma * 0.5,
+                    }
+                }
+            };
             let mut analyzer = ImageAnalyzer::new()
                 .with_max_stars(opts.max_stars.max(8))
                 .with_centroid_refine(false)
-                // Noise-relative levels, not the detector's default rank
-                // budget: the seed population has to be set by how far
-                // above THIS frame's sky a star stands, not by a
-                // bright-pixel count that a brighter sky silently deepens.
-                .with_detection_levels(DetectionLevels::NoiseRelative {
-                    k1: opts.detection_sigma,
-                    k2: opts.detection_sigma * 0.5,
-                });
+                .with_detection_levels(levels);
             if let Some(p) = pool {
                 analyzer = analyzer.with_thread_pool(Arc::clone(p));
             }
@@ -314,32 +373,6 @@ pub fn measure_plane_with_seeds(
     };
     let totals = psf_signal::signal_totals(&outcome.fits);
     let (fwhm_px, eccentricity) = psf_signal::frame_shape(&outcome.fits).unwrap_or((0.0, 0.0));
-    let bg = match pool {
-        Some(p) => p.install(|| psf_signal::background_residual(&scaled, w, h)),
-        None => psf_signal::background_residual(&scaled, w, h),
-    };
-    let (m_star, n_star) = match bg {
-        Some(v) => v,
-        None => {
-            warn!(
-                width = w,
-                height = h,
-                "large-scale background model unavailable; M* and N* are zero"
-            );
-            (0.0, 0.0)
-        }
-    };
-    let (noise_adu, noise_source) = match psf_signal::noise_mrs(&scaled, w, h) {
-        Some(n) => (n as f64, NoiseSource::Mrs),
-        None => {
-            warn!(
-                n_star,
-                "MRS noise unavailable; using the background residual scale"
-            );
-            (n_star, NoiseSource::BackgroundResidual)
-        }
-    };
-
     let sample = stats::stratified_sample(data, w, h);
     let clipped = stats::clip_sample(&sample, CLIP_LO, CLIP_HI);
     let (median, mad, median_mean_dev) = if clipped.is_empty() {
@@ -733,6 +766,57 @@ mod tests {
             high.stars_fitted,
             low.stars_fitted
         );
+    }
+
+    /// Fix round 2 moved the background/noise computation above detection
+    /// so the seed levels can be anchored on the UNFILTERED plane. That
+    /// reordering must not change a single number on the path that ships
+    /// (`SeedPrefilter::None`), which still asks for `NoiseRelative` and
+    /// therefore for the detector's own σ.
+    #[test]
+    fn the_shipped_prefilter_none_path_is_unchanged_by_the_reorder() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        assert_eq!(opts.seed_prefilter, SeedPrefilter::None);
+        let a = measure_plane(&data, w, h, &opts, None);
+        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
+        assert_eq!(a, b);
+        // The fixture's pinned population, unchanged since Plan 2.
+        assert!(a.stars_fitted >= 120, "fitted {}", a.stars_fitted);
+    }
+
+    /// With the filter on, the levels are anchored on the unfiltered noise
+    /// — so the filter's own attenuation of the noise cannot move them.
+    /// On this fixture the median suppresses the (σ 1.8 px, well-sampled)
+    /// stars only mildly, so the population survives; what the test pins is
+    /// that the two settings are genuinely different measurements and that
+    /// the filtered one does not collapse.
+    #[test]
+    fn the_median_prefilter_keeps_a_well_sampled_population() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let plain = measure_plane(&data, w, h, &MeasureOptions::default(), None);
+        let filtered = measure_plane(
+            &data,
+            w,
+            h,
+            &MeasureOptions {
+                seed_prefilter: SeedPrefilter::Median3,
+                ..MeasureOptions::default()
+            },
+            None,
+        );
+        assert_ne!(plain, filtered, "the pre-filter must change something");
+        assert!(
+            filtered.stars_fitted >= 100,
+            "a well-sampled field survives the median: {} vs {}",
+            filtered.stars_fitted,
+            plain.stars_fitted
+        );
+        // Everything downstream of detection reads the untouched plane, so
+        // the noise and the background model are bit-identical.
+        assert_eq!(filtered.noise, plain.noise);
+        assert_eq!((filtered.m_star, filtered.n_star), (plain.m_star, plain.n_star));
+        assert_eq!(filtered.median, plain.median);
     }
 
     #[test]

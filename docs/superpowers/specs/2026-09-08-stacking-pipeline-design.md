@@ -226,8 +226,12 @@ plane instead of the plane itself (`measurement.seedPrefilter`, math
 reference §5.1's "hot-pixel filter radius 1" — it suppresses an undersampled
 star's peak ~2.5× harder than a well-sampled one's, which no single
 threshold can express; everything downstream of detection always measures
-the untouched plane, and the shipped default is `none` — see the M4a Task 2
-fix-round-1 report for the grid that left it off), PSF fitting with the
+the untouched plane, and when the filter is on the detection LEVELS are
+computed from the unfiltered plane's own noise and handed to the detector in
+ADU — a median attenuates the noise as well as the stars, so a level derived
+from the filtered copy would move with the peaks and the filter would cancel
+itself. The shipped default is `none`; see the M4a Task 2 fix rounds 1-2 for
+the two grids that left it off), PSF fitting with the
 `psfModel` (`auto` = Moffat β ∈ {2.5, 4, 6, 10} best MAD, or `moffat4`), the
 hybrid PSF/aperture flux at FWTM, RCR-cleaned and Winsorized mean fluxes,
 `M*`/`N*` from the large-scale background residual (MMT residual, scale 256),
@@ -688,10 +692,15 @@ measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 2457
                 -- measurement stage hash, so every cached measure artifact is recomputed
                 -- (R-M4a-9).
                 -- seedPrefilter: "none" | "median3" — the image seed DETECTION runs on
-                -- (math reference §5.1). "median3" trades a genuinely better mono
-                -- measurement and star-count ranking for a much worse OSC blue-channel
-                -- weight correlation, so it ships off (M4a Task 2 fix round 1,
-                -- ruling R-M4a-13). It rides the same stage hash.
+                -- (math reference §5.1). With "median3" the levels come from the
+                -- UNFILTERED plane's noise, in ADU (ruling R-M4a-14) — otherwise the
+                -- filter cancels itself. It measurably separates sharp from soft
+                -- frames the way the reference does (the OSC red channel's
+                -- bright/dark fits-ratio spread 2.60 -> 1.95, the mono weight-rank
+                -- correlation 0.919 -> 0.97), but it also cuts the mono fit count to
+                -- 0.5-0.8 of the reference's and leaves the OSC blue channel's weight
+                -- correlation at ~0.4, so it ships off (M4a Task 2 fix rounds 1-2).
+                -- It rides the same stage hash.
 selection:     { minWeightFraction: 0.05, maxFwhmPx: null, maxEccentricity: null,
                  minStars: null, excludeOnRegistrationFailure: true }
 reference:     { mode: "auto" }
