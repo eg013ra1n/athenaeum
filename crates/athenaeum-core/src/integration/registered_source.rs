@@ -568,40 +568,50 @@ mod tests {
     // needed for mixed pixel scales, the existing `PixelMap`/`warp_rows`
     // machinery already does the right thing "by construction". ──
 
-    #[test]
-    fn a_coarse_frame_registered_at_double_scale_upsamples_level_and_resolution() {
-        const SUB_W: usize = 200;
-        const SUB_H: usize = 150;
-        const REF_W: usize = 400;
-        const REF_H: usize = 300;
-        const LEVEL: f32 = 0.25;
-        const BG: f32 = 100.0;
-        const SIGMA_SUB: f64 = 1.5;
-        const STAR: (f64, f64, f64) = (100.0, 75.0, 5000.0);
+    const CROSS_SCALE_SUB_W: usize = 200;
+    const CROSS_SCALE_SUB_H: usize = 150;
+    const CROSS_SCALE_REF_W: usize = 400;
+    const CROSS_SCALE_REF_H: usize = 300;
 
-        // Subject → reference: a pure ×2 registration scale (no rotation, no
-        // translation) — a coarse frame registered onto a reference of
-        // twice the linear resolution, the same shape a real WCS-seeded
-        // mixed-pixel-scale registration produces.
+    /// Subject → reference: a pure ×2 registration scale (no rotation, no
+    /// translation) — a coarse frame registered onto a reference of twice
+    /// the linear resolution, the same shape a real WCS-seeded
+    /// mixed-pixel-scale registration produces. Shared by every cross-scale
+    /// pin below (M4b Task 4, ruling R-M4b-6) and by the sibling pins in
+    /// `stacking::drizzle::tests`.
+    fn cross_scale_map() -> PixelMap {
         let fwd = Linear {
             kind: LinearKind::Affine,
             m: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]],
         };
-        let map = PixelMap::linear(fwd).unwrap();
+        PixelMap::linear(fwd).unwrap()
+    }
+
+    // ── Cross-scale pin, level (M4b Task 4, ruling R-M4b-6). ──
+
+    #[test]
+    fn a_coarse_frame_registered_at_double_scale_upsamples_the_level_with_a_nan_margin() {
+        const LEVEL: f32 = 0.25;
 
         let dir = tempfile::tempdir().unwrap();
-
-        // (a) level: a uniform 0.25 subject, read through the ×2 map.
-        let flat = vec![LEVEL; SUB_W * SUB_H];
+        let flat = vec![LEVEL; CROSS_SCALE_SUB_W * CROSS_SCALE_SUB_H];
         let flat_path = dir.path().join("flat.fits");
-        write_fits_f32(&flat_path, SUB_W, SUB_H, 1, &flat, &[]).unwrap();
+        write_fits_f32(
+            &flat_path,
+            CROSS_SCALE_SUB_W,
+            CROSS_SCALE_SUB_H,
+            1,
+            &flat,
+            &[],
+        )
+        .unwrap();
         let flat_src = RegisteredSource::open(
             &[RegisteredFrame {
                 path: flat_path,
-                map: map.clone(),
+                map: cross_scale_map(),
             }],
-            REF_W,
-            REF_H,
+            CROSS_SCALE_REF_W,
+            CROSS_SCALE_REF_H,
             0,
             Interpolation::BicubicBSpline,
             0.3,
@@ -611,23 +621,23 @@ mod tests {
         flat_src
             .read_band_with_progress(
                 0,
-                REF_H,
+                CROSS_SCALE_REF_H,
                 &mut flat_planes,
                 1,
                 &|_| {},
                 &AtomicBool::new(false),
             )
             .unwrap();
-        let mut flat_out = vec![0f32; REF_H * REF_W];
+        let mut flat_out = vec![0f32; CROSS_SCALE_REF_H * CROSS_SCALE_REF_W];
         flat_planes.decode_frame_into(0, &mut flat_out);
 
         // The subject's own last valid pixel (199, 149) maps to (398, 298)
         // — the interior — leaving a one-pixel margin (x=399 or y=299,
         // subject x/y = 199.5) that must read NaN, never a wrong level.
-        for y in 0..REF_H {
-            for x in 0..REF_W {
-                let v = flat_out[y * REF_W + x];
-                if x <= 2 * SUB_W - 2 && y <= 2 * SUB_H - 2 {
+        for y in 0..CROSS_SCALE_REF_H {
+            for x in 0..CROSS_SCALE_REF_W {
+                let v = flat_out[y * CROSS_SCALE_REF_W + x];
+                if x <= 2 * CROSS_SCALE_SUB_W - 2 && y <= 2 * CROSS_SCALE_SUB_H - 2 {
                     assert!(
                         (v - LEVEL).abs() < 1e-6,
                         "interior ({x},{y}) v={v}, expected {LEVEL}"
@@ -637,20 +647,42 @@ mod tests {
                 }
             }
         }
+    }
 
-        // (b) resolution follows the scale — no sharpening: a subject-space
-        // Gaussian of sigma 1.5 px, read through the same ×2 map, lands at
-        // twice the subject position with sigma ≈ 3.0 px.
-        let star_data = gaussian_field(SUB_W, SUB_H, &[STAR], SIGMA_SUB, BG);
+    // ── Cross-scale pin, resolution (M4b Task 4, ruling R-M4b-6). ──
+
+    #[test]
+    fn a_coarse_frame_registered_at_double_scale_preserves_centroid_and_broadens_sigma_by_the_scale()
+    {
+        const BG: f32 = 100.0;
+        const SIGMA_SUB: f64 = 1.5;
+        const STAR: (f64, f64, f64) = (100.0, 75.0, 5000.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let star_data = gaussian_field(
+            CROSS_SCALE_SUB_W,
+            CROSS_SCALE_SUB_H,
+            &[STAR],
+            SIGMA_SUB,
+            BG,
+        );
         let star_path = dir.path().join("star.fits");
-        write_fits_f32(&star_path, SUB_W, SUB_H, 1, &star_data, &[]).unwrap();
+        write_fits_f32(
+            &star_path,
+            CROSS_SCALE_SUB_W,
+            CROSS_SCALE_SUB_H,
+            1,
+            &star_data,
+            &[],
+        )
+        .unwrap();
         let star_src = RegisteredSource::open(
             &[RegisteredFrame {
                 path: star_path,
-                map,
+                map: cross_scale_map(),
             }],
-            REF_W,
-            REF_H,
+            CROSS_SCALE_REF_W,
+            CROSS_SCALE_REF_H,
             0,
             Interpolation::BicubicBSpline,
             0.3,
@@ -660,18 +692,18 @@ mod tests {
         star_src
             .read_band_with_progress(
                 0,
-                REF_H,
+                CROSS_SCALE_REF_H,
                 &mut star_planes,
                 1,
                 &|_| {},
                 &AtomicBool::new(false),
             )
             .unwrap();
-        let mut star_out = vec![0f32; REF_H * REF_W];
+        let mut star_out = vec![0f32; CROSS_SCALE_REF_H * CROSS_SCALE_REF_W];
         star_planes.decode_frame_into(0, &mut star_out);
 
         let (ex, ey) = (2.0 * STAR.0, 2.0 * STAR.1);
-        let (cx, cy) = centroid(&star_out, REF_W, ex, ey, 15, BG);
+        let (cx, cy) = centroid(&star_out, CROSS_SCALE_REF_W, ex, ey, 15, BG);
         assert!(
             (cx - ex).abs() < 0.05 && (cy - ey).abs() < 0.05,
             "centroid ({cx},{cy}) vs expected ({ex},{ey})"
@@ -686,10 +718,17 @@ mod tests {
         let (mut sxx, mut syy, mut sw) = (0.0f64, 0.0f64, 0.0f64);
         for y in (icy - r)..=(icy + r) {
             for x in (icx - r)..=(icx + r) {
-                let v = star_out[y as usize * REF_W + x as usize];
+                let v = star_out[y as usize * CROSS_SCALE_REF_W + x as usize];
                 if !v.is_finite() {
                     continue;
                 }
+                // The fixture is noise-free (`gaussian_field` on a flat
+                // background, no `add_noise`), so this clamp only ever
+                // discards the kernel's own small negative ringing lobes,
+                // never real negative-going noise — on a noisy field the
+                // same clamp would bias the measured sigma low by
+                // truncating negative-flux samples the ideal estimator
+                // would keep.
                 let val = (v - BG).max(0.0) as f64;
                 let (dx, dy) = (x as f64 - ex, y as f64 - ey);
                 sxx += val * dx * dx;
@@ -698,18 +737,26 @@ mod tests {
             }
         }
         let sigma_ref = (((sxx + syy) / sw) / 2.0).sqrt();
-        let expected_sigma = 2.0 * SIGMA_SUB;
-        // 0.25 px covers the ~0.21 px this measures (the BicubicBSpline
-        // kernel is the SMOOTHING B-spline — it does not interpolate
-        // exactly through the source samples, see `stacking::ln::grid`'s
-        // module doc for the same kernel's documented smoothing bias — so a
-        // few percent of broadening on top of the pure ×2 scale is
-        // expected, not a defect); a swapped or missing scale factor would
-        // miss by whole pixels, not a fraction of one.
+        // The honest prediction is NOT a bare ×2 scale of the source sigma:
+        // the BicubicBSpline kernel is the SMOOTHING B-spline (see
+        // `stacking::ln::grid`'s module doc for the same kernel's
+        // documented smoothing bias) — it convolves the source signal with
+        // its own kernel, of variance 1/3 source-px², BEFORE the ×2
+        // geometric scale stretches the result into reference pixels.
+        // Variances add under convolution, so the reference sigma is
+        // `scale · sqrt(sigma_sub² + kernel_var)`, not `scale · sigma_sub`:
+        // `2 · sqrt(1.5² + 1/3) = 3.21460...`, matching the measured
+        // 3.2145 to four significant figures. A symmetric band around the
+        // naive `2 · sigma_sub = 3.0` would admit up to ~8% SHARPENING —
+        // exactly what ruling R-M4b-6 forbids — so the tolerance below is
+        // centred on the honest prediction, not on the naive one.
+        let kernel_var_source_px2 = 1.0 / 3.0;
+        let expected_sigma = 2.0 * (SIGMA_SUB * SIGMA_SUB + kernel_var_source_px2).sqrt();
         assert!(
-            (sigma_ref - expected_sigma).abs() < 0.25,
+            (sigma_ref - expected_sigma).abs() < 0.02,
             "measured sigma {sigma_ref} (2nd-moment estimator) vs expected {expected_sigma} \
-             (subject sigma {SIGMA_SUB} × the ×2 registration scale)"
+             (subject sigma {SIGMA_SUB} convolved with the B-spline kernel's own variance, \
+             × the ×2 registration scale)"
         );
     }
 }

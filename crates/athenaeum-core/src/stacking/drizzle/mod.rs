@@ -2023,4 +2023,120 @@ mod tests {
             assert!(checked > 0, "scale={scale}: the interior region was empty");
         }
     }
+
+    // ── LN cross-scale pin (M4b Task 4 fix round 1, review finding I1,
+    // ruling R-M4b-6): `local_normalization_index_is_not_transposed` above
+    // only ever exercises `deposit_band`'s LN lookup at an IDENTITY map,
+    // where "source pixel" and "reference pixel" are the same coordinate
+    // and cannot distinguish a correct reference-coordinate lookup from a
+    // hypothetical source-coordinate one. This drives the SAME real
+    // `deposit_band` code (`ctx.map.forward`, `round_half_up`,
+    // `a_plane[iy * ctx.ref_width + ix]`, ~L796-831 above) through the ×2
+    // registration map Steps 1/2 use, where the two coordinates genuinely
+    // differ, so the assertion below fails if that lookup ever indexed the
+    // grid by the untransformed source pixel instead of the forward-mapped
+    // reference one. ──
+
+    #[test]
+    fn a_coarse_frame_applies_local_normalization_at_the_mapped_reference_cell_not_the_source_one()
+    {
+        const SUB_W: usize = 200;
+        const SUB_H: usize = 150;
+        const REF_W: usize = 400;
+        const REF_H: usize = 300;
+        const VALUE: f32 = 0.2;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = uniform(SUB_W, SUB_H, VALUE);
+        let p0 = write_mono(dir.path(), "f0.fits", SUB_W, SUB_H, &data);
+
+        // The same ×2 registration map as the level/coverage pin above and
+        // the resampler pin (`integration::registered_source::tests`):
+        // subject (100, 75) forward-maps to reference (200, 150).
+        let fwd = Linear {
+            kind: LinearKind::Affine,
+            m: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let map = PixelMap::linear(fwd).unwrap();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+
+        // `b` ramps by reference NODE column (stride 32 at scale 256), 0.1
+        // per node — the same ramp `local_normalization_index_is_not_transposed`
+        // above uses, built this time in the 400×300 REFERENCE geometry
+        // rather than the (identity-mapped) 64×48 source/reference the
+        // other test shares.
+        let mut grid = LnGrid::constant(REF_W, REF_H, 256, 1.0, 0.0);
+        let (gw, gh) = (grid.gw, grid.gh);
+        for j in 0..gh {
+            for i in 0..gw {
+                grid.b[j * gw + i] = i as f32 * 0.1;
+            }
+        }
+        let grids = LnFrameGrids {
+            channels: vec![grid.clone()],
+        };
+
+        let f_ln = DrizzleFrame {
+            path: &p0,
+            map: &map,
+            weight: &weight,
+            output_pair: &pair,
+            ln: Some(&grids),
+            rej: None,
+        };
+        let frames = [f_ln];
+        let measure = MeasureOptions::default();
+        let input = DrizzleInput {
+            frames: &frames,
+            width: REF_W,
+            height: REF_H,
+            channels: 1,
+            scale: 1, // output pixel == reference pixel, exactly
+            drop_shrink: 1.0,
+            kernel: DrizzleKernel::Square,
+            use_weights: true,
+            use_rejection: false,
+            use_local_normalization: true,
+            write_weight_map: true,
+            measure: &measure,
+            ram_total_bytes: None,
+        };
+
+        // Ground truth: the SAME evaluator `deposit_band` calls, run
+        // independently — once at the MAPPED reference row (150, what a
+        // correct lookup reads) and once at the raw SOURCE row (75, what a
+        // source-coordinate bug would read).
+        let mut scratch = LnScratch::for_grid(&grid);
+        let (mut a_ref_row, mut b_ref_row) = (vec![0f32; REF_W], vec![0f32; REF_W]);
+        grid.evaluate_row_into(150, &mut a_ref_row, &mut b_ref_row, &mut scratch);
+        let (mut a_src_row, mut b_src_row) = (vec![0f32; REF_W], vec![0f32; REF_W]);
+        grid.evaluate_row_into(75, &mut a_src_row, &mut b_src_row, &mut scratch);
+        let expected_at_reference_cell = a_ref_row[200] * VALUE + b_ref_row[200];
+        let expected_if_indexed_by_source = a_src_row[100] * VALUE + b_src_row[100];
+        assert!(
+            (expected_at_reference_cell - expected_if_indexed_by_source).abs() > 0.01,
+            "not vacuous: the reference-cell and would-be source-cell predictions \
+             must differ ({expected_at_reference_cell} vs {expected_if_indexed_by_source})"
+        );
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+
+        // Subject (100, 75)'s drop (drop_shrink=1.0) lands entirely inside
+        // output pixel (200, 150) at drizzle scale=1 — the only subject
+        // pixel that reaches it — so that output pixel's value is exactly
+        // this one deposit's normalized sample, nothing blended in.
+        let actual = out.data[150 * REF_W + 200] as f64;
+        assert!(
+            (actual - expected_at_reference_cell as f64).abs() < 1e-4,
+            "actual={actual} expected(reference cell)={expected_at_reference_cell} \
+             expected(if indexed by source cell)={expected_if_indexed_by_source}"
+        );
+        assert!(
+            (actual - expected_if_indexed_by_source as f64).abs() > 0.01,
+            "actual={actual} must NOT match the source-indexed prediction \
+             {expected_if_indexed_by_source} — that would mean the lookup used the \
+             untransformed source coordinate"
+        );
+    }
 }
