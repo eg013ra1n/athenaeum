@@ -217,8 +217,24 @@ both top-20 frame rankings agreeing with the reference. Report:
   3×3 median pre-filter on the detection image (rulings R-M4a-13/-14, the
   option ships off) closed ~20 % of it and cost the blue channel's weight
   correlation. Closing it properly needs the rest of the reference's
-  structure-map front end (math reference §5.1) and is an M4c item, not a
-  smoke.
+  structure-map front end (math reference §5.1) — tracked as M4c Task 0
+  (the structure-map seed detector, ruling R-M4c-11), not a smoke.
+- **Plan-gate note (twoPass).** With `reference.twoPass` on,
+  `plan.rs::compute_register_stale` (ruling R-M4a-6) correctly reports
+  Register "not stale" against a switched reference — but the two-pass
+  pick's own dry pass over the reference's group is NOT cached and reruns
+  on every run regardless of staleness (bounded, ≈ 1–2 min on the LDN 1272
+  acceptance set). Informational, not a bug.
+- **Cleanup candidate: `MeasureOptions.min_snr ≤ 10` is inert.** The
+  detector's own gate (`snr > 10`) already excludes everything a
+  `min_snr` at or below 10 would filter, so such a config value changes
+  nothing measurable; noted for a future cleanup pass, not fixed here.
+- **Two pre-existing load flakes seen during M4a** (both pass in
+  isolation, both predate this cycle — not new regressions): the M3
+  drizzle `rej/run-<id>` cleanup-on-cancel tests (a race that Task 4's
+  RAII de-registration change narrows but does not fully close) and
+  `sync::ingest_tests::ingest_releases_conn_between_frames` (a
+  self-documented timing probe).
 
 ### Stacking M3 — drizzle (2026-09-10)
 
@@ -241,6 +257,10 @@ Task 8. Two misses/gaps recorded below.
   makes the normalization anchor and the LN-reference members robust to it;
   the integration weights themselves are still ours. Audit the noise/flux
   terms on debayered frames against the external per-frame values.
+  → M4a Task 2 (landed `f37fea8a`) — noise-relative measurement seeds
+  address the root cause (ruling R-M4a-1); the residual is tracked in the
+  Stacking M4a section above. NOT deleted here — Task 7's acceptance run
+  confirms it.
 - **M4 item: the OSC drizzle is ≈ 10 % broader than the external one by the
   fitted FWHM** (G/B ratios 0.83 / 0.82 vs 0.75 / 0.74) while the same bright
   stars' half-maximum radii are 4 % smaller in ours and our drizzle carries
@@ -254,11 +274,18 @@ Task 8. Two misses/gaps recorded below.
   the top frames the one closest to the median transform and re-register
   (≈ 1–2 min). Task 8's 97 % coverage filter protects the normalization
   anchor and the LN members only.
+  → M4a Task 4 (landed `829f255c`, rulings R-M4a-5/6/18) — shipped as
+  described. NOT deleted here — Task 7's acceptance run confirms it.
 - **M4 item: `measure_probe`'s XISF branch is unreliable** — it disagrees with
   the raw Float32 attachment on every external file tried (mono drizzle 4.35
   vs 4.95 px). Select the integration `<Image>` explicitly and verify the plane
   layout, or drop the branch; the acceptance note's numbers all come from
   FITS conversions of the raw attachments.
+  → M4a Task 1 (landed `c20d7676`, ruling R-M4a-11) — the reader fix
+  ships (largest `<Image>` wins, `byteOrder`/`bounds` honoured); the two
+  probes' own `Float32` arm never dividing by 65535 was the actual bug,
+  fixed in `examples/measure_probe.rs` and `examples/weight_audit.rs`. NOT
+  deleted here — Task 7's acceptance run confirms it.
 - **Provisional constant:** `DRIZZLE_SECONDS_PER_PLANE_AT_2X = 1.2` in
   `stageSummary.ts` measured 1.17 s (mono) / 1.33 s (OSC per plane) on a
   clean 16 GB machine — keep; revisit with the M4 performance work.
@@ -304,6 +331,9 @@ misses, both recorded below.
   5.0/3.5. The under-rejection carried since M1 is therefore a dispersion
   calibration of `2·adev·sqrt(1+b²)`, not an LN or reference problem. M4
   calibrates the estimate so the shipped 5.0/3.5 reproduces ≈ 2.8 %.
+  → M4a Task 3 (landed `b931d657`) — the robust minimum-absolute-deviation
+  line ships with `LINEAR_FIT_SIGMA_SCALE = 1.0`; the calibration round
+  itself is Task 7's acceptance run. NOT deleted here — Task 7 confirms it.
 - **Owed:** the owner's own click-through of the LN block on the desktop
   build (Enable local normalization, scale, reference frames, the `local`
   rejection-normalization option and its 5 s reset notice, `LN: n/m frames`

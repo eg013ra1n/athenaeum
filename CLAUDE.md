@@ -414,7 +414,20 @@ weight, or the user's pinned choice via `set_frame_set_reference`; this
 frame REGISTERS every group — since ruling R-M3-17 (2026-09-10) it no
 longer anchors normalization, which every group instead picks sky-
 penalized: `s = weight / sqrt(background)`, so a dark-sky frame outranks a
-brighter-sky one of similar weight) → `Register` (registration v2:
+brighter-sky one of similar weight. With `reference.twoPass` (default
+true, M4a) an Auto reference first registers its OWN group in a dry pass
+(no rows, no artifacts), takes the median rotation/translation of the
+successful alignments, scores the top `TWO_PASS_CANDIDATES = 10` frames by
+weight by their corner displacement from that median (`hypot(Δθ_rad·D/2,
+|Δt|)`, `D` the reference diagonal), and switches to the closest one when
+the current reference is worse by ≥ `TWO_PASS_MIN_GAIN_PX = 4.0` px
+(`stacking/weights.rs::two_pass_pick`) — a switch updates the run row, the
+summary's `reference.switchedFrom` and adds one run warning; Manual
+references never move and the `FastPreview` preset turns it off
+(R-M4a-18); the plan-time stale check keys on the last run's recorded
+reference so a switch doesn't make Register stale next time (R-M4a-6),
+but the dry pass itself is uncached and runs every time) → `Register`
+(registration v2:
 quad-seeded RANSAC + distortion) → `Normalize`
 (local normalization, M2 — see below; a no-op when
 `normalization.local.enabled` is off and `normalization.rejection` isn't
@@ -491,7 +504,12 @@ roots as `"scan"`, plan 5b ruling 6). Per-set override lives in
 — a stored per-set document, when present, IS the run's config with no
 field-level merge against the global default; only with no per-set override
 does the global default JSON apply the same way, and with neither, the
-built-in default.
+built-in default. M4a added `measurement.detectionSigma` and
+`reference.twoPass` to `StackingConfig` as `#[serde(default)]` fields with
+no `STACKING_CONFIG_VERSION` bump (both decode from every stored
+document); both fold into the per-stage `config_hash` above, so the
+Measure stage's cache invalidated for every set on the first M4a run
+(R-M4a-9).
 
 **Beyond M1** (spec §14): **M2** — local normalization (MMT background
 models, PSF-flux scale with RCR, `.athln` sidecars, `NormalizePanel`'s LN
@@ -649,6 +667,78 @@ conventions nor registration distortion (M4 item, together with the OSC
 PSF-weight sky-penalty audit). Drizzle time on this 16 GB Mac: mono 4.2 min,
 OSC 13.5 min (three planes). Plan:
 `docs/superpowers/plans/2026-09-10-stacking-m3-plan-drizzle.md`.
+
+**M4a — quality** (`docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`,
+closes the quality items the M2/M3 acceptance runs left open): measurement
+(stage 3) seeds are now noise-relative instead of rank-budgeted. The root
+cause of the OSC bright-sky/dark-sky weight inversion was
+`ImageAnalyzer::detect_fast_data`'s `star_levels` picking its two
+detection levels by a fixed bright-pixel HISTOGRAM RANK budget
+(`6·maxStars`/`24·maxStars`), which a sharp night fills for free and a
+bright sky pays nothing extra for (ruling R-M4a-1); rustafits'
+`DetectionLevels::{RankBudget, NoiseRelative, Absolute}` hook
+(`with_detection_levels`) now lets the pipeline pass `NoiseRelative { k1:
+σ, k2: σ/2 }`, keyed by `measurement.detectionSigma` (default 20, clamped
+to `[1, 100]` in `resolve_config`), and stops the detector's ladder there.
+The PSF fit grows the external tool's adaptive sampling region (start
+`max(nominal/2, 3)`, grow while the median drops ≥ 1 %, cap
+`min(2·nominal, 48)`) and inner-region acceptance (`inner_margin` 0.15);
+`psf_signal::PSF_FIT_VERSION` (= 2) folds into both the measurement and
+the LN artifact hashes (R-M4a-15), so a fitter change recomputes cached
+metrics AND `.athln` sidecars together. `measurement.seedPrefilter`
+(`none` default | `median3`, a 3×3 median on the DETECTION copy only,
+thresholds from the unfiltered noise) shipped as an option after two
+calibration rounds showed it depletes the star population (R-M4a-13/14);
+the residual OSC sharp-night excess is M4c Task 0 (a structure-map
+detector, R-M4c-11). Calibration on the external tool's 368 calibrated
+LDN 1272 frames (`examples/weight_audit.rs` +
+`docs/superpowers/research/scripts/weight_audit_compare.py`): mono
+per-night fit ratios 1.01/1.05/0.82, PSFSW Spearman 0.92, top-20 18/20;
+OSC 0.91/0.80/0.68, top-20 14/20 (baseline: mono 1.11–1.21 / 0.924 / 18;
+OSC 1.6–7.6× / 0.93/0.86/0.44 / 12); 10 PASS / 12 MISS of the R-M4a-2
+targets vs 7/15 before. Rejection (stage 7) `LinearFitClip` now fits the
+sorted stack against rank with the minimum-absolute-deviation line
+(`integration/combine.rs::medfit_line`: intercept = median of `y − b·x`,
+slope bracketed and bisected on the sign of `Σ x·sgn(residual)`,
+warm-started from the previous iteration, exact-root early return,
+`select_nth` median) instead of the least-squares one; dispersion `s =
+LINEAR_FIT_SIGMA_SCALE · 2 · adev` with `LINEAR_FIT_SIGMA_SCALE = 1.0`
+until Task 7 calibrates it once (target 2.3–3.3 % rejected at the Auto
+5.0/3.5; M2 measured 0.83/0.74 % with the least-squares line); cost ≈
+8.5× the old line at n = 200 end to end (≈ 16 µs per pixel stack, ≈ 40 s
+per 26 Mpx plane on this Mac), accepted by R-M4a-17. Reference resolution
+now includes the two-pass dry-run pick described under the `Reference`
+stage above (`reference.twoPass`, default true, rulings R-M4a-5/6/18).
+The XISF reader (rustafits `formats/xisf.rs`) now picks the largest
+`<Image>` (ties keep the first — the external tool's masters carry a
+same-size weight-map image after the data) and honours `byteOrder="big"`
+and `bounds="lo:hi"`; the u16-domain float convention (samples × 65535)
+stays a cross-crate contract (`integration/banded.rs::spill_via_read_raw`,
+`analysis/analyzer.rs`, R-M4a-11) — the M3 "XISF branch untrustworthy"
+finding was the two probes' own `Float32` arm never dividing by 65535,
+fixed in `examples/measure_probe.rs` and `examples/weight_audit.rs`. Two
+measured LN hot spots (Task 5) came out without changing any output
+number: `LnScratch::for_grid` now precomputes one `wx_table` of 4-tap
+B-spline weights per `stride` value once per grid, and
+`grid.rs::evaluate_row_into` indexes it instead of recomputing
+`BicubicBSpline::weights()` for every pixel — a call-count reduction from
+`ref_height·ref_width` to `stride` per plane, amortized across every row
+and every channel sharing one grid; and `LnReferenceForDetection::build`
+(`ln/mod.rs`) borrows an all-finite reference plane as `Cow::Borrowed`
+instead of always cloning it, paying the sanitizing copy only when a
+plane genuinely carries a non-finite pixel. Ruling R-M4a-19 accepted the
+table's `fx = r/stride` differing from the old per-pixel `fx = tx −
+tx.floor()` by up to 8.1e-5 at non-power-of-two strides (evaluated row
+values drifting up to 6.3e-6) — the table's formula is the MORE accurate
+of the two (the old one's f32 rounding error grows with `x`), pinned at a
+widened 1e-4 tolerance with the reasoning attached rather than silently
+loosened; the power-of-two case (the default scale 1024 → stride 128) is
+bit-identical and its pin tightened to 1e-9. The run thread de-registers
+its cancel handle through an RAII guard as the LAST thing it does (Task 4
+fix round — the old early removal raced tests waiting on
+`stacking-complete`/`rej/` cleanup). Rulings R-M4a-1…R-M4a-19 live in the
+plan's header (`docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`);
+cite it. **Acceptance run: pending (Task 7).**
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,robust,integrate,

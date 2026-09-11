@@ -510,7 +510,11 @@ functions build calibration masters and their output is fingerprint-pinned:
   would reject about twice as hard as the WBPP run they are copied from.
   The reference's slope term sqrt(1 + b²) is omitted: it is inert on [0, 1]
   input and dimensionally wrong on the ADU-scale stacks the master builder
-  feeds (it silenced the rejection there); M4's robust line fit revisits it.
+  feeds (it silenced the rejection there). The robust minimum-absolute-deviation
+  line lands in M4a (`integration/combine.rs::medfit_line`, still omitting
+  the slope term for the same reason); the dispersion constant
+  (`LINEAR_FIT_SIGMA_SCALE`) is calibrated by the M4a acceptance run
+  (Task 7), not fixed here.
   Master builds never select linear fit automatically (their Auto is
   Winsorized / percentile / median), so only a master built with an explicit
   linear-fit recipe changes; that test pin is re-measured in the same task.
@@ -1110,11 +1114,25 @@ WCS, `DrizzlePanel` live, acceptance (FWHM ratio vs WBPP drizzle).
 
 ### M4 — polish
 
-Thin-plate spline distortion (+ local distortion loop), ESD, RCR, min/max,
-large-scale rejection, Bayer drizzle (stage 1 keeps the CFA mosaic), XISF
-output, cataloging masters (a `master_light` entity linked to the set and a
-preview in the Results cards), preset management, **mixed pixel scales in
-one set** (co-registered and native modes, §15 — owner requirement).
+Split into four plans, each with its own acceptance re-run:
+
+- **M4a — quality** (`docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`):
+  the OSC PSF Signal Weight ranking that inverts bright-sky/dark-sky night
+  order, the linear-fit rejection dispersion constant, a two-pass
+  registration-reference pick, the XISF reader fix, two local-normalization
+  hot spots, and the LDN 1272 re-acceptance.
+- **M4b — mixed pixel scales** (`docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`):
+  the plan-gate scale-spread warning, a per-frame registration scale gate,
+  WCS-seeded alignment across scales, and the co-registered / native modes
+  (§15 — owner requirement).
+- **M4c — rejection and registration algorithms** (`docs/superpowers/plans/2026-09-10-stacking-m4c-plan-algorithms.md`,
+  incl. Task 0, the structure-map seed detector): ESD, RCR, min/max and
+  large-scale rejection, the Winsorized-sigma reference re-pin, thin-plate-spline
+  distortion with the local distortion loop, and LN's local-scale spline.
+- **M4d — outputs and product** (`docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`):
+  Bayer drizzle, XISF output, cataloging masters (a `master_lights` entity
+  linked to the set and a preview in the Results cards), and preset
+  management.
 
 ## 15. Deferred and open
 
