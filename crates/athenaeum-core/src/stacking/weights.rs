@@ -451,6 +451,178 @@ pub(crate) fn sky_penalized_order(
 /// own median background — see that function's doc for the rationale.
 const SKY_BACKGROUND_FLOOR_FRACTION: f64 = 0.01;
 
+// ── The two-pass registration reference (spec §4.4, ruling R-M4a-5) ─────────
+
+/// One candidate for the two-pass registration reference (spec §4.4, ruling
+/// R-M4a-5): a frame of the reference's OWN group that pass 1 aligned
+/// successfully, carrying that alignment's rotation and translation as
+/// measured against the CURRENT reference.
+///
+/// `idx` is the caller's own index into that group's entries
+/// (`RunContext::measured[group_key]`), returned verbatim by
+/// [`two_pass_pick`]; `weight` is the frame's
+/// [`FrameWeight::normalized_mean`]. The current reference is a candidate
+/// too, with the identity transform (`rotation_deg = 0.0`, `translation =
+/// (0.0, 0.0)`) — it has to be, or the rule below would have nothing to
+/// compare it against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TwoPassCandidate {
+    pub idx: usize,
+    pub weight: f64,
+    pub rotation_deg: f64,
+    pub translation: (f64, f64),
+}
+
+/// How many of the highest-weighted candidates the two-pass pick chooses
+/// among (ruling R-M4a-5). The re-pick is a tie-break among frames that are
+/// ALREADY good enough to be the reference on quality grounds — it must
+/// never trade a deep, sharp frame for a shallow one just because the
+/// shallow one sits closer to the set's median pointing.
+pub(crate) const TWO_PASS_CANDIDATES: usize = 10;
+
+/// How much corner displacement (px) the switch has to BUY before it
+/// happens (ruling R-M4a-5). Below this the current reference stays: every
+/// frame in a normal set sits within a few px of the median transform, and
+/// swapping the reference for a sub-pixel gain would only invalidate the
+/// whole set's cached registration for nothing.
+pub(crate) const TWO_PASS_MIN_GAIN_PX: f64 = 4.0;
+
+/// The candidates whose numbers can be reasoned about at all — a non-finite
+/// weight, rotation or translation component (a degenerate fit that still
+/// reported success) is dropped here, BEFORE the median, so one such frame
+/// cannot poison the whole set's median and cannot be picked itself.
+fn two_pass_usable(candidates: &[TwoPassCandidate]) -> Vec<TwoPassCandidate> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|c| {
+            c.weight.is_finite()
+                && c.rotation_deg.is_finite()
+                && c.translation.0.is_finite()
+                && c.translation.1.is_finite()
+        })
+        .collect()
+}
+
+fn median_of(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        0.5 * (values[n / 2 - 1] + values[n / 2])
+    }
+}
+
+/// The set's median transform: the COORDINATE-WISE median of the rotation
+/// and of each translation component over every usable candidate (ruling
+/// R-M4a-5 — over all of them, not only the top
+/// [`TWO_PASS_CANDIDATES`] by weight: the median is what "where this set
+/// actually points" means, and the weight ranking has nothing to do with
+/// that). `None` on an empty set.
+fn two_pass_median(usable: &[TwoPassCandidate]) -> Option<(f64, f64, f64)> {
+    if usable.is_empty() {
+        return None;
+    }
+    let mut rot: Vec<f64> = usable.iter().map(|c| c.rotation_deg).collect();
+    let mut tx: Vec<f64> = usable.iter().map(|c| c.translation.0).collect();
+    let mut ty: Vec<f64> = usable.iter().map(|c| c.translation.1).collect();
+    Some((median_of(&mut rot), median_of(&mut tx), median_of(&mut ty)))
+}
+
+/// One candidate's corner displacement from the median transform (ruling
+/// R-M4a-5):
+///
+/// ```text
+/// d = sqrt((Δθ_rad · D/2)² + |Δt|²)
+/// ```
+///
+/// `D` is the reference frame's diagonal in px, so `D/2` is the radius of
+/// the frame's farthest pixel from its centre and `Δθ_rad · D/2` is how far
+/// a rotation offset of `Δθ` moves that corner. The translation term is in
+/// the same unit, so the two add in quadrature and the whole score reads as
+/// "how many px of field this frame's pointing costs against the set's own
+/// median".
+fn two_pass_deviation(c: &TwoPassCandidate, median: (f64, f64, f64), diagonal_px: f64) -> f64 {
+    let (m_rot, m_tx, m_ty) = median;
+    let rot_px = (c.rotation_deg - m_rot).to_radians() * diagonal_px / 2.0;
+    let dt = (c.translation.0 - m_tx).hypot(c.translation.1 - m_ty);
+    rot_px.hypot(dt)
+}
+
+/// One candidate's [`two_pass_deviation`] against the same median
+/// [`two_pass_pick`] uses — the corner-displacement number the run logs and
+/// reports (`corner_px_before` / `corner_px_after`) for the frames it
+/// switched between. `None` when `idx` is not a usable candidate.
+pub(crate) fn two_pass_deviation_px(
+    candidates: &[TwoPassCandidate],
+    idx: usize,
+    diagonal_px: f64,
+) -> Option<f64> {
+    let usable = two_pass_usable(candidates);
+    let median = two_pass_median(&usable)?;
+    usable
+        .iter()
+        .find(|c| c.idx == idx)
+        .map(|c| two_pass_deviation(c, median, diagonal_px))
+}
+
+/// The two-pass registration reference re-pick (spec §4.4, ruling
+/// R-M4a-5). `candidates` are the reference group's included frames that
+/// pass 1 aligned successfully, the current reference among them with the
+/// identity transform; `reference_idx` is that reference's own
+/// [`TwoPassCandidate::idx`].
+///
+/// Takes the set's median transform ([`two_pass_median`]), scores the top
+/// [`TWO_PASS_CANDIDATES`] frames BY WEIGHT (the registration reference is
+/// a geometry/quality choice — the sky-penalized order of
+/// [`sky_penalized_order`] is for normalization only, ruling R-M3-17) by
+/// their corner displacement from that median, and returns the argmin's
+/// `idx` — but ONLY when it buys at least `min_gain_px` of corner
+/// displacement over the current reference's own. `None` otherwise: no
+/// usable candidate, the reference itself not among them, the reference
+/// already the argmin, or the gain below the floor.
+///
+/// Weight ties inside the top-N cut are broken by the lower `idx`, and so
+/// are deviation ties among the finalists — [`best_by_weight`]'s own
+/// star-count tie-break is not expressible here (a candidate carries no
+/// star count), and a deterministic answer matters more than matching that
+/// rule on an exact tie.
+pub(crate) fn two_pass_pick(
+    candidates: &[TwoPassCandidate],
+    reference_idx: usize,
+    diagonal_px: f64,
+    min_gain_px: f64,
+) -> Option<usize> {
+    if !diagonal_px.is_finite() || diagonal_px <= 0.0 {
+        return None;
+    }
+    let mut usable = two_pass_usable(candidates);
+    let median = two_pass_median(&usable)?;
+    let reference_px = usable
+        .iter()
+        .find(|c| c.idx == reference_idx)
+        .map(|c| two_pass_deviation(c, median, diagonal_px))?;
+
+    usable.sort_by(|a, b| b.weight.total_cmp(&a.weight).then(a.idx.cmp(&b.idx)));
+    usable.truncate(TWO_PASS_CANDIDATES);
+
+    let best = usable.iter().min_by(|a, b| {
+        two_pass_deviation(a, median, diagonal_px)
+            .total_cmp(&two_pass_deviation(b, median, diagonal_px))
+            .then(a.idx.cmp(&b.idx))
+    })?;
+    if best.idx == reference_idx {
+        return None;
+    }
+    let best_px = two_pass_deviation(best, median, diagonal_px);
+    if reference_px - best_px >= min_gain_px {
+        Some(best.idx)
+    } else {
+        None
+    }
+}
+
 /// Minimum [`reference_coverage`] fraction for a candidate to be
 /// admissible as the normalization anchor or an LN-reference member (spec
 /// §4.4, ruling R-M3-17 v2 addendum). Fix round 1, Important 6: the
@@ -1121,6 +1293,250 @@ mod tests {
             Some(1),
             "the rotated frame 0 must be skipped for frame 1 (best among the \
              covering candidates): order={order:?}"
+        );
+    }
+    // ── two-pass registration reference (M4a Task 4, ruling R-M4a-5) ───────
+
+    /// A deterministic uniform source, so the "N(0, sigma)" spreads below
+    /// are the SAME numbers on every machine and every run — a two-pass
+    /// test that occasionally flips its verdict would be worse than no
+    /// test at all.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn uniform(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        /// Box-Muller, one of the two deviates kept.
+        fn normal(&mut self) -> f64 {
+            let u1 = self.uniform().max(1e-12);
+            let u2 = self.uniform();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    const TEST_DIAGONAL_PX: f64 = 7211.102550927978; // hypot(6000, 4000)
+
+    fn cand(idx: usize, weight: f64, rotation_deg: f64, tx: f64, ty: f64) -> TwoPassCandidate {
+        TwoPassCandidate {
+            idx,
+            weight,
+            rotation_deg,
+            translation: (tx, ty),
+        }
+    }
+
+    /// The corner displacement, recomputed independently of the shipped
+    /// helpers (same formula, written out) so these tests measure the rule
+    /// rather than echo the implementation.
+    fn deviations(candidates: &[TwoPassCandidate], diagonal_px: f64) -> Vec<(usize, f64)> {
+        let usable: Vec<&TwoPassCandidate> = candidates
+            .iter()
+            .filter(|c| {
+                c.weight.is_finite()
+                    && c.rotation_deg.is_finite()
+                    && c.translation.0.is_finite()
+                    && c.translation.1.is_finite()
+            })
+            .collect();
+        let mid = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            let n = v.len();
+            if n % 2 == 1 {
+                v[n / 2]
+            } else {
+                0.5 * (v[n / 2 - 1] + v[n / 2])
+            }
+        };
+        let m_rot = mid(usable.iter().map(|c| c.rotation_deg).collect());
+        let m_tx = mid(usable.iter().map(|c| c.translation.0).collect());
+        let m_ty = mid(usable.iter().map(|c| c.translation.1).collect());
+        usable
+            .iter()
+            .map(|c| {
+                let rot_px =
+                    (c.rotation_deg - m_rot) * std::f64::consts::PI / 180.0 * diagonal_px / 2.0;
+                let dt =
+                    ((c.translation.0 - m_tx).powi(2) + (c.translation.1 - m_ty).powi(2)).sqrt();
+                (c.idx, (rot_px * rot_px + dt * dt).sqrt())
+            })
+            .collect()
+    }
+
+    /// 30 frames of a normal set plus a reference that is rotated 0.6 deg
+    /// and offset (40, -25) px from them: at 6000x4000 that is ~38 px of
+    /// corner displacement from the rotation alone and ~47 px from the
+    /// offset, far past the 4 px floor — the pick switches, to the
+    /// top-10-by-weight frame closest to the set's median transform.
+    #[test]
+    fn two_pass_switches_away_from_a_deviating_reference() {
+        let mut rng = Lcg(0x5eed_1234);
+        let mut candidates = vec![cand(0, 1.0, 0.6, 40.0, -25.0)];
+        for i in 1..30usize {
+            candidates.push(cand(
+                i,
+                1.0 - i as f64 * 0.01,
+                0.05 * rng.normal(),
+                3.0 * rng.normal(),
+                3.0 * rng.normal(),
+            ));
+        }
+
+        let picked = two_pass_pick(&candidates, 0, TEST_DIAGONAL_PX, TWO_PASS_MIN_GAIN_PX)
+            .expect("a 0.6 deg / 47 px reference must be re-picked");
+        assert_ne!(picked, 0, "the deviating reference must not stay");
+
+        // The weights descend with the index, so the top 10 are 0..=9.
+        assert!(
+            picked < TWO_PASS_CANDIDATES,
+            "picked {picked} is outside the top-{TWO_PASS_CANDIDATES} by weight"
+        );
+
+        let d = deviations(&candidates, TEST_DIAGONAL_PX);
+        let d_of = |i: usize| d.iter().find(|(k, _)| *k == i).unwrap().1;
+        for i in 0..TWO_PASS_CANDIDATES {
+            assert!(
+                d_of(picked) <= d_of(i) + 1e-12,
+                "frame {i} (d={:.4}) is closer to the median than the picked {picked} (d={:.4})",
+                d_of(i),
+                d_of(picked)
+            );
+        }
+        assert!(
+            d_of(0) - d_of(picked) >= TWO_PASS_MIN_GAIN_PX,
+            "the switch must buy at least {TWO_PASS_MIN_GAIN_PX} px: {:.3} -> {:.3}",
+            d_of(0),
+            d_of(picked)
+        );
+
+        // The same numbers the run logs as corner_px_before/after.
+        let before = two_pass_deviation_px(&candidates, 0, TEST_DIAGONAL_PX).unwrap();
+        let after = two_pass_deviation_px(&candidates, picked, TEST_DIAGONAL_PX).unwrap();
+        assert!((before - d_of(0)).abs() < 1e-9);
+        assert!((after - d_of(picked)).abs() < 1e-9);
+    }
+
+    /// The SAME set with a reference that is merely 0.02 deg / (1, 1) px
+    /// off the median: the gain is ~2 px, below the 4 px floor, so nothing
+    /// moves. Every frame of a normal set sits this close to the median —
+    /// switching here would invalidate the whole set's cached registration
+    /// for a sub-pixel improvement.
+    #[test]
+    fn two_pass_keeps_a_reference_whose_gain_is_below_the_floor() {
+        let mut rng = Lcg(0x5eed_1234);
+        let mut candidates = vec![cand(0, 1.0, 0.02, 1.0, 1.0)];
+        for i in 1..30usize {
+            candidates.push(cand(
+                i,
+                1.0 - i as f64 * 0.01,
+                0.05 * rng.normal(),
+                3.0 * rng.normal(),
+                3.0 * rng.normal(),
+            ));
+        }
+
+        let d = deviations(&candidates, TEST_DIAGONAL_PX);
+        let d_ref = d.iter().find(|(k, _)| *k == 0).unwrap().1;
+        let d_best = d
+            .iter()
+            .filter(|(k, _)| *k < TWO_PASS_CANDIDATES)
+            .map(|(_, v)| *v)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            d_ref - d_best < TWO_PASS_MIN_GAIN_PX,
+            "fixture invalid: the gain {:.3} px is already past the floor",
+            d_ref - d_best
+        );
+
+        assert_eq!(
+            two_pass_pick(&candidates, 0, TEST_DIAGONAL_PX, TWO_PASS_MIN_GAIN_PX),
+            None
+        );
+    }
+
+    /// The argmin is taken among the top [`TWO_PASS_CANDIDATES`] by weight
+    /// ONLY: frame 10 sits exactly on the median transform (d = 0) but
+    /// ranks 11th by weight, so it is never the answer — frame 1, the
+    /// lowest-indexed of the nine top-weighted frames 6 px off the median,
+    /// is.
+    #[test]
+    fn two_pass_ignores_a_perfect_frame_outside_the_top_weights() {
+        let mut candidates = vec![cand(0, 1.00, 0.6, 40.0, -25.0)];
+        // Nine frames at +-6 px, five of them negative so the median tx
+        // lands on 0 — where frame 10 (the 11th by weight) sits.
+        for i in 1..=9usize {
+            let tx = if i <= 5 { -6.0 } else { 6.0 };
+            candidates.push(cand(i, 0.99 - i as f64 * 0.01, 0.0, tx, 0.0));
+        }
+        candidates.push(cand(10, 0.10, 0.0, 0.0, 0.0));
+
+        let d = deviations(&candidates, TEST_DIAGONAL_PX);
+        let d_of = |i: usize| d.iter().find(|(k, _)| *k == i).unwrap().1;
+        assert!(
+            d_of(10) < 1e-12,
+            "fixture invalid: frame 10 must sit on the median"
+        );
+        assert!(
+            d.iter().all(|(_, v)| *v >= d_of(10)),
+            "fixture invalid: frame 10 must be the global argmin"
+        );
+
+        let picked = two_pass_pick(&candidates, 0, TEST_DIAGONAL_PX, TWO_PASS_MIN_GAIN_PX)
+            .expect("the reference deviates far past the floor");
+        assert_ne!(
+            picked, 10,
+            "an 11th-ranked frame must not become the reference"
+        );
+        assert_eq!(picked, 1, "the lowest-indexed top-weighted argmin wins");
+    }
+
+    /// A candidate whose fit reported success but whose numbers are not
+    /// finite is dropped before the median AND before the ranking — it can
+    /// neither poison the median nor be picked, however high its weight.
+    #[test]
+    fn two_pass_skips_non_finite_candidates() {
+        let candidates = vec![
+            cand(0, 1.00, 0.6, 40.0, -25.0),
+            cand(1, 0.90, 0.0, 0.0, 0.0),
+            cand(2, 0.95, f64::NAN, 0.0, 0.0),
+            cand(3, 0.80, 0.0, 0.0, 0.0),
+            cand(4, 0.70, 0.0, 0.0, 0.0),
+            cand(5, 0.96, 0.0, f64::INFINITY, 0.0),
+        ];
+
+        let picked = two_pass_pick(&candidates, 0, TEST_DIAGONAL_PX, TWO_PASS_MIN_GAIN_PX)
+            .expect("the reference deviates far past the floor");
+        assert_eq!(
+            picked, 1,
+            "the non-finite frames 2 and 5 outrank frame 1 by weight and must still be skipped"
+        );
+        assert!(two_pass_deviation_px(&candidates, 2, TEST_DIAGONAL_PX).is_none());
+        assert!(two_pass_deviation_px(&candidates, 5, TEST_DIAGONAL_PX).is_none());
+    }
+
+    /// Degenerate inputs answer honestly rather than picking something: no
+    /// candidates at all, a reference that is not among them, and a
+    /// non-positive diagonal.
+    #[test]
+    fn two_pass_refuses_degenerate_inputs() {
+        assert_eq!(
+            two_pass_pick(&[], 0, TEST_DIAGONAL_PX, TWO_PASS_MIN_GAIN_PX),
+            None
+        );
+        let candidates = vec![cand(1, 0.9, 0.0, 0.0, 0.0), cand(2, 0.8, 0.0, 1.0, 0.0)];
+        assert_eq!(
+            two_pass_pick(&candidates, 0, TEST_DIAGONAL_PX, TWO_PASS_MIN_GAIN_PX),
+            None,
+            "a reference that pass 1 never aligned cannot be compared"
+        );
+        assert_eq!(
+            two_pass_pick(&candidates, 1, 0.0, TWO_PASS_MIN_GAIN_PX),
+            None,
+            "a zero diagonal makes the rotation term meaningless"
         );
     }
 }

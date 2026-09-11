@@ -3546,6 +3546,111 @@ mod tests {
         );
     }
 
+    /// Ruling R-M4a-6: after a run whose two-pass pick MOVED the reference
+    /// (the run row records the frame it switched TO, and stage 5's
+    /// persisting pass wrote every `registration_results` row against that
+    /// same frame), the next plan with the same config must NOT call
+    /// Register stale — otherwise every plan after a switch would demand a
+    /// re-registration and every run would pay two passes again.
+    ///
+    /// The rule needed no new code: [`compute_register_stale`] in `Auto`
+    /// mode already takes the expected reference from the LAST RUN's own
+    /// `stacking_runs.reference_frame_id`, which is exactly what
+    /// `run.rs`'s switch updates (`set_run_reference`). This test is the
+    /// pin on that.
+    ///
+    /// Flipping `reference.twoPass` off does NOT make Register stale
+    /// either, and deliberately so: the registration stage hash folds in
+    /// `cfg.registration` and the resolved `reference_frame_id`, never
+    /// `cfg.reference` — the toggle says HOW a reference gets chosen, and
+    /// the stored rows already record WHICH frame it was. (The Auto rule
+    /// is an approximation in both directions — it cannot know what stage 4
+    /// will pick next time without measuring the set first; a run that then
+    /// resolves a different reference re-registers and the NEXT plan sees
+    /// it, which is scenario (e) of
+    /// `register_stale_auto_mode_follows_the_runs_own_reference`.)
+    #[test]
+    fn register_stale_accepts_a_two_pass_switched_reference() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let cfg = StackingConfig::default();
+        assert_eq!(cfg.reference.mode, ReferenceMode::Auto);
+        assert!(cfg.reference.two_pass, "the default is on");
+
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+
+        let mut divisors = DivisorCache::new();
+        let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            calib_hashes.insert(gf.frame_id, hash);
+        }
+
+        // The run STARTED on ids[0] (best weight) and the two-pass pick
+        // switched it to ids[1]; `set_run_reference` left the row naming
+        // ids[1], and pass 2 wrote every row against ids[1].
+        let switched_to = ids[1];
+        seed_run_frame_rows(&f.conn, f.set_id, Some(switched_to), "auto", &ids);
+
+        let reference_hash = calib_hashes.get(&switched_to).unwrap().clone();
+        for &frame_id in &ids {
+            let frame_hash = calib_hashes.get(&frame_id).unwrap();
+            let expected = registration_hash_for(&cfg, switched_to, &reference_hash, frame_hash);
+            let is_reference = frame_id == switched_to;
+            let rec = RegistrationRecord {
+                frames_set_id: f.set_id,
+                frame_id,
+                reference_frame_id: switched_to,
+                is_reference,
+                status: if is_reference { "reference" } else { "aligned" }.to_string(),
+                compute_time_ms: 0,
+                registered_at: "2025-01-01T00:00:00Z".to_string(),
+                config_hash: Some(expected),
+                source_kind: Some("calibrated".to_string()),
+                ..RegistrationRecord::default()
+            };
+            crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
+        }
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Register),
+            "a switched reference the rows already name must not be stale: {:?}",
+            plan.stale_stages
+        );
+
+        let mut off = cfg.clone();
+        off.reference.two_pass = false;
+        let plan_off = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(off),
+        )
+        .unwrap();
+        assert!(
+            !plan_off.stale_stages.contains(&Stage::Register),
+            "reference.twoPass is not part of the registration stage hash: {:?}",
+            plan_off.stale_stages
+        );
+    }
     /// Final fix wave item 3, scenario (d): with no previous run at all,
     /// Register is always stale — nothing to compare against, regardless of
     /// reference mode.

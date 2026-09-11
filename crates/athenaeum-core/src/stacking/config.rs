@@ -170,10 +170,39 @@ impl MeasurementConfig {
 }
 
 /// spec §9.2 `reference:`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ReferenceConfig {
     pub mode: ReferenceMode,
+    /// The two-pass registration reference (spec §4.4, ruling R-M4a-5):
+    /// with `mode = Auto`, stage 5 registers the reference's OWN group once
+    /// without persisting anything, then re-picks the reference among the
+    /// top-weighted frames closest to that group's median transform before
+    /// the real, persisting pass runs. Ignored in `Manual` mode — a pinned
+    /// reference never moves. Default ON: a run whose reference happens to
+    /// be the one frame the mount was nudged on rotates every master and
+    /// loses its corners, and the dry pass costs one extra registration of
+    /// one group.
+    ///
+    /// `#[serde(default = "default_two_pass")]` (ruling R-M4a-9): a config
+    /// stored before M4a has no such field and must decode to `true`, not
+    /// to `false`.
+    #[serde(default = "default_two_pass")]
+    pub two_pass: bool,
+}
+
+/// Serde default for [`ReferenceConfig::two_pass`] — see its doc comment.
+fn default_two_pass() -> bool {
+    true
+}
+
+impl Default for ReferenceConfig {
+    fn default() -> Self {
+        ReferenceConfig {
+            mode: ReferenceMode::default(),
+            two_pass: default_two_pass(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
@@ -552,6 +581,51 @@ mod tests {
         assert!(!c.drizzle.enabled);
         assert_eq!(c.output.cleanup, CleanupPolicy::KeepAll);
         assert!(c.paths.working_dir.is_none());
+        assert!(c.reference.two_pass);
+    }
+
+    /// Ruling R-M4a-9: a `reference` block stored before M4a carries only
+    /// `mode`, and it must decode to the shipped default (`twoPass: true`)
+    /// rather than to `false` — the whole point of `#[serde(default =
+    /// "default_two_pass")]`. The wire name is `twoPass`.
+    #[test]
+    fn a_pre_m4a_reference_block_decodes_with_two_pass_on() {
+        let c: StackingConfig = serde_json::from_str(r#"{"reference":{"mode":"manual"}}"#).unwrap();
+        assert_eq!(c.reference.mode, ReferenceMode::Manual);
+        assert!(c.reference.two_pass);
+
+        let off: StackingConfig =
+            serde_json::from_str(r#"{"reference":{"mode":"auto","twoPass":false}}"#).unwrap();
+        assert!(!off.reference.two_pass);
+
+        let json = serde_json::to_value(StackingConfig::default()).unwrap();
+        assert_eq!(json["reference"]["twoPass"], serde_json::json!(true));
+    }
+
+    /// `reference.twoPass` changes the RUN fingerprint (a different run,
+    /// recorded as such) but no STAGE hash: nothing about a stored
+    /// calibrated/measured/registered artifact depends on how the
+    /// reference was chosen, only on WHICH frame it is — and that already
+    /// rides `registration_hash_for`'s own `reference_frame_id` argument.
+    #[test]
+    fn two_pass_moves_the_config_hash_but_no_stage_hash() {
+        let cfg = StackingConfig::default();
+        let mut other = cfg.clone();
+        other.reference.two_pass = !cfg.reference.two_pass;
+        assert_ne!(config_hash(&cfg), config_hash(&other));
+        assert_eq!(
+            stage_hash(&registration_subtree(&cfg), &[], &[]),
+            stage_hash(&registration_subtree(&other), &[], &[]),
+            "the registration stage hash must not follow reference.twoPass"
+        );
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&other), &[], &[]),
+        );
+        assert_eq!(
+            stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            stage_hash(&calibration_subtree(&other), &[], &[]),
+        );
     }
 
     #[test]
@@ -569,7 +643,7 @@ mod tests {
             "\"psfModel\":\"auto\"",
             "\"minWeightFraction\":0.05",
             "\"excludeOnRegistrationFailure\":true",
-            "\"reference\":{\"mode\":\"auto\"}",
+            "\"reference\":{\"mode\":\"auto\",\"twoPass\":true}",
             "\"interpolation\":\"bicubicBSpline\"",
             "\"clampingThreshold\":0.3",
             "\"output\":\"additiveWithScaling\"",
@@ -956,6 +1030,12 @@ mod tests {
         // joins the same subtree. It ships `none`, i.e. today's behaviour,
         // so nothing about a run changes — but the stored JSON does, so the
         // fingerprint and the measure-stage hash move once more.
-        assert_eq!(default_hash, "43453e18b82b6b31");
+        //
+        // Moved once more here (M4a Task 4, rulings R-M4a-5/R-M4a-9):
+        // `reference.twoPass` joins `ReferenceConfig`. No STAGE hash folds
+        // in `reference` (`registration_subtree` is `cfg.registration`
+        // alone), so not one cached per-frame artifact goes stale over it —
+        // only this whole-config fingerprint moves.
+        assert_eq!(default_hash, "766fa93652078e3f");
     }
 }

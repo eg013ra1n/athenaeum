@@ -346,6 +346,45 @@ lift that guarantee.
 The LN reference's member list (§5.2) is ranked the same sky-penalized way,
 not by raw weight — see the note there.
 
+**Amendment (2026-09-11, ruling R-M4a-5, M4a Task 4) — the two-pass
+reference.** Two-pass reference is Auto-only and dry-first. With
+`reference.mode = auto` and `reference.twoPass = true` (default true),
+stage 5 registers the reference's OWN group once WITHOUT writing
+`registration_results` rows or registered artifacts (pass 1), takes the
+median rotation and translation of the successful alignments, scores the
+top `TWO_PASS_CANDIDATES = 10` frames by normalized weight (the group's
+`best_by_weight` order — the registration reference is a geometry/quality
+choice, the sky-penalized order is for normalization only, ruling R-M3-17)
+by their corner displacement from the median transform
+`d = sqrt((Δθ_rad · D/2)² + |Δt|²)` (`D` the reference frame's diagonal in
+px), and switches the reference to the argmin when the current reference's
+own `d` exceeds the best candidate's by at least
+`TWO_PASS_MIN_GAIN_PX = 4.0` px; pass 2 is the existing persisting loop
+over every group with the final reference. Manual references never move. A
+switch updates `stacking_runs.reference_frame_id`, the summary's reference
+block, and adds one run warning `reference switched by the two-pass pick:
+<old> → <new> (corner displacement <d_old> → <d_new> px)`. Pass 1 is
+bounded by the reference group's size (≈ 1–2 min on the acceptance set);
+pass-1 star lists are NOT cached across passes (simplicity; the cost is
+bounded).
+
+Why it exists: stage 4 picks on weight alone, so on a set where the mount
+was nudged (or a meridian flip left one night a fraction of a degree off),
+the best-weighted frame can be the one frame whose pointing the rest of the
+set does NOT share — and every master then adopts that frame's geometry and
+loses its corners. The dry pass is the only way to know a frame's rotation
+and offset: they are measured by registration, which stage 4 runs before.
+
+The stale check honours a switched reference (ruling R-M4a-6):
+`plan.rs::compute_register_stale` in `Auto` mode already takes the expected
+reference from the LAST run's own `stacking_runs.reference_frame_id`, which
+is exactly what the switch writes — so a plan after a switch does not call
+Register stale and no run pays two passes twice for the same answer.
+`reference.twoPass` is deliberately NOT part of the registration stage hash
+(`registration_subtree` is `cfg.registration` plus the resolved
+`reference_frame_id`): the toggle says HOW the reference is chosen, and a
+stored row already records WHICH frame it was.
+
 ## 5. Normalization
 
 ### 5.1 Global (M1)
@@ -703,7 +742,13 @@ measurement:   { weightMode: "psfSignalWeight", psfModel: "auto", maxStars: 2457
                 -- It rides the same stage hash.
 selection:     { minWeightFraction: 0.05, maxFwhmPx: null, maxEccentricity: null,
                  minStars: null, excludeOnRegistrationFailure: true }
-reference:     { mode: "auto" }
+reference:     { mode: "auto", twoPass: true }
+                -- twoPass (M4a Task 4, ruling R-M4a-5): re-pick the reference
+                -- among the top-weighted frames closest to the reference group's
+                -- median transform, after a dry first registration pass over that
+                -- group (§4.4). Auto only — a manual pin never moves. It is NOT
+                -- part of any stage hash, so flipping it never invalidates a
+                -- cached artifact.
 registration:  { model: "auto", distortion: "off", interpolation: "bicubicBSpline",
                  clampingThreshold: 0.30, maxStars: 2000, ransacTolerancePx: 1.9,
                  ransacMaxIterations: 2000, maxRmsPx: 2.0, failOnMaxRms: false,

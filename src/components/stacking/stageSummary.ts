@@ -251,7 +251,10 @@ export function stageSummary(
         config.measurement.seedPrefilter === 'median3' ? ' · 3×3 median seeds' : ''
       }`;
     case 'reference':
-      return config.reference.mode === 'auto' ? 'Auto (highest-weight frame)' : 'Manual selection';
+      if (config.reference.mode !== 'auto') return 'Manual selection';
+      return config.reference.twoPass
+        ? 'Auto (highest-weight frame · two-pass)'
+        : 'Auto (highest-weight frame)';
     case 'register':
       return `${modelLabel(config.registration.model)} model · distortion ${distortionLabel(config.registration.distortion)} · ${interpolationLabel(config.registration.interpolation)} · clamp ${config.registration.clampingThreshold.toFixed(2)} · ${config.registration.maxStars} stars`;
     case 'normalize': {

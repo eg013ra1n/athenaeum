@@ -143,7 +143,23 @@ seedPrefilter: SeedPrefilter, };
 
 export type ReferenceMode = "auto" | "manual";
 
-export type ReferenceConfig = { mode: ReferenceMode, };
+export type ReferenceConfig = { mode: ReferenceMode, 
+/**
+ * The two-pass registration reference (spec §4.4, ruling R-M4a-5):
+ * with `mode = Auto`, stage 5 registers the reference's OWN group once
+ * without persisting anything, then re-picks the reference among the
+ * top-weighted frames closest to that group's median transform before
+ * the real, persisting pass runs. Ignored in `Manual` mode — a pinned
+ * reference never moves. Default ON: a run whose reference happens to
+ * be the one frame the mount was nudged on rotates every master and
+ * loses its corners, and the dry pass costs one extra registration of
+ * one group.
+ *
+ * `#[serde(default = "default_two_pass")]` (ruling R-M4a-9): a config
+ * stored before M4a has no such field and must decode to `true`, not
+ * to `false`.
+ */
+twoPass: boolean, };
 
 export type DrizzleKernel = "square" | "circle" | "gaussian";
 
@@ -239,7 +255,15 @@ export type StackingRunFrameRow = { id: number, runId: number, groupId: number, 
 
 export type StackingRunSummary = { run: StackingRunRow, groupCount: number, masterPaths: Array<string>, };
 
-export type SummaryReference = { frameId: number | null, filename: string | null, mode: ReferenceMode, weight: number | null, };
+export type SummaryReference = { frameId: number | null, filename: string | null, mode: ReferenceMode, weight: number | null, 
+/**
+ * The frame stage 4 originally picked, when stage 5's two-pass pick
+ * then moved the reference somewhere else (spec §4.4, ruling
+ * R-M4a-5) — `None` on every run that kept its first choice, which is
+ * most of them. `#[serde(default)]` so a `runs/run-<id>.json` written
+ * before M4a still deserializes.
+ */
+switchedFrom: number | null, };
 
 export type SummaryMeasurement = { seedSource: string, scaleEstimator: ScaleEstimator, };
 

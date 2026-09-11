@@ -451,6 +451,20 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
             <p className="text-xs text-content-muted">
               {runDetail.groups.length} group{runDetail.groups.length === 1 ? '' : 's'}
               {runDetail.run.error ? ` · ${runDetail.run.error}` : ''}
+              {/* The run's resolved reference, and — when stage 5's
+               *  two-pass pick moved it (M4a Task 4, ruling R-M4a-5) — the
+               *  frame stage 4 had originally chosen. `switchedFrom` is
+               *  null on every run that kept its first pick. */}
+              {runDetail.summary?.reference.filename && (
+                <>
+                  {' · reference '}
+                  <span className="font-mono" title={runDetail.summary.reference.filename}>
+                    {runDetail.summary.reference.filename}
+                  </span>
+                  {runDetail.summary.reference.switchedFrom != null &&
+                    ` · switched from #${runDetail.summary.reference.switchedFrom} (two-pass)`}
+                </>
+              )}
             </p>
             <button
               type="button"

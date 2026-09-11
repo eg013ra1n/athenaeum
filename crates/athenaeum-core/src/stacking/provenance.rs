@@ -61,6 +61,13 @@ pub struct SummaryReference {
     pub filename: Option<String>,
     pub mode: ReferenceMode,
     pub weight: Option<f64>,
+    /// The frame stage 4 originally picked, when stage 5's two-pass pick
+    /// then moved the reference somewhere else (spec §4.4, ruling
+    /// R-M4a-5) — `None` on every run that kept its first choice, which is
+    /// most of them. `#[serde(default)]` so a `runs/run-<id>.json` written
+    /// before M4a still deserializes.
+    #[serde(default)]
+    pub switched_from: Option<i64>,
 }
 
 /// What stage 3 (measurement, Task 7) used, recorded once at the top of the

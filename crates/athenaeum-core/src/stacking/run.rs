@@ -84,7 +84,7 @@ use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
 use crate::stacking::register::frame::{
-    identity_registration, reference_stars, register_frame, to_record,
+    identity_registration, reference_stars, register_frame, to_record, ReferenceStars,
 };
 use crate::stacking::register::writer::{
     build_registered_cards, source_cards_from_file, write_registered_frame, RegisteredCards,
@@ -92,7 +92,8 @@ use crate::stacking::register::writer::{
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{
     best_by_weight, compute_weights, reference_coverage, select_frames, sky_penalized_order,
-    FrameWeight, WeightInput, WeightMode, MIN_REFERENCE_COVERAGE,
+    two_pass_deviation_px, two_pass_pick, FrameWeight, TwoPassCandidate, WeightInput, WeightMode,
+    MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX,
 };
 
 /// Wire event for `stacking-progress`. `percent` is `100 * current / total`
@@ -785,6 +786,7 @@ pub fn start_stacking(
             filename: plan.reference.filename.clone(),
             mode: plan.reference.mode,
             weight: None,
+            switched_from: None,
         },
         measurement: SummaryMeasurement {
             seed_source: "fast".to_string(),
@@ -966,8 +968,6 @@ fn run_thread(mut rc: RunContext) {
         }
     }
 
-    rc.ctx.active_stacks.lock().unwrap().remove(&run_id);
-
     if let Some(json) = &summary_json {
         if let Err(e) = std::fs::create_dir_all(rc.layout.runs_dir()) {
             tracing::warn!(run_id, error = %e, "failed to create the runs folder for the provenance snapshot");
@@ -1034,6 +1034,21 @@ fn run_thread(mut rc: RunContext) {
             masters,
         },
     );
+
+    // De-register LAST (M4a Task 4). `active_stacks` is what every observer
+    // — `start_stacking`'s double-start refusal, `cancel_stacking`, and the
+    // tests' own `wait_for_run` — reads as "is this run still in flight?",
+    // so the entry has to outlive everything the run still has to do:
+    // `runs/run-<id>.json`, the rejection-bitmap cleanup above, and the
+    // `stacking-complete` event. It used to be removed right after
+    // `finish_run`, which made "the run is gone from the registry" mean
+    // only "the DB row is final" — an observer that then looked at the
+    // provenance file or the working folder could legitimately find the run
+    // still writing them. The cost of holding it a few ms longer is that a
+    // cancel arriving in that window sets a flag nobody reads any more, and
+    // a new run for the same set queued in that window is refused — both
+    // already true for the whole `finish_run`-to-removal gap.
+    rc.ctx.active_stacks.lock().unwrap().remove(&run_id);
 }
 
 /// The whole pipeline, run in order. Queue admission happens FIRST (ruling
@@ -2375,6 +2390,9 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
         filename: Some(filename),
         mode: cfg.reference.mode,
         weight: weight_val,
+        // Stage 5's two-pass pick (ruling R-M4a-5) is the only writer of
+        // this field, and it runs after this stage.
+        switched_from: None,
     };
     rc.reference_frame_id = Some(reference_frame_id);
     rc.reference_calibrated = Some(calibrated);
@@ -2398,230 +2416,221 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Stage 5 (register, spec §3, ruling 10): register every included frame of
-/// every VIABLE group (≥ 3 included, per stage 3) onto the ONE global
-/// reference (its stars computed once), reusing an existing
-/// `registration_results` row when it is still fresh
-/// ([`registration_row_is_fresh`], the SAME predicate the plan's own
-/// `stale_stages` uses — ruling 10), fanning the rest out. Writes every
-/// group's every frame's `stacking_run_frames` row at the end
-/// ([`write_frame_rows`]), included or not.
-fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
-    let stage_start = Instant::now();
+/// A group's currently-included frame count — the viability gate (≥ 3) and
+/// the progress total both read it, in three places since M4a Task 4.
+fn included_count_of(rc: &RunContext, group_key: &str) -> usize {
+    rc.measured
+        .get(group_key)
+        .map(|v| v.iter().filter(|e| e.included).count())
+        .unwrap_or(0)
+}
+
+/// One frame's outcome from a single [`register_group_pass`] over one
+/// group: the entry index into that group's `RunContext::measured` vector,
+/// the frame id, and either the alignment's `(rotation_deg, translation)`
+/// or the failure text. Only the frames the pass actually REGISTERED appear
+/// here — a persisting pass's cache reuses do not (nothing reads them, and
+/// the dry pass never consults the cache at all).
+struct PassResult {
+    idx: usize,
+    frame_id: i64,
+    outcome: Result<(f64, (f64, f64)), String>,
+}
+
+/// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
+/// body [`stage_register`]'s per-group loop used to inline).
+///
+/// `persist = true` is stage 5 as it has always been: an existing fresh
+/// `registration_results` row is reused, everything else is registered and
+/// then WRITTEN — the row ([`upsert_registration`]), the optional registered
+/// artifact, the entry's own `registration` outcome, and the
+/// exclusion/warning bookkeeping a failure implies.
+///
+/// `persist = false` is the two-pass pick's DRY pass. It never consults the
+/// cache (pass 1 always registers afresh — a cached row belongs to the
+/// FINAL reference, which is exactly what this pass exists to choose),
+/// writes no row and no artifact, stores nothing on the entry, excludes
+/// nobody and pushes no warning: a frame that cannot align against the
+/// CURRENT reference may well align against the one this pass is about to
+/// pick, so judging it here would judge it against a reference the run is
+/// about to discard. Its verdicts come back in the returned [`PassResult`]s
+/// instead — and `selection.exclude_on_registration_failure = false` does
+/// NOT fail the run from a dry pass for the same reason.
+///
+/// `progress` is `(current, total)`, threaded through both passes so the
+/// Register stage's progress bar counts them as one stage.
+#[allow(clippy::too_many_arguments)]
+fn register_group_pass(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    ref_stars: &ReferenceStars,
+    reference_frame_id: i64,
+    reference_hash: &str,
+    by_frame: &HashMap<i64, RegistrationRecord>,
+    force_fresh: bool,
+    persist: bool,
+    progress: &mut (usize, usize),
+) -> Result<Vec<PassResult>, RunError> {
     let cfg = rc.config.clone();
+    let mut pass: Vec<PassResult> = Vec::new();
 
-    let reference_frame_id = rc
-        .reference_frame_id
-        .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
-    let reference_calibrated = rc
-        .reference_calibrated
-        .clone()
-        .ok_or_else(|| RunError::Other("reference frame has no calibrated file".to_string()))?;
+    if included_count_of(rc, &group.key) < 3 {
+        return Ok(pass);
+    }
 
-    let ref_stars = {
-        let pool_ref = &rc.ctx.image_pool;
-        reference_stars(&reference_calibrated, &cfg.registration, Some(pool_ref))
-            .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
-    };
-    rc.reference_width = ref_stars.width;
-    rc.reference_height = ref_stars.height;
+    let snapshot: Vec<(usize, GroupFrame, PathBuf, bool)> = rc
+        .measured
+        .get(&group.key)
+        .map(|v| {
+            v.iter()
+                .enumerate()
+                .filter(|(_, e)| e.included)
+                .filter_map(|(i, e)| {
+                    e.calibrated.clone().map(|p| {
+                        (
+                            i,
+                            e.frame.clone(),
+                            p,
+                            e.frame.frame_id == reference_frame_id,
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let reference_group_frame = find_frame_in_groups(&rc.plan_groups, reference_frame_id)
-        .ok_or_else(|| RunError::Other("reference frame not found in any group".to_string()))?;
-    let reference_hash = {
-        let conn = db(&rc.ctx)?.conn();
-        rc.memo
-            .calibration_hash_checked(&conn, &cfg, &reference_group_frame)?
-    };
+    let mut to_register: Vec<(usize, GroupFrame, PathBuf, bool, String)> = Vec::new();
+    for (idx, frame, path, is_reference) in snapshot {
+        let frame_hash = {
+            let conn = db(&rc.ctx)?.conn();
+            rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
+        };
+        let expected_hash =
+            registration_hash_for(&cfg, reference_frame_id, reference_hash, &frame_hash);
 
-    let by_frame: HashMap<i64, RegistrationRecord> = {
-        let conn = db(&rc.ctx)?.conn();
-        get_registration_for_frame_set(&conn, rc.set_id)?
-            .into_iter()
-            .map(|r| (r.frame_id, r))
-            .collect()
-    };
+        let mut reused: Option<RegisteredFrameOutcome> = None;
+        if persist && !force_fresh {
+            if let Some(row) = by_frame.get(&frame.frame_id) {
+                if registration_row_is_fresh(row, reference_frame_id, &expected_hash) {
+                    match PixelMap::from_json(row.transform_json.as_deref().unwrap_or_default()) {
+                        Ok(map) => {
+                            reused = Some(RegisteredFrameOutcome::Aligned {
+                                map,
+                                record: row.clone(),
+                                cached: true,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                run_id = rc.run_id,
+                                frame_id = frame.frame_id,
+                                error = %e,
+                                "stored registration transform failed to parse; re-registering"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
-    let groups = rc.plan_groups.clone();
-    let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Register);
-
-    let mut viable_total = 0usize;
-    for g in &groups {
-        let included = rc
-            .measured
-            .get(&g.key)
-            .map(|v| v.iter().filter(|e| e.included).count())
-            .unwrap_or(0);
-        if included >= 3 {
-            viable_total += included;
+        if let Some(outcome) = reused {
+            if let Some(entries) = rc.measured.get_mut(&group.key) {
+                entries[idx].registration = Some(outcome);
+            }
+            progress.0 += 1;
+            rc.progress(
+                Stage::Register,
+                Some(group.key.clone()),
+                progress.0,
+                progress.1,
+                0,
+                0,
+                Some(frame.frame_id),
+                None,
+            );
+        } else {
+            to_register.push((idx, frame, path, is_reference, expected_hash));
         }
     }
 
-    let mut current = 0usize;
-    rc.progress(
-        Stage::Register,
-        None,
-        current,
-        viable_total,
-        0,
-        0,
-        None,
-        None,
+    if to_register.is_empty() {
+        return Ok(pass);
+    }
+
+    // Registration warps every frame onto the ONE run-wide reference
+    // geometry (already resolved by the caller) — the OUTPUT buffer size,
+    // and a more accurate admission bound than any per-frame native
+    // geometry would be.
+    let admission_n = admission(4 * rc.reference_width as u64 * rc.reference_height as u64 * 4);
+    let meta: Vec<(usize, GroupFrame, String)> = to_register
+        .iter()
+        .map(|(idx, frame, _, _, hash)| (*idx, frame.clone(), hash.clone()))
+        .collect();
+    let items: Vec<(PathBuf, bool)> = to_register
+        .into_iter()
+        .map(|(_, _, path, is_reference, _)| (path, is_reference))
+        .collect();
+
+    let cancel_ref: &AtomicBool = &rc.cancel;
+    let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+    let reg_cfg = &cfg.registration;
+    let ref_stars_ref = ref_stars;
+
+    let results = fan_out(
+        items,
+        admission_n,
+        cancel_ref,
+        move |(path, is_reference)| {
+            if is_reference {
+                Ok(identity_registration(ref_stars_ref))
+            } else {
+                register_frame(ref_stars_ref, &path, reg_cfg, Some(pool_ref), cancel_ref)
+                    .map_err(|e| format!("registration failed: {e}"))
+            }
+        },
     );
 
-    for group in &groups {
-        rc.check_cancel()?;
+    rc.check_cancel()?;
 
-        let included_count = rc
-            .measured
-            .get(&group.key)
-            .map(|v| v.iter().filter(|e| e.included).count())
-            .unwrap_or(0);
-        if included_count < 3 {
-            continue;
-        }
-
-        let snapshot: Vec<(usize, GroupFrame, PathBuf, bool)> = rc
-            .measured
-            .get(&group.key)
-            .map(|v| {
-                v.iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.included)
-                    .filter_map(|(i, e)| {
-                        e.calibrated.clone().map(|p| {
-                            (
-                                i,
-                                e.frame.clone(),
-                                p,
-                                e.frame.frame_id == reference_frame_id,
-                            )
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut to_register: Vec<(usize, GroupFrame, PathBuf, bool, String)> = Vec::new();
-        for (idx, frame, path, is_reference) in snapshot {
-            let frame_hash = {
-                let conn = db(&rc.ctx)?.conn();
-                rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
-            };
-            let expected_hash =
-                registration_hash_for(&cfg, reference_frame_id, &reference_hash, &frame_hash);
-
-            let mut reused: Option<RegisteredFrameOutcome> = None;
-            if !force_fresh {
-                if let Some(row) = by_frame.get(&frame.frame_id) {
-                    if registration_row_is_fresh(row, reference_frame_id, &expected_hash) {
-                        match PixelMap::from_json(row.transform_json.as_deref().unwrap_or_default())
-                        {
-                            Ok(map) => {
-                                reused = Some(RegisteredFrameOutcome::Aligned {
-                                    map,
-                                    record: row.clone(),
-                                    cached: true,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    run_id = rc.run_id,
-                                    frame_id = frame.frame_id,
-                                    error = %e,
-                                    "stored registration transform failed to parse; re-registering"
-                                );
-                            }
-                        }
+    for (pos, res) in results.into_iter().enumerate() {
+        let (idx, frame, hash) = &meta[pos];
+        let idx = *idx;
+        match res {
+            None => return Err(RunError::Cancelled),
+            Some(Err(msg)) => {
+                if !persist {
+                    pass.push(PassResult {
+                        idx,
+                        frame_id: frame.frame_id,
+                        outcome: Err(msg),
+                    });
+                } else if cfg.selection.exclude_on_registration_failure {
+                    rc.runtime_exclusions.push((frame.frame_id, msg.clone()));
+                    if let Some(entries) = rc.measured.get_mut(&group.key) {
+                        entries[idx].included = false;
+                        entries[idx].reason = Some(msg.clone());
+                        entries[idx].registration =
+                            Some(RegisteredFrameOutcome::Failed(msg.clone()));
                     }
-                }
-            }
-
-            if let Some(outcome) = reused {
-                if let Some(entries) = rc.measured.get_mut(&group.key) {
-                    entries[idx].registration = Some(outcome);
-                }
-                current += 1;
-                rc.progress(
-                    Stage::Register,
-                    Some(group.key.clone()),
-                    current,
-                    viable_total,
-                    0,
-                    0,
-                    Some(frame.frame_id),
-                    None,
-                );
-            } else {
-                to_register.push((idx, frame, path, is_reference, expected_hash));
-            }
-        }
-
-        if to_register.is_empty() {
-            continue;
-        }
-
-        // Registration warps every frame onto the ONE run-wide reference
-        // geometry (already resolved above, at the top of this stage) —
-        // the OUTPUT buffer size, and a more accurate admission bound than
-        // any per-frame native geometry would be.
-        let admission_n = admission(4 * rc.reference_width as u64 * rc.reference_height as u64 * 4);
-        let meta: Vec<(usize, GroupFrame, String)> = to_register
-            .iter()
-            .map(|(idx, frame, _, _, hash)| (*idx, frame.clone(), hash.clone()))
-            .collect();
-        let items: Vec<(PathBuf, bool)> = to_register
-            .into_iter()
-            .map(|(_, _, path, is_reference, _)| (path, is_reference))
-            .collect();
-
-        let cancel_ref: &AtomicBool = &rc.cancel;
-        let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
-        let reg_cfg = &cfg.registration;
-        let ref_stars_ref = &ref_stars;
-
-        let results = fan_out(
-            items,
-            admission_n,
-            cancel_ref,
-            move |(path, is_reference)| {
-                if is_reference {
-                    Ok(identity_registration(ref_stars_ref))
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        frame_id = frame.frame_id,
+                        reason = %msg,
+                        "frame excluded"
+                    );
                 } else {
-                    register_frame(ref_stars_ref, &path, reg_cfg, Some(pool_ref), cancel_ref)
-                        .map_err(|e| format!("registration failed: {e}"))
+                    return Err(RunError::Other(msg.clone()));
                 }
-            },
-        );
-
-        rc.check_cancel()?;
-
-        for (pos, res) in results.into_iter().enumerate() {
-            let (idx, frame, hash) = &meta[pos];
-            let idx = *idx;
-            match res {
-                None => return Err(RunError::Cancelled),
-                Some(Err(msg)) => {
-                    if cfg.selection.exclude_on_registration_failure {
-                        rc.runtime_exclusions.push((frame.frame_id, msg.clone()));
-                        if let Some(entries) = rc.measured.get_mut(&group.key) {
-                            entries[idx].included = false;
-                            entries[idx].reason = Some(msg.clone());
-                            entries[idx].registration =
-                                Some(RegisteredFrameOutcome::Failed(msg.clone()));
-                        }
-                        tracing::warn!(
-                            run_id = rc.run_id,
-                            frame_id = frame.frame_id,
-                            reason = %msg,
-                            "frame excluded"
-                        );
+            }
+            Some(Ok(reg)) => match &reg.outcome {
+                Ok(alignment) => {
+                    if !persist {
+                        pass.push(PassResult {
+                            idx,
+                            frame_id: frame.frame_id,
+                            outcome: Ok((alignment.rotation_deg, alignment.translation)),
+                        });
                     } else {
-                        return Err(RunError::Other(msg.clone()));
-                    }
-                }
-                Some(Ok(reg)) => match &reg.outcome {
-                    Ok(alignment) => {
                         tracing::debug!(
                             run_id = rc.run_id,
                             frame_id = frame.frame_id,
@@ -2676,8 +2685,16 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
                             });
                         }
                     }
-                    Err(align_err) => {
-                        let reason = format!("registration failed: {align_err}");
+                }
+                Err(align_err) => {
+                    let reason = format!("registration failed: {align_err}");
+                    if !persist {
+                        pass.push(PassResult {
+                            idx,
+                            frame_id: frame.frame_id,
+                            outcome: Err(reason),
+                        });
+                    } else {
                         let now =
                             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                         let rec = to_record(
@@ -2711,20 +2728,290 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
                             return Err(RunError::Other(reason));
                         }
                     }
-                },
-            }
-            current += 1;
-            rc.progress(
-                Stage::Register,
-                Some(group.key.clone()),
-                current,
-                viable_total,
-                0,
-                0,
-                Some(frame.frame_id),
-                None,
-            );
+                }
+            },
         }
+        progress.0 += 1;
+        rc.progress(
+            Stage::Register,
+            Some(group.key.clone()),
+            progress.0,
+            progress.1,
+            0,
+            0,
+            Some(frame.frame_id),
+            None,
+        );
+    }
+
+    Ok(pass)
+}
+
+/// Stage 5 (register, spec §3, ruling 10): register every included frame of
+/// every VIABLE group (≥ 3 included, per stage 3) onto the ONE global
+/// reference (its stars computed once), reusing an existing
+/// `registration_results` row when it is still fresh
+/// ([`registration_row_is_fresh`], the SAME predicate the plan's own
+/// `stale_stages` uses — ruling 10), fanning the rest out. Writes every
+/// group's every frame's `stacking_run_frames` row at the end
+/// ([`write_frame_rows`]), included or not.
+///
+/// M4a Task 4 (ruling R-M4a-5): in `Auto` mode with `reference.two_pass`
+/// on, the reference's OWN group is registered once first through
+/// [`register_group_pass`] with `persist = false` — a dry pass whose only
+/// product is each frame's rotation/translation against the stage-4 pick.
+/// [`two_pass_pick`] then re-chooses the reference among the top-weighted
+/// of those frames by corner displacement from that group's median
+/// transform, and the real, persisting loop below runs with whatever came
+/// out (re-detecting the new reference's stars and recomputing its stage-1
+/// hash first, so every row the second pass writes names the FINAL
+/// reference). Both passes live inside ONE `Stage::Register` timing and
+/// share ONE progress total. A `Manual` reference never moves.
+fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
+    let stage_start = Instant::now();
+    let cfg = rc.config.clone();
+
+    let mut reference_frame_id = rc
+        .reference_frame_id
+        .ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
+    let reference_calibrated = rc
+        .reference_calibrated
+        .clone()
+        .ok_or_else(|| RunError::Other("reference frame has no calibrated file".to_string()))?;
+
+    let mut ref_stars = {
+        let pool_ref = &rc.ctx.image_pool;
+        reference_stars(&reference_calibrated, &cfg.registration, Some(pool_ref))
+            .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
+    };
+    rc.reference_width = ref_stars.width;
+    rc.reference_height = ref_stars.height;
+
+    let reference_group_frame = find_frame_in_groups(&rc.plan_groups, reference_frame_id)
+        .ok_or_else(|| RunError::Other("reference frame not found in any group".to_string()))?;
+    let mut reference_hash = {
+        let conn = db(&rc.ctx)?.conn();
+        rc.memo
+            .calibration_hash_checked(&conn, &cfg, &reference_group_frame)?
+    };
+
+    let by_frame: HashMap<i64, RegistrationRecord> = {
+        let conn = db(&rc.ctx)?.conn();
+        get_registration_for_frame_set(&conn, rc.set_id)?
+            .into_iter()
+            .map(|r| (r.frame_id, r))
+            .collect()
+    };
+
+    let groups = rc.plan_groups.clone();
+    let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Register);
+
+    let mut viable_total = 0usize;
+    for g in &groups {
+        let included = included_count_of(rc, &g.key);
+        if included >= 3 {
+            viable_total += included;
+        }
+    }
+
+    // The dry pass's own group (ruling R-M4a-5): Auto mode, two-pass on,
+    // and the reference's group viable — a group the persisting loop would
+    // skip anyway gives nothing to take a median over.
+    let dry_group: Option<IntegrationGroup> =
+        if cfg.reference.mode == ReferenceMode::Auto && cfg.reference.two_pass {
+            groups
+                .iter()
+                .find(|g| {
+                    g.frames.iter().any(|f| f.frame_id == reference_frame_id)
+                        && included_count_of(rc, &g.key) >= 3
+                })
+                .cloned()
+        } else {
+            None
+        };
+    let dry_total = dry_group
+        .as_ref()
+        .map(|g| included_count_of(rc, &g.key))
+        .unwrap_or(0);
+
+    let mut progress = (0usize, viable_total + dry_total);
+    rc.progress(
+        Stage::Register,
+        None,
+        progress.0,
+        progress.1,
+        0,
+        0,
+        None,
+        None,
+    );
+
+    if let Some(group) = &dry_group {
+        rc.check_cancel()?;
+        let pass = register_group_pass(
+            rc,
+            group,
+            &ref_stars,
+            reference_frame_id,
+            &reference_hash,
+            &by_frame,
+            force_fresh,
+            false,
+            &mut progress,
+        )?;
+
+        let candidates: Vec<TwoPassCandidate> = {
+            let entries = rc.measured.get(&group.key);
+            pass.iter()
+                .filter_map(|r| {
+                    let (rotation_deg, translation) = r.outcome.as_ref().ok()?;
+                    // A frame whose weight never computed ranks last rather
+                    // than dropping out — it is still a legitimate geometry
+                    // candidate, just never a top-N one.
+                    let weight = entries
+                        .and_then(|v| v.get(r.idx))
+                        .and_then(|e| e.weight.as_ref())
+                        .map(|w| w.normalized_mean)
+                        .unwrap_or(0.0);
+                    Some(TwoPassCandidate {
+                        idx: r.idx,
+                        weight,
+                        rotation_deg: *rotation_deg,
+                        translation: *translation,
+                    })
+                })
+                .collect()
+        };
+
+        let reference_idx = pass
+            .iter()
+            .find(|r| r.frame_id == reference_frame_id)
+            .map(|r| r.idx);
+        let diagonal_px = (rc.reference_width as f64).hypot(rc.reference_height as f64);
+
+        match reference_idx {
+            None => {
+                // The reference's own identity row is produced by the same
+                // fan-out as everything else, so this only happens if the
+                // dry pass never saw the reference at all (it lost its
+                // calibrated file between stages) — say so, keep it.
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id = reference_frame_id,
+                    "the two-pass dry pass produced no alignment for the reference itself; keeping it"
+                );
+            }
+            Some(reference_idx) => {
+                if let Some(new_idx) = two_pass_pick(
+                    &candidates,
+                    reference_idx,
+                    diagonal_px,
+                    TWO_PASS_MIN_GAIN_PX,
+                ) {
+                    let corner_px_before =
+                        two_pass_deviation_px(&candidates, reference_idx, diagonal_px)
+                            .unwrap_or(f64::NAN);
+                    let corner_px_after = two_pass_deviation_px(&candidates, new_idx, diagonal_px)
+                        .unwrap_or(f64::NAN);
+                    let picked = rc
+                        .measured
+                        .get(&group.key)
+                        .and_then(|v| v.get(new_idx))
+                        .map(|e| {
+                            (
+                                e.frame.frame_id,
+                                e.frame.filename.clone(),
+                                e.calibrated.clone(),
+                                e.weight.as_ref().map(|w| w.normalized_mean),
+                            )
+                        });
+                    match picked {
+                        Some((new_frame_id, new_filename, Some(new_calibrated), new_weight)) => {
+                            let old = reference_frame_id;
+                            let new_group_frame = find_frame_in_groups(
+                                &rc.plan_groups,
+                                new_frame_id,
+                            )
+                            .ok_or_else(|| {
+                                RunError::Other(
+                                    "the re-picked reference frame is not in any group".to_string(),
+                                )
+                            })?;
+                            let new_ref_stars = {
+                                let pool_ref = &rc.ctx.image_pool;
+                                reference_stars(&new_calibrated, &cfg.registration, Some(pool_ref))
+                                    .map_err(|e| {
+                                        RunError::Other(format!(
+                                            "reference star detection failed: {e}"
+                                        ))
+                                    })?
+                            };
+                            let new_hash = {
+                                let conn = db(&rc.ctx)?.conn();
+                                rc.memo
+                                    .calibration_hash_checked(&conn, &cfg, &new_group_frame)?
+                            };
+                            {
+                                let conn = db(&rc.ctx)?.conn();
+                                set_run_reference(
+                                    &conn,
+                                    rc.run_id,
+                                    new_frame_id,
+                                    reference_mode_wire(cfg.reference.mode),
+                                )?;
+                            }
+
+                            reference_frame_id = new_frame_id;
+                            ref_stars = new_ref_stars;
+                            reference_hash = new_hash;
+                            rc.reference_width = ref_stars.width;
+                            rc.reference_height = ref_stars.height;
+                            rc.reference_frame_id = Some(new_frame_id);
+                            rc.reference_calibrated = Some(new_calibrated);
+                            rc.summary.reference.frame_id = Some(new_frame_id);
+                            rc.summary.reference.filename = Some(new_filename);
+                            rc.summary.reference.weight = new_weight;
+                            rc.summary.reference.switched_from = Some(old);
+
+                            tracing::info!(
+                                run_id = rc.run_id,
+                                from = old,
+                                to = new_frame_id,
+                                corner_px_before,
+                                corner_px_after,
+                                "reference switched by the two-pass pick"
+                            );
+                            rc.warnings.push(format!(
+                                "reference switched by the two-pass pick: {old} → {new_frame_id} \
+                                 (corner displacement {corner_px_before:.1} → \
+                                 {corner_px_after:.1} px)"
+                            ));
+                        }
+                        _ => {
+                            tracing::warn!(
+                                run_id = rc.run_id,
+                                "the two-pass pick chose a frame with no calibrated file; keeping the current reference"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for group in &groups {
+        rc.check_cancel()?;
+        register_group_pass(
+            rc,
+            group,
+            &ref_stars,
+            reference_frame_id,
+            &reference_hash,
+            &by_frame,
+            force_fresh,
+            true,
+            &mut progress,
+        )?;
     }
 
     write_frame_rows(rc)?;
@@ -5680,6 +5967,7 @@ pub(crate) fn test_context(
             filename: None,
             mode: config.reference.mode,
             weight: None,
+            switched_from: None,
         },
         measurement: SummaryMeasurement {
             seed_source: "fast".to_string(),
@@ -6789,6 +7077,319 @@ mod tests {
         assert_eq!(row.reference_mode, "auto");
     }
 
+    // ── two-pass registration reference (M4a Task 4, ruling R-M4a-5) ──────
+
+    /// [`BASE_STARS`] rotated `deg` about the fixture canvas's centre and
+    /// then shifted by `(dx, dy)` — the fixture shape the two-pass pick
+    /// exists for: one frame whose own pointing deviates from the rest of
+    /// its group. [`shifted_stars`] can only translate.
+    fn rotated_shifted_stars(deg: f64, dx: f64, dy: f64) -> Vec<(f64, f64, f64)> {
+        let cx = STAR_FIELD_WIDTH as f64 / 2.0;
+        let cy = STAR_FIELD_HEIGHT as f64 / 2.0;
+        let (s, c) = deg.to_radians().sin_cos();
+        BASE_STARS
+            .iter()
+            .map(|&(x, y, a)| {
+                let (px, py) = (x - cx, y - cy);
+                (cx + px * c - py * s + dx, cy + px * s + py * c + dy, a)
+            })
+            .collect()
+    }
+
+    /// As [`seed_star_group`], but with an explicit star field per frame —
+    /// that helper can only shift ONE field, and these tests need frame A
+    /// ROTATED against the other five.
+    fn seed_star_group_with_fields(
+        db_path: &Path,
+        set_name: &str,
+        fields: &[(Vec<(f64, f64, f64)>, f32)],
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, set_name);
+
+        let mut light_ids = Vec::new();
+        for (i, (stars, sigma)) in fields.iter().enumerate() {
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = star_light_spec(&stem, &date_obs);
+            let (id, _path) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                stars,
+                600.0,
+                *sigma,
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        (fixture, light_ids, working, output)
+    }
+
+    /// Six frames whose pointing agrees except for frame A (`f0`), which is
+    /// rotated 0.8 deg AND offset (6, -5) px from the other five — and is
+    /// also the cleanest frame (noise 3.0 against 5.0), so stage 4's
+    /// best-by-weight pick lands on exactly the frame whose geometry the
+    /// whole set would then inherit.
+    ///
+    /// The offset carries most of the deviation ON PURPOSE: these fixtures
+    /// are 192x144, so 0.8 deg of rotation alone displaces a corner by only
+    /// `0.8° · hypot(192, 144)/2 = 1.7 px` — below [`TWO_PASS_MIN_GAIN_PX`]
+    /// by construction, and a switch on that would be exactly the sub-pixel
+    /// churn the floor exists to prevent. On the real 6224x4168 frames the
+    /// rotation term alone is 33 px.
+    fn two_pass_fields() -> Vec<(Vec<(f64, f64, f64)>, f32)> {
+        vec![
+            (rotated_shifted_stars(0.8, 6.0, -5.0), 3.0f32),
+            (rotated_shifted_stars(0.0, 0.0, 0.0), 5.0f32),
+            (rotated_shifted_stars(0.0, 1.0, 0.0), 5.0f32),
+            (rotated_shifted_stars(0.0, 0.0, 1.0), 5.0f32),
+            (rotated_shifted_stars(0.0, 1.0, 1.0), 5.0f32),
+            (rotated_shifted_stars(0.0, 2.0, 1.0), 5.0f32),
+        ]
+    }
+
+    /// Builds a `RunContext` over [`two_pass_fields`] and runs stages 1-4,
+    /// asserting that stage 4 did pick frame A — the premise every test
+    /// below rests on. The caller then drives stage 5 itself.
+    fn two_pass_context(
+        tmp: &tempfile::TempDir,
+        cfg: StackingConfig,
+    ) -> (
+        Arc<ServiceContext>,
+        test_fixtures::Fixture,
+        Vec<i64>,
+        RunContext,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, output) =
+            seed_star_group_with_fields(&db_path, SET_NAME, &two_pass_fields());
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+        run_stages_for_test(&mut rc, Stage::Reference).unwrap();
+        (ctx, fixture, light_ids, rc, working, output)
+    }
+
+    /// Ruling R-M4a-5: stage 4 picks frame A on weight, stage 5's dry pass
+    /// measures how far A's own pointing sits from the group's median, and
+    /// the reference moves to one of the other five. The run row, the
+    /// summary block, the run warning and every persisted
+    /// `registration_results` row all name the FINAL reference.
+    #[test]
+    fn two_pass_moves_the_reference_off_a_deviating_top_weight_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, fixture, light_ids, mut rc, _working, _output) =
+            two_pass_context(&tmp, StackingConfig::default());
+        assert!(rc.config.reference.two_pass, "the default must be on");
+        assert_eq!(
+            rc.reference_frame_id,
+            Some(light_ids[0]),
+            "fixture premise: stage 4 picks the deviating frame A on weight"
+        );
+
+        stage_register(&mut rc).unwrap();
+
+        let chosen = rc.reference_frame_id.expect("a reference after stage 5");
+        assert_ne!(chosen, light_ids[0], "the deviating frame must not stay");
+        assert!(
+            light_ids[1..].contains(&chosen),
+            "the new reference must be one of the five agreeing frames: {chosen}"
+        );
+
+        let row = crate::db::stacking::get_run(&fixture.conn, rc.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reference_frame_id, Some(chosen));
+        assert_eq!(row.reference_mode, "auto");
+
+        assert_eq!(rc.summary.reference.frame_id, Some(chosen));
+        assert_eq!(rc.summary.reference.switched_from, Some(light_ids[0]));
+        // The exact wording of ruling R-M4a-5, including the corner
+        // displacements — the string literal is line-continued in the
+        // source, so this also pins that it renders as one flat sentence.
+        let switch_warning = rc
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("reference switched by the two-pass pick:"))
+            .unwrap_or_else(|| panic!("no switch warning in {:?}", rc.warnings));
+        assert!(
+            switch_warning.contains(&format!(
+                ": {} → {chosen} (corner displacement ",
+                light_ids[0]
+            )),
+            "{switch_warning}"
+        );
+        assert!(switch_warning.ends_with(" px)"), "{switch_warning}");
+        assert!(
+            switch_warning.matches(" → ").count() == 2,
+            "{switch_warning}"
+        );
+
+        // Pass 1 persisted nothing: every row is pass 2's, against the
+        // final reference, with exactly one identity row.
+        let rows = get_registration_for_frame_set(&fixture.conn, fixture.set_id).unwrap();
+        assert_eq!(rows.len(), light_ids.len(), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| r.reference_frame_id == chosen),
+            "{rows:?}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.is_reference).count(), 1);
+        assert!(rows.iter().any(|r| r.frame_id == chosen && r.is_reference));
+
+        // One Register timing covering both passes, and the Reference
+        // timing stage 4 pushed — no extra stage rows.
+        assert_eq!(
+            rc.timings
+                .iter()
+                .filter(|t| t.stage == Stage::Register)
+                .count(),
+            1,
+            "{:?}",
+            rc.timings
+        );
+    }
+
+    /// The same fixture with the toggle off: nothing re-picks, frame A
+    /// stays the reference, no warning is added and no switch is recorded.
+    #[test]
+    fn two_pass_off_keeps_the_stage_four_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = StackingConfig::default();
+        cfg.reference.two_pass = false;
+        let (_ctx, fixture, light_ids, mut rc, _working, _output) = two_pass_context(&tmp, cfg);
+        assert_eq!(rc.reference_frame_id, Some(light_ids[0]));
+
+        stage_register(&mut rc).unwrap();
+
+        assert_eq!(rc.reference_frame_id, Some(light_ids[0]));
+        assert_eq!(rc.summary.reference.switched_from, None);
+        assert!(
+            !rc.warnings.iter().any(|w| w.contains("two-pass")),
+            "{:?}",
+            rc.warnings
+        );
+        let row = crate::db::stacking::get_run(&fixture.conn, rc.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reference_frame_id, Some(light_ids[0]));
+    }
+
+    /// "Manual references never move" (ruling R-M4a-5): the same deviating
+    /// frame A, pinned by hand, with `twoPass` left ON — the dry pass does
+    /// not run at all.
+    #[test]
+    fn two_pass_never_moves_a_manual_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, output) =
+            seed_star_group_with_fields(&db_path, SET_NAME, &two_pass_fields());
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        crate::registration::db::set_frame_set_reference(
+            &fixture.conn,
+            fixture.set_id,
+            light_ids[0],
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        assert!(cfg.reference.two_pass, "left on deliberately");
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+
+        assert_eq!(rc.reference_frame_id, Some(light_ids[0]));
+        assert_eq!(rc.summary.reference.switched_from, None);
+        assert!(
+            !rc.warnings.iter().any(|w| w.contains("two-pass")),
+            "{:?}",
+            rc.warnings
+        );
+        let row = crate::db::stacking::get_run(&fixture.conn, rc.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reference_frame_id, Some(light_ids[0]));
+        assert_eq!(row.reference_mode, "manual");
+    }
     #[test]
     fn registration_rows_are_written_and_reused() {
         let tmp = tempfile::tempdir().unwrap();

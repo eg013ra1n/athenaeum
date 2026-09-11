@@ -1,6 +1,7 @@
-// Stage 4 (Reference) inspector panel: Auto/Manual mode radio. Manual mode
-// has no in-tab picker yet (the frame is chosen on the Analysis tab) — this
-// panel only reflects the plan's resolved reference and links there.
+// Stage 4 (Reference) inspector panel: Auto/Manual mode radio, plus the
+// two-pass pick (M4a Task 4, ruling R-M4a-5) under Auto. Manual mode has no
+// in-tab picker yet (the frame is chosen on the Analysis tab) — this panel
+// only reflects the plan's resolved reference and links there.
 
 import { useNavigate } from 'react-router-dom';
 import { CheckCircle2, XCircle } from 'lucide-react';
@@ -19,6 +20,10 @@ export function ReferencePanel({ config, onChange, plan, disabled }: ReferencePa
 
   const setMode = (next: ReferenceMode) => {
     onChange({ ...config, reference: { ...config.reference, mode: next } });
+  };
+
+  const setTwoPass = (next: boolean) => {
+    onChange({ ...config, reference: { ...config.reference, twoPass: next } });
   };
 
   return (
@@ -45,6 +50,27 @@ export function ReferencePanel({ config, onChange, plan, disabled }: ReferencePa
             className="w-3.5 h-3.5 text-accent border-border focus:ring-accent disabled:opacity-50"
           />
           <span className="text-sm text-content-secondary">Manual</span>
+        </label>
+
+        {/* Ruling R-M4a-5: the two-pass pick applies to Auto only — a manual
+         *  pin never moves — so in Manual mode the checkbox stays visible
+         *  (the stored value is never hidden) but inert. */}
+        <label
+          className={`flex items-start gap-2 pt-1 ${
+            disabled || mode === 'manual' ? 'cursor-not-allowed' : 'cursor-pointer'
+          }`}
+          title={mode === 'manual' ? 'A manually pinned reference is never re-picked' : undefined}
+        >
+          <input
+            type="checkbox"
+            checked={config.reference.twoPass}
+            disabled={disabled || mode === 'manual'}
+            onChange={(e) => setTwoPass(e.target.checked)}
+            className="w-4 h-4 mt-0.5 shrink-0 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+          />
+          <span className={`text-sm ${mode === 'manual' ? 'text-content-muted' : 'text-content-secondary'}`}>
+            Two-pass pick (re-choose the reference closest to the set&rsquo;s median transform)
+          </span>
         </label>
       </div>
 
