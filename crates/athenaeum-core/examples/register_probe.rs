@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use athenaeum_core::geometry::PixelMap;
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::resample::{warp_rows, Plane};
-use athenaeum_core::stacking::register::align::{model_name, SCALE_RANGE};
+use athenaeum_core::stacking::register::align::{model_name, SeedPolicy, SCALE_RANGE};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, Star};
 use athenaeum_core::stacking::register::frame::{reference_stars, register_frame};
 use athenaeum_core::stacking::register::writer::{
@@ -216,6 +216,7 @@ fn main() {
         None,
         &AtomicBool::new(false),
         None,
+        SeedPolicy::QuadFirst,
         SCALE_RANGE,
     )
     .unwrap_or_else(|e| {

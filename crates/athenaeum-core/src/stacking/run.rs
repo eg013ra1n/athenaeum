@@ -83,6 +83,7 @@ use crate::stacking::plan::{
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
+use crate::stacking::register::align::{SeedKind, SeedPolicy};
 use crate::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, to_record, ReferenceStars,
 };
@@ -2695,9 +2696,11 @@ struct PendingRegistration {
     path: PathBuf,
     is_reference: bool,
     expected_hash: String,
-    /// M4b: this frame's own scale window and optional plate-solve seed.
+    /// M4b: this frame's own scale window, optional plate-solve seed, and
+    /// which of the two seeds leads (ruling R-T6-9).
     scale_gate: (f64, f64),
     hint: Option<Linear>,
+    policy: SeedPolicy,
 }
 
 /// What one fan-out worker needs — the pixel-side half of a
@@ -2707,6 +2710,15 @@ struct RegisterItem {
     is_reference: bool,
     scale_gate: (f64, f64),
     hint: Option<Linear>,
+    policy: SeedPolicy,
+}
+
+/// [`SeedPolicy`] as the `seed_policy` log field's value.
+fn seed_policy_field(policy: SeedPolicy) -> &'static str {
+    match policy {
+        SeedPolicy::QuadFirst => "quad_first",
+        SeedPolicy::WcsFirst => "wcs_first",
+    }
 }
 
 /// Stage 5's stored-plate-solve memo (M4b Task 2): `frame_id` → its
@@ -2744,20 +2756,25 @@ fn solve_of(
 /// One frame's registration inputs (M4b Task 2, rulings R-M4b-2/3): the
 /// scale window it is judged against, and the optional plate-solve seed.
 ///
-/// The seed is only built when the frame's own implied ratio to the
-/// reference says a real scale step is expected — rulings R-T2-1 and
-/// R-T6-4, the [`ratio_wants_seed`] tolerance. Comparing the resulting
-/// WINDOW against `align::SCALE_RANGE` instead would be exact float
-/// equality on a quotient of two MEASURED pixel scales:
-/// `GroupFrame::pixel_scale_arcsec` prefers the stored plate solve, two
+/// The seed is built whenever BOTH this frame and the reference carry a
+/// stored plate solve (ruling R-T6-9). What the frame's implied ratio
+/// decides is only the ORDER: [`SeedPolicy::WcsFirst`] when the ratio says
+/// a real scale step is expected (rulings R-T2-1 / R-T6-4, the
+/// [`ratio_wants_seed`] tolerance), [`SeedPolicy::QuadFirst`] otherwise —
+/// the M1 path, with the seed held in reserve for the frames it drops.
+///
+/// The tolerance decides the order rather than the window because the
+/// ratio is a quotient of two MEASURED pixel scales:
+/// `GroupFrame::pixel_scale_arcsec` prefers the stored plate solve, and two
 /// solves of one rig disagree (typically in the fourth digit, out to 1.6 %
-/// in the measured tail), and every frame of an ordinary same-scale set
-/// would take the WCS path — exactly the path M1–M4a's pins were measured
-/// without. Below the tolerance a same-scale set therefore makes no solve
-/// lookups and produces no hint, and the cross-scale case is the only one
-/// that pays for the seed. The gate itself stays centred on the exact
-/// ratio either way — the tolerance decides only whether a seed is worth
-/// building, never how the frame is judged.
+/// in the measured tail), so an exact comparison would put every frame of
+/// an ordinary same-scale set on the WCS path — exactly the path M1–M4a's
+/// pins were measured without. The gate itself stays centred on the exact
+/// ratio either way: none of this changes how a frame is judged, only
+/// which seed it is offered first.
+///
+/// A frame with no solve on either side gets no hint at all and takes the
+/// M1 path with no fallback, exactly as it did before M4b.
 ///
 /// Both passes of stage 5 go through here — the dry two-pass run and the
 /// persisting one — so a frame is never measured against one gate and
@@ -2768,25 +2785,26 @@ fn registration_gate_and_hint(
     frame: &GroupFrame,
     reference_frame_id: i64,
     reference_scale: Option<f64>,
-) -> ((f64, f64), Option<Linear>) {
+) -> ((f64, f64), Option<Linear>, SeedPolicy) {
     let scale_gate = scale_gate_for(frame.pixel_scale_arcsec, reference_scale);
     let ratio = scale_ratio_for(frame.pixel_scale_arcsec, reference_scale);
-    let hint = if !ratio_wants_seed(ratio) {
-        None
+    let policy = if ratio_wants_seed(ratio) {
+        SeedPolicy::WcsFirst
     } else {
-        match (
-            solve_of(solves, conn, frame.frame_id),
-            solve_of(solves, conn, reference_frame_id),
-        ) {
-            (Some(subject), Some(reference)) => seed_from_solves(
-                &subject,
-                &reference,
-                (frame.width.max(0) as usize, frame.height.max(0) as usize),
-            ),
-            _ => None,
-        }
+        SeedPolicy::QuadFirst
     };
-    (scale_gate, hint)
+    let hint = match (
+        solve_of(solves, conn, frame.frame_id),
+        solve_of(solves, conn, reference_frame_id),
+    ) {
+        (Some(subject), Some(reference)) => seed_from_solves(
+            &subject,
+            &reference,
+            (frame.width.max(0) as usize, frame.height.max(0) as usize),
+        ),
+        _ => None,
+    };
+    (scale_gate, hint, policy)
 }
 
 /// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
@@ -2913,7 +2931,7 @@ fn register_group_pass(
             // actually register, so a fully cached group pays nothing for
             // the seed and the log line never claims a gate for a frame
             // that is not being judged.
-            let (scale_gate, hint) = {
+            let (scale_gate, hint, policy) = {
                 let conn = db(&rc.ctx)?.conn();
                 registration_gate_and_hint(
                     solves,
@@ -2929,6 +2947,7 @@ fn register_group_pass(
                 scale_gate_low = scale_gate.0,
                 scale_gate_high = scale_gate.1,
                 hint = hint.is_some(),
+                seed_policy = seed_policy_field(policy),
                 "registration gate"
             );
             to_register.push(PendingRegistration {
@@ -2939,6 +2958,7 @@ fn register_group_pass(
                 expected_hash,
                 scale_gate,
                 hint,
+                policy,
             });
         }
     }
@@ -2957,9 +2977,9 @@ fn register_group_pass(
         (geometry.width, geometry.height)
     };
     let admission_n = admission(4 * ref_w as u64 * ref_h as u64 * 4);
-    let meta: Vec<(usize, GroupFrame, String)> = to_register
+    let meta: Vec<(usize, GroupFrame, String, SeedPolicy)> = to_register
         .iter()
-        .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone()))
+        .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone(), p.policy))
         .collect();
     let items: Vec<RegisterItem> = to_register
         .into_iter()
@@ -2968,6 +2988,7 @@ fn register_group_pass(
             is_reference: p.is_reference,
             scale_gate: p.scale_gate,
             hint: p.hint,
+            policy: p.policy,
         })
         .collect();
 
@@ -2991,6 +3012,7 @@ fn register_group_pass(
                     Some(pool_ref),
                     cancel_ref,
                     item.hint.as_ref(),
+                    item.policy,
                     item.scale_gate,
                 )
                 .map_err(|e| format!("registration failed: {e}"))
@@ -3001,8 +3023,8 @@ fn register_group_pass(
     rc.check_cancel()?;
 
     for (pos, res) in results.into_iter().enumerate() {
-        let (idx, frame, hash) = &meta[pos];
-        let idx = *idx;
+        let (idx, frame, hash, policy) = &meta[pos];
+        let (idx, policy) = (*idx, *policy);
         match res {
             None => return Err(RunError::Cancelled),
             Some(Err(msg)) => {
@@ -3046,6 +3068,18 @@ fn register_group_pass(
                             rms_px = alignment.rms_px,
                             "frame registered"
                         );
+                        // Ruling R-T6-9: the quad matcher dropped this
+                        // frame and the plate-solve seed picked it up. Its
+                        // own note is in `warnings` below, but a distinct
+                        // event is what makes the pattern countable — on
+                        // real data it clusters by filter, not by frame.
+                        if alignment.seed == SeedKind::Wcs && policy == SeedPolicy::QuadFirst {
+                            tracing::warn!(
+                                run_id = rc.run_id,
+                                frame_id = frame.frame_id,
+                                "quad seed failed; the plate-solve seed carried this frame"
+                            );
+                        }
                         for note in &alignment.warnings {
                             tracing::warn!(
                                 run_id = rc.run_id,
@@ -8533,11 +8567,12 @@ mod tests {
     /// twice the reference's are judged against a gate centred on 2.0 and
     /// register, and the plate-solve seed is what carried them there.
     ///
-    /// Ruling R-T2-1 rides on the same run: the three fine frames carry
-    /// solve-to-solve scale jitter (0.7800 / 0.7803 / 0.7801 — ratios
-    /// within 4e-4 of 1), which must NOT be read as a scale step. They
-    /// keep the M1–M4a path: no seed built, no `+wcs` on the row, no
-    /// wcs-seed warning anywhere in the run.
+    /// Rulings R-T2-1/R-T6-4/R-T6-9 ride on the same run: the three fine
+    /// frames carry solve-to-solve scale jitter (0.7800 / 0.7803 / 0.7801
+    /// — ratios within 4e-4 of 1), which must NOT be read as a scale step.
+    /// Since R-T6-9 they DO get a seed built (they are solved, and so is
+    /// the reference) — it simply does not lead, and the quads carry them,
+    /// so no `+wcs` lands on their rows and no seed warning anywhere.
     #[test]
     fn mixed_scale_frames_register_through_the_per_frame_gate() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8605,19 +8640,27 @@ mod tests {
             let row = rows.get(&id).unwrap_or_else(|| panic!("no row for {id}"));
             let scale = row.scale.expect("an aligned row carries its scale");
             assert!((scale - 1.0).abs() < 0.02, "{id}: scale {scale}");
-            // Same-scale frames keep the M1-M4a path: no seed was built,
-            // so the row cannot name one …
+            // R-T6-4 with R-T6-9's plumbing in place: a seed WAS built for
+            // these frames (both they and the reference are solved), and
+            // the jitter only decided that it would not LEAD. The quads
+            // carried them, so the row must not name the seed …
             assert!(
                 !row.model.as_deref().unwrap_or_default().contains("wcs"),
                 "{id}: {:?}",
                 row.model
             );
         }
-        // … and no hint was even attempted, so no frame reported one being
-        // rejected either (which is what a built-then-refused seed would
-        // have left behind).
+        // … and the seed never had to step in, so no frame reported the
+        // quad matcher failing or a hint being refused.
         assert!(
             !rc.warnings.iter().any(|w| w.contains("wcs seed")),
+            "{:?}",
+            rc.warnings
+        );
+        assert!(
+            !rc.warnings
+                .iter()
+                .any(|w| w.contains("plate-solve seed used")),
             "{:?}",
             rc.warnings
         );

@@ -57,7 +57,7 @@ use athenaeum_core::stacking::measure::{
     measure_frame_with_seeds, measure_plane, measure_plane_with_seeds, MeasureOptions, NoiseSource,
     SeedSource, ADU_SCALE,
 };
-use athenaeum_core::stacking::register::align::{model_name, SCALE_RANGE};
+use athenaeum_core::stacking::register::align::{model_name, SeedPolicy, SCALE_RANGE};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, Star};
 use athenaeum_core::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, FrameRegistration,
@@ -658,6 +658,7 @@ fn main() {
                 Some(&pool),
                 &cancel,
                 None,
+                SeedPolicy::QuadFirst,
                 SCALE_RANGE,
             )
             .map_err(|e| e.to_string())

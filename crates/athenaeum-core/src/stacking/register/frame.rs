@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use super::align::{align, model_name, AlignError, Alignment, SeedKind};
+use super::align::{align, model_name, AlignError, Alignment, SeedKind, SeedPolicy};
 use super::detect::{detect_stars, luminance, Star};
 use super::RegistrationConfig;
 use crate::geometry::{Linear, LinearKind, PixelMap};
@@ -64,9 +64,11 @@ pub fn reference_stars(
 /// are `Err`; an alignment failure is a successful measurement of a frame
 /// that cannot be registered (`outcome: Err(AlignError)`).
 ///
-/// `hint` and `scale_gate` are M4b's two per-frame inputs, passed straight
-/// through to [`align`]: an optional plate-solve seed, and the scale
-/// window this particular frame is judged against.
+/// `hint`, `policy` and `scale_gate` are M4b's three per-frame inputs,
+/// passed straight through to [`align`]: an optional plate-solve seed,
+/// which seed leads (ruling R-T6-9), and the scale window this particular
+/// frame is judged against.
+#[allow(clippy::too_many_arguments)]
 pub fn register_frame(
     reference: &ReferenceStars,
     subject: &Path,
@@ -74,6 +76,7 @@ pub fn register_frame(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
     hint: Option<&Linear>,
+    policy: SeedPolicy,
     scale_gate: (f64, f64),
 ) -> Result<FrameRegistration, IntegrationError> {
     let start = Instant::now();
@@ -93,6 +96,7 @@ pub fn register_frame(
         (width, height),
         cfg,
         hint,
+        policy,
         scale_gate,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -294,6 +298,7 @@ mod tests {
             None,
             &AtomicBool::new(false),
             None,
+            SeedPolicy::QuadFirst,
             SCALE_RANGE,
         )
         .unwrap();
@@ -357,6 +362,7 @@ mod tests {
             None,
             &AtomicBool::new(false),
             None,
+            SeedPolicy::QuadFirst,
             SCALE_RANGE,
         )
         .unwrap();
@@ -374,6 +380,7 @@ mod tests {
                 None,
                 &AtomicBool::new(true),
                 None,
+                SeedPolicy::QuadFirst,
                 SCALE_RANGE
             ),
             Err(IntegrationError::Cancelled)
@@ -388,6 +395,7 @@ mod tests {
                 None,
                 &AtomicBool::new(false),
                 None,
+                SeedPolicy::QuadFirst,
                 SCALE_RANGE
             ),
             Err(IntegrationError::BadInput(_))
@@ -410,6 +418,7 @@ mod tests {
             None,
             &AtomicBool::new(false),
             None,
+            SeedPolicy::QuadFirst,
             SCALE_RANGE,
         )
         .unwrap();

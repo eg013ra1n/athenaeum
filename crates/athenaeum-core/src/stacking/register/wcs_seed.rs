@@ -69,6 +69,14 @@ pub fn ratio_wants_seed(ratio: f64) -> bool {
     ratio.is_finite() && (ratio - 1.0).abs() > WCS_SEED_RATIO_EPS
 }
 
+/// The radius, in reference pixels, at which `align` confirms a seed
+/// against the reference's own stars before trusting it:
+/// [`WCS_SEED_RADIUS_FACTOR`] × the RANSAC tolerance, never below
+/// [`WCS_SEED_RADIUS_MIN_PX`].
+pub fn seed_radius_px(ransac_tolerance_px: f64) -> f64 {
+    (WCS_SEED_RADIUS_FACTOR * ransac_tolerance_px).max(WCS_SEED_RADIUS_MIN_PX)
+}
+
 /// Subject → reference as an affine, from both frames' stored plate
 /// solves. `subject_geometry` is the subject frame's own `(width, height)`
 /// in pixels — the grid is laid over it, not over the reference.
