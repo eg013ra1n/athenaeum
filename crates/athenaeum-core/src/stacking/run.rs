@@ -2418,7 +2418,7 @@ fn resolve_group_geometry(rc: &mut RunContext) -> Result<(), RunError> {
                             tracing::warn!(
                                 run_id = rc.run_id,
                                 group_key = %key,
-                                "the group's own reference has no calibrated file;                                  using the run reference for it"
+                                "group reference has no calibrated file; using the run reference"
                             );
                             run_geometry.clone()
                         }
@@ -4183,6 +4183,18 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
     }
 }
 
+/// Whether stage 5 actually registered this group — at least one of its
+/// measured entries carries a registration outcome. `register_group_pass`
+/// returns before touching a single entry when it skips a group (fewer
+/// than 3 included frames), so an all-`None` group is exactly one the
+/// register stage never processed (M4b Task 3 fix round 1, m3).
+fn group_registered(rc: &RunContext, group_key: &str) -> bool {
+    rc.measured
+        .get(group_key)
+        .map(|entries| entries.iter().any(|e| e.registration.is_some()))
+        .unwrap_or(false)
+}
+
 /// Push one [`SummaryGroup`] for `group` onto `rc.summary.groups` — called
 /// exactly once per plan group, whatever its outcome (skipped/failed/
 /// written), so the run's provenance document always accounts for every
@@ -4233,10 +4245,23 @@ fn push_summary_group(
         // M4b ruling R-M4b-4: whichever frame this group actually
         // registered onto — its `GroupGeometry` is the one place that
         // knows, in either mode.
-        reference_frame_id: rc
-            .group_geometry
-            .get(&group.key)
-            .map(|g| g.reference_frame_id),
+        //
+        // Fix round 1 (m3): `Some` ONLY for a group stage 5 really
+        // registered. Stage 4 resolves a `GroupGeometry` for every plan
+        // group, including ones the register stage then skips (fewer than
+        // 3 included frames), and reporting those would put a
+        // `reference #N` on a card whose master was never written. A
+        // registered group always carries a `registration` outcome on at
+        // least one of its entries — `register_group_pass` returns before
+        // touching any of them when it skips a group — so that is the
+        // signal, not a second copy of the viability rule.
+        reference_frame_id: group_registered(rc, &group.key)
+            .then(|| {
+                rc.group_geometry
+                    .get(&group.key)
+                    .map(|g| g.reference_frame_id)
+            })
+            .flatten(),
         ln_reference_path,
         drizzle_path,
         weight_map_path,
@@ -6585,6 +6610,7 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
     // Keyed by frame id so the lookup AND the warning happen once per
     // distinct reference, never once per group.
     let mut solves: HashMap<i64, Option<PlateSolveRecord>> = HashMap::new();
+    let mut warned_missing_wcs: HashSet<i64> = HashSet::new();
 
     // Fix round 1, Minor M2: the `dropShrink` clamp (ruling R-M3-10) runs
     // ONCE here, for the whole run, instead of once per group — `drizzle.
@@ -6634,14 +6660,37 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
     for group in &groups {
         rc.check_cancel()?;
         let reference_frame_id = rc.geometry_of(&group.key).reference_frame_id;
-        if let std::collections::hash_map::Entry::Vacant(slot) = solves.entry(reference_frame_id) {
-            let solve = {
+        // Fix round 1 (m2): a group `process_group_output` is about to skip
+        // never writes a master, so neither the solve lookup nor the
+        // missing-WCS warning belongs to it. `included_count_of` is the
+        // SAME first gate that function applies (its own `included_count <
+        // 3` early return), read here rather than re-derived.
+        let wcs = if included_count_of(rc, &group.key) >= 3 {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                solves.entry(reference_frame_id)
+            {
                 let conn = db(&rc.ctx)?.conn();
-                get_plate_solve(&conn, reference_frame_id)?
-            };
-            let missing = solve.is_none();
-            slot.insert(solve);
-            if missing {
+                slot.insert(get_plate_solve(&conn, reference_frame_id)?);
+            }
+            solves
+                .get(&reference_frame_id)
+                .and_then(|s| s.as_ref())
+                .cloned()
+        } else {
+            None
+        };
+        let (outcome, n, i, d, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
+        normalize_total += n;
+        integrate_total += i;
+        drizzle_total += d;
+        output_total += o;
+        if matches!(outcome, GroupOutcome::Written) {
+            any_master = true;
+            // … and the warning belongs to a master that was ACTUALLY
+            // written without a WCS — once per distinct reference frame, so
+            // co-registered mode (where every group names the same one)
+            // still warns exactly once, as it always has.
+            if wcs.is_none() && warned_missing_wcs.insert(reference_frame_id) {
                 tracing::warn!(
                     run_id = rc.run_id,
                     frame_id = reference_frame_id,
@@ -6651,18 +6700,6 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
                     "no plate solve on the reference frame; the master has no WCS".to_string(),
                 );
             }
-        }
-        let wcs = solves
-            .get(&reference_frame_id)
-            .and_then(|s| s.as_ref())
-            .cloned();
-        let (outcome, n, i, d, o) = process_group_output(rc, group, &measure_opts, wcs.as_ref())?;
-        normalize_total += n;
-        integrate_total += i;
-        drizzle_total += d;
-        output_total += o;
-        if matches!(outcome, GroupOutcome::Written) {
-            any_master = true;
         }
     }
 
@@ -8132,8 +8169,9 @@ mod tests {
             Some(&rc.ctx.image_pool),
         )
         .unwrap();
-        rc.reference_width = ref_stars.width;
-        rc.reference_height = ref_stars.height;
+        // (M4b Task 3 fix round 1, m7: nothing sets `rc.reference_width`/
+        // `height` here any more — `register_group_pass` reads the group's
+        // own `GroupGeometry`, which stage 4 already resolved.)
         let reference_group_frame =
             find_frame_in_groups(&rc.plan_groups, reference_frame_id).unwrap();
         let reference_hash = {
@@ -8642,10 +8680,19 @@ mod tests {
     /// coarse group register onto the FINE reference at all in
     /// co-registered mode (a ×2 scale step needs the WCS seed, M4b Task
     /// 2) — the very comparison these tests rest on.
+    ///
+    /// A THIRD group of two frames (filter `SII`, coarse geometry) rides
+    /// along: it is below the 3-frame viability floor, so stage 5 never
+    /// registers it and stage 9 skips it — the case fix round 1's m3 is
+    /// about (`SummaryGroup::reference_frame_id` must stay `None` for a
+    /// group that never registered onto anything).
+    ///
+    /// Returns `(fixture, fine_ids, coarse_ids, tiny_ids, working, output)`.
     fn seed_two_geometry_groups(
         db_path: &Path,
     ) -> (
         test_fixtures::Fixture,
+        Vec<i64>,
         Vec<i64>,
         Vec<i64>,
         tempfile::TempDir,
@@ -8690,8 +8737,26 @@ mod tests {
             coarse_ids.push(id);
         }
 
+        let mut tiny_ids = Vec::new();
+        for (i, (dx, dy)) in [(0.0, 0.0), (1.0, 0.0)].iter().enumerate() {
+            let date_obs = date_obs_at(i + 7);
+            let stem = format!("tiny{i}");
+            let mut spec = mixed_light_spec(&stem, &date_obs, COARSE_W, COARSE_H);
+            spec.filter = Some("SII");
+            let (id, _) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &scaled_stars(1.0, *dx, *dy),
+                600.0,
+                5.0,
+                320 + i as u64,
+            );
+            tiny_ids.push(id);
+        }
+
         test_fixtures::add_master_dark_and_flat(&fixture, &fine_ids, FINE_W, FINE_H);
         test_fixtures::add_master_dark_and_flat(&fixture, &coarse_ids, COARSE_W, COARSE_H);
+        test_fixtures::add_master_dark_and_flat(&fixture, &tiny_ids, COARSE_W, COARSE_H);
 
         for &id in &fine_ids {
             test_fixtures::seed_plate_solve_wcs(
@@ -8704,7 +8769,7 @@ mod tests {
                 FINE_SCALE_ARCSEC,
             );
         }
-        for &id in &coarse_ids {
+        for &id in coarse_ids.iter().chain(tiny_ids.iter()) {
             test_fixtures::seed_plate_solve_wcs(
                 &fixture.conn,
                 id,
@@ -8731,7 +8796,7 @@ mod tests {
         )
         .unwrap();
 
-        (fixture, fine_ids, coarse_ids, working, output)
+        (fixture, fine_ids, coarse_ids, tiny_ids, working, output)
     }
 
     /// Drives stages 1-9 over [`seed_two_geometry_groups`] with `cfg`, and
@@ -8748,7 +8813,7 @@ mod tests {
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         assert_eq!(
             plan_groups.len(),
-            2,
+            3,
             "premise: one group per filter: {plan_groups:?}"
         );
         let (run_id, group_ids) = seed_run_and_groups(
@@ -8818,7 +8883,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let (fixture, fine_ids, coarse_ids, working, output) = seed_two_geometry_groups(&db_path);
+        let (fixture, fine_ids, coarse_ids, tiny_ids, working, output) =
+            seed_two_geometry_groups(&db_path);
 
         let mut cfg = StackingConfig::default();
         cfg.registration.geometry = RegistrationGeometry::Native;
@@ -8845,6 +8911,17 @@ mod tests {
         let (cw, ch, cgeo) = master_geometry(coarse);
         assert_eq!((cw, ch), (COARSE_W as i64, COARSE_H as i64));
         assert_eq!(cgeo, "native");
+
+        // Fix round 1 (m3): the two-frame `SII` group never reached stage
+        // 5, so it never registered onto anything — its summary must not
+        // claim a reference (the Results card would render
+        // `· reference #N` for a master that was never written).
+        let tiny = summary_group(&rc, &group_key_of(&rc, tiny_ids[0]));
+        assert_eq!(
+            tiny.reference_frame_id, None,
+            "a group the register stage skipped has no reference: {tiny:?}"
+        );
+        assert_eq!(tiny.master_path, None, "{tiny:?}");
 
         // The run-level reference is still the largest group's — what the
         // plan gate and the results header show (ruling R-M4b-4).
@@ -8885,7 +8962,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let (fixture, fine_ids, coarse_ids, working, output) = seed_two_geometry_groups(&db_path);
+        let (fixture, fine_ids, coarse_ids, _tiny_ids, working, output) =
+            seed_two_geometry_groups(&db_path);
 
         let mut cfg = StackingConfig::default();
         assert_eq!(
@@ -8932,6 +9010,83 @@ mod tests {
         }
     }
 
+    /// Controller ruling R-T3-2 (fix round 1, m6): a Manual pin in native
+    /// mode pins ITS OWN group's reference and nothing else — the other
+    /// groups still auto-pick their own best-weighted member — while the
+    /// RUN-level `stacking_runs.reference_frame_id` stays the pin, whatever
+    /// size its group is, because that is the choice the results header and
+    /// the plan gate both key on. The pin never moves, two-pass on.
+    #[test]
+    fn native_manual_reference_pins_only_its_own_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, fine_ids, coarse_ids, _tiny_ids, working, output) =
+            seed_two_geometry_groups(&db_path);
+
+        // Deliberately the SMALLER group, and deliberately NOT that group's
+        // own best-by-weight member (`coarse_ids[0]` is the cleanest): both
+        // halves of the ruling are only visible when the pin disagrees with
+        // what Auto would have chosen.
+        let pin = coarse_ids[1];
+        crate::registration::db::set_frame_set_reference(&fixture.conn, fixture.set_id, pin)
+            .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        cfg.reference.mode = ReferenceMode::Manual;
+        assert!(cfg.reference.two_pass, "the default must be on");
+
+        let rc = run_two_geometry_groups(&fixture, ctx, cfg, &working, &output);
+
+        // (i) the pinned group keeps the pin, and two-pass did not move it.
+        let coarse = summary_group(&rc, &group_key_of(&rc, pin));
+        assert_eq!(
+            coarse.reference_frame_id,
+            Some(pin),
+            "a manual pin is its own group's reference: {coarse:?}"
+        );
+        assert_eq!(
+            rc.summary.reference.switched_from, None,
+            "{:?}",
+            rc.warnings
+        );
+        assert!(
+            !rc.warnings.iter().any(|w| w.contains("two-pass")),
+            "{:?}",
+            rc.warnings
+        );
+
+        // (ii) the other group auto-picks its OWN member — never the pin.
+        let fine = summary_group(&rc, &group_key_of(&rc, fine_ids[0]));
+        let fine_reference = fine.reference_frame_id.expect("a group reference");
+        assert_ne!(fine_reference, pin, "the pin applies to its own group only");
+        assert!(
+            fine_ids.contains(&fine_reference),
+            "the fine group's reference must be one of its own frames: {fine_reference}"
+        );
+
+        // (iii) the RUN-level reference is the pin, in the context, the
+        // summary and the `stacking_runs` row alike.
+        assert_eq!(rc.reference_frame_id, Some(pin));
+        assert_eq!(rc.summary.reference.frame_id, Some(pin));
+        let row = crate::db::stacking::get_run(&fixture.conn, rc.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reference_frame_id, Some(pin));
+        assert_eq!(row.reference_mode, "manual");
+
+        // … and each master is still delivered in its own group's geometry.
+        assert_eq!(
+            master_geometry(fine),
+            (FINE_W as i64, FINE_H as i64, "native".to_string())
+        );
+        assert_eq!(
+            master_geometry(coarse),
+            (COARSE_W as i64, COARSE_H as i64, "native".to_string())
+        );
+    }
+
     /// (c) Native mode with the two-pass re-pick ON (the default): the
     /// pick runs over each group's OWN members, so whatever it chooses is
     /// still a member of that same group — it can never wander into the
@@ -8941,7 +9096,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let (fixture, fine_ids, coarse_ids, working, output) = seed_two_geometry_groups(&db_path);
+        let (fixture, fine_ids, coarse_ids, _tiny_ids, working, output) =
+            seed_two_geometry_groups(&db_path);
 
         let mut cfg = StackingConfig::default();
         cfg.registration.geometry = RegistrationGeometry::Native;

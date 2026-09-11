@@ -755,9 +755,10 @@ knows; every former reader of `rc.reference_width/height` now reads
 `rc.geometry_of(&group.key)`, which in co-registered mode holds the
 run-wide value for every group, so the M1–M4a pins keep passing with the
 default config. The run-level `stacking_runs.reference_frame_id` stays the
-largest group's reference in both modes (what the plan gate and the
-results header show); `SummaryGroup.reference_frame_id` carries each
-group's own; every master and drizzled master (and a drizzle weight map)
+largest group's reference in `Auto` mode and IS the pin in `Manual` mode
+(ruling R-T3-2 — what the plan gate and the results header show);
+`SummaryGroup.reference_frame_id` carries each group's own, and is `None`
+for a group stage 5 never registered (fewer than 3 included frames); every master and drizzled master (and a drizzle weight map)
 carries `ATH_RGEO = 'coRegistered' | 'native'`, and in native mode the
 master's WCS is the GROUP reference's solve. `registration.geometry` rides
 `registration_subtree`, so flipping it re-registers every set on purpose.

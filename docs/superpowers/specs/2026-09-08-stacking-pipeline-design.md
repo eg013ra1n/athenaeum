@@ -320,6 +320,19 @@ Rulings (M4b plan header, `docs/superpowers/plans/2026-09-10-stacking-m4b-plan-m
   reference's solve; `bin<n>` in the filename stays the group's own binning
   in both modes (M11) — the WCS says the delivered scale.
 
+**Clarification (ruling R-T3-2, M4b Task 3).** R-M4b-4's "the run-level
+`stacking_runs.reference_frame_id` stays the largest group's reference" is
+the `Auto` rule. A **Manual** pin overrides it in both modes: the run-level
+id IS the pin, whatever the size of the group it sits in — the results
+header must show the frame the owner chose, and `plan.rs` keys its own
+staleness check on it. In native mode the pin is additionally that group's
+own registration reference and never moves (no two-pass re-pick for it),
+while every OTHER group still auto-picks its best-weighted member and may
+refine it two-pass. `SummaryGroup.reference_frame_id` is filled only for a
+group that stage 5 actually registered — a group below the 3-frame
+viability floor never warped anything onto its resolved reference, so it
+reports `None`.
+
 ## 4. Measurement, weights, selection
 
 Today's `frame_analysis.psf_signal` is `median(peak)/noise`, not the PSF

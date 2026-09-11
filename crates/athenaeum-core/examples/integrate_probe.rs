@@ -63,7 +63,9 @@ use athenaeum_core::stacking::register::frame::{
     identity_registration, reference_stars, register_frame, FrameRegistration,
 };
 use athenaeum_core::stacking::register::writer::source_cards_from_file;
-use athenaeum_core::stacking::register::{DetectionConfig, RegistrationConfig};
+use athenaeum_core::stacking::register::{
+    DetectionConfig, RegistrationConfig, RegistrationGeometry,
+};
 use athenaeum_core::stacking::weights::{
     best_by_weight, compute_weights, FormulaWeights, WeightInput, WeightMode,
 };
@@ -1091,6 +1093,9 @@ fn main() {
         cameras: &cameras,
         run_id: "probe",
         app_version: env!("CARGO_PKG_VERSION"),
+        // The probe integrates one group onto one reference — the
+        // co-registered shape, whatever the app's own config says.
+        geometry: RegistrationGeometry::CoRegistered,
     }) {
         Ok(c) => c,
         Err(e) => {

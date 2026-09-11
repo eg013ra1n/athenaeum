@@ -151,8 +151,12 @@ pub struct SummaryGroup {
     /// M4b (ruling R-M4b-4): the frame every member of THIS group was
     /// registered onto — the run-wide reference in `coRegistered` mode
     /// (the same id `RunSummary::reference` carries), the group's own in
-    /// `native` mode. `None` only on a summary written before M4b, or for
-    /// a group that never reached stage 5. `#[serde(default)]`, see
+    /// `native` mode. `None` on a summary written before M4b, and for a
+    /// group that never reached stage 5 (fewer than 3 included frames):
+    /// such a group has a resolved reference in the run's own bookkeeping,
+    /// but it never warped anything onto it and never wrote a master, so
+    /// reporting one here would put a `reference #N` on a Results card
+    /// with no master behind it. `#[serde(default)]`, see
     /// [`SummaryFrame::ln_scale`]'s own doc.
     #[serde(default)]
     pub reference_frame_id: Option<i64>,
