@@ -695,11 +695,19 @@ functions build calibration masters and their output is fingerprint-pinned:
   1.5σ Winsorization with a first-pass cutoff of 5 (a sample beyond
   `μ ± 5σ` becomes `μ`, not the neighbouring threshold), `σ = 1.134·stddev`,
   `μ = mean`, to `|Δσ|/σ < 0.0005` after ≥ 2 passes and at most 20, then the
-  sigma clip about `(μ_w, σ_w)` repeated until stable. The one documented
-  deviation is the initial scale: `1.4826·MAD` instead of the reference's
-  `1.1926·Sn`, which is O(n²) per pixel stack — the first-pass cutoff makes
-  the start point nearly irrelevant and the loop reaches the same fixed
-  point from either. No fixture fingerprint pin moved (the two Winsorized
+  sigma clip about `(μ_w, σ_w)` repeated until stable. Two documented
+  deviations, both in the initial scale: `1.4826·MAD` instead of the
+  reference's `1.1926·Sn`, which is O(n²) per pixel stack — the first-pass
+  cutoff makes the start point nearly irrelevant and the loop reaches the
+  same fixed point from either — and, when that MAD is exactly **0**, the
+  sample standard deviation about the median instead (ruling R-T2-1). The
+  MAD of any MAJORITY-TIED stack is 0, which integer-ADU calibration stacks
+  routinely are: `15 × 500 ADU + one cosmic ray` would otherwise seed
+  `σ = 0` and switch the rejection off on the default master recipe
+  (Winsorized 3/3 for n ≥ 15). The reference's `Sn` seed degenerates on the
+  same stacks; the fallback is ours, it restores the retired estimator's
+  answer there, and a stack with a non-zero MAD can never reach it.
+  No fixture fingerprint pin moved (the two Winsorized
   fixtures are tolerance- and survivor-set-based, and both fixed points
   reject the same planted outlier there); the real move was measured on 21
   calibrated LDN 1272 mono frames at 4.0/3.0 — rejected fraction

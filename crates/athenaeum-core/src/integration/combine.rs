@@ -402,7 +402,7 @@ fn apply_rejection<T: Sample>(values: &mut [T], rejection: Rejection) -> (usize,
     }
 }
 
-// ── Rejection algorithms (in place, allocation-free except winsorized) ──────
+// ── Rejection algorithms (in place, allocation-free) ───────────────────────
 
 fn reject_percentile<T: Sample>(values: &mut [T], low: f64, high: f64) -> (usize, bool) {
     let n = values.len();
@@ -542,17 +542,39 @@ fn median_in_place(v: &mut [f32]) -> f64 {
 /// `mu = mean(v)`, `sigma = 1.134·stddev(v)`; stop once `sigma` moves by
 /// less than 0.05 % and at least two passes have run, or at 20 passes.
 ///
+/// **Zero-MAD fallback (ruling R-T2-1), ours and not the reference's.** The
+/// MAD is 0 for any stack whose MAJORITY is tied, not just for identical
+/// samples — and integer-ADU calibration stacks are exactly that shape, so
+/// `15 × 500 ADU + one cosmic ray` would seed `sigma = 0` and switch the
+/// whole rejection off on the DEFAULT master recipe. When the MAD is 0 the
+/// scale is seeded from the sample standard deviation about the median
+/// instead (the retired estimator's contaminated seed, which restores its
+/// answer on exactly these stacks); a stack with a non-zero MAD can never
+/// reach that branch, so nothing else moves. All-identical samples have no
+/// dispersion under either seed and still reject nothing. The reference's
+/// `1.1926·Sn` seed degenerates on the same stacks — this fallback is our
+/// own, not something read out of §3.4.
+///
 /// Allocation-free: `scratch` is the caller's reused buffer, used first for
-/// the two medians and then as the working copy. Zero dispersion (identical
-/// samples, or fewer than three of them) returns `sigma_w = 0`, which the
-/// caller reads as "nothing to reject".
+/// the two medians and then as the working copy. The working copy is `f32`
+/// where the reference's loop is `f64`; a clamped value's quantization is
+/// ~6e-8 relative, three orders of magnitude below the 5e-4 stop rule, so
+/// it cannot change how many passes the loop takes.
+///
+/// Fewer than three samples, and zero dispersion by either seed, return
+/// `sigma_w = 0` — which the caller reads as "nothing to reject".
 fn winsorized_location_scale<T: Sample>(values: &[T], scratch: &mut Vec<f32>) -> (f64, f64, usize) {
     let n = values.len();
     if n == 0 {
         return (0.0, 0.0, 0);
     }
     if n < 3 {
-        return (mean_f64(values), 0.0, 0);
+        // The loop's centre is the median, so the degenerate answer is the
+        // median too — a caller that reads mu without looking at sigma must
+        // not be handed a different statistic than the loop would give it.
+        scratch.clear();
+        scratch.extend(values.iter().map(|s| s.value()));
+        return (median_in_place(&mut scratch[..]), 0.0, 0);
     }
     scratch.clear();
     scratch.extend(values.iter().map(|s| s.value()));
@@ -561,7 +583,12 @@ fn winsorized_location_scale<T: Sample>(values: &[T], scratch: &mut Vec<f32>) ->
         *dst = (src.value() as f64 - mu).abs() as f32;
     }
     let mad = median_in_place(&mut scratch[..]);
-    let mut sigma = WINSORIZE_MAD_TO_SIGMA * mad;
+    let mut sigma = if mad > 0.0 {
+        WINSORIZE_MAD_TO_SIGMA * mad
+    } else {
+        // Majority-tied stack: see the fallback note above.
+        stddev(values, mu)
+    };
     scratch.clear();
     scratch.extend(values.iter().map(|s| s.value()));
 
@@ -606,12 +633,26 @@ fn winsorized_location_scale<T: Sample>(values: &[T], scratch: &mut Vec<f32>) ->
 /// the contaminated mean and standard deviation — byte-identical to the
 /// pre-2026-07-06 `WinsorizedSigmaClip` estimator, deliberately, so that
 /// masters built by older versions could be reproduced. Ruling R-M4c-3
-/// retires that fixed point: the old start point let a gross outlier inflate
-/// the scale it was supposed to be measured against (it converged ~5 % high
-/// on a 5 %-contaminated normal stack, against ~2.7 % low for the reference
-/// loop, whose centre-mapping cutoff removes the outlier's leverage
-/// entirely). Every Winsorized master fingerprint moved with it — the
-/// old/new numbers are in the M4c Task 2 commit body.
+/// retires that fixed point: the old seed let a gross outlier inflate the
+/// very scale it was supposed to be measured against, because plain clamping
+/// pinned it at `mu + 1.5·sigma` and left it there, while the reference
+/// loop's first-pass cutoff maps it to the centre where it has no leverage.
+/// Measured on 100 draws of N(0.1, 0.002) plus 5 samples at +10 sigma
+/// (`winsorized_location_scale_lands_on_the_reference_fixed_point`), against
+/// each estimator's OWN answer on the clean 100: contamination moves the
+/// retired estimator +8.2 % (0.00185773 → 0.00201002) and the reference loop
+/// −5.3 % (0.00181578 → 0.00172028).
+///
+/// **No fixture fingerprint pin moved.** The Winsorized fixtures in this
+/// module and in `engine.rs` are tolerance- or survivor-set-based, and on
+/// `fixture_stack()` both fixed points reject the same single outlier and
+/// average the same 24 survivors — so the bit-for-bit legacy pin below still
+/// holds, incidentally (it now asserts the estimators DISAGREE as well, so
+/// it cannot quietly become a claim of equivalence). The real move was
+/// measured on 21 calibrated LDN 1272 mono frames at 4.0/3.0: rejected
+/// fraction 0.380 % → 0.963 %, master median −0.024 %, master MAD +0.50 %,
+/// master noise +2.0 %, 6.59 % of the 25.9 M pixels changed. Full numbers in
+/// the M4c Task 2 commit body and spec §6.3.
 fn reject_winsorized<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f64) -> (usize, bool) {
     let n = values.len();
     if n < 3 {
@@ -2098,6 +2139,99 @@ mod tests {
         let mut pure = planted_stack(100, 0.1, 0.002, SEED, &[]);
         let (kept_pure, _) = reject_winsorized(&mut pure, 4.0, 3.0);
         assert!(kept_pure >= 98, "a pure Gaussian may lose at most 2: kept {kept_pure}");
+    }
+
+    /// Ruling R-T2-1: a stack whose MAJORITY is tied has a zero MAD, which
+    /// would seed the loop with `sigma = 0` and turn the whole rejection off
+    /// — on the DEFAULT master recipe (`resolve_recipe` → Winsorized 3/3 for
+    /// n ≥ 15) and in the Auto ladder's 8–19 band. Integer-ADU calibration
+    /// stacks are exactly that shape, so the two cases below are the ones a
+    /// bias master with a cosmic ray actually hits. The MAD fallback restores
+    /// the retired estimator's answer on them.
+    #[test]
+    fn winsorized_rejects_the_outlier_of_a_majority_tied_stack() {
+        // 15 samples at 500 ADU + one cosmic ray. Without the fallback:
+        // 0 rejected and 781.25 combined (the outlier folded straight into
+        // the master).
+        let mut tied: Vec<f32> = vec![500.0; 15];
+        tied.push(sample_from(5000.0));
+        let (v, rejected) = combine_pixel(
+            &mut tied.clone(),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 3.0,
+                sigma_high: 3.0,
+            }),
+        );
+        assert_eq!(rejected, 1, "the cosmic ray must be rejected");
+        assert!((v as f64 - 500.0).abs() < 1e-6, "combined {v}, want 500.0");
+
+        // 9 tied at 500 (a bare majority of 16, so the MAD is still 0), 6
+        // samples spread +-1..3 ADU around them, one cosmic ray. Without the
+        // fallback: 0 rejected and 1031.25 combined.
+        let mut mixed: Vec<f32> = vec![500.0; 9];
+        for d in [1.0f32, -1.0, 2.0, -2.0, 3.0, -3.0] {
+            mixed.push(sample_from(500.0 + d));
+        }
+        mixed.push(sample_from(9000.0));
+        let (v2, rejected2) = combine_pixel(
+            &mut mixed.clone(),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 3.0,
+                sigma_high: 3.0,
+            }),
+        );
+        assert_eq!(rejected2, 1, "the cosmic ray must be rejected");
+        assert!(
+            (v2 as f64 - 500.0).abs() < 1e-6,
+            "combined {v2}, want 500.0 (the 15 survivors are symmetric about it)"
+        );
+
+        // All-identical samples still reject nothing: there is no dispersion
+        // to measure, by either seed.
+        let mut flat: Vec<f32> = vec![500.0; 16];
+        let (v3, rejected3) = combine_pixel(
+            &mut flat,
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 3.0,
+                sigma_high: 3.0,
+            }),
+        );
+        assert_eq!(rejected3, 0);
+        assert_eq!(v3, 500.0);
+    }
+
+    /// The control for the fallback above: a stack with a NON-zero MAD must
+    /// be untouched by it. The two values are the ones `combine_pixel`
+    /// returned BEFORE the fallback was added (commit 92bf2482) and after —
+    /// identical, because the fallback is reachable only when the MAD is
+    /// exactly 0.
+    #[test]
+    fn winsorized_mad_fallback_cannot_touch_a_non_degenerate_stack() {
+        let clean = fixture_gaussian_stack(100, 0.1, 0.002, 0xD15_0001);
+        let mut contaminated = clean.clone();
+        for _ in 0..5 {
+            contaminated.push(sample_from(0.12));
+        }
+        // The premise: this fixture's MAD is nowhere near zero.
+        let mut devs: Vec<f32> = contaminated.iter().map(|&x| (x - 0.1).abs()).collect();
+        let mad = median_in_place(&mut devs[..]);
+        assert!(mad > 1e-4, "the control fixture must have a real MAD: {mad}");
+
+        let (v, rejected) = combine_pixel(
+            &mut contaminated.clone(),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 4.0,
+                sigma_high: 3.0,
+            }),
+        );
+        assert_eq!(rejected, 6, "5 planted outliers + 1 clean tail sample");
+        // 1e-7 rather than exact bits for the same reason as the fixed-point
+        // pin: the fixture is generated through `ln`/`cos`. It is still four
+        // orders of magnitude tighter than any change of seed could be.
+        assert!(
+            (v as f64 - 0.100_086_555).abs() < 1e-7,
+            "the non-degenerate answer must not move: {v}"
+        );
     }
 
     /// The all-rejected fallback survives the loop (it used to be reachable

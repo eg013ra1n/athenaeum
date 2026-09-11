@@ -1316,6 +1316,63 @@ mod tests {
         assert!(out.flat_norm.is_none());
     }
 
+    /// The master path's only BIT-EXACT Winsorized pin (M4c Task 2, rulings
+    /// R-M4c-3 and R-T2-1 — the tree had none, which is why the reference
+    /// loop could be introduced without a single fingerprint moving).
+    ///
+    /// 16 frames of 1000 ADU — the `resolve_recipe` default for n >= 15 is
+    /// exactly this recipe — with three planted pixels:
+    ///
+    /// - a cosmic ray (9000 in one frame) and a dead sample (200 in another)
+    ///   on stacks whose other 15 samples are TIED. Their MAD is 0, so
+    ///   without the zero-MAD fallback of ruling R-T2-1 the rejection is off
+    ///   and these come out at 1500.0 and 950.0 — the regression this pin
+    ///   exists to catch;
+    /// - a spread pixel (1000..1004, three frames each) with a mild outlier
+    ///   at 1100 in the last frame, so the pin also covers a stack the
+    ///   fallback must NOT touch.
+    ///
+    /// Every value below is exact in f32: the survivors are integers and
+    /// their means land on integers.
+    #[test]
+    fn winsorized_master_is_bit_exact_on_a_planted_integer_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 4usize);
+        let mut paths = Vec::new();
+        for i in 0..16usize {
+            let mut data = vec![1000.0f32; w * h];
+            data[0] = if i < 15 { 1000.0 + (i % 5) as f32 } else { 1100.0 };
+            if i == 3 { data[w + 2] = 9000.0; }
+            if i == 7 { data[2 * w + 5] = 200.0; }
+            let p = dir.path().join(format!("w{i:02}.fits"));
+            write_fits_f32(&p, w, h, 1, &data, &[]).unwrap();
+            paths.push(p);
+        }
+        let out = integrate_bias_like(
+            &paths,
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
+            &pool(), dir.path(), &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(MIN_BUDGET_BYTES),
+        ).unwrap();
+        let px = |x: usize, y: usize| out.data[y * w + x];
+        assert_eq!(px(2, 1).to_bits(), 1000.0f32.to_bits(),
+            "cosmic ray on a majority-tied stack: got {} (1500.0 = the zero-MAD hole)", px(2, 1));
+        assert_eq!(px(5, 2).to_bits(), 1000.0f32.to_bits(),
+            "dead sample on a majority-tied stack: got {} (950.0 = the zero-MAD hole)", px(5, 2));
+        assert_eq!(px(0, 0).to_bits(), 1002.0f32.to_bits(),
+            "spread pixel: the 15 survivors average 1002 exactly, got {}", px(0, 0));
+        for y in 0..h {
+            for x in 0..w {
+                if (x, y) == (2, 1) || (x, y) == (5, 2) || (x, y) == (0, 0) { continue; }
+                assert_eq!(px(x, y).to_bits(), 1000.0f32.to_bits(), "untouched pixel ({x},{y})");
+            }
+        }
+        // Three algorithm rejections out of 16 x 32 samples.
+        assert_eq!(out.rejected_fraction, 3.0 / 512.0);
+        assert!(out.flat_norm.is_none());
+    }
+
     #[test]
     fn flat_normalization_equalizes_exposure_drift() {
         let dir = tempfile::tempdir().unwrap();
