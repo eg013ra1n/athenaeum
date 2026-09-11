@@ -380,6 +380,43 @@ pub(crate) fn add_raw_linked_dark(
     set_id
 }
 
+/// As [`add_raw_linked_dark`], but for a caller-chosen `imagetyp` and raw
+/// sub-frame COUNT instead of always `Dark`/`MIN_MASTER_FRAMES` — needed to
+/// build an UNBUILDABLE raw set (fewer than `MIN_MASTER_FRAMES` sub-frames)
+/// on purpose, the M4b R-T6-6 real-data finding's own shape (a 1-frame raw
+/// flat linked to lights that all turn out to be manually excluded).
+/// Returns the raw `calibration_set` id.
+pub(crate) fn add_raw_linked_calibration_with_count(
+    f: &Fixture,
+    light_frame_ids: &[i64],
+    width: usize,
+    height: usize,
+    imagetyp: &str,
+    frame_count: usize,
+) -> i64 {
+    f.conn
+        .execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library, frame_count)
+             VALUES (?1, '2025-01-01', 0, ?2)",
+            params![imagetyp, frame_count as i64],
+        )
+        .unwrap();
+    let set_id = f.conn.last_insert_rowid();
+    for i in 0..frame_count {
+        let frame_id = write_raw_subframe(f, imagetyp, width, height, 100.0, i, set_id);
+        f.conn
+            .execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+    }
+    for &light_id in light_frame_ids {
+        link_calibration(&f.conn, light_id, set_id, imagetyp);
+    }
+    set_id
+}
+
 /// Real on-disk `(size, modified_at)` for a just-written file, in the same
 /// shape the scanner stores: `size` = byte length, `modified_at` =
 /// `chrono::DateTime::<Utc>::from(metadata.modified()).to_rfc3339()` — the

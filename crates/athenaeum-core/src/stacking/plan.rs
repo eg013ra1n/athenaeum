@@ -18,7 +18,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::api::lights::{compute_export_readiness, ExportReadiness};
+use crate::api::lights::{compute_export_readiness_for_frames, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
 use crate::db::stacking::{
     active_run_for_set, find_artifact, get_set_config, list_frame_rows, list_runs,
@@ -35,7 +35,9 @@ use crate::stacking::config::{
     registration_subtree, resolve_config, stage_hash, ReferenceMode, SourceIdentity,
     StackingConfig,
 };
-use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup, ScaleSource};
+use crate::stacking::groups::{
+    group_frames, median_f64, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
+};
 use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
@@ -716,31 +718,79 @@ fn last_run_reference_scale(
         .and_then(|gf| gf.pixel_scale_arcsec))
 }
 
+/// M4b ruling R-T6-7: the median `pixel_scale_arcsec` over `g`'s INCLUDED
+/// members only — a manually excluded frame's scale contributes nothing to
+/// "what a run will actually integrate" (the real-data finding: a group's
+/// median read 1.73 because 68 excluded 448 mm frames outvoted the 30 + 30
+/// kept ones). `None` when the group has no included member with a scale
+/// (including when every member is excluded) — [`group_display_scale`]
+/// below is what falls back to the group's own all-member
+/// [`IntegrationGroup::pixel_scale_arcsec`] for that case.
+fn included_median_scale(g: &IntegrationGroup, excluded: &HashSet<i64>) -> Option<f64> {
+    let mut scales: Vec<f64> = g
+        .frames
+        .iter()
+        .filter(|f| !excluded.contains(&f.frame_id))
+        .filter_map(|f| f.pixel_scale_arcsec)
+        .collect();
+    if scales.is_empty() {
+        None
+    } else {
+        Some(median_f64(&mut scales))
+    }
+}
+
+/// M4b ruling R-T6-7: the scale [`PlanGroup.pixel_scale_arcsec`] and every
+/// pixel-scale warning/ratio actually use — [`included_median_scale`] when
+/// the group has at least one included member with a scale, else the
+/// group's own all-member median ([`IntegrationGroup::pixel_scale_arcsec`],
+/// `groups.rs`) so a FULLY excluded group still shows something in the
+/// Scale column rather than a bare `None`. A fully excluded group never
+/// drives a warning either way — `build_plan`'s "mixes pixel scales" check
+/// already only looks at included members, and this group can never win
+/// [`largest_group_scale`]'s ranking (zero included members), so the only
+/// way this fallback value is even seen is the Scale column itself.
+fn group_display_scale(g: &IntegrationGroup, excluded: &HashSet<i64>) -> Option<f64> {
+    included_median_scale(g, excluded).or(g.pixel_scale_arcsec)
+}
+
 /// M4b ruling R-T1-1's second-choice fallback (no previous run at all): the
-/// median pixel scale of the LARGEST group — most frames, ties broken by
-/// the smaller key — the group an `Auto` reference most often lands in
-/// before a first run has ever weighed the set. This is an approximation,
-/// not the eventual pick: if the real `Auto` reference lands in a
-/// different group, comparing "the wrong way round" still reports the
-/// ratio's reciprocal, which sits just as far outside `[1 /
-/// SCALE_TOLERANCE, SCALE_TOLERANCE]` — the warning still fires when it
-/// should, only the wording's "the reference's" number would differ from
-/// what a run later actually uses.
-fn largest_group_scale(groups: &[IntegrationGroup]) -> Option<f64> {
-    let mut best: Option<&IntegrationGroup> = None;
+/// INCLUDED-member median pixel scale of the LARGEST group — ranked by
+/// INCLUDED member count, never total membership (ruling R-T6-7's
+/// real-data finding: a 127-frame group, every member manually excluded,
+/// was picked over the 30 + 30 frames a run would actually integrate) —
+/// ties broken by the smaller key, as before. A group with ZERO included
+/// members is skipped outright, never just outranked, so it can never be
+/// picked even when it is the only group. This is an approximation, not
+/// the eventual pick: if the real `Auto` reference lands in a different
+/// group, comparing "the wrong way round" still reports the ratio's
+/// reciprocal, which sits just as far outside `[1 / SCALE_TOLERANCE,
+/// SCALE_TOLERANCE]` — the warning still fires when it should, only the
+/// wording's "the reference's" number would differ from what a run later
+/// actually uses.
+fn largest_group_scale(groups: &[IntegrationGroup], excluded: &HashSet<i64>) -> Option<f64> {
+    let mut best: Option<(&IntegrationGroup, usize)> = None;
     for g in groups {
+        let included_count = g
+            .frames
+            .iter()
+            .filter(|f| !excluded.contains(&f.frame_id))
+            .count();
+        if included_count == 0 {
+            continue;
+        }
         let take = match best {
             None => true,
-            Some(b) => {
-                g.frames.len() > b.frames.len()
-                    || (g.frames.len() == b.frames.len() && g.key < b.key)
+            Some((b, b_count)) => {
+                included_count > b_count || (included_count == b_count && g.key < b.key)
             }
         };
         if take {
-            best = Some(g);
+            best = Some((g, included_count));
         }
     }
-    best.and_then(|g| g.pixel_scale_arcsec)
+    let (g, _) = best?;
+    included_median_scale(g, excluded)
 }
 
 /// The `registration_results` reuse predicate itself (ruling 10): a row is
@@ -1170,7 +1220,25 @@ pub fn build_plan(
     let hash = config_hash(&cfg);
 
     let groups = group_frames(conn, frames_set_id, &cfg.grouping)?;
-    let readiness = compute_export_readiness(conn, frames_set_id)?;
+
+    // M4b (ruling R-T6-6, real-data finding on set 195 "Ghost Nebula"):
+    // readiness must be judged over the frames a run will actually touch —
+    // the set's LIGHT membership minus manual exclusions — never the whole
+    // set's membership. A calibration set only an excluded light needs
+    // (the finding's own example: a 1-frame flat linked to 9 lights, all
+    // manually excluded) must never block a run or get built by stage 0.5.
+    // Built once here — both `compute_export_readiness_for_frames` below
+    // and the pixel-scale warnings further down (which also need to know
+    // which frames are excluded, for the SAME "over what will run" reason)
+    // share this one set rather than each deriving their own.
+    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+    let light_frame_ids: Vec<i64> = groups
+        .iter()
+        .flat_map(|g| g.frames.iter())
+        .map(|f| f.frame_id)
+        .filter(|id| !excluded_set.contains(id))
+        .collect();
+    let readiness = compute_export_readiness_for_frames(conn, frames_set_id, &light_frame_ids)?;
     let (masters_to_build, dropped_masters) = collect_masters_to_build(conn, &readiness);
 
     let mut blockers: Vec<PlanBlocker> = Vec::new();
@@ -1274,15 +1342,6 @@ pub fn build_plan(
     // Gate 2: reference.
     let reference = resolve_reference(conn, frames_set_id, &cfg, &mut blockers)?;
 
-    // Moved up from just before Gate 3 (fix round 1): the pixel-scale
-    // warnings below need to know which frames are manually excluded
-    // BEFORE computing a group's own member spread (a user-excluded
-    // foreign-scale frame must not trigger the "mixes pixel scales"
-    // warning) — `excluded_frame_ids` has been resolved since the top of
-    // this function, so hoisting the plain HashSet build has no other
-    // effect on ordering.
-    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
-
     // M4b (rulings R-M4b-1/7, R-T1-1): pixel-scale warnings — never
     // blockers. A mixed-pixel-scale set is a real, supportable
     // configuration (co-registered mode resamples a foreign-scale group
@@ -1305,18 +1364,20 @@ pub fn build_plan(
     let reference_scale: Option<f64> = match reference.frame_id {
         Some(id) => find_group_frame(&groups, id).and_then(|gf| gf.pixel_scale_arcsec),
         None => last_run_reference_scale(conn, frames_set_id, &groups)?
-            .or_else(|| largest_group_scale(&groups)),
+            .or_else(|| largest_group_scale(&groups, &excluded_set)),
     };
     // Fix round 1: the ratio is computed ONCE per group here and reused
     // both for the warning message immediately below and for
     // `PlanGroup.scale_ratio_to_reference` later (keyed by group key —
     // unique per build by construction, `groups.rs`'s own "one key ⇔ one
     // group" doc) — the two spellings of the same guard used to risk
-    // drifting apart.
+    // drifting apart. R-T6-7: the group's own side of the ratio is now
+    // `group_display_scale` (included-only median, all-member fallback for
+    // a fully excluded group), not the raw all-member
+    // `IntegrationGroup::pixel_scale_arcsec`.
     let mut group_scale_ratios: HashMap<String, f64> = HashMap::new();
     for g in &groups {
-        let scale_ratio = g
-            .pixel_scale_arcsec
+        let scale_ratio = group_display_scale(g, &excluded_set)
             .zip(reference_scale.filter(|&r| r > 0.0))
             .map(|(group_scale, ref_scale)| (group_scale, ref_scale, group_scale / ref_scale));
         if let Some((group_scale, ref_scale, ratio)) = scale_ratio {
@@ -1660,24 +1721,36 @@ pub fn build_plan(
             ln_cached,
             anchor_width,
             anchor_height,
-            pixel_scale_arcsec: g.pixel_scale_arcsec,
+            // R-T6-7: included-only median, all-member fallback for a fully
+            // excluded group (`group_display_scale`'s own doc).
+            pixel_scale_arcsec: group_display_scale(g, &excluded_set),
             // Fix round 1: reused from `group_scale_ratios`, computed once
             // alongside the warning above — never recomputed here.
             scale_ratio_to_reference: group_scale_ratios.get(&g.key).copied(),
-            // `Solve` only when EVERY contributing member measured its own
-            // scale; any member relying on the header (or a mix of both)
-            // makes the group's own median partly a header assumption, so
-            // it reads as `Header` — the UI's honest "this is implied, not
-            // measured" signal.
+            // F3: `Solve` when at least HALF of the INCLUDED members with a
+            // scale measured their own (`2 * solve_count >= total`), else
+            // `Header` — one header-sourced member out of many used to flip
+            // a 95 %-solved group to `Header` ("~"), reading a group that
+            // is almost entirely measured as merely implied. A manually
+            // excluded member's source doesn't count either way — its
+            // scale never entered `pixel_scale_arcsec` above.
             scale_source: {
-                let sources: Vec<ScaleSource> =
-                    g.frames.iter().filter_map(|f| f.scale_source).collect();
+                let sources: Vec<ScaleSource> = g
+                    .frames
+                    .iter()
+                    .filter(|f| !excluded_set.contains(&f.frame_id))
+                    .filter_map(|f| f.scale_source)
+                    .collect();
                 if sources.is_empty() {
                     None
-                } else if sources.iter().all(|s| *s == ScaleSource::Solve) {
-                    Some(ScaleSource::Solve)
                 } else {
-                    Some(ScaleSource::Header)
+                    let solve_count =
+                        sources.iter().filter(|s| **s == ScaleSource::Solve).count();
+                    if solve_count * 2 >= sources.len() {
+                        Some(ScaleSource::Solve)
+                    } else {
+                        Some(ScaleSource::Header)
+                    }
                 }
             },
         });
@@ -1764,6 +1837,7 @@ pub fn build_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::lights::compute_export_readiness;
     use crate::db::stacking::set_set_config;
     use crate::registration::db::set_frame_set_reference;
     use crate::stacking::test_fixtures::{self, LightSpec};
@@ -2222,28 +2296,141 @@ mod tests {
         assert!((big_ratio - 0.78 / 1.55).abs() < 1e-9, "{big_ratio}");
     }
 
+    /// M4b ruling R-T6-7 (real-data finding: a 127-frame group, every
+    /// member manually excluded, was picked over the 30 + 30 frames a run
+    /// would actually integrate): `largest_group_scale` ranks by INCLUDED
+    /// member count, never total membership, and a group's own
+    /// `pixel_scale_arcsec` is the INCLUDED-only median. An 8-member group
+    /// (5 excluded at 0.78 "/px, 3 included at 1.55 "/px) is the bigger
+    /// group by TOTAL count, but only a 4-member, fully-included group
+    /// wins the ranking — and the 8-member group's own scale reads 1.55,
+    /// never corrupted by its excluded majority.
+    #[test]
+    fn scale_warning_auto_mode_largest_group_ranks_by_included_count() {
+        let f = test_fixtures::frame_set("LDN 1272");
+
+        // The "big" group: 8 total members, only 3 survive exclusion.
+        let mut big_ids = Vec::new();
+        for i in 0..8 {
+            let t = format!("2025-01-01T00:{:02}:00", i * 5);
+            let stem = format!("big{i}");
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&stem, &t));
+            let scale = if i < 5 { 0.78 } else { 1.55 };
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, scale);
+            big_ids.push(id);
+        }
+        let excluded_from_big: Vec<i64> = big_ids[..5].to_vec();
+
+        // The "small" group: 4 total members, all of them included — fewer
+        // frames overall, but MORE included frames than the big group's 3.
+        let mut small_ids = Vec::new();
+        for i in 0..4 {
+            let t = format!("2025-01-01T02:{:02}:00", i * 5);
+            let stem = format!("small{i}");
+            let mut spec = light_spec(&stem, &t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            small_ids.push(id);
+        }
+
+        let mut all_ids = big_ids.clone();
+        all_ids.extend(&small_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        set_set_config(&f.conn, f.set_id, "{}", &excluded_from_big).unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
+
+        let big_group = plan
+            .groups
+            .iter()
+            .find(|g| g.frame_count == 8)
+            .expect("the 8-member group exists");
+        let small_group = plan
+            .groups
+            .iter()
+            .find(|g| g.frame_count == 4)
+            .expect("the 4-member group exists");
+        assert_eq!(big_group.included_count, 3);
+        assert_eq!(small_group.included_count, 4);
+
+        // Point 1: the big group's own scale is the INCLUDED-only median —
+        // 1.55, not the all-member median the 5 excluded 0.78s would pull
+        // it toward.
+        assert_eq!(big_group.pixel_scale_arcsec, Some(1.55));
+        assert_eq!(small_group.pixel_scale_arcsec, Some(0.78));
+
+        // Point 2: the SMALL group (4 included > the big group's 3) wins
+        // the largest-group-scale ranking, so the warning names the BIG
+        // group (far from 0.78), never the small one.
+        let far_warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.contains("\u{d7}2.0"))
+            .collect();
+        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(far_warnings[0].contains(&big_group.key), "{:?}", far_warnings);
+
+        assert!(
+            (small_group.scale_ratio_to_reference.unwrap() - 1.0).abs() < 1e-9,
+            "the small group IS the comparison point"
+        );
+        let big_ratio = big_group.scale_ratio_to_reference.unwrap();
+        assert!((big_ratio - 1.55 / 0.78).abs() < 1e-9, "{big_ratio}");
+    }
+
     /// M4b: a group whose OWN members span a wide pixel-scale range (mixed
     /// optics feeding one logical group) gets its own warning, independent
     /// of any reference — this fixture leaves the reference in `Auto` mode
     /// (unresolved at plan time) precisely to show the mixing warning needs
-    /// none. The third member's scale comes from the header rather than a
-    /// solve, so `PlanGroup.scale_source` reads `Header` too (not every
-    /// contributing member measured its own scale).
+    /// none. F3: two of the three members' scales come from the header
+    /// rather than a solve — only 1 of 3 (below the "at least half" bar) —
+    /// so `PlanGroup.scale_source` reads `Header`.
     #[test]
     fn scale_warning_group_mixes_scales() {
         let f = test_fixtures::frame_set("LDN 1272");
         let mut ids = Vec::new();
+        // F3: two of the three members are header-sourced (i == 1, 2) and
+        // only one is solve-sourced (i == 0) — 1 of 3 is below the "at
+        // least half" bar, so the group reads `Header`.
         for (i, t) in THREE_TIMES.iter().enumerate() {
             let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
-            if i == 2 {
+            if i == 0 {
+                test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            } else if i == 1 {
+                f.conn
+                    .execute(
+                        "UPDATE frames SET focallen = 1000.0, xpixsz = 3.76 WHERE id = ?1",
+                        params![id],
+                    )
+                    .unwrap();
+            } else {
                 f.conn
                     .execute(
                         "UPDATE frames SET focallen = 1000.0, xpixsz = 7.5 WHERE id = ?1",
                         params![id],
                     )
                     .unwrap();
-            } else {
-                test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
             }
             ids.push(id);
         }
@@ -2279,7 +2466,7 @@ mod tests {
         assert_eq!(
             plan.groups[0].scale_source,
             Some(ScaleSource::Header),
-            "one member's scale came from the header, not a solve"
+            "only 1 of 3 members is solve-sourced — below the \"at least half\" bar"
         );
     }
 
@@ -2423,6 +2610,96 @@ mod tests {
         assert_eq!(plan.masters_to_build[0].kind, MasterWork::Build);
         assert_eq!(plan.masters_to_build[0].imagetyp, "Dark");
         assert_eq!(plan.masters_to_build[0].frame_count, 3);
+    }
+
+    /// M4b ruling R-T6-6 (real-data finding on set 195 "Ghost Nebula", 495
+    /// lights, 375 manually excluded): masters/links readiness — and the
+    /// stage-0.5 build list it feeds (`mastersToBuild`) — must be judged
+    /// over the frames a run will actually touch. A 1-frame raw flat
+    /// (unbuildable — fewer than `MIN_MASTER_FRAMES`) linked to a light
+    /// that turns out to be the ONLY consumer, and is manually excluded,
+    /// must not block the plan or appear in `mastersToBuild`; with the
+    /// exclusion lifted, the existing behaviour (a `masters` blocker) is
+    /// back.
+    #[test]
+    fn masters_readiness_ignores_a_raw_set_only_an_excluded_light_needs() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        // A fourth light, calibrated ONLY by a 1-frame raw flat — the
+        // finding's own shape.
+        let (outlier_id, _path) =
+            test_fixtures::add_light(&f, &light_spec("outlier", "2025-01-01T00:20:00"));
+        let raw_flat = test_fixtures::add_raw_linked_calibration_with_count(
+            &f,
+            &[outlier_id],
+            64,
+            48,
+            "Flat",
+            1,
+        );
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let library_dir = f.dir.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &library_dir.to_string_lossy(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+
+        // Sanity: with the outlier INCLUDED, the unbuildable flat blocks —
+        // the existing behaviour this fix must not disturb.
+        let plan_included =
+            build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            plan_included.blockers.iter().any(|b| b.code == "masters"),
+            "sanity: an unbuildable raw set must block while its only light is included: {:?}",
+            plan_included.blockers
+        );
+        assert!(
+            plan_included
+                .masters_to_build
+                .iter()
+                .all(|m| m.set_id != raw_flat),
+            "an unbuildable set is a blocker, never planned work: {:?}",
+            plan_included.masters_to_build
+        );
+
+        // Manually exclude the ONLY light that needs the unbuildable flat.
+        set_set_config(&f.conn, f.set_id, "{}", &[outlier_id]).unwrap();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            !plan.blockers.iter().any(|b| b.code == "masters"),
+            "no included light needs this set any more: {:?}",
+            plan.blockers
+        );
+        assert!(
+            plan.masters_to_build.iter().all(|m| m.set_id != raw_flat),
+            "an excluded-only set must not become planned work either: {:?}",
+            plan.masters_to_build
+        );
     }
 
     /// Fix round 1, item 1: with NO calibration library folder configured at

@@ -321,9 +321,12 @@ fn load_solved_scales(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i6
 }
 
 /// The plain median of `values` (sorted in place) — the SAME odd/even
-/// convention `weights.rs::median_of` uses, kept local to this module
-/// rather than shared since the two operate on unrelated quantities.
-fn median_f64(values: &mut [f64]) -> f64 {
+/// convention `weights.rs::median_of` uses, a separate copy rather than a
+/// shared one since the two operate on unrelated quantities. `pub(crate)`
+/// (M4b R-T6-7): `plan.rs::build_plan` reuses this SAME function to derive
+/// a group's INCLUDED-only median pixel scale, rather than adding a third
+/// copy of the same six lines.
+pub(crate) fn median_f64(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let n = values.len();
     if n % 2 == 1 {

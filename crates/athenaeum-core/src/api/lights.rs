@@ -23,7 +23,7 @@
 //! `api/calibration.rs` inner-fn precedent); the public handler is a thin
 //! `ctx` → `conn` wrapper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use rusqlite::{params, Connection};
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{db, ApiError};
 use crate::calibration_library::light_resolve::{link_set_id, resolve_master};
 use crate::db::calibration_links::get_links_for_frame;
-use crate::export::models::{ExportFileCounts, ExportMode};
+use crate::export::models::{ExportData, ExportFileCounts, ExportMode};
 use crate::services::ServiceContext;
 
 // Re-export the flat-normalization statistic + advanced-parameter types so the
@@ -230,12 +230,40 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
 /// backstop. Tallying the calibrated mode from the per-frame `classify` walk
 /// instead would let the two modes report different numbers for the same frame
 /// set, and let the calibrated gate pass a tree the backstop would refuse.
+///
+/// Thin wrapper over [`compute_export_readiness_for_frames`] with the
+/// frame set's WHOLE light membership — export/send readiness is always
+/// judged over every light, exclusions are a stacking-only concept.
 pub(crate) fn compute_export_readiness(
     conn: &Connection,
     set_id: i64,
 ) -> Result<ExportReadiness, ApiError> {
-    let members = load_light_members(conn, set_id)?;
-    let total = members.len() as i64;
+    let light_frame_ids: Vec<i64> = load_light_members(conn, set_id)?
+        .into_iter()
+        .map(|(frame_id, _filename)| frame_id)
+        .collect();
+    compute_export_readiness_for_frames(conn, set_id, &light_frame_ids)
+}
+
+/// [`compute_export_readiness`]'s worker, generalized (ruling R-T6-6) over an
+/// EXPLICIT light-frame-id subset rather than always the frame set's whole
+/// membership — the stacking plan gate's own use
+/// (`stacking::plan::build_plan`): masters/links readiness, and the stage-0.5
+/// build list it feeds (`raw_sets_buildable`/`masters_rebuildable`), must be
+/// judged over the frames a run will actually touch, never a set's full
+/// membership including manually excluded frames (the real-data finding on
+/// set 195 "Ghost Nebula": a 1-frame flat linked to 9 lights, all manually
+/// excluded, blocked a run that would never touch it). `light_frame_ids` is
+/// trusted to already be LIGHT frame ids belonging to `set_id` — both
+/// callers derive it that way (`compute_export_readiness`'s whole-set list
+/// above, `build_plan`'s membership minus its exclusions); duplicates are
+/// harmless, everything below dedupes by frame/path id.
+pub(crate) fn compute_export_readiness_for_frames(
+    conn: &Connection,
+    set_id: i64,
+    light_frame_ids: &[i64],
+) -> Result<ExportReadiness, ApiError> {
+    let total = light_frame_ids.len() as i64;
 
     // A light with no links of ANY type: nothing to subtract, nothing to
     // divide by. It is the one per-frame fact the export tree cannot state,
@@ -262,7 +290,7 @@ pub(crate) fn compute_export_readiness(
     // keeps the same distinct-by-path dedup the old `BTreeSet<PathBuf>` gave
     // (two different master sets never share one on-disk file).
     let mut master_paths: BTreeMap<PathBuf, i64> = BTreeMap::new();
-    for (frame_id, _filename) in members {
+    for &frame_id in light_frame_ids {
         let links = get_links_for_frame(conn, frame_id)?;
         if links.is_empty() {
             unlinked_lights += 1;
@@ -390,6 +418,18 @@ pub(crate) fn compute_export_readiness(
 
     let data = crate::export::collect_export_data(conn, set_id)
         .map_err(|e| ApiError::Internal(format!("collect export data for readiness: {e:#}")))?;
+    // Ruling R-T6-6: filter the export tree down to the given light subset
+    // BEFORE deriving raw-set readiness from it — a `CalibrationSubgroup`
+    // whose lights are entirely outside `light_frame_ids` is dropped, so
+    // the calibration sets it alone needed stop appearing in
+    // `raw_sets_without_master`/`file_counts`/`missing_raw_calibration_files`
+    // below. A no-op for [`compute_export_readiness`]'s whole-set caller
+    // (`light_frame_ids` there covers every light `collect_export_data`
+    // itself would have found, so no subgroup's member list changes and
+    // none is ever dropped) — see [`filter_export_data_to_frames`]'s own
+    // doc for why.
+    let frame_id_set: HashSet<i64> = light_frame_ids.iter().copied().collect();
+    let data = filter_export_data_to_frames(data, &frame_id_set);
     let raw_set_ids_without_master =
         crate::export::data_collector::raw_sets_without_master(conn, &data)
             .map_err(|e| ApiError::Internal(format!("raw-set readiness: {e:#}")))?;
@@ -451,6 +491,53 @@ pub(crate) fn compute_export_readiness(
         masters_rebuildable,
         masters_unrebuildable,
     })
+}
+
+/// Ruling R-T6-6: filter `data`'s export groups down to only the LIGHT
+/// frames named by `frame_ids` — used by
+/// [`compute_export_readiness_for_frames`] to derive masters/links
+/// readiness over the frames a stacking run will actually touch, without
+/// touching `export::collect_export_data` itself (which every OTHER export
+/// caller still walks unfiltered).
+///
+/// A `CalibrationSubgroup` — the collector's own unit of "lights sharing
+/// one exact combination of calibration links" — is dropped entirely when
+/// EVERY one of its lights falls outside `frame_ids`: its own
+/// `flat`/`dark`/`bias` nodes (and their sub-calibrations) then never reach
+/// `raw_sets_without_master`'s walk, so a raw set only an excluded light
+/// needs stops being counted/blocking/offered to stage 0.5. A subgroup with
+/// AT LEAST ONE surviving light keeps every one of its calibration nodes
+/// untouched — an included light there still needs them, and a raw set's
+/// OWN sub-frame count (`CalibrationSetInfo.frames`, unrelated to which
+/// lights use the set) is never itself filtered.
+///
+/// A no-op when `frame_ids` covers the WHOLE set (every subgroup's member
+/// list is already exactly what it was, so nothing is ever dropped) —
+/// exactly [`compute_export_readiness`]'s own case, which is how the
+/// whole-set caller and the frame-filtered one can share this one filter
+/// without the whole-set behaviour changing.
+fn filter_export_data_to_frames(mut data: ExportData, frame_ids: &HashSet<i64>) -> ExportData {
+    for group in &mut data.groups {
+        group.subgroups.retain_mut(|subgroup| {
+            subgroup.frames.retain(|f| frame_ids.contains(&f.frame_id));
+            !subgroup.frames.is_empty()
+        });
+        // Kept in sync with the filtered subgroups — not read by any of the
+        // three readiness functions this feeds today, but a stale total on
+        // a filtered copy would be a trap for a future reader.
+        group.total_frames = group
+            .subgroups
+            .iter()
+            .map(|sg| sg.frames.len() as i32)
+            .sum();
+        group.total_exposure = group
+            .subgroups
+            .iter()
+            .flat_map(|sg| sg.frames.iter())
+            .filter_map(|f| f.exptime)
+            .sum();
+    }
+    data
 }
 
 // ── Plan 5b Task 8: buildable/rebuildable classification ────────────────────
@@ -1241,6 +1328,45 @@ mod tests {
             "{:?}",
             r.raw_sets_unbuildable
         );
+    }
+
+    /// M4b ruling R-T6-6: [`compute_export_readiness_for_frames`] derives
+    /// `raw_set_ids_without_master` over the GIVEN light subset only — a
+    /// raw set linked exclusively to a light outside that subset must not
+    /// appear at all, even though the whole-set readiness lists it.
+    /// [`compute_export_readiness`] (the whole-set wrapper) is unaffected
+    /// either way — same result whether called directly or through the
+    /// frame-filtered worker with every light named.
+    #[test]
+    fn readiness_for_frames_excludes_a_raw_set_only_an_excluded_light_needs() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_light(&conn, 2, session);
+        seed_masters(&conn);
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Light 1: linked to a raw (unbuilt) dark set — its ONLY consumer.
+        let raw_dark = seed_raw_set_real_files(&conn, tmp.path(), 300, "Dark", 3);
+        add_link(&conn, 1, raw_dark, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+        // Light 2: fully linked to built masters — nothing missing.
+        add_link(&conn, 2, 100, "Dark");
+        add_link(&conn, 2, 101, "Flat");
+
+        let whole_set = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(whole_set.raw_set_ids_without_master, vec![raw_dark]);
+
+        let filtered = compute_export_readiness_for_frames(&conn, 1, &[2]).unwrap();
+        assert!(
+            filtered.raw_set_ids_without_master.is_empty(),
+            "light 1 (the raw set's only consumer) is excluded from this subset: {:?}",
+            filtered.raw_set_ids_without_master
+        );
+        assert_eq!(filtered.total, 1);
+
+        let unfiltered = compute_export_readiness_for_frames(&conn, 1, &[1, 2]).unwrap();
+        assert_eq!(unfiltered.raw_set_ids_without_master, vec![raw_dark]);
     }
 
     /// Fix round 1, item 1: a raw set that is otherwise perfectly buildable
