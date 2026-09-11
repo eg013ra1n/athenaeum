@@ -679,6 +679,55 @@ fn find_group_frame<'a>(groups: &'a [IntegrationGroup], frame_id: i64) -> Option
         .find(|f| f.frame_id == frame_id)
 }
 
+/// M4b ruling R-T1-1: the plan-time comparison point for the pixel-scale
+/// warning in `Auto` reference mode, first choice — the last run's OWN
+/// recorded `reference_frame_id`, the SAME lookup [`compute_register_stale`]
+/// already performs (`list_runs(_, _, 1)` → `last_run.reference_frame_id`),
+/// so a set that has run once compares against the reference it actually
+/// used rather than a guess. `None` when there is no previous run, the run
+/// recorded no reference, that frame isn't found among the current groups
+/// (deleted/re-typed since), or it carries no scale of its own.
+fn last_run_reference_scale(
+    conn: &Connection,
+    frames_set_id: i64,
+    groups: &[IntegrationGroup],
+) -> Result<Option<f64>, ApiError> {
+    let Some(last_run) = list_runs(conn, frames_set_id, 1)?.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(last_run
+        .reference_frame_id
+        .and_then(|id| find_group_frame(groups, id))
+        .and_then(|gf| gf.pixel_scale_arcsec))
+}
+
+/// M4b ruling R-T1-1's second-choice fallback (no previous run at all): the
+/// median pixel scale of the LARGEST group — most frames, ties broken by
+/// the smaller key — the group an `Auto` reference most often lands in
+/// before a first run has ever weighed the set. This is an approximation,
+/// not the eventual pick: if the real `Auto` reference lands in a
+/// different group, comparing "the wrong way round" still reports the
+/// ratio's reciprocal, which sits just as far outside `[1 /
+/// SCALE_TOLERANCE, SCALE_TOLERANCE]` — the warning still fires when it
+/// should, only the wording's "the reference's" number would differ from
+/// what a run later actually uses.
+fn largest_group_scale(groups: &[IntegrationGroup]) -> Option<f64> {
+    let mut best: Option<&IntegrationGroup> = None;
+    for g in groups {
+        let take = match best {
+            None => true,
+            Some(b) => {
+                g.frames.len() > b.frames.len()
+                    || (g.frames.len() == b.frames.len() && g.key < b.key)
+            }
+        };
+        if take {
+            best = Some(g);
+        }
+    }
+    best.and_then(|g| g.pixel_scale_arcsec)
+}
+
 /// The `registration_results` reuse predicate itself (ruling 10): a row is
 /// reusable against a given reference/expected-hash pair iff its
 /// `reference_frame_id` matches, its `status` is `aligned` /
@@ -1126,46 +1175,74 @@ pub fn build_plan(
     // Gate 2: reference.
     let reference = resolve_reference(conn, frames_set_id, &cfg, &mut blockers)?;
 
-    // M4b (rulings R-M4b-1/7): pixel-scale warnings — never blockers. A
-    // mixed-pixel-scale set is a real, supportable configuration
-    // (co-registered mode resamples a foreign-scale group into the
-    // reference geometry; native mode keeps each group's own), so this is
-    // purely informational. `reference_scale` is the resolved reference
-    // frame's OWN pixel scale, found among `groups` by its `frame_id`;
-    // `None` in `Auto` mode with no prior run (the reference itself isn't
-    // resolved until a run weighs the frames) or when that frame carries no
-    // scale of its own — either way the "far from reference" warning below
-    // can't fire, while the per-group "mixes pixel scales" warning (which
-    // needs no reference at all) still can. Placed right after the
+    // Moved up from just before Gate 3 (fix round 1): the pixel-scale
+    // warnings below need to know which frames are manually excluded
+    // BEFORE computing a group's own member spread (a user-excluded
+    // foreign-scale frame must not trigger the "mixes pixel scales"
+    // warning) — `excluded_frame_ids` has been resolved since the top of
+    // this function, so hoisting the plain HashSet build has no other
+    // effect on ordering.
+    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+
+    // M4b (rulings R-M4b-1/7, R-T1-1): pixel-scale warnings — never
+    // blockers. A mixed-pixel-scale set is a real, supportable
+    // configuration (co-registered mode resamples a foreign-scale group
+    // into the reference geometry; native mode keeps each group's own), so
+    // this is purely informational. `reference_scale` is the plan-time
+    // comparison point: the resolved reference frame's OWN pixel scale in
+    // `Manual` mode (found among `groups` by its `frame_id`); in `Auto`
+    // mode — where `resolve_reference` never populates `frame_id`, the
+    // real pick happens only once a run weighs the frames — it falls back
+    // to the last run's own recorded reference ([`last_run_reference_scale`],
+    // the same lookup `compute_register_stale` uses), then to the median
+    // scale of the largest group ([`largest_group_scale`]) when there is no
+    // previous run at all. `None` only when every one of those sources is
+    // unavailable, in which case the "far from reference" warning below
+    // simply can't fire, while the per-group "mixes pixel scales" warning
+    // (which needs no reference at all) still can. Placed right after the
     // reference resolves (the earliest point both warnings' inputs are
     // available), alongside the EXPTIME warning above as this build's other
     // purely-informational, never-blocking group note.
-    let reference_scale: Option<f64> = reference
-        .frame_id
-        .and_then(|id| find_group_frame(&groups, id))
-        .and_then(|gf| gf.pixel_scale_arcsec);
+    let reference_scale: Option<f64> = match reference.frame_id {
+        Some(id) => find_group_frame(&groups, id).and_then(|gf| gf.pixel_scale_arcsec),
+        None => last_run_reference_scale(conn, frames_set_id, &groups)?
+            .or_else(|| largest_group_scale(&groups)),
+    };
+    // Fix round 1: the ratio is computed ONCE per group here and reused
+    // both for the warning message immediately below and for
+    // `PlanGroup.scale_ratio_to_reference` later (keyed by group key —
+    // unique per build by construction, `groups.rs`'s own "one key ⇔ one
+    // group" doc) — the two spellings of the same guard used to risk
+    // drifting apart.
+    let mut group_scale_ratios: HashMap<String, f64> = HashMap::new();
     for g in &groups {
-        if let Some(group_scale) = g.pixel_scale_arcsec {
-            if let Some(ref_scale) = reference_scale.filter(|&r| r > 0.0) {
-                let ratio = group_scale / ref_scale;
-                if ratio > SCALE_TOLERANCE || ratio < 1.0 / SCALE_TOLERANCE {
-                    warnings.push(format!(
-                        "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the reference's {ref_scale:.2} \"/px; co-registered mode resamples it into the reference geometry, native mode keeps its own",
-                        g.key
-                    ));
-                }
-                tracing::debug!(
-                    group_key = %g.key,
-                    pixel_scale_arcsec = group_scale,
-                    scale_ratio = ratio,
-                    "group pixel scale"
-                );
+        let scale_ratio = g
+            .pixel_scale_arcsec
+            .zip(reference_scale.filter(|&r| r > 0.0))
+            .map(|(group_scale, ref_scale)| (group_scale, ref_scale, group_scale / ref_scale));
+        if let Some((group_scale, ref_scale, ratio)) = scale_ratio {
+            if ratio > SCALE_TOLERANCE || ratio < 1.0 / SCALE_TOLERANCE {
+                warnings.push(format!(
+                    "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the reference's {ref_scale:.2} \"/px; co-registered mode resamples it into the reference geometry, native mode keeps its own",
+                    g.key
+                ));
             }
+            tracing::debug!(
+                group_key = %g.key,
+                pixel_scale_arcsec = group_scale,
+                scale_ratio = ratio,
+                "group pixel scale"
+            );
+            group_scale_ratios.insert(g.key.clone(), ratio);
         }
 
+        // Fix round 1: only INCLUDED members — a group whose only
+        // foreign-scale members are manually excluded must not warn
+        // "mixes pixel scales" over frames the run will never touch.
         let member_scales: Vec<f64> = g
             .frames
             .iter()
+            .filter(|f| !excluded_set.contains(&f.frame_id))
             .filter_map(|f| f.pixel_scale_arcsec)
             .collect();
         if member_scales.len() >= 2 {
@@ -1182,8 +1259,6 @@ pub fn build_plan(
             }
         }
     }
-
-    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
 
     // Gate 3: folders — also resolves free space and the estimate's probe
     // target.
@@ -1487,12 +1562,9 @@ pub fn build_plan(
             anchor_width,
             anchor_height,
             pixel_scale_arcsec: g.pixel_scale_arcsec,
-            scale_ratio_to_reference: match (g.pixel_scale_arcsec, reference_scale) {
-                (Some(group_scale), Some(ref_scale)) if ref_scale > 0.0 => {
-                    Some(group_scale / ref_scale)
-                }
-                _ => None,
-            },
+            // Fix round 1: reused from `group_scale_ratios`, computed once
+            // alongside the warning above — never recomputed here.
+            scale_ratio_to_reference: group_scale_ratios.get(&g.key).copied(),
             // `Solve` only when EVERY contributing member measured its own
             // scale; any member relying on the header (or a mix of both)
             // makes the group's own median partly a header assumption, so
@@ -1874,6 +1946,183 @@ mod tests {
         );
     }
 
+    /// M4b ruling R-T1-1, fix round 1: `Auto` reference mode (the default)
+    /// never resolves `reference.frame_id` at plan time, so with NO
+    /// previous run the pixel-scale comparison falls back to the median
+    /// scale of the LARGEST group (most frames). Four frames at 0.78 "/px
+    /// (the largest group) vs three at 1.55 "/px produces exactly one
+    /// warning — for the SMALLER group, ×2.0 the largest group's own scale
+    /// — and `scale_ratio_to_reference` comes back `Some` on BOTH groups
+    /// (≈1.0 for the largest group itself, since it IS the comparison
+    /// point; ≈1.99 for the other).
+    #[test]
+    fn scale_warning_auto_mode_falls_back_to_largest_group() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut big_ids = Vec::new();
+        for i in 0..4 {
+            let t = format!("2025-01-01T00:{:02}:00", i * 5);
+            let stem = format!("big{i}");
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&stem, &t));
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            big_ids.push(id);
+        }
+        let mut small_ids = Vec::new();
+        for i in 0..3 {
+            let t = format!("2025-01-01T01:{:02}:00", i * 5);
+            let stem = format!("small{i}");
+            let mut spec = light_spec(&stem, &t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
+            small_ids.push(id);
+        }
+        let mut all_ids = big_ids.clone();
+        all_ids.extend(&small_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        // Default config: `ReferenceMode::Auto`, no `set_frame_set_reference`
+        // call and no previous run — the largest-group fallback is the
+        // only source `reference_scale` can come from.
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
+
+        let big_group = plan
+            .groups
+            .iter()
+            .find(|g| g.frame_count == 4)
+            .expect("largest group exists");
+        let small_group = plan
+            .groups
+            .iter()
+            .find(|g| g.frame_count == 3)
+            .expect("smaller group exists");
+        assert_eq!(big_group.pixel_scale_arcsec, Some(0.78));
+        assert_eq!(small_group.pixel_scale_arcsec, Some(1.55));
+
+        let far_warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.contains("\u{d7}2.0"))
+            .collect();
+        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(far_warnings[0].contains(&small_group.key), "{:?}", far_warnings);
+
+        let big_ratio = big_group
+            .scale_ratio_to_reference
+            .expect("the largest group IS the comparison point, so its own ratio is Some too");
+        assert!((big_ratio - 1.0).abs() < 1e-9, "{big_ratio}");
+        let small_ratio = small_group.scale_ratio_to_reference.unwrap();
+        assert!((small_ratio - 1.55 / 0.78).abs() < 1e-9, "{small_ratio}");
+    }
+
+    /// M4b ruling R-T1-1: once a set has run at least once, `Auto` mode
+    /// prefers the LAST RUN's own recorded reference over the
+    /// largest-group fallback — even when that reference sits in the
+    /// SMALLER group. Same 4-vs-3-frame fixture as
+    /// `scale_warning_auto_mode_falls_back_to_largest_group`, but with a
+    /// seeded run row pointing at a frame in the smaller (1.55 "/px) group:
+    /// the warning now names the LARGER group instead (×0.5, not ×2.0).
+    #[test]
+    fn scale_warning_auto_mode_prefers_last_run_reference_over_largest_group() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut big_ids = Vec::new();
+        for i in 0..4 {
+            let t = format!("2025-01-01T00:{:02}:00", i * 5);
+            let stem = format!("big{i}");
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&stem, &t));
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            big_ids.push(id);
+        }
+        let mut small_ids = Vec::new();
+        for i in 0..3 {
+            let t = format!("2025-01-01T01:{:02}:00", i * 5);
+            let stem = format!("small{i}");
+            let mut spec = light_spec(&stem, &t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
+            small_ids.push(id);
+        }
+        let mut all_ids = big_ids.clone();
+        all_ids.extend(&small_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        // A previous run recorded its reference in the SMALLER group.
+        seed_run_frame_rows(&f.conn, f.set_id, Some(small_ids[0]), "auto", &all_ids);
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
+
+        let big_group = plan
+            .groups
+            .iter()
+            .find(|g| g.frame_count == 4)
+            .expect("largest group exists");
+        let small_group = plan
+            .groups
+            .iter()
+            .find(|g| g.frame_count == 3)
+            .expect("smaller group exists");
+
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("\u{d7}2.0")),
+            "the largest-group fallback would have warned about the small \
+             group (×2.0) — the last run's reference must win instead: {:?}",
+            plan.warnings
+        );
+        let far_warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.contains("\u{d7}0.5"))
+            .collect();
+        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(far_warnings[0].contains(&big_group.key), "{:?}", far_warnings);
+
+        let small_ratio = small_group.scale_ratio_to_reference.unwrap();
+        assert!(
+            (small_ratio - 1.0).abs() < 1e-9,
+            "the last run's own reference sits in the small group: ratio ~1.0, {small_ratio}"
+        );
+        let big_ratio = big_group.scale_ratio_to_reference.unwrap();
+        assert!((big_ratio - 0.78 / 1.55).abs() < 1e-9, "{big_ratio}");
+    }
+
     /// M4b: a group whose OWN members span a wide pixel-scale range (mixed
     /// optics feeding one logical group) gets its own warning, independent
     /// of any reference — this fixture leaves the reference in `Auto` mode
@@ -1932,6 +2181,45 @@ mod tests {
             plan.groups[0].scale_source,
             Some(ScaleSource::Header),
             "one member's scale came from the header, not a solve"
+        );
+    }
+
+    /// Fix round 1 (finding 5): the "mixes pixel scales" spread must only
+    /// consider INCLUDED members — a group whose only foreign-scale member
+    /// is manually excluded must not warn about a spread the run will
+    /// never actually see.
+    #[test]
+    fn scale_warning_mixes_ignores_manually_excluded_members() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            ids.push(id);
+        }
+        let (outlier_id, _path) =
+            test_fixtures::add_light(&f, &light_spec("outlier", "2025-01-01T00:15:00"));
+        test_fixtures::seed_plate_solve_scale(&f.conn, outlier_id, 1.55);
+        ids.push(outlier_id);
+
+        let settings = SettingsManager::new();
+        let plan_all =
+            build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            plan_all
+                .warnings
+                .iter()
+                .any(|w| w.contains("mixes pixel scales")),
+            "sanity: with the outlier included, the spread must warn: {:?}",
+            plan_all.warnings
+        );
+
+        set_set_config(&f.conn, f.set_id, "{}", &[outlier_id]).unwrap();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("mixes pixel scales")),
+            "the outlier is manually excluded — no spread left to warn about: {:?}",
+            plan.warnings
         );
     }
 

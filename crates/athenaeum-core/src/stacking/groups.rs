@@ -170,13 +170,15 @@ fn exposure_token(exposure_s: Option<f64>) -> String {
 /// (an ASI294MM bin-2 light's `XPIXSZ` already reads twice the sensor's
 /// native pixel size, the FITS convention every camera driver in the wild
 /// follows) — there is deliberately NO separate binning factor here.
-/// `None` when either input is missing or non-positive (a zero/negative
-/// `focallen` would divide by zero or invert the sign; neither is a usable
-/// optical setup).
+/// `None` when either input is missing, non-finite, or non-positive (a
+/// zero/negative `focallen` would divide by zero or invert the sign,
+/// neither a usable optical setup; a non-finite value is reachable from a
+/// real header — the FITS parser passes a literal `1E999` through as `inf`
+/// with no finiteness filter of its own, `fits_parser/fits_header_reader.rs`).
 pub fn header_pixel_scale_arcsec(xpixsz_um: Option<f64>, focallen_mm: Option<f64>) -> Option<f64> {
     let xpixsz = xpixsz_um?;
     let focallen = focallen_mm?;
-    if xpixsz <= 0.0 || focallen <= 0.0 {
+    if !xpixsz.is_finite() || !focallen.is_finite() || xpixsz <= 0.0 || focallen <= 0.0 {
         return None;
     }
     Some(206.2648 * xpixsz / focallen)
@@ -290,12 +292,14 @@ fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<Light
 /// variable ceiling, never one query per frame. A frame with no `plate_solves`
 /// row is simply absent from the returned map; [`group_frames`]'s caller then
 /// keeps that frame's header-derived scale (if any).
+/// A non-finite or non-positive stored `pixel_scale_arcsec` is dropped, not
+/// inserted — an authoritative-looking but bogus DB value must not win over
+/// (and suppress) a usable header-derived scale for the same frame;
+/// [`to_group_frame`]'s caller falls back to [`header_pixel_scale_arcsec`]
+/// for any `frame_id` this map has no entry for.
 fn load_solved_scales(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i64, f64>> {
     let mut out = HashMap::new();
     for chunk in frame_ids.chunks(500) {
-        if chunk.is_empty() {
-            continue;
-        }
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT frame_id, pixel_scale_arcsec FROM plate_solves WHERE frame_id IN ({placeholders})"
@@ -308,7 +312,9 @@ fn load_solved_scales(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i6
         })?;
         for row in rows {
             let (frame_id, scale) = row?;
-            out.insert(frame_id, scale);
+            if scale.is_finite() && scale > 0.0 {
+                out.insert(frame_id, scale);
+            }
         }
     }
     Ok(out)
@@ -907,6 +913,35 @@ mod tests {
         assert_eq!(header_pixel_scale_arcsec(Some(-1.0), Some(1000.0)), None);
         assert_eq!(header_pixel_scale_arcsec(Some(3.76), Some(0.0)), None);
         assert_eq!(header_pixel_scale_arcsec(Some(3.76), Some(-1.0)), None);
+
+        // Fix round 1: a non-finite input (reachable from a real header —
+        // the FITS parser passes `1E999` through as `inf`) must not slip
+        // past the `<= 0.0` guard, which NaN/inf both fail (`NaN <= 0.0` and
+        // `inf <= 0.0` are both `false`).
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(f64::NAN), Some(1000.0)),
+            None
+        );
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(f64::INFINITY), Some(1000.0)),
+            None
+        );
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(f64::NEG_INFINITY), Some(1000.0)),
+            None
+        );
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(3.76), Some(f64::NAN)),
+            None
+        );
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(3.76), Some(f64::INFINITY)),
+            None
+        );
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(3.76), Some(f64::NEG_INFINITY)),
+            None
+        );
     }
 
     /// M4b: a member with only header data gets `Header`; a member that ALSO
@@ -976,6 +1011,64 @@ mod tests {
             "{:?}",
             g[0].pixel_scale_arcsec
         );
+    }
+
+    /// Fix round 1: a stored `plate_solves` row with a non-finite or
+    /// non-positive `pixel_scale_arcsec` (a corrupt/impossible value) must
+    /// not win over a usable header-derived scale for the same frame — the
+    /// bogus DB value is dropped, and the frame falls back to `Header`
+    /// exactly as if no solve row existed at all.
+    #[test]
+    fn group_frame_invalid_solve_scale_falls_back_to_header() {
+        let f = test_fixtures::frame_set("s");
+        let mut ids = Vec::new();
+        for (i, bad_scale) in [0.0, -3.0, f64::INFINITY].iter().enumerate() {
+            let (id, _) = test_fixtures::add_light(
+                &f,
+                &LightSpec {
+                    stem: &format!("f{i}"),
+                    instrume: "cam",
+                    filter: None,
+                    binning: 1,
+                    width: 8,
+                    height: 8,
+                    exptime: 60.0,
+                    date_obs: "2025-01-01T00:00:00",
+                    bayerpat: None,
+                    write_file: false,
+                },
+            );
+            f.conn
+                .execute(
+                    "UPDATE frames SET focallen = 1000.0, xpixsz = 3.76 WHERE id = ?1",
+                    params![id],
+                )
+                .unwrap();
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, *bad_scale);
+            ids.push(id);
+        }
+
+        let g = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+
+        let header_expected = header_pixel_scale_arcsec(Some(3.76), Some(1000.0)).unwrap();
+        for id in ids {
+            let gf = g[0]
+                .frames
+                .iter()
+                .find(|gf| gf.frame_id == id)
+                .expect("frame present");
+            assert_eq!(
+                gf.scale_source,
+                Some(ScaleSource::Header),
+                "a non-finite/non-positive solve scale must fall back to Header: {gf:?}"
+            );
+            assert!(
+                (gf.pixel_scale_arcsec.unwrap() - header_expected).abs() < 1e-9,
+                "{:?}",
+                gf.pixel_scale_arcsec
+            );
+        }
     }
 
     /// A member with neither a header focal length/pixel size nor a stored
