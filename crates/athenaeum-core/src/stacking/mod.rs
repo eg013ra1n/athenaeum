@@ -42,10 +42,13 @@
 //! frame's own `PixelMap` — a whole-branch final fix wave item made this
 //! tolerate a frame whose native geometry differs from the run's
 //! reference (only `channels` has to match), mirroring the tolerance the
-//! integration engine's own `RegisteredSource` has always had per frame. M4a Task 2's fix
-//! round adds `prefilter` (math reference §5.1's optional 3×3 median on
-//! the image the seed DETECTION runs on — a sharpness-dependent
-//! suppression the detection threshold cannot express).
+//! integration engine's own `RegisteredSource` has always had per frame.
+//!
+//! M4a Task 2's fix rounds add `prefilter`: math reference §5.1's optional
+//! 3×3 median on the image the seed DETECTION runs on, a
+//! sharpness-dependent suppression no single threshold can express. It
+//! ships off — see that task's report for the two grids that left it
+//! there.
 
 pub mod config;
 pub mod drizzle;

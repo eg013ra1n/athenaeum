@@ -480,7 +480,7 @@ pub fn measure_frame_with_seeds(
             psf_signal_weight = m.psf_signal_weight,
             psf_snr = m.psf_snr,
             detection_sigma = opts.detection_sigma,
-            seed_prefilter = ?opts.seed_prefilter,
+            seed_prefilter = opts.seed_prefilter.as_str(),
             duration_ms = t.elapsed().as_millis() as u64,
             "frame plane measured"
         );
@@ -768,21 +768,36 @@ mod tests {
         );
     }
 
-    /// Fix round 2 moved the background/noise computation above detection
-    /// so the seed levels can be anchored on the UNFILTERED plane. That
-    /// reordering must not change a single number on the path that ships
-    /// (`SeedPrefilter::None`), which still asks for `NoiseRelative` and
-    /// therefore for the detector's own σ.
+    /// The shipping path (`SeedPrefilter::None`) pinned by its NUMBERS, not
+    /// by a delegate equality — `measure_plane` forwards to
+    /// `measure_plane_with_seeds`, so comparing the two can never fail.
+    ///
+    /// These four are what `field(7, 1.0, 0.002)` — 150 Gaussian stars,
+    /// σ 1.8 px, background 0.08, noise 0.002 — measures through the
+    /// default options, recorded 2026-09-11 (M4a Task 2 fix round 3). Any
+    /// later change to detection, the fit region, the acceptance rules or
+    /// the estimator moves at least one of them; that is the point. A task
+    /// that changes one on purpose says so and rewrites the literal.
     #[test]
-    fn the_shipped_prefilter_none_path_is_unchanged_by_the_reorder() {
+    fn the_shipped_none_path_measures_exactly_these_numbers() {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
         assert_eq!(opts.seed_prefilter, SeedPrefilter::None);
-        let a = measure_plane(&data, w, h, &opts, None);
-        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
-        assert_eq!(a, b);
-        // The fixture's pinned population, unchanged since Plan 2.
-        assert!(a.stars_fitted >= 120, "fitted {}", a.stars_fitted);
+        let c = measure_plane(&data, w, h, &opts, None);
+        assert_eq!(
+            (c.stars_detected, c.stars_fitted),
+            (150, 150),
+            "the whole fixture field is detected and fitted"
+        );
+        assert_eq!(c.beta, 10.0, "Auto resolves to the widest β on Gaussians");
+        assert_eq!(c.psf_signal_weight, 1.387_068_045_273_481_56e-3);
+        assert_eq!(c.fwhm_px, 4.122_658_320_014_302_55);
+        // The delegate equality, kept as a cheap structural check — it is
+        // not the pin above.
+        assert_eq!(
+            c,
+            measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast)
+        );
     }
 
     /// With the filter on, the levels are anchored on the unfiltered noise
@@ -815,7 +830,10 @@ mod tests {
         // Everything downstream of detection reads the untouched plane, so
         // the noise and the background model are bit-identical.
         assert_eq!(filtered.noise, plain.noise);
-        assert_eq!((filtered.m_star, filtered.n_star), (plain.m_star, plain.n_star));
+        assert_eq!(
+            (filtered.m_star, filtered.n_star),
+            (plain.m_star, plain.n_star)
+        );
         assert_eq!(filtered.median, plain.median);
     }
 

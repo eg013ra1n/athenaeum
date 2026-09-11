@@ -16,7 +16,7 @@ use crate::resample::Interpolation;
 use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
-use crate::stacking::psf_signal::PsfModel;
+use crate::stacking::psf_signal::{PsfModel, PSF_FIT_VERSION};
 use crate::stacking::register::DistortionChoice;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
 
@@ -69,6 +69,13 @@ impl Default for StackingConfig {
 /// SAME [`crate::calibration_library::paths::fmt_num`] token and collide on
 /// `stacking_run_groups`'s `UNIQUE(run_id, group_key)`.
 pub const MIN_EXPOSURE_TOLERANCE_SEC: f64 = 0.01;
+
+/// The range [`resolve_config`] clamps [`MeasurementConfig::detection_sigma`]
+/// to — the same numbers `MeasurePanel`'s field offers, enforced on the
+/// backend too because a stored or hand-edited document never went through
+/// that field (M4a Task 2 fix round 3).
+pub const MIN_DETECTION_SIGMA: f64 = 1.0;
+pub const MAX_DETECTION_SIGMA: f64 = 100.0;
 
 /// spec §9.2 `grouping:` (owner decision 2026-09-10: groups are
 /// camera-agnostic — colour mode, filter, binning and exposure form the
@@ -346,7 +353,43 @@ pub fn resolve_config(
         );
         config.grouping.exposure_tolerance_sec = MIN_EXPOSURE_TOLERANCE_SEC;
     }
+    config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
     Ok(config)
+}
+
+/// [`MeasurementConfig::detection_sigma`] into
+/// `[MIN_DETECTION_SIGMA, MAX_DETECTION_SIGMA]`, warning when it moves.
+///
+/// The UI's own field already offers exactly that range; this is the
+/// backend's guard for a value that never went through it — a stored
+/// document, a hand-edited one, or a caller building the struct directly.
+/// Out of range it is not a preference but a broken detector: at `0` or
+/// below, every pixel clears the level, and at an infinity none does.
+///
+/// `!(x >= MIN)` rather than `x < MIN` so a NaN clamps too (every
+/// comparison against NaN is false) — the same shape the exposure-tolerance
+/// floor uses. JSON cannot express NaN or an infinity (`serde_json` rejects
+/// both the literals and out-of-range magnitudes such as `1e309`), so that
+/// arm only ever fires for a programmatic caller; it is cheap and it means
+/// the value handed to the detector is finite by construction.
+fn clamp_detection_sigma(value: f64) -> f64 {
+    if !(value >= MIN_DETECTION_SIGMA) {
+        warn!(
+            detection_sigma = value,
+            min = MIN_DETECTION_SIGMA,
+            "stacking config: detectionSigma below the minimum; clamped"
+        );
+        return MIN_DETECTION_SIGMA;
+    }
+    if value > MAX_DETECTION_SIGMA {
+        warn!(
+            detection_sigma = value,
+            max = MAX_DETECTION_SIGMA,
+            "stacking config: detectionSigma above the maximum; clamped"
+        );
+        return MAX_DETECTION_SIGMA;
+    }
+    value
 }
 
 /// xxh3 of the canonical JSON of the whole resolved config — a run-level
@@ -423,13 +466,27 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     })
 }
 
-/// Stage 3 (measurement) config subtree: the measurement settings plus the
+/// Stage 3 (measurement) config subtree: the measurement settings, the
 /// scale estimator normalization keeps in lockstep with it (see
-/// [`MeasurementConfig::measure_options`]).
+/// [`MeasurementConfig::measure_options`]), and
+/// [`crate::stacking::psf_signal::PSF_FIT_VERSION`] — the config alone
+/// cannot express "the fitter itself now accepts different stars", which is
+/// what M4a Task 2 did to every stored measurement (ruling R-M4a-15).
 pub fn measurement_subtree(cfg: &StackingConfig) -> serde_json::Value {
+    measurement_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
+}
+
+/// [`measurement_subtree`] with the fitter version supplied, so a test can
+/// prove the hash actually follows it (nothing else should call this with
+/// anything but [`PSF_FIT_VERSION`]).
+fn measurement_subtree_with_fit_version(
+    cfg: &StackingConfig,
+    psf_fit_version: u32,
+) -> serde_json::Value {
     serde_json::json!({
         "measurement": cfg.measurement,
         "normalization": { "scaleEstimator": cfg.normalization.scale_estimator },
+        "psfFitVersion": psf_fit_version,
     })
 }
 
@@ -449,14 +506,29 @@ pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
 /// under `measurement`, not `normalization`. `measurement.psfModel` rides
 /// along too (harmless — it just widens what invalidates a sidecar — but
 /// plays no role in `relative_scale`'s own model choice; fix round 1, item
-/// 11: an earlier version of this comment claimed otherwise).
+/// 11: an earlier version of this comment claimed otherwise), plus
+/// [`crate::stacking::psf_signal::PSF_FIT_VERSION`]: `relative_scale` fits
+/// its matched stars through the same `fit_stars` /
+/// `FitParams::default()` the measurement uses, so a change to what the
+/// fitter accepts silently changes every `.athln` — and no config field
+/// moves when it does (ruling R-M4a-15).
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
+    normalization_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
+}
+
+/// [`normalization_subtree`] with the fitter version supplied — see
+/// [`measurement_subtree_with_fit_version`].
+fn normalization_subtree_with_fit_version(
+    cfg: &StackingConfig,
+    psf_fit_version: u32,
+) -> serde_json::Value {
     serde_json::json!({
         "normalization": cfg.normalization,
         "measurement": {
             "psfModel": cfg.measurement.psf_model,
             "maxStars": cfg.measurement.max_stars,
         },
+        "psfFitVersion": psf_fit_version,
     })
 }
 
@@ -702,6 +774,98 @@ mod tests {
             stage_hash(&measurement_subtree(&filtered), &[], &[]),
             "the measurement stage hash must follow seedPrefilter"
         );
+    }
+
+    /// Ruling R-M4a-15: the PSF fitter's own behaviour is not expressible
+    /// in the config, so the artifact hashes that store fit-derived numbers
+    /// fold in [`PSF_FIT_VERSION`] instead. Both of them must: the
+    /// measurement stage stores PSFSW/TFlux/star counts, and local
+    /// normalization's `.athln` stores a PSF-flux scale measured with the
+    /// SAME fitter.
+    #[test]
+    fn both_fit_derived_subtree_hashes_follow_the_psf_fit_version() {
+        let cfg = StackingConfig::default();
+        let h = |v: u32| {
+            (
+                stage_hash(&measurement_subtree_with_fit_version(&cfg, v), &[], &[]),
+                stage_hash(&normalization_subtree_with_fit_version(&cfg, v), &[], &[]),
+            )
+        };
+        let (m_now, n_now) = h(PSF_FIT_VERSION);
+        let (m_old, n_old) = h(PSF_FIT_VERSION - 1);
+        assert_ne!(m_now, m_old, "the measurement hash must follow the fitter");
+        assert_ne!(n_now, n_old, "the LN hash must follow the fitter");
+        // And the shipped helpers are the versioned ones at the current
+        // constant — not a second, drifting copy of the JSON shape.
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            m_now,
+            "measurement_subtree must hash as the current fitter version"
+        );
+        assert_eq!(
+            stage_hash(&normalization_subtree(&cfg), &[], &[]),
+            n_now,
+            "normalization_subtree must hash as the current fitter version"
+        );
+    }
+
+    /// `detectionSigma` reaches the detector as a raw level multiplier, so a
+    /// stored or hand-edited document must not be able to hand it a zero, a
+    /// negative or a non-finite value (fix round 3, Important 3).
+    #[test]
+    fn detection_sigma_is_clamped_to_its_range() {
+        let sigma = |doc: &str| {
+            resolve_config(Some(doc), None)
+                .unwrap()
+                .measurement
+                .detection_sigma
+        };
+        assert_eq!(
+            sigma("{\"measurement\":{\"detectionSigma\":-5}}"),
+            MIN_DETECTION_SIGMA
+        );
+        assert_eq!(
+            sigma("{\"measurement\":{\"detectionSigma\":0}}"),
+            MIN_DETECTION_SIGMA
+        );
+        assert_eq!(
+            sigma("{\"measurement\":{\"detectionSigma\":250}}"),
+            MAX_DETECTION_SIGMA
+        );
+        // In range, untouched — including both ends and the shipped default.
+        for v in ["1", "20", "100"] {
+            assert_eq!(
+                sigma(&format!("{{\"measurement\":{{\"detectionSigma\":{v}}}}}")),
+                v.parse::<f64>().unwrap()
+            );
+        }
+        assert_eq!(
+            resolve_config(None, None)
+                .unwrap()
+                .measurement
+                .detection_sigma,
+            MeasurementConfig::default().detection_sigma,
+            "the shipped default is inside the range and must not move"
+        );
+
+        // A non-finite value cannot travel through JSON at all — serde_json
+        // rejects the out-of-range magnitude rather than decoding it to an
+        // infinity — so the clamp's NaN-safe shape is exercised directly.
+        assert!(
+            resolve_config(Some("{\"measurement\":{\"detectionSigma\":1e309}}"), None).is_err(),
+            "an out-of-range JSON number is refused before the clamp sees it"
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, 0.9999] {
+            assert_eq!(
+                clamp_detection_sigma(bad),
+                if bad > MAX_DETECTION_SIGMA {
+                    MAX_DETECTION_SIGMA
+                } else {
+                    MIN_DETECTION_SIGMA
+                },
+                "clamping {bad}"
+            );
+        }
     }
 
     #[test]

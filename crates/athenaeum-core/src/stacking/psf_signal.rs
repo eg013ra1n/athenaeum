@@ -25,6 +25,23 @@ pub enum PsfModel {
 pub const AUTO_BETAS: [f64; 4] = [2.5, 4.0, 6.0, 10.0];
 pub const AUTO_SAMPLE: usize = 64;
 
+/// Version of the PSF fitter's own behaviour — bumped whenever
+/// [`fit_one`], [`accept`] or the aperture change what a fit accepts or
+/// measures; folded into every artifact hash that stores fit-derived
+/// numbers.
+///
+/// Without it a cached artifact cannot tell that the code which produced it
+/// has changed: the config it was keyed on is untouched, but the numbers
+/// would come out different today. M4a Task 2 is exactly that case — the
+/// adaptive sampling region and the inner-region rule moved which stars are
+/// accepted, for the quality measurement AND for local normalization's
+/// PSF-flux scale, which fits through the same `fit_stars` with
+/// `FitParams::default()` (ruling R-M4a-15).
+///
+/// 1 = the fixed `5σ` stamp with the `0.85·r` centre rule (M1-M3).
+/// 2 = the adaptive sampling region + `inner_margin` (M4a Task 2).
+pub const PSF_FIT_VERSION: u32 = 2;
+
 /// A detection to fit: centroid, background-subtracted peak and flux.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Seed {
@@ -270,7 +287,8 @@ fn fit_one(
     // and is measuring a truncated star.
     let nominal = stamp_radius(sigma0) as i64;
     let (cx, cy) = (seed.x.round() as i64, seed.y.round() as i64);
-    if cx - nominal < 0 || cy - nominal < 0 || cx + nominal >= w as i64 || cy + nominal >= h as i64 {
+    if cx - nominal < 0 || cy - nominal < 0 || cx + nominal >= w as i64 || cy + nominal >= h as i64
+    {
         return None;
     }
     let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);

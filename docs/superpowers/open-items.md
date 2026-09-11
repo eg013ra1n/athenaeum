@@ -187,6 +187,39 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M4a — measurement seeds and the PSF fitter (2026-09-11)
+
+The measurement's PSF-fit seeds became noise-relative
+(`measurement.detectionSigma`, calibrated to 20 on 368 external frames) and
+the fitter gained the reference's adaptive sampling region plus the
+inner-region acceptance rule. Both were graded against the external log by
+`examples/weight_audit` + `docs/superpowers/research/scripts/
+weight_audit_compare.py`: 10 PASS / 12 MISS against the baseline's 7/15, the
+minimum per-channel PSF-signal-weight Spearman up from 0.435 to 0.683, and
+both top-20 frame rankings agreeing with the reference. Report:
+`.superpowers/sdd/2026-09-10-stacking-m4a-plan-quality/task-2-report.md`.
+
+- **LN sidecars recompute once, and Task 7 must re-measure what they contain.**
+  `stacking/ln/scale.rs` fits its matched stars through the same `fit_stars` /
+  `FitParams::default()` the measurement uses, so the region change moved
+  local normalization's PSF-flux scale too. `PSF_FIT_VERSION` (ruling
+  R-M4a-15) is folded into both `measurement_subtree` and
+  `normalization_subtree`, so every cached `.athln` and every cached measure
+  artifact is invalidated exactly once and rebuilt — that part is automatic
+  and needs no hand check. What needs one: Task 7's acceptance run has to
+  re-measure LN's matched-star counts (`ln_matches`) and its exclusions
+  against the M2 acceptance numbers — 368/368 sidecars written, no frame
+  excluded for "fewer than 20 matched stars". A quieter fitter could push a
+  marginal frame under that floor, and the M2 run is the only baseline that
+  would show it.
+- The OSC group's bright, undersampled night (measured FWHM 1.55 px) still
+  yields 3.8-6.9× the reference's fit count; two bounded experiments with a
+  3×3 median pre-filter on the detection image (rulings R-M4a-13/-14, the
+  option ships off) closed ~20 % of it and cost the blue channel's weight
+  correlation. Closing it properly needs the rest of the reference's
+  structure-map front end (math reference §5.1) and is an M4c item, not a
+  smoke.
+
 ### Stacking M3 — drizzle (2026-09-10)
 
 M3 (drizzle 1×/2×/3× with exact-clipping square drops or tabulated circle/

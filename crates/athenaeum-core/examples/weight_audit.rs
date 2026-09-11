@@ -38,7 +38,7 @@
 //! become a fit seed; `--prefilter` is `MeasureOptions::seed_prefilter`,
 //! what the seed DETECTION runs on (the fits and every other estimator
 //! always see the untouched plane). All three default to the production
-//! values.`
+//! values.
 use athenaeum_core::stacking::measure::{
     measure_plane_with_seeds, ChannelMeasurement, MeasureOptions, SeedSource,
 };

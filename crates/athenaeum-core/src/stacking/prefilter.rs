@@ -17,6 +17,7 @@
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// What the seed detection runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
@@ -27,6 +28,17 @@ pub enum SeedPrefilter {
     None,
     /// Detect on the 3×3 median of the plane (math reference §5.1).
     Median3,
+}
+
+impl SeedPrefilter {
+    /// The serde name, for logs — `"none"` / `"median3"`. One spelling
+    /// everywhere, so a log filter and a stored config agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeedPrefilter::None => "none",
+            SeedPrefilter::Median3 => "median3",
+        }
+    }
 }
 
 /// 3×3 median of `src` (`w × h`, row-major), returned as a new buffer.
@@ -47,10 +59,22 @@ pub enum SeedPrefilter {
 /// One rayon task per output row; the window lives in a stack array, so
 /// there is no per-pixel allocation.
 pub fn median3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; w * h];
-    if w == 0 || h == 0 || src.len() < w * h {
-        return out;
+    if w == 0 || h == 0 {
+        return Vec::new();
     }
+    if src.len() < w * h {
+        // Never hand the detector a black frame over a caller's arithmetic
+        // slip: pass the plane through unfiltered so it still detects
+        // something, and say loudly that the filter did not run.
+        warn!(
+            len = src.len(),
+            width = w,
+            height = h,
+            "median pre-filter: plane length does not match the geometry"
+        );
+        return src.to_vec();
+    }
+    let mut out = vec![0.0f32; w * h];
     out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let y0 = y.saturating_sub(1);
         let y1 = (y + 1).min(h - 1);
@@ -140,7 +164,7 @@ mod tests {
         assert_eq!(m[0], 900.0, "corner");
         // Edge (0,2): window {900,100,900,100,900,100} → upper median 900.
         assert_eq!(m[2 * w], 900.0, "left edge");
-        // Interior (1,2): window has two 900s and seven 100s → 100.
+        // Interior (1,2): window has three 900s and six 100s → 100.
         assert_eq!(m[2 * w + 1], 100.0, "interior next to the bright column");
     }
 
@@ -156,5 +180,21 @@ mod tests {
             SeedPrefilter::None
         );
         assert!(median3(&[], 0, 0).is_empty());
+        assert_eq!(SeedPrefilter::None.as_str(), "none");
+        assert_eq!(SeedPrefilter::Median3.as_str(), "median3");
+        for v in [SeedPrefilter::None, SeedPrefilter::Median3] {
+            assert_eq!(
+                serde_json::to_string(&v).unwrap(),
+                format!("\"{}\"", v.as_str())
+            );
+        }
+    }
+
+    /// A geometry that does not match the buffer must not silently produce
+    /// a black detection image — the plane passes through unfiltered.
+    #[test]
+    fn a_length_mismatch_passes_the_plane_through() {
+        let src = vec![7.0f32; 10];
+        assert_eq!(median3(&src, 4, 4), src, "10 pixels are not a 4×4 plane");
     }
 }
