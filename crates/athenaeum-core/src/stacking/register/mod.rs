@@ -15,6 +15,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::resample::Interpolation;
 
+/// A linear scale outside `[1 / SCALE_TOLERANCE, SCALE_TOLERANCE]` of the
+/// reference fails a frame's registration (spec §3.6, `align::SCALE_RANGE`).
+/// M4b (rulings R-M4b-1/7) shares this same tolerance for the plan-time
+/// pixel-scale warning (`stacking::plan::build_plan`) — a group the warning
+/// flags as "far from the reference" is, by construction, the same
+/// situation the per-frame registration gate would refuse a frame over, so
+/// both read one constant rather than risking two numbers drifting apart.
+pub const SCALE_TOLERANCE: f64 = 1.25;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelChoice {

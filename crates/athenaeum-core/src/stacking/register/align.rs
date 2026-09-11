@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use solvemyastro::quad::{build_quads, fit_affine, group_size_for, match_quads};
 
 use super::detect::Star;
-use super::{DistortionChoice, ModelChoice, RegistrationConfig};
+use super::{DistortionChoice, ModelChoice, RegistrationConfig, SCALE_TOLERANCE};
 use crate::geometry::{
     ransac_fit, refit_weighted, Distortion, KdTree2, Linear, LinearKind, Pair, PixelMap,
     RansacConfig, RansacResult, RefitResult,
@@ -19,8 +19,13 @@ use crate::geometry::{
 pub const QUAD_TOLERANCE: f64 = 0.007;
 /// RANSAC and the QA gates need at least this many inliers.
 pub const MIN_INLIERS: usize = 8;
-/// A linear scale outside this range fails the frame (spec §3.6).
-pub const SCALE_RANGE: (f64, f64) = (0.8, 1.25);
+/// A linear scale outside this range fails the frame (spec §3.6). M4b:
+/// derived from the shared [`SCALE_TOLERANCE`] rather than a second literal
+/// — bit-identical to the old `(0.8, 1.25)` tuple (`1.0 / 1.25 == 0.8`
+/// exactly in `f64`; pinned by
+/// `tests::scale_range_matches_the_tolerance_constant`), so every existing
+/// test that pins this gate keeps passing unchanged.
+pub const SCALE_RANGE: (f64, f64) = (1.0 / SCALE_TOLERANCE, SCALE_TOLERANCE);
 /// `model: auto` — homography from this many correspondences …
 pub const AUTO_HOMOGRAPHY_MIN: usize = 30;
 /// … affine from this many, similarity below.
@@ -495,6 +500,17 @@ pub fn align(
 mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
+
+    /// M4b: `SCALE_RANGE` is now derived from `SCALE_TOLERANCE` rather than
+    /// a second literal — pin that the derived tuple still equals the old
+    /// hand-written `(0.8, 1.25)` so every test pinning this gate keeps
+    /// passing unchanged.
+    #[test]
+    fn scale_range_matches_the_tolerance_constant() {
+        assert_eq!(SCALE_RANGE, (0.8, 1.25));
+        assert!((SCALE_RANGE.0 - 1.0 / SCALE_TOLERANCE).abs() < 1e-12);
+        assert_eq!(SCALE_RANGE.1, SCALE_TOLERANCE);
+    }
 
     #[test]
     fn align_error_serializes_camel_case_fields() {

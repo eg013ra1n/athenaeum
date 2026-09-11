@@ -31,13 +31,29 @@ pub enum ColorMode {
     Osc,
 }
 
+/// Where a [`GroupFrame`]'s `pixel_scale_arcsec` came from (M4b, spec's
+/// mixed-pixel-scale work). `Solve` — a stored `plate_solves` row for the
+/// frame — always wins over `Header` — [`header_pixel_scale_arcsec`] from
+/// the frame's own `FOCALLEN`/`XPIXSZ` — when both are available, since a
+/// solve measures the actual optical scale rather than assuming the header
+/// is correct/complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaleSource {
+    Solve,
+    Header,
+}
+
 /// One LIGHT frame as it sits inside an [`IntegrationGroup`] — the catalog
 /// identity (`frame_id`/`file_id`), the file location the later stages read
 /// from, the two per-frame fields the grouping/clustering logic itself
-/// consumes (`exposure_s`, `date_obs`), and this frame's own native
-/// geometry (`width`/`height` — a group's members may differ now that
-/// camera/geometry are not grouping keys; `0` when `NAXIS1`/`NAXIS2` is
-/// absent, the same fallback the old group-level fields used).
+/// consumes (`exposure_s`, `date_obs`), this frame's own native geometry
+/// (`width`/`height` — a group's members may differ now that camera/
+/// geometry are not grouping keys; `0` when `NAXIS1`/`NAXIS2` is absent,
+/// the same fallback the old group-level fields used), and this frame's own
+/// pixel scale (M4b — a stored plate solve's `pixel_scale_arcsec` when one
+/// exists, else [`header_pixel_scale_arcsec`] from `FOCALLEN`/`XPIXSZ`;
+/// `None`/`None` when neither is available).
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupFrame {
@@ -51,6 +67,8 @@ pub struct GroupFrame {
     pub date_obs: Option<String>,
     pub width: i64,
     pub height: i64,
+    pub pixel_scale_arcsec: Option<f64>,
+    pub scale_source: Option<ScaleSource>,
 }
 
 /// One integration group: every LIGHT frame sharing colour mode, filter,
@@ -78,6 +96,12 @@ pub struct IntegrationGroup {
     pub exposure_s: Option<f64>,
     pub frames: Vec<GroupFrame>,
     pub total_exposure_s: f64,
+    /// The group's own pixel scale (M4b): the median `pixel_scale_arcsec`
+    /// of whichever members have one, `None` when none do. The plan gate
+    /// (`plan.rs::build_plan`) compares this against the run's resolved
+    /// reference to decide whether this group is "far" from it — a
+    /// warning, never a blocker.
+    pub pixel_scale_arcsec: Option<f64>,
 }
 
 /// The stable group-key string (spec §2, owner decision 2026-09-10):
@@ -138,6 +162,24 @@ fn exposure_token(exposure_s: Option<f64>) -> String {
         Some(e) => format!("{}s", fmt_num(e)),
         None => "unknown".to_string(),
     }
+}
+
+/// Pixel scale from the header's focal length and pixel size (M4b, ruling
+/// R-M4b-1): `206.2648 * xpixsz_um / focallen_mm`, arcsec/px — the standard
+/// plate-scale formula. `xpixsz_um` is trusted as already binned-effective
+/// (an ASI294MM bin-2 light's `XPIXSZ` already reads twice the sensor's
+/// native pixel size, the FITS convention every camera driver in the wild
+/// follows) — there is deliberately NO separate binning factor here.
+/// `None` when either input is missing or non-positive (a zero/negative
+/// `focallen` would divide by zero or invert the sign; neither is a usable
+/// optical setup).
+pub fn header_pixel_scale_arcsec(xpixsz_um: Option<f64>, focallen_mm: Option<f64>) -> Option<f64> {
+    let xpixsz = xpixsz_um?;
+    let focallen = focallen_mm?;
+    if xpixsz <= 0.0 || focallen <= 0.0 {
+        return None;
+    }
+    Some(206.2648 * xpixsz / focallen)
 }
 
 /// `sanitize_for_filename` a possibly-absent, possibly-blank value, falling
@@ -201,12 +243,15 @@ struct LightMember {
     exptime: Option<f64>,
     date_obs: Option<String>,
     bayerpat: Option<String>,
+    focallen: Option<f64>,
+    xpixsz: Option<f64>,
 }
 
 fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<LightMember>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT f.id, fi.id, fi.filename, fi.path, fi.size, fi.modified_at,
-                f.instrume, f.filter, f.xbinning, f.naxis1, f.naxis2, f.exptime, f.date_obs, f.bayerpat
+                f.instrume, f.filter, f.xbinning, f.naxis1, f.naxis2, f.exptime, f.date_obs, f.bayerpat,
+                f.focallen, f.xpixsz
          FROM session_members sm
          JOIN sessions s ON s.id = sm.session_id
          JOIN imaging_nights ino ON ino.id = s.imaging_night_id
@@ -232,10 +277,54 @@ fn load_group_members(conn: &Connection, frames_set_id: i64) -> Result<Vec<Light
                 exptime: r.get(11)?,
                 date_obs: r.get(12)?,
                 bayerpat: r.get(13)?,
+                focallen: r.get(14)?,
+                xpixsz: r.get(15)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Bulk-load `plate_solves.pixel_scale_arcsec` for a set of frame ids — ONE
+/// query per (up to) 500 ids, chunked well under SQLite's default bound
+/// variable ceiling, never one query per frame. A frame with no `plate_solves`
+/// row is simply absent from the returned map; [`group_frames`]'s caller then
+/// keeps that frame's header-derived scale (if any).
+fn load_solved_scales(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i64, f64>> {
+    let mut out = HashMap::new();
+    for chunk in frame_ids.chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT frame_id, pixel_scale_arcsec FROM plate_solves WHERE frame_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        for row in rows {
+            let (frame_id, scale) = row?;
+            out.insert(frame_id, scale);
+        }
+    }
+    Ok(out)
+}
+
+/// The plain median of `values` (sorted in place) — the SAME odd/even
+/// convention `weights.rs::median_of` uses, kept local to this module
+/// rather than shared since the two operate on unrelated quantities.
+fn median_f64(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        0.5 * (values[n / 2 - 1] + values[n / 2])
+    }
 }
 
 fn color_mode_of(bayerpat: &Option<String>) -> ColorMode {
@@ -245,7 +334,19 @@ fn color_mode_of(bayerpat: &Option<String>) -> ColorMode {
     }
 }
 
-fn to_group_frame(m: &LightMember) -> GroupFrame {
+/// `solved_scales` (built once per [`group_frames`] call, keyed by
+/// `frame_id`) overrides the header-derived scale with `Solve` when this
+/// member has a stored plate solve — a measured scale always outranks the
+/// header's assumption.
+fn to_group_frame(m: &LightMember, solved_scales: &HashMap<i64, f64>) -> GroupFrame {
+    let (pixel_scale_arcsec, scale_source) = match solved_scales.get(&m.frame_id) {
+        Some(&scale) => (Some(scale), Some(ScaleSource::Solve)),
+        None => {
+            let header_scale = header_pixel_scale_arcsec(m.xpixsz, m.focallen);
+            let source = header_scale.map(|_| ScaleSource::Header);
+            (header_scale, source)
+        }
+    };
     GroupFrame {
         frame_id: m.frame_id,
         file_id: m.file_id,
@@ -257,6 +358,8 @@ fn to_group_frame(m: &LightMember) -> GroupFrame {
         date_obs: m.date_obs.clone(),
         width: m.naxis1.unwrap_or(0),
         height: m.naxis2.unwrap_or(0),
+        pixel_scale_arcsec,
+        scale_source,
     }
 }
 
@@ -371,6 +474,13 @@ pub fn group_frames(
     let members = load_group_members(conn, frames_set_id)?;
     let total_frames = members.len();
 
+    // M4b: one bulk query for every member's stored plate-solve scale,
+    // before the members are bucketed/moved below — see
+    // `load_solved_scales`'s own doc for why this is one chunked query,
+    // never one per frame.
+    let frame_ids: Vec<i64> = members.iter().map(|m| m.frame_id).collect();
+    let solved_scales = load_solved_scales(conn, &frame_ids)?;
+
     // Bucketed by a plain tuple rather than a dedicated struct: `ColorMode`
     // deliberately does not derive `Hash` (it is a wire type, not a map key
     // elsewhere), so the colour axis rides along as a `bool` (`true` = OSC)
@@ -402,9 +512,20 @@ pub fn group_frames(
         for (label, idxs) in cluster_indices(&bucket.members, cfg) {
             let frames: Vec<GroupFrame> = idxs
                 .iter()
-                .map(|&i| to_group_frame(&bucket.members[i]))
+                .map(|&i| to_group_frame(&bucket.members[i], &solved_scales))
                 .collect();
             let total_exposure_s = frames.iter().map(|f| f.exposure_s.unwrap_or(0.0)).sum();
+
+            // The group's own pixel scale: the median of whichever members
+            // have one (Solve or Header — see `GroupFrame::scale_source`);
+            // `None` when none do.
+            let mut member_scales: Vec<f64> =
+                frames.iter().filter_map(|f| f.pixel_scale_arcsec).collect();
+            let pixel_scale_arcsec = if member_scales.is_empty() {
+                None
+            } else {
+                Some(median_f64(&mut member_scales))
+            };
 
             // The reference-anchor member is the cluster's own first member
             // (idxs is already restored to date_obs/id order — see
@@ -437,6 +558,7 @@ pub fn group_frames(
                 exposure_s: label,
                 frames,
                 total_exposure_s,
+                pixel_scale_arcsec,
             });
         }
     }
@@ -762,5 +884,125 @@ mod tests {
             .expect("'Ha ' and 'Ha' collapse into the Ha group");
         assert_eq!(ha.frames.len(), 2);
         assert_ne!(no_filter.key, ha.key);
+    }
+
+    /// M4b, ruling R-M4b-1: `206.2648 * xpixsz_um / focallen_mm`, no binning
+    /// factor — `XPIXSZ` is already binned-effective by FITS convention
+    /// (an ASI294MM bin-2 light's `XPIXSZ` already reads twice the native
+    /// pixel size). Values hand-computed to full precision so the test
+    /// actually pins the constant, not just round-trips the formula.
+    #[test]
+    fn header_pixel_scale() {
+        let a = header_pixel_scale_arcsec(Some(3.76), Some(1000.0)).unwrap();
+        assert!((a - 0.775555648).abs() < 1e-9, "{a}");
+
+        // An ASI294MM bin-2 light: XPIXSZ already effective at 4.63 um.
+        let b = header_pixel_scale_arcsec(Some(4.63), Some(1000.0)).unwrap();
+        assert!((b - 0.955006024).abs() < 1e-9, "{b}");
+
+        assert_eq!(header_pixel_scale_arcsec(None, Some(1000.0)), None);
+        assert_eq!(header_pixel_scale_arcsec(Some(3.76), None), None);
+        assert_eq!(header_pixel_scale_arcsec(None, None), None);
+        assert_eq!(header_pixel_scale_arcsec(Some(0.0), Some(1000.0)), None);
+        assert_eq!(header_pixel_scale_arcsec(Some(-1.0), Some(1000.0)), None);
+        assert_eq!(header_pixel_scale_arcsec(Some(3.76), Some(0.0)), None);
+        assert_eq!(header_pixel_scale_arcsec(Some(3.76), Some(-1.0)), None);
+    }
+
+    /// M4b: a member with only header data gets `Header`; a member that ALSO
+    /// carries a stored plate solve gets `Solve` — the measured scale (0.80)
+    /// wins over what the header would have implied (≈0.7756) for that same
+    /// frame. The group's own scale is the median of the members that have
+    /// one — with two members here (even count), the mean of the two.
+    #[test]
+    fn group_frame_pixel_scale_solve_overrides_header() {
+        let f = test_fixtures::frame_set("s");
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let (id, _) = test_fixtures::add_light(
+                &f,
+                &LightSpec {
+                    stem: &format!("f{i}"),
+                    instrume: "cam",
+                    filter: None,
+                    binning: 1,
+                    width: 8,
+                    height: 8,
+                    exptime: 60.0,
+                    date_obs: "2025-01-01T00:00:00",
+                    bayerpat: None,
+                    write_file: false,
+                },
+            );
+            f.conn
+                .execute(
+                    "UPDATE frames SET focallen = 1000.0, xpixsz = 3.76 WHERE id = ?1",
+                    params![id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        // Only the second frame gets a stored plate solve — its header alone
+        // would imply ~0.7756, but the solve (0.80) must win.
+        test_fixtures::seed_plate_solve_scale(&f.conn, ids[1], 0.80);
+
+        let g = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+
+        let header_expected = header_pixel_scale_arcsec(Some(3.76), Some(1000.0)).unwrap();
+        let header_frame = g[0]
+            .frames
+            .iter()
+            .find(|gf| gf.frame_id == ids[0])
+            .expect("first frame present");
+        assert!(
+            (header_frame.pixel_scale_arcsec.unwrap() - header_expected).abs() < 1e-9,
+            "{:?}",
+            header_frame.pixel_scale_arcsec
+        );
+        assert_eq!(header_frame.scale_source, Some(ScaleSource::Header));
+
+        let solved_frame = g[0]
+            .frames
+            .iter()
+            .find(|gf| gf.frame_id == ids[1])
+            .expect("second frame present");
+        assert_eq!(solved_frame.pixel_scale_arcsec, Some(0.80));
+        assert_eq!(solved_frame.scale_source, Some(ScaleSource::Solve));
+
+        let expected_median = (header_expected + 0.80) / 2.0;
+        assert!(
+            (g[0].pixel_scale_arcsec.unwrap() - expected_median).abs() < 1e-9,
+            "{:?}",
+            g[0].pixel_scale_arcsec
+        );
+    }
+
+    /// A member with neither a header focal length/pixel size nor a stored
+    /// plate solve gets no scale at all, and the group's own scale stays
+    /// `None` too (no members to take a median over).
+    #[test]
+    fn group_frame_with_no_scale_data_has_no_pixel_scale() {
+        let f = test_fixtures::frame_set("s");
+        test_fixtures::add_light(
+            &f,
+            &LightSpec {
+                stem: "f0",
+                instrume: "cam",
+                filter: None,
+                binning: 1,
+                width: 8,
+                height: 8,
+                exptime: 60.0,
+                date_obs: "2025-01-01T00:00:00",
+                bayerpat: None,
+                write_file: false,
+            },
+        );
+        let g = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].frames[0].pixel_scale_arcsec, None);
+        assert_eq!(g[0].frames[0].scale_source, None);
+        assert_eq!(g[0].pixel_scale_arcsec, None);
     }
 }

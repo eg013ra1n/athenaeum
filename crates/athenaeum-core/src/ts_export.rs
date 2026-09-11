@@ -330,6 +330,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::config::StackingPreset,
             crate::api::stacking::StackingPresets,
             crate::stacking::groups::ColorMode,
+            crate::stacking::groups::ScaleSource,
             crate::stacking::plan::Stage,
             crate::stacking::plan::MasterWork,
             crate::stacking::plan::PlanMaster,

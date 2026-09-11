@@ -94,7 +94,13 @@ blocker). The group key is the stable string
 `cameras: string[]` (every distinct camera actually present, sorted) and
 `instrume` as a DISPLAY-only value (the reference-anchor member's own
 camera — the best-weighted included member once weights exist, the first
-member by `(date_obs, id)` at plan time).
+member by `(date_obs, id)` at plan time). M4b (mixed pixel scales): every
+`GroupFrame` also carries `pixelScaleArcsec`/`scaleSource` (a stored plate
+solve when the frame is solved, else the header's `FOCALLEN`/`XPIXSZ`), the
+group's own value is the median of its members', and the plan gate warns —
+never blocks — when a group's scale sits outside `[1 / SCALE_TOLERANCE,
+SCALE_TOLERANCE]` of the resolved reference's own, or when a single group's
+members themselves span that range.
 
 **Gate** (stage 0, the one gate for the Run button and for `start_stacking`):
 

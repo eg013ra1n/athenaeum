@@ -35,8 +35,9 @@ use crate::stacking::config::{
     registration_subtree, resolve_config, stage_hash, ReferenceMode, SourceIdentity,
     StackingConfig,
 };
-use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup};
+use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup, ScaleSource};
 use crate::stacking::paths::{self, EstimateInputs};
+use crate::stacking::register::SCALE_TOLERANCE;
 use crate::stacking::run::group_anchor_geometry;
 
 /// One pipeline stage (spec §10.2's `stage` enum, minus the `Ok`-only
@@ -174,6 +175,24 @@ pub struct PlanGroup {
     /// the run's own actual reference geometry is not known this early.
     pub anchor_width: Option<i64>,
     pub anchor_height: Option<i64>,
+    /// M4b: this group's own pixel scale — the median of whichever members
+    /// have one (`IntegrationGroup::pixel_scale_arcsec`, propagated
+    /// verbatim). `None` when no member has a usable scale.
+    pub pixel_scale_arcsec: Option<f64>,
+    /// M4b: `pixel_scale_arcsec / reference_scale`, where `reference_scale`
+    /// is the plan's resolved reference frame's OWN pixel scale. `None`
+    /// when either side is unavailable — the reference isn't resolved yet
+    /// (`Auto` mode with no prior run) or carries no scale, or this group
+    /// has none of its own. A ratio outside `[1 / SCALE_TOLERANCE,
+    /// SCALE_TOLERANCE]` is what the plan's "far from reference" warning
+    /// (never a blocker) is about.
+    pub scale_ratio_to_reference: Option<f64>,
+    /// M4b: whether `pixel_scale_arcsec` rests entirely on measured plate
+    /// solves (`Solve`) or includes at least one member whose scale came
+    /// from the header's focal length/pixel size instead (`Header`) —
+    /// the UI's `~` prefix on a header-implied number. `None` alongside
+    /// `pixel_scale_arcsec == None` (no member has a scale at all).
+    pub scale_source: Option<ScaleSource>,
 }
 
 /// The plan's resolved reference frame, or the lack of one. `Auto` never
@@ -1107,6 +1126,63 @@ pub fn build_plan(
     // Gate 2: reference.
     let reference = resolve_reference(conn, frames_set_id, &cfg, &mut blockers)?;
 
+    // M4b (rulings R-M4b-1/7): pixel-scale warnings — never blockers. A
+    // mixed-pixel-scale set is a real, supportable configuration
+    // (co-registered mode resamples a foreign-scale group into the
+    // reference geometry; native mode keeps each group's own), so this is
+    // purely informational. `reference_scale` is the resolved reference
+    // frame's OWN pixel scale, found among `groups` by its `frame_id`;
+    // `None` in `Auto` mode with no prior run (the reference itself isn't
+    // resolved until a run weighs the frames) or when that frame carries no
+    // scale of its own — either way the "far from reference" warning below
+    // can't fire, while the per-group "mixes pixel scales" warning (which
+    // needs no reference at all) still can. Placed right after the
+    // reference resolves (the earliest point both warnings' inputs are
+    // available), alongside the EXPTIME warning above as this build's other
+    // purely-informational, never-blocking group note.
+    let reference_scale: Option<f64> = reference
+        .frame_id
+        .and_then(|id| find_group_frame(&groups, id))
+        .and_then(|gf| gf.pixel_scale_arcsec);
+    for g in &groups {
+        if let Some(group_scale) = g.pixel_scale_arcsec {
+            if let Some(ref_scale) = reference_scale.filter(|&r| r > 0.0) {
+                let ratio = group_scale / ref_scale;
+                if ratio > SCALE_TOLERANCE || ratio < 1.0 / SCALE_TOLERANCE {
+                    warnings.push(format!(
+                        "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the reference's {ref_scale:.2} \"/px; co-registered mode resamples it into the reference geometry, native mode keeps its own",
+                        g.key
+                    ));
+                }
+                tracing::debug!(
+                    group_key = %g.key,
+                    pixel_scale_arcsec = group_scale,
+                    scale_ratio = ratio,
+                    "group pixel scale"
+                );
+            }
+        }
+
+        let member_scales: Vec<f64> = g
+            .frames
+            .iter()
+            .filter_map(|f| f.pixel_scale_arcsec)
+            .collect();
+        if member_scales.len() >= 2 {
+            let min = member_scales.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = member_scales
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            if min > 0.0 && max / min > SCALE_TOLERANCE {
+                warnings.push(format!(
+                    "group `{}` mixes pixel scales ({min:.2}\u{2013}{max:.2} \"/px); frames outside \u{d7}{SCALE_TOLERANCE} of the group's reference are registered with a scale factor",
+                    g.key
+                ));
+            }
+        }
+    }
+
     let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
 
     // Gate 3: folders — also resolves free space and the estimate's probe
@@ -1410,6 +1486,29 @@ pub fn build_plan(
             ln_cached,
             anchor_width,
             anchor_height,
+            pixel_scale_arcsec: g.pixel_scale_arcsec,
+            scale_ratio_to_reference: match (g.pixel_scale_arcsec, reference_scale) {
+                (Some(group_scale), Some(ref_scale)) if ref_scale > 0.0 => {
+                    Some(group_scale / ref_scale)
+                }
+                _ => None,
+            },
+            // `Solve` only when EVERY contributing member measured its own
+            // scale; any member relying on the header (or a mix of both)
+            // makes the group's own median partly a header assumption, so
+            // it reads as `Header` — the UI's honest "this is implied, not
+            // measured" signal.
+            scale_source: {
+                let sources: Vec<ScaleSource> =
+                    g.frames.iter().filter_map(|f| f.scale_source).collect();
+                if sources.is_empty() {
+                    None
+                } else if sources.iter().all(|s| *s == ScaleSource::Solve) {
+                    Some(ScaleSource::Solve)
+                } else {
+                    Some(ScaleSource::Header)
+                }
+            },
         });
     }
 
@@ -1675,6 +1774,211 @@ mod tests {
             vec![Stage::Calibrate, Stage::Measure, Stage::Register]
         );
         assert!(plan.estimate_bytes > 0);
+    }
+
+    /// M4b (rulings R-M4b-1/7): a group whose pixel scale sits far from the
+    /// resolved reference's own gets a warning naming it — never a blocker.
+    /// The reference's own group (ratio ~1.0) gets no such warning, and
+    /// both groups' `PlanGroup.pixelScaleArcsec`/`scaleRatioToReference`
+    /// come back populated.
+    #[test]
+    fn scale_warning_group_far_from_reference() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ref_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("ref{i}");
+            // Real file on disk: `Manual` mode's `resolve_reference` checks
+            // `reference.on_disk` for the chosen frame.
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&stem, t));
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            ref_ids.push(id);
+        }
+        let mut other_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("other{i}");
+            let mut spec = light_spec(&stem, t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            test_fixtures::seed_plate_solve_scale(&f.conn, id, 1.55);
+            other_ids.push(id);
+        }
+        let mut all_ids = ref_ids.clone();
+        all_ids.extend(&other_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        set_frame_set_reference(&f.conn, f.set_id, ref_ids[0]).unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            f.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
+
+        let other_group = plan
+            .groups
+            .iter()
+            .find(|g| g.key.contains("Ha"))
+            .expect("the Ha group exists");
+        let far_warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.contains("\u{d7}2.0"))
+            .collect();
+        assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            far_warnings[0].contains(&other_group.key),
+            "{:?}",
+            far_warnings
+        );
+        assert_eq!(other_group.pixel_scale_arcsec, Some(1.55));
+        assert_eq!(other_group.scale_source, Some(ScaleSource::Solve));
+        let ratio = other_group.scale_ratio_to_reference.unwrap();
+        assert!((ratio - 1.55 / 0.78).abs() < 1e-9, "{ratio}");
+
+        let ref_group = plan
+            .groups
+            .iter()
+            .find(|g| g.key != other_group.key)
+            .expect("the reference's own group exists");
+        assert_eq!(ref_group.pixel_scale_arcsec, Some(0.78));
+        assert_eq!(ref_group.scale_source, Some(ScaleSource::Solve));
+        assert!(
+            (ref_group.scale_ratio_to_reference.unwrap() - 1.0).abs() < 1e-9,
+            "{:?}",
+            ref_group.scale_ratio_to_reference
+        );
+    }
+
+    /// M4b: a group whose OWN members span a wide pixel-scale range (mixed
+    /// optics feeding one logical group) gets its own warning, independent
+    /// of any reference — this fixture leaves the reference in `Auto` mode
+    /// (unresolved at plan time) precisely to show the mixing warning needs
+    /// none. The third member's scale comes from the header rather than a
+    /// solve, so `PlanGroup.scale_source` reads `Header` too (not every
+    /// contributing member measured its own scale).
+    #[test]
+    fn scale_warning_group_mixes_scales() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            if i == 2 {
+                f.conn
+                    .execute(
+                        "UPDATE frames SET focallen = 1000.0, xpixsz = 7.5 WHERE id = ?1",
+                        params![id],
+                    )
+                    .unwrap();
+            } else {
+                test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
+            }
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("mixes pixel scales")),
+            "{:?}",
+            plan.warnings
+        );
+        assert_eq!(
+            plan.groups[0].scale_source,
+            Some(ScaleSource::Header),
+            "one member's scale came from the header, not a solve"
+        );
+    }
+
+    /// M4b: when no frame in the set has any usable pixel scale (no header
+    /// focal length/pixel size, no stored solve), the plan gate stays
+    /// entirely silent about it — nothing to warn about, and both new
+    /// `PlanGroup` fields come back `None`.
+    #[test]
+    fn no_scale_data_means_no_scale_warning() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.groups[0].pixel_scale_arcsec, None);
+        assert_eq!(plan.groups[0].scale_ratio_to_reference, None);
+        assert_eq!(plan.groups[0].scale_source, None);
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("pixel scale") || w.contains("\"/px")),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     /// Owner requirement 2026-09-09 ("the pipeline should build the

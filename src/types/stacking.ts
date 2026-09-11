@@ -192,6 +192,8 @@ export type StackingPresets = { default: StackingConfig, fastPreview: StackingCo
 
 export type ColorMode = "mono" | "osc";
 
+export type ScaleSource = "solve" | "header";
+
 export type Stage = "masters" | "calibrate" | "measure" | "reference" | "register" | "normalize" | "integrate" | "drizzle" | "output";
 
 export type MasterWork = "build" | "rebuild";
@@ -219,7 +221,31 @@ lnCached: number,
  * empty group. Frontend's Task 6 drizzle estimate line reads these —
  * the run's own actual reference geometry is not known this early.
  */
-anchorWidth: number | null, anchorHeight: number | null, };
+anchorWidth: number | null, anchorHeight: number | null, 
+/**
+ * M4b: this group's own pixel scale — the median of whichever members
+ * have one (`IntegrationGroup::pixel_scale_arcsec`, propagated
+ * verbatim). `None` when no member has a usable scale.
+ */
+pixelScaleArcsec: number | null, 
+/**
+ * M4b: `pixel_scale_arcsec / reference_scale`, where `reference_scale`
+ * is the plan's resolved reference frame's OWN pixel scale. `None`
+ * when either side is unavailable — the reference isn't resolved yet
+ * (`Auto` mode with no prior run) or carries no scale, or this group
+ * has none of its own. A ratio outside `[1 / SCALE_TOLERANCE,
+ * SCALE_TOLERANCE]` is what the plan's "far from reference" warning
+ * (never a blocker) is about.
+ */
+scaleRatioToReference: number | null, 
+/**
+ * M4b: whether `pixel_scale_arcsec` rests entirely on measured plate
+ * solves (`Solve`) or includes at least one member whose scale came
+ * from the header's focal length/pixel size instead (`Header`) —
+ * the UI's `~` prefix on a header-implied number. `None` alongside
+ * `pixel_scale_arcsec == None` (no member has a scale at all).
+ */
+scaleSource: ScaleSource | null, };
 
 export type PlanReference = { mode: ReferenceMode, frameId: number | null, filename: string | null, onDisk: boolean, };
 

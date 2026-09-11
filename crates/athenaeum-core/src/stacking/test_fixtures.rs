@@ -406,6 +406,36 @@ fn link_calibration(conn: &Connection, frame_id: i64, set_id: i64, cal_type: &st
     .unwrap();
 }
 
+/// A minimal `plate_solves` row for `frame_id`, carrying only
+/// `pixel_scale_arcsec` as a meaningful value — every other NOT NULL column
+/// gets an arbitrary placeholder (M4b's own tests are the only callers, and
+/// they read back nothing but the scale). Mirrors
+/// `plate_solve::storage::insert_plate_solve`'s column list; kept as a
+/// direct `INSERT` here since that module's own record type pulls in the
+/// `solver`-gated plate-solve stack this fixture has no other reason to
+/// depend on.
+pub(crate) fn seed_plate_solve_scale(conn: &Connection, frame_id: i64, pixel_scale_arcsec: f64) {
+    conn.execute(
+        "INSERT INTO plate_solves (
+            frame_id, crpix1, crpix2, crval1, crval2,
+            cd1_1, cd1_2, cd2_1, cd2_2,
+            matched_stars, total_detected,
+            rms_residual_px, rms_residual_arcsec,
+            pixel_scale_arcsec, field_rotation_deg,
+            solve_time_ms, catalog_used, algorithm_used, solved_at
+         ) VALUES (
+            ?1, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            10, 10,
+            0.1, 0.1,
+            ?2, 0.0,
+            0, 'test', 'test', '2025-01-01T00:00:00Z'
+         )",
+        params![frame_id, pixel_scale_arcsec],
+    )
+    .unwrap();
+}
+
 // ── Real 16-bit FITS for a LIGHT fixture ────────────────────────────────────
 
 /// Write a real 16-bit (`BITPIX 16`, `BZERO 32768`, `BSCALE 1`) FITS with a

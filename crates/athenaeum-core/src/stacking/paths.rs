@@ -1042,6 +1042,8 @@ mod tests {
             date_obs: None,
             width: w,
             height: h,
+            pixel_scale_arcsec: None,
+            scale_source: None,
         }
     }
 
@@ -1056,6 +1058,7 @@ mod tests {
             exposure_s: Some(60.0),
             frames: (0..n_frames).map(|id| frame(id, w, h)).collect(),
             total_exposure_s: n_frames as f64 * 60.0,
+            pixel_scale_arcsec: None,
         }
     }
 
