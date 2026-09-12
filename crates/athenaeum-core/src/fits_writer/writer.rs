@@ -17,7 +17,10 @@ fn push(records: &mut Vec<[u8; CARD_SIZE]>, c: Card) -> Result<(), FitsWriteErro
 
 /// Validate channel count and data length before any I/O happens. Shared by
 /// `write_fits_f32` and `write_fits_f32_to` so a bad call never touches disk.
-fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Result<(), FitsWriteError> {
+/// M4d Task 2: `pub(super)` — the sibling XISF writer validates the same
+/// geometry contract (1 or 3 channels, non-zero dimensions, matching data
+/// length) through this one function rather than a second copy of it.
+pub(super) fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Result<(), FitsWriteError> {
     if channels != 1 && channels != 3 {
         return Err(FitsWriteError::BadChannels(channels));
     }

@@ -946,7 +946,11 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
 
 ### 6.4 Output
 
-- Master: float32 FITS, 1 or 3 planes (`write_fits_f32`), path
+- Master: float32, 1 or 3 planes, in the container `output.format` names
+  (`write_fits_f32`, or `write_xisf_f32` for `"xisf"` — M4d Task 2, ruling
+  R-M4d-3: monolithic XISF 1.0, one uncompressed Float32 planar image whose
+  XML header carries the same cards as `<FITSKeyword>` elements, attachment
+  on a 4096-byte boundary), path
   `<output>/<master name>` (§9.5). Header: copy-through cards (object,
   instrument, filter, dates, Bayer-free, `ROWORDER`) and `ATH_STKF` (below)
   come from the group's **normalization anchor** (§4.4, ruling R-M3-17 v2 —
@@ -967,7 +971,10 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
   distinct camera in the group, comma-joined, sorted, e.g.
   `'ATR2600M,ZWO ASI2600MC Duo'`, truncated with `…` past 68 chars),
   `ATH_STKI` (run id; FITS keywords are eight characters).
-- Rejection maps: `<master stem>_rejlow.fits` / `_rejhigh.fits` (optional).
+- Rejection maps: `<master stem>_rejlow.fits` / `_rejhigh.fits` (optional)
+  — always FITS, whatever `output.format` says: they are diagnostics, not
+  the product (ruling R-M4d-3). The drizzled master and its weight map DO
+  follow the master's container.
 - **Scanner rule**: a file carrying `ATH_STK` or `ATH_REG` is an Athenaeum
   artifact and is never cataloged, the same one-rule skip as
   `CALSTAT + ATH_CSRC` (calibrated intermediates already carry those).
@@ -1253,6 +1260,11 @@ drizzle:       { enabled: false, scale: 2, dropShrink: 0.9, kernel: "square",
                  useRejection: true, useWeights: true, useLocalNormalization: true,
                  writeWeightMap: false, bayer: false }    -- bayer: M4d, OSC only
 output:        { format: "fits", cleanup: "keepAll" }
+                -- format: "fits" | "xisf" (M4d Task 2, ruling R-M4d-3) — the
+                -- container for the master, the drizzled master and the
+                -- drizzle weight map; the rejection maps stay FITS. No
+                -- STACKING_CONFIG_VERSION bump: "fits" is the default and
+                -- every stored document decodes unchanged.
 paths:         { workingDir: null, outputDir: null }     -- null = the global default
 ```
 
@@ -1333,6 +1345,14 @@ never disagree about what the first Bayer run will redo.
                                                     colour-mode/exposure never collides either)
   …_drizzle<s>x.fits, …_rejlow.fits, …_rejhigh.fits, …_drizzle<s>x_weight.fits
 ```
+
+M4d Task 2 (ruling R-M4d-3): with `output.format = "xisf"` the master, the
+drizzled master and the drizzle weight map take `.xisf` instead of `.fits`
+(`master_cards::output_extension` swaps the extension the two name builders
+above produce); the rejection maps keep `.fits`. The two containers are
+distinct names, so an XISF master and a FITS master of the same run stem
+coexist without either taking a `_2` suffix — a re-run in the other format
+lands beside the first, never over it.
 
 When two frames of a group share a source file name, each of them gets
 `_f<frame id>` before the extension (`c_<stem>_f<id>.fits`), so a capture

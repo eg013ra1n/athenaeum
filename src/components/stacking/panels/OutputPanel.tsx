@@ -12,9 +12,14 @@ import { FolderBrowserModal } from '../../FolderBrowserModal';
 import { FolderCard } from '../FolderCard';
 import { cleanupLabel } from '../stageSummary';
 import type { PathSetting } from '../../../types/models';
-import type { CleanupPolicy, StackingConfig, StackingPaths, StackingPlan } from '../../../types/stacking';
+import type { CleanupPolicy, OutputFormat, StackingConfig, StackingPaths, StackingPlan } from '../../../types/stacking';
 
 const CLEANUP_POLICIES: CleanupPolicy[] = ['keepAll', 'deleteRegistered', 'deleteIntermediates'];
+
+const FORMATS: { value: OutputFormat; label: string }[] = [
+  { value: 'fits', label: 'FITS — float32, the format every tool here reads' },
+  { value: 'xisf', label: 'XISF: one image, uncompressed, the same cards' },
+];
 
 export interface OutputPanelProps {
   config: StackingConfig;
@@ -122,9 +127,32 @@ export function OutputPanel({ config, onChange, plan, disabled, mode = 'perSet' 
         </select>
       </div>
 
+      {/* Format (M4d Task 2, ruling R-M4d-3) — a radio, like the Register
+       *  panel's geometry: two choices whose labels carry the whole
+       *  explanation. The rejection maps stay FITS in both cases, which is
+       *  what the note below says. */}
       <div>
-        <label className="block text-xs text-content-secondary mb-1">Format</label>
-        <p className="text-sm text-content-muted">FITS (the only format available)</p>
+        <span className="block text-xs text-content-secondary mb-1">Format</span>
+        <div className="space-y-1.5">
+          {FORMATS.map((f) => (
+            <label key={f.value} className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="stacking-output-format"
+                value={f.value}
+                checked={config.output.format === f.value}
+                disabled={disabled}
+                onChange={() => onChange({ ...config, output: { ...config.output, format: f.value } })}
+                className="mt-0.5 w-4 h-4 border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+              />
+              <span className="text-sm text-content-secondary">{f.label}</span>
+            </label>
+          ))}
+        </div>
+        <p className="mt-1 text-[11px] text-content-muted">
+          Applies to the master, the drizzled master and the drizzle weight map. The rejection
+          maps stay FITS.
+        </p>
       </div>
 
       <FolderBrowserModal

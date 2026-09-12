@@ -134,7 +134,10 @@ fn is_printable_ascii(s: &str) -> bool {
 /// one character (a recipe glyph, a Cyrillic path, a copied-through source
 /// card), so offending chars degrade lossily to '?' instead. One placeholder
 /// per CHAR, not per byte. Keywords stay strict (`validate_keyword`).
-fn sanitize_text<'a>(keyword: &str, s: &'a str) -> std::borrow::Cow<'a, str> {
+/// M4d Task 2: `pub(super)`, shared with the sibling XISF writer — an
+/// XISF `<FITSKeyword>` value must sanitize by exactly these rules, or one
+/// master's two containers would disagree about what a card says.
+pub(super) fn sanitize_text<'a>(keyword: &str, s: &'a str) -> std::borrow::Cow<'a, str> {
     if is_printable_ascii(s) {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -143,7 +146,9 @@ fn sanitize_text<'a>(keyword: &str, s: &'a str) -> std::borrow::Cow<'a, str> {
     std::borrow::Cow::Owned(cleaned)
 }
 
-fn fmt_real(kw: &str, v: f64) -> Result<String, FitsWriteError> {
+/// M4d Task 2: `pub(super)` for the same reason as `sanitize_text` above —
+/// the XISF writer formats a real by these rules, not its own.
+pub(super) fn fmt_real(kw: &str, v: f64) -> Result<String, FitsWriteError> {
     if !v.is_finite() {
         return Err(FitsWriteError::NonFiniteReal(kw.to_string()));
     }

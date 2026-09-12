@@ -5710,7 +5710,13 @@ fn process_group_output(
         // call still sees that name correctly free and reuses it; there is
         // no partial state under this lock for a later writer to misread.
         let _guard = OUTPUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        write_master_light(&rc.output_dir, &name, &output, &cards)
+        write_master_light(
+            &rc.output_dir,
+            &name,
+            &output,
+            &cards,
+            rc.config.output.format,
+        )
     };
     let written = match written {
         Ok(w) => w,
@@ -6102,8 +6108,17 @@ fn process_group_output(
                         // check-then-write (`resolve_collision`) into the
                         // SAME output dir.
                         let _guard = OUTPUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                        match write_drizzled_master(&rc.output_dir, &master_stem, &drz, &drz_cards)
-                        {
+                        match write_drizzled_master(
+                            &rc.output_dir,
+                            &master_stem,
+                            &drz,
+                            &drz_cards,
+                            // A plain immutable read of `rc`, like
+                            // `rc.output_dir` above: the drizzled master
+                            // and its weight map land in the SAME
+                            // container as the master (ruling R-M4d-3).
+                            rc.config.output.format,
+                        ) {
                             Ok(wd) => Ok((wd, drz.stats)),
                             Err(e) => Err(DrizzleFailure::Other(format!("{e:#}"))),
                         }
@@ -15055,6 +15070,96 @@ mod tests {
             vec![normal_ids[0], normal_ids[1], normal_ids[2]],
             "the LN reference's members must never include the mismatched-geometry \
              one despite its own top raw score: {payload:?}"
+        );
+    }
+
+    // ── M4d Task 2: XISF output (ruling R-M4d-3) ────────────────────────
+
+    /// `output.format = xisf`: the master, the drizzled master and its
+    /// weight map all land as `.xisf`, all read back through the reader this
+    /// project ships at the run's own geometry (`PlaneReader` is FITS-only,
+    /// so these assertions go through `astroimage::ImageConverter::read_raw`
+    /// instead), and the rejection maps stay FITS.
+    #[test]
+    fn an_xisf_run_writes_xisf_outputs_and_fits_rejection_maps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.format = crate::stacking::config::OutputFormat::Xisf;
+        cfg.integration.write_rejection_maps = true;
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.drizzle.write_weight_map = true;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        let master_path = group.master_path.clone().expect("master path recorded");
+        assert!(master_path.ends_with(".xisf"), "{master_path}");
+        let drizzle_path = group.drizzle_path.clone().expect("drizzle path recorded");
+        assert!(drizzle_path.ends_with(".xisf"), "{drizzle_path}");
+
+        // The rejection maps are diagnostics and stay FITS either way.
+        let low = group.rejection_low_path.clone().expect("_rejlow path set");
+        assert!(low.ends_with("_rejlow.fits"), "{low}");
+        assert!(Path::new(&low).exists(), "{low}");
+
+        let (master_meta, _) =
+            astroimage::ImageConverter::read_raw(Path::new(&master_path)).unwrap();
+        assert!(
+            master_meta.width > 0 && master_meta.height > 0,
+            "{} x {}",
+            master_meta.width,
+            master_meta.height
+        );
+        let (drizzle_meta, _) =
+            astroimage::ImageConverter::read_raw(Path::new(&drizzle_path)).unwrap();
+        assert_eq!(drizzle_meta.width, 2 * master_meta.width);
+        assert_eq!(drizzle_meta.height, 2 * master_meta.height);
+        assert_eq!(drizzle_meta.channels, master_meta.channels);
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        let weight_map_path = summary.groups[0]
+            .weight_map_path
+            .clone()
+            .expect("weight map path recorded");
+        assert!(weight_map_path.ends_with(".xisf"), "{weight_map_path}");
+        let (weight_meta, _) =
+            astroimage::ImageConverter::read_raw(Path::new(&weight_map_path)).unwrap();
+        assert_eq!(
+            (weight_meta.width, weight_meta.height, weight_meta.channels),
+            (drizzle_meta.width, drizzle_meta.height, drizzle_meta.channels),
+            "the weight map shares the drizzled master's grid"
         );
     }
 }

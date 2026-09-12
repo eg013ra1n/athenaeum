@@ -314,11 +314,17 @@ pub struct OutputConfig {
     pub cleanup: CleanupPolicy,
 }
 
+/// The container the master, the drizzled master and the drizzle weight map
+/// are written in (spec §6.4/§9.5). The rejection maps stay FITS either way
+/// — they are diagnostic artifacts, not the product (ruling R-M4d-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutputFormat {
     #[default]
     Fits,
+    /// Monolithic XISF 1.0, one uncompressed Float32 image, the same cards
+    /// as the FITS master (M4d Task 2, `fits_writer::xisf_writer`).
+    Xisf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]

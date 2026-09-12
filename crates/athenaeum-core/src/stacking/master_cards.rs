@@ -15,8 +15,9 @@ use crate::archive::path_layout::sanitize_for_filename;
 use crate::calibration_library::paths::{fmt_num, resolve_collision};
 use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::wcs::wcs_cards;
-use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
+use crate::fits_writer::{write_fits_f32, write_xisf_f32, Card, CardValue, FitsWriteError};
 use crate::plate_solve::storage::PlateSolveRecord;
+use crate::stacking::config::OutputFormat;
 use crate::stacking::drizzle::{DrizzleKernel, DrizzleOutput};
 use crate::stacking::groups::ColorMode;
 use crate::stacking::integrate::GroupOutput;
@@ -413,6 +414,41 @@ pub fn drizzle_file_names(master_stem: &str, scale: u32) -> (String, String) {
     )
 }
 
+/// The file extension the run's [`OutputFormat`] writes (M4d Task 2, ruling
+/// R-M4d-3): the master, the drizzled master and the drizzle weight map all
+/// take it; the rejection maps never do — they stay FITS diagnostics.
+///
+/// [`master_file_name`] and [`drizzle_file_names`] keep naming `.fits`: they
+/// answer "what is this output called", and the writers below swap in the
+/// chosen container's extension. That is also what lets a FITS master and an
+/// XISF master of the SAME run stem coexist — `resolve_collision` only ever
+/// probes the exact candidate path, so `x.fits` never occupies `x.xisf`'s
+/// name and neither gets a `_2` suffix because of the other.
+pub fn output_extension(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Fits => "fits",
+        OutputFormat::Xisf => "xisf",
+    }
+}
+
+/// One image in the run's chosen container — the ONE place the two writers
+/// below branch on format, so a master and its drizzled sibling can never
+/// disagree about which container they were written in.
+fn write_output(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[Card],
+    format: OutputFormat,
+) -> Result<(), FitsWriteError> {
+    match format {
+        OutputFormat::Fits => write_fits_f32(path, width, height, channels, data, cards),
+        OutputFormat::Xisf => write_xisf_f32(path, width, height, channels, data, cards),
+    }
+}
+
 pub struct WrittenMaster {
     pub master: PathBuf,
     pub rejection_low: Option<PathBuf>,
@@ -504,11 +540,17 @@ pub struct WrittenDrizzle {
 /// catches a caller that names the file for one scale while stamping
 /// `ATH_DRZ` for another, which would otherwise ship a drizzled master
 /// whose file name and header silently disagree.
+///
+/// M4d Task 2: `format` picks the container for BOTH outputs — a drizzled
+/// master and its weight map always share the master's own format (ruling
+/// R-M4d-3), so a run never leaves one of the pair behind in the other
+/// container.
 pub fn write_drizzled_master(
     dir: &Path,
     master_stem: &str,
     output: &DrizzleOutput,
     cards: &[Card],
+    format: OutputFormat,
 ) -> anyhow::Result<WrittenDrizzle> {
     debug_assert!(
         cards
@@ -523,15 +565,17 @@ pub fn write_drizzled_master(
 
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
 
+    let ext = output_extension(format);
     let (drizzle_name, _) = drizzle_file_names(master_stem, output.stats.scale);
-    let drizzle_path = resolve_collision(&dir.join(&drizzle_name));
-    write_fits_f32(
+    let drizzle_path = resolve_collision(&dir.join(&drizzle_name).with_extension(ext));
+    write_output(
         &drizzle_path,
         output.width,
         output.height,
         output.channels,
         &output.data,
         cards,
+        format,
     )
     .with_context(|| format!("writing {}", drizzle_path.display()))?;
     info!(
@@ -547,15 +591,17 @@ pub fn write_drizzled_master(
                 .and_then(|s| s.to_str())
                 .unwrap_or("drizzle")
                 .to_string();
-            let weight_path = resolve_collision(&dir.join(format!("{resolved_stem}_weight.fits")));
+            let weight_path =
+                resolve_collision(&dir.join(format!("{resolved_stem}_weight.{ext}")));
             let weight_cards = weight_map_cards(cards)?;
-            write_fits_f32(
+            write_output(
                 &weight_path,
                 output.width,
                 output.height,
                 output.channels,
                 weight_data,
                 &weight_cards,
+                format,
             )
             .with_context(|| format!("writing {}", weight_path.display()))?;
             info!(
@@ -579,6 +625,13 @@ pub fn write_drizzled_master(
 /// written. Never overwrites: `resolve_collision` on the master path, the
 /// map names derived from the resolved stem (so a collision-suffixed master
 /// still names its own maps, not a sibling's).
+///
+/// M4d Task 2: `format` picks the master's container —
+/// [`output_extension`] replaces `file_name`'s extension with the chosen
+/// one, so a caller keeps passing [`master_file_name`]'s `.fits` name. The
+/// rejection MAPS stay FITS in both cases (ruling R-M4d-3): they are
+/// diagnostics, read by the same tools either way, and the master's own
+/// `_2` collision suffix still carries into their names.
 /// Not atomic as a set: the master lands before the maps, so a failed map
 /// write leaves the master on disk with no map (re-running never overwrites
 /// it — resolve_collision suffixes the retry). Two runs writing into one
@@ -589,17 +642,20 @@ pub fn write_master_light(
     file_name: &str,
     output: &GroupOutput,
     cards: &[Card],
+    format: OutputFormat,
 ) -> anyhow::Result<WrittenMaster> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    let master_path = resolve_collision(&dir.join(file_name));
-    write_fits_f32(
+    let master_path =
+        resolve_collision(&dir.join(file_name).with_extension(output_extension(format)));
+    write_output(
         &master_path,
         output.width,
         output.height,
         output.channels,
         &output.data,
         cards,
+        format,
     )
     .with_context(|| format!("writing {}", master_path.display()))?;
 
@@ -609,6 +665,7 @@ pub fn write_master_light(
         .unwrap_or("master")
         .to_string();
 
+    // Always FITS, whatever the master's own container is (ruling R-M4d-3).
     let write_map = |suffix: &str, label: &str, data: &[f32]| -> anyhow::Result<PathBuf> {
         let path = resolve_collision(&dir.join(format!("{stem}_{suffix}.fits")));
         let map_cards = rejection_map_cards(label, cards)?;
@@ -1083,7 +1140,9 @@ mod tests {
             stats: dummy_stats(),
         };
 
-        let first = write_master_light(dir.path(), "master.fits", &output, &cards).unwrap();
+        let first =
+            write_master_light(dir.path(), "master.fits", &output, &cards, OutputFormat::Fits)
+                .unwrap();
         assert_eq!(
             first.master.file_name().and_then(|s| s.to_str()),
             Some("master.fits")
@@ -1120,7 +1179,9 @@ mod tests {
         assert_eq!(high_header.get_str("ATH_STK").as_deref(), Some("T"));
 
         // Write again with the same file name → collision-suffixed names, no overwrite.
-        let second = write_master_light(dir.path(), "master.fits", &output, &cards).unwrap();
+        let second =
+            write_master_light(dir.path(), "master.fits", &output, &cards, OutputFormat::Fits)
+                .unwrap();
         assert_eq!(
             second.master.file_name().and_then(|s| s.to_str()),
             Some("master_2.fits")
@@ -1143,6 +1204,104 @@ mod tests {
         );
         assert!(first.master.exists());
         assert!(second.master.exists());
+    }
+
+    /// M4d Task 2 (ruling R-M4d-3): the same call with `OutputFormat::Xisf`
+    /// lands `master.xisf`, readable by the reader this project ships, with
+    /// its rejection maps still FITS — and the two containers do not
+    /// collide: a FITS master of the same stem written afterwards is
+    /// `master.fits`, not `master_2.fits`.
+    #[test]
+    fn xisf_master_lands_beside_a_fits_one_with_fits_rejection_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h, ch) = (8usize, 6usize, 3usize);
+        let plane = w * h;
+
+        let mut cards = HeaderBuilder::new(FrameKind::MasterLight).build().unwrap();
+        cards.push(Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap());
+        cards.push(Card::new("ATH_STKG", CardValue::Str("group-7".into())).unwrap());
+
+        let output = GroupOutput {
+            width: w,
+            height: h,
+            channels: ch,
+            data: vec![0.5f32; plane * ch],
+            rejection_low: Some(vec![1.0f32; plane * ch]),
+            rejection_high: Some(vec![2.0f32; plane * ch]),
+            included: vec![0, 1, 2],
+            output_pairs: vec![Vec::new(); ch],
+            second_pass_rej_ok: false,
+            stats: dummy_stats(),
+        };
+
+        let xisf = write_master_light(
+            dir.path(),
+            "master.fits",
+            &output,
+            &cards,
+            OutputFormat::Xisf,
+        )
+        .unwrap();
+        assert_eq!(
+            xisf.master.file_name().and_then(|s| s.to_str()),
+            Some("master.xisf")
+        );
+        assert_eq!(
+            xisf.rejection_low
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("master_rejlow.fits"),
+            "the rejection maps stay FITS"
+        );
+        assert_eq!(
+            xisf.rejection_high
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("master_rejhigh.fits")
+        );
+
+        let (meta, pixels) = astroimage::ImageConverter::read_raw(&xisf.master).unwrap();
+        assert_eq!((meta.width, meta.height, meta.channels), (w, h, ch));
+        match pixels {
+            astroimage::PixelData::Float32(v) => {
+                assert_eq!(v.len(), plane * ch);
+                // The reader's ADU convention (R-M4a-11): ×65535 on the way
+                // out, so divide to compare against what was written.
+                assert!(
+                    (v[0] / 65535.0 - 0.5).abs() <= 1e-6,
+                    "first sample read back as {}",
+                    v[0] / 65535.0
+                );
+            }
+            _ => panic!("expected Float32 samples"),
+        }
+
+        // A FITS master of the SAME stem: its own name is free, because
+        // `resolve_collision` probes the exact candidate path. Its
+        // rejection maps DO take the `_2` suffix — those names really are
+        // occupied by the XISF run's own FITS maps.
+        let fits = write_master_light(
+            dir.path(),
+            "master.fits",
+            &output,
+            &cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
+        assert_eq!(
+            fits.master.file_name().and_then(|s| s.to_str()),
+            Some("master.fits")
+        );
+        assert_eq!(
+            fits.rejection_low
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("master_rejlow_2.fits")
+        );
+        assert!(xisf.master.exists() && fits.master.exists());
     }
 
     #[test]
@@ -1422,7 +1581,9 @@ mod tests {
             stats: dummy_drizzle_stats(2, ch, w, h),
         };
 
-        let first = write_drizzled_master(dir.path(), "master", &output, &cards).unwrap();
+        let first =
+            write_drizzled_master(dir.path(), "master", &output, &cards, OutputFormat::Fits)
+                .unwrap();
         assert_eq!(
             first.drizzle.file_name().and_then(|s| s.to_str()),
             Some("master_drizzle2x.fits")
@@ -1461,7 +1622,9 @@ mod tests {
 
         // Write again with the same master stem → collision-suffixed names,
         // the weight map following the RESOLVED drizzle stem, no overwrite.
-        let second = write_drizzled_master(dir.path(), "master", &output, &cards).unwrap();
+        let second =
+            write_drizzled_master(dir.path(), "master", &output, &cards, OutputFormat::Fits)
+                .unwrap();
         assert_eq!(
             second.drizzle.file_name().and_then(|s| s.to_str()),
             Some("master_drizzle2x_2.fits")
@@ -1476,5 +1639,54 @@ mod tests {
         );
         assert!(first.drizzle.exists());
         assert!(second.drizzle.exists());
+    }
+
+    /// M4d Task 2 (ruling R-M4d-3): a drizzled master and its weight map
+    /// always share the master's container — both `.xisf` here, both
+    /// readable, and the weight map still derived from the drizzle output's
+    /// own resolved stem.
+    #[test]
+    fn xisf_drizzle_pair_shares_the_masters_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h, ch) = (8usize, 6usize, 3usize);
+        let plane = w * h;
+
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
+            Card::new(ATH_DRZ, CardValue::Integer(2)).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap(),
+        ];
+
+        let output = DrizzleOutput {
+            width: w,
+            height: h,
+            channels: ch,
+            data: vec![0.25f32; plane * ch],
+            weight: Some(vec![0.75f32; plane * ch]),
+            stats: dummy_drizzle_stats(2, ch, w, h),
+        };
+
+        let written =
+            write_drizzled_master(dir.path(), "master", &output, &cards, OutputFormat::Xisf)
+                .unwrap();
+        assert_eq!(
+            written.drizzle.file_name().and_then(|s| s.to_str()),
+            Some("master_drizzle2x.xisf")
+        );
+        let weight = written.weight_map.clone().unwrap();
+        assert_eq!(
+            weight.file_name().and_then(|s| s.to_str()),
+            Some("master_drizzle2x_weight.xisf")
+        );
+
+        for path in [&written.drizzle, &weight] {
+            let (meta, _) = astroimage::ImageConverter::read_raw(path).unwrap();
+            assert_eq!(
+                (meta.width, meta.height, meta.channels),
+                (w, h, ch),
+                "{}",
+                path.display()
+            );
+        }
     }
 }

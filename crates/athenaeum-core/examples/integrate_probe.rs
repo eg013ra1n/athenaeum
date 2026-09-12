@@ -45,6 +45,7 @@ use athenaeum_core::integration::io_policy::IoPolicy;
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::integration::stats;
 use athenaeum_core::integration::storage_class::StorageClass;
+use athenaeum_core::stacking::config::OutputFormat;
 use athenaeum_core::stacking::groups::ColorMode;
 use athenaeum_core::stacking::integrate::{
     integrate_group, GroupInput, GroupProgress, GroupStats, IntegrationConfig, NormalizationConfig,
@@ -1107,7 +1108,15 @@ fn main() {
     };
 
     let write_start = Instant::now();
-    let written = match write_master_light(&args.out, &name, &output, &cards) {
+    let written = match write_master_light(
+        &args.out,
+        &name,
+        &output,
+        &cards,
+        // The probe always writes FITS: its whole job is the integration
+        // numbers and the FITS master is what every other probe reads.
+        OutputFormat::Fits,
+    ) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("[integrate_probe] writing master failed: {e:#}");

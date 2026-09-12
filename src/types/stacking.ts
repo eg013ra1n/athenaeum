@@ -272,7 +272,7 @@ useLocalNormalization: boolean, writeWeightMap: boolean,
  */
 bayer: boolean, };
 
-export type OutputFormat = "fits";
+export type OutputFormat = "fits" | "xisf";
 
 export type CleanupPolicy = "keepAll" | "deleteRegistered" | "deleteIntermediates";
 
