@@ -1574,6 +1574,18 @@ Split into four plans, each with its own acceptance re-run:
   incl. Task 0, the structure-map seed detector): ESD, RCR, min/max and
   large-scale rejection, the Winsorized-sigma reference re-pin, thin-plate-spline
   distortion with the local distortion loop, and LN's local-scale spline.
+  Tasks 0–5 landed 2026-09-12 — the structure-map seed detector
+  (`measurement.seedDetector`, default `peak`; rulings R-M4c-11, R-T0-1/2),
+  `Rejection::{MinMax, Esd, Rcr}` as user choices with the Auto ladder left
+  byte-for-byte unchanged and a dependency-free `integration/student_t.rs`
+  (R-M4c-1/2), the Winsorized loop of §6.3 with its zero-MAD fallback
+  (R-M4c-3, R-T2-1), large-scale rejection through processed `.rejl` bitmaps
+  and a second integration pass writing its own `pass2/` bitmap set that
+  drizzle reads (R-M4c-4, R-T3-1), `geometry/tps.rs` +
+  `stacking/register/local_loop.rs` (R-M4c-5/6/7, R-T4-1…5), and LN's
+  local-scale spline + barycentre second matching pass (R-M4c-8/9,
+  R-T5-1/2) — **SHIPPED pending acceptance**: the LDN 1272 re-run (variants
+  A–E over the real trail found for R-M4c-10) is Task 7.
 - **M4d — outputs and product** (`docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`):
   Bayer drizzle, XISF output, cataloging masters (a `master_lights` entity
   linked to the set and a preview in the Results cards), and preset

@@ -805,11 +805,261 @@ run-level `stacking_runs.reference_frame_id` (ruling R-T3-2); every other
 group still auto-picks and two-pass-refines its own best-weighted member
 independently of the pin. **Acceptance run 2026-09-11** (`docs/superpowers/research/2026-09-11-m4b-acceptance-run.md`, three real mixed-scale sets of the owner's catalog at 30 best frames per group, both modes, 7 runs): the cross-scale groups registered through the plate-solve seed at the expected scale — ×0.207 / ×1.457 (ASI6200MM and ASI294MM-bin2 onto an OSC reference, rms ≤ 0.61 px), ×0.502 (bin 1 onto bin 2, same-star centroids 0.15 px between the masters), ×1.285 (two focal lengths inside one narrowband group) — and native mode gave each group its own reference, geometry and WCS; the reference's own master is bit-identical between the modes on every set. Two rulings came out of it: `WCS_SEED_RATIO_EPS = 0.05` (R-T6-4, from the measured within-rig solve jitter of up to 1.6 %) and the plate-solve seed as the FALLBACK after a quad-seed failure (R-T6-9 — an H-alpha field against an O-filter reference of the same rig lost 14 of 30 frames to quads and 0 with the fallback); and the plan gate now evaluates masters/links readiness and its scale statistics over the frames that will actually run, after manual exclusions (R-T6-6/7).
 
+**M4c — algorithms** (spec §3.3, §5.1, §5.2, §6.2, §6.3, plan
+`docs/superpowers/plans/2026-09-10-stacking-m4c-plan-algorithms.md`,
+rulings R-M4c-1…11 plus the fix-round rulings R-T0-1/2, R-T2-1, R-T3-1,
+R-T4-1…5 and R-T5-1/2): the algorithm half of §14's M4 — six items, every
+one an added arm on an existing enum or an optional pass inside a stage
+that already runs, so no table changed and no command was added.
+
+**The structure-map seed detector** (`stacking/structure.rs`, ruling
+R-M4c-11) lets stage 3 seed its PSF fits from the math reference's §5.1
+structure map instead of the peak threshold —
+`measurement.seedDetector = "peak" | "structure"`, **default `peak`**. The
+map is an optional 3×3 median on its own copy → a high-pass subtracting a
+separable Gaussian of size `1 + 2^structure_layers` (5 → 33 px) truncated
+at 0 → 3×3 dilation → adaptive binarization at `median(dilated) +
+3·σ_noise` → 3×3 erosion → two-pass union-find labelling → the reference's
+per-candidate rules in its own order (border, size floor, ring background,
+significant pixels and their maxima, barycentre, `upper_limit`, coverage,
+detection SNR, kurtosis). Two deviations are measured rather than assumed:
+the binarization LEVEL comes from the dilated map but the SCALE from the
+caller's UNFILTERED plane (anchoring both on the map costs most of the
+sharpness behaviour the detector exists for — 0.56× against 0.73× of the
+well-sampled field's star count on the fixture), and `σ_noise` is the
+module's own second-à-trous-layer K-sigma estimator ÷ `B3_LAYER2_GAIN =
+0.2007` rather than rustafits' `noise_mrs` — ruling R-T0-2 ran both on the
+same unfiltered plane over 176 real planes: they agree to 11 % on mono but
+diverge 1.67 / 2.20 / 2.04× on the debayered OSC R/G/B, 10.8 % of planes
+inside the ruling's 10 % bar against its 90 % re-use rule, so the private
+estimator stays. `min_structure_size = 0` is an AUTOMATIC floor (the
+detected sizes clustered by their own increasing-gap statistic, the first
+cluster dropped when it is a minority beside the second) — documented on
+the field, in the panel help and the spec, unit-pinned, and re-measured
+with the floor forced off: at the shipped `DEFAULT_SENSITIVITY = 0.7` it
+evaluates to 3 px on both fixture fields and removes NOTHING (ruling
+R-T0-1); it bites only at the reference's own 0.5. `peak` stays the default
+because R-M4c-11's bar is ALL 22 of the R-M4a-2 targets and the full
+368-frame run passes 12 where the shipped peak threshold passes 10: mono
+improves across the board (PSFSW ρ 0.918 → 0.977, fit-count ρ 0.94 → 0.96)
+but the OSC bright night still yields 2.46–3.86× the external tool's fits
+and OSC blue REGRESSES (PSFSW ρ 0.683 → 0.423, top-20 14/20 → 11/20). That
+run is also the OSC residual's **second signature**: two unrelated noise
+estimators disagree by 1.6–2.2× on exactly the debayered planes where both
+detectors overshoot, so the next investigation belongs on the VNG planes or
+the PSF fitter's acceptance, not on a third detector.
+
+**Three more rejection algorithms** (ruling R-M4c-1): `Rejection::{MinMax,
+Esd, Rcr}` appended to the engine enum (`integration/combine.rs`) and
+`RejectionChoice::{minMax, esd, rcr}` to the config
+(`stacking/integrate.rs`), defaults `MinMax { low: 1, high: 1 }` / `Esd {
+outliersFraction: 0.3, alpha: 0.05, lowRelaxation: 1.5 }` / `Rcr { limit:
+0.5 }`. **The Auto ladder is byte-for-byte unchanged** (`n < 8` percentile
+0.2/0.1, `8 ≤ n < 20` Winsorized 4.0/3.0, `n ≥ 20` linear fit 5.0/3.5) and
+never resolves to any of the three — they are user choices only, so no
+existing group's rejection moved because they exist.
+`integration/student_t.rs` (new leaf) carries the numerics with no new
+dependency:
+`erfc`/`erfinv` (bit-identical copies of `stacking::robust`'s, which is
+unreachable from `integration/`), `ln_gamma`, the regularized incomplete
+beta by Lentz's continued fraction, `t_quantile` by bisection, and
+`esd_critical(n, i, alpha)` = ESD's `λ_i`; `with_esd_lambdas` memoizes the
+`λ` vector per `(n, alpha)` in a thread-local map (ruling R-M4c-2) so the
+incomplete beta is evaluated at most `k` times per distinct stack size
+instead of 26 M times per plane. Both new routines are **allocation-free
+per pixel**: ESD and RCR only ever remove one of the two ENDS of the sorted
+stack, so the survivors are a contiguous range finished by one
+`copy_within`, and RCR's deviation scratch and half-normal abscissae table
+are thread-local. Measured: `esd_critical(50, 0, 0.05) = 3.128247` against
+Rosner's published 3.128 (and `λ` SHRINKS with `i`); ESD rejects exactly
+the four planted +6σ samples of a 60-sample Gaussian and keeps all 60 of a
+clean one; RCR rejects the same four plus one genuine tail sample and keeps
+57 of a clean 60. `stacking::robust`'s own RCR is cross-checked
+bit-for-bit against the integration copy over 50 contaminated samples.
+Throughput on a real plane is an ESTIMATE, never measured (order 50 s per
+26 Mpx plane for RCR) — Task 7's job.
+
+**Winsorized sigma clipping now runs the reference loop** (ruling
+R-M4c-3): `winsorized_location_scale` in `integration/combine.rs` replaces
+the retired fixed point — `μ = median`, `σ = WINSORIZE_MAD_TO_SIGMA
+(1.4826) · MAD`, then `t = μ ± WINSORIZE_CLAMP_SIGMA (1.5) · σ` with a
+first-pass `WINSORIZE_CUTOFF_SIGMA (5.0)` mapping a gross outlier to the
+CENTRE rather than to the bound, `σ = WINSORIZE_SCALE_CORRECTION (1.134) ·
+stddev`, `μ = mean`, stop at `|Δσ| < WINSORIZE_CONVERGENCE (0.0005) · σ`
+after ≥ 2 passes, cap `WINSORIZE_MAX_PASSES = 20`. Two documented
+deviations: the MAD seed instead of `1.1926·Sn` (O(n²) per pixel stack),
+and — ruling R-T2-1 — a **stddev-about-the-median fallback when `MAD ==
+0`**, because a majority-tied stack (every integer-ADU bias master) seeded
+`σ = 0`, i.e. "nothing to reject", and a cosmic ray survived: `15 × 500 +
+1 × 5000` went from 0 rejected / combined 781.25 to 1 rejected / 500.0. A
+stack with a non-zero MAD cannot reach that branch, so no non-degenerate
+output moved. **No fixture fingerprint pin moved** — on the master-build
+fixtures both fixed points reject the same single outlier, a coincidence of
+the fixtures rather than agreement between the estimators (the surviving
+legacy pin now asserts they disagree) — so the real move was measured on
+real data instead: 21 calibrated LDN 1272 mono frames through
+`integrate_probe --rejection winsorized`, rejected fraction 0.380 % →
+0.963 % (×2.54), master median −0.024 %, MAD +0.50 %, noise +2.0 %, PSF SNR
+−3.9 %, 6.59 % of 25.9 M pixels changed, combine time +20 %. **Every master
+built with Winsorized now differs from its pre-M4c self** (the Auto
+ladder's `8 ≤ n < 20`, plus master builds at n ≥ 15) — a `rebuild_master`
+produces different pixels than the original build; provenance shape and the
+`ATH_REJ` text are unchanged, so nothing migrates.
+
+**Large-scale rejection** (ruling R-M4c-4) is an optional SECOND
+integration pass that removes what the per-pixel algorithms leave as
+speckle — a satellite trail's faint shoulders. `integration/source.rs::
+RejectionBitSource` is the read-side mirror of M3's `RejectionBitSink`,
+ROW-based and plane-bound (`words_per_row`/`frames`/`forced_row`) because
+`StackParams` is per-plane and a `&dyn` call per SAMPLE would be ≈ 5×10⁹
+virtual calls per plane; `StackParams.forced_rejection` makes a forced
+sample `present` (the side attribution still judges it against the
+survivors' median) but never lets it enter `work`, counts it in
+`rejected_per_frame`, the low/high maps and the bitmaps, and NOT in
+`base.rejected_fraction` (the algorithm-only convention range rejection
+already had). `integration.largeScale { enabled: false, protectedLayers: 2,
+growth: 2 }` (clamped 1–6 / 0–4 in `resolve_config`) turns it on: pass 1
+writes the `.rej` bitmaps, `stacking::rej::process_large_scale` filters each
+frame's bitmap into a `.rejl` sibling, pass 2 re-integrates with those bits
+forced. The filter is an **MMT-shaped median cascade** — majority medians
+of windows 3, 5, …, `2^layers + 1` — not the single wide median the ruling
+first named: no majority median of window 9 can keep a 3-px band (27 of 81
+set is a minority), so the single-median reading would erase exactly the
+thin trails the stage exists for. `protectedLayers` is therefore a SCALE
+SELECTOR, not a strength knob — a band needs 3 px at 2, 5 px at 3, 9 px at
+4, and a compact blob survives only while it is larger than the widest
+window; `growth` dilates with a disc, not a square. Ruling R-T3-1: the
+second pass runs WITH a sink of its OWN into a fresh set at
+`rej/run-<id>/<group>/pass2/<stem>.rej` (`SECOND_PASS_DIR = "pass2"`), and
+drizzle reads THAT set when `GroupOutput.second_pass_rej_ok` — forced
+structures ∪ pass 2's own algorithmic and range rejections, i.e. exactly
+the set the master was built from; `.rejl` stays the intermediate. A second
+pass that ran WITHOUT a usable set of its own skips drizzle for the group
+rather than being handed pass 1's bits, which describe the integration pass
+2 replaced (the master is already written and untouched).
+`GroupStats.large_scale_rejected_fraction` reports the forced fraction, the
+plan-time footprint counts THREE bitmap copies per frame when large-scale
+is on, and everything under `rej/run-<id>` rides the run's single-exit
+cleanup. **No preset enables it** — turning it on in `MaximumQuality` would
+double every such run's integration time, which the ruling does not ask
+for. Run pin: 6 frames, a flat-topped trail whose 2-px shoulders survive
+the per-pixel clip — the shoulder band reads +11.70 % of a control row
+without large-scale and +0.40 % with it.
+
+**Thin-plate-spline distortion** (rulings R-M4c-5/6/7): `geometry/tps.rs`
+(ungated, no `stacking` dependency) holds `ThinPlateSpline` — the classic
+`φ(r) = r² ln r` with an affine part, two scalar splines (x and y) sharing
+nodes, Bookstein's bordered system with both right-hand sides on ONE
+factorization, coordinates normalized to the node cloud's bounding-box
+diagonal (`center`/`scale` stored so `displacement` stays a self-contained
+function of pixel coordinates) — plus `TPS_MAX_NODES = 600`, `TPS_GRID_PX =
+8`, `TPS_MIN_NODES = 4` and `select_nodes`, which grid-stratifies over a
+30×20 cell grid (best combined-σ pair per cell, then round-robin), never
+the first N. The solver is **dense Gaussian elimination with partial
+pivoting, not a Cholesky** (ruling R-T4-2): `φ(0) = 0` makes `trace(K) = 0`
+exactly, so the plan's suggested `1e-9·trace/n` ridge is literally zero, and
+no diagonal ridge can make a merely conditionally-positive-definite kernel
+Cholesky-able. `PixelMap.distortion` became `Option<DistortionModel>` —
+`Polynomial(Distortion)` | `Tps { forward, inverse, domain, grids }` — with
+explicit `kind` tagging and a hand-written `Deserialize` that reads a
+missing tag as polynomial, so every M1–M4b `transform_json` decodes
+unchanged and the polynomial arm is byte-identical. `DistortionChoice::Tps`
+is a user choice; `Auto` never picks it. Ruling R-T4-3 draws the line
+between the two evaluation paths: `forward_exact`/`inverse_exact`
+(`O(nodes)`) serve every NON-pixel caller — registration QA, the local
+loop's re-pairing, `weights::reference_coverage`,
+`drizzle::band_source_window`, the probes — while `TpsGrids { forward:
+OnceLock<TpsGrid>, inverse: OnceLock<TpsGrid> }` lives behind an `Arc` so
+every clone of a map shares ONE allocation and each direction is built only
+when that direction's pixel path first asks for it. Ruling R-T4-4 makes the
+reported RMS honest: at the default `λ = 0` every inlier is a node and the
+spline INTERPOLATES, so the in-sample residual (0.0013 px on the synthetic
+scene against a real 0.108 px off-inlier error) would leave `maxRmsPx`
+toothless — above the node cap the non-node inliers ARE the hold-out, below
+it `TPS_HOLDOUT_STRIDE = 5` fits a second spline on 80 % of the stratified
+node order and measures the held-back 20 %, while the SHIPPED model stays
+the one fitted on all nodes. **A TPS row's hold-out rms is not comparable
+with a polynomial row's in-sample rms**: on the same scene the spline
+reports 1.47 px against the cubic's 0.93 px while being 11× more accurate
+against the truth field. `dedupe_nodes` +
+`TPS_MIN_NODE_SEPARATION_PX = 0.05` closes a real defect found while
+pinning that hold-out — `pair_through` gives each subject star its own
+nearest reference star independently, so two subjects can claim ONE
+reference, the node set carries that position twice and Bookstein's system
+is exactly singular; roughly one synthetic seed in three fell back to its
+linear model before the fix (the correspondence ambiguity itself stands for
+every model). The local distortion loop lives in
+`stacking/register/local_loop.rs` (extracted from `align`): with
+`registration.localDistortion` and any distortion model, up to
+`LOCAL_DISTORTION_ROUNDS = 3` rounds of re-pair through the whole current
+map at `ransacTolerancePx · (1 + round)` → RANSAC a corrector homography →
+stop at `‖H_c − I‖_F < LOCAL_DISTORTION_STOP = 1e-3` → else compose into
+the linear part and refit the distortion; ruling R-T4-5 has the accept
+guard evaluate the incumbent AND the candidate on ONE common pair set (the
+incumbent's own inliers), so a round whose corrector kept an easier subset
+cannot look better while being worse. `Alignment.local_rounds` is a field
+of its own (ruling R-T4-1) — `refit_rounds` already means the σ-clip rounds
+inside one `refit_weighted` call. `registration.tpsSmoothing` (clamped to
+`[MIN_TPS_SMOOTHING, MAX_TPS_SMOOTHING] = [0, 10]`) defaults to `0.0` =
+interpolating, and both new fields ride `registration_subtree`, so the
+first run after M4c re-registers every set once on purpose. `model_name`
+yields `homography+tps`, with `+wcs` still LAST (`homography+tps+wcs`)
+because `FramesTable.tsx::splitRegModel` strips the trailing suffix for its
+`WCS` chip.
+
+**LN local scale and the barycentre pass** (rulings R-M4c-8/9):
+`ScaleResult` grew `pass: u8` and `local: Option<ThinPlateSpline>` (and
+lost `Copy`). With `normalization.local.localScale`,
+`ln::scale::fit_local_scale` fits an approximating spline on the RCR
+survivors' residuals `z_k − scale` at their reference positions with
+`λ = LN_LOCAL_SCALE_SMOOTHING_SIGMAS (5.0) · σ_z`, and `ln::a_grid` samples
+`A(node) = s + spline(node).0` on the stride mesh in place of the constant
+`s`, with `B = B_ref − A·B_tgt` following; with no spline `a_grid` returns
+`vec![s; gw·gh]` before touching a position, so every M2/M3/M4a LN
+byte-identity pin holds. `LN_LOCAL_SCALE_MIN_STARS = 40` counts DISTINCT
+reference stars and is applied AFTER the reference-index dedupe the one-way
+match makes necessary, so 40 pairs collapsing onto 5 stars fit nothing;
+`LN_LOCAL_SCALE_MAX_DEVIATION = 0.25` (in `ln/mod.rs`, beside its only
+consumer) refuses a sampled surface that moves by more than a quarter of
+`s` across the frame AS A WHOLE, loudly — never a partial clamp. Ruling
+R-T5-1 leaves the math reference's surface-simplification step deliberately
+unimplemented: because λ scales with the dispersion, a PURE-NOISE ratio
+sample still yields a smooth spurious surface — measured end to end through
+the real detector, fitter, RCR and grid sampling over 10 seeds at
+σ_z ∈ [0.031, 0.038], peak-to-peak **0.92–2.18·σ_z** — so a no-gradient
+control pin records it at `3.0·σ_z` as a number to beat (the gradient pin's
+own REAL structure runs at ≈ 5·σ_z), and Task 7 variant E decides on real
+data. The barycentre second matching pass re-matches on the DETECTION
+barycentres (the seeds' positions before the PSF fit) when pass 1 covered
+less than `LN_BARYCENTRE_PASS_THRESHOLD = 0.8` of the **TARGET's** own
+accepted fits — not the reference's (ruling R-T5-2): the LN reference is an
+integration of the group's best 20 frames and therefore deeper than any
+single target, so against ITS fit count "matched under 80 %" is the
+ordinary case, the pass would run on nearly every real frame and its lazy
+preparation would be defeated. The larger pairing wins, a tie keeps pass 1,
+and the pass-2 tree arrives as a `FnOnce` so the common path pays nothing.
+
+Two process facts this cycle established, both worth remembering: **the
+headless check does not exercise `integration/`** — `cargo check -p
+athenaeum-core --no-default-features` passes while `lib.rs` carries
+`#[cfg(feature = "render")] pub mod integration;`, so the module is not
+compiled at all (verified in Task 2 by appending a deliberate type error to
+`combine.rs` and watching the check stay green); of the trees this cycle
+touched only `geometry/` is genuinely ungated, so the headless gate is not
+coverage for anything under `integration/`. And **`cargo test --lib` hides
+example breakage** — a public-signature change that breaks
+`examples/*_probe.rs` surfaces only under
+`cargo check -p athenaeum-core --all-targets`, which is the re-gate to run
+after one. Acceptance: Task 7 (pending).
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
-plan,run,provenance,measure,weights,psf_signal,prefilter,robust,integrate,
-master_cards}.rs`, `stacking/register/{mod,detect,align,frame,wcs_seed,writer}.rs`,
+plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
+integrate,master_cards}.rs`,
+`stacking/register/{mod,detect,align,frame,wcs_seed,local_loop,writer}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
+`crates/athenaeum-core/src/integration/student_t.rs`,
+`crates/athenaeum-core/src/geometry/tps.rs`,
 `crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
 fits_writer/wcs.rs`; dev probes
 `examples/{measure,register,integrate,ln}_probe.rs` and the weight-audit

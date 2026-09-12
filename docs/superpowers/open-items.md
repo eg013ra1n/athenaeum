@@ -187,6 +187,117 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M4c — algorithms (2026-09-12)
+
+M4c (plan `docs/superpowers/plans/2026-09-10-stacking-m4c-plan-algorithms.md`,
+rulings R-M4c-1…11 plus the fix-round rulings R-T0-1/2, R-T2-1, R-T3-1, R-T4-1…5 and
+R-T5-1/2): the structure-map seed detector as an option
+(`measurement.seedDetector`, default `peak`); min/max, generalized ESD and RCR as
+user-chosen pixel rejection with the Auto ladder unchanged; Winsorized sigma clipping
+on the reference loop with a zero-MAD fallback; large-scale rejection through
+processed `.rejl` bitmaps and a second integration pass with its own `pass2/` bitmap
+set; thin-plate-spline distortion with the local distortion loop; and LN's local-scale
+spline plus the barycentre second matching pass. **Tasks 0–5 are code-complete with
+green gates and clean reviews; the LDN 1272 acceptance re-run is Task 7 and has not
+run** — everything below is what that run has to weigh or what it inherits.
+
+- **Not re-measured (Task 0, minor m9):** the Measure stage's memory admission was
+  sized for the peak detector; the structure path allocates its own map, blurred and
+  dilated copies per plane and nobody re-measured the admission against it.
+- **Residual (OSC), second signature (Task 0, ruling R-T0-2):** two unrelated noise
+  estimators agree to 11 % on the mono planes but diverge 1.67 / 2.20 / 2.04× on the
+  debayered OSC R/G/B (176 real planes), which is exactly where both detectors
+  overshoot the external tool's fit counts. The structure map halved the M4a excess
+  (3.8–6.9× → 2.46–3.86×) without closing it and made OSC blue worse (PSFSW ρ 0.683 →
+  0.423), so the next investigation is the VNG-debayered planes or the PSF fitter's
+  acceptance on them, **not another detector**.
+- **Deferred (Task 1 review, 5 minors):** the `robust.rs` cross-check comment
+  overclaims f32/f64 sameness for its planted values (`6 + 0.5k + 0.01·seed` is not
+  f32-exact); the board labels `Min/max (l/h)` / `ESD (f, α, ρ)` / `RCR (limit)` are
+  capitalised and parenthesised against the lowercase house style (the brief's verbatim
+  text, kept this cycle); the RCR clean pin sits at exactly 57/60 with zero margin and
+  wants a "this means the estimator moved" comment; `rcr_line_fit_deviation` does a
+  TLS + `RefCell` + SipHash lookup per phase-0 iteration (the first suspect if RCR is
+  slow in Task 7) and inserts a degenerate `sxx ≤ 0` entry; `t_quantile` returns the
+  bracket end silently.
+- **Re-tune candidate (Task 2):** the Auto ladder's Winsorized thresholds (4.0/3.0,
+  `8 ≤ n < 20`) may want a re-tune now that the scale they multiply is ≈ 14 % smaller
+  on real stacks — measured on 21 LDN 1272 mono frames, rejection ×2.54 at +2.0 %
+  master noise and −3.9 % PSF SNR. Task 7's call, the same kind of calibration
+  `LINEAR_FIT_SIGMA_SCALE` got in M4a.
+- **RELEASE-NOTE LINE OWED (Task 2):** every master built with Winsorized sigma
+  clipping now differs from its pre-M4c self — a `rebuild_master` produces different
+  pixels than the original build. No migration exists or is needed (provenance shape
+  and the `ATH_REJ` text are unchanged).
+- **Cost, bounded (Task 2, ruling R-T2-1):** a zero-MAD stack always burns the 20-pass
+  cap, ≈ 4.8× a non-degenerate stack of the same size, so the worst case is ≈ 5× the
+  combine phase on a fully tied integer bias master. Outcome-insensitive (any cap ≥ ~8
+  passes leaves the same survivors); if a real bias build ever looks slow, this is the
+  first place to look.
+- **Gate correction (Task 2, verified):** `cargo check -p athenaeum-core
+  --no-default-features` does **not** exercise `integration/` — `lib.rs` gates it on
+  `render`, proven by a deliberate type error in `combine.rs` that left the headless
+  check green. Only `geometry/` is genuinely ungated among the trees this cycle
+  touched. Related: `cargo test --lib` hides example breakage; re-gate a
+  public-signature change with `cargo check -p athenaeum-core --all-targets`.
+- **Deferred (Task 3, large-scale rejection):** the filter's scratch is `2 · W · H`
+  bytes per rayon worker (≈ 52 MB at 6248×4176, ≈ 520 MB transient on a 10-worker
+  pool), unbounded — a row-ring `hsum` plus bitset masks would bring it to ≈ 7 MB per
+  worker; `large_scale_rejected_fraction` counts bits over the full geometry including
+  never-covered pixels while its doc says "samples"; the majority cascade needs a DENSE
+  rejected structure, so a sparse real-trail mask may be erased (Task 7 check m5: does
+  mono frame `_0085`'s mask survive the cascade?); **no preset enables the feature**
+  (adding it to `MaximumQuality` would double every such run's integration time —
+  owner call); the "drizzle skipped … second pass's rejection bitmaps are unavailable"
+  warning is not gated on drizzle being enabled, so standalone large-scale with a
+  `pass2/` write fault warns about a drizzle that never ran; and the "pass-2 set
+  unusable → skip drizzle, no fallback to pass-1 bits" path has no persisted regression
+  test (verified by reading, the sabotage was reverted rather than committed). Pass 1
+  also still computes rejection maps that pass 2's replace when `writeRejectionMaps` is
+  on.
+- **Deferred (Task 4, TPS):** there is **no grid release mechanism** — a `TpsGrid`
+  lives as long as the last clone of its map, so a run holding 368 registered maps
+  through integration under `distortion: "tps"` accumulates ≈ 8.6 MB × 368 of inverse
+  grids on a 26 Mpx set (Task 7 measures peak RSS and wall clock before anyone
+  recommends TPS; the cheap mitigations are a `release_cache` or a coarser
+  `TPS_GRID_PX` for large frames); `drizzle::band_source_window` costs ≈ 800 exact
+  probes × 600 nodes per band on a TPS map; **a TPS row's hold-out `rms_px` is not
+  comparable with a polynomial row's in-sample `rms_px`**, and the frames table shows
+  both in one column (1.47 px against 0.93 px on the same scene, with the spline 11×
+  more accurate against the truth field) — the column wants a note or a split; the
+  `pair_through` two-subjects-one-reference correspondence ambiguity stands for **every
+  model** (TPS is merely the first consumer that cannot tolerate it — `dedupe_nodes`
+  guards the spline, nothing resolves the pairing itself); `dedupe_nodes`'s doc
+  overstates the "cell picked first" rule for the uncapped case (there the lower index
+  wins); in the cap-bites branch an UNselected duplicate pair stays in the hold-out set
+  (asymmetric with the 80/20 branch, never flattering); `TpsGrid::len`/`is_empty` are
+  dead public API; a superseded incumbent's note can survive a kept round in
+  `warnings`; and nothing in the tests distinguishes the common-set accept guard
+  (R-T4-5) from the old per-model one.
+- **Deferred (Task 5, LN):** the ±1–2·σ_z local-scale ripple SHIPS — with `localScale`
+  on and no true structure the sampled `A` carries a spurious smooth surface of
+  peak-to-peak 0.92–2.18·σ_z (10 seeds, σ_z ∈ [0.031, 0.038]), pinned at 3.0·σ_z by a
+  no-gradient control; Task 7 variant E weighs it against the real flat-field residual,
+  and only then does the math reference's surface-simplification step or a node-count-
+  aware λ get implemented (ruling R-T5-1). `ln_pass` and `ln_local_nodes` reach the
+  **logs only** — not `LnFrameOutcome`, the run summary or provenance — and do not
+  exist at all on a cache hit, so "how often pass 2 fires on real frames" is
+  unmeasured. The trailing-node clamp convention (`(i·stride).min(width−1)`, shared
+  with `background_grid` and `ln_probe`) lives in prose at three sites rather than in a
+  shared helper. A comment in the noise-control test misattributes σ_z ≈ 0.03 to the
+  `NOISE` level where `LOUD` is what produces it.
+- **Deferred (Task 0, comment-only):** `structure_map`'s comment says 0.56× where the
+  report and the adjacent test say 0.60× for the sensitivity-0.5 plane-anchored ratio;
+  the noise-comparison doc table's "all" row maximum (2.2443) exceeds every group
+  maximum (a typo carried from the report); and the "correlated noise" attribution
+  reads as fact where the evidence supports "consistent with".
+- **Owed (owner), after Task 7:** an own look at the acceptance masters and the desktop
+  click-through of what M4c added to the tab — the Measure panel's `Seed detector`
+  select (with the two peak-only controls disabled under `structure`), the Integrate
+  panel's three new rejection methods and its Large-scale rejection block, the Register
+  panel's `tps` distortion with `TPS smoothing (λ)` and `Local distortion loop`, and
+  the Normalize panel's now-live `localScale` checkbox. Task 7 will add its own lines.
+
 ### Stacking M4b — mixed pixel scales (2026-09-11)
 
 M4b (plan `docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`,
