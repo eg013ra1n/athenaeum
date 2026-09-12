@@ -260,8 +260,9 @@ run** — everything below is what that run has to weigh or what it inherits.
   through integration under `distortion: "tps"` accumulates ≈ 8.6 MB × 368 of inverse
   grids on a 26 Mpx set (Task 7 measures peak RSS and wall clock before anyone
   recommends TPS; the cheap mitigations are a `release_cache` or a coarser
-  `TPS_GRID_PX` for large frames); `drizzle::band_source_window` costs ≈ 800 exact
-  probes × 600 nodes per band on a TPS map; **a TPS row's hold-out `rms_px` is not
+  `TPS_GRID_PX` for large frames); `drizzle::band_source_window` costs a few
+  hundred exact probes × up to 600 nodes per band on a TPS map; **a TPS row's
+  hold-out `rms_px` is not
   comparable with a polynomial row's in-sample `rms_px`**, and the frames table shows
   both in one column (1.47 px against 0.93 px on the same scene, with the spline 11×
   more accurate against the truth field) — the column wants a note or a split; the

@@ -825,8 +825,9 @@ significant pixels and their maxima, barycentre, `upper_limit`, coverage,
 detection SNR, kurtosis). Two deviations are measured rather than assumed:
 the binarization LEVEL comes from the dilated map but the SCALE from the
 caller's UNFILTERED plane (anchoring both on the map costs most of the
-sharpness behaviour the detector exists for — 0.56× against 0.73× of the
-well-sampled field's star count on the fixture), and `σ_noise` is the
+sharpness behaviour the detector exists for — at the shipped sensitivity an
+undersampled fixture field yields 0.56× the well-sampled field's star count
+with the plane anchor and 0.91× with the map anchor), and `σ_noise` is the
 module's own second-à-trous-layer K-sigma estimator ÷ `B3_LAYER2_GAIN =
 0.2007` rather than rustafits' `noise_mrs` — ruling R-T0-2 ran both on the
 same unfiltered plane over 176 real planes: they agree to 11 % on mono but
