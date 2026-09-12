@@ -222,7 +222,7 @@ pub struct Alignment {
     pub ransac_iterations: usize,
     pub refit_rounds: usize,
     /// Rounds of the local distortion loop whose corrector was actually
-    /// FITTED (M4c, ruling R-M4c-7; semantics settled by R-T4-2): the
+    /// FITTED (M4c, ruling R-M4c-7; semantics settled by R-T4-1): the
     /// round's re-pairing produced at least [`MIN_INLIERS`]
     /// correspondences AND its corrector's RANSAC succeeded. A round that
     /// then CONVERGED counts — it did the work and found nothing left to

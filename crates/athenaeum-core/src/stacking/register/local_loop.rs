@@ -47,7 +47,7 @@ pub const LOCAL_DISTORTION_STOP: f64 = 1e-3;
 pub(super) struct LoopOutcome {
     /// Rounds whose corrector was actually FITTED — the pairing produced
     /// at least [`MIN_INLIERS`] correspondences and the corrector's
-    /// RANSAC succeeded (ruling R-T4-2). A round that converged counts;
+    /// RANSAC succeeded (ruling R-T4-1). A round that converged counts;
     /// a round the pairing or the RANSAC ended before a corrector existed
     /// does not.
     pub rounds: usize,
