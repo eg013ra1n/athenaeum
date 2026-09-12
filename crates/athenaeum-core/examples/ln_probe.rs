@@ -581,6 +581,11 @@ registration row for each — run stacking through Register first); found {}",
         let mut after = Vec::with_capacity(target_bg.gw * target_bg.gh);
         let mut a_row = vec![0f32; reference.width];
         let mut b_row = vec![0f32; reference.width];
+        // The trailing node on each axis overshoots the plane by design,
+        // so its address is clamped to the last pixel — the same rule
+        // `ln::background::background_grid` windows that node's cell with
+        // and `ln::a_grid` samples the local-scale spline at (review m7),
+        // so all three read the mesh at one and the same pixel.
         for j in 0..target_bg.gh {
             let node_y = (j * stride).min(reference.height.saturating_sub(1));
             grid.evaluate_row(node_y, &mut a_row, &mut b_row);

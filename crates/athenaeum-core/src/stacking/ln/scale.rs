@@ -21,8 +21,8 @@
 //!
 //! **M4c (rulings R-M4c-8/9) added the two pieces M2 recorded as
 //! deferred:** a BARYCENTRE second matching pass — when pass 1's pairing
-//! covered fewer than [`LN_BARYCENTRE_PASS_THRESHOLD`] of the reference's
-//! own accepted fits, the same nearest-within query runs again over the
+//! covered fewer than [`LN_BARYCENTRE_PASS_THRESHOLD`] of the TARGET's own
+//! accepted fits, the same nearest-within query runs again over the
 //! DETECTION barycentres each fit came from and the larger of the two
 //! pairings wins ([`choose_pairing`]) — and an optional LOCAL SCALE model:
 //! with `normalization.local.localScale` on, the surviving ratios'
@@ -49,15 +49,19 @@ use crate::stacking::register::DetectionConfig;
 pub const MIN_MATCHES: usize = 20;
 
 /// Ruling R-M4c-9: a pass-1 pairing covering less than this FRACTION of
-/// the reference plane's own accepted fits triggers the barycentre second
+/// the TARGET plane's own accepted fits triggers the barycentre second
 /// pass. `0.8` is math §4.3 step 2's "a second pass using barycentres runs
-/// when < 80 % matched".
+/// when < 80 % matched"; the denominator is the target's, not the
+/// reference's — see [`choose_pairing`] and review finding R-T5-2.
 pub const LN_BARYCENTRE_PASS_THRESHOLD: f64 = 0.8;
 
-/// Ruling R-M4c-8: fewer than this many pairs surviving RCR and no local
-/// scale spline is fitted at all — `A` stays the constant RCR location and
-/// the frame is logged as such. A surface fitted on a handful of stars is
-/// noise dressed as a flat-field residual.
+/// Ruling R-M4c-8: fewer DISTINCT reference stars than this among the
+/// pairs surviving RCR and no local scale spline is fitted at all — `A`
+/// stays the constant RCR location and the frame is logged as such. A
+/// surface fitted on a handful of stars is noise dressed as a flat-field
+/// residual. Counted after the reference-index dedupe (review m6), so it
+/// counts what the spline is actually fitted on, not how many target fits
+/// happened to claim the same few stars.
 pub const LN_LOCAL_SCALE_MIN_STARS: usize = 40;
 
 /// Ruling R-M4c-8 / math §4.3 step 5: the local-scale spline's smoothing
@@ -69,17 +73,6 @@ pub const LN_LOCAL_SCALE_MIN_STARS: usize = 40;
 /// terms in when the residuals are genuinely tighter than the structure
 /// they carry.
 pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
-
-/// Safety band on the SAMPLED local-scale surface, as a fraction of the
-/// global scale `s` (an addition to ruling R-M4c-8's own wording, see
-/// `ln::a_grid`): a flat-field residual that moves the relative scale by
-/// more than a quarter of `s` between two corners of the same frame is not
-/// a flat-field residual — it is a spline that left its node cloud or a
-/// fit that went wrong. Such a surface is refused as a whole and the
-/// channel keeps the constant `A = s`, loudly. Real vignetting-driven
-/// residuals are a few percent, so this is an order of magnitude of
-/// headroom, not a working limit.
-pub const LN_LOCAL_SCALE_MAX_DEVIATION: f64 = 0.25;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScaleResult {
@@ -101,8 +94,9 @@ pub struct ScaleResult {
     /// larger.
     pub pass: u8,
     /// The local scale model (ruling R-M4c-8), `None` unless the caller
-    /// asked for one AND at least [`LN_LOCAL_SCALE_MIN_STARS`] pairs
-    /// survived RCR AND the spline could be fitted. The surface is the
+    /// asked for one AND at least [`LN_LOCAL_SCALE_MIN_STARS`] DISTINCT
+    /// reference stars survived RCR AND the spline could be fitted. The
+    /// surface is the
     /// RESIDUAL around [`Self::scale`]: `A(x, y) = scale +
     /// local.displacement(x, y).0` (the y channel is fitted on zeros and
     /// carries nothing — see [`fit_local_scale`]).
@@ -169,8 +163,16 @@ fn seed_link_radius(p: &FitParams) -> f64 {
 /// seed within [`seed_link_radius`], or `None` when there is none (see
 /// that function for why that is a degenerate case, not a normal one).
 /// Positions are in the same plane coordinates as the fits themselves.
-fn link_barycentres(fits: &[StarFit], seeds: &[Seed]) -> Vec<Option<(f64, f64)>> {
-    let radius = seed_link_radius(&FitParams::default());
+/// `params` must be the SAME [`FitParams`] `fits` was produced with — the
+/// link radius is derived from its own `centroid_tolerance_px`, so reading
+/// a default here while the fits were made with something else would size
+/// the radius against a rule those fits never obeyed (review m4).
+fn link_barycentres(
+    fits: &[StarFit],
+    seeds: &[Seed],
+    params: &FitParams,
+) -> Vec<Option<(f64, f64)>> {
+    let radius = seed_link_radius(params);
     let points: Vec<(f64, f64)> = seeds.iter().map(|s| (s.x, s.y)).collect();
     let tree = KdTree2::build(&points);
     fits.iter()
@@ -225,14 +227,26 @@ fn pair_positions(
 
 /// Ruling R-M4c-9 in one place. Pass 1 matches the two planes' PSF-FIT
 /// centroids; if its pairing covered fewer than
-/// [`LN_BARYCENTRE_PASS_THRESHOLD`] of `ref_fits` (the reference plane's
-/// own accepted fits), a second pass matches the DETECTION BARYCENTRES
-/// with the same radius, and the LARGER of the two pairings wins.
+/// [`LN_BARYCENTRE_PASS_THRESHOLD`] of the TARGET's own accepted fits
+/// (`tgt_fit_positions.len()`), a second pass matches the DETECTION
+/// BARYCENTRES with the same radius, and the LARGER of the two pairings
+/// wins.
+///
+/// **The denominator is the TARGET's fit count, not the reference's**
+/// (review finding R-T5-2). The LN reference is an integration of the
+/// group's best `referenceFrames` frames and is therefore deeper than any
+/// single target: measured against ITS fit count, "matched under 80 %" is
+/// the ordinary case and pass 2 would run on nearly every real frame — for
+/// nothing, since the only pairs it can add are those whose two fits
+/// drifted across the match radius, and a fit is bounded to
+/// [`seed_link_radius`] of its own seed. The shortfall this pass exists to
+/// repair is fits that WALKED, which is a property of the target, so the
+/// target is what the threshold is measured against.
 ///
 /// A tie keeps pass 1 — so a frame pass 1 already handled cannot have its
-/// numbers changed by this rule, whatever the second pass finds. `ref_fits
-/// == 0` has no denominator and no pairing to improve: pass 1 (empty)
-/// stands.
+/// numbers changed by this rule, whatever the second pass finds. A target
+/// with no accepted fits has no denominator and nothing to pair either
+/// way: pass 1 (empty) stands.
 ///
 /// `tgt_barycentres` is a CLOSURE, not a slice: linking a plane's fits
 /// back to their seeds costs a tree over every one of them
@@ -249,11 +263,13 @@ fn choose_pairing(
     ref_barycentre_tree: &KdTree2,
     ref_barycentre_of_point: &[usize],
     tgt_barycentres: impl FnOnce() -> Vec<Option<(f64, f64)>>,
-    ref_fits: usize,
     radius: f64,
 ) -> (Vec<(usize, usize)>, u8) {
     let pass1 = pair_positions(ref_tree, ref_fit_of_point, tgt_fit_positions, radius);
-    if ref_fits == 0 || pass1.len() as f64 >= LN_BARYCENTRE_PASS_THRESHOLD * ref_fits as f64 {
+    // The target's own accepted fits — one slot per fit, so the slice's
+    // own length IS the count (R-T5-2, above).
+    let tgt_fits = tgt_fit_positions.len();
+    if tgt_fits == 0 || pass1.len() as f64 >= LN_BARYCENTRE_PASS_THRESHOLD * tgt_fits as f64 {
         return (pass1, 1);
     }
     let pass2 = pair_positions(
@@ -318,9 +334,10 @@ fn ratio_sample(
 /// singular (`fit` would return `None` for the whole frame).
 ///
 /// `None` — `A` stays the constant `scale` — when fewer than
-/// [`LN_LOCAL_SCALE_MIN_STARS`] pairs survived RCR, when the node cap's
-/// own floor ([`TPS_MIN_NODES`]) is not met, or when the system is
-/// singular anyway. Every one of those says so at `warn`.
+/// [`LN_LOCAL_SCALE_MIN_STARS`] DISTINCT reference stars survived RCR
+/// (counted after that dedupe, review m6), when the node cap's own floor
+/// ([`TPS_MIN_NODES`]) is not met, or when the system is singular anyway.
+/// Every one of those says so at `warn`.
 fn fit_local_scale(
     sample: &RatioSample,
     kept: &[bool],
@@ -332,12 +349,10 @@ fn fit_local_scale(
     let mut seen: HashSet<usize> = HashSet::new();
     let mut nodes: Vec<(f64, f64)> = Vec::new();
     let mut residuals: Vec<f64> = Vec::new();
-    let mut survivors = 0usize;
     for (k, &keep) in kept.iter().enumerate().take(sample.ratios.len()) {
         if !keep {
             continue;
         }
-        survivors += 1;
         if !seen.insert(sample.ref_idx[k]) {
             continue;
         }
@@ -345,10 +360,15 @@ fn fit_local_scale(
         residuals.push(sample.ratios[k] - scale);
     }
 
-    if survivors < LN_LOCAL_SCALE_MIN_STARS {
+    // The floor is applied AFTER the dedupe (review m6): a crowded field
+    // where 40 surviving pairs collapse onto 5 distinct reference stars
+    // carries five stars' worth of information, not forty, and a surface
+    // fitted on it would be guarded by nothing but [`TPS_MIN_NODES`].
+    // What the floor counts is what the spline is actually fitted on.
+    if nodes.len() < LN_LOCAL_SCALE_MIN_STARS {
         warn!(
-            count = survivors,
-            "local scale: too few matched stars survived RCR; A stays the global scale"
+            count = nodes.len(),
+            "local scale: too few distinct matched stars survived RCR; A stays the global scale"
         );
         return None;
     }
@@ -432,19 +452,13 @@ impl PreparedReferenceChannel {
         psf: PsfModel,
         max_stars: usize,
     ) -> PreparedReferenceChannel {
+        let fit_params = FitParams::default();
         let ref_seeds = detect_seeds(reference, width, height, max_stars);
-        let outcome = fit_stars(
-            reference,
-            width,
-            height,
-            &ref_seeds,
-            psf,
-            &FitParams::default(),
-        );
+        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params);
         let fit_positions: Vec<Option<(f64, f64)>> =
             outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
         let (tree, fit_of_point) = tree_over(&fit_positions);
-        let barycentres = link_barycentres(&outcome.fits, &ref_seeds);
+        let barycentres = link_barycentres(&outcome.fits, &ref_seeds, &fit_params);
         let (barycentre_tree, barycentre_of_point) = tree_over(&barycentres);
         PreparedReferenceChannel {
             outcome,
@@ -497,6 +511,7 @@ pub fn relative_scale_against(
     rcr_limit: f64,
     local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
+    let fit_params = FitParams::default();
     let tgt_seeds = detect_seeds(target, width, height, max_stars);
     let tgt_outcome = fit_stars_with_beta(
         target,
@@ -504,13 +519,13 @@ pub fn relative_scale_against(
         height,
         &tgt_seeds,
         prepared.outcome.beta,
-        &FitParams::default(),
+        &fit_params,
     );
 
     // Pass 1 on the PSF-fit centroids; pass 2 (ruling R-M4c-9) on the
     // DETECTION barycentres, only when pass 1 covered too little of the
-    // reference — `choose_pairing` owns the whole rule, including the tie
-    // that keeps pass 1.
+    // TARGET's own fits (review R-T5-2) — `choose_pairing` owns the whole
+    // rule, including the tie that keeps pass 1.
     let tgt_fit_positions: Vec<Option<(f64, f64)>> =
         tgt_outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
     let (pairs, pass) = choose_pairing(
@@ -519,8 +534,7 @@ pub fn relative_scale_against(
         &tgt_fit_positions,
         &prepared.barycentre_tree,
         &prepared.barycentre_of_point,
-        || link_barycentres(&tgt_outcome.fits, &tgt_seeds),
-        prepared.outcome.fits.len(),
+        || link_barycentres(&tgt_outcome.fits, &tgt_seeds, &fit_params),
         match_radius_px,
     );
 
@@ -942,16 +956,17 @@ mod tests {
             &bary_tree,
             &bary_map,
             || tgt_bary,
-            grid.len(),
             4.0,
         );
 
         let pass1 = pair_positions(&ref_tree, &ref_map, &tgt_fits, 4.0);
+        // The denominator is the TARGET's own fit count (R-T5-2), which
+        // here happens to equal the reference's.
         assert!(
-            (pass1.len() as f64) < LN_BARYCENTRE_PASS_THRESHOLD * grid.len() as f64,
-            "pass 1 matched {} of {} — the second pass would not even run",
+            (pass1.len() as f64) < LN_BARYCENTRE_PASS_THRESHOLD * tgt_fits.len() as f64,
+            "pass 1 matched {} of the target's {} fits — the second pass would not even run",
             pass1.len(),
-            grid.len()
+            tgt_fits.len()
         );
         assert_eq!(pass, 2, "the barycentre pairing must win");
         assert!(
@@ -984,7 +999,6 @@ mod tests {
             &bary_tree,
             &bary_map,
             || panic!("the barycentre pass must not even be prepared here"),
-            grid.len(),
             4.0,
         );
 
@@ -995,16 +1009,24 @@ mod tests {
     /// A tie keeps pass 1 (ruling R-M4c-9's own wording is "the larger of
     /// the two pairings"): nothing about a frame pass 1 already handled may
     /// change because the second pass found the same number of pairs.
+    ///
+    /// Half of the TARGET's own fits sit where no reference star is, so
+    /// pass 1 covers 50 % of them — under the threshold on the R-T5-2
+    /// denominator — and the barycentre pass runs; it is handed the same
+    /// positions, so it ties, and the tie keeps pass 1.
     #[test]
     fn a_tie_between_the_two_pairings_keeps_pass_one() {
         let grid = grid_positions(9);
-        // Only the first third of the reference's fits are reachable, so
-        // pass 1 covers 1/3 < 80 % and the second pass runs …
-        let reachable: Vec<(f64, f64)> = grid[..grid.len() / 3].to_vec();
+        let half = grid.len() / 2;
+        let mut tgt_positions: Vec<(f64, f64)> = grid[..half].to_vec();
+        // The other half, parked far from every reference star (the
+        // frame's own stars are on a 48 px pitch starting at x = 40).
+        tgt_positions.extend(grid[half..].iter().map(|&(_, y)| (-1000.0, y)));
+
         let ref_fits = present(&grid);
         let (ref_tree, ref_map) = tree_over(&ref_fits);
         let (bary_tree, bary_map) = tree_over(&ref_fits);
-        let tgt = present(&reachable);
+        let tgt = present(&tgt_positions);
 
         let (pairs, pass) = choose_pairing(
             &ref_tree,
@@ -1013,13 +1035,180 @@ mod tests {
             &bary_tree,
             &bary_map,
             || tgt.clone(),
-            grid.len(),
             4.0,
         );
 
-        // … and finds exactly as many pairs, which is not larger.
+        assert!(
+            (half as f64) < LN_BARYCENTRE_PASS_THRESHOLD * tgt.len() as f64,
+            "the scene must put pass 1 under the threshold: {half} of {}",
+            tgt.len()
+        );
+        // … and pass 2 finds exactly as many pairs, which is not larger.
         assert_eq!(pass, 1);
-        assert_eq!(pairs.len(), reachable.len());
+        assert_eq!(pairs.len(), half);
+    }
+
+    /// R-T5-2's whole point: a target that matched every one of ITS OWN
+    /// fits stays on pass 1 even though the (deeper) LN reference has many
+    /// more fits than that — which is the ordinary case on real data, and
+    /// what the reference-side denominator got wrong.
+    #[test]
+    fn a_deeper_reference_does_not_trigger_the_barycentre_pass() {
+        let deep = grid_positions(10);
+        // The target sees only the brightest quarter of the reference's
+        // stars — 15 of 60 — but every one of them pairs.
+        let shallow: Vec<(f64, f64)> = deep[..deep.len() / 4].to_vec();
+        let ref_fits = present(&deep);
+        let (ref_tree, ref_map) = tree_over(&ref_fits);
+        let (bary_tree, bary_map) = tree_over(&ref_fits);
+        let tgt = present(&shallow);
+
+        let (pairs, pass) = choose_pairing(
+            &ref_tree,
+            &ref_map,
+            &tgt,
+            &bary_tree,
+            &bary_map,
+            || panic!("a fully-matched target must not reach the barycentre pass"),
+            4.0,
+        );
+
+        assert!(
+            (pairs.len() as f64) < LN_BARYCENTRE_PASS_THRESHOLD * deep.len() as f64,
+            "the scene must be one the OLD reference-side denominator would have tripped: \
+             {} pairs vs the reference's {} fits",
+            pairs.len(),
+            deep.len()
+        );
+        assert_eq!(pass, 1);
+        assert_eq!(pairs.len(), shallow.len());
+    }
+
+    /// A [`StarFit`] at `(x, y)` — only the position and a positive
+    /// `signal` matter to the pairing machinery under test.
+    fn fit_at(x: f64, y: f64) -> StarFit {
+        StarFit {
+            x,
+            y,
+            background: 0.0,
+            amplitude: 1.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            fwtm_x: 6.0,
+            fwtm_y: 6.0,
+            theta: 0.0,
+            beta: 4.0,
+            residual: 0.01,
+            signal: 100.0,
+            area: 28.0,
+        }
+    }
+
+    fn seed_at(x: f64, y: f64) -> Seed {
+        Seed {
+            x,
+            y,
+            peak: 1.0,
+            flux: 100.0,
+        }
+    }
+
+    /// Review m8: a fit that walked from its seed still finds it (the link
+    /// radius is `centroid_tolerance_px · √2`), a fit that is farther than
+    /// the fitter could ever have put it links to nothing, and the
+    /// returned positions are the SEEDS' — not the fits'.
+    #[test]
+    fn link_barycentres_finds_the_seed_a_walked_fit_came_from() {
+        let params = FitParams::default();
+        let seeds = vec![seed_at(100.0, 100.0), seed_at(300.0, 220.0)];
+        let fits = vec![
+            // Walked by the most the tolerance allows on both axes
+            // (1.5, 1.5) — distance 2.12, exactly the link radius.
+            fit_at(101.5, 101.5),
+            // Twice that: no fitter could have produced this from either
+            // seed, so it must not be linked to a stranger.
+            fit_at(304.0, 224.0),
+        ];
+
+        let linked = link_barycentres(&fits, &seeds, &params);
+
+        assert_eq!(linked.len(), 2);
+        assert_eq!(
+            linked[0],
+            Some((100.0, 100.0)),
+            "the walked fit must link to its own seed's barycentre"
+        );
+        assert_eq!(
+            linked[1], None,
+            "a fit beyond the link radius must link to nothing, not to the nearest stranger"
+        );
+    }
+
+    /// Review m8: the `of_point` map is NOT the identity once some slots
+    /// are absent, and `pair_positions` must report the FIT index, not the
+    /// tree's point index. With the first two reference fits unlinked, a
+    /// target landing on reference fit 3 must come back as `3`.
+    #[test]
+    fn a_pairing_through_a_shifted_map_reports_fit_indices() {
+        let ref_positions = vec![
+            None,
+            None,
+            Some((50.0, 50.0)),
+            Some((150.0, 60.0)),
+            Some((260.0, 70.0)),
+        ];
+        let (tree, of_point) = tree_over(&ref_positions);
+        assert_eq!(
+            of_point,
+            vec![2, 3, 4],
+            "the map must skip the absent slots"
+        );
+
+        let tgt = vec![Some((150.5, 60.5)), Some((259.0, 70.0))];
+        let pairs = pair_positions(&tree, &of_point, &tgt, 4.0);
+
+        assert_eq!(
+            pairs,
+            vec![(3, 0), (4, 1)],
+            "pairs must carry reference FIT indices, not tree point indices"
+        );
+    }
+
+    /// Review m6: the 40-star floor counts DISTINCT reference stars. 60
+    /// surviving pairs that all claim the same 5 reference fits carry five
+    /// stars' worth of information and must not produce a spline.
+    #[test]
+    fn the_local_scale_floor_counts_distinct_reference_stars() {
+        let crowded = RatioSample {
+            ratios: (0..60).map(|k| 0.8 + (k % 7) as f64 * 0.001).collect(),
+            positions: (0..60)
+                .map(|k| {
+                    let s = k % 5;
+                    (40.0 + s as f64 * 90.0, 40.0 + s as f64 * 60.0)
+                })
+                .collect(),
+            ref_idx: (0..60).map(|k| k % 5).collect(),
+        };
+        let kept = vec![true; 60];
+
+        assert!(
+            fit_local_scale(&crowded, &kept, 0.8, 0.01, WIDTH, HEIGHT).is_none(),
+            "60 pairs over 5 distinct stars must not fit a surface"
+        );
+
+        // The control: the same 60 pairs, one distinct reference star
+        // each, spread over the frame — that one DOES fit.
+        let spread = RatioSample {
+            ratios: crowded.ratios.clone(),
+            positions: (0..60)
+                .map(|k| (30.0 + (k % 10) as f64 * 45.0, 30.0 + (k / 10) as f64 * 55.0))
+                .collect(),
+            ref_idx: (0..60).collect(),
+        };
+        assert!(
+            fit_local_scale(&spread, &kept, 0.8, 0.01, WIDTH, HEIGHT).is_some(),
+            "60 distinct stars over the frame must fit a surface"
+        );
     }
 
     #[test]
@@ -1146,6 +1335,95 @@ mod tests {
         assert_eq!(off.matches, on.matches);
         assert_eq!(off.rejected, on.rejected);
         assert_eq!(off.pass, on.pass);
+    }
+
+    /// Peak-to-peak, in units of `σ_z`, that a PURE-NOISE ratio sample's
+    /// spurious local-scale surface may reach — see
+    /// [`a_pure_noise_sample_produces_only_a_small_spurious_surface`].
+    const LOCAL_SCALE_NOISE_PTP_SIGMAS: f64 = 3.0;
+
+    /// **R-T5-1 control pin.** The gradient test above is noise-free
+    /// (`NOISE = 0.002`), so it cannot see what the review found by
+    /// replicating [`ThinPlateSpline::fit`] numerically: because
+    /// `λ = LN_LOCAL_SCALE_SMOOTHING_SIGMAS · σ_z` scales WITH the
+    /// dispersion and the solve is linear, a pure-noise ratio sample — no
+    /// true structure at all — still yields a smooth SPURIOUS surface of
+    /// peak-to-peak ≈ 1–2·σ_z. The ±25 % safety band never sees it (it is
+    /// two orders of magnitude below), and the math reference's
+    /// surface-simplification step (§4.3 step 5: tolerance 3·σ_z, reject
+    /// fraction 0.1), which is what would suppress it, was dropped by
+    /// ruling R-M4c-8 and is NOT being implemented blind — Task 7's
+    /// acceptance variant E measures the effect on real data first.
+    ///
+    /// So this is a NUMBER TO BEAT, not a guard: a uniformly scaled target
+    /// (constant true scale, nothing for a surface to find) at a realistic
+    /// ratio dispersion, asserting the sampled `A` grid's peak-to-peak
+    /// stays within [`LOCAL_SCALE_NOISE_PTP_SIGMAS`]·σ_z. **Measured
+    /// 2026-09-12 over 10 seeds at σ_z ∈ [0.031, 0.038]: ptp/σ_z ∈
+    /// [0.92, 2.18]**, so the pin sits at 3.0 — ≈ 1.4× the observed
+    /// maximum. For scale, the gradient test's own REAL structure runs at
+    /// ptp/σ_z ≈ 5, so this bound still separates signal from the
+    /// artefact. A λ change, or the simplification step arriving, should
+    /// push these numbers DOWN and this constant with them.
+    #[test]
+    fn a_pure_noise_sample_produces_only_a_small_spurious_surface() {
+        // `NOISE` (0.002) gives σ_z ≈ 0.014; this level is what puts the
+        // ratio dispersion at the ≈ 0.03 the review asked for.
+        const LOUD: f32 = 0.006;
+        const STRIDE: usize = 128;
+
+        for seed in 0..3u64 {
+            let stars = star_grid(70 + seed);
+            let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, LOUD, 300 + seed);
+            // A UNIFORM scale: the true surface is flat everywhere, so
+            // whatever the spline finds is the sample's own noise.
+            let target_stars = scale_stars(&stars, 0.8);
+            let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, LOUD, 400 + seed);
+
+            let r = relative_scale(
+                &reference,
+                &target,
+                WIDTH,
+                HEIGHT,
+                PsfModel::Moffat4,
+                200,
+                4.0,
+                0.3,
+                true,
+            )
+            .expect("a uniformly-scaled field must match even at this noise level");
+            assert!(
+                r.matches >= LN_LOCAL_SCALE_MIN_STARS,
+                "seed {seed}: matched {} — the scene must clear the local-scale floor",
+                r.matches
+            );
+            let spline = r
+                .local
+                .as_ref()
+                .expect("enough distinct stars survived, so a surface was fitted");
+
+            let (gw, gh) = super::super::LnGrid::grid_dims(WIDTH, HEIGHT, STRIDE);
+            let (a, used) =
+                super::super::a_grid(Some(spline), r.scale, gw, gh, STRIDE, WIDTH, HEIGHT);
+            assert!(
+                used,
+                "seed {seed}: the spurious surface sits far inside the safety band, so what \
+                 this pin measures is the SAMPLED grid, not the constant fallback"
+            );
+
+            let lo = a.iter().cloned().fold(f32::INFINITY, f32::min) as f64;
+            let hi = a.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let ratio = (hi - lo) / r.sigma;
+            assert!(
+                ratio <= LOCAL_SCALE_NOISE_PTP_SIGMAS,
+                "seed {seed}: a pure-noise sample produced a surface of peak-to-peak {:.5} = \
+                 {ratio:.3}·σ_z (σ_z {:.5}), over the {LOCAL_SCALE_NOISE_PTP_SIGMAS}·σ_z pin. \
+                 λ = 5·σ_z scales with the dispersion, so the spline reproduces the sample's \
+                 own noise as a smooth surface (review R-T5-1); 0.92–2.18·σ_z when pinned.",
+                hi - lo,
+                r.sigma
+            );
+        }
     }
 
     #[test]

@@ -689,16 +689,24 @@ per-frame grids.
   clip 0.85 relative, deviation thresholds 3.0σ / 3.2σ, rejection limit 0.3
   per cell); global scale `s` from matched-star PSF-flux ratios cleaned by
   RCR (limit 0.3), matched on the PSF-fit centroids and — when that
-  pairing covered less than 80 % of the reference plane's own accepted
-  fits — a second time on the DETECTION barycentres, the larger pairing
-  winning (M4c, ruling R-M4c-9; a tie keeps the first pass, so a frame the
-  first pass already handled never changes); `A(x,y) = s` (or a local
+  pairing covered less than 80 % of the TARGET's own accepted fits — a
+  second time on the DETECTION barycentres, the larger pairing winning
+  (M4c, ruling R-M4c-9; a tie keeps the first pass, so a frame the first
+  pass already handled never changes). The denominator is the target's own
+  fit count, not the reference's (review finding R-T5-2): the LN reference
+  is an integration of the group's best `referenceFrames` frames and is
+  deeper than any single target, so measured against IT "matched under
+  80 %" would be the ordinary case and the second pass would run on nearly
+  every frame for nothing — the shortfall it repairs is fits that WALKED,
+  which is a property of the target. `A(x,y) = s` (or a local
   scale spline when `localScale` is on: M4c, ruling R-M4c-8 — the
   residuals `z_k − s` of the pairs RCR kept, at their reference positions,
   fitted with an approximating thin-plate spline, smoothing `5·σ_z`, nodes
   grid-stratified and capped at 600, then `A(x,y) = s + spline(x,y)`
-  sampled at every grid node; `s` stands alone when fewer than 40 pairs
-  survive RCR, when the spline cannot be fitted, or when the sampled
+  sampled at every grid node; `s` stands alone when fewer than 40 DISTINCT
+  reference stars survive RCR (counted after the reference-index dedupe a
+  one-way match makes necessary), when the spline cannot be fitted, or when
+  the sampled
   surface leaves a ±25 % band around `s` — each of those says so at
   `warn`, and none of them produces a partially-clamped grid),
   `B(x,y) = B_ref − A·B_tgt`, sampled on the

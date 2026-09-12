@@ -54,9 +54,24 @@ pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
 pub use scale::{
     relative_scale, relative_scale_against, PreparedReferenceChannel, ScaleResult,
-    LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MAX_DEVIATION, LN_LOCAL_SCALE_MIN_STARS,
-    LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
+    LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS, LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
+
+/// Safety band on the SAMPLED local-scale surface, as a fraction of the
+/// global scale `s` (an addition to ruling R-M4c-8's own wording): a
+/// flat-field residual that moves the relative scale by more than a
+/// quarter of `s` between two corners of the same frame is not a
+/// flat-field residual — it is a spline that left its node cloud or a fit
+/// that went wrong. Such a surface is refused as a whole and the channel
+/// keeps the constant `A = s`, loudly. Real vignetting-driven residuals
+/// are a few percent, so this is an order of magnitude of headroom, not a
+/// working limit.
+///
+/// It lives here, beside [`a_grid`], and not next to the other
+/// local-scale constants in [`scale`] (review m5): the band is a property
+/// of the SAMPLED grid, which is this module's job — `scale` never sees a
+/// grid, only the spline it hands over.
+pub const LN_LOCAL_SCALE_MAX_DEVIATION: f64 = 0.25;
 
 /// Local-normalization errors shared by every M2 task past detection: a
 /// frame that cannot be trusted for LN (too few matched stars — see
@@ -157,23 +172,36 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 /// convention), which is where the `B` term and the band loop's B-spline
 /// both read it.
 ///
+/// The trailing node on each axis overshoots the plane by design
+/// (`LnGrid::node_count` makes the mesh REACH the last pixel, so its last
+/// address can sit up to `stride − 1` past it) and is **clamped into the
+/// plane before the spline is evaluated** — the identical rule
+/// [`background::background_grid`] applies to that same node's own cell
+/// window, and the one `examples/ln_probe.rs` reads the mesh back with
+/// (review m7). `A` and `B` are therefore measured at the same pixel at
+/// every node, including the trailing one, and the spline is never asked
+/// for a position its own node cloud could not have covered.
+///
 /// The returned flag says whether the spline was actually used. It is
 /// `false` for `local: None` and ALSO when the sampled surface left the
-/// safety band [`scale::LN_LOCAL_SCALE_MAX_DEVIATION`] defines around
-/// `scale` (or produced a non-finite node): such a surface is refused as a
-/// whole — a partially-clamped `A` grid would be a quiet lie about what
-/// was measured — and the channel keeps the constant `A = scale`, which
-/// the caller logs.
+/// safety band [`LN_LOCAL_SCALE_MAX_DEVIATION`] defines around `scale` (or
+/// produced a non-finite node): such a surface is refused as a whole — a
+/// partially-clamped `A` grid would be a quiet lie about what was measured
+/// — and the channel keeps the constant `A = scale`, which the caller
+/// logs.
 ///
 /// With no spline the grid is `vec![scale as f32; gw·gh]`, bit-for-bit
 /// what M2/M3/M4a wrote, which is what keeps every LN pin passing while
 /// `localScale` is off.
+#[allow(clippy::too_many_arguments)]
 fn a_grid(
     local: Option<&ThinPlateSpline>,
     scale: f64,
     gw: usize,
     gh: usize,
     stride: usize,
+    ref_width: usize,
+    ref_height: usize,
 ) -> (Vec<f32>, bool) {
     let constant = || (vec![scale as f32; gw * gh], false);
     let Some(spline) = local else {
@@ -182,9 +210,9 @@ fn a_grid(
     let band = LN_LOCAL_SCALE_MAX_DEVIATION * scale.abs();
     let mut a = Vec::with_capacity(gw * gh);
     for j in 0..gh {
-        let y = (j * stride) as f64;
+        let y = (j * stride).min(ref_height.saturating_sub(1)) as f64;
         for i in 0..gw {
-            let x = (i * stride) as f64;
+            let x = (i * stride).min(ref_width.saturating_sub(1)) as f64;
             let v = scale + spline.displacement(x, y).0;
             if !v.is_finite() || (v - scale).abs() > band {
                 return constant();
@@ -493,6 +521,8 @@ pub fn normalize_frame(
             expected_gw,
             expected_gh,
             stride,
+            reference.width,
+            reference.height,
         );
         if let Some(spline) = scale_result.local.as_ref() {
             if local_used {
@@ -642,7 +672,7 @@ mod tests {
     #[test]
     fn a_grid_without_a_spline_is_the_constant_global_scale() {
         let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
-        let (a, used) = a_grid(None, TEST_SCALE, gw, gh, GRID_STRIDE);
+        let (a, used) = a_grid(None, TEST_SCALE, gw, gh, GRID_STRIDE, GRID_W, GRID_H);
         assert!(!used, "no spline means no local scale");
         assert_eq!(a.len(), gw * gh);
         assert!(
@@ -658,7 +688,15 @@ mod tests {
     fn a_grid_follows_the_spline_at_the_left_centre_and_right_columns() {
         let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
         let spline = linear_residual_spline(1.0);
-        let (a, used) = a_grid(Some(&spline), TEST_SCALE, gw, gh, GRID_STRIDE);
+        let (a, used) = a_grid(
+            Some(&spline),
+            TEST_SCALE,
+            gw,
+            gh,
+            GRID_STRIDE,
+            GRID_W,
+            GRID_H,
+        );
         assert!(used, "the sampled surface is well inside the safety band");
 
         let row = gh / 2;
@@ -689,7 +727,15 @@ mod tests {
         // 30x the residual above puts the edges at ±0.525 of a 0.835
         // scale, far past `LN_LOCAL_SCALE_MAX_DEVIATION` (0.25).
         let spline = linear_residual_spline(30.0);
-        let (a, used) = a_grid(Some(&spline), TEST_SCALE, gw, gh, GRID_STRIDE);
+        let (a, used) = a_grid(
+            Some(&spline),
+            TEST_SCALE,
+            gw,
+            gh,
+            GRID_STRIDE,
+            GRID_W,
+            GRID_H,
+        );
         assert!(!used, "the surface left the band and must be refused");
         assert!(
             a.iter().all(|&v| v == TEST_SCALE as f32),
