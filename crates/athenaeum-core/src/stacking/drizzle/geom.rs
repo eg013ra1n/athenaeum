@@ -12,7 +12,7 @@
 //! `[x − 0.5, x + 0.5] × [y − 0.5, y + 0.5]` — on both the subject/reference
 //! side and the output-grid side.
 
-use crate::geometry::pixel_map::PixelMap;
+use crate::geometry::pixel_map::ForwardEval;
 use crate::stacking::config::DrizzleKernel;
 
 /// A convex quadrilateral in output-grid coordinates, vertex order matching
@@ -93,14 +93,19 @@ pub fn drop_corners(x: usize, y: usize, drop_shrink: f64) -> [(f64, f64); 4] {
 /// Signed-area orientation fix: [`clip_area`] assumes a counter-clockwise
 /// polygon; a flipped `PixelMap` mirrors the quad, so this reverses the
 /// vertex order when the shoelace area of the mapped quad is negative.
+/// `fwd` is the frame's captured forward evaluator
+/// ([`PixelMap::forward_eval`]), taken once per frame rather than per
+/// corner: this runs four times for every source pixel of every frame,
+/// so a cache lock in here would be four locks per pixel (ruling
+/// R-T4-6b).
 pub fn map_drop(
-    map: &PixelMap,
+    fwd: &ForwardEval<'_>,
     corners: &[(f64, f64); 4],
     scale: u32,
 ) -> Option<(Quad, (i64, i64, i64, i64))> {
     let mut quad: Quad = [(0.0, 0.0); 4];
     for (i, &(sx, sy)) in corners.iter().enumerate() {
-        let (u, v) = map.forward(sx, sy);
+        let (u, v) = fwd.at(sx, sy);
         let ox = to_output(u, scale);
         let oy = to_output(v, scale);
         if !ox.is_finite() || !oy.is_finite() {
@@ -405,7 +410,7 @@ mod tests {
     fn identity_scale1_drop_lands_exactly_on_its_own_pixel() {
         let map = identity_map();
         let corners = drop_corners(3, 4, 1.0);
-        let (quad, _bbox) = map_drop(&map, &corners, 1).expect("finite map");
+        let (quad, _bbox) = map_drop(&map.forward_eval(), &corners, 1).expect("finite map");
         let area_here = clip_area(&quad, 3, 4);
         assert!((area_here - 1.0).abs() < 1e-12, "area_here={area_here}");
         let area_neighbor = clip_area(&quad, 4, 4);
@@ -418,7 +423,7 @@ mod tests {
         let map = identity_map();
         for (drop_shrink, expected) in [(1.0, 1.0), (0.5, 0.25)] {
             let corners = drop_corners(0, 0, drop_shrink);
-            let (quad, bbox) = map_drop(&map, &corners, 2).expect("finite map");
+            let (quad, bbox) = map_drop(&map.forward_eval(), &corners, 2).expect("finite map");
             assert_eq!(bbox, (0, 0, 1, 1), "drop_shrink={drop_shrink}");
             let mut total = 0.0;
             for (px, py) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
@@ -439,7 +444,7 @@ mod tests {
     fn translation_drop_bbox_excludes_boundary_touching_pixels() {
         let map = translation_map(0.5, 0.0);
         let corners = drop_corners(0, 0, 1.0);
-        let (quad, bbox) = map_drop(&map, &corners, 2).expect("finite map");
+        let (quad, bbox) = map_drop(&map.forward_eval(), &corners, 2).expect("finite map");
         assert_eq!(bbox, (1, 0, 2, 1));
         for row in [0i64, 1] {
             let a1 = clip_area(&quad, 1, row);
@@ -456,7 +461,8 @@ mod tests {
     fn rotation_conserves_area_over_the_bbox() {
         let map = rotation_map(30.0);
         let corners = drop_corners(5, 5, 0.9);
-        let (quad, (x_min, y_min, x_max, y_max)) = map_drop(&map, &corners, 1).expect("finite map");
+        let (quad, (x_min, y_min, x_max, y_max)) =
+            map_drop(&map.forward_eval(), &corners, 1).expect("finite map");
         let mut total = 0.0;
         for py in y_min..=y_max {
             for px in x_min..=x_max {
@@ -492,7 +498,8 @@ mod tests {
         );
 
         let corners = drop_corners(5, 5, 0.9);
-        let (quad, (x_min, y_min, x_max, y_max)) = map_drop(&map, &corners, 1).expect("finite map");
+        let (quad, (x_min, y_min, x_max, y_max)) =
+            map_drop(&map.forward_eval(), &corners, 1).expect("finite map");
         assert!(
             signed_area(&quad) > 0.0,
             "expected a CCW quad after the flip fix"
@@ -623,6 +630,6 @@ mod tests {
         assert!(u.is_nan(), "expected a genuine 0/0 NaN, got {u}");
 
         let corners = drop_corners(0, 0, 2.0); // corner (x - h, y - h) = (-1, -1)
-        assert_eq!(map_drop(&map, &corners, 1), None);
+        assert_eq!(map_drop(&map.forward_eval(), &corners, 1), None);
     }
 }

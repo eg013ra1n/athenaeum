@@ -211,6 +211,23 @@ registration's residual statistics, star re-pairing, a coverage probe, a band's
 source window in the other direction — calls `forward_exact` / `inverse_exact`
 and builds nothing.
 
+**A grid never outlives the stage's per-frame work** (ruling R-T4-6). Every
+stage that resamples a frame releases its grid when that frame is done — the
+registration writer after it writes, `RegisteredSource`'s `Drop` for
+integration and both of local normalization's warps, drizzle after each frame's
+deposit — and because the clones share ONE cache, releasing through any of them
+frees it for all. Pixel loops take a HANDLE once per band or per frame
+(`PixelMap::forward_eval` / `inverse_eval`, `InverseMap::inverse_burst`) and
+sample through it: no lock and no atomic per pixel, and a release during a
+running band cannot pull the data out from under it. The cost of that is honest
+and bounded: a `tps` frame rebuilds its grid once per stage that resamples it
+(≈ 1 s each on a 26 Mpx frame, so three to four builds per frame more than a
+polynomial run), in exchange for never holding more than a few grids at once.
+Without it, acceptance run 27 (208 mono frames at 6224×4168, LN on, drizzle 2×)
+integrated in 11 minutes and then sat at 0 % CPU for 2.7 hours with 11.3 of
+12 GB of swap in use — every frame's inverse grid alive from registration
+onward, plus a forward grid each in drizzle.
+
 **A spline's reported RMS is a hold-out measurement** (ruling R-T4-4). At the
 default `λ = 0` the spline interpolates its own nodes, so measuring
 `registration_results.rms_residual_px` there would report a solver artefact and

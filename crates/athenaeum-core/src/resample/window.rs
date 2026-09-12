@@ -37,8 +37,11 @@ pub fn source_window(
     let bottom = (y0 + rows) as f64 - 0.5;
     let mut ymin = f64::INFINITY;
     let mut ymax = f64::NEG_INFINITY;
+    // Ruling R-T4-6b: one evaluator for the whole probe, not one cache
+    // lock per sample.
+    let at = map.inverse_burst();
     let mut visit = |x: f64, y: f64| {
-        let (_, sy) = map.inverse(x, y);
+        let (_, sy) = at(x, y);
         if sy.is_finite() {
             ymin = ymin.min(sy);
             ymax = ymax.max(sy);

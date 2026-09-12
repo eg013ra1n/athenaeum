@@ -4,7 +4,7 @@
 //! thin-plate spline ([`super::tps`]). Serialized as the `transform_json`
 //! of `registration_results` (spec §9.1).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use rayon::prelude::*;
 use serde::de::Error as _;
@@ -18,6 +18,19 @@ use super::tps::{ThinPlateSpline, TPS_GRID_PX};
 /// needs.
 pub trait InverseMap: Sync {
     fn inverse(&self, x: f64, y: f64) -> (f64, f64);
+
+    /// An evaluator for a BURST of queries — one band, one row, one
+    /// window probe (ruling R-T4-6b).
+    ///
+    /// The default is `self.inverse` per call, which is what every map
+    /// without a cache wants. [`PixelMap`] overrides it to capture its
+    /// displacement-grid handle ONCE, so a million-pixel warp neither
+    /// takes the cache lock per pixel nor can have its grid released out
+    /// from under it mid-band. The `Box` costs one allocation per burst
+    /// and the call costs exactly what `&dyn InverseMap` already cost.
+    fn inverse_burst(&self) -> Box<dyn Fn(f64, f64) -> (f64, f64) + Send + Sync + '_> {
+        Box::new(move |x, y| self.inverse(x, y))
+    }
 }
 
 impl InverseMap for Linear {
@@ -49,7 +62,12 @@ impl InverseMap for Linear {
 ///
 /// Never serialized: `transform_json` stores the splines, and the grid is
 /// rebuilt lazily on first use.
-#[derive(Clone, Debug)]
+///
+/// NOT `Clone`, deliberately: the whole point of the cache is that one
+/// grid is shared through an `Arc`, and a `Clone` would let a caller
+/// silently reintroduce the per-map copy ruling R-T4-3b removed (and
+/// would break the alive-grid accounting below).
+#[derive(Debug)]
 pub struct TpsGrid {
     /// Sample origin (the domain's lower corner) in reference pixels.
     x0: f64,
@@ -121,20 +139,85 @@ impl TpsGrid {
         (lerp(dx_top, dx_bot, ty), lerp(dy_top, dy_bot, ty))
     }
 
-    /// Samples in this grid — the allocation a clone of a `PixelMap` no
-    /// longer duplicates (ruling R-T4-3b).
-    pub fn len(&self) -> usize {
-        self.samples.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
+    /// Bytes this grid's samples occupy — what
+    /// [`PixelMap::release_grids`] gives back, and what a stage's memory
+    /// budget is counted in.
+    pub fn bytes(&self) -> usize {
+        self.samples.len() * std::mem::size_of::<(f32, f32)>()
     }
 }
 
+/// How many displacement grids exist RIGHT NOW, and the most that ever
+/// existed at once (test builds only).
+///
+/// This is the instrument ruling R-T4-6d's run-level pin reads: a `tps`
+/// run's memory problem is not how many grids it builds over its life
+/// (rebuilding is cheap and expected) but how many are resident at the
+/// same moment — 208 of them, at ~8.6 MB each, is what thrashed the
+/// acceptance machine. `ALIVE` is decremented by [`TpsGrid`]'s own
+/// `Drop`, so it counts grids however they go away: an explicit
+/// [`PixelMap::release_grids`], or the last handle simply falling out of
+/// scope.
+#[cfg(test)]
+pub(crate) mod grid_counters {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static BUILDS: AtomicUsize = AtomicUsize::new(0);
+    pub static ALIVE: AtomicUsize = AtomicUsize::new(0);
+    pub static PEAK_ALIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn on_build() {
+        BUILDS.fetch_add(1, Ordering::Relaxed);
+        let now = ALIVE.fetch_add(1, Ordering::Relaxed) + 1;
+        PEAK_ALIVE.fetch_max(now, Ordering::Relaxed);
+    }
+
+    pub(super) fn on_drop() {
+        ALIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Zeroes every counter — a test that measures a run calls this first.
+    /// Tests that share a process must not measure concurrently; the run
+    /// pins that use this are `#[serial]`-shaped by construction (one run
+    /// thread at a time).
+    pub fn reset() {
+        BUILDS.store(0, Ordering::Relaxed);
+        ALIVE.store(0, Ordering::Relaxed);
+        PEAK_ALIVE.store(0, Ordering::Relaxed);
+    }
+
+    pub fn snapshot() -> (usize, usize, usize) {
+        (
+            BUILDS.load(Ordering::Relaxed),
+            ALIVE.load(Ordering::Relaxed),
+            PEAK_ALIVE.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for TpsGrid {
+    fn drop(&mut self) {
+        grid_counters::on_drop();
+    }
+}
+
+/// One direction's cache slot: empty, or holding a built grid every
+/// clone of the map shares.
+///
+/// `RwLock<Option<Arc<…>>>` rather than a `OnceLock` because a built grid
+/// must be RELEASABLE (ruling R-T4-6) and a `OnceLock` cannot be reset.
+/// The `Arc` inside is what keeps the per-pixel path off the lock: a
+/// caller takes ONE handle for a row or a band
+/// ([`PixelMap::inverse_burst`], [`PixelMap::forward_eval`]) and samples
+/// through it, so a release during that burst frees the slot while the
+/// burst's own handle keeps its grid alive to the end.
+type GridSlot = RwLock<Option<Arc<TpsGrid>>>;
+
 /// The two lazily-built displacement grids of one spline pair, shared by
 /// every clone of the [`PixelMap`] that owns them (fix round 1, ruling
-/// R-T4-3b/c).
+/// R-T4-3b/c) and releasable through any of them (fix round 2, ruling
+/// R-T4-6).
 ///
 /// `Clone` on a `OnceLock<TpsGrid>` COPIES the built grid, and a
 /// registered frame's map is cloned into run state five times over
@@ -147,8 +230,124 @@ impl TpsGrid {
 /// drizzle only for `forward`, and neither should pay for the other.
 #[derive(Debug, Default)]
 pub struct TpsGrids {
-    forward: OnceLock<TpsGrid>,
-    inverse: OnceLock<TpsGrid>,
+    forward: GridSlot,
+    inverse: GridSlot,
+}
+
+impl TpsGrids {
+    /// The slot's grid, built through `build` on first use. Read-locked
+    /// on the hot path (every subsequent burst), write-locked only to
+    /// install a freshly built grid — and the double check inside the
+    /// write lock means two threads racing a rebuild install one grid,
+    /// not two.
+    fn get_or_build(slot: &GridSlot, build: impl FnOnce() -> TpsGrid) -> Arc<TpsGrid> {
+        if let Some(g) = slot.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return Arc::clone(g);
+        }
+        let mut w = slot.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(g) = w.as_ref() {
+            return Arc::clone(g);
+        }
+        let g = Arc::new(build());
+        #[cfg(test)]
+        grid_counters::on_build();
+        *w = Some(Arc::clone(&g));
+        g
+    }
+}
+
+/// Which way an [`EvalLayer`] is being asked to displace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Direction {
+    Forward,
+    Inverse,
+}
+
+/// One direction's distortion, resolved once for a burst of pixel
+/// queries (ruling R-T4-6b).
+///
+/// The spline arm holds an `Arc<TpsGrid>`: taken once when the evaluator
+/// is built, so the per-pixel path is a bounds-checked slice read and
+/// nothing else — and so a [`PixelMap::release_grids`] on another thread
+/// cannot free the grid this burst is reading.
+enum EvalLayer<'a> {
+    None,
+    Polynomial(&'a Distortion, Direction),
+    Grid(Arc<TpsGrid>),
+}
+
+impl<'a> EvalLayer<'a> {
+    fn of(distortion: Option<&'a DistortionModel>, dir: Direction) -> EvalLayer<'a> {
+        match distortion {
+            None => EvalLayer::None,
+            Some(DistortionModel::Polynomial(d)) => EvalLayer::Polynomial(d, dir),
+            Some(model @ DistortionModel::Tps { .. }) => {
+                let grid = match dir {
+                    Direction::Forward => model.forward_grid(),
+                    Direction::Inverse => model.inverse_grid(),
+                };
+                match grid {
+                    Some(g) => EvalLayer::Grid(g),
+                    // Unreachable: the spline arm always returns a grid.
+                    None => EvalLayer::None,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn displacement(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            EvalLayer::None => (0.0, 0.0),
+            EvalLayer::Polynomial(d, Direction::Forward) => d.forward_displacement(x, y),
+            EvalLayer::Polynomial(d, Direction::Inverse) => d.inverse_displacement(x, y),
+            EvalLayer::Grid(g) => g.displacement_at(x, y),
+        }
+    }
+}
+
+/// Subject → reference, with the displacement grid captured — see
+/// [`PixelMap::forward_eval`].
+pub struct ForwardEval<'a> {
+    linear: &'a Linear,
+    layer: EvalLayer<'a>,
+}
+
+impl ForwardEval<'_> {
+    /// Byte-identical to [`PixelMap::forward`] for every arm.
+    #[inline]
+    pub fn at(&self, x: f64, y: f64) -> (f64, f64) {
+        let (px, py) = self.linear.apply(x, y);
+        match &self.layer {
+            EvalLayer::None => (px, py),
+            layer => {
+                let (dx, dy) = layer.displacement(px, py);
+                (px + dx, py + dy)
+            }
+        }
+    }
+}
+
+/// Reference → subject, with the displacement grid captured — see
+/// [`PixelMap::inverse_eval`].
+pub struct InverseEval<'a> {
+    linear_inv: &'a Linear,
+    layer: EvalLayer<'a>,
+}
+
+impl InverseEval<'_> {
+    /// Byte-identical to [`PixelMap::inverse`] for every arm.
+    #[inline]
+    pub fn at(&self, x: f64, y: f64) -> (f64, f64) {
+        let (rx, ry) = match &self.layer {
+            EvalLayer::None => (x, y),
+            layer => {
+                let (dx, dy) = layer.displacement(x, y);
+                (x + dx, y + dy)
+            }
+        };
+        self.linear_inv.apply(rx, ry)
+    }
 }
 
 /// The distortion layer sitting on top of a [`PixelMap`]'s linear model
@@ -312,41 +511,89 @@ impl DistortionModel {
         )
     }
 
-    /// Forward displacement (pixels) at reference-space point `(x, y)` —
-    /// the linear model's output. **The PIXEL path**: for a spline this
-    /// builds and reads the forward displacement grid.
-    #[inline]
-    pub fn forward_displacement(&self, x: f64, y: f64) -> (f64, f64) {
+    /// The forward displacement grid, built on first use. **Take this
+    /// ONCE per row or per band** and sample through the handle — calling
+    /// it per pixel pays a lock and an atomic refcount per pixel, which is
+    /// exactly what ruling R-T4-6(b) forbids. `None` for the polynomial
+    /// arm, which has no grid.
+    pub fn forward_grid(&self) -> Option<Arc<TpsGrid>> {
         match self {
-            DistortionModel::Polynomial(d) => d.forward_displacement(x, y),
+            DistortionModel::Polynomial(_) => None,
             DistortionModel::Tps {
                 forward,
                 domain,
                 grids,
                 ..
-            } => grids
-                .forward
-                .get_or_init(|| TpsGrid::build(forward, *domain))
-                .displacement_at(x, y),
+            } => Some(TpsGrids::get_or_build(&grids.forward, || {
+                TpsGrid::build(forward, *domain)
+            })),
         }
     }
 
-    /// Inverse displacement (pixels) at reference pixel `(x, y)`. **The
-    /// PIXEL path**: for a spline this builds and reads the inverse
-    /// displacement grid.
-    #[inline]
-    pub fn inverse_displacement(&self, x: f64, y: f64) -> (f64, f64) {
+    /// The inverse displacement grid, built on first use — see
+    /// [`DistortionModel::forward_grid`] for how often to ask.
+    pub fn inverse_grid(&self) -> Option<Arc<TpsGrid>> {
         match self {
-            DistortionModel::Polynomial(d) => d.inverse_displacement(x, y),
+            DistortionModel::Polynomial(_) => None,
             DistortionModel::Tps {
                 inverse,
                 domain,
                 grids,
                 ..
-            } => grids
-                .inverse
-                .get_or_init(|| TpsGrid::build(inverse, *domain))
-                .displacement_at(x, y),
+            } => Some(TpsGrids::get_or_build(&grids.inverse, || {
+                TpsGrid::build(inverse, *domain)
+            })),
+        }
+    }
+
+    /// Drops both directions' built grids, for every clone of this model
+    /// (ruling R-T4-6a): they share one cache, so releasing through any
+    /// handle frees it for all of them. A burst that is still running
+    /// holds its own `Arc` and finishes on the grid it started with; the
+    /// next request after that rebuilds.
+    ///
+    /// Returns the bytes freed — 0 when nothing was built, and 0 for the
+    /// polynomial arm.
+    pub fn release_grids(&self) -> usize {
+        let DistortionModel::Tps { grids, .. } = self else {
+            return 0;
+        };
+        let mut freed = 0;
+        for slot in [&grids.forward, &grids.inverse] {
+            if let Some(g) = slot.write().unwrap_or_else(|e| e.into_inner()).take() {
+                freed += g.bytes();
+            }
+        }
+        freed
+    }
+
+    /// Forward displacement (pixels) at reference-space point `(x, y)` —
+    /// the linear model's output. **The PIXEL path**, and the SLOW way to
+    /// walk it: every call takes the cache lock. Kept for one-off queries
+    /// and for the tests that pin grid-vs-exact agreement; a loop over
+    /// pixels wants [`PixelMap::forward_eval`].
+    #[inline]
+    pub fn forward_displacement(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            DistortionModel::Polynomial(d) => d.forward_displacement(x, y),
+            DistortionModel::Tps { .. } => self
+                .forward_grid()
+                .map(|g| g.displacement_at(x, y))
+                .unwrap_or((0.0, 0.0)),
+        }
+    }
+
+    /// Inverse displacement (pixels) at reference pixel `(x, y)` — see
+    /// [`DistortionModel::forward_displacement`] on why a pixel loop wants
+    /// a handle instead.
+    #[inline]
+    pub fn inverse_displacement(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            DistortionModel::Polynomial(d) => d.inverse_displacement(x, y),
+            DistortionModel::Tps { .. } => self
+                .inverse_grid()
+                .map(|g| g.displacement_at(x, y))
+                .unwrap_or((0.0, 0.0)),
         }
     }
 
@@ -394,7 +641,9 @@ impl DistortionModel {
         match self {
             DistortionModel::Polynomial(_) => (false, false),
             DistortionModel::Tps { grids, .. } => {
-                (grids.forward.get().is_some(), grids.inverse.get().is_some())
+                let built =
+                    |slot: &GridSlot| slot.read().unwrap_or_else(|e| e.into_inner()).is_some();
+                (built(&grids.forward), built(&grids.inverse))
             }
         }
     }
@@ -441,10 +690,50 @@ impl PixelMap {
         })
     }
 
+    /// A forward evaluator that holds this map's displacement-grid handle
+    /// for its whole lifetime (ruling R-T4-6b).
+    ///
+    /// **This is what a pixel loop takes** — once per frame, row or band —
+    /// and then calls [`ForwardEval::at`] per pixel: no lock, no atomic,
+    /// no `match` on the cache. It also pins the grid it captured against
+    /// a concurrent [`PixelMap::release_grids`], so a release can never
+    /// pull the data out from under a running deposit.
+    pub fn forward_eval(&self) -> ForwardEval<'_> {
+        ForwardEval {
+            linear: &self.linear,
+            layer: EvalLayer::of(self.distortion.as_ref(), Direction::Forward),
+        }
+    }
+
+    /// The reverse direction of [`PixelMap::forward_eval`] — reference
+    /// pixel → subject pixel, the gather-style resampler's direction.
+    pub fn inverse_eval(&self) -> InverseEval<'_> {
+        InverseEval {
+            linear_inv: &self.linear_inv,
+            layer: EvalLayer::of(self.distortion.as_ref(), Direction::Inverse),
+        }
+    }
+
+    /// Drops this map's built displacement grids (ruling R-T4-6a),
+    /// returning the bytes freed. A no-op for a linear or polynomial map,
+    /// which have no grids.
+    ///
+    /// Every clone of a map shares ONE cache, so this frees the grid for
+    /// all of them — which is the point: a registered frame's map lives in
+    /// five places at once, and a stage that has finished resampling that
+    /// frame should not leave 8.6 MB per direction behind in any of them.
+    /// The next pixel request rebuilds lazily (≈ 1 s on a 26 Mpx frame).
+    pub fn release_grids(&self) -> usize {
+        self.distortion
+            .as_ref()
+            .map_or(0, DistortionModel::release_grids)
+    }
+
     /// Subject pixel → reference pixel. **The PIXEL path** — for a
     /// thin-plate spline this reads (and, on the first call, builds) the
-    /// forward displacement grid. A caller that evaluates the map a few
-    /// hundred times rather than a few million wants
+    /// forward displacement grid, taking the cache lock to do it. A loop
+    /// over pixels wants [`PixelMap::forward_eval`]; a caller that
+    /// evaluates the map a few hundred times wants
     /// [`PixelMap::forward_exact`] (ruling R-T4-3a).
     #[inline]
     pub fn forward(&self, x: f64, y: f64) -> (f64, f64) {
@@ -536,6 +825,13 @@ impl InverseMap for PixelMap {
     fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
         PixelMap::inverse(self, x, y)
     }
+
+    /// Captures the inverse displacement grid once for the burst (ruling
+    /// R-T4-6b) — the whole reason the trait has this method.
+    fn inverse_burst(&self) -> Box<dyn Fn(f64, f64) -> (f64, f64) + Send + Sync + '_> {
+        let eval = self.inverse_eval();
+        Box::new(move |x, y| eval.at(x, y))
+    }
 }
 
 #[cfg(test)]
@@ -624,6 +920,114 @@ mod tests {
         // …and then the forward one, when something finally asks.
         map.forward(400.0, 300.0);
         assert_eq!(d().grids_built(), (true, true));
+    }
+
+    /// Ruling R-T4-6a: a release through ONE clone frees the grid every
+    /// other clone sees, and the next pixel request rebuilds it. This is
+    /// the whole mechanism the stages lean on — a registered frame's map
+    /// lives in five places at once, so a release that only emptied the
+    /// handle it was called on would free nothing at all.
+    #[test]
+    fn releasing_through_one_clone_frees_the_grid_for_every_clone() {
+        let map = PixelMap::with_distortion_model(Linear::identity(), tps_model(26, 60)).unwrap();
+        let clone = map.clone();
+        map.inverse(100.0, 100.0);
+        clone.forward(100.0, 100.0);
+        assert_eq!(map.distortion.as_ref().unwrap().grids_built(), (true, true));
+
+        // Released through the CLONE, observed on the original.
+        let freed = clone.release_grids();
+        assert!(freed > 0, "release must report the bytes it gave back");
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false),
+            "one cache: a release through any handle frees it for all"
+        );
+        assert_eq!(clone.release_grids(), 0, "releasing twice frees nothing");
+
+        // The values are unchanged after the rebuild — a release is a
+        // memory decision, never a numeric one.
+        let before = {
+            let m2 =
+                PixelMap::with_distortion_model(Linear::identity(), tps_model(26, 60)).unwrap();
+            m2.inverse(311.0, 222.0)
+        };
+        let after = map.inverse(311.0, 222.0);
+        assert_eq!(before, after);
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, true)
+        );
+
+        // A burst taken BEFORE the release keeps working on the grid it
+        // captured (ruling R-T4-6b): the handle owns an `Arc`, so the
+        // release empties the slot without freeing the data underneath a
+        // running band.
+        let eval = map.inverse_eval();
+        map.release_grids();
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false)
+        );
+        assert_eq!(eval.at(311.0, 222.0), after, "the burst survives a release");
+
+        // Linear and polynomial maps have nothing to release.
+        assert_eq!(
+            PixelMap::linear(Linear::identity())
+                .unwrap()
+                .release_grids(),
+            0
+        );
+    }
+
+    /// Ruling R-T4-6b: the burst evaluators agree with the one-off pixel
+    /// path exactly — they are the same arithmetic with the grid lookup
+    /// hoisted, for every arm.
+    #[test]
+    fn the_burst_evaluators_match_the_one_off_pixel_path() {
+        let linear = Linear {
+            kind: LinearKind::Homography,
+            m: [
+                [0.998, 0.021, -11.5],
+                [-0.021, 0.998, 31.25],
+                [2.1e-8, -1.0e-8, 1.0],
+            ],
+        };
+        let poly = Distortion {
+            order: 2,
+            center: (500.0, 400.0),
+            scale: 500.0,
+            domain: Some([-1.2, -1.2, 1.2, 1.2]),
+            forward: Polynomial2D {
+                order: 2,
+                ax: vec![0.3, -0.2, 0.1],
+                ay: vec![-0.1, 0.25, 0.05],
+            },
+            inverse: Polynomial2D {
+                order: 2,
+                ax: vec![-0.3, 0.2, -0.1],
+                ay: vec![0.1, -0.25, -0.05],
+            },
+        };
+        let maps = [
+            PixelMap::linear(linear).unwrap(),
+            PixelMap::with_distortion(linear, poly).unwrap(),
+            PixelMap::with_distortion_model(linear, tps_model(27, 80)).unwrap(),
+        ];
+        let mut rng = SplitMix64(31337);
+        for map in &maps {
+            let fwd = map.forward_eval();
+            let inv = map.inverse_eval();
+            for _ in 0..200 {
+                let (x, y) = (rng.next_f64() * TW, rng.next_f64() * TH);
+                assert_eq!(fwd.at(x, y), map.forward(x, y));
+                assert_eq!(inv.at(x, y), map.inverse(x, y));
+                // `InverseMap::inverse_burst` is the trait-object route
+                // the resampler takes; same numbers.
+                let burst = map.inverse_burst();
+                assert_eq!(burst(x, y), map.inverse(x, y));
+            }
+        }
     }
 
     /// Ruling R-T4-3b: a clone SHARES the grids rather than copying them.

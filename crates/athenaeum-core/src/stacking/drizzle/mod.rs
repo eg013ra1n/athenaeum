@@ -25,7 +25,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::geometry::PixelMap;
+use crate::geometry::{ForwardEval, PixelMap};
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::NormalizationPair;
 use crate::integration::IntegrationError;
@@ -277,7 +277,14 @@ struct FrameDepositCtx<'a> {
     /// sized regardless of this frame's own `src_width`/`src_height`.
     ref_width: usize,
     ref_height: usize,
+    /// Subject → reference, for the sparse band-window probe (which asks
+    /// the INVERSE direction and goes through the exact path).
     map: &'a PixelMap,
+    /// The frame's forward evaluator, built ONCE per (frame, plane) and
+    /// shared by every band (ruling R-T4-6b): the deposit calls it twice
+    /// per source pixel plus four times per drop corner, so a cache lock
+    /// in there would be six locks per pixel.
+    fwd: ForwardEval<'a>,
     scale: u32,
     drop_shrink: f64,
     kernel: DrizzleKernel,
@@ -397,6 +404,10 @@ pub fn drizzle_group(
     // a few hundred frames.
     let mut read_duration_total = std::time::Duration::ZERO;
     let mut deposit_duration_total = std::time::Duration::ZERO;
+    // Displacement-grid bytes handed back after each frame's deposit
+    // (ruling R-T4-6c) — reported on the stage's finish event so a `tps`
+    // run's grid churn is visible without a profiler.
+    let mut released_bytes = 0u64;
     let mut bytes_read_total = 0u64;
 
     // Reused across every (frame, plane) pair that needs local
@@ -529,6 +540,7 @@ pub fn drizzle_group(
                 ref_width: input.width,
                 ref_height: input.height,
                 map: frame.map,
+                fwd: frame.map.forward_eval(),
                 scale: input.scale,
                 drop_shrink: input.drop_shrink,
                 kernel: input.kernel,
@@ -551,6 +563,16 @@ pub fn drizzle_group(
                     });
             });
             deposit_duration_total += deposit_start.elapsed();
+            // Ruling R-T4-6c: this frame's pixel work is done for this
+            // plane, so its displacement grid goes back now. The plane
+            // loop is the OUTER one, so a frame's next plane is separated
+            // from this one by every other frame's deposit — holding the
+            // grid until then is exactly the "every frame's grid alive at
+            // once" shape that made a `tps` drizzle thrash. An OSC frame
+            // therefore rebuilds its forward grid once per plane; that is
+            // the documented cost of the spline arm.
+            drop(ctx);
+            released_bytes += frame.map.release_grids() as u64;
 
             done_units += 1;
             (progress.on_frame)(done_units, total_units);
@@ -626,6 +648,7 @@ pub fn drizzle_group(
         out_height = out_h,
         drizzle_scale = input.scale,
         frames = input.frames.len(),
+        grid_bytes_released = released_bytes,
         duration_ms = group_start.elapsed().as_millis() as u64,
         "drizzle group finished"
     );
@@ -798,7 +821,7 @@ fn deposit_band(
             if !d.is_finite() || d == 0.0 {
                 continue;
             }
-            let (u, v) = ctx.map.forward(x as f64, y as f64);
+            let (u, v) = ctx.fwd.at(x as f64, y as f64);
             if !u.is_finite() || !v.is_finite() {
                 continue;
             }
@@ -847,7 +870,7 @@ fn deposit_band(
             match ctx.kernel {
                 DrizzleKernel::Square => {
                     let corners = geom::drop_corners(x, y, ctx.drop_shrink);
-                    if let Some((quad, bbox)) = geom::map_drop(ctx.map, &corners, ctx.scale) {
+                    if let Some((quad, bbox)) = geom::map_drop(&ctx.fwd, &corners, ctx.scale) {
                         let (bx0, by0, bx1, by1) = bbox;
                         let px0 = bx0.max(0);
                         let px1 = bx1.min(out_w as i64 - 1);
@@ -874,7 +897,7 @@ fn deposit_band(
                         if wt <= 0.0 {
                             continue;
                         }
-                        let (u2, v2) = ctx.map.forward(x as f64 + dx, y as f64 + dy);
+                        let (u2, v2) = ctx.fwd.at(x as f64 + dx, y as f64 + dy);
                         if !u2.is_finite() || !v2.is_finite() {
                             continue;
                         }
@@ -1728,6 +1751,7 @@ mod tests {
             ref_width: width,
             ref_height: height,
             map: &map,
+            fwd: map.forward_eval(),
             scale,
             drop_shrink,
             kernel: DrizzleKernel::Square,
@@ -1751,6 +1775,7 @@ mod tests {
             ref_width: width,
             ref_height: height,
             map: &map,
+            fwd: map.forward_eval(),
             scale,
             drop_shrink,
             kernel: DrizzleKernel::Circle,

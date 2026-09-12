@@ -635,9 +635,13 @@ pub const TPS_MIN_NODE_SEPARATION_PX: f64 = 0.05;
 
 /// Splits `idx` into the nodes to fit on and the ones dropped for
 /// coinciding with an earlier node (see
-/// [`TPS_MIN_NODE_SEPARATION_PX`]), preserving `idx`'s order — so the
-/// grid-stratified priority [`select_nodes`] established survives, and
-/// the pair a cell picked first is the pair a cell keeps.
+/// [`TPS_MIN_NODE_SEPARATION_PX`]), preserving `idx`'s order — whatever
+/// priority [`select_nodes`] established survives, so of two coincident
+/// pairs the one that comes FIRST in that order wins: the better-σ pair
+/// of a cell when the node cap made `select_nodes` stratify, and simply
+/// the lower pair index when it did not (under the cap `select_nodes`
+/// returns `0..n` untouched, and there is no per-cell ranking to
+/// inherit).
 ///
 /// The dropped list matters beyond the fit: a dropped pair sits at (as
 /// good as) the same position as a node, so it is NOT a hold-out

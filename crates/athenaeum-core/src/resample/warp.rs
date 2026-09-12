@@ -140,12 +140,19 @@ pub fn warp_rows(
         rows * out_width,
         "warp_rows: out must be rows * out_width"
     );
+    // Ruling R-T4-6b: ONE evaluator for the whole band. For a spline map
+    // this captures the inverse displacement grid's handle here instead
+    // of taking the cache lock per pixel — and holds it, so a concurrent
+    // `release_grids` cannot free the grid these rows are reading. Every
+    // other map's `inverse_burst` is the default, i.e. exactly the
+    // `&dyn InverseMap` call this replaced.
+    let at = map.inverse_burst();
     out.par_chunks_mut(out_width)
         .enumerate()
         .for_each(|(r, row)| {
             let y = (y0 + r) as f64;
             for (x, o) in row.iter_mut().enumerate() {
-                let (sx, sy) = map.inverse(x as f64, y);
+                let (sx, sy) = at(x as f64, y);
                 *o = sample_at(src, sx, sy, interp, clamping);
             }
         });

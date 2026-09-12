@@ -85,9 +85,21 @@ pub enum DistortionChoice {
     Polynomial4,
     /// A regularized thin-plate spline over the refit inliers (M4c,
     /// ruling R-M4c-5): local by construction, so it follows a residual
-    /// field a global polynomial of order 2..=4 cannot — at the cost of a
-    /// dense solve and a cached displacement grid per frame. `Auto` never
+    /// field a global polynomial of order 2..=4 cannot. `Auto` never
     /// picks it; it is always a deliberate user choice.
+    ///
+    /// **What it costs** (ruling R-T4-6e). A spline cannot be evaluated
+    /// per pixel — 600 logarithms per query — so every stage that
+    /// RESAMPLES a frame builds an 8-px displacement grid for it first
+    /// (≈ 1 s and ≈ 8.6 MB per direction on a 26 Mpx frame) and hands it
+    /// back when that frame is done. A frame is resampled by the
+    /// registration writer, by local normalization, by integration and by
+    /// drizzle, so a `tps` run pays roughly three to four grid builds per
+    /// frame more than a polynomial run — and in exchange never holds
+    /// more than a few grids at once, however many frames the set has.
+    /// Registration itself pays nothing extra: its residual statistics,
+    /// its star re-pairing and the local distortion loop all evaluate the
+    /// spline exactly and build no grid at all.
     Tps,
     /// Order 3 for a subject whose geometry differs from the reference's,
     /// when the refit keeps at least `align::AUTO_DISTORTION_MIN_INLIERS`

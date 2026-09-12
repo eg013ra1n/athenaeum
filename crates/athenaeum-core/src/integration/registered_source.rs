@@ -89,6 +89,24 @@ impl RegisteredSource {
         })
     }
 
+    /// Hands back every frame's displacement grid (ruling R-T4-6c).
+    ///
+    /// Called from [`Drop`], which is the right moment for all three
+    /// stages that warp through this type: integration finishes a group
+    /// (every plane, via `set_plane`, shares one source), LN's per-frame
+    /// driver finishes one frame's plane, and LN's reference build
+    /// finishes one member. Without it a spline map's grid would outlive
+    /// the source — every clone shares ONE cache, and the run's own
+    /// `GroupMember`/`StackFrame` clones keep that cache alive to the end
+    /// of the run, so "the source was dropped" frees nothing by itself.
+    /// That is exactly how 208 frames' inverse grids survived integration
+    /// and met drizzle's forward grids on the acceptance run.
+    ///
+    /// A no-op for linear and polynomial maps, which have no grids.
+    pub fn release_grids(&self) -> usize {
+        self.frames.iter().map(|(_, m)| m.release_grids()).sum()
+    }
+
     pub fn channels(&self) -> usize {
         self.channels
     }
@@ -170,6 +188,14 @@ impl RegisteredSource {
             dst,
         );
         Ok((src_rows * sw * reader.kind().bytes_per_sample()) as u64)
+    }
+}
+
+impl Drop for RegisteredSource {
+    /// See [`RegisteredSource::release_grids`] — the stage that opened
+    /// this source is done warping through it.
+    fn drop(&mut self) {
+        self.release_grids();
     }
 }
 

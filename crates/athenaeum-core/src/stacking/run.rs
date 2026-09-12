@@ -7045,14 +7045,22 @@ mod tests {
     /// `ctx.active_stacks` — the thread's single exit path removes it last
     /// among the observable side effects these tests care about.
     fn wait_for_run(ctx: &ServiceContext, run_id: i64) {
+        wait_for_run_within(ctx, run_id, Duration::from_secs(30));
+    }
+
+    /// [`wait_for_run`] with the cap supplied — for the one test whose run
+    /// is deliberately big (20 frames through the whole spline pipeline)
+    /// and therefore does not fit the default cap when the rest of the
+    /// suite is competing for the same cores.
+    fn wait_for_run_within(ctx: &ServiceContext, run_id: i64, cap: Duration) {
         let start = Instant::now();
         loop {
             if !ctx.active_stacks.lock().unwrap().contains_key(&run_id) {
                 return;
             }
             assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "stacking run {run_id} did not finish within 30s"
+                start.elapsed() < cap,
+                "stacking run {run_id} did not finish within {cap:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -12428,6 +12436,148 @@ mod tests {
         assert_eq!(
             masters[0]["drizzlePath"].as_str(),
             Some(drizzle_path.as_str())
+        );
+    }
+
+    /// Ruling R-T4-6d: a whole `tps` run — registration, LN, integration
+    /// and drizzle — must never hold more than a handful of displacement
+    /// grids at once, however many frames it has.
+    ///
+    /// This is the acceptance-run failure in miniature. Run 27 (208 mono
+    /// frames at 6224×4168, `distortion: "tps"`, LN on, drizzle 2×)
+    /// registered, normalized and integrated in 11 minutes and then sat at
+    /// 0 % CPU for 2.7 hours with 11.3 of 12 GB of swap in use: every
+    /// frame's INVERSE grid stayed alive from the registration writer
+    /// onward (the clones share one cache, so nothing freed it), and
+    /// drizzle then built a FORWARD grid per frame on top.
+    ///
+    /// `PEAK_ALIVE` is the number that matters — grids resident at the
+    /// same moment, not grids built over the run's life. Rebuilding is
+    /// cheap and expected; 2 × frame_count resident is not.
+    #[test]
+    fn a_tps_run_never_holds_more_than_a_few_displacement_grids_at_once() {
+        use crate::geometry::pixel_map::grid_counters;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        // 20 frames — the ruling's own figure, and enough that "one grid
+        // per frame" and "a handful" cannot be confused. The field has to
+        // be DENSE: the spline arm needs `TPS_MIN_INLIERS` (32) inliers
+        // before it fits at all, and LN needs 20 matched stars, so the
+        // 10-star `BASE_STARS` field every other run test uses would leave
+        // this one measuring a pipeline that built no grid.
+        // 56 stars on an 8x7 lattice, amplitudes in [`BASE_STARS`]' own ADU
+        // range, spaced 23x19 px — far enough apart on this 192x144 canvas
+        // that their supra-threshold regions do not merge (the hazard
+        // `STAR_FIELD_WIDTH`'s own doc records). Each position carries a
+        // deterministic ±5 px jitter: a PERFECTLY regular lattice is
+        // degenerate for the quad matcher (measured: 160–4834 ambiguous
+        // quad matches per frame and not one usable affine), which is its
+        // own small lesson about synthetic star fields.
+        let dense = |dx: f64, dy: f64| -> Vec<(f64, f64, f64)> {
+            let mut stars = Vec::new();
+            for row in 0..7 {
+                for col in 0..8 {
+                    let k = (row * 8 + col) as f64;
+                    let jx = (k * 2.399963).sin() * 4.0;
+                    let jy = (k * 1.618034).cos() * 4.0;
+                    let x = 13.0 + col as f64 * 23.0 + jx + dx;
+                    let y = 14.0 + row as f64 * 19.0 + jy + dy;
+                    let amp = 6000.0 + ((row * 8 + col) % 5) as f64 * 875.0;
+                    stars.push((x, y, amp));
+                }
+            }
+            stars
+        };
+        let fields: Vec<(Vec<(f64, f64, f64)>, f32)> = (0..20)
+            .map(|i| (dense((i % 5) as f64 * 1.5, (i / 5) as f64 * 1.5), 5.0f32))
+            .collect();
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group_with_fields(&db_path, SET_NAME, &fields);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
+        cfg.registration.local_distortion = true;
+        cfg.registration.write_registered_frames = true;
+        // LN stays OFF here: its PSF-flux scale needs 20 matched stars per
+        // frame and this 192x144 canvas cannot carry that many resolvable
+        // ones (measured: 3–6 matched, every frame excluded). Nothing is
+        // lost for THIS property — LN warps through `RegisteredSource`,
+        // whose `Drop` is the same release path integration exercises
+        // below, and `local_normalization_sidecars_are_cached_on_the_second_run`
+        // covers LN's own pipeline.
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.output.cleanup = CleanupPolicy::DeleteIntermediates;
+
+        grid_counters::reset();
+        let recorder = Arc::new(Recording::new());
+        let started = start_stacking(
+            ctx.clone(),
+            recorder.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run_within(&ctx, started.run_id, Duration::from_secs(180));
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let (builds, alive, peak) = grid_counters::snapshot();
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        let tps_frames = summary.groups[0]
+            .frames
+            .iter()
+            .filter(|f| f.reg_model.as_deref().is_some_and(|m| m.contains("+tps")))
+            .count();
+        assert!(
+            tps_frames >= 8,
+            "the spline arm must actually have fitted: {tps_frames} frames carry +tps"
+        );
+        // The run really did use the spline arm — otherwise the rest of
+        // this test would pass on a pipeline that never built a grid.
+        assert!(
+            builds > 0,
+            "a tps run must have built displacement grids at all"
+        );
+        assert_eq!(alive, 0, "no grid may outlive the run");
+        // A stage that releases per frame holds at most the grids its
+        // parallel workers have in flight at that instant — bounded by
+        // the POOL, not by the frame count. Measured on this Mac (10
+        // rayon workers, 11 of the 20 frames carrying `+tps`): 33 grids
+        // built over the run — registration releases, drizzle rebuilds,
+        // which is the documented cost of the spline arm — and 11
+        // resident at the peak. The un-released shape is one inverse grid
+        // per frame surviving registration plus one forward grid per
+        // frame in drizzle, i.e. 2 × included.
+        //
+        // Caveat, stated rather than hidden: on a machine with many more
+        // cores than this group has frames the bound degrades towards the
+        // frame count itself, since that is all the concurrency there is
+        // to find.
+        let threads = rayon::current_num_threads().max(1);
+        // Slack of 4 over the pool size: the run thread itself
+        // participates in `install`, and a straggler from the previous
+        // stage can still hold one. Measured on this 10-worker Mac: peak
+        // 11. The shape this refuses is 2 x included (22 here).
+        assert!(
+            peak <= threads + 4,
+            "peak resident grids {peak} over {threads} workers (builds \
+             {builds}) — a stage is holding grids across frames"
         );
     }
 

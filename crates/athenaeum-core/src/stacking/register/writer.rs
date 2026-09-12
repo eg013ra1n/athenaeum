@@ -143,6 +143,12 @@ pub fn write_registered_frame(
             &mut all[plane * plane_len..(plane + 1) * plane_len],
         );
     }
+    // Ruling R-T4-6c: this frame's resampling is done, so its
+    // displacement grid goes back before the next frame's begins. Without
+    // this every registered frame's inverse grid (≈ 8.6 MB at 6224×4168)
+    // stayed alive from here to the end of the run — 208 frames of it on
+    // the acceptance set, before drizzle then added a forward grid each.
+    map.release_grids();
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -270,6 +276,66 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].value, Some(CardValue::Str("BOTTOM-UP".into())));
         assert!(cards.iter().any(|c| c.keyword == "EXPTIME"));
+    }
+
+    /// Ruling R-T4-6c/d: when the writer has finished a frame, no grid of
+    /// that frame's map is alive. Left behind, every registered frame's
+    /// inverse grid (≈ 8.6 MB at 6224×4168) survived to the end of the
+    /// run — 208 of them on the acceptance set, before drizzle added a
+    /// forward grid each; the run then thrashed a 16 GB machine for 2.7
+    /// hours.
+    #[test]
+    fn the_writer_releases_the_frames_grid_when_it_is_done() {
+        use crate::geometry::{select_nodes, DistortionModel, Pair, ThinPlateSpline};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (96usize, 72usize);
+        let field = gaussian_field(w, h, &[(40.0, 30.0, 0.5)], 1.6, 0.05);
+        let subject = dir.path().join("c_sub.fits");
+        crate::fits_writer::write_fits_f32(&subject, w, h, 1, &field, &[]).unwrap();
+
+        // A spline map over a smooth field — the only arm that has a grid.
+        let nodes: Vec<(f64, f64)> = (0..40)
+            .map(|i| {
+                let (a, b) = ((i % 8) as f64, (i / 8) as f64);
+                (6.0 + a * 11.0, 5.0 + b * 13.0)
+            })
+            .collect();
+        let dx: Vec<f64> = nodes.iter().map(|(x, _)| 0.4 * (x / 30.0).sin()).collect();
+        let dy: Vec<f64> = nodes.iter().map(|(_, y)| 0.3 * (y / 25.0).cos()).collect();
+        let ndx: Vec<f64> = dx.iter().map(|v| -v).collect();
+        let ndy: Vec<f64> = dy.iter().map(|v| -v).collect();
+        let forward = ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0).unwrap();
+        let inverse = ThinPlateSpline::fit(&nodes, &ndx, &ndy, 0.0).unwrap();
+        let model = DistortionModel::tps(forward, inverse, [0.0, 0.0, w as f64, h as f64]);
+        let map = PixelMap::with_distortion_model(Linear::identity(), model).unwrap();
+        // `select_nodes` and `Pair` are re-exported at the geometry root —
+        // touched here so this test also pins that surface.
+        let pairs: Vec<Pair> = vec![((0.0, 0.0), (0.0, 0.0)); 4];
+        assert_eq!(select_nodes(&pairs, None, (w as f64, h as f64), 4).len(), 4);
+
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false)
+        );
+        let out = dir.path().join("registered").join("r_sub.fits");
+        write_registered_frame(
+            &subject,
+            &map,
+            w,
+            h,
+            Interpolation::BicubicBSpline,
+            0.3,
+            &[],
+            &out,
+        )
+        .unwrap();
+        assert!(out.exists(), "the frame was actually written");
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false),
+            "no grid of a written frame's map may outlive the write"
+        );
     }
 
     #[test]
