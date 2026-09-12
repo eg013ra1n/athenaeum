@@ -1465,6 +1465,19 @@ pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame)
     }
 }
 
+/// Whether this group's stage-1 also keeps the calibrated CFA mosaic beside
+/// each debayered frame (M4d Task 1, rulings R-M4d-1/2): only an OSC group
+/// whose drizzle is on AND asked to deposit each colour's own samples. A mono
+/// group ignores `drizzle.bayer` silently — there is no mosaic to keep and
+/// nothing about the run changes.
+///
+/// The ONE place the condition is spelled out: stage 1 reads it to decide
+/// what to write and cache, and stage 8 reads it to decide what to deposit
+/// from, so the two can never disagree about whether a mosaic should exist.
+fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -> bool {
+    cfg.drizzle.enabled && cfg.drizzle.bayer && group.color_mode == ColorMode::Osc
+}
+
 /// Stage 1 (calibrate) for one frame (spec §9.3, decision 4).
 ///
 /// Three DB connections, each opened, used and dropped in its own scope: one
@@ -1497,19 +1510,47 @@ fn calibrate_one_frame(
         }
     };
 
+    // M4d Task 1 (ruling R-M4d-1): does this group's drizzle deposit each
+    // colour's own samples? Then this frame also owes a calibrated CFA
+    // mosaic, produced by the SAME generation as the debayered artifact.
+    let want_mosaic = wants_cfa_mosaic(cfg, group);
+
     if rc.rerun_from != Some(Stage::Calibrate) {
-        let existing = {
+        let (existing, mosaic_row) = {
             let conn = db(&rc.ctx)?.conn();
-            crate::db::stacking::find_artifact(
+            let existing = crate::db::stacking::find_artifact(
                 &conn,
                 rc.set_id,
                 group_key,
                 "calibrated",
                 Some(frame.frame_id),
-            )?
+            )?;
+            let mosaic_row = if want_mosaic {
+                crate::db::stacking::find_artifact(
+                    &conn,
+                    rc.set_id,
+                    group_key,
+                    "calibrated_mosaic",
+                    Some(frame.frame_id),
+                )?
+            } else {
+                None
+            };
+            (existing, mosaic_row)
         };
         if let Some(row) = &existing {
-            if is_fresh(row, &hash) {
+            // The mosaic rides the calibrated artifact's OWN hash (it is the
+            // same generation), so `drizzle.bayer` deliberately stays out of
+            // `calibration_subtree`: flipping it must not invalidate every
+            // calibrated frame in the set. What brings the mosaic into being
+            // is this second freshness check — a frame calibrated by an
+            // earlier run that wanted no mosaic regenerates BOTH files in one
+            // generation, exactly once.
+            let mosaic_fresh = !want_mosaic
+                || mosaic_row
+                    .as_ref()
+                    .is_some_and(|row| is_fresh(row, &hash));
+            if is_fresh(row, &hash) && mosaic_fresh {
                 return Ok(CalibrateOutcome::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });
@@ -1541,12 +1582,29 @@ fn calibrate_one_frame(
         .layout
         .calibrated_dir(group_key)
         .join(spec.output_filename(&format!("{stem}.fits")));
+    // M4d Task 1: the mosaic is the same stem under the MONO spelling
+    // (`c_<stem>.fits`) — through the one shared naming rule, never a second
+    // `format!`, so the mosaic and the debayered sibling can never drift
+    // apart. A mono frame never has one (`wants_cfa_mosaic` is false for a
+    // mono group, and `execute_generation` writes none for a frame it is not
+    // debayering — whose own output already IS this name).
+    let mosaic_out = want_mosaic.then(|| {
+        rc.layout
+            .calibrated_dir(group_key)
+            .join(crate::export::calibrated_output_filename(
+                &format!("{stem}.fits"),
+                false,
+            ))
+    });
 
+    let mut calibration_opts = cfg.calibration.clone();
+    calibration_opts.keep_mosaic = want_mosaic;
     let generated = execute_generation(
         &spec,
         &out,
+        mosaic_out.as_deref(),
         scratch,
-        &cfg.calibration,
+        &calibration_opts,
         &mut rc.hot_maps,
         &rc.cancel,
     );
@@ -1567,6 +1625,16 @@ fn calibrate_one_frame(
     rc.warnings.extend(generated.warnings);
 
     let (size, modified_at) = file_identity(&out).map_err(|e| RunError::Other(format!("{e:#}")))?;
+    // M4d Task 1: recorded only when the generator says it actually wrote one
+    // (`mosaic_written`), never by stat-ing the path — a leftover file from an
+    // earlier run must not be adopted as this generation's output.
+    let mosaic_identity = match (&mosaic_out, generated.mosaic_written) {
+        (Some(path), true) => Some((
+            path.clone(),
+            file_identity(path).map_err(|e| RunError::Other(format!("{e:#}")))?,
+        )),
+        _ => None,
+    };
 
     {
         let conn = db(&rc.ctx)?.conn();
@@ -1584,8 +1652,27 @@ fn calibrate_one_frame(
                 payload_json: None,
             },
         )?;
+        if let Some((path, (mosaic_size, mosaic_modified))) = &mosaic_identity {
+            upsert_artifact(
+                &conn,
+                &NewArtifact {
+                    frames_set_id: rc.set_id,
+                    frame_id: Some(frame.frame_id),
+                    group_key,
+                    kind: "calibrated_mosaic",
+                    path: path.to_str(),
+                    config_hash: &hash,
+                    size: Some(*mosaic_size),
+                    modified_at: Some(mosaic_modified),
+                    payload_json: None,
+                },
+            )?;
+        }
     }
 
+    // Only the debayered artifact's bytes are reported: `bytes_total` for this
+    // stage is the debayered footprint (`calibrate_bytes_total`), so counting
+    // the mosaic here would push a complete stage past 100%.
     Ok(CalibrateOutcome::Generated { bytes: size as u64 })
 }
 
@@ -5717,6 +5804,72 @@ fn process_group_output(
             let scale = drizzle_cfg.scale;
             let drop_shrink = drizzle_cfg.drop_shrink;
 
+            // M4d Task 1 (ruling R-M4d-2): Bayer drizzle's per-frame source.
+            // Resolved HERE, before the immutable borrows below, because it
+            // needs a DB connection: the frame's own `calibrated_mosaic`
+            // artifact (stage 1 wrote it in the same generation as the
+            // debayered frame) plus the mosaic's phase-corrected pattern,
+            // read through the SAME two functions the generator used, so the
+            // deposit and the debayer can never disagree about which pixel is
+            // red. A frame missing either falls back to the debayered deposit
+            // with a named warning — an interpolated frame in the stack is
+            // honest and useful; refusing the whole group over one frame is
+            // not.
+            // A 3-channel group is the only one a mosaic can be routed into
+            // (`drizzle_group` refuses the combination outright), and
+            // `channels` is this GROUP's own plane count — an OSC group whose
+            // frames somehow measured one plane is not one.
+            let bayer_wanted = wants_cfa_mosaic(&rc.config, group) && channels == 3;
+            let mut bayer_sources: Vec<Option<(PathBuf, astroimage::BayerPattern)>> =
+                vec![None; output.included.len()];
+            if bayer_wanted {
+                let conn = db(&rc.ctx)?.conn();
+                for (k, &idx) in output.included.iter().enumerate() {
+                    let frame_id = members[idx].frame_id;
+                    let path = crate::db::stacking::find_artifact(
+                        &conn,
+                        rc.set_id,
+                        &group.key,
+                        "calibrated_mosaic",
+                        Some(frame_id),
+                    )?
+                    .and_then(|a| a.path)
+                    .map(PathBuf::from);
+                    let pattern = match crate::calibration_library::light_resolve::
+                        resolve_cfa_geometry(&conn, frame_id)
+                    {
+                        Ok(geom) => geom.map(crate::export::calibrated_generator::bayer_for),
+                        Err(error) => {
+                            tracing::warn!(
+                                run_id = rc.run_id,
+                                frame_id,
+                                error = %format!("{error:#}"),
+                                "bayer drizzle: reading the frame's mosaic phase failed"
+                            );
+                            None
+                        }
+                    };
+                    bayer_sources[k] = match (path, pattern) {
+                        (Some(path), Some(pattern)) => Some((path, pattern)),
+                        _ => None,
+                    };
+                }
+            }
+            let bayer_missing = bayer_sources.iter().filter(|s| s.is_none()).count();
+            if bayer_wanted && bayer_missing > 0 {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    count = bayer_missing,
+                    "bayer drizzle: frames without a cfa mosaic fall back to the debayered deposit"
+                );
+                rc.warnings.push(format!(
+                    "group {}: Bayer drizzle deposited {bayer_missing} frame(s) from their \
+                     debayered planes — no calibrated CFA mosaic was available for them",
+                    group.key
+                ));
+            }
+
             let drizzle_progress_total = output.included.len() * channels;
             rc.progress(
                 Stage::Drizzle,
@@ -5786,6 +5939,14 @@ fn process_group_output(
                                 .and_then(|g| g.get(idx))
                                 .and_then(|o| o.as_ref()),
                             rej: rej_paths[k].as_deref(),
+                            // M4d Task 1: indexed by `k` like `rej_paths` —
+                            // the included-frame order, not `idx`.
+                            cfa: bayer_sources[k].as_ref().map(|(path, pattern)| {
+                                crate::stacking::drizzle::CfaSource {
+                                    path: path.as_path(),
+                                    pattern: *pattern,
+                                }
+                            }),
                         })
                         .collect();
 
@@ -12577,6 +12738,338 @@ mod tests {
         assert_eq!(
             masters[0]["drizzlePath"].as_str(),
             Some(drizzle_path.as_str())
+        );
+    }
+
+    // ── M4d Task 1: the CFA mosaic artifact and Bayer drizzle ────────────
+
+    /// [`seed_star_group`] with a declared `RGGB` mosaic on every frame, so
+    /// `group_frames` puts them in ONE **OSC** group and stage 1 debayers
+    /// them. The pixels are the same star field the mono fixtures use — a
+    /// mosaic the debayer reads as one (every site carries the field's own
+    /// value), which is all the Bayer deposit needs: the per-colour routing
+    /// itself is pinned on a real per-colour fixture in
+    /// `drizzle::tests::bayer_drizzle_*`.
+    fn seed_osc_star_group(
+        db_path: &Path,
+        set_name: &str,
+        shifts: &[(f64, f64)],
+        noise_sigmas: &[f32],
+    ) -> (
+        test_fixtures::Fixture,
+        Vec<i64>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        assert_eq!(shifts.len(), noise_sigmas.len());
+        let fixture_conn = rusqlite::Connection::open(db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, set_name);
+
+        let mut light_ids = Vec::new();
+        for (i, (&(dx, dy), &sigma)) in shifts.iter().zip(noise_sigmas.iter()).enumerate() {
+            let stars = shifted_stars(dx, dy);
+            let date_obs = date_obs_at(i);
+            let stem = format!("f{i}");
+            let spec = test_fixtures::LightSpec {
+                bayerpat: Some("RGGB"),
+                ..star_light_spec(&stem, &date_obs)
+            };
+            let (id, _path) = test_fixtures::add_light_with_field(
+                &fixture,
+                &spec,
+                &stars,
+                600.0,
+                sigma,
+                100 + i as u64,
+            );
+            light_ids.push(id);
+        }
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        (fixture, light_ids, working, output)
+    }
+
+    /// Step 3's run test (rulings R-M4d-1/2), end to end on an OSC group:
+    /// stage 1 keeps one `calibrated_mosaic` artifact per frame — a
+    /// single-plane file of the frame's own geometry, beside the debayered
+    /// `_d` sibling — the Drizzle stage deposits from those mosaics (the
+    /// drizzled R plane's level matches the master's own R plane, i.e. the
+    /// mask is level-preserving in a real run), and
+    /// `CleanupWhat::Intermediates` — what `cleanup = deleteIntermediates`
+    /// maps to — removes the rows with the calibrated frames.
+    #[test]
+    fn bayer_drizzle_keeps_a_mosaic_per_frame_and_deposits_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (0.0, 3.0),
+            (2.0, 2.0),
+            (-2.0, 1.0),
+            (1.0, -2.0),
+        ];
+        let noise = [5.0f32; 6];
+        let (fixture, light_ids, working, _output) =
+            seed_osc_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.drizzle.bayer = true;
+        // KeepAll so this test can inspect the mosaics, then clean up itself.
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        assert!(
+            group.group_key.contains("osc"),
+            "the fixture must make an OSC group: {}",
+            group.group_key
+        );
+
+        // One mosaic artifact per calibrated frame, each a single-plane file
+        // of the frame's own geometry beside its `_d` sibling.
+        let calibrated =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
+                .unwrap();
+        let mosaics = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            fixture.set_id,
+            Some("calibrated_mosaic"),
+        )
+        .unwrap();
+        assert_eq!(
+            mosaics.len(),
+            calibrated.len(),
+            "one mosaic per calibrated frame: {mosaics:?}"
+        );
+        assert_eq!(mosaics.len(), light_ids.len(), "{mosaics:?}");
+        for m in &mosaics {
+            let path = m.path.clone().expect("a mosaic artifact names its file");
+            let reader = PlaneReader::open(Path::new(&path)).unwrap();
+            assert_eq!(reader.channels(), 1, "the mosaic is one plane: {path}");
+            assert_eq!(
+                (reader.width(), reader.height()),
+                (STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT)
+            );
+            let name = Path::new(&path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap();
+            assert!(
+                name.starts_with("c_") && !name.ends_with("_d.fits"),
+                "the mosaic takes the mono spelling: {name}"
+            );
+            let debayered = Path::new(&path)
+                .with_file_name(name.replace(".fits", "_d.fits"));
+            assert!(
+                debayered.exists(),
+                "the debayered sibling must be there too: {}",
+                debayered.display()
+            );
+        }
+
+        // The deposit read those mosaics, and `I / W` is still
+        // level-preserving through the colour mask: the drizzled R plane's
+        // median matches the master's own R plane median.
+        let master_path = group.master_path.clone().expect("master written");
+        let drizzle_path = group.drizzle_path.clone().expect("drizzle ran");
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("Bayer drizzle")),
+            "every frame should have had a mosaic: {:?}",
+            summary.warnings
+        );
+        let master = PlaneReader::open(Path::new(&master_path)).unwrap();
+        assert_eq!(master.channels(), 3, "an OSC master has three planes");
+        let drizzled = PlaneReader::open(Path::new(&drizzle_path)).unwrap();
+        assert_eq!(drizzled.channels(), 3);
+        assert_eq!(drizzled.width(), 2 * master.width());
+
+        // The signature of the colour mask, and the proof the deposit really
+        // came from the mosaics: R and B carry a QUARTER of a mosaic's sites
+        // each against G's half, so their output coverage is strictly lower.
+        // A deposit from the debayered planes covers all three identically.
+        let stats = summary.groups[0]
+            .drizzle
+            .as_ref()
+            .expect("drizzle stats recorded");
+        assert_eq!(stats.coverage.len(), 3, "{:?}", stats.coverage);
+        assert!(
+            stats.coverage[0] < stats.coverage[1] && stats.coverage[2] < stats.coverage[1],
+            "R and B must cover less of the grid than G: {:?}",
+            stats.coverage
+        );
+
+        let median_of = |mut v: Vec<f32>| -> f64 {
+            v.retain(|x| x.is_finite() && *x > 0.0);
+            assert!(!v.is_empty(), "nothing deposited");
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2] as f64
+        };
+        for plane in 0..3usize {
+            let m = median_of(master.read_plane(plane).unwrap());
+            let d = median_of(drizzled.read_plane(plane).unwrap());
+            assert!(
+                (d - m).abs() <= 0.01 * m.abs(),
+                "plane {plane}: drizzled median {d} is not within 1% of the master's {m}"
+            );
+        }
+
+        // `deleteIntermediates` takes the mosaic rows with the calibrated
+        // ones (`INTERMEDIATE_ARTIFACT_KINDS`).
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        cleanup_work(
+            &fixture.conn,
+            fixture.set_id,
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert!(
+            crate::db::stacking::list_artifacts(
+                &fixture.conn,
+                fixture.set_id,
+                Some("calibrated_mosaic")
+            )
+            .unwrap()
+            .is_empty(),
+            "the mosaic rows must go with the calibrated frames"
+        );
+        assert!(!layout.calibrated_root().exists());
+    }
+
+    /// Step 3's cache rule (ruling R-M4d-1): a frame calibrated by an
+    /// earlier run that wanted no mosaic is NOT reused as-is once
+    /// `drizzle.bayer` goes on — the run regenerates the pair in one
+    /// generation. And it costs nothing the other way round: the calibrated
+    /// artifact's own hash is unchanged by the toggle, so a set does not
+    /// recalibrate when the mosaic is already there.
+    #[test]
+    fn turning_bayer_on_regenerates_the_mosaic_of_an_already_calibrated_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_osc_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let run_with_bayer = |bayer: bool| {
+            let mut cfg = StackingConfig::default();
+            cfg.drizzle.enabled = true;
+            cfg.drizzle.scale = 1;
+            cfg.drizzle.bayer = bayer;
+            cfg.output.cleanup = CleanupPolicy::KeepAll;
+            let started = start_stacking(
+                ctx.clone(),
+                Arc::new(Recording::new()),
+                &PathPolicy::AllowAll,
+                "test".to_string(),
+                fixture.set_id,
+                Some(cfg),
+                None,
+            )
+            .expect("start should succeed");
+            wait_for_run(&ctx, started.run_id);
+            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "done", "{row:?}");
+        };
+        let hashes = || -> Vec<(Option<i64>, String)> {
+            let mut rows = crate::db::stacking::list_artifacts(
+                &fixture.conn,
+                fixture.set_id,
+                Some("calibrated"),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.frame_id, a.config_hash))
+            .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+
+        run_with_bayer(false);
+        let before = hashes();
+        assert_eq!(before.len(), light_ids.len(), "{before:?}");
+        assert!(
+            crate::db::stacking::list_artifacts(
+                &fixture.conn,
+                fixture.set_id,
+                Some("calibrated_mosaic")
+            )
+            .unwrap()
+            .is_empty(),
+            "no mosaic is kept while bayer is off"
+        );
+
+        run_with_bayer(true);
+        let mosaics = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            fixture.set_id,
+            Some("calibrated_mosaic"),
+        )
+        .unwrap();
+        assert_eq!(
+            mosaics.len(),
+            light_ids.len(),
+            "every already-calibrated frame regenerates its mosaic: {mosaics:?}"
+        );
+        for m in &mosaics {
+            assert!(Path::new(&m.path.clone().unwrap()).exists());
+        }
+        assert_eq!(
+            hashes(),
+            before,
+            "drizzle.bayer must not change a calibrated frame's own hash"
         );
     }
 

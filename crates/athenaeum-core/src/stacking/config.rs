@@ -265,6 +265,20 @@ pub struct DrizzleConfig {
     /// normalization for the group.
     pub use_local_normalization: bool,
     pub write_weight_map: bool,
+    /// M4d Task 1 (ruling R-M4d-2): deposit each colour's OWN samples from
+    /// the calibrated CFA mosaic instead of the debayered planes'
+    /// interpolated ones. Ignored for a mono group (silently — there is no
+    /// mosaic to deposit), and it makes stage 1 keep one extra artifact per
+    /// OSC frame.
+    ///
+    /// `#[serde(default)]` rides the struct-level `default`, so every stored
+    /// config written before M4d decodes as `false` and no
+    /// `STACKING_CONFIG_VERSION` bump is needed. It deliberately does NOT
+    /// enter [`calibration_subtree`]: the debayered artifact is
+    /// byte-identical either way, so flipping this must not invalidate a
+    /// set's whole calibrated cache — the missing `calibrated_mosaic`
+    /// artifact is what makes the run regenerate the pair (`stacking::run`).
+    pub bayer: bool,
 }
 
 impl Default for DrizzleConfig {
@@ -278,6 +292,7 @@ impl Default for DrizzleConfig {
             use_weights: true,
             use_local_normalization: true,
             write_weight_map: false,
+            bayer: false,
         }
     }
 }
@@ -837,6 +852,38 @@ mod tests {
         );
     }
 
+    /// M4d Task 1 (ruling R-M4d-1/2): `drizzle.bayer` moves the run
+    /// fingerprint (it changes what the run produces) but must leave every
+    /// PER-STAGE hash alone — above all the calibration one. The debayered
+    /// artifact is byte-identical whether or not the mosaic is kept beside
+    /// it, so flipping this toggle must not throw away a set's whole
+    /// calibrated cache; the run notices the missing `calibrated_mosaic`
+    /// artifact instead and regenerates the pair, frame by frame.
+    #[test]
+    fn bayer_moves_the_run_fingerprint_but_no_stage_hash() {
+        let cfg = StackingConfig::default();
+        let mut other = cfg.clone();
+        other.drizzle.bayer = true;
+        assert_ne!(config_hash(&cfg), config_hash(&other));
+        assert_eq!(
+            stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            stage_hash(&calibration_subtree(&other), &[], &[]),
+            "drizzle.bayer must not invalidate a calibrated frame"
+        );
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&other), &[], &[]),
+        );
+        assert_eq!(
+            stage_hash(&registration_subtree(&cfg), &[], &[]),
+            stage_hash(&registration_subtree(&other), &[], &[]),
+        );
+        assert_eq!(
+            stage_hash(&normalization_subtree(&cfg), &[], &[]),
+            stage_hash(&normalization_subtree(&other), &[], &[]),
+        );
+    }
+
     #[test]
     fn serde_names_follow_the_spec() {
         let s = serde_json::to_string(&StackingConfig::default()).unwrap();
@@ -871,7 +918,7 @@ mod tests {
             "\"minWeight\":0.005",
             "\"rangeLow\":0.0",
             "\"rangeHigh\":null",
-            "\"drizzle\":{\"enabled\":false,\"scale\":2,\"dropShrink\":0.9,\"kernel\":\"square\",\"useRejection\":true,\"useWeights\":true,\"useLocalNormalization\":true,\"writeWeightMap\":false}",
+            "\"drizzle\":{\"enabled\":false,\"scale\":2,\"dropShrink\":0.9,\"kernel\":\"square\",\"useRejection\":true,\"useWeights\":true,\"useLocalNormalization\":true,\"writeWeightMap\":false,\"bayer\":false}",
         ] {
             assert!(s.contains(needle), "{needle} missing in {s}");
         }
@@ -1381,6 +1428,15 @@ mod tests {
         // invalidation in practice — the field's arrival above already
         // spent the one re-registration, and a stored document that
         // spells `tpsSmoothing` out keeps its own value either way.
-        assert_eq!(default_hash, "55140f6ae0f69ffc");
+        //
+        // And here (M4d Task 1, rulings R-M4d-1/R-M4d-2): `drizzle.bayer`
+        // joins `DrizzleConfig`. It ships `false`, i.e. today's behaviour,
+        // and no stage subtree folds in `drizzle` at all — deliberately,
+        // since a debayered calibrated frame is byte-identical whether or
+        // not the mosaic is kept beside it (see
+        // `bayer_moves_the_run_fingerprint_but_no_stage_hash`) — so not one
+        // cached per-frame artifact goes stale over it; only this
+        // whole-config fingerprint moves.
+        assert_eq!(default_hash, "fe75994518f16c4c");
     }
 }

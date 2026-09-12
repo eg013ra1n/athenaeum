@@ -254,7 +254,23 @@ export type DrizzleConfig = { enabled: boolean, scale: number, dropShrink: numbe
  * effect when local normalization is actually driving output
  * normalization for the group.
  */
-useLocalNormalization: boolean, writeWeightMap: boolean, };
+useLocalNormalization: boolean, writeWeightMap: boolean, 
+/**
+ * M4d Task 1 (ruling R-M4d-2): deposit each colour's OWN samples from
+ * the calibrated CFA mosaic instead of the debayered planes'
+ * interpolated ones. Ignored for a mono group (silently — there is no
+ * mosaic to deposit), and it makes stage 1 keep one extra artifact per
+ * OSC frame.
+ *
+ * `#[serde(default)]` rides the struct-level `default`, so every stored
+ * config written before M4d decodes as `false` and no
+ * `STACKING_CONFIG_VERSION` bump is needed. It deliberately does NOT
+ * enter [`calibration_subtree`]: the debayered artifact is
+ * byte-identical either way, so flipping this must not invalidate a
+ * set's whole calibrated cache — the missing `calibrated_mosaic`
+ * artifact is what makes the run regenerate the pair (`stacking::run`).
+ */
+bayer: boolean, };
 
 export type OutputFormat = "fits";
 

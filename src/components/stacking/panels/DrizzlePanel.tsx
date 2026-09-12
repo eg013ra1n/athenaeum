@@ -34,6 +34,10 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: Dri
   };
 
   const estimate = plan ? drizzleEstimate(config, plan) : null;
+  // Only a hint, never a disabled control: with no plan loaded (Settings →
+  // Stacking) nothing is known about the set's groups, and a set can gain an
+  // OSC group later.
+  const noOscGroup = plan ? !plan.groups.some((g) => g.colorMode === 'osc') : false;
 
   return (
     <div className="space-y-3">
@@ -80,6 +84,31 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: Dri
         <p className="mt-1 text-[11px] text-content-muted">
           default {kernelLabel(defaults.drizzle.kernel)} — square = exact clipping; circle/gaussian = 16×16
           tabulated.
+        </p>
+      </div>
+
+      {/* M4d Task 1 (ruling R-M4d-2): Bayer drizzle. Under the kernel, since
+       *  it changes what the deposit READS (each colour's own mosaic
+       *  samples) rather than how a drop is spread. Never disabled: a set's
+       *  config is edited here and in Settings → Stacking alike, where there
+       *  is no plan to ask about OSC groups — the note carries the "OSC
+       *  only" part, and a mono group ignores the flag silently. */}
+      <div className="pt-1">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={d.bayer}
+            disabled={disabled}
+            onChange={(e) => patch({ bayer: e.target.checked })}
+            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+          />
+          <span className="text-sm text-content-secondary">
+            Bayer drizzle (deposit each colour's own samples, OSC only)
+          </span>
+        </label>
+        <p className="mt-1 ml-6 text-[11px] text-content-muted">
+          R and B cover a quarter of the pixels each — use drop shrink ≥ 0.9 or more frames.
+          {noOscGroup ? ' This set has no OSC group, so it changes nothing.' : ''}
         </p>
       </div>
 
@@ -146,7 +175,8 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: Dri
           {kernelLabel(defaults.drizzle.kernel)} kernel, {defaults.drizzle.useRejection ? 'rejection on' : 'rejection off'},{' '}
           {defaults.drizzle.useWeights ? 'weights on' : 'weights off'},{' '}
           local normalization {defaults.drizzle.useLocalNormalization ? 'on' : 'off'}, weight map{' '}
-          {defaults.drizzle.writeWeightMap ? 'on' : 'off'}.
+          {defaults.drizzle.writeWeightMap ? 'on' : 'off'}, Bayer{' '}
+          {defaults.drizzle.bayer ? 'on' : 'off'}.
         </p>
       </div>
 

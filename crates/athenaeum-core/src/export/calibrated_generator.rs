@@ -86,6 +86,15 @@ pub struct GeneratedLight {
     pub output_hash: String,
     /// Size of the written file, measured on disk after the write.
     pub byte_size: u64,
+    /// Whether a second file — the calibrated CFA mosaic (M4d Task 1, ruling
+    /// R-M4d-1) — was written to the `mosaic_path` the caller passed. `false`
+    /// whenever the caller asked for none, or asked for one on a frame that
+    /// has no mosaic to keep (a mono frame, or an OSC frame with the debayer
+    /// off — whose primary output IS the mosaic already). The caller that
+    /// records the mosaic as an artifact must read this rather than stat the
+    /// path, so a stale file from an earlier run can never be mistaken for
+    /// this generation's output.
+    pub mosaic_written: bool,
 }
 
 /// One frame's resolved plan: everything [`execute_generation`] needs, with no
@@ -163,7 +172,10 @@ fn compute_calstat(dark: bool, bias: bool, flat: bool) -> String {
 /// unit test cross-checks all four patterns against
 /// [`crate::integration::cfa::cfa_channel_at`], the codebase's own definition
 /// of where each colour sits.
-fn bayer_for(geom: CfaGeometry) -> BayerPattern {
+/// `pub` since M4d Task 1: the stacking run's Bayer drizzle routes a mosaic
+/// pixel to its colour's plane with the SAME phase-corrected pattern the
+/// debayer was given, and must read it through this one function.
+pub fn bayer_for(geom: CfaGeometry) -> BayerPattern {
     // A column shift swaps the two columns of the 2x2 tile...
     let shifted = if geom.xoff.rem_euclid(2) == 1 {
         match geom.pattern {
@@ -453,6 +465,15 @@ pub fn resolved_master_paths(
 /// The write is atomic (temp file + rename), so re-generating over an existing
 /// output replaces it in place rather than leaving a truncated file behind.
 ///
+/// `mosaic_path` is the SECOND output of this same generation (M4d Task 1,
+/// ruling R-M4d-1): with [`CalibratedLightOptions::keep_mosaic`] set and a
+/// path given, a frame being debayered also writes its calibrated,
+/// hot-pixel-corrected CFA mosaic there — from the same in-memory frame, so
+/// one read and one calibration produce both files. `None` (and a cleared
+/// `keep_mosaic`) is the behavior every caller but the stacking run has:
+/// one output, exactly as before. [`GeneratedLight::mosaic_written`] reports
+/// whether the second file was actually produced.
+///
 /// Cancellation is cooperative: per band inside the formula, and once more
 /// before the debayer, which is the most expensive stage and the one worth not
 /// entering. The error carries [`IntegrationError::Cancelled`], so a caller can
@@ -460,6 +481,7 @@ pub fn resolved_master_paths(
 pub fn execute_generation(
     spec: &GenerationSpec,
     output_path: &Path,
+    mosaic_path: Option<&Path>,
     scratch_dir: &Path,
     opts: &CalibratedLightOptions,
     hot_maps: &mut HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
@@ -532,6 +554,76 @@ pub fn execute_generation(
         return Err(IntegrationError::Cancelled.into());
     }
 
+    // The cosmetic pass's own card, needed by BOTH writes below (the mosaic
+    // is corrected by the same pass, from the same buffer), so it is built
+    // once. A refused map adds no card at all — see [`GeneratedLight::
+    // hot_pixels_replaced`]'s own doc for the three shapes of `0`.
+    let hot_card = if corrected {
+        Some(
+            Card::new("ATH_CHPX", CardValue::Integer(hot_pixels_replaced as i64))?
+                .with_comment("hot pixels replaced"),
+        )
+    } else {
+        None
+    };
+
+    // ── The calibrated CFA mosaic (M4d Task 1, ruling R-M4d-1) ──────────────
+    // A SECOND output of this same generation, written BEFORE the debayer
+    // from the very buffer the debayer is about to read: one read, one
+    // calibration, two writes. Its header keeps the mosaic keywords
+    // (`BAYERPAT`/`XBAYROFF`/`YBAYROFF` — they still describe the data) and
+    // carries no `ATH_CDBM`, because nothing was debayered here.
+    //
+    // Only a frame that IS being debayered can have one: a mono frame has no
+    // mosaic to keep, and an OSC frame with the debayer off already writes
+    // the mosaic itself as its primary output (`c_<stem>.fits`, the same
+    // name) — writing it twice would race two writers onto one path.
+    //
+    // Written first, per the ordering the two writes cannot share (each is
+    // its own temp-file + rename): a failure here leaves no half file and no
+    // calibrated output at all, so the caller treats the frame as not
+    // calibrated rather than as calibrated-without-a-mosaic.
+    let mut mosaic_written = false;
+    if opts.keep_mosaic {
+        match (mosaic_path, spec.debayer) {
+            (Some(path), true) => {
+                let mut mosaic_cards = spec.cards.clone();
+                if let Some(card) = hot_card.clone() {
+                    mosaic_cards.push(card);
+                }
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_calibrated_output(
+                    path,
+                    frame.width,
+                    frame.height,
+                    1,
+                    &frame.data,
+                    &mosaic_cards,
+                )?;
+                mosaic_written = true;
+                tracing::debug!(
+                    src = %spec.inputs.light_path.display(),
+                    dest = %path.display(),
+                    "calibrated cfa mosaic written"
+                );
+            }
+            (Some(_), false) => {
+                tracing::debug!(
+                    src = %spec.inputs.light_path.display(),
+                    "no cfa mosaic to keep: this frame is not being debayered"
+                );
+            }
+            (None, _) => {
+                tracing::warn!(
+                    src = %spec.inputs.light_path.display(),
+                    "keep_mosaic is set but no mosaic path was given; no mosaic written"
+                );
+            }
+        }
+    }
+
     // ── Optional OSC debayer ────────────────────────────────────────────────
     // Full resolution: same width and height, three planes. `spec.debayer`
     // already implies a usable geometry; the fallback arm cannot fire, and if
@@ -551,11 +643,8 @@ pub fn execute_generation(
         cards.retain(|c| !MOSAIC_KEYWORDS.contains(&c.keyword.as_str()));
         cards.push(Card::new("ATH_CDBM", CardValue::Str("VNG".into()))?);
     }
-    if corrected {
-        cards.push(
-            Card::new("ATH_CHPX", CardValue::Integer(hot_pixels_replaced as i64))?
-                .with_comment("hot pixels replaced"),
-        );
+    if let Some(card) = hot_card {
+        cards.push(card);
     }
 
     // The write stages a sibling temp file and renames it into place, so the
@@ -593,6 +682,7 @@ pub fn execute_generation(
         output_hash,
         byte_size,
         warnings,
+        mosaic_written,
     })
 }
 
@@ -861,6 +951,7 @@ mod tests {
         let generated = execute_generation(
             &spec,
             &out,
+            None,
             dir.path(),
             &opts,
             &mut HashMap::new(),
@@ -1052,6 +1143,7 @@ mod tests {
         let generated = execute_generation(
             &spec,
             &out,
+            None,
             dir.path(),
             &opts,
             &mut hot_maps,
@@ -1108,6 +1200,7 @@ mod tests {
         let generated = execute_generation(
             &spec,
             &out,
+            None,
             dir.path(),
             &opts,
             &mut hot_maps,
@@ -1156,6 +1249,7 @@ mod tests {
         let generated = execute_generation(
             &spec,
             &out,
+            None,
             dir.path(),
             &opts,
             &mut hot_maps,
@@ -1196,6 +1290,7 @@ mod tests {
             let generated = execute_generation(
                 &spec,
                 &out,
+                None,
                 dir.path(),
                 &opts,
                 &mut hot_maps,
@@ -1247,6 +1342,7 @@ mod tests {
             let g = execute_generation(
                 &spec,
                 &out,
+                None,
                 dir.path(),
                 &opts,
                 &mut hot_maps,
@@ -1319,6 +1415,7 @@ mod tests {
         let generated = execute_generation(
             &spec,
             &out,
+            None,
             dir.path(),
             &opts,
             &mut HashMap::new(),
@@ -1442,5 +1539,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── The calibrated CFA mosaic (M4d Task 1, ruling R-M4d-1) ────────────
+
+    /// `keep_mosaic` writes a SECOND file from the same generation: the
+    /// corrected, pre-debayer mosaic. Its pixels must equal exactly what a
+    /// debayer-off generation of the same frame writes (the ground truth for
+    /// "the corrected frame"), and its header must still describe a mosaic —
+    /// `BAYERPAT`/`XBAYROFF`/`YBAYROFF` kept, no `ATH_CDBM` — while the
+    /// debayered output beside it is unchanged.
+    #[test]
+    fn keep_mosaic_writes_the_corrected_mosaic_beside_the_debayered_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, filename) = seed_osc(dir.path());
+
+        // Ground truth first: the same frame, debayer off — one plane, the
+        // calibrated + hot-pixel-corrected mosaic and nothing else.
+        let plain_opts = CalibratedLightOptions {
+            debayer_osc: false,
+            ..CalibratedLightOptions::default()
+        };
+        let plain_spec = resolve_generation(&conn, 1, &plain_opts, dir.path()).unwrap();
+        let plain_out = dir.path().join("truth").join("c_light_b.fits");
+        execute_generation(
+            &plain_spec,
+            &plain_out,
+            None,
+            dir.path(),
+            &plain_opts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let (tw, th, tch, truth) = read_written(&plain_out);
+        assert_eq!((tw, th, tch), (W, H, 1));
+
+        let opts = CalibratedLightOptions {
+            keep_mosaic: true,
+            ..CalibratedLightOptions::default()
+        };
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert!(spec.debayer);
+        let out = dir.path().join("run").join(spec.output_filename(&filename));
+        let mosaic = dir.path().join("run").join("c_light_b.fits");
+        let generated = execute_generation(
+            &spec,
+            &out,
+            Some(&mosaic),
+            dir.path(),
+            &opts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(generated.mosaic_written, "the mosaic must be reported");
+        assert!(generated.debayered, "the primary output is still debayered");
+        assert!(mosaic.exists(), "{} missing", mosaic.display());
+        assert!(out.exists(), "{} missing", out.display());
+
+        let (mw, mh, mch, mosaic_data) = read_written(&mosaic);
+        assert_eq!((mw, mh, mch), (W, H, 1), "the mosaic stays one plane");
+        assert_eq!(
+            mosaic_data, truth,
+            "the mosaic must be the corrected pre-debayer frame, bit-exact"
+        );
+
+        let mh_header = FitsHeader::from_path(&mosaic).unwrap();
+        assert_eq!(mh_header.get_str("BAYERPAT").as_deref(), Some("RGGB"));
+        assert_eq!(mh_header.get_i32("XBAYROFF"), Some(0));
+        assert_eq!(mh_header.get_i32("YBAYROFF"), Some(0));
+        assert_eq!(
+            mh_header.get_str("ATH_CDBM"),
+            None,
+            "nothing was debayered into this file"
+        );
+        assert_eq!(
+            mh_header.get_str("CALSTAT").as_deref(),
+            Some("BDF"),
+            "the mosaic is as calibrated as its debayered sibling"
+        );
+        assert_eq!(
+            mh_header.get_i32("ATH_CHPX"),
+            Some(2),
+            "the same cosmetic pass corrected both files"
+        );
+
+        // The debayered output is exactly what it always was.
+        let dh = FitsHeader::from_path(&out).unwrap();
+        assert_eq!(dh.get_i32("NAXIS3"), Some(3));
+        assert_eq!(dh.get_str("BAYERPAT"), None);
+        assert_eq!(dh.get_str("ATH_CDBM").as_deref(), Some("VNG"));
+        assert_eq!(dh.get_i32("ATH_CHPX"), Some(2));
+    }
+
+    /// Without the flag nothing changes, even with a path in hand; and a
+    /// frame with no mosaic to keep (mono here) reports none rather than
+    /// writing its own calibrated plane twice.
+    #[test]
+    fn no_mosaic_without_the_flag_or_without_a_mosaic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, filename) = seed_osc(dir.path());
+
+        let opts = CalibratedLightOptions::default();
+        assert!(!opts.keep_mosaic, "off by default");
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        let out = dir.path().join("off").join(spec.output_filename(&filename));
+        let mosaic = dir.path().join("off").join("c_light_b.fits");
+        let generated = execute_generation(
+            &spec,
+            &out,
+            Some(&mosaic),
+            dir.path(),
+            &opts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!generated.mosaic_written);
+        assert!(!mosaic.exists(), "a path alone must write nothing");
+
+        // Mono: `keep_mosaic` is honoured as "there is nothing to keep".
+        let light = write_plane(&dir.path().join("light_mono.fits"), |_, _| 1000.0);
+        let dark = write_plane(&dir.path().join("dark_mono.fits"), spiky_dark);
+        let mono_conn = seed_db();
+        seed_light(&mono_conn, 1, &light, None, None);
+        seed_master_set(&mono_conn, 10, "Dark", &dark);
+        add_link(&mono_conn, 1, 10, "Dark");
+        let mono_opts = CalibratedLightOptions {
+            keep_mosaic: true,
+            ..CalibratedLightOptions::default()
+        };
+        let mono_spec = resolve_generation(&mono_conn, 1, &mono_opts, dir.path()).unwrap();
+        assert!(!mono_spec.debayer);
+        let mono_out = dir.path().join("mono").join("c_light_mono.fits");
+        let mono_mosaic = dir.path().join("mono").join("mosaic_light_mono.fits");
+        let mono_generated = execute_generation(
+            &mono_spec,
+            &mono_out,
+            Some(&mono_mosaic),
+            dir.path(),
+            &mono_opts,
+            &mut HashMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!mono_generated.mosaic_written);
+        assert!(
+            !mono_mosaic.exists(),
+            "a mono frame has no mosaic to keep beside its own plane"
+        );
+        assert!(mono_out.exists());
     }
 }

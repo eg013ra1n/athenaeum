@@ -2380,7 +2380,8 @@ mod real_data_e2e {
                 "output naming must come from the one shared rule"
             );
             let generated =
-                execute_generation(&spec, &out, &scratch, &opts, &mut hot_maps, &cancel).unwrap();
+                execute_generation(&spec, &out, None, &scratch, &opts, &mut hot_maps, &cancel)
+                    .unwrap();
 
             assert_eq!(generated.calstat, "BDF", "frame {fid} calstat");
             assert!(!generated.debayered);

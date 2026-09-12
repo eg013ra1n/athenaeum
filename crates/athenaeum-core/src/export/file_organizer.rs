@@ -475,8 +475,17 @@ fn generate_one(
             "debayer decision disagrees with the placed filename"
         );
     }
-    let generated =
-        crate::export::execute_generation(spec, dest, scratch_dir, opts, hot_maps, cancel_flag)?;
+    // `None` mosaic: an export lands the calibrated light itself — the CFA
+    // mosaic is a stacking-run artifact (M4d Task 1), not an export product.
+    let generated = crate::export::execute_generation(
+        spec,
+        dest,
+        None,
+        scratch_dir,
+        opts,
+        hot_maps,
+        cancel_flag,
+    )?;
     tracing::debug!(
         frame_id,
         dest = %dest.display(),

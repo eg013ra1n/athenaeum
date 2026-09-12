@@ -485,6 +485,11 @@ pub struct EstimateInputs<'a> {
     /// per-frame rejection bitmaps drizzle's `use_rejection` does, plus one
     /// PROCESSED `.rejl` sibling per frame of exactly the same size.
     pub large_scale: bool,
+    /// M4d Task 1: `drizzle.bayer` — stage 1 keeps one extra single-plane
+    /// artifact (the calibrated CFA mosaic) per frame of every OSC group,
+    /// which is a third of that group's calibrated footprint again. Nothing
+    /// for a mono group, which has no mosaic to keep.
+    pub drizzle_bayer: bool,
 }
 
 /// Rough byte estimate for a run's working+output footprint: every group
@@ -527,6 +532,16 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
         total += calibrated_bytes;
         if i.write_registered {
             total += calibrated_bytes;
+        }
+        // M4d Task 1: Bayer drizzle keeps the single-plane CFA mosaic beside
+        // each debayered OSC frame — one plane where the calibrated frame
+        // above counted three. A mono group keeps none.
+        if i.drizzle_bayer && i.drizzle.is_some() && planes == 3 {
+            total += g
+                .frames
+                .iter()
+                .map(|f| f.width.max(0) as u64 * f.height.max(0) as u64 * 4)
+                .sum::<u64>();
         }
 
         let (max_w, max_h) = g
@@ -630,8 +645,17 @@ pub enum CleanupWhat {
 /// [`crate::db::stacking::delete_all_artifacts`] instead — a future kind
 /// this list doesn't yet name must not survive "delete everything" and keep
 /// pointing at files cleanup just removed.
-const INTERMEDIATE_ARTIFACT_KINDS: &[&str] =
-    &["registered", "calibrated", "ln", "ln_reference", "metrics"];
+const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
+    "registered",
+    "calibrated",
+    // M4d Task 1: the calibrated CFA mosaic lives IN `calibrated/` beside
+    // its debayered sibling, so the directory removal above already takes
+    // the file — this is its row.
+    "calibrated_mosaic",
+    "ln",
+    "ln_reference",
+    "metrics",
+];
 
 /// Remove a working layout's subtrees per `what` and the matching
 /// `stacking_artifacts` rows, returning the bytes freed (summed by walking
@@ -1098,6 +1122,7 @@ mod tests {
             write_maps: true,
             drizzle: None,
             large_scale: false,
+            drizzle_bayer: false,
         };
         let expected = 2 * 400 + 1 * 1200 + (400 * 3) + (1200 * 3);
         assert_eq!(estimate_bytes(&inputs), expected);
@@ -1112,6 +1137,7 @@ mod tests {
             write_maps: false,
             drizzle: None,
             large_scale: false,
+            drizzle_bayer: false,
         });
         let on = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1119,6 +1145,7 @@ mod tests {
             write_maps: false,
             drizzle: None,
             large_scale: false,
+            drizzle_bayer: false,
         });
         assert_eq!(
             on,
@@ -1142,6 +1169,7 @@ mod tests {
             write_maps: false,
             drizzle: None,
             large_scale: false,
+            drizzle_bayer: false,
         });
         let with_drizzle = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1149,6 +1177,7 @@ mod tests {
             write_maps: false,
             drizzle: Some((2, true, true)),
             large_scale: false,
+            drizzle_bayer: false,
         });
         assert_eq!(
             with_drizzle,
@@ -1163,6 +1192,7 @@ mod tests {
             write_maps: false,
             drizzle: Some((2, false, true)),
             large_scale: false,
+            drizzle_bayer: false,
         });
         assert_eq!(with_drizzle_no_weight_map, without_drizzle + 240 + 1600);
 
@@ -1173,6 +1203,7 @@ mod tests {
             write_maps: false,
             drizzle: Some((2, true, false)),
             large_scale: false,
+            drizzle_bayer: false,
         });
         assert_eq!(with_drizzle_no_rejection, without_drizzle + 3200);
     }
@@ -1192,6 +1223,7 @@ mod tests {
             write_maps: false,
             drizzle: None,
             large_scale: false,
+            drizzle_bayer: false,
         });
         let large_scale_only = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1199,6 +1231,7 @@ mod tests {
             write_maps: false,
             drizzle: None,
             large_scale: true,
+            drizzle_bayer: false,
         });
         assert_eq!(
             large_scale_only,
@@ -1212,11 +1245,48 @@ mod tests {
             write_maps: false,
             drizzle: Some((2, true, true)),
             large_scale: true,
+            drizzle_bayer: false,
         });
         assert_eq!(
             both,
             base + 3 * 240 + 3200,
             "the first pass's bitmaps are created once, not once per consumer"
+        );
+    }
+
+    /// M4d Task 1: `drizzle_bayer` adds ONE plane per OSC frame (the
+    /// calibrated CFA mosaic) and nothing at all for a mono group — and
+    /// nothing when drizzle itself is off, since stage 1 only keeps the
+    /// mosaic for a drizzle that will read it.
+    #[test]
+    fn estimate_adds_the_cfa_mosaic_for_osc_groups_only() {
+        let osc = vec![group(ColorMode::Osc, 3, 10, 10)];
+        let mono = vec![group(ColorMode::Mono, 3, 10, 10)];
+        let inputs = |groups: &[IntegrationGroup], bayer: bool, drizzle: bool| {
+            estimate_bytes(&EstimateInputs {
+                groups,
+                write_registered: false,
+                write_maps: false,
+                drizzle: drizzle.then_some((2, false, false)),
+                large_scale: false,
+                drizzle_bayer: bayer,
+            })
+        };
+
+        assert_eq!(
+            inputs(&osc, true, true),
+            inputs(&osc, false, true) + 3 * 400,
+            "one 10x10 float plane per OSC frame"
+        );
+        assert_eq!(
+            inputs(&mono, true, true),
+            inputs(&mono, false, true),
+            "a mono group has no mosaic to keep"
+        );
+        assert_eq!(
+            inputs(&osc, true, false),
+            inputs(&osc, false, false),
+            "no drizzle, no mosaic"
         );
     }
 

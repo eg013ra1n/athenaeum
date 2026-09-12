@@ -313,7 +313,14 @@ fn append_bayer_cards_from_columns(
 ///
 /// `ROWORDER` is deliberately not folded in: `BAYERPAT` describes the mosaic in
 /// FILE row order (see [`CfaGeometry`]'s own rustdoc, which ratifies this).
-fn resolve_cfa_geometry(conn: &Connection, frame_id: i64) -> anyhow::Result<Option<CfaGeometry>> {
+/// `pub(crate)` since M4d Task 1: the stacking run's drizzle stage resolves
+/// the same phase for a frame whose mosaic it is about to deposit, and must
+/// read it through THIS function rather than a second `bayerpat` query of its
+/// own.
+pub(crate) fn resolve_cfa_geometry(
+    conn: &Connection,
+    frame_id: i64,
+) -> anyhow::Result<Option<CfaGeometry>> {
     let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
         .query_row(
             "SELECT bayerpat, xbayroff, ybayroff FROM frames WHERE id = ?1",

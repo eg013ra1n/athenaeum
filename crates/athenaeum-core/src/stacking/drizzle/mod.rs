@@ -14,6 +14,13 @@
 //! parallel (ruling R-M3-6). `I / W` where `W > 0` is level-preserving
 //! (ruling R-M3-2); `W / max(W)` is the weight map when
 //! [`DrizzleInput::write_weight_map`] is on.
+//!
+//! M4d Task 1 (ruling R-M4d-2) adds Bayer drizzle: with a
+//! [`DrizzleFrame::cfa`] source, every output plane is deposited from the
+//! frame's ONE calibrated CFA mosaic and a source pixel only reaches the
+//! plane of its own colour ([`geom::cfa_plane_of`]) — registration,
+//! weights, rejection and LN are untouched, all still the debayered run's
+//! in reference geometry.
 
 pub mod geom;
 
@@ -21,6 +28,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use astroimage::BayerPattern;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -69,6 +77,31 @@ pub struct DrizzleFrame<'a> {
     /// This frame's `.rej` rejection bitmap, when
     /// [`DrizzleInput::use_rejection`] is on and one was written for it.
     pub rej: Option<&'a Path>,
+    /// M4d Task 1 (ruling R-M4d-2): Bayer drizzle. When set, EVERY output
+    /// plane is deposited from this ONE single-plane calibrated CFA mosaic
+    /// instead of from `path`'s interpolated planes, and a source pixel
+    /// only reaches the plane of its own colour
+    /// ([`geom::cfa_plane_of`]). Requires a 3-channel group; `None` is the
+    /// debayered deposit M1–M4c always did.
+    ///
+    /// Everything else stays the DEBAYERED run's, in reference geometry:
+    /// the `map`, the weights, the `.rej` lookup and the LN grids (math
+    /// §6.4 — "alignment data still come from the registration of the
+    /// debayered frame"). The mosaic and the debayered frame share one
+    /// geometry by construction (the debayer runs at native resolution),
+    /// so the same `map` carries both.
+    pub cfa: Option<CfaSource<'a>>,
+}
+
+/// The calibrated CFA mosaic one frame deposits from under Bayer drizzle
+/// (M4d Task 1, ruling R-M4d-2): the `calibrated_mosaic` artifact's path
+/// and the mosaic's phase-corrected pattern (the same value the debayer
+/// itself was given, so the two can never disagree about which pixel is
+/// red).
+#[derive(Debug, Clone, Copy)]
+pub struct CfaSource<'a> {
+    pub path: &'a Path,
+    pub pattern: BayerPattern,
 }
 
 /// Everything [`drizzle_group`] needs for one group's drizzle pass.
@@ -297,6 +330,12 @@ struct FrameDepositCtx<'a> {
     pair: NormalizationPair,
     w: f32,
     plane: usize,
+    /// M4d Task 1 (ruling R-M4d-2): the mosaic's phase-corrected pattern
+    /// when `src` is a CFA mosaic — a source pixel then reaches `plane`
+    /// only when [`geom::cfa_plane_of`] says it carries that colour.
+    /// `None` is the debayered deposit (`src` is already `plane`'s own
+    /// interpolated plane, every pixel contributes).
+    cfa: Option<BayerPattern>,
 }
 
 /// Per plane, per included frame, banded forward deposition (rulings
@@ -348,6 +387,19 @@ pub fn drizzle_group(
                 "frame {idx} ({}): output_pair has {} channel(s), need {}",
                 f.path.display(),
                 f.output_pair.len(),
+                input.channels
+            )));
+        }
+        // M4d Task 1 (ruling R-M4d-2): a mosaic routes its pixels into R/G/B,
+        // so a group that is not 3-channel has nothing to route them into.
+        // The run never builds a `CfaSource` for a mono group (it ignores
+        // `drizzle.bayer` there, silently, by design); a caller that does is
+        // a bug worth naming rather than silently drizzling the mosaic as if
+        // it were a luminance plane.
+        if f.cfa.is_some() && input.channels != 3 {
+            return Err(DrizzleError::BadInput(format!(
+                "frame {idx} ({}): a CFA mosaic source needs a 3-channel group, got {}",
+                f.path.display(),
                 input.channels
             )));
         }
@@ -456,19 +508,34 @@ pub fn drizzle_group(
             }
 
             let read_start = Instant::now();
-            let reader = PlaneReader::open(frame.path)?;
+            // M4d Task 1 (ruling R-M4d-2): under Bayer drizzle the source of
+            // EVERY plane is the one single-plane mosaic — `plane 0` of it,
+            // three times over (once per output plane), each pass keeping
+            // only the pixels of that plane's own colour.
+            let src_path = match frame.cfa {
+                Some(cfa) => cfa.path,
+                None => frame.path,
+            };
+            let reader = PlaneReader::open(src_path)?;
             // B1 (M3 final fix wave, I1): only `channels` has to match the
             // group — a frame's own width/height is read straight off the
             // file and carried through as its SOURCE geometry; `map`
             // (subject → reference) is what places it correctly on the
             // shared output grid regardless of how it compares to the
-            // reference's own size.
-            if reader.channels() != input.channels {
+            // reference's own size. A mosaic is single-plane by definition,
+            // and its own geometry is the frame's native one (the debayer
+            // runs at native resolution), so the same `map` carries it.
+            let want_channels = if frame.cfa.is_some() {
+                1
+            } else {
+                input.channels
+            };
+            if reader.channels() != want_channels {
                 return Err(DrizzleError::BadInput(format!(
-                    "{}: {} channel(s) != group channels {}",
-                    frame.path.display(),
+                    "{}: {} channel(s) != expected {}",
+                    src_path.display(),
                     reader.channels(),
-                    input.channels
+                    want_channels
                 )));
             }
             let src_width = reader.width();
@@ -476,10 +543,10 @@ pub fn drizzle_group(
             if src_width == 0 || src_height == 0 {
                 return Err(DrizzleError::BadInput(format!(
                     "{}: source geometry {src_width}x{src_height} is empty",
-                    frame.path.display()
+                    src_path.display()
                 )));
             }
-            let src = reader.read_plane(c)?;
+            let src = reader.read_plane(if frame.cfa.is_some() { 0 } else { c })?;
             let read_bytes = (src_width * src_height * 4) as u64;
             plane_bytes_read += read_bytes;
             bytes_read_total += read_bytes;
@@ -550,6 +617,7 @@ pub fn drizzle_group(
                 pair,
                 w,
                 plane: c,
+                cfa: frame.cfa.map(|s| s.pattern),
             };
 
             let deposit_start = Instant::now();
@@ -817,6 +885,17 @@ fn deposit_band(
     for y in sy0..=sy1 {
         let row_off = y * ctx.src_width;
         for x in sx0..=sx1 {
+            // M4d Task 1 (ruling R-M4d-2): under Bayer drizzle `ctx.src` is
+            // the whole mosaic, so this plane only takes the pixels of its
+            // own colour — every other one belongs to a different plane's
+            // pass over the same file. Checked before the sample is even
+            // read: it is a two-bit test, and three quarters of the pixels
+            // fail it on the R and B passes.
+            if let Some(pattern) = ctx.cfa {
+                if geom::cfa_plane_of(pattern, x, y) != ctx.plane {
+                    continue;
+                }
+            }
             let d = ctx.src[row_off + x];
             if !d.is_finite() || d == 0.0 {
                 continue;
@@ -1007,6 +1086,7 @@ mod tests {
             output_pair: pair,
             ln: None,
             rej: None,
+            cfa: None,
         }
     }
 
@@ -1253,6 +1333,7 @@ mod tests {
             output_pair: &pair,
             ln: None,
             rej: None,
+            cfa: None,
         };
         let rej1 = set.path(1).to_path_buf();
         let f1 = DrizzleFrame {
@@ -1262,6 +1343,7 @@ mod tests {
             output_pair: &pair,
             ln: None,
             rej: Some(&rej1),
+            cfa: None,
         };
         let frames = [f0, f1];
         let measure = MeasureOptions::default();
@@ -1384,6 +1466,7 @@ mod tests {
             output_pair: &pair,
             ln: Some(&grids),
             rej: None,
+            cfa: None,
         };
         let frames = [f_ln];
         let measure = MeasureOptions::default();
@@ -1452,6 +1535,7 @@ mod tests {
             output_pair: &pair,
             ln: Some(&grids),
             rej: None,
+            cfa: None,
         };
         let frames = [f_ln];
         let measure = MeasureOptions::default();
@@ -1740,6 +1824,7 @@ mod tests {
             output_pair: &pair,
             ln: None,
             rej: None,
+            cfa: None,
         };
         let frames = [f_bad_weight];
         let mut input = base_input(&frames, &measure);
@@ -1762,6 +1847,7 @@ mod tests {
             output_pair: &short_pair,
             ln: None,
             rej: None,
+            cfa: None,
         };
         let frames2 = [f_bad_pair];
         let input2 = base_input(&frames2, &measure);
@@ -1817,6 +1903,7 @@ mod tests {
             kernel: DrizzleKernel::Square,
             kernel_table: None,
             rej: None,
+            cfa: None,
             ln: None,
             pair,
             w: 1.0,
@@ -1841,6 +1928,7 @@ mod tests {
             kernel: DrizzleKernel::Circle,
             kernel_table: Some(&table),
             rej: None,
+            cfa: None,
             ln: None,
             pair,
             w: 1.0,
@@ -2174,6 +2262,7 @@ mod tests {
             output_pair: &pair,
             ln: Some(&grids),
             rej: None,
+            cfa: None,
         };
         let frames = [f_ln];
         let measure = MeasureOptions::default();
@@ -2228,5 +2317,240 @@ mod tests {
              {expected_if_indexed_by_source} — that would mean the lookup used the \
              untransformed source coordinate"
         );
+    }
+
+    // ── Bayer drizzle (M4d Task 1, ruling R-M4d-2) ────────────────────────
+
+    /// A mosaic whose every R site is `r`, every G site `g` and every B
+    /// site `b` — the constant-per-colour fixture the level pin needs.
+    fn rggb_mosaic(w: usize, h: usize, r: f32, g: f32, b: f32) -> Vec<f32> {
+        let mut data = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = match geom::cfa_plane_of(BayerPattern::Rggb, x, y) {
+                    0 => r,
+                    1 => g,
+                    _ => b,
+                };
+            }
+        }
+        data
+    }
+
+    fn cfa_frame<'a>(
+        debayered: &'a std::path::Path,
+        mosaic: &'a std::path::Path,
+        map: &'a PixelMap,
+        weight: &'a [f64],
+        pair: &'a [NormalizationPair],
+    ) -> DrizzleFrame<'a> {
+        DrizzleFrame {
+            path: debayered,
+            map,
+            weight,
+            output_pair: pair,
+            ln: None,
+            rej: None,
+            cfa: Some(CfaSource {
+                path: mosaic,
+                pattern: BayerPattern::Rggb,
+            }),
+        }
+    }
+
+    fn cfa_input<'a>(
+        frames: &'a [DrizzleFrame<'a>],
+        measure: &'a MeasureOptions,
+        scale: u32,
+    ) -> DrizzleInput<'a> {
+        DrizzleInput {
+            frames,
+            width: W,
+            height: H,
+            channels: 3,
+            scale,
+            drop_shrink: 1.0,
+            kernel: DrizzleKernel::Square,
+            use_weights: true,
+            use_rejection: false,
+            use_local_normalization: false,
+            write_weight_map: true,
+            measure,
+            ram_total_bytes: None,
+        }
+    }
+
+    /// Step 1's level pin: the three planes read exactly the mosaic's own
+    /// per-colour levels wherever they are covered, and the coverage is the
+    /// mosaic's own site density (a quarter for R and B, a half for G) —
+    /// each output pixel covered by exactly one same-colour source pixel at
+    /// scale 1, drop 1.0, identity map.
+    #[test]
+    fn bayer_drizzle_deposits_each_colours_own_level_at_scale_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mosaic = rggb_mosaic(W, H, 0.4, 0.6, 0.2);
+        let mp = write_mono(dir.path(), "c_f0.fits", W, H, &mosaic);
+        // The debayered sibling exists (the run always writes it) and must
+        // NOT be read at all under Bayer drizzle: filled with a level no
+        // assertion below could mistake for a mosaic sample.
+        let dp = dir.path().join("c_f0_d.fits");
+        write_fits_f32(&dp, W, H, 3, &vec![9.0f32; W * H * 3], &[]).unwrap();
+
+        let map = identity_map();
+        let weight = [1.0f64; 3];
+        let pair = [NormalizationPair::IDENTITY; 3];
+        let frames = [cfa_frame(&dp, &mp, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let input = cfa_input(&frames, &measure, 1);
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        assert_eq!((out.width, out.height, out.channels), (W, H, 3));
+
+        let plane_px = W * H;
+        let weight_map = out.weight.as_ref().expect("weight map requested");
+        for (plane, expect) in [(0usize, 0.4f32), (1, 0.6), (2, 0.2)] {
+            let mut covered = 0usize;
+            for idx in 0..plane_px {
+                let w = weight_map[plane * plane_px + idx];
+                let v = out.data[plane * plane_px + idx];
+                if w > 0.0 {
+                    covered += 1;
+                    assert!(
+                        (v - expect).abs() < 1e-6,
+                        "plane {plane} pixel {idx}: {v} != {expect}"
+                    );
+                } else {
+                    assert_eq!(v, 0.0, "plane {plane} pixel {idx} uncovered but non-zero");
+                }
+            }
+            let coverage = covered as f64 / plane_px as f64;
+            let want = if plane == 1 { 0.5 } else { 0.25 };
+            assert!(
+                (coverage - want).abs() < 1e-9,
+                "plane {plane} coverage {coverage} != {want}"
+            );
+            assert!(
+                (out.stats.coverage[plane] - want).abs() < 1e-9,
+                "plane {plane} reported coverage {} != {want}",
+                out.stats.coverage[plane]
+            );
+        }
+    }
+
+    /// The same levels hold at scale 2 — `I / W` is level-preserving across
+    /// the mask exactly as it is without one (ruling R-M3-2). Coverage is
+    /// NOT pinned here: how much of a 2x grid a quarter-density mosaic
+    /// reaches is a measured number (Task 6), not a contract.
+    #[test]
+    fn bayer_drizzle_is_level_preserving_at_scale_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mosaic = rggb_mosaic(W, H, 0.4, 0.6, 0.2);
+        let mp = write_mono(dir.path(), "c_f0.fits", W, H, &mosaic);
+        let dp = dir.path().join("c_f0_d.fits");
+        write_fits_f32(&dp, W, H, 3, &vec![9.0f32; W * H * 3], &[]).unwrap();
+
+        let map = identity_map();
+        let weight = [1.0f64; 3];
+        let pair = [NormalizationPair::IDENTITY; 3];
+        let frames = [cfa_frame(&dp, &mp, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let input = cfa_input(&frames, &measure, 2);
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        let plane_px = out.width * out.height;
+        let weight_map = out.weight.as_ref().expect("weight map requested");
+        for (plane, expect) in [(0usize, 0.4f32), (1, 0.6), (2, 0.2)] {
+            let mut covered = 0usize;
+            for idx in 0..plane_px {
+                if weight_map[plane * plane_px + idx] > 0.0 {
+                    covered += 1;
+                    let v = out.data[plane * plane_px + idx];
+                    assert!(
+                        (v - expect).abs() < 1e-6,
+                        "plane {plane} pixel {idx}: {v} != {expect}"
+                    );
+                }
+            }
+            assert!(covered > 0, "plane {plane} deposited nothing at scale 2");
+        }
+    }
+
+    /// Colour purity (the controller's second pin): a mosaic whose R sites
+    /// ramp while its G and B sites stay flat must produce a ramping R
+    /// plane and FLAT G/B planes. A deposit that read the debayered planes
+    /// — or routed a pixel to the wrong plane — would leak the ramp into G
+    /// and B, which is exactly what interpolation does.
+    #[test]
+    fn bayer_drizzle_keeps_each_colour_pure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mosaic = rggb_mosaic(W, H, 0.4, 0.6, 0.2);
+        for y in 0..H {
+            for x in 0..W {
+                if geom::cfa_plane_of(BayerPattern::Rggb, x, y) == 0 {
+                    // 0.4 .. 0.4 + 0.63 across the frame, by column.
+                    mosaic[y * W + x] = 0.4 + x as f32 * 0.01;
+                }
+            }
+        }
+        let mp = write_mono(dir.path(), "c_f0.fits", W, H, &mosaic);
+        let dp = dir.path().join("c_f0_d.fits");
+        write_fits_f32(&dp, W, H, 3, &vec![9.0f32; W * H * 3], &[]).unwrap();
+
+        let map = identity_map();
+        let weight = [1.0f64; 3];
+        let pair = [NormalizationPair::IDENTITY; 3];
+        let frames = [cfa_frame(&dp, &mp, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let input = cfa_input(&frames, &measure, 1);
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        let plane_px = W * H;
+        let weight_map = out.weight.as_ref().expect("weight map requested");
+
+        // R follows the ramp at its own sites.
+        for y in (0..H).step_by(2) {
+            for x in (0..W).step_by(2) {
+                let idx = y * W + x;
+                assert!(weight_map[idx] > 0.0, "R site ({x}, {y}) not covered");
+                let expect = 0.4 + x as f32 * 0.01;
+                let v = out.data[idx];
+                assert!((v - expect).abs() < 1e-5, "R ({x}, {y}): {v} != {expect}");
+            }
+        }
+        // G and B stay exactly flat wherever they are covered.
+        for (plane, expect) in [(1usize, 0.6f32), (2, 0.2)] {
+            for idx in 0..plane_px {
+                if weight_map[plane * plane_px + idx] > 0.0 {
+                    let v = out.data[plane * plane_px + idx];
+                    assert!(
+                        (v - expect).abs() < 1e-6,
+                        "plane {plane} pixel {idx} leaked the R ramp: {v} != {expect}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A mosaic source has nowhere to route its colours in a mono group —
+    /// refused up front, never silently drizzled as a luminance plane.
+    #[test]
+    fn bayer_drizzle_is_refused_for_a_mono_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mosaic = rggb_mosaic(W, H, 0.4, 0.6, 0.2);
+        let mp = write_mono(dir.path(), "c_f0.fits", W, H, &mosaic);
+
+        let map = identity_map();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames = [cfa_frame(&mp, &mp, &map, &weight, &pair)];
+        let measure = MeasureOptions::default();
+        let input = base_input(&frames, &measure);
+
+        match drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()) {
+            Err(DrizzleError::BadInput(msg)) => {
+                assert!(msg.contains("3-channel group"), "{msg}");
+            }
+            other => panic!("expected a BadInput refusal, got {other:?}"),
+        }
     }
 }

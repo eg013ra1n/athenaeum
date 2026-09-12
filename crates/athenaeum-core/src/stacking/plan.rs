@@ -1499,6 +1499,9 @@ pub fn build_plan(
         // bitmaps drizzle's `useRejection` does, plus a processed sibling
         // of each — even with drizzle off.
         large_scale: cfg.integration.large_scale.enabled,
+        // M4d Task 1: Bayer drizzle keeps one extra single-plane artifact
+        // per OSC frame (the calibrated CFA mosaic).
+        drizzle_bayer: cfg.drizzle.bayer,
     });
 
     // Gate 4: space.

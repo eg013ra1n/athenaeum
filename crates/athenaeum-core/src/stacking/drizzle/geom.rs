@@ -12,6 +12,8 @@
 //! `[x − 0.5, x + 0.5] × [y − 0.5, y + 0.5]` — on both the subject/reference
 //! side and the output-grid side.
 
+use astroimage::BayerPattern;
+
 use crate::geometry::pixel_map::ForwardEval;
 use crate::stacking::config::DrizzleKernel;
 
@@ -361,6 +363,39 @@ pub fn kernel_table(kernel: DrizzleKernel, drop_shrink: f64) -> Option<KernelTab
     Some(KernelTable { offsets, weights })
 }
 
+/// Which output plane mosaic pixel `(x, y)` carries (M4d Task 1, ruling
+/// R-M4d-2, math §6.4): `0 = R`, `1 = G`, `2 = B`. The pattern names the
+/// 2x2 tile in FILE row order — the same convention
+/// [`crate::integration::cfa::cfa_channel_at`] reads and the debayer
+/// itself assumes — and every supported pattern is 2x2, so the cell index
+/// is `(y mod 2) * 2 + (x mod 2)`.
+///
+/// The mosaic's own phase (`XBAYROFF`/`YBAYROFF`) is NOT folded in here:
+/// the caller passes the phase-corrected pattern the debayer would get
+/// (`export::calibrated_generator::bayer_for`), so this function and the
+/// debayer can never disagree about which pixel is red.
+///
+/// [`BayerPattern::None`] has no mosaic to route, so it reports plane 0 for
+/// every pixel — a caller must never reach here with it (the run only ever
+/// builds a [`super::CfaSource`] from a real pattern).
+#[inline]
+pub fn cfa_plane_of(pattern: BayerPattern, x: usize, y: usize) -> usize {
+    // Row-major 2x2 cells: entry `(y & 1) * 2 + (x & 1)`, the same tables
+    // `cfa_channel_at` spells out as nested arrays.
+    const RGGB: [usize; 4] = [0, 1, 1, 2];
+    const BGGR: [usize; 4] = [2, 1, 1, 0];
+    const GRBG: [usize; 4] = [1, 0, 2, 1];
+    const GBRG: [usize; 4] = [1, 2, 0, 1];
+    let cell = (y & 1) * 2 + (x & 1);
+    match pattern {
+        BayerPattern::Rggb => RGGB[cell],
+        BayerPattern::Bggr => BGGR[cell],
+        BayerPattern::Grbg => GRBG[cell],
+        BayerPattern::Gbrg => GBRG[cell],
+        BayerPattern::None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::geometry::linear::{Linear, LinearKind};
@@ -631,5 +666,83 @@ mod tests {
 
         let corners = drop_corners(0, 0, 2.0); // corner (x - h, y - h) = (-1, -1)
         assert_eq!(map_drop(&map.forward_eval(), &corners, 1), None);
+    }
+
+    // ── cfa_plane_of (M4d Task 1, ruling R-M4d-2) ─────────────────────────
+
+    /// The four patterns, each read as its own name spells it: the tile's
+    /// top-left, top-right, bottom-left, bottom-right colours.
+    #[test]
+    fn cfa_plane_of_follows_the_pattern_name() {
+        for (pattern, expect) in [
+            (BayerPattern::Rggb, [0usize, 1, 1, 2]),
+            (BayerPattern::Bggr, [2, 1, 1, 0]),
+            (BayerPattern::Grbg, [1, 0, 2, 1]),
+            (BayerPattern::Gbrg, [1, 2, 0, 1]),
+        ] {
+            for (cell, (x, y)) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    cfa_plane_of(pattern, x, y),
+                    expect[cell],
+                    "{pattern:?} at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// The tile repeats: pixel `(x + 2k, y + 2m)` carries the same colour as
+    /// `(x, y)` — the property `deposit_band`'s per-pixel mask relies on.
+    #[test]
+    fn cfa_plane_of_is_periodic_in_two() {
+        for pattern in [
+            BayerPattern::Rggb,
+            BayerPattern::Bggr,
+            BayerPattern::Grbg,
+            BayerPattern::Gbrg,
+        ] {
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    assert_eq!(
+                        cfa_plane_of(pattern, x, y),
+                        cfa_plane_of(pattern, x % 2, y % 2),
+                        "{pattern:?} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The routing agrees with the codebase's own definition of where each
+    /// colour sits (`integration::cfa::cfa_channel_at` at phase zero) — the
+    /// two tables are written out separately and must never drift.
+    #[test]
+    fn cfa_plane_of_agrees_with_cfa_channel_at() {
+        use crate::fits_writer::keywords::Bayer;
+        use crate::integration::cfa::{cfa_channel_at, CfaGeometry};
+
+        for (pattern, bayer) in [
+            (BayerPattern::Rggb, Bayer::Rggb),
+            (BayerPattern::Bggr, Bayer::Bggr),
+            (BayerPattern::Grbg, Bayer::Grbg),
+            (BayerPattern::Gbrg, Bayer::Gbrg),
+        ] {
+            let geom = CfaGeometry {
+                pattern: bayer,
+                xoff: 0,
+                yoff: 0,
+            };
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    assert_eq!(
+                        cfa_plane_of(pattern, x, y),
+                        cfa_channel_at(x, y, geom).idx(),
+                        "{pattern:?} at ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 }

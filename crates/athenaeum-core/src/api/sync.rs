@@ -3806,6 +3806,9 @@ pub async fn enqueue_frame_set_send(
         params,
         hot_pixel_correction,
         debayer_osc,
+        // A send carries the calibrated light itself; the CFA mosaic is a
+        // stacking-run artifact (M4d Task 1), never part of a payload.
+        keep_mosaic: false,
     };
     let entries =
         crate::api::frame_set_send::frame_set_entries(ctx, frame_set_id, mode, &gen_opts)?;

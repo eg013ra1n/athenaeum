@@ -992,9 +992,24 @@ bitmaps) and zero samples are skipped; final `I /= W / dropShrink²`, weight
 map kept and written as `<stem>_drizzle<s>x_weight.fits` when asked.
 Parallel by tile, one `I`/`W` pair per plane. Output `<master
 stem>_drizzle<s>x.fits` with the WCS scaled (`CRPIX·s`, `CD/s`) and
-`ATH_DRZ`, `ATH_DRZP`, `ATH_DRZK` cards. Bayer drizzle (CFA source → RGB
-planes without demosaic) is M4 and needs stage 1 to also keep the calibrated
-CFA mosaic.
+`ATH_DRZ`, `ATH_DRZP`, `ATH_DRZK` cards.
+
+**Bayer drizzle (M4d, `drizzle.bayer`, default off, ignored for a mono
+group)** — CFA source → RGB planes without demosaic (math §6.4). Stage 1
+keeps the calibrated, hot-pixel-corrected CFA mosaic beside each debayered
+frame (`c_<stem>.fits` next to `c_<stem>_d.fits`, written by the SAME
+generation — one read, one calibration, two writes; a `calibrated_mosaic`
+artifact keyed by the calibrated frame's own hash), and the deposit then
+reads that ONE single-plane mosaic for every output plane, taking a source
+pixel into plane `c` only when its own 2×2 site carries `"RGB"[c]` — G has
+two sites per cell and contributes both. Everything else is the DEBAYERED
+run's, unchanged and in reference geometry: the `PixelMap`, the per-plane
+weight, the `.rej` lookup and the LN grid (§3, §5.2 — "alignment data still
+come from the registration of the debayered frame"). R and B therefore
+deposit a quarter of the pixels each against G's half, so per-plane coverage
+is lower and honestly reported in `DrizzleStats.coverage`; `dropShrink` is
+never forced up on the user's behalf, the panel says so instead. `I / W`
+stays level-preserving across the mask.
 
 ### Implementation notes (M3)
 
@@ -1232,7 +1247,7 @@ integration:   { combination: "average", rejection: { method: "auto" },
                 -- every survivor is grown by. On, integration runs TWICE.
 drizzle:       { enabled: false, scale: 2, dropShrink: 0.9, kernel: "square",
                  useRejection: true, useWeights: true, useLocalNormalization: true,
-                 writeWeightMap: false }
+                 writeWeightMap: false, bayer: false }    -- bayer: M4d, OSC only
 output:        { format: "fits", cleanup: "keepAll" }
 paths:         { workingDir: null, outputDir: null }     -- null = the global default
 ```
@@ -1259,6 +1274,15 @@ when its row's hash matches and the file exists with the recorded size. A
 stale artifact is overwritten in place; orphan files in the working folder
 are reported by the cleanup action, never deleted silently.
 
+M4d adds one artifact kind, not one stage: `calibrated_mosaic` (§7's Bayer
+drizzle) is keyed by its frame's OWN stage-1 hash — the same generation
+produces both files, and `drizzle.bayer` deliberately enters NO stage
+subtree, since the debayered frame is byte-identical whether the mosaic is
+kept or not. Turning the toggle on therefore recalibrates nothing by hash;
+what makes the pair appear is the missing `calibrated_mosaic` row, which
+stage 1 treats as "this frame is not fresh" and regenerates both from one
+read. `deleteIntermediates` removes the kind with `calibrated`.
+
 ### 9.4 Paths
 
 - Global defaults: `stacking.working_dir`, `stacking.output_dir` (empty =
@@ -1280,7 +1304,10 @@ are reported by the cleanup action, never deleted silently.
 
 ```
 <working>/<set slug>/
-  calibrated/<group key>/c_<stem>.fits
+  calibrated/<group key>/c_<stem>.fits           (an OSC group debayers into
+                                                  c_<stem>_d.fits; the bare
+                                                  c_<stem>.fits is then its CFA
+                                                  mosaic — M4d, `drizzle.bayer`)
   registered/<group key>/r_<stem>.fits          (optional)
   ln/<group key>/reference.fits, <stem>.athln    (M2)
   rej/run-<id>/<group key>/<stem>.rej            (drizzle runs only, temporary)

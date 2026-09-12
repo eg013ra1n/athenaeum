@@ -313,9 +313,13 @@ export function stageSummary(
         : '';
       return `${combinationLabel(config.integration.combination)} · ${rejectionLabel(config.integration.rejection)} · min weight ${formatUpTo3Decimals(config.integration.minWeight)}${lnRejection}${largeScale}`;
     }
-    case 'drizzle':
+    case 'drizzle': {
       if (!config.drizzle.enabled) return 'Off';
-      return `${config.drizzle.scale}× · ${kernelLabel(config.drizzle.kernel)} kernel · drop ${config.drizzle.dropShrink.toFixed(2)}`;
+      // M4d Task 1: ` · Bayer` when the deposit takes each colour's own
+      // mosaic samples (OSC groups only — a mono group ignores it).
+      const bayer = config.drizzle.bayer ? ' · Bayer' : '';
+      return `${config.drizzle.scale}× · ${kernelLabel(config.drizzle.kernel)} kernel · drop ${config.drizzle.dropShrink.toFixed(2)}${bayer}`;
+    }
     case 'output':
       return `${config.output.format.toUpperCase()} · ${cleanupLabel(config.output.cleanup)}`;
   }

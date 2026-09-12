@@ -339,6 +339,19 @@ pub struct CalibratedLightOptions {
     /// frames and for a `BAYERPAT` the catalog cannot vouch for.
     #[serde(default = "default_true")]
     pub debayer_osc: bool,
+    /// Also keep the calibrated CFA mosaic beside the debayered output (M4d
+    /// Task 1, ruling R-M4d-1) — the stacking run sets this for an OSC group
+    /// whose drizzle deposits each colour's own samples, and nothing else
+    /// does.
+    ///
+    /// **Run-internal, never on the wire** (`#[serde(skip)]`, which also
+    /// keeps it out of the generated TypeScript): a host command has no say
+    /// in it — the artifact is an implementation detail of the pipeline that
+    /// asked for it, not an export option a user picks. A payload written by
+    /// any host therefore decodes it as `false`, and an options value
+    /// serialized by this build round-trips to `false` too.
+    #[serde(skip)]
+    pub keep_mosaic: bool,
 }
 
 impl Default for CalibratedLightOptions {
@@ -349,6 +362,7 @@ impl Default for CalibratedLightOptions {
             params: LightCalParams::default(),
             hot_pixel_correction: true,
             debayer_osc: true,
+            keep_mosaic: false,
         }
     }
 }
@@ -372,6 +386,9 @@ impl CalibratedLightOptions {
             params: params.unwrap_or(d.params),
             hot_pixel_correction: hot_pixel.unwrap_or(d.hot_pixel_correction),
             debayer_osc: debayer.unwrap_or(d.debayer_osc),
+            // Not a host argument (see the field's own doc): the run that
+            // wants the mosaic sets it on the resolved options itself.
+            keep_mosaic: d.keep_mosaic,
         }
     }
 }

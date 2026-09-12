@@ -827,6 +827,9 @@ fn generate_payload(
     let generated = crate::export::execute_generation(
         spec,
         dest,
+        // A send carries the calibrated light itself; the CFA mosaic is a
+        // stacking-run artifact (M4d Task 1), never part of a payload.
+        None,
         &gen.scratch_dir,
         &gen.opts,
         &mut gen.hot_maps,
