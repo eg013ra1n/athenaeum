@@ -104,6 +104,13 @@ pub(crate) struct LightSpec<'a> {
     pub write_file: bool,
 }
 
+/// The row order every fixture light declares — in its file's header, in
+/// its stored `fits_header` blob and in `frames.roworder`, the three places
+/// the pipeline can learn it from. A test that needs another order changes
+/// the stored blob and the column (what the calibrate stage READS), never
+/// the file's bytes.
+pub(crate) const FIXTURE_ROW_ORDER: &str = "TOP-DOWN";
+
 /// One LIGHT frame (`files` + `frames` rows) joined into the fixture's
 /// session, mirroring `api::lights.rs`'s `seed_light` plus the columns
 /// integration groups need (`instrume`, `filter`, `xbinning`, `naxis1/2`,
@@ -180,9 +187,23 @@ pub(crate) fn add_light_with_field_and_bands(
     (frame_id, path)
 }
 
-/// The `files`/`frames`/`session_members` rows shared by [`add_light`] and
-/// [`add_light_with_field`] — everything BUT the pixel data itself, which
-/// each caller writes its own way before calling this. Returns `frame_id`.
+/// The `files`/`frames`/`fits_header`/`session_members` rows shared by
+/// [`add_light`] and [`add_light_with_field`] — everything BUT the pixel
+/// data itself, which each caller writes its own way before calling this.
+/// Returns `frame_id`.
+///
+/// M4d Task 2 fix round 2: the `fits_header` blob and `frames.roworder` are
+/// part of this now. They used to be missing, which made the fixture LIE
+/// about the pipeline: `calibration_library::light_resolve` reads the
+/// stored blob (with the catalog columns as its fallback) to build the
+/// source cards a calibrated light copies through, so a fixture with
+/// neither produced calibrated frames — and therefore masters — carrying
+/// none of the source's `OBJECT`/`INSTRUME`/`ROWORDER`/WCS cards, a state
+/// no scanned file is ever in. The blob is the same shape the scanner
+/// stores (`FitsHeader::to_header_text`, 80-byte cards joined by newlines,
+/// through `db::insert_fits_header` so the fingerprint is real) and is
+/// written only when a file actually exists on disk; the column is set
+/// either way, since it is catalog data.
 fn insert_light_row(
     f: &Fixture,
     spec: &LightSpec<'_>,
@@ -203,8 +224,8 @@ fn insert_light_row(
     f.conn
         .execute(
             "INSERT INTO frames
-                (file_id, instrume, filter, xbinning, naxis1, naxis2, exptime, date_obs, bayerpat, imagetyp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'Light')",
+                (file_id, instrume, filter, xbinning, naxis1, naxis2, exptime, date_obs, bayerpat, roworder, imagetyp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'Light')",
             params![
                 file_id,
                 spec.instrume,
@@ -215,10 +236,25 @@ fn insert_light_row(
                 spec.exptime,
                 spec.date_obs,
                 spec.bayerpat,
+                FIXTURE_ROW_ORDER,
             ],
         )
         .unwrap();
     let frame_id = f.conn.last_insert_rowid();
+
+    // The scanner-stored header blob, when there is a file to read it from
+    // (`write_file: false` specs seed catalog rows only).
+    if path.exists() {
+        match crate::fits_parser::fits_header_reader::FitsHeader::from_path(path) {
+            Ok(header) => {
+                crate::db::insert_fits_header(&f.conn, file_id, &header.to_header_text()).unwrap();
+            }
+            Err(e) => panic!(
+                "fixture light {} has no readable header: {e}",
+                path.display()
+            ),
+        }
+    }
 
     f.conn
         .execute(
@@ -605,7 +641,7 @@ fn write_light_fits_field(
     if let Some(bayerpat) = spec.bayerpat {
         cards.push(Card::new("BAYERPAT", CardValue::Str(bayerpat.to_string())).unwrap());
     }
-    cards.push(Card::new("ROWORDER", CardValue::Str("TOP-DOWN".to_string())).unwrap());
+    cards.push(Card::new("ROWORDER", CardValue::Str(FIXTURE_ROW_ORDER.to_string())).unwrap());
 
     write_fits_i16(path, w, h, &data, &cards);
 }

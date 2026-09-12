@@ -526,7 +526,14 @@ pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteEr
     for c in drizzle_cards.iter().filter(|c| is_wcs_keyword(&c.keyword)) {
         cards.push(c.clone());
     }
-    for kw in ["ATH_STKI", "ATH_STKG", ATH_DRZ, ATH_RGEO] {
+    // `ROWORDER` (M4d Task 2 fix round 2): the weight map IS the drizzled
+    // master's grid, row for row, so it must declare the same row order.
+    // Load-bearing for an XISF weight map specifically —
+    // `fits_writer::xisf_writer` states the effective order explicitly and
+    // synthesizes the astronomical default when the cards carry none, so
+    // without this copy-through a weight map would claim `'BOTTOM-UP'`
+    // beside a master that says `'TOP-DOWN'`.
+    for kw in ["ROWORDER", "ATH_STKI", "ATH_STKG", ATH_DRZ, ATH_RGEO] {
         if let Some(c) = drizzle_cards.iter().find(|c| c.keyword == kw) {
             cards.push(c.clone());
         }
@@ -1677,6 +1684,11 @@ mod tests {
             Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
             Card::new(ATH_DRZ, CardValue::Integer(2)).unwrap(),
             Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap(),
+            Card::new(
+                "ROWORDER",
+                CardValue::Str(crate::orientation::ROW_ORDER_TOP_DOWN.into()),
+            )
+            .unwrap(),
         ];
 
         let output = DrizzleOutput {
@@ -1707,6 +1719,20 @@ mod tests {
                 (meta.width, meta.height, meta.channels),
                 (w, h, ch),
                 "{}",
+                path.display()
+            );
+            // Fix round 2: the weight map is the drizzled master's grid row
+            // for row, so it declares the master's own row order — not the
+            // `'BOTTOM-UP'` the XISF writer synthesizes for a card list
+            // that carries none.
+            let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
+                crate::models::FileFormat::XISF,
+                &crate::fits_parser::extract_xisf_header(path).unwrap(),
+            );
+            assert_eq!(
+                keys.get("ROWORDER").map(String::as_str),
+                Some(crate::orientation::ROW_ORDER_TOP_DOWN),
+                "{}: {keys:?}",
                 path.display()
             );
         }

@@ -978,13 +978,15 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
 - **XISF row order — a known limitation** (M4d Task 2 fix round 1, ruling
   R-T2-1). XISF's convention is that row 0 IS the top row and no XISF
   reader has a `ROWORDER` concept, while the master's array is simply its
-  source frames' order: no stage flips pixels. So for a BOTTOM-UP set — or
-  one whose cards carry no `ROWORDER` at all, which the astronomical
-  convention reads as bottom-up (`orientation::row_order_is_bottom_up`) and
-  which is every master this pipeline writes today, since the calibration
-  hop's card whitelist (`calibration_library::light_headers`) does not copy
-  the keyword through — an XISF viewer shows the master
-  vertically MIRRORED relative to the FITS master of the same run. The
+  source frames' order: no stage flips pixels, and the master's `ROWORDER`
+  is the source frames' own, copied through calibration
+  (`calibration_library::light_headers`' `COPY_THROUGH_KEYWORDS`),
+  registration (`register::writer::REGISTERED_COPY_THROUGH`) and the
+  master's card build. So for a BOTTOM-UP set — or one whose frames carry
+  no `ROWORDER` at all, which the astronomical convention reads as
+  bottom-up (`orientation::row_order_is_bottom_up`) — an XISF viewer shows
+  the master vertically MIRRORED relative to the FITS master of the same
+  run. The
   pixels are deliberately not flipped: a row flip would have to transform
   the master's WCS too (`CRPIX2`, the CD matrix, the odd-`v` SIP terms),
   which is a feature of its own and is a recorded follow-up. The WCS is

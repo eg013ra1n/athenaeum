@@ -45,11 +45,12 @@
 //! R-T2-1). XISF's convention is that row 0 IS the top row and no XISF
 //! reader has a `ROWORDER` concept, but the array handed to this writer is
 //! simply its source frames' order — no stage of the stacking pipeline
-//! flips pixels. So for a BOTTOM-UP set, or one whose cards carry no
-//! `ROWORDER` at all (which the astronomical convention reads as
-//! bottom-up — `crate::orientation`, and which is every stacking master
-//! today: the calibration hop does not copy the keyword through), an XISF
-//! viewer shows this file vertically mirrored relative to the FITS file of
+//! flips pixels, and a stacking master's `ROWORDER` is its source frames'
+//! own, copied through calibration, registration and the master's card
+//! build. So for a BOTTOM-UP set, or one whose cards carry no `ROWORDER`
+//! at all (which the astronomical convention reads as bottom-up —
+//! `crate::orientation`), an XISF viewer shows this file vertically
+//! mirrored relative to the FITS file of
 //! the same data. The pixels are deliberately NOT flipped here: a row flip
 //! would have to transform the master's WCS too (`CRPIX2`, the CD matrix,
 //! the odd-`v` SIP terms), which is a feature of its own and is recorded as

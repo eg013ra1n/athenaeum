@@ -15195,85 +15195,94 @@ mod tests {
 
         // Fix round 1, ruling R-T2-1: the XISF header always STATES the
         // stored array's row order rather than leaving a reader with the
-        // FITS convention's silent default.
-        //
-        // Why `BOTTOM-UP` even though this fixture's lights are written
-        // `TOP-DOWN`: the calibration hop does not copy `ROWORDER` through
-        // (`calibration_library::light_headers`'s card whitelist has no
-        // such entry), so no master built by this pipeline carries the
-        // keyword at all today and the astronomical default applies — to
-        // the FITS master exactly as much as to this one. That also makes
-        // the warning below unconditional for XISF runs. If `ROWORDER` ever
-        // starts flowing through calibration, THIS line is the canary that
-        // says so, and the sibling test below (whose SOURCE frames are
-        // genuinely bottom-up) keeps pinning the bottom-up case.
+        // FITS convention's silent default. The effective order is the
+        // SOURCE frames' own `ROWORDER`, copied through calibration
+        // (`calibration_library::light_headers`' `COPY_THROUGH_KEYWORDS`),
+        // registration (`register::writer::REGISTERED_COPY_THROUGH`) and
+        // the master's own card build — so this fixture's `TOP-DOWN` lights
+        // give a `TOP-DOWN` master and nothing to warn about. Only a set
+        // whose frames carry no card at all lands on the `'BOTTOM-UP'`
+        // default (the two sibling tests below cover both of those).
         let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
             crate::models::FileFormat::XISF,
             &crate::fits_parser::extract_xisf_header(Path::new(&master_path)).unwrap(),
         );
         assert_eq!(
             keys.get("ROWORDER").map(String::as_str),
-            Some(crate::orientation::ROW_ORDER_BOTTOM_UP),
+            Some(crate::orientation::ROW_ORDER_TOP_DOWN),
             "{keys:?}"
         );
-        assert_eq!(
-            summary
+        assert!(
+            !summary
                 .warnings
                 .iter()
-                .filter(|w| w.contains("bottom-up row order"))
-                .count(),
-            1,
-            "one row-order warning per group, drizzle and weight map included: {:?}",
+                .any(|w| w.contains("bottom-up row order")),
+            "a TOP-DOWN set must not warn: {:?}",
             summary.warnings
         );
     }
 
-    /// The fixture writes `ROWORDER = 'TOP-DOWN'`; rewrite it in place to
-    /// `'BOTTOM-UP'` on every light, in the SAME 80-byte record, so the file
-    /// size and every later offset stay put and the value travels through
-    /// calibration and registration by the same copy-through a real
-    /// bottom-up set's would.
-    fn make_lights_bottom_up(dir: &Path, count: usize) {
-        let record = crate::fits_writer::card::format_card(
-            &crate::fits_writer::Card::new(
-                "ROWORDER",
-                crate::fits_writer::CardValue::Str(
-                    crate::orientation::ROW_ORDER_BOTTOM_UP.into(),
-                ),
+    /// Point what the CALIBRATE stage reads at a different row order: the
+    /// stored `fits_header` blob (`light_resolve::source_cards_for_file`
+    /// parses it) and the `frames.roworder` column (its catalog fallback).
+    /// `None` removes both — the state of a source frame that never carried
+    /// the card. The raw file's own bytes are deliberately left alone: the
+    /// pipeline never re-reads a light's header off disk, so rewriting the
+    /// file would change nothing and prove nothing.
+    fn set_lights_row_order(
+        conn: &rusqlite::Connection,
+        frame_ids: &[i64],
+        order: Option<&str>,
+    ) {
+        let card_line = order.map(|order| {
+            let records = crate::fits_writer::card::format_card(
+                &crate::fits_writer::Card::new(
+                    "ROWORDER",
+                    crate::fits_writer::CardValue::Str(order.to_string()),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(record.len(), 1, "one 80-byte record");
-        for i in 0..count {
-            let path = dir.join(format!("f{i}.fits"));
-            let mut bytes = std::fs::read(&path).unwrap();
-            let mut at: Option<usize> = None;
-            for (idx, chunk) in bytes.chunks(80).enumerate() {
-                if chunk.starts_with(b"END ") {
-                    break;
-                }
-                if chunk.starts_with(b"ROWORDER") {
-                    at = Some(idx);
-                    break;
+            .unwrap();
+            assert_eq!(records.len(), 1, "one 80-byte record");
+            String::from_utf8(records[0].to_vec()).unwrap()
+        });
+        for &frame_id in frame_ids {
+            let (file_id, header): (i64, String) = conn
+                .query_row(
+                    "SELECT f.file_id, h.header
+                     FROM frames f JOIN fits_header h ON h.file_id = f.file_id
+                     WHERE f.id = ?1",
+                    rusqlite::params![frame_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or_else(|e| panic!("frame {frame_id} has no stored header: {e}"));
+            let mut lines: Vec<String> = header
+                .lines()
+                .filter(|l| !l.starts_with("ROWORDER"))
+                .map(|l| l.to_string())
+                .collect();
+            if let Some(line) = card_line.clone() {
+                match lines.iter().position(|l| l.starts_with("END")) {
+                    Some(i) => lines.insert(i, line),
+                    None => lines.push(line),
                 }
             }
-            let at =
-                at.unwrap_or_else(|| panic!("no ROWORDER card in {}", path.display()));
-            bytes[at * 80..at * 80 + 80].copy_from_slice(&record[0]);
-            std::fs::write(&path, &bytes).unwrap();
+            conn.execute(
+                "UPDATE fits_header SET header = ?1 WHERE file_id = ?2",
+                rusqlite::params![lines.join("\n"), file_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE frames SET roworder = ?1 WHERE id = ?2",
+                rusqlite::params![order, frame_id],
+            )
+            .unwrap();
         }
     }
 
     /// Ruling R-T2-1: a bottom-up set's XISF master keeps the frames' row
     /// order — the pixels are not flipped, the header states `BOTTOM-UP`
     /// explicitly, and the run warns exactly ONCE, naming the group.
-    ///
-    /// The SOURCE lights are genuinely `BOTTOM-UP` here (the sibling test
-    /// above starts from the fixture's `TOP-DOWN` ones and reaches the same
-    /// answer only because calibration drops the keyword — see its comment).
-    /// So this test is the one that still asks the real question if
-    /// `ROWORDER` ever starts flowing through calibration.
     #[test]
     fn a_bottom_up_xisf_run_warns_once_about_the_row_order() {
         let tmp = tempfile::tempdir().unwrap();
@@ -15283,7 +15292,11 @@ mod tests {
         let noise = [5.0f32; 4];
         let (fixture, light_ids, _working, _output) =
             seed_star_group(&db_path, SET_NAME, &shifts, &noise);
-        make_lights_bottom_up(fixture.dir.path(), shifts.len());
+        set_lights_row_order(
+            &fixture.conn,
+            &light_ids,
+            Some(crate::orientation::ROW_ORDER_BOTTOM_UP),
+        );
         test_fixtures::add_master_dark_and_flat(
             &fixture,
             &light_ids,
@@ -15342,6 +15355,77 @@ mod tests {
             keys.get("ROWORDER").map(String::as_str),
             Some(crate::orientation::ROW_ORDER_BOTTOM_UP),
             "the XISF header states the effective order: {keys:?}"
+        );
+    }
+
+    /// Ruling R-T2-1, the third case: source frames carrying NO `ROWORDER`
+    /// at all. The astronomical convention reads that as bottom-up
+    /// (`orientation::row_order_is_bottom_up`'s `None` arm), so the XISF
+    /// header says `'BOTTOM-UP'` — a statement the source never made, which
+    /// is exactly why it comes with the warning.
+    #[test]
+    fn a_source_without_a_row_order_card_is_declared_bottom_up_and_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        set_lights_row_order(&fixture.conn, &light_ids, None);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.format = crate::stacking::config::OutputFormat::Xisf;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        let master_path = groups[0]
+            .master_path
+            .clone()
+            .expect("master path recorded");
+
+        let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
+            crate::models::FileFormat::XISF,
+            &crate::fits_parser::extract_xisf_header(Path::new(&master_path)).unwrap(),
+        );
+        assert_eq!(
+            keys.get("ROWORDER").map(String::as_str),
+            Some(crate::orientation::ROW_ORDER_BOTTOM_UP),
+            "{keys:?}"
+        );
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            summary
+                .warnings
+                .iter()
+                .filter(|w| w.contains("bottom-up row order"))
+                .count(),
+            1,
+            "{:?}",
+            summary.warnings
         );
     }
 }
