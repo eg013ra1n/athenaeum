@@ -110,6 +110,16 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: Dri
           R and B cover a quarter of the pixels each — use drop shrink ≥ 0.9 or more frames.
           {noOscGroup ? ' This set has no OSC group, so it changes nothing.' : ''}
         </p>
+        {/* Fix round 1 (I1): with the debayer off, an OSC group's calibrated
+         *  frame IS the mosaic and the group is single-plane, so no mosaic is
+         *  kept and the toggle has no effect — the run warns about exactly
+         *  this, and the panel that owns the toggle should not make the user
+         *  discover it there. */}
+        {d.bayer && !config.calibration.debayerOsc && (
+          <p className="mt-1 ml-6 text-[11px] text-warning">
+            No effect — the OSC debayer is off for this set (Calibrate), so no CFA mosaic is kept.
+          </p>
+        )}
       </div>
 
       <div className="space-y-1.5 pt-1">

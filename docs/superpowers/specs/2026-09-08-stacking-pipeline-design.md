@@ -994,8 +994,12 @@ Parallel by tile, one `I`/`W` pair per plane. Output `<master
 stem>_drizzle<s>x.fits` with the WCS scaled (`CRPIX·s`, `CD/s`) and
 `ATH_DRZ`, `ATH_DRZP`, `ATH_DRZK` cards.
 
-**Bayer drizzle (M4d, `drizzle.bayer`, default off, ignored for a mono
-group)** — CFA source → RGB planes without demosaic (math §6.4). Stage 1
+**Bayer drizzle (M4d, `drizzle.bayer`, default off, ignored for a mono group
+and for a run whose `calibration.debayerOsc` is off — with the debayer off an
+OSC group's calibrated frame IS the mosaic and the group is single-plane, so
+there is nothing to route per colour; the run says so once as a warning
+rather than wanting an artifact no generation can produce)** — CFA source →
+RGB planes without demosaic (math §6.4). Stage 1
 keeps the calibrated, hot-pixel-corrected CFA mosaic beside each debayered
 frame (`c_<stem>.fits` next to `c_<stem>_d.fits`, written by the SAME
 generation — one read, one calibration, two writes; a `calibrated_mosaic`
@@ -1281,7 +1285,10 @@ subtree, since the debayered frame is byte-identical whether the mosaic is
 kept or not. Turning the toggle on therefore recalibrates nothing by hash;
 what makes the pair appear is the missing `calibrated_mosaic` row, which
 stage 1 treats as "this frame is not fresh" and regenerates both from one
-read. `deleteIntermediates` removes the kind with `calibrated`.
+read. The plan gate applies the SAME two-artifact rule — a frame owing a
+mosaic is reported neither cached nor fresh — so the gate and the run can
+never disagree about what the first Bayer run will redo.
+`deleteIntermediates` removes the kind with `calibrated`.
 
 ### 9.4 Paths
 

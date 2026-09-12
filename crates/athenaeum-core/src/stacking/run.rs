@@ -79,7 +79,8 @@ use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, is_fresh, measurement_hash_for, normalization_hash_for, registration_hash_for,
-    registration_row_is_fresh, HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
+    registration_row_is_fresh, wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork,
+    PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -1465,19 +1466,6 @@ pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame)
     }
 }
 
-/// Whether this group's stage-1 also keeps the calibrated CFA mosaic beside
-/// each debayered frame (M4d Task 1, rulings R-M4d-1/2): only an OSC group
-/// whose drizzle is on AND asked to deposit each colour's own samples. A mono
-/// group ignores `drizzle.bayer` silently — there is no mosaic to keep and
-/// nothing about the run changes.
-///
-/// The ONE place the condition is spelled out: stage 1 reads it to decide
-/// what to write and cache, and stage 8 reads it to decide what to deposit
-/// from, so the two can never disagree about whether a mosaic should exist.
-fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -> bool {
-    cfg.drizzle.enabled && cfg.drizzle.bayer && group.color_mode == ColorMode::Osc
-}
-
 /// Stage 1 (calibrate) for one frame (spec §9.3, decision 4).
 ///
 /// Three DB connections, each opened, used and dropped in its own scope: one
@@ -1635,11 +1623,32 @@ fn calibrate_one_frame(
         )),
         _ => None,
     };
+    // Fix round 1 (I1): the one case the group-level `wants_cfa_mosaic` rule
+    // cannot see — an OSC group frame whose own `BAYERPAT` the catalog could
+    // not parse, so `resolve_generation` left `spec.debayer` false and no
+    // mosaic exists to keep. That frame's `calibrated_mosaic` row will be
+    // missing on the next run too, which means it recalibrates every run:
+    // cheap on one broken frame, but never silent.
+    if mosaic_out.is_some() && !generated.mosaic_written {
+        tracing::warn!(
+            run_id = rc.run_id,
+            frame_id = frame.frame_id,
+            "no cfa mosaic could be kept for this frame; it will be recalibrated on every run"
+        );
+    }
 
     {
-        let conn = db(&rc.ctx)?.conn();
+        // One transaction for the pair (fix round 1, m3): a crash between two
+        // bare statements would leave the calibrated row alone and the mosaic
+        // row missing — recoverable (the next run regenerates both) but it
+        // would silently spend a full recalibration of the frame. Committing
+        // them together makes the pair as atomic as the generation was.
+        let mut conn = db(&rc.ctx)?.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|e| RunError::Other(format!("opening the artifact transaction: {e}")))?;
         upsert_artifact(
-            &conn,
+            &tx,
             &NewArtifact {
                 frames_set_id: rc.set_id,
                 frame_id: Some(frame.frame_id),
@@ -1654,7 +1663,7 @@ fn calibrate_one_frame(
         )?;
         if let Some((path, (mosaic_size, mosaic_modified))) = &mosaic_identity {
             upsert_artifact(
-                &conn,
+                &tx,
                 &NewArtifact {
                     frames_set_id: rc.set_id,
                     frame_id: Some(frame.frame_id),
@@ -1668,6 +1677,8 @@ fn calibrate_one_frame(
                 },
             )?;
         }
+        tx.commit()
+            .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
     }
 
     // Only the debayered artifact's bytes are reported: `bytes_total` for this
@@ -1703,6 +1714,30 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         config_hash = %rc.hash,
         "stacking run started"
     );
+
+    // M4d Task 1 (fix round 1, I1): Bayer drizzle needs the calibrated CFA
+    // mosaic, and stage 1 can only keep one for a frame it is DEBAYERING —
+    // with the debayer off, an OSC group's calibrated frame IS the mosaic and
+    // the group is single-plane, so there is nothing to route per colour.
+    // Said once per run, here, where the toggle first matters: the
+    // alternative (silence) is a run whose Drizzle row claims Bayer while
+    // every plane is deposited exactly as it would have been without it.
+    if cfg.drizzle.enabled
+        && cfg.drizzle.bayer
+        && !cfg.calibration.debayer_osc
+        && groups.iter().any(|g| g.color_mode == ColorMode::Osc)
+    {
+        tracing::warn!(
+            run_id = rc.run_id,
+            set_id = rc.set_id,
+            "bayer drizzle ignored: the osc debayer is off for this run"
+        );
+        rc.warnings.push(
+            "Bayer drizzle is ignored: the OSC debayer is off for this run, so no calibrated CFA \
+             mosaic is kept and drizzle deposits each frame's calibrated planes as they are."
+                .to_string(),
+        );
+    }
 
     let scratch = rc.layout.root.join("tmp");
     std::fs::create_dir_all(&scratch)
@@ -13071,6 +13106,243 @@ mod tests {
             before,
             "drizzle.bayer must not change a calibrated frame's own hash"
         );
+    }
+
+    /// Fix round 1 (I1): `bayer` on with the OSC debayer OFF must not want a
+    /// mosaic no generation can produce. Before the fix, `want_mosaic` was
+    /// true, the generator wrote nothing, the artifact never appeared and the
+    /// group recalibrated from scratch on EVERY run, with only a `debug!`.
+    /// Now the run says so once, keeps no mosaic, and the second run reuses
+    /// every calibrated frame.
+    #[test]
+    fn bayer_with_the_debayer_off_says_so_once_and_stays_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_osc_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let cfg = || {
+            let mut c = StackingConfig::default();
+            c.drizzle.enabled = true;
+            c.drizzle.scale = 1;
+            c.drizzle.bayer = true;
+            c.calibration.debayer_osc = false;
+            c.output.cleanup = CleanupPolicy::KeepAll;
+            c
+        };
+        let run_once = || -> RunSummary {
+            let started = start_stacking(
+                ctx.clone(),
+                Arc::new(Recording::new()),
+                &PathPolicy::AllowAll,
+                "test".to_string(),
+                fixture.set_id,
+                Some(cfg()),
+                None,
+            )
+            .expect("start should succeed");
+            wait_for_run(&ctx, started.run_id);
+            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "done", "{row:?}");
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap()
+        };
+
+        let first = run_once();
+        let expected = "Bayer drizzle is ignored: the OSC debayer is off for this run, so no \
+                        calibrated CFA mosaic is kept and drizzle deposits each frame's \
+                        calibrated planes as they are.";
+        assert!(
+            first.warnings.iter().any(|w| w == expected),
+            "the contradiction must be reported once: {:?}",
+            first.warnings
+        );
+        assert_eq!(
+            first
+                .warnings
+                .iter()
+                .filter(|w| w.starts_with("Bayer drizzle is ignored"))
+                .count(),
+            1,
+            "once per run, not once per group or frame: {:?}",
+            first.warnings
+        );
+        assert!(
+            crate::db::stacking::list_artifacts(
+                &fixture.conn,
+                fixture.set_id,
+                Some("calibrated_mosaic")
+            )
+            .unwrap()
+            .is_empty(),
+            "no mosaic can exist while the debayer is off"
+        );
+
+        let second = run_once();
+        let frames: Vec<&SummaryFrame> = second.groups.iter().flat_map(|g| g.frames.iter()).collect();
+        assert_eq!(frames.len(), light_ids.len(), "{frames:?}");
+        assert!(
+            frames.iter().all(|f| f.cached_calibrated),
+            "the second run must reuse every calibrated frame: {:?}",
+            frames
+                .iter()
+                .map(|f| (f.frame_id, f.cached_calibrated))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Fix round 1 (I2): the plan gate and the run must agree about what the
+    /// first `bayer` run will do. A fully calibrated set used to report
+    /// Calibrate fresh and `calibratedCached = N` while the run was about to
+    /// regenerate all N pairs — and only for the OSC group, which is what
+    /// makes the mono half of this set the control.
+    #[test]
+    fn the_plan_reports_the_mosaics_a_bayer_run_still_owes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+
+        // One OSC group and one mono group in the same set (the bucket key's
+        // own colour axis splits them), four frames each.
+        let fixture_conn = rusqlite::Connection::open(&db_path).unwrap();
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let mut osc_ids = Vec::new();
+        let mut mono_ids = Vec::new();
+        for (i, &(dx, dy)) in shifts.iter().enumerate() {
+            for (osc, ids) in [(true, &mut osc_ids), (false, &mut mono_ids)] {
+                let date_obs = date_obs_at(i);
+                let stem = format!("{}{i}", if osc { "osc" } else { "mono" });
+                let spec = test_fixtures::LightSpec {
+                    bayerpat: if osc { Some("RGGB") } else { None },
+                    ..star_light_spec(&stem, &date_obs)
+                };
+                let (id, _path) = test_fixtures::add_light_with_field(
+                    &fixture,
+                    &spec,
+                    &shifted_stars(dx, dy),
+                    600.0,
+                    5.0,
+                    100 + i as u64,
+                );
+                ids.push(id);
+            }
+        }
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &fixture.conn,
+            crate::settings::keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+        let all_ids: Vec<i64> = osc_ids.iter().chain(mono_ids.iter()).copied().collect();
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &all_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let cfg = |bayer: bool| {
+            let mut c = StackingConfig::default();
+            c.drizzle.enabled = true;
+            c.drizzle.scale = 1;
+            c.drizzle.bayer = bayer;
+            c.output.cleanup = CleanupPolicy::KeepAll;
+            c
+        };
+        let run_with = |bayer: bool| {
+            let started = start_stacking(
+                ctx.clone(),
+                Arc::new(Recording::new()),
+                &PathPolicy::AllowAll,
+                "test".to_string(),
+                fixture.set_id,
+                Some(cfg(bayer)),
+                None,
+            )
+            .expect("start should succeed");
+            wait_for_run(&ctx, started.run_id);
+            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "done", "{row:?}");
+        };
+        let plan_with = |bayer: bool| {
+            build_plan(
+                &fixture.conn,
+                &ctx.settings,
+                &PathPolicy::AllowAll,
+                fixture.set_id,
+                Some(cfg(bayer)),
+            )
+            .expect("the plan should build")
+        };
+        let group_of = |plan: &crate::stacking::plan::StackingPlan, osc: bool| {
+            plan.groups
+                .iter()
+                .find(|g| g.color_mode == if osc { ColorMode::Osc } else { ColorMode::Mono })
+                .expect("both groups planned")
+                .clone()
+        };
+
+        // Calibrated by a run that wanted no mosaic.
+        run_with(false);
+        let plan_off = plan_with(false);
+        assert!(
+            !plan_off.stale_stages.contains(&Stage::Calibrate),
+            "a non-bayer plan over a calibrated set is fresh: {:?}",
+            plan_off.stale_stages
+        );
+        assert_eq!(group_of(&plan_off, true).calibrated_cached, 4);
+        assert_eq!(group_of(&plan_off, false).calibrated_cached, 4);
+
+        // The same set, planned with Bayer drizzle on: the OSC group owes
+        // four mosaics, the mono group owes nothing.
+        let plan_on = plan_with(true);
+        assert!(
+            plan_on.stale_stages.contains(&Stage::Calibrate),
+            "the OSC group's missing mosaics make Calibrate stale: {:?}",
+            plan_on.stale_stages
+        );
+        assert_eq!(
+            group_of(&plan_on, true).calibrated_cached,
+            0,
+            "every OSC frame is regenerated as a pair"
+        );
+        assert_eq!(
+            group_of(&plan_on, false).calibrated_cached,
+            4,
+            "the mono group ignores drizzle.bayer entirely"
+        );
+
+        // And after the bayer run, fresh again.
+        run_with(true);
+        let plan_after = plan_with(true);
+        assert!(
+            !plan_after.stale_stages.contains(&Stage::Calibrate),
+            "{:?}",
+            plan_after.stale_stages
+        );
+        assert_eq!(group_of(&plan_after, true).calibrated_cached, 4);
+        assert_eq!(group_of(&plan_after, false).calibrated_cached, 4);
     }
 
     /// Ruling R-T4-6d: a whole `tps` run — registration, LN, integration

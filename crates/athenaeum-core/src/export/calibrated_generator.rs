@@ -34,7 +34,7 @@ use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalC
 use crate::calibration_library::light_resolve::resolve_frame_inputs;
 use crate::export::models::{calibrated_output_filename, CalibratedLightOptions};
 use crate::fits_writer::keywords::Bayer;
-use crate::fits_writer::{Card, CardValue};
+use crate::fits_writer::{write_fits_f32, Card, CardValue};
 use crate::integration::banded::probe_bitpix;
 use crate::integration::cfa::CfaGeometry;
 use crate::integration::IntegrationError;
@@ -594,14 +594,21 @@ pub fn execute_generation(
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                write_calibrated_output(
+                // `write_fits_f32` directly, not `write_calibrated_output`
+                // (fix round 1, m4): the same temp-file + rename write, but
+                // no sampling xxh3 — nothing consumes a hash of the mosaic
+                // (it is a working artifact, never a payload or a catalog
+                // row), and computing one costs three 512 KB reads of the
+                // file we just wrote, per OSC frame.
+                write_fits_f32(
                     path,
                     frame.width,
                     frame.height,
                     1,
                     &frame.data,
                     &mosaic_cards,
-                )?;
+                )
+                .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
                 mosaic_written = true;
                 tracing::debug!(
                     src = %spec.inputs.light_path.display(),

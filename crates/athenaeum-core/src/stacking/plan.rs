@@ -547,6 +547,37 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
             .is_some_and(|meta| Some(meta.len() as i64) == artifact.size)
 }
 
+/// Whether this group's stage 1 also keeps the calibrated CFA mosaic beside
+/// each debayered frame (M4d Task 1, rulings R-M4d-1/2): an OSC group whose
+/// drizzle is on, asked to deposit each colour's own samples, AND whose
+/// lights are actually being debayered. A mono group ignores
+/// `drizzle.bayer` silently — there is no mosaic to keep and nothing about
+/// the run changes.
+///
+/// `calibration.debayer_osc` is load-bearing, not belt-and-braces (fix round
+/// 1, I1): the generator only writes a mosaic for a frame it is DEBAYERING
+/// (`spec.debayer = debayer_osc && cfa_geometry.is_some()`), because an OSC
+/// frame with the debayer off already writes the mosaic itself as its
+/// primary output under that very name. Without this term, a run with
+/// `bayer` on and the debayer off would want a mosaic no generation can
+/// produce, find the artifact missing every time, and recalibrate the whole
+/// group on every run for ever.
+///
+/// `pub(crate)`, and THE one place the condition is spelled out: this gate
+/// reports what is cached, stage 1 decides what to write, and stage 8
+/// decides what to deposit from — all three read this, so they cannot
+/// disagree about whether a mosaic should exist. The remaining per-FRAME
+/// half of `spec.debayer` (a `BAYERPAT` the catalog cannot parse) is
+/// deliberately not folded in here: resolving it would cost a catalog read
+/// per frame in both this gate and the run's freshness check, and such a
+/// frame is reported as stale by both and warned about by the run.
+pub(crate) fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -> bool {
+    cfg.drizzle.enabled
+        && cfg.drizzle.bayer
+        && cfg.calibration.debayer_osc
+        && group.color_mode == ColorMode::Osc
+}
+
 // ── build_plan ──────────────────────────────────────────────────────────────
 
 pub(crate) fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<String, ApiError> {
@@ -1500,8 +1531,11 @@ pub fn build_plan(
         // of each — even with drizzle off.
         large_scale: cfg.integration.large_scale.enabled,
         // M4d Task 1: Bayer drizzle keeps one extra single-plane artifact
-        // per OSC frame (the calibrated CFA mosaic).
-        drizzle_bayer: cfg.drizzle.bayer,
+        // per OSC frame (the calibrated CFA mosaic) — under the same
+        // condition `wants_cfa_mosaic` applies, minus its per-group colour
+        // test, which `estimate_bytes` makes itself (fix round 1, I1: with
+        // the debayer off no mosaic is kept, so the term must not be added).
+        drizzle_bayer: cfg.drizzle.bayer && cfg.calibration.debayer_osc,
     });
 
     // Gate 4: space.
@@ -1614,6 +1648,12 @@ pub fn build_plan(
         let mut metrics_cached = 0usize;
         let mut ln_cached = 0usize;
         let mut included_count = 0usize;
+        // M4d Task 1 (fix round 1, I2): with Bayer drizzle on, stage 1 owes
+        // this group's frames a SECOND file, and a frame whose mosaic is
+        // missing is regenerated as a pair — see `wants_cfa_mosaic` and
+        // `run::calibrate_one_frame`. Reporting such a frame as cached here
+        // would promise work the run is about to do all over again.
+        let group_wants_mosaic = wants_cfa_mosaic(&cfg, g);
 
         for f in &g.frames {
             let is_excluded = excluded_set.contains(&f.frame_id);
@@ -1640,6 +1680,26 @@ pub fn build_plan(
             let calib_fresh = match (&calib_artifact, &current_calib_hash) {
                 (Some(row), Some(hash)) => is_fresh(row, hash),
                 _ => false,
+            };
+            // The mosaic half of stage 1's freshness — the same rule
+            // `run::calibrate_one_frame` applies, keyed on the frame's own
+            // calibration hash (one generation, one hash). Only asked when
+            // the calibrated half already passed, so a group without Bayer
+            // drizzle costs no extra query at all.
+            let calib_fresh = if calib_fresh && group_wants_mosaic {
+                let mosaic_artifact = find_artifact(
+                    conn,
+                    frames_set_id,
+                    &g.key,
+                    "calibrated_mosaic",
+                    Some(f.frame_id),
+                )?;
+                match (&mosaic_artifact, &current_calib_hash) {
+                    (Some(row), Some(hash)) => is_fresh(row, hash),
+                    _ => false,
+                }
+            } else {
+                calib_fresh
             };
             if calib_fresh {
                 calibrated_cached += 1;
