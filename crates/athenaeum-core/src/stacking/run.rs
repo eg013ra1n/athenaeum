@@ -937,15 +937,22 @@ fn run_thread(mut rc: RunContext) {
     let run_started = Instant::now();
 
     // The de-registration itself is RAII (M4a Task 4 fix round 1, item 1):
-    // declared first, so it drops LAST — after `finish_run`, the provenance
-    // snapshot, the rejection-bitmap cleanup and the `stacking-complete`
-    // event — which is the ordering the tail needs (see this function's own
-    // doc), and it still happens if any of those panics. An explicit
-    // removal at the tail would have been skipped by such a panic, leaking
-    // the handle: `heal_interrupted_runs` only heals rows ABSENT from
-    // `active_stacks`, so every later `start_stacking` for that set would
-    // answer `Conflict` until the process restarted — the same failure mode
+    // it runs after `finish_run`, the provenance snapshot, the
+    // rejection-bitmap cleanup and the `stacking-complete` event — the
+    // ordering the tail needs (see this function's own doc) — and it still
+    // happens if any of those panics. An explicit removal at the tail would
+    // have been skipped by such a panic, leaking the handle:
+    // `heal_interrupted_runs` only heals rows ABSENT from `active_stacks`,
+    // so every later `start_stacking` for that set would answer `Conflict`
+    // until the process restarted — the same failure mode
     // [`StartStackingGuard`] exists to prevent on the setup path.
+    //
+    // Declaring it first is NOT what makes it last (M4c Task 4 fix round 3,
+    // finding 1 — the previous wording said so and was wrong): `rc` is a
+    // function PARAMETER and parameters drop after the body's locals, so
+    // the guard would have gone first and freed the run's registration
+    // while `rc` was still alive. The explicit `drop(rc)` at the tail is
+    // what orders them.
     let _handle = RunHandleGuard {
         ctx: rc.ctx.clone(),
         run_id,
@@ -1099,6 +1106,16 @@ fn run_thread(mut rc: RunContext) {
             masters,
         },
     );
+
+    // M4c Task 4 fix round 3, finding 1: `rc` is a PARAMETER, and Rust
+    // drops parameters AFTER the body's locals — so `_handle` would
+    // otherwise go first and de-register the run while `rc` (every group's
+    // `PixelMap`, its displacement grids, the readers) is still alive.
+    // Every observer that wakes on the de-registration — `wait_for_run`
+    // above all — would then be racing the teardown it thinks it waited
+    // for. Dropping `rc` explicitly here is what actually puts the handle
+    // last.
+    drop(rc);
 
     // `_handle`'s `Drop` de-registers the run from `active_stacks` here, as
     // the last thing the thread does — see its construction at the top.
@@ -12458,6 +12475,10 @@ mod tests {
     fn a_tps_run_never_holds_more_than_a_few_displacement_grids_at_once() {
         use crate::geometry::pixel_map::grid_counters;
 
+        // The counters are process-global; this holds the harness's other
+        // grid-building tests off for the measurement window.
+        let _quiet = grid_counters::exclusive();
+
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
@@ -12536,7 +12557,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, "done", "{row:?}");
 
-        let (builds, alive, peak) = grid_counters::snapshot();
+        let (builds, _alive, peak) = grid_counters::snapshot();
         let summary: RunSummary =
             serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
         let tps_frames = summary.groups[0]
@@ -12554,7 +12575,14 @@ mod tests {
             builds > 0,
             "a tps run must have built displacement grids at all"
         );
-        assert_eq!(alive, 0, "no grid may outlive the run");
+        // There is deliberately NO `alive == 0` assertion (fix round 3,
+        // finding 1): the thread's `RunHandleGuard` now genuinely drops
+        // last, which means `rc` — every map, every grid — is already gone
+        // by the time `wait_for_run` observes the de-registration. Such an
+        // assertion could not fail however many releases were removed, so
+        // it would have measured teardown rather than the releases. What
+        // the releases are pinned by is `peak` below and the three
+        // per-stage tests (`writer`, `registered_source`, `drizzle`).
         // A stage that releases per frame holds at most the grids its
         // parallel workers have in flight at that instant — bounded by
         // the POOL, not by the frame count. Measured on this Mac (10
@@ -12570,6 +12598,19 @@ mod tests {
         // frame count itself, since that is all the concurrency there is
         // to find.
         let threads = rayon::current_num_threads().max(1);
+        eprintln!(
+            "R-T4-6d measured: builds {builds} peak_alive {peak} threads {threads} \
+             tps_frames {tps_frames}"
+        );
+        // The absolute bound, independent of this machine's core count:
+        // one inverse grid per frame surviving registration plus one
+        // forward grid per frame in drizzle is `2 * tps_frames`, and that
+        // is precisely the shape that thrashed the acceptance run.
+        assert!(
+            peak < 2 * tps_frames,
+            "peak resident grids {peak} vs {tps_frames} spline frames — the \
+             un-released shape is 2x that"
+        );
         // Slack of 4 over the pool size: the run thread itself
         // participates in `install`, and a straggler from the previous
         // stage can still hold one. Measured on this 10-worker Mac: peak

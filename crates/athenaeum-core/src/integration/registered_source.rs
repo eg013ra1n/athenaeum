@@ -92,15 +92,25 @@ impl RegisteredSource {
     /// Hands back every frame's displacement grid (ruling R-T4-6c).
     ///
     /// Called from [`Drop`], which is the right moment for all three
-    /// stages that warp through this type: integration finishes a group
-    /// (every plane, via `set_plane`, shares one source), LN's per-frame
-    /// driver finishes one frame's plane, and LN's reference build
-    /// finishes one member. Without it a spline map's grid would outlive
-    /// the source — every clone shares ONE cache, and the run's own
-    /// `GroupMember`/`StackFrame` clones keep that cache alive to the end
-    /// of the run, so "the source was dropped" frees nothing by itself.
-    /// That is exactly how 208 frames' inverse grids survived integration
-    /// and met drizzle's forward grids on the acceptance run.
+    /// stages that warp through this type, at the granularity each of
+    /// them actually opens a source:
+    ///
+    /// - **integration** — one source per GROUP since ruling R-T4-7;
+    ///   `integrate_group` re-points it at each plane with
+    ///   [`RegisteredSource::set_plane`] instead of reopening, so a
+    ///   colour group builds one grid per frame, not one per frame per
+    ///   plane;
+    /// - **local normalization** — one source per frame per plane
+    ///   (`ln::normalize_frame` opens inside its own plane loop), and one
+    ///   per member for the reference build;
+    /// - and any other caller, when its own source goes out of scope.
+    ///
+    /// Without it a spline map's grid would outlive the source — every
+    /// clone shares ONE cache, and the run's own `GroupMember`/
+    /// `StackFrame` clones keep that cache alive to the end of the run, so
+    /// "the source was dropped" frees nothing by itself. That is exactly
+    /// how 208 frames' inverse grids survived integration and met
+    /// drizzle's forward grids on the acceptance run.
     ///
     /// A no-op for linear and polynomial maps, which have no grids.
     pub fn release_grids(&self) -> usize {
@@ -114,6 +124,10 @@ impl RegisteredSource {
         self.plane
     }
 
+    /// Re-points this source at another plane of the SAME frames —
+    /// `integrate_group`'s plane loop (ruling R-T4-7). Reopening instead
+    /// would re-open every reader and, since M4c, rebuild every spline
+    /// frame's displacement grid for a frame list that has not changed.
     pub fn set_plane(&mut self, plane: usize) -> Result<(), IntegrationError> {
         if plane >= self.channels {
             return Err(IntegrationError::BadInput(format!(
@@ -410,6 +424,143 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Ruling R-T4-6c/d: a source that has warped a band holds its frames'
+    /// displacement grids, and dropping it hands them back — observed on
+    /// the CALLER's own clone of the map, which is the only thing that
+    /// makes the release meaningful (every clone shares one cache, and the
+    /// run keeps clones of its own until the run ends).
+    ///
+    /// This is the pin for the integration and local-normalization halves
+    /// of the release; the writer and drizzle have their own.
+    #[test]
+    fn dropping_a_source_hands_back_its_frames_displacement_grids() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        use crate::geometry::{DistortionModel, ThinPlateSpline};
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = gaussian_field(W, H, &STARS, 1.8, BG);
+        let path = dir.path().join("spline.fits");
+        write_fits_f32(&path, W, H, 1, &data, &[]).unwrap();
+
+        // A spline map — the only arm with a grid to release.
+        let nodes: Vec<(f64, f64)> = (0..36)
+            .map(|i| (18.0 + (i % 6) as f64 * 30.0, 16.0 + (i / 6) as f64 * 22.0))
+            .collect();
+        let dx: Vec<f64> = nodes.iter().map(|(x, _)| 0.3 * (x / 40.0).sin()).collect();
+        let dy: Vec<f64> = nodes.iter().map(|(_, y)| 0.2 * (y / 35.0).cos()).collect();
+        let ndx: Vec<f64> = dx.iter().map(|v| -v).collect();
+        let ndy: Vec<f64> = dy.iter().map(|v| -v).collect();
+        let model = DistortionModel::tps(
+            ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0).unwrap(),
+            ThinPlateSpline::fit(&nodes, &ndx, &ndy, 0.0).unwrap(),
+            [0.0, 0.0, W as f64, H as f64],
+        );
+        let map = PixelMap::with_distortion_model(Linear::identity(), model).unwrap();
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false)
+        );
+
+        {
+            let src = RegisteredSource::open(
+                &[RegisteredFrame {
+                    path: path.clone(),
+                    map: map.clone(),
+                }],
+                W,
+                H,
+                0,
+                Interpolation::BicubicBSpline,
+                0.3,
+            )
+            .unwrap();
+            let mut band = BandPlanes::new(&src);
+            src.read_band_with_progress(0, 16, &mut band, 1, &|_| {}, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(
+                map.distortion.as_ref().unwrap().grids_built(),
+                (false, true),
+                "warping a band must have built the INVERSE grid, and only it"
+            );
+        }
+
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false),
+            "dropping the source must hand the grid back to every clone"
+        );
+    }
+
+    /// Ruling R-T4-7: walking a colour source's planes through
+    /// [`RegisteredSource::set_plane`] builds ONE displacement grid per
+    /// frame, not one per frame per plane.
+    ///
+    /// `set_plane` had no production caller at all until this round —
+    /// `integrate_group` reopened a source per plane, which re-opened every
+    /// reader and (since M4c) rebuilt every spline frame's grid twice over
+    /// for a frame list that had not changed. The run-level pin cannot see
+    /// this: its group is mono, so its `builds` count is identical either
+    /// way; the saving is exactly ×3 on colour data, which is what this
+    /// measures.
+    #[test]
+    fn walking_the_planes_of_one_source_builds_one_grid_per_frame() {
+        use crate::geometry::pixel_map::grid_counters;
+        use crate::geometry::{DistortionModel, ThinPlateSpline};
+
+        let _quiet = grid_counters::exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        let one = gaussian_field(W, H, &STARS, 1.8, BG);
+        let three: Vec<f32> = one.iter().chain(&one).chain(&one).copied().collect();
+        let path = dir.path().join("rgb.fits");
+        write_fits_f32(&path, W, H, 3, &three, &[]).unwrap();
+
+        let nodes: Vec<(f64, f64)> = (0..36)
+            .map(|i| (18.0 + (i % 6) as f64 * 30.0, 16.0 + (i / 6) as f64 * 22.0))
+            .collect();
+        let dx: Vec<f64> = nodes.iter().map(|(x, _)| 0.3 * (x / 40.0).sin()).collect();
+        let dy: Vec<f64> = nodes.iter().map(|(_, y)| 0.2 * (y / 35.0).cos()).collect();
+        let ndx: Vec<f64> = dx.iter().map(|v| -v).collect();
+        let ndy: Vec<f64> = dy.iter().map(|v| -v).collect();
+        let model = DistortionModel::tps(
+            ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0).unwrap(),
+            ThinPlateSpline::fit(&nodes, &ndx, &ndy, 0.0).unwrap(),
+            [0.0, 0.0, W as f64, H as f64],
+        );
+        let map = PixelMap::with_distortion_model(Linear::identity(), model).unwrap();
+
+        let before = grid_counters::snapshot().0;
+        {
+            let mut src = RegisteredSource::open(
+                &[RegisteredFrame {
+                    path: path.clone(),
+                    map: map.clone(),
+                }],
+                W,
+                H,
+                0,
+                Interpolation::BicubicBSpline,
+                0.3,
+            )
+            .unwrap();
+            assert_eq!(src.channels(), 3);
+            for p in 0..3 {
+                src.set_plane(p).unwrap();
+                let mut band = BandPlanes::new(&src);
+                src.read_band_with_progress(0, 16, &mut band, 1, &|_| {}, &AtomicBool::new(false))
+                    .unwrap();
+            }
+        }
+        let built = grid_counters::snapshot().0 - before;
+        assert_eq!(
+            built, 1,
+            "three planes of one source must share ONE grid, built {built}"
+        );
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (false, false)
+        );
     }
 
     fn io(budget: usize) -> IoPolicy {

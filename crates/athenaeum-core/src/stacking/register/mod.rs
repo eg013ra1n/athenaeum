@@ -88,15 +88,33 @@ pub enum DistortionChoice {
     /// field a global polynomial of order 2..=4 cannot. `Auto` never
     /// picks it; it is always a deliberate user choice.
     ///
-    /// **What it costs** (ruling R-T4-6e). A spline cannot be evaluated
-    /// per pixel — 600 logarithms per query — so every stage that
-    /// RESAMPLES a frame builds an 8-px displacement grid for it first
-    /// (≈ 1 s and ≈ 8.6 MB per direction on a 26 Mpx frame) and hands it
-    /// back when that frame is done. A frame is resampled by the
-    /// registration writer, by local normalization, by integration and by
-    /// drizzle, so a `tps` run pays roughly three to four grid builds per
-    /// frame more than a polynomial run — and in exchange never holds
-    /// more than a few grids at once, however many frames the set has.
+    /// **What it costs** (ruling R-T4-6e, numbers corrected in fix round
+    /// 3). A spline cannot be evaluated per pixel — 600 logarithms per
+    /// query — so every stage that RESAMPLES a frame builds an 8-px
+    /// displacement grid for it first and hands it back when that frame
+    /// is done.
+    ///
+    /// Size, from `TpsGrid::build`'s own formula (`ceil(span / 8) + 2`
+    /// samples per axis over the node box inflated by `DOMAIN_MARGIN`):
+    /// at 6224×4168 that is 936 × 628 × 8 B ≈ **4.5 MB per DIRECTION**,
+    /// and ≈ 1 s to build.
+    ///
+    /// Builds per frame, for a run with local normalization on:
+    ///
+    /// | stage | grids per frame |
+    /// | ---- | ---- |
+    /// | registration writer (when `writeRegisteredFrames`) | 1 |
+    /// | local normalization | 1 per PLANE (it opens a source per plane) |
+    /// | integration | 1 (one source per group since ruling R-T4-7) |
+    /// | drizzle | 1 per PLANE (the plane loop is the outer one) |
+    ///
+    /// So a mono run pays ≈ 4 builds per frame and a three-plane colour
+    /// run ≈ 9 — on the 160-frame OSC acceptance group, ≈ 25 minutes of
+    /// grid building. In exchange it never holds more than a few grids at
+    /// once: the resident figure is one inverse grid per frame for the
+    /// length of a group's integration (≈ 208 × 4.5 MB ≈ 0.9 GB at that
+    /// set's size) and a handful anywhere else.
+    ///
     /// Registration itself pays nothing extra: its residual statistics,
     /// its star re-pairing and the local distortion loop all evaluate the
     /// spline exactly and build no grid at all.

@@ -125,6 +125,16 @@ pub fn write_registered_frame(
     cards: &[Card],
     out: &Path,
 ) -> anyhow::Result<usize> {
+    // Ruling R-T4-6c, made exit-path-proof in fix round 3: this frame's
+    // displacement grid goes back when this function returns, however it
+    // returns. Without the release at all, every registered frame's
+    // inverse grid (≈ 4.7 MB per direction at 6224×4168) stayed alive to
+    // the end of the run — 208 frames of it on the acceptance set, before
+    // drizzle added a forward grid each. With it placed after the warp
+    // loop instead, a plane-1 read failure on a 3-plane frame would leak
+    // that one frame's grid, and a per-frame registration failure is
+    // non-fatal upstream, so the run would carry on around it.
+    let _release = map.release_grids_on_drop();
     let reader = PlaneReader::open(subject)?;
     let (w, h, channels) = (reader.width(), reader.height(), reader.channels());
     let plane_len = ref_w * ref_h;
@@ -143,12 +153,6 @@ pub fn write_registered_frame(
             &mut all[plane * plane_len..(plane + 1) * plane_len],
         );
     }
-    // Ruling R-T4-6c: this frame's resampling is done, so its
-    // displacement grid goes back before the next frame's begins. Without
-    // this every registered frame's inverse grid (≈ 8.6 MB at 6224×4168)
-    // stayed alive from here to the end of the run — 208 frames of it on
-    // the acceptance set, before drizzle then added a forward grid each.
-    map.release_grids();
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -286,6 +290,7 @@ mod tests {
     /// hours.
     #[test]
     fn the_writer_releases_the_frames_grid_when_it_is_done() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         use crate::geometry::{select_nodes, DistortionModel, Pair, ThinPlateSpline};
 
         let dir = tempfile::tempdir().unwrap();

@@ -600,6 +600,29 @@ pub(crate) fn integrate_planes<'g>(
     let mut outputs = Vec::with_capacity(input.channels);
     let mut output_pairs_out: Vec<Vec<NormalizationPair>> = Vec::with_capacity(input.channels);
 
+    // M4c Task 4 fix round 3, ruling R-T4-7: ONE source for the whole
+    // group, re-pointed at each plane through `set_plane`, rather than a
+    // fresh one per plane. The frame list does not depend on `p` — same
+    // paths, same maps — so opening it three times for an OSC group only
+    // re-opened every reader and, since M4c, rebuilt every frame's
+    // displacement grid twice over for nothing. `set_plane` existed for
+    // exactly this and had no production caller until now.
+    let registered_frames: Vec<RegisteredFrame> = frame_indices
+        .iter()
+        .map(|&i| RegisteredFrame {
+            path: frames[i].path.clone(),
+            map: frames[i].map.clone(),
+        })
+        .collect();
+    let mut src = RegisteredSource::open(
+        &registered_frames,
+        input.width,
+        input.height,
+        0,
+        input.interpolation,
+        input.clamping,
+    )?;
+
     for p in 0..input.channels {
         if cancel.load(Ordering::Relaxed) {
             warn!(plane = p, "group integration cancelled");
@@ -611,7 +634,6 @@ pub(crate) fn integrate_planes<'g>(
         let mut rejection_pairs = Vec::with_capacity(n);
         let mut output_pairs = Vec::with_capacity(n);
         let mut plane_weights = Vec::with_capacity(n);
-        let mut registered_frames = Vec::with_capacity(n);
         // M2: this plane's local-normalization row-evaluator FACTORIES, one
         // per entry of `frame_indices` (fix round 1, item 3 — `StackParams::local`
         // now carries factories, not evaluators: the engine calls one once
@@ -631,10 +653,6 @@ pub(crate) fn integrate_planes<'g>(
             rejection_pairs.push(rp);
             output_pairs.push(op);
             plane_weights.push(weights[k].get(p).copied().unwrap_or(0.0));
-            registered_frames.push(RegisteredFrame {
-                path: f.path.clone(),
-                map: f.map.clone(),
-            });
             let grid = ln
                 .and_then(|grids| grids.get(i))
                 .and_then(|g| g.as_ref())
@@ -646,14 +664,7 @@ pub(crate) fn integrate_planes<'g>(
         let local_refs: Vec<Option<&LocalNormRowFactory<'_>>> =
             local_factories.iter().map(|o| o.as_deref()).collect();
 
-        let src = RegisteredSource::open(
-            &registered_frames,
-            input.width,
-            input.height,
-            p,
-            input.interpolation,
-            input.clamping,
-        )?;
+        src.set_plane(p)?;
 
         // M3 Task 2: this plane's rejection-bit sink, when the caller asked
         // for one — an owned `Option<RejPlaneSink>` so `StackParams` can

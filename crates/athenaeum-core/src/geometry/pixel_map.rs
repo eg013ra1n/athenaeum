@@ -161,10 +161,29 @@ impl TpsGrid {
 #[cfg(test)]
 pub(crate) mod grid_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     pub static BUILDS: AtomicUsize = AtomicUsize::new(0);
     pub static ALIVE: AtomicUsize = AtomicUsize::new(0);
     pub static PEAK_ALIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held by EVERY test that builds a displacement grid.
+    ///
+    /// The counters are process-global and the harness runs tests in
+    /// parallel, so without this a grid another test happened to hold
+    /// would inflate the measuring test's `PEAK_ALIVE` — its bound is
+    /// deliberately tight (one grid per worker, not one per frame), so
+    /// even three stray grids could flip it. The lock is cheap: every
+    /// test that takes it is short, and the one long holder (the 20-frame
+    /// run pin) is the only thing that needs the quiet.
+    ///
+    /// **A new test that builds a `tps` grid must take this too**, or it
+    /// will make the run pin flaky rather than itself.
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+    pub fn exclusive() -> MutexGuard<'static, ()> {
+        EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     pub(super) fn on_build() {
         BUILDS.fetch_add(1, Ordering::Relaxed);
@@ -303,6 +322,22 @@ impl<'a> EvalLayer<'a> {
             EvalLayer::Polynomial(d, Direction::Inverse) => d.inverse_displacement(x, y),
             EvalLayer::Grid(g) => g.displacement_at(x, y),
         }
+    }
+}
+
+/// Releases a map's displacement grids when it goes out of scope —
+/// [`PixelMap::release_grids_on_drop`].
+///
+/// For a caller whose per-frame pixel work has fallible steps in it: an
+/// early `?` between the first warp and the explicit release would
+/// otherwise leak that frame's grid for the rest of the run, and a
+/// per-frame failure is routinely non-fatal upstream (a frame that fails
+/// to register is excluded, not fatal to the run).
+pub struct GridRelease<'a>(&'a PixelMap);
+
+impl Drop for GridRelease<'_> {
+    fn drop(&mut self) {
+        self.0.release_grids();
     }
 }
 
@@ -729,6 +764,12 @@ impl PixelMap {
             .map_or(0, DistortionModel::release_grids)
     }
 
+    /// [`PixelMap::release_grids`] bound to a scope, so a fallible caller
+    /// releases on EVERY exit path and not just the happy one.
+    pub fn release_grids_on_drop(&self) -> GridRelease<'_> {
+        GridRelease(self)
+    }
+
     /// Subject pixel → reference pixel. **The PIXEL path** — for a
     /// thin-plate spline this reads (and, on the first call, builds) the
     /// forward displacement grid, taking the cache lock to do it. A loop
@@ -890,6 +931,7 @@ mod tests {
     /// that is not resampling.
     #[test]
     fn only_the_pixel_path_builds_a_grid_and_only_its_own_direction() {
+        let _quiet = grid_counters::exclusive();
         let map = PixelMap::with_distortion_model(Linear::identity(), tps_model(24, 60)).unwrap();
         let d = || map.distortion.as_ref().unwrap();
         assert_eq!(d().grids_built(), (false, false), "nothing built yet");
@@ -929,6 +971,7 @@ mod tests {
     /// handle it was called on would free nothing at all.
     #[test]
     fn releasing_through_one_clone_frees_the_grid_for_every_clone() {
+        let _quiet = grid_counters::exclusive();
         let map = PixelMap::with_distortion_model(Linear::identity(), tps_model(26, 60)).unwrap();
         let clone = map.clone();
         map.inverse(100.0, 100.0);
@@ -985,6 +1028,7 @@ mod tests {
     /// hoisted, for every arm.
     #[test]
     fn the_burst_evaluators_match_the_one_off_pixel_path() {
+        let _quiet = grid_counters::exclusive();
         let linear = Linear {
             kind: LinearKind::Homography,
             m: [
@@ -1038,6 +1082,7 @@ mod tests {
     /// on a full-frame map that was gigabytes of duplicate.
     #[test]
     fn a_clone_shares_the_grids_it_does_not_copy_them() {
+        let _quiet = grid_counters::exclusive();
         let map = PixelMap::with_distortion_model(Linear::identity(), tps_model(25, 60)).unwrap();
         map.inverse(100.0, 100.0);
         let built = map.distortion.as_ref().unwrap().grids_built();
@@ -1075,6 +1120,7 @@ mod tests {
     /// thousand of a pixel, not hundredths.
     #[test]
     fn the_tps_grid_agrees_with_the_exact_spline() {
+        let _quiet = grid_counters::exclusive();
         let model = tps_model(21, 200);
         let mut rng = SplitMix64(555);
         let mut worst = 0.0f64;
@@ -1106,6 +1152,7 @@ mod tests {
     /// rebuilt on the far side, never stored.
     #[test]
     fn a_tps_map_round_trips_and_rebuilds_its_grid() {
+        let _quiet = grid_counters::exclusive();
         let linear = Linear {
             kind: LinearKind::Homography,
             m: [

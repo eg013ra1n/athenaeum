@@ -1031,6 +1031,66 @@ mod tests {
         }
     }
 
+    /// Ruling R-T4-6c/d: after `drizzle_group` returns, no frame's map
+    /// still holds a displacement grid — observed on the CALLER's own
+    /// maps, which are the clones the run keeps until it ends.
+    ///
+    /// Drizzle is the stage that broke the acceptance run: it built a
+    /// FORWARD grid per frame on top of the inverse grids registration had
+    /// already left alive. This is the pin that would fail if its release
+    /// were removed.
+    #[test]
+    fn drizzle_hands_back_every_frames_displacement_grid() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        use crate::geometry::{DistortionModel, ThinPlateSpline};
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = uniform(W, H, 0.25);
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &data);
+        let p1 = write_mono(dir.path(), "f1.fits", W, H, &data);
+
+        let spline_map = || {
+            let nodes: Vec<(f64, f64)> = (0..36)
+                .map(|i| {
+                    (
+                        8.0 + (i % 6) as f64 * (W as f64 - 16.0) / 5.0,
+                        8.0 + (i / 6) as f64 * (H as f64 - 16.0) / 5.0,
+                    )
+                })
+                .collect();
+            let dx: Vec<f64> = nodes.iter().map(|(x, _)| 0.2 * (x / 30.0).sin()).collect();
+            let dy: Vec<f64> = nodes.iter().map(|(_, y)| 0.15 * (y / 25.0).cos()).collect();
+            let ndx: Vec<f64> = dx.iter().map(|v| -v).collect();
+            let ndy: Vec<f64> = dy.iter().map(|v| -v).collect();
+            let model = DistortionModel::tps(
+                ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0).unwrap(),
+                ThinPlateSpline::fit(&nodes, &ndx, &ndy, 0.0).unwrap(),
+                [0.0, 0.0, W as f64, H as f64],
+            );
+            PixelMap::with_distortion_model(Linear::identity(), model).unwrap()
+        };
+        let (m0, m1) = (spline_map(), spline_map());
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames = [
+            frame(&p0, &m0, &weight, &pair),
+            frame(&p1, &m1, &weight, &pair),
+        ];
+        let measure = MeasureOptions::default();
+        let input = base_input(&frames, &measure);
+
+        let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        assert!(out.stats.coverage[0] > 0.5, "the deposit really ran");
+
+        for (i, m) in [&m0, &m1].iter().enumerate() {
+            assert_eq!(
+                m.distortion.as_ref().unwrap().grids_built(),
+                (false, false),
+                "frame {i}'s grid outlived the deposit"
+            );
+        }
+    }
+
     // ── (a) level: a uniform field comes out at its own level, with full
     // coverage, for every kernel and every (scale, drop_shrink) combo. ──
 
