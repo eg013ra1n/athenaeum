@@ -431,6 +431,28 @@ pub fn output_extension(format: OutputFormat) -> &'static str {
     }
 }
 
+/// Whether a master's own card list says its stored rows run bottom-up
+/// (M4d Task 2 fix round 1, ruling R-T2-1): the `ROWORDER` card's value
+/// through [`crate::orientation::row_order_is_bottom_up`], the one encoding
+/// of the astronomical convention — a missing card included, which is the
+/// common case for a set whose frames never carried one.
+///
+/// Why the run needs this: XISF has no row-order concept (row 0 is the top
+/// row for every XISF reader) while this master's array is simply its
+/// source frames' order, carried through every stage unflipped. So a
+/// bottom-up set's XISF master displays mirrored relative to its FITS
+/// master, and the run says so once rather than shipping a silent flip.
+pub fn cards_row_order_is_bottom_up(cards: &[Card]) -> bool {
+    let value = cards
+        .iter()
+        .find(|c| c.keyword == "ROWORDER")
+        .and_then(|c| match c.value.as_ref() {
+            Some(CardValue::Str(s)) => Some(s.as_str()),
+            _ => None,
+        });
+    crate::orientation::row_order_is_bottom_up(value)
+}
+
 /// One image in the run's chosen container — the ONE place the two writers
 /// below branch on format, so a master and its drizzled sibling can never
 /// disagree about which container they were written in.

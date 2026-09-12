@@ -29,15 +29,35 @@
 //! and `location="attachment:<offset>:<size>"`. `byteOrder` and `bounds` are
 //! left off: their format defaults (little-endian, `0:1`) are exactly what
 //! this writer produces, and the reader treats an explicit `0:1` as the same
-//! identity mapping.
+//! identity mapping. A sample ABOVE 1.0 therefore sits outside the defaulted
+//! range, and what a foreign reader does with that (ignore the range, or
+//! clamp/rescale to it) is reader-defined — declaring the array's true
+//! min/max instead would oblige every honouring reader to rescale the data,
+//! which is worse, so the default stays. That question and the
+//! padding-inside-`headerLength` one above are what the owner's
+//! external-tool smoke (ruling R-M4d-7) has to confirm.
 //!
 //! Samples are little-endian f32 in the SAME plane-major order the FITS
 //! writer uses (all of channel 0, then 1, then 2), which is what
-//! `pixelStorage="Planar"` declares — no reordering, no scaling. Row 0 is
-//! the top row, XISF's own convention and the order every master's pixel
-//! buffer is already in; a `ROWORDER` card copied through from a source
-//! frame therefore rides along as plain metadata and means nothing to this
-//! container.
+//! `pixelStorage="Planar"` declares — no reordering, no scaling.
+//!
+//! **Row order is a known limitation** (M4d Task 2 fix round 1, ruling
+//! R-T2-1). XISF's convention is that row 0 IS the top row and no XISF
+//! reader has a `ROWORDER` concept, but the array handed to this writer is
+//! simply its source frames' order — no stage of the stacking pipeline
+//! flips pixels. So for a BOTTOM-UP set, or one whose cards carry no
+//! `ROWORDER` at all (which the astronomical convention reads as
+//! bottom-up — `crate::orientation`, and which is every stacking master
+//! today: the calibration hop does not copy the keyword through), an XISF
+//! viewer shows this file vertically mirrored relative to the FITS file of
+//! the same data. The pixels are deliberately NOT flipped here: a row flip
+//! would have to transform the master's WCS too (`CRPIX2`, the CD matrix,
+//! the odd-`v` SIP terms), which is a feature of its own and is recorded as
+//! a follow-up. The WCS is untouched and stays correct for the array as
+//! stored. What this writer does instead is state the effective order
+//! EXPLICITLY in the keyword list — the copied value when the cards carry
+//! one, `'BOTTOM-UP'` when they do not — so a reader is never left to
+//! guess, and the stacking run warns once per bottom-up XISF master.
 //!
 //! **Reading one of these back is not symmetric.** rustafits' XISF reader
 //! returns every float sample multiplied by 65535 (its ADU-domain
@@ -55,6 +75,12 @@
 //! The structural cards (`SIMPLE`/`BITPIX`/`NAXIS*`) are NOT emitted: the
 //! `<Image>` attributes above carry that information, and the FITS writer
 //! owns those cards itself rather than taking them from `cards`.
+//!
+//! **Not byte-reproducible.** `XISF:CreationTime` is the wall clock, so two
+//! writes of the same image and cards differ in the header (the attachment
+//! is identical). A FITS write of the same data IS byte-identical run to
+//! run, so every byte-comparison pin and every acceptance-run byte
+//! comparison stays on `output.format = fits`.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -153,6 +179,33 @@ fn escape_xml(s: &str) -> Cow<'_, str> {
 
 fn align_up(n: usize, a: usize) -> usize {
     n.div_ceil(a) * a
+}
+
+/// `ROWORDER`, made explicit (M4d Task 2 fix round 1, ruling R-T2-1 — see
+/// the module docs): XISF has no row-order concept of its own, so the
+/// keyword list must say which order the stored array is actually in rather
+/// than leave a reader with the FITS convention's silent default.
+///
+/// A card list that already carries `ROWORDER` is returned borrowed and its
+/// value passes through verbatim — it IS the answer, and rewriting it would
+/// only invent a disagreement with the FITS twin. A list without one gets
+/// [`crate::orientation::ROW_ORDER_BOTTOM_UP`] appended, which is the same
+/// astronomical default `crate::orientation::row_order_is_bottom_up`
+/// applies to a missing card (that function stays the ONE encoding of the
+/// rule; this is its `None` arm, spelled with its own constant).
+fn with_explicit_row_order(cards: &[Card]) -> Result<Cow<'_, [Card]>, FitsWriteError> {
+    if cards.iter().any(|c| c.keyword == "ROWORDER") {
+        return Ok(Cow::Borrowed(cards));
+    }
+    let mut owned = cards.to_vec();
+    owned.push(
+        Card::new(
+            "ROWORDER",
+            CardValue::Str(crate::orientation::ROW_ORDER_BOTTOM_UP.to_string()),
+        )?
+        .with_comment("image row order (astronomical default)"),
+    );
+    Ok(Cow::Owned(owned))
 }
 
 /// The XML header for one image, with the attachment at `attachment_pos`.
@@ -306,17 +359,20 @@ pub fn write_xisf_f32_to<W: Write>(
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
     validate(width, height, channels, data.len())?;
+    // The stored array's row order, stated explicitly (ruling R-T2-1).
+    let cards = with_explicit_row_order(cards)?;
     // Card-grammar parity with the FITS writer (see the module docs): an
     // invalid or reserved keyword, a non-finite real or an over-long comment
     // fails an XISF write exactly as it fails a FITS one, so the two
-    // containers of one master always carry the same cards.
-    for card in cards {
+    // containers of one master always carry the same cards. Runs over the
+    // FINAL list, the added `ROWORDER` included.
+    for card in cards.iter() {
         format_card(card)?;
     }
 
     let data_bytes = data.len() * std::mem::size_of::<f32>();
     let creation_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let prefix = header_prefix(width, height, channels, data_bytes, cards, &creation_time)?;
+    let prefix = header_prefix(width, height, channels, data_bytes, &cards, &creation_time)?;
     w.write_all(&prefix)?;
 
     let mut buf = Vec::with_capacity(8192 * 4);
@@ -426,6 +482,53 @@ mod tests {
             ]);
             assert_eq!(got, *expected, "sample {i}");
         }
+    }
+
+    /// Ruling R-T2-1: the keyword list always states the stored array's row
+    /// order — the source's own value when it has one, the astronomical
+    /// default when it does not, and never two `ROWORDER` cards.
+    #[test]
+    fn row_order_is_always_stated_explicitly() {
+        let with = vec![Card::new(
+            "ROWORDER",
+            CardValue::Str(crate::orientation::ROW_ORDER_TOP_DOWN.into()),
+        )
+        .unwrap()];
+        let mut out: Vec<u8> = Vec::new();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &with).unwrap();
+        let (_, xml) = split_header(&out);
+        assert!(
+            xml.contains("name=\"ROWORDER\" value=\"'TOP-DOWN'\""),
+            "a TOP-DOWN source passes through verbatim: {xml}"
+        );
+        assert_eq!(
+            xml.matches("name=\"ROWORDER\"").count(),
+            1,
+            "exactly one ROWORDER keyword: {xml}"
+        );
+
+        // No ROWORDER card at all: the same astronomical default
+        // `orientation::row_order_is_bottom_up` applies to a missing card.
+        let mut out: Vec<u8> = Vec::new();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &sample_cards()).unwrap();
+        let (_, xml) = split_header(&out);
+        assert!(
+            xml.contains("name=\"ROWORDER\" value=\"'BOTTOM-UP'\""),
+            "a source with no ROWORDER is declared bottom-up: {xml}"
+        );
+        assert_eq!(xml.matches("name=\"ROWORDER\"").count(), 1, "{xml}");
+
+        // An unrecognized explicit value is still the source's answer and
+        // passes through untouched (the rule reads it as bottom-up for the
+        // run's warning, which is a separate question).
+        let odd = vec![Card::new("ROWORDER", CardValue::Str("sideways".into())).unwrap()];
+        let mut out: Vec<u8> = Vec::new();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &odd).unwrap();
+        let (_, xml) = split_header(&out);
+        assert!(
+            xml.contains("name=\"ROWORDER\" value=\"'sideways'\""),
+            "{xml}"
+        );
     }
 
     #[test]

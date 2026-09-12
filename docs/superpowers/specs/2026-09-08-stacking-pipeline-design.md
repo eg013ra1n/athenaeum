@@ -975,6 +975,31 @@ rejection: `rangeLow` 0.0 on, `rangeHigh` off (0.98 when on).
   — always FITS, whatever `output.format` says: they are diagnostics, not
   the product (ruling R-M4d-3). The drizzled master and its weight map DO
   follow the master's container.
+- **XISF row order — a known limitation** (M4d Task 2 fix round 1, ruling
+  R-T2-1). XISF's convention is that row 0 IS the top row and no XISF
+  reader has a `ROWORDER` concept, while the master's array is simply its
+  source frames' order: no stage flips pixels. So for a BOTTOM-UP set — or
+  one whose cards carry no `ROWORDER` at all, which the astronomical
+  convention reads as bottom-up (`orientation::row_order_is_bottom_up`) and
+  which is every master this pipeline writes today, since the calibration
+  hop's card whitelist (`calibration_library::light_headers`) does not copy
+  the keyword through — an XISF viewer shows the master
+  vertically MIRRORED relative to the FITS master of the same run. The
+  pixels are deliberately not flipped: a row flip would have to transform
+  the master's WCS too (`CRPIX2`, the CD matrix, the odd-`v` SIP terms),
+  which is a feature of its own and is a recorded follow-up. The WCS is
+  untouched and stays correct for the array as stored. Instead the XISF
+  keyword list states the effective order EXPLICITLY (the copied value when
+  the cards carry one, `'BOTTOM-UP'` when they do not) and the run pushes
+  one warning per bottom-up XISF master ("XISF output keeps the frames'
+  bottom-up row order; XISF viewers will show it flipped relative to the
+  FITS master"), which also covers that group's drizzled master and weight
+  map — they share the same array order.
+- **An XISF write is not byte-reproducible**: `XISF:CreationTime` is the
+  wall clock, so two writes of the same image differ in the header (the
+  attachment is identical). A FITS write of the same data IS byte-identical
+  run to run, so every byte-comparison pin and every acceptance-run byte
+  comparison stays on `output.format = fits`.
 - **Scanner rule**: a file carrying `ATH_STK` or `ATH_REG` is an Athenaeum
   artifact and is never cataloged, the same one-rule skip as
   `CALSTAT + ATH_CSRC` (calibrated intermediates already carry those).

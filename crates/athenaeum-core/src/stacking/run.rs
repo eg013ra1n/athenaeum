@@ -72,7 +72,8 @@ use crate::stacking::ln::{
     LnReferenceForDetection, DEFAULT_PARAMS,
 };
 use crate::stacking::master_cards::{
-    build_drizzle_cards, build_master_light_cards, master_file_name, write_drizzled_master,
+    build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up,
+    master_file_name, write_drizzled_master,
     write_master_light, MasterCardInputs, WrittenDrizzle,
 };
 use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
@@ -5702,13 +5703,16 @@ fn process_group_output(
         // would otherwise poison it for the rest of the process's life,
         // failing every later master write with no write ever attempted.
         // Safe to recover: the guarded section only claims a name
-        // (`resolve_collision`) and writes through `write_fits_f32`, which
-        // already writes to a sibling temp file and atomically renames it
-        // into place (`fits_writer::writer::write_fits_f32`) — a panic mid-write
-        // leaves an orphaned `*.fits.tmp.<pid>.<seq>` file, never a partial
-        // file AT the resolved name itself, so a later `resolve_collision`
-        // call still sees that name correctly free and reuses it; there is
-        // no partial state under this lock for a later writer to misread.
+        // (`resolve_collision`) and writes through `write_fits_f32` or, for
+        // `output.format = xisf` (M4d Task 2), `write_xisf_f32` — both of
+        // which write to a sibling temp file and atomically rename it into
+        // place (`fits_writer::writer::write_fits_f32`,
+        // `fits_writer::xisf_writer::write_xisf_f32`) — so a panic mid-write
+        // leaves an orphaned `*.fits.tmp.<pid>.<seq>` (or
+        // `*.xisf.tmp.<pid>.<seq>`) file, never a partial file AT the
+        // resolved name itself; a later `resolve_collision` call still sees
+        // that name correctly free and reuses it, and there is no partial
+        // state under this lock for a later writer to misread.
         let _guard = OUTPUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         write_master_light(
             &rc.output_dir,
@@ -5787,6 +5791,33 @@ fn process_group_output(
         path = %master_path_str,
         "master written"
     );
+
+    // M4d Task 2 fix round 1 (ruling R-T2-1): XISF has no row-order concept
+    // — row 0 IS the top row for every XISF reader — while this master's
+    // array is simply its source frames' order, carried through every stage
+    // unflipped. For a bottom-up set (or one whose frames carry no
+    // `ROWORDER` at all, the astronomical default) the XISF master therefore
+    // displays mirrored relative to the FITS master of the same run. The
+    // pixels are deliberately not flipped (that would have to transform the
+    // WCS and its SIP terms — a follow-up); the XISF header states the
+    // effective order explicitly and this says so once per group. The
+    // group's drizzled master and weight map share this array order, so
+    // they are covered by this one warning rather than repeating it.
+    if rc.config.output.format == crate::stacking::config::OutputFormat::Xisf
+        && cards_row_order_is_bottom_up(&cards)
+    {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            path = %master_path_str,
+            "xisf output keeps the frames' bottom-up row order"
+        );
+        rc.warnings.push(format!(
+            "group {}: XISF output keeps the frames' bottom-up row order; XISF viewers \
+             will show it flipped relative to the FITS master",
+            group.key
+        ));
+    }
 
     // M3 Task 5 (spec Stage::Drizzle, ruling R-M3-11): runs AFTER the master
     // is written and its DB row updated, in this SAME call, so a drizzle
@@ -15160,6 +15191,157 @@ mod tests {
             (weight_meta.width, weight_meta.height, weight_meta.channels),
             (drizzle_meta.width, drizzle_meta.height, drizzle_meta.channels),
             "the weight map shares the drizzled master's grid"
+        );
+
+        // Fix round 1, ruling R-T2-1: the XISF header always STATES the
+        // stored array's row order rather than leaving a reader with the
+        // FITS convention's silent default.
+        //
+        // Why `BOTTOM-UP` even though this fixture's lights are written
+        // `TOP-DOWN`: the calibration hop does not copy `ROWORDER` through
+        // (`calibration_library::light_headers`'s card whitelist has no
+        // such entry), so no master built by this pipeline carries the
+        // keyword at all today and the astronomical default applies — to
+        // the FITS master exactly as much as to this one. That also makes
+        // the warning below unconditional for XISF runs. If `ROWORDER` ever
+        // starts flowing through calibration, THIS line is the canary that
+        // says so, and the sibling test below (whose SOURCE frames are
+        // genuinely bottom-up) keeps pinning the bottom-up case.
+        let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
+            crate::models::FileFormat::XISF,
+            &crate::fits_parser::extract_xisf_header(Path::new(&master_path)).unwrap(),
+        );
+        assert_eq!(
+            keys.get("ROWORDER").map(String::as_str),
+            Some(crate::orientation::ROW_ORDER_BOTTOM_UP),
+            "{keys:?}"
+        );
+        assert_eq!(
+            summary
+                .warnings
+                .iter()
+                .filter(|w| w.contains("bottom-up row order"))
+                .count(),
+            1,
+            "one row-order warning per group, drizzle and weight map included: {:?}",
+            summary.warnings
+        );
+    }
+
+    /// The fixture writes `ROWORDER = 'TOP-DOWN'`; rewrite it in place to
+    /// `'BOTTOM-UP'` on every light, in the SAME 80-byte record, so the file
+    /// size and every later offset stay put and the value travels through
+    /// calibration and registration by the same copy-through a real
+    /// bottom-up set's would.
+    fn make_lights_bottom_up(dir: &Path, count: usize) {
+        let record = crate::fits_writer::card::format_card(
+            &crate::fits_writer::Card::new(
+                "ROWORDER",
+                crate::fits_writer::CardValue::Str(
+                    crate::orientation::ROW_ORDER_BOTTOM_UP.into(),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.len(), 1, "one 80-byte record");
+        for i in 0..count {
+            let path = dir.join(format!("f{i}.fits"));
+            let mut bytes = std::fs::read(&path).unwrap();
+            let mut at: Option<usize> = None;
+            for (idx, chunk) in bytes.chunks(80).enumerate() {
+                if chunk.starts_with(b"END ") {
+                    break;
+                }
+                if chunk.starts_with(b"ROWORDER") {
+                    at = Some(idx);
+                    break;
+                }
+            }
+            let at =
+                at.unwrap_or_else(|| panic!("no ROWORDER card in {}", path.display()));
+            bytes[at * 80..at * 80 + 80].copy_from_slice(&record[0]);
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+
+    /// Ruling R-T2-1: a bottom-up set's XISF master keeps the frames' row
+    /// order — the pixels are not flipped, the header states `BOTTOM-UP`
+    /// explicitly, and the run warns exactly ONCE, naming the group.
+    ///
+    /// The SOURCE lights are genuinely `BOTTOM-UP` here (the sibling test
+    /// above starts from the fixture's `TOP-DOWN` ones and reaches the same
+    /// answer only because calibration drops the keyword — see its comment).
+    /// So this test is the one that still asks the real question if
+    /// `ROWORDER` ever starts flowing through calibration.
+    #[test]
+    fn a_bottom_up_xisf_run_warns_once_about_the_row_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        make_lights_bottom_up(fixture.dir.path(), shifts.len());
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.format = crate::stacking::config::OutputFormat::Xisf;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        let group = &groups[0];
+        let master_path = group.master_path.clone().expect("master path recorded");
+        assert!(master_path.ends_with(".xisf"), "{master_path}");
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        let row_order: Vec<&String> = summary
+            .warnings
+            .iter()
+            .filter(|w| w.contains("bottom-up row order"))
+            .collect();
+        assert_eq!(
+            row_order.len(),
+            1,
+            "exactly one row-order warning: {:?}",
+            summary.warnings
+        );
+        assert!(
+            row_order[0].contains(&group.group_key),
+            "the warning names its group: {}",
+            row_order[0]
+        );
+
+        let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
+            crate::models::FileFormat::XISF,
+            &crate::fits_parser::extract_xisf_header(Path::new(&master_path)).unwrap(),
+        );
+        assert_eq!(
+            keys.get("ROWORDER").map(String::as_str),
+            Some(crate::orientation::ROW_ORDER_BOTTOM_UP),
+            "the XISF header states the effective order: {keys:?}"
         );
     }
 }

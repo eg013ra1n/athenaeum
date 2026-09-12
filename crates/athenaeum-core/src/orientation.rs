@@ -59,26 +59,33 @@ pub fn flip_vertical_for_path(path: &Path) -> bool {
     }
 }
 
-/// FITS-specific rule: read `ROWORDER`, apply astronomical convention.
-fn fits_flip_vertical(path: &Path) -> bool {
-    let header = match FitsHeader::from_path(path) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    match header.get_str("ROWORDER") {
+/// The canonical `ROWORDER` spellings, so a writer that has to state the
+/// order explicitly (the XISF writer — see [`row_order_is_bottom_up`])
+/// spells it the same way this rule reads it.
+pub const ROW_ORDER_TOP_DOWN: &str = "TOP-DOWN";
+pub const ROW_ORDER_BOTTOM_UP: &str = "BOTTOM-UP";
+
+/// The row-order rule over an already-read `ROWORDER` value — the ONE
+/// place the table in the module docs is encoded (M4d Task 2 fix round 1,
+/// ruling R-T2-1: the XISF writer and the stacking run both need this
+/// answer over a card they already hold, and a second copy of the rule is
+/// exactly how a 180° flip goes unnoticed).
+///
+/// `TOP-DOWN` → `false`; `BOTTOM-UP`, an unrecognized explicit value, and a
+/// missing card → `true`, the astronomical default. Case-insensitive, and
+/// tolerant of the surrounding quotes some writers leave in the value
+/// despite the FITS card already delimiting it.
+pub fn row_order_is_bottom_up(value: Option<&str>) -> bool {
+    match value {
         Some(value) => {
-            // Compare case-insensitive against canonical FITS spellings.
-            // Trim leading/trailing whitespace and surrounding quotes that
-            // some writers leave in the value despite the FITS card
-            // already being delimited.
             let normalized = value
                 .trim()
                 .trim_matches('\'')
                 .trim()
                 .to_ascii_uppercase();
             match normalized.as_str() {
-                "TOP-DOWN" => false,
-                "BOTTOM-UP" => true,
+                s if s == ROW_ORDER_TOP_DOWN => false,
+                s if s == ROW_ORDER_BOTTOM_UP => true,
                 // Unknown explicit value — assume astronomical default.
                 _ => true,
             }
@@ -86,6 +93,15 @@ fn fits_flip_vertical(path: &Path) -> bool {
         // Missing ROWORDER → astronomical default = bottom-up = flip.
         None => true,
     }
+}
+
+/// FITS-specific rule: read `ROWORDER`, apply astronomical convention.
+fn fits_flip_vertical(path: &Path) -> bool {
+    let header = match FitsHeader::from_path(path) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    row_order_is_bottom_up(header.get_str("ROWORDER").as_deref())
 }
 
 #[cfg(test)]
@@ -105,6 +121,25 @@ mod tests {
     fn xisf_extension_returns_false() {
         // No file needs to exist; the dispatch happens before any I/O.
         assert!(!flip_vertical_for_path(Path::new("/tmp/whatever.xisf")));
+    }
+
+    /// The rule itself, over the values callers actually hold (M4d Task 2
+    /// fix round 1): the two canonical spellings, case and quote noise, an
+    /// unrecognized value and a missing card.
+    #[test]
+    fn row_order_rule_covers_every_value_shape() {
+        assert!(!row_order_is_bottom_up(Some(ROW_ORDER_TOP_DOWN)));
+        assert!(row_order_is_bottom_up(Some(ROW_ORDER_BOTTOM_UP)));
+        assert!(!row_order_is_bottom_up(Some(" 'top-down' ")));
+        assert!(row_order_is_bottom_up(Some("bottom-up")));
+        assert!(
+            row_order_is_bottom_up(Some("sideways")),
+            "an unrecognized value takes the astronomical default"
+        );
+        assert!(
+            row_order_is_bottom_up(None),
+            "a missing card takes the astronomical default"
+        );
     }
 
     #[test]

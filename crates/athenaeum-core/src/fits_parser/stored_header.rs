@@ -391,6 +391,38 @@ fn parse_xisf_xml_text(text: &str) -> HashMap<String, String> {
 mod tests {
     use super::*;
 
+    /// The scanner's one-rule skip for Athenaeum artifacts keys on
+    /// `ATH_STK` being visible in the stored header (spec §6.4). An XISF
+    /// master (M4d Task 2) must therefore surface that keyword through this
+    /// very path — `extract_xisf_header` + `parse_stored_header_keys` —
+    /// which is what makes "a master is never cataloged" true for the XISF
+    /// container too instead of resting on three unrelated details.
+    #[test]
+    fn an_xisf_masters_stored_header_surfaces_ath_stk() {
+        use crate::fits_writer::{write_xisf_f32, Card, CardValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.xisf");
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
+            Card::new("ATH_STK", CardValue::Logical(true))
+                .unwrap()
+                .with_comment("stacked by Athenaeum; never cataloged"),
+            Card::new("OBJECT", CardValue::Str("LDN 1272".into())).unwrap(),
+        ];
+        write_xisf_f32(&path, 4, 2, 1, &[0.25f32; 8], &cards).unwrap();
+
+        let header = crate::fits_parser::extract_xisf_header(&path).unwrap();
+        let keys = parse_stored_header_keys(FileFormat::XISF, &header);
+        assert_eq!(keys.get("ATH_STK").map(String::as_str), Some("T"), "{keys:?}");
+        assert_eq!(
+            keys.get("IMAGETYP").map(String::as_str),
+            Some("Master Light"),
+            "{keys:?}"
+        );
+        assert_eq!(keys.get("OBJECT").map(String::as_str), Some("LDN 1272"));
+    }
+
     /// Survey / processed frames (e.g. SkyMapper `1_18_r_1_P.fit`) ship
     /// with full FITS WCS — `CRVAL1`/`CRVAL2` + a CD matrix — but no
     /// OBJCTRA/RA or OBJCTDEC/DEC. The snapshot must extract ra/dec from
