@@ -174,8 +174,17 @@ FWHM are identical to the baseline's to three digits in all three runs.
   frames") is satisfied by every λ through the cap itself; read as
   "converges before the cap", λ = 0.5 sits at 94.4 % and λ = 0 at 99.7 %,
   but λ = 0's rms is worse by 45 % and its spline is the noise-fitting one.
-  The default moves to 0.5 in the final fix wave (the registration hash
-  moves for `tps` sets only).
+  The default moves to 0.5 in the final fix wave. It does NOT move the
+  registration hash for `tps` sets only, as this note first claimed:
+  `registration_subtree` serializes `cfg.registration` whole, with no
+  `skip_serializing_if`, so `tpsSmoothing` sits in every set's registration
+  hash whatever the distortion (the pin
+  `the_tps_fields_move_the_registration_stage_hash` demonstrates it under
+  `distortion: off`). What the default-VALUE change touches is only the
+  documents that OMIT the field — serde's default fills a missing field
+  only, so a stored `"tpsSmoothing": 0.0` stays 0.0 — and the hash
+  consequence was already absorbed when M4c added the field: every set
+  re-registers once on its first M4c run either way.
 - On this set TPS buys nothing measurable over the polynomial (the field
   is well corrected by a cubic — M3/M4a already showed rms 0.1 px); its case
   is the field a polynomial cannot fit, which this set does not have. It

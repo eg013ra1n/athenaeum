@@ -1574,14 +1574,25 @@ mod tests {
     /// cannot represent, the spline lands the inliers where the
     /// polynomial leaves them a third of a pixel off.
     ///
-    /// Measured: at the inliers, cubic 0.929 px vs spline 0.0013 px; off
-    /// the inliers, over the whole star-covered field, cubic 1.193 px vs
-    /// spline 0.108 px. The two spline numbers differ by two orders of
-    /// magnitude for a reason worth stating — with `λ = 0` and every
-    /// inlier a node the spline INTERPOLATES, so its residual AT the
-    /// inliers is a solver artefact, not a model error. The off-inlier
-    /// figure is the honest accuracy statement, and it beats the
-    /// polynomial by 11× on its own.
+    /// Measured at `λ = 0`: at the inliers, cubic 0.929 px vs spline
+    /// 0.0013 px; off the inliers, over the whole star-covered field,
+    /// cubic 1.193 px vs spline 0.108 px. The two spline numbers differ by
+    /// two orders of magnitude for a reason worth stating — with `λ = 0`
+    /// and every inlier a node the spline INTERPOLATES, so its residual
+    /// AT the inliers is a solver artefact, not a model error. The
+    /// off-inlier figure is the honest accuracy statement, and it beats
+    /// the polynomial by 11× on its own.
+    ///
+    /// **λ is pinned explicitly here**, not taken from the default, which
+    /// ruling R-T7-1 moved to 0.5. That default is calibrated at the
+    /// 600-node cap on real 26 Mpx frames, whose residual field is smooth
+    /// at frame scale; this 1000×800 synthetic wobbles with a period of
+    /// ≈ 100 px over 450 nodes, so 0.5 over-smooths it — hold-out 0.717 px
+    /// against the interpolating spline's 0.052, off-inlier 0.838 against
+    /// 0.108. The second block below keeps the shipped default honest at
+    /// the one thing that still has to hold on such a field: even
+    /// over-smoothed, the spline beats the cubic off the inliers (0.838 vs
+    /// 1.193 px, 1.4× rather than 11×).
     #[test]
     fn the_spline_follows_a_field_the_polynomial_cannot() {
         let (subject, reference, geo) = wobble_scene(31, 450);
@@ -1599,6 +1610,9 @@ mod tests {
 
         let tps = RegistrationConfig {
             distortion: DistortionChoice::Tps,
+            // The interpolating spline — see this test's own doc for why λ
+            // is spelled out rather than taken from the default.
+            tps_smoothing: 0.0,
             ..Default::default()
         };
         let t = align_default(&subject, &reference, geo, geo, &tps).unwrap();
@@ -1614,6 +1628,27 @@ mod tests {
         assert_eq!(
             model_name(t.model, t.distortion, SeedKind::Wcs),
             "homography+tps+wcs"
+        );
+
+        // Ruling R-T7-1's shipped λ over-smooths this synthetic field, so
+        // it gets the weaker of the two claims: it must still beat the
+        // cubic off the inliers. Measured 0.838 px against the cubic's
+        // 1.193 (the interpolating spline's own 0.108 is asserted below).
+        let shipped = RegistrationConfig {
+            distortion: DistortionChoice::Tps,
+            ..Default::default()
+        };
+        assert_eq!(
+            shipped.tps_smoothing, 0.5,
+            "this block exists to exercise the SHIPPED λ"
+        );
+        let ts = align_default(&subject, &reference, geo, geo, &shipped).unwrap();
+        assert_eq!(ts.distortion, DistortionFit::Tps);
+        assert!(
+            off_truth_rms(&ts.map) < off_truth_rms(&p.map),
+            "off-inlier at the shipped λ: spline {} px vs cubic {} px",
+            off_truth_rms(&ts.map),
+            off_truth_rms(&p.map)
         );
 
         // Off the inliers, over the whole star-covered field: the spline

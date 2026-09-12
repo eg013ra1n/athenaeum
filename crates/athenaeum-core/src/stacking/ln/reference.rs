@@ -6,7 +6,8 @@
 //! [`read_reference`]).
 //!
 //! [`build_reference`] shares [`crate::stacking::integrate::integrate_planes`]
-//! — the per-plane `RegisteredSource` + `integrate_stack` loop
+//! — the ONE `RegisteredSource` per group (ruling R-T4-7: re-pointed at
+//! each plane with `set_plane`) plus `integrate_stack` per plane that
 //! `integrate_group` (Plan 4) also drives — rather than re-implementing it:
 //! the only differences from a normal group integration are the frame
 //! subset (the best `n` by weight, not every included frame), the weights
@@ -426,6 +427,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -477,6 +479,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -526,6 +529,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);

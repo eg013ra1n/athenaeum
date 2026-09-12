@@ -108,9 +108,11 @@ pub enum DistortionChoice {
     /// | integration | 1 (one source per group since ruling R-T4-7) |
     /// | drizzle | 1 per PLANE (the plane loop is the outer one) |
     ///
-    /// So a mono run pays ≈ 4 builds per frame and a three-plane colour
-    /// run ≈ 9 — on the 160-frame OSC acceptance group, ≈ 25 minutes of
-    /// grid building. In exchange it never holds more than a few grids at
+    /// Adding the table up, a mono run pays 4 builds per frame (3 by
+    /// default — `writeRegisteredFrames` is off) and a three-plane colour
+    /// run 8 (7 by default) — on the 160-frame OSC acceptance group,
+    /// ≈ 19 minutes of grid building at the default toggles. In exchange
+    /// it never holds more than a few grids at
     /// once: the resident figure is one inverse grid per frame for the
     /// length of a group's integration (≈ 208 × 4.5 MB ≈ 0.9 GB at that
     /// set's size) and a handful anywhere else.
@@ -204,6 +206,15 @@ pub struct RegistrationConfig {
     /// nodes, roughly an order of magnitude higher at the 600-node cap.
     /// Read only by [`DistortionChoice::Tps`]; ignored by every other
     /// choice.
+    ///
+    /// **The shipped default is `0.5`** (ruling R-T7-1), measured rather
+    /// than guessed: at the 600-node cap on the acceptance set's real
+    /// 26 Mpx frames the hold-out rms was 0.145 / 0.203 px (mono / OSC)
+    /// at `λ = 0`, **0.099 / 0.156 px at `λ = 0.5`** and 0.102 / 0.165 px
+    /// at `λ = 2`. `λ = 0` interpolates the star-position noise — it
+    /// lands every inlier exactly and generalizes worst of the three — so
+    /// the interpolating spline is a deliberate choice now, not what a
+    /// default run gets.
     pub tps_smoothing: f64,
     /// The local distortion loop (M4c, ruling R-M4c-7): after the first
     /// map, up to `align::LOCAL_DISTORTION_ROUNDS` rounds of re-pairing
@@ -229,7 +240,9 @@ impl Default for RegistrationConfig {
             geometry: RegistrationGeometry::CoRegistered,
             model: ModelChoice::Auto,
             distortion: DistortionChoice::Off,
-            tps_smoothing: 0.0,
+            // Ruling R-T7-1: the acceptance run's own measurement, not the
+            // interpolating spline — see `tps_smoothing`'s doc.
+            tps_smoothing: 0.5,
             local_distortion: false,
             interpolation: Interpolation::BicubicBSpline,
             clamping_threshold: 0.30,
@@ -325,20 +338,32 @@ mod tests {
 
     /// M4c rulings R-M4c-5/7: two fields, both `#[serde(default)]`
     /// through the struct-level `default`, so a config document written
-    /// before M4c decodes to exactly today's behaviour (interpolating
-    /// spline weight, loop off) and no `STACKING_CONFIG_VERSION` bump is
-    /// needed. `tps` is a valid `distortion`, and `Auto` never resolves
-    /// to it.
+    /// before M4c decodes to exactly today's behaviour for the loop (off)
+    /// and to the measured smoothing default for the spline — neither is
+    /// read at all by a default run, whose `distortion` is `off`, so no
+    /// `STACKING_CONFIG_VERSION` bump is needed. `tps` is a valid
+    /// `distortion`, and `Auto` never resolves to it.
+    ///
+    /// Ruling R-T7-1 moved the smoothing default from the interpolating
+    /// `0.0` to `0.5`; the local loop stays off. A stored document that
+    /// spells `tpsSmoothing` out keeps its own value — serde's default
+    /// fills a MISSING field only — so the change reaches exactly the
+    /// documents that omit it.
     #[test]
-    fn tps_smoothing_and_the_local_loop_default_to_off() {
+    fn tps_smoothing_defaults_to_the_measured_lambda_and_the_local_loop_to_off() {
         let d = RegistrationConfig::default();
-        assert_eq!(d.tps_smoothing, 0.0);
+        assert_eq!(d.tps_smoothing, 0.5);
         assert!(!d.local_distortion);
 
         let pre_m4c: RegistrationConfig =
             serde_json::from_str("{\"distortion\":\"polynomial3\"}").unwrap();
-        assert_eq!(pre_m4c.tps_smoothing, 0.0);
+        assert_eq!(pre_m4c.tps_smoothing, 0.5);
         assert!(!pre_m4c.local_distortion);
+
+        // An explicit `0.0` is a choice and survives untouched.
+        let interpolating: RegistrationConfig =
+            serde_json::from_str("{\"distortion\":\"tps\",\"tpsSmoothing\":0.0}").unwrap();
+        assert_eq!(interpolating.tps_smoothing, 0.0);
 
         let tps: RegistrationConfig = serde_json::from_str(
             "{\"distortion\":\"tps\",\"tpsSmoothing\":2.5,\"localDistortion\":true}",
@@ -361,7 +386,7 @@ mod tests {
         assert_eq!(d.geometry, RegistrationGeometry::CoRegistered);
         assert_eq!(d.model, ModelChoice::Auto);
         assert_eq!(d.distortion, DistortionChoice::Off);
-        assert_eq!(d.tps_smoothing, 0.0);
+        assert_eq!(d.tps_smoothing, 0.5);
         assert!(!d.local_distortion);
         assert_eq!(d.interpolation, Interpolation::BicubicBSpline);
         assert_eq!(d.clamping_threshold, 0.30);
@@ -383,7 +408,7 @@ mod tests {
             "\"geometry\":\"coRegistered\"",
             "\"model\":\"auto\"",
             "\"distortion\":\"off\"",
-            "\"tpsSmoothing\":0.0",
+            "\"tpsSmoothing\":0.5",
             "\"localDistortion\":false",
             "\"interpolation\":\"bicubicBSpline\"",
             "\"clampingThreshold\":0.3",

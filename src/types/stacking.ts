@@ -60,6 +60,15 @@ geometry: RegistrationGeometry, model: ModelChoice, distortion: DistortionChoice
  * nodes, roughly an order of magnitude higher at the 600-node cap.
  * Read only by [`DistortionChoice::Tps`]; ignored by every other
  * choice.
+ *
+ * **The shipped default is `0.5`** (ruling R-T7-1), measured rather
+ * than guessed: at the 600-node cap on the acceptance set's real
+ * 26 Mpx frames the hold-out rms was 0.145 / 0.203 px (mono / OSC)
+ * at `λ = 0`, **0.099 / 0.156 px at `λ = 0.5`** and 0.102 / 0.165 px
+ * at `λ = 2`. `λ = 0` interpolates the star-position noise — it
+ * lands every inlier exactly and generalizes worst of the three — so
+ * the interpolating spline is a deliberate choice now, not what a
+ * default run gets.
  */
 tpsSmoothing: number, 
 /**

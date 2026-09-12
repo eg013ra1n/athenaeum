@@ -2748,6 +2748,12 @@ mod tests {
 
         let mut clean = planted_stack(60, 1000.0, 10.0, 0x8C8_0002, &[]);
         let (kept_clean, _) = reject_rcr(&mut clean, 0.5);
+        // This bound has ZERO margin: the measured answer on this fixture
+        // is exactly 57 of 60. That is deliberate — RCR is allowed to trim
+        // the tails of a clean Gaussian and 3 of 60 is what it trims here —
+        // but it means a failure of this line is not noise: the estimator
+        // moved, and the next step is to find out how, not to lower the
+        // bar.
         assert!(kept_clean >= 57, "kept {kept_clean} of 60");
 
         // Identical samples have no dispersion: nothing is extreme.

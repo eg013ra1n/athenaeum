@@ -328,6 +328,25 @@ pub struct GroupInput<'a> {
     /// `integrate_group` checks `rej.frames()` against the post-min-weight-
     /// drop included count before handing it to `integrate_planes`.
     pub rej: Option<&'a RejBitmapSet>,
+    /// Whether the large-scale SECOND pass should write a bitmap set of its
+    /// own (`rej/<…>/pass2/`, ruling R-T3-1) — i.e. whether anything will
+    /// ever READ it.
+    ///
+    /// The only reader is the Drizzle stage, which is handed pass 2's files
+    /// instead of pass 1's precisely because they describe the master it is
+    /// depositing into (see `run::drizzle_rejection_paths`). So this flag
+    /// carries the run's own `drizzle.enabled && drizzle.useRejection`
+    /// decision — the SAME condition that creates `rej` in the first place
+    /// — and with drizzle off a large-scale run writes two bitmap sets, not
+    /// three: the first pass's `.rej`, its filtered `.rejl` sibling, and
+    /// nothing under `pass2/`. That third set is ≈ 3.3 MB per frame per
+    /// plane at 26 Mpx (≈ 600 MB on a 208-frame group) that no code would
+    /// open.
+    ///
+    /// `false` for every caller that is not a run: the LN reference builder
+    /// and the tests never pass a `rej` set at all, so the flag has nothing
+    /// to gate.
+    pub second_pass_bitmaps: bool,
 }
 
 // `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
@@ -1105,15 +1124,24 @@ pub fn integrate_group(
                     // drizzle loses its input, which `stacking::run` turns
                     // into the same "drizzle skipped for this group"
                     // degradation a pass-1 bitmap failure already gets.
-                    let second_set = match rej_set.create_second_pass() {
-                        Ok(set) => Some(set),
-                        Err(e) => {
-                            warn!(
-                                error = %format!("{e:#}"),
-                                "the second pass's rejection bitmaps could not be created; \
-                                 the master is unaffected"
-                            );
-                            None
+                    //
+                    // …but only when something will READ it: the Drizzle
+                    // stage is the one consumer, so a standalone
+                    // large-scale run (drizzle off) writes no third set at
+                    // all — see `GroupInput::second_pass_bitmaps`.
+                    let second_set = if !input.second_pass_bitmaps {
+                        None
+                    } else {
+                        match rej_set.create_second_pass() {
+                            Ok(set) => Some(set),
+                            Err(e) => {
+                                warn!(
+                                    error = %format!("{e:#}"),
+                                    "the second pass's rejection bitmaps could not be created; \
+                                     the master is unaffected"
+                                );
+                                None
+                            }
                         }
                     };
                     let (second, pairs) = integrate_planes(
@@ -1182,10 +1210,11 @@ pub fn integrate_group(
             return Err(IntegrationError::Cancelled);
         }
         // `integrate_planes` no longer exposes a per-plane wall-clock split
-        // (it runs every plane's `RegisteredSource::open` + `integrate_stack`
-        // before this tail even starts), so the logged `duration_ms` below is
+        // (it opens ONE `RegisteredSource` for the group — ruling R-T4-7 —
+        // and runs every plane's `set_plane` + `integrate_stack` before
+        // this tail even starts), so the logged `duration_ms` below is
         // now `out.base`'s own read+combine time plus this tail's own
-        // elapsed time — the dominant costs, not `RegisteredSource::open`'s
+        // elapsed time — the dominant costs, not the source's
         // (comparatively negligible) setup — rather than the true
         // open-to-tail span the pre-extraction code measured.
         let stats_start = Instant::now();
@@ -1691,6 +1720,7 @@ mod tests {
             normalization: &normalization,
             ln: Some(&grids),
             rej: None,
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1760,6 +1790,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         // Frame 1's grid is built for a 10x10 reference geometry — the
         // group above declares 20x20.
@@ -1883,6 +1914,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         let out = integrate_group(
             &input,
@@ -2014,6 +2046,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -2158,6 +2191,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let planes_seen = std::sync::Mutex::new(Vec::new());
@@ -2261,6 +2295,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
 
         // The engine's own raw rejected count, from a bitmap-less
@@ -2395,6 +2430,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: Some(&set),
+            second_pass_bitmaps: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -2558,6 +2594,7 @@ mod tests {
             normalization: &normalization,
             ln: None,
             rej: None,
+            second_pass_bitmaps: false,
         };
 
         let off = integrate_group(
@@ -2587,6 +2624,9 @@ mod tests {
         let input_on = GroupInput {
             integration: &integration_on,
             rej: Some(&set),
+            // This pin reads the second pass's own set, which is what a
+            // drizzle-consuming run asks for.
+            second_pass_bitmaps: true,
             ..input_off
         };
         let on = integrate_group(

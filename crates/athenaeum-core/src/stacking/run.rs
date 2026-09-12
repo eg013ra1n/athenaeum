@@ -5013,6 +5013,7 @@ fn process_group_output(
         // (the LN pass), never `integrate_group` — the real `GroupInput`
         // further down is the one a `RejBitmapSet` (Task 5) will attach to.
         rej: None,
+        second_pass_bitmaps: false,
     };
 
     let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
@@ -5279,6 +5280,13 @@ fn process_group_output(
         // itself failed — `integrate_group` runs fine either way, it just
         // never gets bitmaps to write).
         rej: rej_set.as_ref(),
+        // Final fix wave: the large-scale SECOND pass writes a bitmap set
+        // of its own only when the Drizzle stage — its one reader — is
+        // going to open it. `bitmaps_for_drizzle` is the same condition
+        // that decides whether drizzle reads bitmaps at all, so a
+        // standalone large-scale run writes two sets per frame instead of
+        // three and nothing downstream misses the third.
+        second_pass_bitmaps: bitmaps_for_drizzle,
     };
 
     // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`
@@ -5442,7 +5450,17 @@ fn process_group_output(
     // rejected samples — drizzle is skipped for the group rather than
     // pointed at pass 1's bits, which describe the integration the second
     // pass replaced. The master itself is untouched and already written.
-    if output.stats.large_scale_rejected_fraction.is_some()
+    //
+    // Final fix wave: gated on `bitmaps_for_drizzle`, because the whole
+    // degradation this branch describes is drizzle's. With drizzle off the
+    // second pass deliberately writes no set of its own (`GroupInput::
+    // second_pass_bitmaps`), so `second_pass_rej_ok` is false by design and
+    // warning here told the user about a drizzle that was never going to
+    // run. `rej_set_failure` — the only thing this branch sets — is itself
+    // read only under `rc.config.drizzle.enabled`, so nothing else loses
+    // information.
+    if bitmaps_for_drizzle
+        && output.stats.large_scale_rejected_fraction.is_some()
         && !output.second_pass_rej_ok
         && rej_set_failure.is_none()
     {
@@ -12158,6 +12176,112 @@ mod tests {
                 "row {y}: the core is rejected either way: {without} vs {with}"
             );
         }
+    }
+
+    /// Final fix wave: a large-scale run with drizzle OFF writes NO
+    /// `pass2/` directory and warns about nothing.
+    ///
+    /// The second pass's own bitmap set exists for one reader — the Drizzle
+    /// stage, which must see the bits the returned master was built with
+    /// (ruling R-T3-1). With drizzle off nothing opens it, so writing it is
+    /// ≈ 3.3 MB per frame per plane at 26 Mpx (≈ 600 MB on a 208-frame
+    /// group) of pure waste; and `second_pass_rej_ok` coming back false
+    /// used to push a run warning saying "drizzle skipped … the second
+    /// pass's rejection bitmaps are unavailable" about a drizzle that was
+    /// never going to run.
+    ///
+    /// `KeepAll` so the run's own `rej/` tree survives for this test to
+    /// look inside it: the first pass's `.rej` files and their `.rejl`
+    /// siblings must BOTH be there (the filter needs them), and `pass2/`
+    /// must not exist at all.
+    #[test]
+    fn large_scale_with_drizzle_off_writes_no_second_pass_set_and_no_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, _output) = seed_trail_group(&db_path, SET_NAME, 2);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.integration.rejection = RejectionChoice::PercentileClip {
+            low: 0.2,
+            high: 1.0,
+        };
+        cfg.integration.large_scale = LargeScaleRejection {
+            enabled: true,
+            protected_layers: 2,
+            growth: 2,
+        };
+        // Drizzle off — the whole point of the pin.
+        assert!(!cfg.drizzle.enabled, "the default must be drizzle off");
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("the run should start");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        assert!(group.master_path.is_some(), "the master must be written");
+        assert!(
+            group.drizzle_path.is_none(),
+            "drizzle never ran: {:?}",
+            group.drizzle_path
+        );
+        let stats: GroupStats =
+            serde_json::from_str(group.stats_json.as_deref().unwrap()).unwrap();
+        assert!(
+            stats.large_scale_rejected_fraction.is_some(),
+            "the second pass must have run: {stats:?}"
+        );
+
+        let summary: RunSummary =
+            serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert!(
+            !summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("drizzle") || w.contains("rejection bitmaps")),
+            "no drizzle or bitmap warning belongs on a drizzle-off run: {:?}",
+            summary.warnings
+        );
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let rej_dir = layout.rej_dir(started.run_id, &group.group_key);
+        let names: Vec<String> = std::fs::read_dir(&rej_dir)
+            .unwrap_or_else(|e| panic!("reading {rej_dir:?}: {e}"))
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with(".rej")),
+            "the first pass's bitmaps must be there: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with(".rejl")),
+            "the filter's processed siblings must be there: {names:?}"
+        );
+        assert!(
+            !rej_dir.join(crate::stacking::rej::SECOND_PASS_DIR).exists(),
+            "no pass2/ directory with drizzle off: {names:?}"
+        );
     }
 
     /// Fix round 1 (ruling R-T3-1): WHICH bitmaps the Drizzle stage is

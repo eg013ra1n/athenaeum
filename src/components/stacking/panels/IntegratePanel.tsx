@@ -130,6 +130,23 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
           0.2/0.1 · 8–19 Winsorized 4.0/3.0 · ≥ 20 linear fit 5.0/3.5. Min/max, ESD and RCR are
           picked by hand only — Auto never resolves to them.
         </p>
+        {/* Acceptance run 2026-09-12: on the debayered red plane RCR and
+         *  Winsorized 4/3 clip the cores of medium and faint stars, which
+         *  neither the mono planes nor the brightest stars show. Muted
+         *  while it only informs the choice, warning-toned once one of the
+         *  two is actually selected. */}
+        <p
+          className={`mt-1 text-[11px] ${
+            i.rejection.method === 'rcr' || i.rejection.method === 'winsorizedSigma'
+              ? 'text-warning'
+              : 'text-content-muted'
+          }`}
+        >
+          On colour (debayered) data RCR and Winsorized sigma with a tight high sigma clip the
+          cores of medium and faint stars — measured on the red plane: faint-star peaks at 0.67×
+          (RCR) and 0.73× (Winsorized 4/3) of the linear fit&rsquo;s, with the brightest stars and
+          mono data untouched. Prefer the linear fit on colour data, or raise the high sigma.
+        </p>
       </div>
 
       {i.rejection.method === 'percentileClip' && (

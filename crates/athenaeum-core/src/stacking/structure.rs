@@ -316,10 +316,12 @@ fn structure_map(plane: &[f32], w: usize, h: usize, p: &StructureParams) -> (Vec
     // (≈ 0.42×) as well as the stars, so a level taken from the filtered
     // map would fall with the very peaks the filter suppressed, and the
     // detector would lose most of the sharpness behaviour it exists for.
-    // Measured on this module's fixture (the two numbers its sharpness pin
+    // Measured on this module's fixture (the numbers its sharpness pin
     // asserts): anchored on the plane, an undersampled field yields 0.56×
-    // the well-sampled field's stars; anchored on the map, 0.91× — and at
-    // the reference's own sensitivity of 0.5, 0.56× against 0.73×.
+    // the well-sampled field's stars at this module's own fixture
+    // settings; anchored on the map, 0.91×. At the reference's own
+    // sensitivity of 0.5 the plane-anchored ratio is 0.60× (159/267, the
+    // figure the pin states) against the map-anchored 0.73×.
     let noise = map_noise(plane, w, h);
     let threshold = if noise > 0.0 {
         median + 3.0 * noise
@@ -356,16 +358,23 @@ fn structure_map(plane: &[f32], w: usize, h: usize, p: &StructureParams) -> (Vec
 /// | OSC B | 41 | 2.041 | 1.991 | 2.106 | 0/41 |
 /// | all | 176 | 1.676 | 1.071 | 2.243 | 19/176 (10.8 %) |
 ///
+/// The `all` row's min/max are the group extremes (mono's minimum, OSC G's
+/// maximum) — the source measurement's own 4-decimal table prints 2.2443
+/// there against its OSC G maximum of 2.2425, which is a transcription
+/// typo, not a 177th plane.
+///
 /// They agree to ~11 % on the mono planes and diverge by up to 2.24× on the
-/// debayered colour planes, and the reason is the thing that matters here:
-/// the noise in those planes is spatially CORRELATED (each missing colour is
-/// interpolated from its neighbours), so the finest wavelet scale carries
-/// less of it and a layer-1 estimate under-reports the dispersion of the
-/// BLOBS the noise actually forms. A structure detector mistakes blobs for
-/// stars, so the level has to follow them — which is exactly what the
-/// second layer does, and why the reference reads it. The whole calibration
-/// grid was measured through this estimator; swapping it would move the
-/// OSC levels by 1.6-2.2× and invalidate that grid.
+/// debayered colour planes, which is CONSISTENT WITH spatially correlated
+/// noise in those planes (each missing colour is interpolated from its
+/// neighbours, so the finest wavelet scale carries less of the noise and a
+/// layer-1 estimate under-reports the dispersion of the BLOBS the noise
+/// actually forms) — the evidence here is the ratio itself, not a
+/// measurement of the correlation, so the mechanism is the reading rather
+/// than a demonstrated fact. Either way a structure detector mistakes blobs
+/// for stars, so the level has to follow them — which is what the second
+/// layer does, and why the reference reads it. The whole calibration grid
+/// was measured through this estimator; swapping it would move the OSC
+/// levels by 1.6-2.2× and invalidate that grid.
 fn map_noise(map: &[f32], w: usize, h: usize) -> f32 {
     let c1 = b3_smooth(map, w, h, 1);
     let c2 = b3_smooth(&c1, w, h, 2);

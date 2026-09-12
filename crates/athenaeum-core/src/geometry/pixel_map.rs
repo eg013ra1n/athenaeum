@@ -153,7 +153,7 @@ impl TpsGrid {
 /// This is the instrument ruling R-T4-6d's run-level pin reads: a `tps`
 /// run's memory problem is not how many grids it builds over its life
 /// (rebuilding is cheap and expected) but how many are resident at the
-/// same moment — 208 of them, at ~8.6 MB each, is what thrashed the
+/// same moment — 208 of them, at ~4.5 MB each, is what thrashed the
 /// acceptance machine. `ALIVE` is decremented by [`TpsGrid`]'s own
 /// `Drop`, so it counts grids however they go away: an explicit
 /// [`PixelMap::release_grids`], or the last handle simply falling out of
@@ -241,7 +241,7 @@ type GridSlot = RwLock<Option<Arc<TpsGrid>>>;
 /// `Clone` on a `OnceLock<TpsGrid>` COPIES the built grid, and a
 /// registered frame's map is cloned into run state five times over
 /// (`rc.measured`, `GroupMember`, `StackFrame`, `RegisteredFrame`,
-/// `RegisteredSource`) — at 8.6 MB a direction that was gigabytes of
+/// `RegisteredSource`) — at 4.5 MB a direction that was gigabytes of
 /// duplicate. Behind an `Arc` every clone shares one allocation.
 ///
 /// The two directions are independent cells because they have
@@ -756,7 +756,7 @@ impl PixelMap {
     /// Every clone of a map shares ONE cache, so this frees the grid for
     /// all of them — which is the point: a registered frame's map lives in
     /// five places at once, and a stage that has finished resampling that
-    /// frame should not leave 8.6 MB per direction behind in any of them.
+    /// frame should not leave 4.5 MB per direction behind in any of them.
     /// The next pixel request rebuilds lazily (≈ 1 s on a 26 Mpx frame).
     pub fn release_grids(&self) -> usize {
         self.distortion
@@ -1078,7 +1078,7 @@ mod tests {
     /// A registered frame's map is cloned into run state several times
     /// over (`rc.measured`, `GroupMember`, `StackFrame`,
     /// `RegisteredFrame`, `RegisteredSource`), and `Clone` on a bare
-    /// `OnceLock<TpsGrid>` copies the built grid — at ~8.6 MB a direction
+    /// `OnceLock<TpsGrid>` copies the built grid — at ~4.5 MB a direction
     /// on a full-frame map that was gigabytes of duplicate.
     #[test]
     fn a_clone_shares_the_grids_it_does_not_copy_them() {

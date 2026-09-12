@@ -1342,8 +1342,12 @@ mod tests {
     /// [`a_pure_noise_sample_produces_only_a_small_spurious_surface`].
     const LOCAL_SCALE_NOISE_PTP_SIGMAS: f64 = 3.0;
 
-    /// **R-T5-1 control pin.** The gradient test above is noise-free
-    /// (`NOISE = 0.002`), so it cannot see what the review found by
+    /// **R-T5-1 control pin.** The gradient test above runs at the
+    /// module's quiet `NOISE = 0.002`, which puts the ratio dispersion at
+    /// σ_z ≈ 0.014 — a real but small sample noise, well under the
+    /// ≈ 0.03 the review asked for (that is what this test's own `LOUD =
+    /// 0.006` reaches) — and its true surface dominates whatever the
+    /// sample noise contributes, so it cannot see what the review found by
     /// replicating [`ThinPlateSpline::fit`] numerically: because
     /// `λ = LN_LOCAL_SCALE_SMOOTHING_SIGMAS · σ_z` scales WITH the
     /// dispersion and the solve is linear, a pure-noise ratio sample — no
@@ -1361,7 +1365,10 @@ mod tests {
     /// stays within [`LOCAL_SCALE_NOISE_PTP_SIGMAS`]·σ_z. **Measured
     /// 2026-09-12 over 10 seeds at σ_z ∈ [0.031, 0.038]: ptp/σ_z ∈
     /// [0.92, 2.18]**, so the pin sits at 3.0 — ≈ 1.4× the observed
-    /// maximum. For scale, the gradient test's own REAL structure runs at
+    /// maximum. The test itself loops over the FIRST 3 of those seeds
+    /// (the range is what the measurement covered, not what runs on every
+    /// `cargo test`; each seed is a full detect-fit-RCR-spline pass).
+    /// For scale, the gradient test's own REAL structure runs at
     /// ptp/σ_z ≈ 5, so this bound still separates signal from the
     /// artefact. A λ change, or the simplification step arriving, should
     /// push these numbers DOWN and this constant with them.

@@ -423,6 +423,7 @@ registration row for each — run stacking through Register first); found {}",
         normalization: &normalization_cfg,
         ln: None,
         rej: None,
+        second_pass_bitmaps: false,
     };
 
     let n = (args.frames as usize).min(stack_frames.len());

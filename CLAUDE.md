@@ -970,11 +970,21 @@ between the two evaluation paths: `forward_exact`/`inverse_exact`
 (`O(nodes)`) serve every NON-pixel caller — registration QA, the local
 loop's re-pairing, `weights::reference_coverage`,
 `drizzle::band_source_window`, the probes — while `TpsGrids { forward:
-OnceLock<TpsGrid>, inverse: OnceLock<TpsGrid> }` lives behind an `Arc` so
-every clone of a map shares ONE allocation and each direction is built only
-when that direction's pixel path first asks for it. Ruling R-T4-4 makes the
-reported RMS honest: at the default `λ = 0` every inlier is a node and the
-spline INTERPOLATES, so the in-sample residual (0.0013 px on the synthetic
+RwLock<Option<Arc<TpsGrid>>>, inverse: … }` lives behind an `Arc` so every
+clone of a map shares ONE allocation and each direction is built only when
+that direction's pixel path first asks for it. Both slots are `RwLock`s
+rather than `OnceLock`s because ruling R-T4-6 made a built grid
+RELEASABLE: `PixelMap::release_grids` (and its scope guard
+`release_grids_on_drop` → `GridRelease`) empties the slots and reports the
+bytes handed back, and every stage calls it when its per-frame work ends —
+the registration writer after it writes, `RegisteredSource`'s `Drop` for
+integration and LN, drizzle after each frame's deposit. The `Arc` inside is
+what keeps the per-pixel path lock-free: a pixel loop takes ONE handle per
+band (`forward_eval`/`inverse_eval`/`inverse_burst`), so a release on
+another thread frees the slot while that burst's own handle keeps its grid
+alive to the end. Ruling R-T4-4 makes the reported RMS honest: at `λ = 0`
+every inlier is a node and the spline INTERPOLATES, so the in-sample
+residual (0.0013 px on the synthetic
 scene against a real 0.108 px off-inlier error) would leave `maxRmsPx`
 toothless — above the node cap the non-node inliers ARE the hold-out, below
 it `TPS_HOLDOUT_STRIDE = 5` fits a second spline on 80 % of the stratified
@@ -1001,10 +1011,16 @@ incumbent's own inliers), so a round whose corrector kept an easier subset
 cannot look better while being worse. `Alignment.local_rounds` is a field
 of its own (ruling R-T4-1) — `refit_rounds` already means the σ-clip rounds
 inside one `refit_weighted` call. `registration.tpsSmoothing` (clamped to
-`[MIN_TPS_SMOOTHING, MAX_TPS_SMOOTHING] = [0, 10]`) defaults to `0.0` =
-interpolating, and both new fields ride `registration_subtree`, so the
-first run after M4c re-registers every set once on purpose. `model_name`
-yields `homography+tps`, with `+wcs` still LAST (`homography+tps+wcs`)
+`[MIN_TPS_SMOOTHING, MAX_TPS_SMOOTHING] = [0, 10]`) defaults to `0.5` —
+ruling R-T7-1's own measurement, not the interpolating `0.0`: at the
+600-node cap on real 26 Mpx frames the hold-out rms was 0.145 / 0.203 px
+(mono / OSC) at λ = 0, 0.099 / 0.156 at 0.5 and 0.102 / 0.165 at 2. Both
+new fields ride `registration_subtree` (`cfg.registration` is serialized
+whole — `tpsSmoothing` is in every set's registration hash whatever the
+`distortion`), so the first run after M4c re-registers every set once on
+purpose; the later default-VALUE change costs no second invalidation, and
+reaches only documents that OMIT the field. `model_name` yields
+`homography+tps`, with `+wcs` still LAST (`homography+tps+wcs`)
 because `FramesTable.tsx::splitRegModel` strips the trailing suffix for its
 `WCS` chip.
 

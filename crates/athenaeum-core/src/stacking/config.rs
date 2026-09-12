@@ -1186,9 +1186,11 @@ mod tests {
                 "{bad} → {got}"
             );
         }
+        // The shipped default (ruling R-T7-1) is inside the range and must
+        // not move without a deliberate re-measurement.
         assert_eq!(
             resolve_config(None, None).unwrap().registration.tps_smoothing,
-            0.0
+            0.5
         );
     }
 
@@ -1368,13 +1370,17 @@ mod tests {
         //
         // And once more here (M4c Task 4, rulings R-M4c-5/R-M4c-7):
         // `registration.tpsSmoothing` and `registration.localDistortion`
-        // join `RegistrationConfig`. They ship `0.0` / `false`, i.e.
-        // today's behaviour (and `distortion` still defaults to `off`, so
-        // neither is even read by a default run), but they DO ride
+        // join `RegistrationConfig`. `distortion` still defaults to `off`,
+        // so neither is read by a default run at all, but they DO ride
         // `registration_subtree`, so every set's cached registration rows
         // go stale once — deliberately, per the same reasoning as
         // `geometry` above: the fields decide what surface a stored
-        // `transform_json` describes.
-        assert_eq!(default_hash, "4c0cdc66be4b9284");
+        // `transform_json` describes. The final fix wave then moved
+        // `tpsSmoothing`'s own default from `0.0` to `0.5` (ruling
+        // R-T7-1); that re-pins this literal but costs no SECOND
+        // invalidation in practice — the field's arrival above already
+        // spent the one re-registration, and a stored document that
+        // spells `tpsSmoothing` out keeps its own value either way.
+        assert_eq!(default_hash, "55140f6ae0f69ffc");
     }
 }

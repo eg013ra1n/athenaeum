@@ -504,9 +504,11 @@ pub struct EstimateInputs<'a> {
 /// use the SAME largest-member geometry the master term above does —
 /// rejection bitmaps (`use_rejection`, one `.rej` per included frame,
 /// `ceil(W/64)` u64 words per row per plane, per `rej.rs`'s own layout:
-/// `included * planes * ceil(W/64) * 8 * H`; TRIPLED when `i.large_scale`
-/// is on, for its `.rejl` sibling and the second pass's own set — M4c Task
-/// 3, ruling R-T3-1) and the drizzled output itself
+/// `included * planes * ceil(W/64) * 8 * H`; DOUBLED when `i.large_scale`
+/// is on, for its `.rejl` sibling, and TRIPLED when drizzle is on with it,
+/// for the second pass's own set — which is written only when drizzle will
+/// read it, M4c Task 3, ruling R-T3-1 plus the final fix wave) and the
+/// drizzled output itself
 /// (`planes * (W*scale) * (H*scale) * 4`, doubled when `write_weight_map` is
 /// on — the weight map is the same geometry). "included" here is the
 /// group's own frame count (`g.frames.len()`), the same approximation the
@@ -539,12 +541,17 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
 
         // Rejection-bitmap temporaries, all the same size: one `.rej` per
         // included frame when drizzle wants the survivor mask, and (M4c
-        // Task 3) THREE per frame when large-scale rejection is on — the
-        // first pass's `.rej`, the filtered `.rejl` sibling, and the second
-        // pass's own `.rej` under `pass2/` (ruling R-T3-1). Whichever
-        // feature asks for the first one, it is created once.
-        let bitmap_copies = match (i.drizzle.is_some_and(|(_, _, rej)| rej), i.large_scale) {
-            (_, true) => 3,
+        // Task 3) one more per frame when large-scale rejection is on — its
+        // filtered `.rejl` sibling. The second pass's own `.rej` under
+        // `pass2/` (ruling R-T3-1) is a THIRD copy, but only when drizzle
+        // is there to read it (final fix wave,
+        // `GroupInput::second_pass_bitmaps`) — a standalone large-scale run
+        // writes two. Whichever feature asks for the first one, it is
+        // created once.
+        let drizzle_rej = i.drizzle.is_some_and(|(_, _, rej)| rej);
+        let bitmap_copies = match (drizzle_rej, i.large_scale) {
+            (true, true) => 3,
+            (false, true) => 2,
             (true, false) => 1,
             (false, false) => 0,
         };
@@ -1171,9 +1178,11 @@ mod tests {
     }
 
     /// M4c Task 3: large-scale rejection adds the same bitmap term with
-    /// drizzle off entirely (it needs the bitmaps itself), and TRIPLES it —
-    /// the first pass's `.rej`, its `.rejl` sibling and the second pass's
-    /// own set (fix round 1, ruling R-T3-1).
+    /// drizzle off entirely (it needs the bitmaps itself) and DOUBLES it —
+    /// the first pass's `.rej` plus its `.rejl` sibling. The second pass's
+    /// own set (fix round 1, ruling R-T3-1) is the third copy and rides
+    /// drizzle, its only reader, so it appears in the estimate only when
+    /// drizzle does (final fix wave).
     #[test]
     fn estimate_counts_the_large_scale_bitmaps_with_and_without_drizzle() {
         let groups = vec![group(ColorMode::Mono, 3, 10, 10)];
@@ -1193,8 +1202,9 @@ mod tests {
         });
         assert_eq!(
             large_scale_only,
-            base + 3 * 240,
-            "one .rej, one .rejl and one second-pass .rej per frame, with no drizzle at all"
+            base + 2 * 240,
+            "one .rej and one .rejl per frame, with no drizzle at all — and no \
+             second-pass set, which only drizzle reads"
         );
         let both = estimate_bytes(&EstimateInputs {
             groups: &groups,

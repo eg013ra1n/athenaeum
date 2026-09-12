@@ -919,6 +919,7 @@ fn main() {
         normalization: &normalization,
         ln: None,
         rej: None,
+        second_pass_bitmaps: false,
     };
 
     let band_throttle = Throttle::new(Duration::from_secs(2));

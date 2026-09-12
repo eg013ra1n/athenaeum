@@ -128,7 +128,7 @@ pub fn write_registered_frame(
     // Ruling R-T4-6c, made exit-path-proof in fix round 3: this frame's
     // displacement grid goes back when this function returns, however it
     // returns. Without the release at all, every registered frame's
-    // inverse grid (≈ 4.7 MB per direction at 6224×4168) stayed alive to
+    // inverse grid (≈ 4.5 MB per direction at 6224×4168) stayed alive to
     // the end of the run — 208 frames of it on the acceptance set, before
     // drizzle added a forward grid each. With it placed after the warp
     // loop instead, a plane-1 read failure on a 3-plane frame would leak
@@ -284,10 +284,10 @@ mod tests {
 
     /// Ruling R-T4-6c/d: when the writer has finished a frame, no grid of
     /// that frame's map is alive. Left behind, every registered frame's
-    /// inverse grid (≈ 8.6 MB at 6224×4168) survived to the end of the
-    /// run — 208 of them on the acceptance set, before drizzle added a
-    /// forward grid each; the run then thrashed a 16 GB machine for 2.7
-    /// hours.
+    /// inverse grid (≈ 4.5 MB per direction at 6224×4168) survived to
+    /// the end of the run — 208 of them on the acceptance set, before
+    /// drizzle added a forward grid each; the run then thrashed a 16 GB
+    /// machine for 2.7 hours.
     #[test]
     fn the_writer_releases_the_frames_grid_when_it_is_done() {
         let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();

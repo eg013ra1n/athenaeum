@@ -1180,7 +1180,7 @@ reference:     { mode: "auto", twoPass: true }
                 -- cached artifact.
 registration:  { geometry: "coRegistered",
                  model: "auto", distortion: "off",
-                 tpsSmoothing: 0.0, localDistortion: false,
+                 tpsSmoothing: 0.5, localDistortion: false,
                  interpolation: "bicubicBSpline",
                  clampingThreshold: 0.30, maxStars: 2000, ransacTolerancePx: 1.9,
                  ransacMaxIterations: 2000, maxRmsPx: 2.0, failOnMaxRms: false,
@@ -1194,8 +1194,10 @@ registration:  { geometry: "coRegistered",
                 -- measurement — §3.3). Read only by distortion: "tps". Clamped
                 -- to [0, 10] by resolve_config. The useful range grows with the
                 -- node count (≈ 0.01 for a few dozen nodes, roughly 10× that at
-                -- the 600-node cap); Task 7's acceptance run picks the shipped
-                -- default from real frames.
+                -- the 600-node cap). The shipped 0.5 is Task 7's measurement
+                -- (ruling R-T7-1): at the 600-node cap on real 26 Mpx frames the
+                -- hold-out rms was 0.145 / 0.203 px (mono / OSC) at λ = 0,
+                -- 0.099 / 0.156 at 0.5 and 0.102 / 0.165 at 2.
                 -- localDistortion (M4c, ruling R-M4c-7): the local distortion
                 -- loop (§3.3). A no-op with distortion: "off" — there is nothing
                 -- to refit. Both fields ride `registration_subtree`, so either

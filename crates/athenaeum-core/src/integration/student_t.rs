@@ -212,6 +212,20 @@ pub fn t_quantile(p: f64, nu: f64) -> f64 {
     if tail(hi) > p {
         // `p` is smaller than the tail at the far end of the bracket: the
         // true quantile is beyond it. Report the bracket end.
+        //
+        // Silent by design, and the analytic bound says why it is safe.
+        // The only caller is [`esd_critical`], whose
+        // `λ = t·(m−1) / sqrt((m−2+t²)·m)` (with `m = n−i ≥ 3`, its own
+        // guard) is monotone in `t` and SATURATING: as `t → ∞` it tends to
+        // `(m−1)/sqrt(m)`, largest in relative terms at the smallest
+        // stack, `m = 3` → `2/sqrt(3) ≈ 1.154700`. The cap IS reachable
+        // there — `n = 3, alpha = 0.001` asks for the `nu = 1` (Cauchy)
+        // quantile at `p = alpha/6`, whose true `t ≈ 1910` — and at
+        // `t = T_QUANTILE_MAX = 1e3` λ already reads 1.154699, i.e. within
+        // 6e-7 (the error falls as `1/(2t²)`), far under 1e-4 and far
+        // under anything a rejection decision can see. A caller that
+        // wanted `t` itself rather than a saturating function of it would
+        // need a real error here, not this.
         return hi;
     }
     for _ in 0..200 {

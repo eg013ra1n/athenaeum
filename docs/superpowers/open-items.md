@@ -198,8 +198,11 @@ on the reference loop with a zero-MAD fallback; large-scale rejection through
 processed `.rejl` bitmaps and a second integration pass with its own `pass2/` bitmap
 set; thin-plate-spline distortion with the local distortion loop; and LN's local-scale
 spline plus the barycentre second matching pass. **Tasks 0–5 are code-complete with
-green gates and clean reviews; the LDN 1272 acceptance re-run is Task 7 and has not
-run** — everything below is what that run has to weigh or what it inherits.
+green gates and clean reviews, and the LDN 1272 acceptance re-run (Task 7) RAN on
+2026-09-12 — `docs/superpowers/research/2026-09-12-m4c-acceptance-run.md`, runs 22–33,
+verdict "M4c is accepted"** (its own rulings and follow-ups are the Task 7 bullet near
+the end of this subsection). Everything below is what that run weighed, or what it
+left behind.
 
 - **Not re-measured (Task 0, minor m9):** the Measure stage's memory admission was
   sized for the peak detector; the structure path allocates its own map, blurred and
@@ -263,11 +266,16 @@ run** — everything below is what that run has to weigh or what it inherits.
   per-band release would rebuild every grid every band) and drizzle rebuilds a colour
   frame's forward grid once per plane (the plane loop is outer; ≈ +8 min on 160 OSC
   frames — swapping the nesting means restructuring the per-plane I/W accumulators);
-  doc drift left by the last fix round: the enum doc's "≈ 9 builds for a three-plane
-  run" against its own table's 8 (7 by default), five stale "8.6 MB per direction"
-  copies (`pixel_map.rs`, `writer.rs`), three comments made stale by R-T4-7
-  (`integrate.rs` ~1185, `registered_source.rs` ~99, `ln/reference.rs` ~9), and the
-  cost table ignores the large-scale second pass; `drizzle::band_source_window` costs a few
+  the doc drift the last fix round left is CLOSED by the final fix wave (the enum
+  doc's build count and its derived minutes, the five stale "8.6 MB per direction"
+  copies in `pixel_map.rs`/`writer.rs` → 4.5 MB, and the two comments R-T4-7 made
+  stale in `integrate.rs` ~1185 and `ln/reference.rs` ~9 — `registered_source.rs`
+  ~99 was never stale, it describes LN accurately); what that same enum's cost table
+  still ignores is the large-scale second pass; **LN could use `set_plane` the way
+  R-T4-7 wired integration** — `ln/mod.rs` ~405 opens a `RegisteredSource` per frame
+  PER PLANE inside its own plane loop, so an OSC frame builds three displacement
+  grids in the LN stage where one would do (2 of 3 builds per colour frame saved, the
+  same change integration already took); `drizzle::band_source_window` costs a few
   hundred exact probes × up to 600 nodes per band on a TPS map; **a TPS row's
   hold-out `rms_px` is not
   comparable with a polynomial row's in-sample `rms_px`**, and the frames table shows
@@ -293,11 +301,37 @@ run** — everything below is what that run has to weigh or what it inherits.
   with `background_grid` and `ln_probe`) lives in prose at three sites rather than in a
   shared helper. A comment in the noise-control test misattributes σ_z ≈ 0.03 to the
   `NOISE` level where `LOUD` is what produces it.
-- **Deferred (Task 0, comment-only):** `structure_map`'s comment says 0.56× where the
-  report and the adjacent test say 0.60× for the sensitivity-0.5 plane-anchored ratio;
-  the noise-comparison doc table's "all" row maximum (2.2443) exceeds every group
-  maximum (a typo carried from the report); and the "correlated noise" attribution
-  reads as fact where the evidence supports "consistent with".
+- **CLOSED (Task 0, comment-only, final fix wave):** `structure_map`'s 0.56× → 0.60×
+  for the sensitivity-0.5 plane-anchored ratio (the figure the adjacent pin states);
+  the noise-comparison doc table's `all` row now says its min/max ARE the group
+  extremes and names the source report's 2.2443 as the transcription typo it is; and
+  the "correlated noise" attribution is hedged to "consistent with", the evidence
+  being a ratio rather than a measurement of the correlation.
+- **Deferred (whole-branch review, recorded by the final fix wave, not fixed):**
+  - a TPS `transform_json` is ≈ 100 KB per frame (≈ 40 MB of `registration_results`
+    rows per 368-frame `tps` run), and with `writeRegisteredFrames` on it becomes an
+    `ATH_REGT` CONTINUE chain of ≈ 140 KB per registered frame —
+    `fits_writer/card.rs` puts no cap on a chain's length, and **no test round-trips a
+    TPS map through `build_registered_cards` → `FitsHeader::get_str`** (the existing
+    round-trip pin writes a plain `homography`, no distortion at all, so its
+    `transform_json` is one card), so that is an untested combination. Both
+    toggles default off, which is why it is a note and not a blocker.
+  - `ln::scale::fit_local_scale` dedupes its nodes by reference INDEX but has no
+    `align::dedupe_nodes` equivalent — no `TPS_MIN_NODE_SEPARATION_PX` separation
+    test — so two DISTINCT reference stars closer than 0.05 px would make the
+    Bookstein system singular and the whole local-scale surface is dropped with a
+    `warn!` instead of one node being removed. Honest, just more pessimistic than it
+    needs to be; never observed on real data (688/688 channel-frames fitted in the
+    acceptance run).
+  - `student_t::with_esd_lambdas` does one thread-local `RefCell` borrow plus a
+    SipHash `HashMap` lookup PER PIXEL STACK (≈ 26 M per plane). Correct and bounded,
+    but it is the first thing to look at if ESD ever reads slow; hoisting the
+    `(n, alpha)` slice per band would remove both.
+  - **PRE-EXISTING, outside this branch:** 85 references to another image-processing
+    application BY NAME across `src/` and `crates/` — including a serde wire token
+    (`FlatNormMode` in `src/types/models.ts` ~745 and its Rust source), which cannot
+    be renamed without a migration. A project-wide naming cleanup with its own cycle,
+    not an M4c item; M4c's own code names nothing.
 - **Owed (owner), after Task 7:** an own look at the acceptance masters and the desktop
   click-through of what M4c added to the tab — the Measure panel's `Seed detector`
   select (with the two peak-only controls disabled under `structure`), the Integrate
@@ -323,8 +357,16 @@ run** — everything below is what that run has to weigh or what it inherits.
     is the shoulder a per-pixel clip misses (pinned synthetically).
   - **TPS: ruling R-T7-1 sets `tpsSmoothing`'s default to 0.5** (hold-out rms 0.099 /
     0.156 px vs 0.145 / 0.203 at λ = 0; 5.6 % of frames reach the 3-round cap at 0.5) —
-    the final fix wave changes the default (the registration hash moves for `tps` sets
-    only). A TPS run costs ≈ +25 % wall (49 vs 40 min) from the per-stage grid
+    the final fix wave changed the default. It does NOT move "the registration hash for
+    `tps` sets only", as this bullet first claimed: `registration_subtree` serializes
+    `cfg.registration` whole (no `skip_serializing_if`), so `tpsSmoothing` is in every
+    set's registration hash whatever the distortion — the pin
+    `the_tps_fields_move_the_registration_stage_hash` shows it under `distortion: off`.
+    A default-VALUE change alters only documents that OMIT the field (a stored
+    `"tpsSmoothing": 0.0` stays 0.0 — serde's default fills a missing field only), and
+    the hash consequence was already absorbed when M4c added the field: every set
+    re-registers once on the first M4c run, as CLAUDE.md says. A TPS run costs ≈ +25 %
+    wall (49 vs 40 min) from the per-stage grid
     rebuilds; drizzle still rebuilds a colour frame's forward grid once per plane
     (≈ +8 min on 160 OSC frames — the plane loop is outer); integration holds one
     inverse grid per frame for a whole group (≈ 0.9 GB at 208 frames). No measurable

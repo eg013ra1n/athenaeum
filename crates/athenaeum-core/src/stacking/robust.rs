@@ -502,10 +502,20 @@ mod tests {
         let limit = 0.5;
         let mut scratch: Vec<f32> = Vec::new();
         for seed in 0..50u64 {
-            // A clean Gaussian plus four distinct planted outliers. The
-            // values come from an f32 buffer, so the f64 sample this module
-            // takes and the f32 sample the pixel path takes are the same
-            // number — any disagreement is the algorithm, not the width.
+            // A clean Gaussian plus four distinct planted outliers.
+            //
+            // The two paths do NOT see the same numbers: `values` is
+            // `Vec<f64>` and neither the Gaussian draws nor
+            // `6.0 + 0.5·k + 0.01·seed` is f32-exact, so the pixel path's
+            // `v as f32` rounds every sample. What makes the comparison
+            // sound is that RCR's SURVIVOR SET is robust to that rounding
+            // on these samples — the outliers sit whole units clear of the
+            // clean population's spread and the survivors are nowhere near
+            // the rejection boundary, so a ULP of f32 rounding cannot move
+            // a sample across it. A disagreement here is therefore the
+            // algorithm drifting apart, not the width; a fixture whose
+            // samples crowded the boundary would need matched widths
+            // instead.
             let mut values = gaussian(60, 1000 + seed);
             for k in 0..4 {
                 values.push(6.0 + 0.5 * k as f64 + 0.01 * seed as f64);
