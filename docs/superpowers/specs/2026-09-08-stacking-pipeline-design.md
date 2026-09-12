@@ -188,18 +188,46 @@ does. Nodes are capped at `TPS_MAX_NODES = 600` and chosen grid-stratified
 over a 30×20 cell grid (best-σ pair per occupied cell first, then round-robin);
 a frame with fewer than `4 · MIN_INLIERS = 32` refit inliers keeps the linear
 model with a warning, since a local model fitted on a handful of stars says
-nothing about the rest of the frame. `distortion: auto` never resolves to the
-spline — it is always a deliberate choice. Pixel work never evaluates the
-spline (600 logarithms per pixel per direction): `PixelMap`'s distortion is an
-explicitly tagged enum (`{"kind": "polynomial" | "tps", …}`, an untagged
-`transform_json` — every row written before M4c — decoding as polynomial), and
-its `tps` arm samples both splines onto a `TPS_GRID_PX = 8` px grid over the
-fitted domain, cached in memory on first use and never serialized. `λ` is the
-weight of the `λ · wᵀw` penalty in px² of the normalized frame; its useful
-range grows with the node count (≈ 0.01 for a few dozen nodes, roughly an
-order of magnitude higher at the cap), and the shipped default is `0.0` — the
-interpolating spline — until Task 7's acceptance run picks one from real
-frames.
+nothing about the rest of the frame. Coincident nodes are dropped first
+(`TPS_MIN_NODE_SEPARATION_PX = 0.05` px in either direction's node positions):
+the correspondence search gives every subject star its own nearest reference
+star independently, so two subject stars can pair to ONE reference star, and
+the inverse spline's node set would then carry that position twice — an
+exactly singular system that sinks the whole fit. `distortion: auto` never
+resolves to the spline — it is always a deliberate choice.
+
+**Pixel work and everything else are separate paths** (ruling R-T4-3).
+Evaluating a spline costs one logarithm per node per query, so a 26 Mpx frame
+cannot go through it: `PixelMap`'s distortion is an explicitly tagged enum
+(`{"kind": "polynomial" | "tps", …}`, an untagged `transform_json` — every row
+written before M4c — decoding as polynomial), and its `tps` arm samples the
+spline onto a `TPS_GRID_PX = 8` px grid over the fitted domain, **one grid per
+direction, each built lazily only when that direction is first asked for
+through the pixel path** (the resampler only ever asks `inverse`, drizzle only
+`forward`), **shared behind an `Arc` so the several clones of a registered
+frame's map that run state holds are one allocation, not several**. Everything
+that evaluates a map a few hundred times instead of a few million —
+registration's residual statistics, star re-pairing, a coverage probe, a band's
+source window in the other direction — calls `forward_exact` / `inverse_exact`
+and builds nothing.
+
+**A spline's reported RMS is a hold-out measurement** (ruling R-T4-4). At the
+default `λ = 0` the spline interpolates its own nodes, so measuring
+`registration_results.rms_residual_px` there would report a solver artefact and
+leave `maxRmsPx` / `failOnMaxRms` structurally unable to refuse a TPS frame.
+Instead: when the node cap left inliers out, those inliers are the hold-out and
+the shipped model is measured on them; when every inlier is a node, one in five
+is held back, a second spline is fitted on the rest, and ITS error on the
+held-out ones is reported — while the shipped model is still the one fitted on
+all of them. The number is therefore not comparable with the polynomial arm's
+in-sample RMS, and nothing in the pipeline compares them.
+
+`λ` is the weight of the `λ · wᵀw` penalty in px² of the normalized frame; its
+useful range grows with the node count (≈ 0.01 for a few dozen nodes, roughly an
+order of magnitude higher at the cap), it is clamped to `[0, 10]` by
+`resolve_config` like every other numeric config field, and the shipped default
+is `0.0` — the interpolating spline — until Task 7's acceptance run picks one
+from real frames.
 
 **Local distortion correction loop (M4c, ruling R-M4c-7).** With
 `registration.localDistortion` on and any distortion model selected, up to
@@ -209,16 +237,27 @@ the current map (linear part and distortion together) at tolerance
 the map still gets wrong (predicted reference position → actual reference
 position); stop once `‖H_c − I‖_F < LOCAL_DISTORTION_STOP = 1e-3`; otherwise
 compose `H_c` into the linear part and refit the distortion around it. A round
-is KEPT only when it does not raise the RMS — our guard, not the ruling's,
-because a round changes both the model and the pair set it is measured over.
-`Alignment.local_rounds` counts the rounds that ran (`refit_rounds` keeps its
-own meaning: the σ-clip rounds inside one `refit_weighted` call). On
-well-conditioned data the corrector converges on the FIRST round for a
-structural reason worth recording: the refit has already least-squares-fitted
-the linear part over these pairs and `Distortion::fit_joint` has already folded
+is KEPT only when it does not raise the RMS **measured on ONE COMMON pair set —
+the incumbent's own inliers** (ruling R-T4-5; comparing each model on its own
+inlier set would let a round whose corrector kept an easier subset look better
+while being worse on the population the incumbent was judged on). A round that
+cannot deliver the distortion the frame asked for is refused rather than
+shipped as a silent downgrade. `Alignment.local_rounds` counts the rounds whose
+corrector was actually fitted — a converged round included (R-T4-1/2);
+`refit_rounds` keeps its own meaning, the σ-clip rounds inside one
+`refit_weighted` call. After a kept round `pairs` and `inlier_ratio` are
+reported against that round's own widened pairing.
+
+The loop earns its keep exactly where the first pairing was partial. Measured
+on the synthetic 1.5 px checkerboard field: the first map is fitted on 415 of
+450 pairs — the σ-clip refit drops the legitimate stars in the deepest lobes —
+re-pairing through that map recovers all 450, the corrector on the 35 it was
+never fitted on is far from the identity, and the round is kept. Where the first
+map already saw the whole field the corrector converges on the FIRST round, for
+a structural reason worth recording: the refit has already least-squares-fitted
+the linear part over those pairs and `Distortion::fit_joint` has already folded
 the residual's affine term back into it, so what is left is orthogonal to what
-a homography can represent. The loop is therefore a safety net for maps whose
-first pairing was partial, which is a real-frame situation.
+a homography can represent. Implementation: `register/local_loop.rs`.
 
 ### 3.4 Output geometry and coverage
 
@@ -1104,10 +1143,12 @@ registration:  { geometry: "coRegistered",
                 -- orders and "auto" (§3.3). `auto` never resolves to it.
                 -- tpsSmoothing (M4c, ruling R-M4c-5): the spline's λ, in px² of
                 -- the normalized frame. 0.0 = interpolating, which lands every
-                -- inlier exactly. Read only by distortion: "tps". The useful
-                -- range grows with the node count (≈ 0.01 for a few dozen nodes,
-                -- roughly 10× that at the 600-node cap); Task 7's acceptance run
-                -- picks the shipped default from real frames.
+                -- inlier exactly (and makes the reported RMS a hold-out
+                -- measurement — §3.3). Read only by distortion: "tps". Clamped
+                -- to [0, 10] by resolve_config. The useful range grows with the
+                -- node count (≈ 0.01 for a few dozen nodes, roughly 10× that at
+                -- the 600-node cap); Task 7's acceptance run picks the shipped
+                -- default from real frames.
                 -- localDistortion (M4c, ruling R-M4c-7): the local distortion
                 -- loop (§3.3). A no-op with distortion: "off" — there is nothing
                 -- to refit. Both fields ride `registration_subtree`, so either

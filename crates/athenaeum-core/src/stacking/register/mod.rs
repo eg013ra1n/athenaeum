@@ -9,6 +9,7 @@
 pub mod align;
 pub mod detect;
 pub mod frame;
+pub mod local_loop;
 pub mod wcs_seed;
 pub mod writer;
 

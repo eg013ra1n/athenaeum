@@ -682,7 +682,12 @@ fn band_source_window(
     let mut visit = |ox: f64, oy: f64| {
         let rx = geom::to_reference(ox, scale);
         let ry = geom::to_reference(oy, scale);
-        let (sx, sy) = map.inverse(rx, ry);
+        // A few hundred probes per band, and in the OPPOSITE direction
+        // from the deposit that follows (which only ever asks `forward`).
+        // Through the grid path this would build the whole INVERSE
+        // displacement grid for a direction drizzle never uses again —
+        // ruling R-T4-3a/c.
+        let (sx, sy) = map.inverse_exact(rx, ry);
         if sx.is_finite() && sy.is_finite() {
             sx_lo = sx_lo.min(sx);
             sx_hi = sx_hi.max(sx);

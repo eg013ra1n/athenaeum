@@ -566,14 +566,20 @@ mod tests {
 
         let (exact_node, smooth_node) = (node_rms(&exact), node_rms(&smooth));
         let (exact_off, smooth_off) = (off_rms(&exact), off_rms(&smooth));
+        // STRICT on both sides (fix round 1, finding I4): a non-strict
+        // pair of `>=` / `<=` would pass an implementation that ignored
+        // `smoothing` entirely, which is precisely the thing this test
+        // exists to catch. The measured margins are wide — node RMS
+        // 0 → 0.031 px, off-node RMS 0.094 → 0.058 px — so the
+        // strictness costs nothing in robustness.
         assert!(
-            smooth_node >= exact_node,
-            "the smoothed fit must not beat the interpolant AT its nodes: \
-             {smooth_node} vs {exact_node}"
+            smooth_node > exact_node,
+            "the smoothed fit must pay AT its nodes (measured 0.031 vs 0.000): \
+             {smooth_node} vs {exact_node} — λ = {SMOOTHING} ignored?"
         );
         assert!(
-            smooth_off <= exact_off,
-            "the smoothed fit must not be worse OFF the nodes: \
+            smooth_off < exact_off,
+            "…and must earn it OFF them (measured 0.058 vs 0.094): \
              {smooth_off} vs {exact_off} (λ = {SMOOTHING})"
         );
     }

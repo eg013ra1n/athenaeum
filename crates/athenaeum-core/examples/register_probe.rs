@@ -130,7 +130,7 @@ fn corner_delta(
     ];
     let mut worst = 0.0f64;
     for (x, y) in pts {
-        let (ox, oy) = map.inverse(x, y);
+        let (ox, oy) = map.inverse_exact(x, y);
         let (ty, oy_t) = if flip {
             (h - 1.0 - y, sub_h as f64 - 1.0 - oy)
         } else {
@@ -157,7 +157,7 @@ fn star_delta(
     let mut d: Vec<f64> = stars
         .iter()
         .filter_map(|s| {
-            let (ox, oy) = map.inverse(s.x, s.y);
+            let (ox, oy) = map.inverse_exact(s.x, s.y);
             let (px, py) = apply3(theirs, s.x, s.y);
             (inside(ox, oy) && inside(px, py))
                 .then(|| ((px - ox).powi(2) + (py - oy).powi(2)).sqrt())

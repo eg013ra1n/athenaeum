@@ -8,16 +8,18 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use solvemyastro::quad::{build_quads, fit_affine, group_size_for, match_quads};
-use tracing::debug;
-
 use super::detect::Star;
 use super::wcs_seed::seed_radius_px;
+use super::local_loop;
 use super::{DistortionChoice, ModelChoice, RegistrationConfig, SCALE_TOLERANCE};
+// One import path for everything `geometry` re-exports at its root (fix
+// round 1, minor 10); `DOMAIN_MARGIN` is the one item that lives only in
+// its own module.
 use crate::geometry::polynomial::DOMAIN_MARGIN;
-use crate::geometry::tps::{select_nodes, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES};
 use crate::geometry::{
-    ransac_fit, refit_weighted, Distortion, DistortionModel, KdTree2, Linear, LinearKind, Pair,
-    PixelMap, RansacConfig, RansacResult, RefitResult,
+    ransac_fit, refit_weighted, select_nodes, Distortion, DistortionModel, KdTree2, Linear,
+    LinearKind, Pair, PixelMap, RansacConfig, RansacResult, RefitResult, ThinPlateSpline,
+    TPS_MAX_NODES, TPS_MIN_NODES,
 };
 
 /// Quad-ratio tolerance of the seed matcher (the plate solver's default).
@@ -59,14 +61,6 @@ pub const DISTORTION_ROUNDS: usize = 2;
 /// stance [`min_pairs_for`] takes for the polynomial arm, at the scale a
 /// LOCAL model needs.
 pub const TPS_MIN_INLIERS: usize = 4 * MIN_INLIERS;
-/// Rounds of the local distortion loop (ruling R-M4c-7).
-pub const LOCAL_DISTORTION_ROUNDS: usize = 3;
-/// The loop stops once the corrector homography is this close to the
-/// identity in Frobenius norm (ruling R-M4c-7). The translation entries
-/// are in pixels, so this is a sub-milli-pixel correction: in practice
-/// the loop is bounded by [`LOCAL_DISTORTION_ROUNDS`], and the threshold
-/// is what stops it early when a round has genuinely nothing left to fix.
-pub const LOCAL_DISTORTION_STOP: f64 = 1e-3;
 
 /// What a frame's distortion layer actually turned out to be — the third
 /// state `Option<u8>` could not carry once M4c added a model with no
@@ -201,7 +195,11 @@ pub struct Alignment {
     /// Quad matches behind a [`SeedKind::Quads`] seed; 0 for a WCS seed,
     /// which pairs nothing to arrive at its transform.
     pub seed_matches: usize,
-    /// Correspondences in the final pairing (the seed's, or the re-paired set).
+    /// Correspondences in the final pairing (the seed's, the step-4b
+    /// re-paired set, or — after a KEPT local distortion round (M4c) —
+    /// that round's own widened pairing, since that is the population
+    /// [`Alignment::inliers`] and [`Alignment::inlier_ratio`] came out
+    /// of).
     pub pairs: usize,
     /// Growth of the correspondence count from the re-pairing pass through
     /// the refit model (0 when the seed already paired the field, or when
@@ -223,10 +221,19 @@ pub struct Alignment {
     pub regularity: f64,
     pub ransac_iterations: usize,
     pub refit_rounds: usize,
-    /// Rounds of the local distortion loop that actually ran (M4c, ruling
-    /// R-M4c-7); 0 when `registration.localDistortion` is off, which is
-    /// the default. Kept separate from [`Alignment::refit_rounds`], which
-    /// has always meant the σ-clip rounds inside one
+    /// Rounds of the local distortion loop whose corrector was actually
+    /// FITTED (M4c, ruling R-M4c-7; semantics settled by R-T4-2): the
+    /// round's re-pairing produced at least [`MIN_INLIERS`]
+    /// correspondences AND its corrector's RANSAC succeeded. A round that
+    /// then CONVERGED counts — it did the work and found nothing left to
+    /// fix; a round the pairing or the RANSAC ended before a corrector
+    /// existed does not. Bounded by
+    /// [`super::local_loop::LOCAL_DISTORTION_ROUNDS`]; 0 when
+    /// `registration.localDistortion` is off, which is the default, and 0
+    /// when there is no distortion layer for the loop to refit.
+    ///
+    /// Kept separate from [`Alignment::refit_rounds`], which has always
+    /// meant the σ-clip rounds inside one
     /// [`crate::geometry::refit_weighted`] call (≤ 5) — one number cannot
     /// honestly be both.
     pub local_rounds: usize,
@@ -334,12 +341,19 @@ fn seed_affine(
     ))
 }
 
-fn residual_stats(map: &PixelMap, pairs: &[Pair]) -> (f64, f64, (f64, f64)) {
+/// RMS, residual σ and peak |Δx|/|Δy| of `pairs` through `map`.
+///
+/// Evaluated through the EXACT distortion (ruling R-T4-3a): this is a few
+/// hundred stars, so the grid path would build a half-million-sample
+/// displacement grid to answer them — three orders of magnitude more
+/// spline evaluations than doing it directly, once per registered frame,
+/// and for a direction the pixel work may never ask about.
+pub(super) fn residual_stats(map: &PixelMap, pairs: &[Pair]) -> Residuals {
     let mut sum2 = 0.0;
     let mut sum = 0.0;
     let (mut px, mut py) = (0.0f64, 0.0f64);
     for &((sx, sy), (rx, ry)) in pairs {
-        let (fx, fy) = map.forward(sx, sy);
+        let (fx, fy) = map.forward_exact(sx, sy);
         let (dx, dy) = (fx - rx, fy - ry);
         let d = (dx * dx + dy * dy).sqrt();
         sum2 += d * d;
@@ -355,10 +369,10 @@ fn residual_stats(map: &PixelMap, pairs: &[Pair]) -> (f64, f64, (f64, f64)) {
 }
 
 /// One set of correspondences with the per-pair centroid σ.
-struct Pairing {
-    pairs: Vec<Pair>,
-    sigmas: Vec<(f64, f64)>,
-    all_sigmas: bool,
+pub(super) struct Pairing {
+    pub pairs: Vec<Pair>,
+    pub sigmas: Vec<(f64, f64)>,
+    pub all_sigmas: bool,
 }
 
 /// Correspondences through `model`: every subject star's nearest reference
@@ -377,7 +391,7 @@ fn pair_through(
 /// [`pair_through`] with the projection supplied: the local distortion
 /// loop (ruling R-M4c-7) re-pairs through the whole current MAP, linear
 /// part and distortion together, not just a linear model.
-fn pair_projected(
+pub(super) fn pair_projected(
     project: &dyn Fn(f64, f64) -> (f64, f64),
     subject: &[Star],
     reference: &[Star],
@@ -538,14 +552,137 @@ fn fit_distortion(
 /// Unlike the polynomial arm this does NOT rebalance the linear part:
 /// the spline's own affine block absorbs any residual affine term, so
 /// there is nothing to fold back out.
+///
+/// The returned [`TpsOutcome`] carries the honest QA triple demanded by
+/// ruling R-T4-4 — see the body.
 fn fit_tps(
     linear: &Linear,
     pairs: &[Pair],
     sigmas: Option<&[(f64, f64)]>,
     frame: (f64, f64),
     smoothing: f64,
+) -> Option<TpsOutcome> {
+    let (idx, coincident) =
+        dedupe_nodes(linear, pairs, select_nodes(pairs, sigmas, frame, TPS_MAX_NODES));
+    if idx.len() < TPS_MIN_NODES {
+        return None;
+    }
+    let model = fit_tps_on(linear, pairs, &idx, smoothing)?;
+
+    // Honest QA (ruling R-T4-4). An interpolating spline lands every one
+    // of its own nodes by construction, so measuring the reported RMS
+    // there says nothing about the model and leaves `maxRmsPx` unable to
+    // fail a TPS frame at all. Measure on inliers the SHIPPED spline's
+    // fit did not see.
+    let mut notes = Vec::new();
+    // The node cap (or a cell-stratified pick that could not use every
+    // pair) leaves inliers out: they are the natural hold-out, and the
+    // model measured on them is the one being shipped. Coincident pairs
+    // are NOT hold-out candidates — see `dedupe_nodes`.
+    let node_set: std::collections::HashSet<usize> = idx.iter().copied().collect();
+    let held: Vec<usize> = (0..pairs.len())
+        .filter(|i| !node_set.contains(i) && !coincident.contains(i))
+        .collect();
+    let qa = if !held.is_empty() {
+        let held_pairs: Vec<Pair> = held.iter().map(|&i| pairs[i]).collect();
+        PixelMap::with_distortion_model(*linear, model.clone())
+            .map(|m| residual_stats(&m, &held_pairs))
+    } else {
+        // Every inlier IS a node: hold `TPS_HOLDOUT_STRIDE`-th of them
+        // back, fit a spline on the rest, and report ITS error on the
+        // held-out ones. The node order `select_nodes` returns is
+        // cell-major round-robin, so a fixed stride over it is spread
+        // across the frame rather than clustered.
+        let holdout: Vec<usize> = idx.iter().copied().step_by(TPS_HOLDOUT_STRIDE).collect();
+        let fitted: Vec<usize> = idx
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| k % TPS_HOLDOUT_STRIDE != 0)
+            .map(|(_, &i)| i)
+            .collect();
+        let held_pairs: Vec<Pair> = holdout.iter().map(|&i| pairs[i]).collect();
+        fit_tps_on(linear, pairs, &fitted, smoothing)
+            .and_then(|m| PixelMap::with_distortion_model(*linear, m))
+            .map(|m| residual_stats(&m, &held_pairs))
+    };
+    if qa.is_none() {
+        notes.push(
+            "tps hold-out fit failed; the reported RMS is measured at the spline's own nodes"
+                .to_string(),
+        );
+    }
+    Some(TpsOutcome { model, qa, notes })
+}
+
+/// Two nodes closer together than this — in EITHER direction's node
+/// positions, which are `L(sub)` and `ref` — are one node as far as the
+/// spline is concerned, and only the first is kept.
+///
+/// This is not a nicety. `pair_through` gives every subject star its own
+/// nearest reference star, independently, so TWO subject stars can pair
+/// to ONE reference star; RANSAC and the refit have no reason to drop
+/// either. Both survive into the node list, the inverse spline's node set
+/// then carries that reference position twice, and Bookstein's system is
+/// EXACTLY singular — the whole spline fails and the frame silently falls
+/// back to its linear model. Measured on the synthetic 450-star field: it
+/// happens on roughly one seed in three.
+///
+/// 0.05 px is safe in both directions: no detector resolves two stars
+/// that close as two objects, so a pair this near another is the same
+/// star, never a distinct one being thrown away. It also keeps the solve
+/// away from the ill-conditioned regime a near-duplicate produces.
+pub const TPS_MIN_NODE_SEPARATION_PX: f64 = 0.05;
+
+/// Splits `idx` into the nodes to fit on and the ones dropped for
+/// coinciding with an earlier node (see
+/// [`TPS_MIN_NODE_SEPARATION_PX`]), preserving `idx`'s order — so the
+/// grid-stratified priority [`select_nodes`] established survives, and
+/// the pair a cell picked first is the pair a cell keeps.
+///
+/// The dropped list matters beyond the fit: a dropped pair sits at (as
+/// good as) the same position as a node, so it is NOT a hold-out
+/// candidate for the QA measurement — measuring there would measure the
+/// correspondence's own ambiguity (two subject stars, one reference star)
+/// and blame it on the model.
+fn dedupe_nodes(
+    linear: &Linear,
+    pairs: &[Pair],
+    idx: Vec<usize>,
+) -> (Vec<usize>, std::collections::HashSet<usize>) {
+    let eps2 = TPS_MIN_NODE_SEPARATION_PX * TPS_MIN_NODE_SEPARATION_PX;
+    let mut kept: Vec<usize> = Vec::with_capacity(idx.len());
+    let mut dropped = std::collections::HashSet::new();
+    let mut positions: Vec<((f64, f64), (f64, f64))> = Vec::with_capacity(idx.len());
+    for i in idx {
+        let ((sx, sy), r) = pairs[i];
+        let f = linear.apply(sx, sy);
+        let clash = positions.iter().any(|&(pf, pr)| {
+            let (dfx, dfy) = (f.0 - pf.0, f.1 - pf.1);
+            let (drx, dry) = (r.0 - pr.0, r.1 - pr.1);
+            dfx * dfx + dfy * dfy < eps2 || drx * drx + dry * dry < eps2
+        });
+        if clash {
+            dropped.insert(i);
+        } else {
+            kept.push(i);
+            positions.push((f, r));
+        }
+    }
+    (kept, dropped)
+}
+
+/// One spline pair over the node subset `idx` of `pairs`, around
+/// `linear`. Both [`fit_tps`]'s shipped model and its hold-out model come
+/// through here, so the two cannot drift apart.
+///
+/// `idx` is assumed already de-duplicated by [`dedupe_nodes`]; a
+/// coincident pair in it makes the solve singular and the fit `None`.
+fn fit_tps_on(
+    linear: &Linear,
+    pairs: &[Pair],
+    idx: &[usize],
+    smoothing: f64,
 ) -> Option<DistortionModel> {
-    let idx = select_nodes(pairs, sigmas, frame, TPS_MAX_NODES);
     if idx.len() < TPS_MIN_NODES {
         return None;
     }
@@ -555,7 +692,7 @@ fn fit_tps(
     let mut inv_nodes = Vec::with_capacity(idx.len());
     let mut inv_dx = Vec::with_capacity(idx.len());
     let mut inv_dy = Vec::with_capacity(idx.len());
-    for &i in &idx {
+    for &i in idx {
         let ((sx, sy), (rx, ry)) = pairs[i];
         let (px, py) = linear.apply(sx, sy);
         fwd_nodes.push((px, py));
@@ -590,33 +727,6 @@ fn tps_domain(forward: &ThinPlateSpline, inverse: &ThinPlateSpline) -> [f64; 4] 
     [b[0] - mx, b[1] - my, b[2] + mx, b[3] + my]
 }
 
-/// `‖H − I‖_F`, the local distortion loop's convergence measure (ruling
-/// R-M4c-7). The translation column is in pixels, the rest is
-/// dimensionless; the norm mixes them deliberately — a corrector that
-/// shifts nothing AND rotates nothing is what "converged" means.
-fn corrector_norm(h: &Linear) -> f64 {
-    let mut sum = 0.0;
-    for i in 0..3 {
-        for j in 0..3 {
-            let identity = if i == j { 1.0 } else { 0.0 };
-            let d = h.m[i][j] - identity;
-            sum += d * d;
-        }
-    }
-    sum.sqrt()
-}
-
-/// `a · b` for the 3×3 homogeneous matrices.
-fn compose(a: &Linear, b: &Linear) -> Linear {
-    let mut m = [[0.0f64; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            m[i][j] = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] + a.m[i][2] * b.m[2][j];
-        }
-    }
-    Linear { kind: b.kind, m }
-}
-
 /// σ-derived least-squares weights for the distortion fits: `1 / (σx² +
 /// σy² + ε)`, or `None` when any pair lacks a centroid σ.
 fn distortion_weights(sigmas: Option<&[(f64, f64)]>) -> Option<Vec<f64>> {
@@ -627,28 +737,65 @@ fn distortion_weights(sigmas: Option<&[(f64, f64)]>) -> Option<Vec<f64>> {
     })
 }
 
+/// The residual triple [`residual_stats`] reports: `(rms, σ, (peak_x,
+/// peak_y))`, all in pixels.
+pub(super) type Residuals = (f64, f64, (f64, f64));
+
+/// What [`fit_tps`] produces: the shipped spline pair, the honest QA
+/// triple (ruling R-T4-4) and any notes.
+struct TpsOutcome {
+    model: DistortionModel,
+    /// Residuals on inliers the shipped spline's fit did NOT see. `None`
+    /// only when the hold-out fit itself failed, which the notes say.
+    qa: Option<Residuals>,
+    notes: Vec<String>,
+}
+
+/// Every inlier a node? Then one in [`TPS_HOLDOUT_STRIDE`] of them is
+/// held back from a second fit, and THAT fit's error on them is what the
+/// frame reports (ruling R-T4-4). 5 = the ruling's 80/20 split.
+pub const TPS_HOLDOUT_STRIDE: usize = 5;
+
+/// One distortion fit's result, as step 5 and the local distortion loop
+/// both need it.
+pub(super) struct MapFit {
+    pub map: PixelMap,
+    /// The linear part — the joint polynomial fit rebalances it, the
+    /// spline arm leaves it alone.
+    pub linear: Linear,
+    /// What was actually fitted, which is NOT always what was asked for:
+    /// too few inliers or a fit that would not converge degrade to the
+    /// linear model, with the reason in `notes`.
+    pub fit: DistortionFit,
+    /// Residuals measured on pairs the fit did not see — `Some` only for
+    /// the spline arm, which interpolates its own nodes and would
+    /// otherwise report a residual of zero (ruling R-T4-4). `None` means
+    /// "measure through the map itself", which is honest for every model
+    /// that does not interpolate.
+    pub qa: Option<Residuals>,
+    pub notes: Vec<String>,
+}
+
 /// Step 5 as a function, so the local distortion loop can re-run it
-/// around a corrected linear model. Returns the map, the (possibly
-/// rebalanced) linear part, what was actually fitted, and any notes for
-/// the frame's warnings — a distortion the inlier count or the solver
-/// refuses is a NOTE plus the linear model, never a failure.
-#[allow(clippy::too_many_arguments)]
-fn build_map(
+/// around a corrected linear model. A distortion the inlier count or the
+/// solver refuses is a NOTE plus the linear model, never a failure.
+pub(super) fn build_map(
     plan: DistortionFit,
     linear: Linear,
     inlier_pairs: &[Pair],
     sigmas: Option<&[(f64, f64)]>,
     reference_geometry: (usize, usize),
     tps_smoothing: f64,
-) -> Result<(PixelMap, Linear, DistortionFit, Vec<String>), AlignError> {
+) -> Result<MapFit, AlignError> {
     let mut notes = Vec::new();
-    let linear_only = |notes: Vec<String>| -> Result<_, AlignError> {
-        Ok((
-            PixelMap::linear(linear).ok_or(AlignError::Degenerate)?,
+    let linear_only = |notes: Vec<String>| -> Result<MapFit, AlignError> {
+        Ok(MapFit {
+            map: PixelMap::linear(linear).ok_or(AlignError::Degenerate)?,
             linear,
-            DistortionFit::None,
+            fit: DistortionFit::None,
+            qa: None,
             notes,
-        ))
+        })
     };
     match plan {
         DistortionFit::None => linear_only(notes),
@@ -667,16 +814,15 @@ fn build_map(
             );
             let norm = reference_geometry.0.max(reference_geometry.1) as f64 / 2.0;
             let weights = distortion_weights(sigmas);
-            match fit_distortion(
-                o,
-                linear,
-                inlier_pairs,
-                weights.as_deref(),
-                center,
-                norm,
-            ) {
+            match fit_distortion(o, linear, inlier_pairs, weights.as_deref(), center, norm) {
                 Some((lin, d)) => match PixelMap::with_distortion(lin, d) {
-                    Some(m) => Ok((m, lin, DistortionFit::Polynomial(o), notes)),
+                    Some(map) => Ok(MapFit {
+                        map,
+                        linear: lin,
+                        fit: DistortionFit::Polynomial(o),
+                        qa: None,
+                        notes,
+                    }),
                     None => Err(AlignError::Degenerate),
                 },
                 None => {
@@ -697,8 +843,17 @@ fn build_map(
         DistortionFit::Tps => {
             let frame = (reference_geometry.0 as f64, reference_geometry.1 as f64);
             match fit_tps(&linear, inlier_pairs, sigmas, frame, tps_smoothing) {
-                Some(model) => match PixelMap::with_distortion_model(linear, model) {
-                    Some(m) => Ok((m, linear, DistortionFit::Tps, notes)),
+                Some(outcome) => match PixelMap::with_distortion_model(linear, outcome.model) {
+                    Some(map) => {
+                        notes.extend(outcome.notes);
+                        Ok(MapFit {
+                            map,
+                            linear,
+                            fit: DistortionFit::Tps,
+                            qa: outcome.qa,
+                            notes,
+                        })
+                    }
                     None => Err(AlignError::Degenerate),
                 },
                 None => {
@@ -923,12 +1078,12 @@ pub fn align(
     }
 
     // 5. Optional distortion on the refit inliers.
-    let mut inlier_pairs: Vec<Pair> = refit.inliers.iter().map(|&i| pairs[i]).collect();
+    let inlier_pairs: Vec<Pair> = refit.inliers.iter().map(|&i| pairs[i]).collect();
     let inlier_sigmas: Option<Vec<(f64, f64)>> =
         all_sigmas.then(|| refit.inliers.iter().map(|&i| sigmas[i]).collect());
     // The pairing the reported inlier RATIO is taken against. The local
     // distortion loop re-pairs, so a kept round moves this too.
-    let mut pairs_len = pairs.len();
+    let pairs_len = pairs.len();
     let cross_geometry = subject_geometry != reference_geometry;
     let wanted = match cfg.distortion {
         DistortionChoice::Auto => {
@@ -952,7 +1107,7 @@ pub fn align(
             .order()
             .map_or(DistortionFit::None, DistortionFit::Polynomial),
     };
-    let (mut map, mut linear, mut distortion, notes) = build_map(
+    let fitted = build_map(
         wanted,
         linear,
         &inlier_pairs,
@@ -960,120 +1115,44 @@ pub fn align(
         reference_geometry,
         cfg.tps_smoothing,
     )?;
-    warnings.extend(notes);
+    warnings.extend(fitted.notes.clone());
 
-    // 5b. The local distortion loop (ruling R-M4c-7), off by default and a
-    // no-op without a distortion layer to refit. Each round re-pairs every
-    // subject star THROUGH the current map (not just its linear part) at a
-    // widening tolerance, RANSACs a corrector homography on what the map
-    // still gets wrong — predicted reference position → actual reference
-    // position — and, unless that corrector is already the identity,
-    // composes it into the linear part and refits the distortion around it.
-    //
-    // A round is KEPT only when it does not raise the RMS. That guard is
-    // ours, not the ruling's: a round changes both the model AND the pair
-    // set it is measured over, so without it a wider tolerance that swept
-    // in a few bad correspondences could ship a worse map than the one it
-    // started from. `local_rounds` counts rounds RUN, kept or not.
-    let mut local_rounds = 0usize;
-    if cfg.local_distortion && distortion.is_some() {
-        let (mut best_rms, _, _) = residual_stats(&map, &inlier_pairs);
-        for round in 0..LOCAL_DISTORTION_ROUNDS {
-            let tolerance = cfg.ransac_tolerance_px * (1.0 + round as f64);
-            let again = pair_projected(
-                &|x, y| map.forward(x, y),
-                subject,
-                reference,
-                &tree,
-                tolerance,
-            );
-            if again.pairs.len() < MIN_INLIERS {
-                break;
-            }
-            let residual_pairs: Vec<Pair> = again
-                .pairs
-                .iter()
-                .map(|&((sx, sy), r)| (map.forward(sx, sy), r))
-                .collect();
-            let mut rc = RansacConfig::new(
-                LinearKind::Homography,
-                reference_geometry.0 as f64,
-                reference_geometry.1 as f64,
-            );
-            rc.tolerance_px = cfg.ransac_tolerance_px;
-            rc.max_iterations = cfg.ransac_max_iterations;
-            rc.min_inliers = MIN_INLIERS;
-            let Some(corrector) = ransac_fit(&residual_pairs, &rc) else {
-                break;
-            };
-            let norm = corrector_norm(&corrector.linear);
-            local_rounds = round + 1;
-            debug!(
-                round = local_rounds,
-                inliers = corrector.inliers.len(),
-                rms_px = corrector.rms_px,
-                corrector_norm = norm,
-                "local distortion round"
-            );
-            if norm < LOCAL_DISTORTION_STOP {
-                break;
-            }
-            let composed = compose(&corrector.linear, &linear);
-            if composed.inverse().is_none() {
-                warnings.push(
-                    "local distortion round produced a singular linear model; previous map kept"
-                        .to_string(),
-                );
-                break;
-            }
-            let kept: Vec<Pair> = corrector.inliers.iter().map(|&i| again.pairs[i]).collect();
-            let kept_sigmas: Option<Vec<(f64, f64)>> = again
-                .all_sigmas
-                .then(|| corrector.inliers.iter().map(|&i| again.sigmas[i]).collect());
-            let rebuilt = build_map(
-                wanted,
-                composed,
-                &kept,
-                kept_sigmas.as_deref(),
-                reference_geometry,
-                cfg.tps_smoothing,
-            );
-            let (candidate, candidate_linear, candidate_fit, candidate_notes) = match rebuilt {
-                Ok(v) => v,
-                Err(e) => {
-                    warnings.push(format!(
-                        "local distortion round {local_rounds} could not rebuild the map ({e}); previous map kept"
-                    ));
-                    break;
-                }
-            };
-            if candidate_fit != wanted {
-                // The round's own inlier set was too small for the
-                // requested distortion, or its fit did not converge —
-                // `build_map` degraded to the linear model and said why.
-                // Shipping that instead of the map we already have would
-                // be a silent downgrade, so the round is refused and its
-                // reason recorded.
-                warnings.extend(candidate_notes);
-                break;
-            }
-            let (candidate_rms, _, _) = residual_stats(&candidate, &kept);
-            if candidate_rms > best_rms {
-                break;
-            }
-            best_rms = candidate_rms;
-            map = candidate;
-            linear = candidate_linear;
-            distortion = candidate_fit;
-            pairs_len = again.pairs.len();
-            inlier_pairs = kept;
-            warnings.extend(candidate_notes);
-        }
-    }
+    // 5b. The local distortion loop (ruling R-M4c-7), off by default and
+    // a no-op without a distortion layer to refit — see
+    // [`super::local_loop`] for the round and its accept guard.
+    let outcome = local_loop::run(
+        wanted,
+        fitted,
+        inlier_pairs,
+        pairs_len,
+        subject,
+        reference,
+        &tree,
+        reference_geometry,
+        cfg,
+    );
+    let local_rounds = outcome.rounds;
+    let inlier_pairs = outcome.inlier_pairs;
+    let pairs_len = outcome.pairs_len;
+    let MapFit {
+        map,
+        linear,
+        fit: distortion,
+        qa,
+        notes: _,
+    } = outcome.fit;
+    warnings.extend(outcome.warnings);
     let scale = linear.scale();
 
-    // 6. QA through the final map.
-    let (rms_px, sigma_rms_px, peak_px) = residual_stats(&map, &inlier_pairs);
+    // 6. QA through the final map — or, when the fitted model INTERPOLATES
+    // its own inliers, over pairs its fit did not see (ruling R-T4-4). An
+    // interpolating spline's residual at its own nodes is a solver
+    // artefact, and reporting it would leave `maxRmsPx` unable to fail a
+    // TPS frame at all. Every other model is measured where it always was.
+    let (rms_px, sigma_rms_px, peak_px) = match qa {
+        Some(triple) => triple,
+        None => residual_stats(&map, &inlier_pairs),
+    };
     if rms_px > cfg.max_rms_px {
         if cfg.fail_on_max_rms {
             return Err(AlignError::RmsTooHigh {
@@ -1114,6 +1193,7 @@ pub fn align(
 mod tests {
     use super::*;
     use crate::geometry::ransac::SplitMix64;
+    use crate::stacking::register::local_loop::{compose, LOCAL_DISTORTION_ROUNDS};
 
     /// M4b: `SCALE_RANGE` is now derived from `SCALE_TOLERANCE` rather than
     /// a second literal — pin that the derived tuple still equals the old
@@ -1535,60 +1615,33 @@ mod tests {
         // Off the inliers, over the whole star-covered field: the spline
         // still beats the cubic, which is the claim that matters for the
         // pixels a resampler actually asks about.
-        let off_rms = |a: &Alignment| -> f64 {
-            let mut rng = SplitMix64(7777);
-            let mut sum = 0.0;
-            let mut n = 0;
-            for _ in 0..400 {
-                let (x, y) = (
-                    60.0 + rng.next_f64() * (W - 120.0),
-                    60.0 + rng.next_f64() * (H - 120.0),
-                );
-                // Where the truth says this subject pixel lands.
-                let truth = similarity(1.0, 0.7, 3.0, -2.0);
-                let (tx, ty) = truth.apply(x, y);
-                let (tx, ty) = (
-                    tx + 1.5 * (tx / 120.0).sin() * (ty / 100.0).cos(),
-                    ty + 1.5 * (tx / 120.0).cos() * (ty / 100.0).sin(),
-                );
-                let (fx, fy) = a.map.forward(x, y);
-                sum += (fx - tx).powi(2) + (fy - ty).powi(2);
-                n += 1;
-            }
-            (sum / n as f64).sqrt()
-        };
-        let (poly_off, tps_off) = (off_rms(&p), off_rms(&t));
+        let (poly_off, tps_off) = (off_truth_rms(&p.map), off_truth_rms(&t.map));
         assert!(
             tps_off < poly_off,
             "off-inlier: spline {tps_off} px vs cubic {poly_off} px"
         );
     }
 
-    /// M4c Step 3(b), ruling R-M4c-7: the loop never makes the fit worse,
-    /// and it is bounded by [`LOCAL_DISTORTION_ROUNDS`].
+    /// Ruling R-M4c-7 and its fix-round guard R-T4-5: the loop is bounded
+    /// by [`LOCAL_DISTORTION_ROUNDS`], it KEEPS a round when the round
+    /// earns it, and it never ships a map that generalizes worse.
     ///
-    /// Measured on this scene, both arms run EXACTLY ONE round and change
-    /// nothing — and that is the ruling's own convergence test firing,
-    /// not a dead loop. Worth writing down, because it is structural:
-    /// `refit_weighted` has already least-squares-fitted the linear part
-    /// over these pairs and `Distortion::fit_joint` has already folded
-    /// the residual's affine term back into it, so what the map has left
-    /// over is orthogonal to the space a corrector HOMOGRAPHY can
-    /// represent — `‖H_c − I‖_F` comes out under
-    /// [`LOCAL_DISTORTION_STOP`] on the first try. Measured: TPS 0.00131
-    /// px before and after, polynomial-3 0.90398 px before and after, one
-    /// round each. Deliberately-polluted variants (a coherent population
-    /// of 3 px-wrong pairs inside the initial pairing radius) were tried
-    /// and made no difference: RANSAC plus the σ-clip refit drop all of
-    /// them before the loop is reached.
+    /// What actually happens on this scene, measured: the first map is
+    /// fitted on 415 of the 450 pairs — the σ-clip refit drops 35 of them,
+    /// which on a 1.5 px non-polynomial field are the legitimate stars in
+    /// the deepest lobes. Re-pairing THROUGH that map recovers all 450,
+    /// the corrector on the 35 it was never fitted on is far from the
+    /// identity, and the round is kept: 415 → 450 inliers, two rounds run.
+    /// That is exactly the partial-first-pairing case the loop exists for.
     ///
-    /// So the compose-and-refit half of a round is a safety net for maps
-    /// whose FIRST pairing was partial — which is a real-frame situation,
-    /// not a synthetic one. It is pinned directly by
-    /// [`build_map_refits_the_distortion_around_a_corrected_linear_model`],
-    /// and Task 7's acceptance run is where it meets real frames.
+    /// The pin compares the two maps OFF their own nodes, against the
+    /// truth field. It deliberately does NOT compare the two reported
+    /// `rms_px` values: since ruling R-T4-4 those are hold-out estimates
+    /// over each model's OWN node set (415 nodes vs 450, 83 held out vs
+    /// 90), so the two numbers answer two different questions and neither
+    /// ordering between them would mean anything.
     #[test]
-    fn the_local_distortion_loop_is_bounded_and_never_worse() {
+    fn the_local_distortion_loop_is_bounded_and_keeps_a_round_it_earns() {
         let (subject, reference, geo) = wobble_scene(32, 450);
         let base_cfg = RegistrationConfig {
             distortion: DistortionChoice::Tps,
@@ -1611,18 +1664,31 @@ mod tests {
             looped.local_rounds > 0,
             "a distortion model on and the loop enabled: it must have run"
         );
-        // The interpolating spline already lands its own nodes, so the
-        // RMS this compares is near the solver floor either way — the
-        // pin is the DIRECTION, with a floor-sized slack.
-        assert!(
-            looped.rms_px <= base.rms_px + 1e-9,
-            "loop rms {} vs base {}",
-            looped.rms_px,
-            base.rms_px
-        );
         assert_eq!(looped.distortion, DistortionFit::Tps);
+        // A round was actually KEPT (ruling R-T4-5's pin): the map is not
+        // the one the loop started from, and it is fitted on MORE
+        // correspondences.
+        assert!(
+            looped.inliers > base.inliers,
+            "a kept round must have grown the inlier set: {} vs {}",
+            looped.inliers,
+            base.inliers
+        );
+        assert_ne!(
+            looped.map, base.map,
+            "a kept round must have changed the map"
+        );
 
-        // And with the polynomial arm the loop is equally harmless.
+        // Never worse, measured where it means something: both maps
+        // against the truth field, at the same 400 points, none of which
+        // is a node of either.
+        let (base_off, loop_off) = (off_truth_rms(&base.map), off_truth_rms(&looped.map));
+        assert!(
+            loop_off <= base_off,
+            "the loop must not generalize worse: {loop_off} px vs {base_off} px"
+        );
+
+        // The polynomial arm goes through the same loop.
         let poly_loop = RegistrationConfig {
             distortion: DistortionChoice::Polynomial3,
             local_distortion: true,
@@ -1635,12 +1701,15 @@ mod tests {
         let b = align_default(&subject, &reference, geo, geo, &poly_base).unwrap();
         let l = align_default(&subject, &reference, geo, geo, &poly_loop).unwrap();
         assert!(l.local_rounds <= LOCAL_DISTORTION_ROUNDS && l.local_rounds > 0);
+        // The polynomial arm reports the map's OWN residuals either way
+        // (it does not interpolate), so these two numbers ARE comparable.
         assert!(
             l.rms_px <= b.rms_px + 1e-9,
             "polynomial loop rms {} vs base {}",
             l.rms_px,
             b.rms_px
         );
+        assert!(off_truth_rms(&l.map) <= off_truth_rms(&b.map) + 1e-9);
 
         // With no distortion model there is nothing to refit, so the loop
         // does not run at all.
@@ -1654,6 +1723,172 @@ mod tests {
                 .unwrap()
                 .local_rounds,
             0
+        );
+    }
+
+    /// RMS of a map against [`wobble_scene`]'s own truth at 400 fixed
+    /// points, none of them a star — the one comparison that is common to
+    /// any two maps of that scene, whatever each was fitted on.
+    fn off_truth_rms(map: &PixelMap) -> f64 {
+        let truth = similarity(1.0, 0.7, 3.0, -2.0);
+        let mut rng = SplitMix64(7777);
+        let mut sum = 0.0;
+        for _ in 0..400 {
+            let (x, y) = (
+                60.0 + rng.next_f64() * (W - 120.0),
+                60.0 + rng.next_f64() * (H - 120.0),
+            );
+            let (tx, ty) = truth.apply(x, y);
+            let (tx, ty) = (
+                tx + 1.5 * (tx / 120.0).sin() * (ty / 100.0).cos(),
+                ty + 1.5 * (tx / 120.0).cos() * (ty / 100.0).sin(),
+            );
+            let (fx, fy) = map.forward_exact(x, y);
+            sum += (fx - tx).powi(2) + (fy - ty).powi(2);
+        }
+        (sum / 400.0).sqrt()
+    }
+
+    /// Ruling R-T4-4: the reported RMS of a TPS frame is measured on
+    /// inliers the shipped spline's fit did NOT see, so it is a real
+    /// number and `maxRmsPx` / `failOnMaxRms` can actually refuse a TPS
+    /// frame.
+    ///
+    /// Before this ruling the spline interpolated every inlier and
+    /// reported ~1e-3 px whatever the field looked like, which made the
+    /// QA gate structurally unable to fire on the one distortion model
+    /// most able to overfit.
+    #[test]
+    fn a_tps_frame_reports_a_real_rms_and_the_gate_can_refuse_it() {
+        let (subject, reference, geo) = wobble_scene(36, 450);
+        let cfg = RegistrationConfig {
+            distortion: DistortionChoice::Tps,
+            ..Default::default()
+        };
+        let a = align_default(&subject, &reference, geo, geo, &cfg).unwrap();
+        assert_eq!(a.distortion, DistortionFit::Tps, "{:?}", a.warnings);
+        // Hold-out, not interpolation: a real, non-zero number.
+        assert!(
+            a.rms_px > 1e-3,
+            "an interpolating spline's reported rms must be a hold-out \
+             measurement, got {}",
+            a.rms_px
+        );
+        // It is NOT comparable to the polynomial arm's number (that one is
+        // in-sample, this one is a hold-out) and this test does not
+        // pretend otherwise — the model comparison that means something
+        // lives in `the_spline_follows_a_field_the_polynomial_cannot`,
+        // against the truth field. What is pinned here is that the number
+        // is real and that the gate can act on it.
+
+        // The soft gate warns at the reported number …
+        let soft = RegistrationConfig {
+            max_rms_px: a.rms_px / 2.0,
+            ..cfg.clone()
+        };
+        let warned = align_default(&subject, &reference, geo, geo, &soft).unwrap();
+        assert!(
+            warned.warnings.iter().any(|w| w.starts_with("RMS ")),
+            "{:?}",
+            warned.warnings
+        );
+        // … and the hard gate refuses the frame outright.
+        let hard = RegistrationConfig {
+            max_rms_px: a.rms_px / 2.0,
+            fail_on_max_rms: true,
+            ..cfg.clone()
+        };
+        match align_default(&subject, &reference, geo, geo, &hard) {
+            Err(AlignError::RmsTooHigh { rms_px, max_rms_px }) => {
+                assert!(rms_px > max_rms_px, "{rms_px} vs {max_rms_px}");
+            }
+            other => panic!("expected the RMS gate to refuse the frame, got {other:?}"),
+        }
+        // A generous limit still passes, so the gate is not simply broken.
+        let ok = RegistrationConfig {
+            max_rms_px: a.rms_px * 4.0,
+            fail_on_max_rms: true,
+            ..cfg
+        };
+        assert!(align_default(&subject, &reference, geo, geo, &ok).is_ok());
+    }
+
+    /// Found in fix round 1, and a real defect rather than a test
+    /// artefact: two subject stars can pair to ONE reference star
+    /// (`pair_through` gives each subject star its own nearest reference
+    /// star, independently), RANSAC and the refit keep both, and the
+    /// inverse spline's node set then carries that reference position
+    /// twice — Bookstein's system is exactly singular and the whole
+    /// spline fails. Before [`dedupe_nodes`] it happened on roughly one
+    /// synthetic seed in three (seeds 36 and 37 below), and the frame
+    /// silently fell back to its linear model with a "did not fit" note.
+    #[test]
+    fn coincident_nodes_do_not_kill_the_spline() {
+        // A scene with a deliberate collision: two subject stars sitting
+        // on top of each other pair to the same reference star.
+        let (mut subject, reference, geo) = wobble_scene(38, 200);
+        let twin = subject[7];
+        subject.push(Star {
+            x: twin.x + 0.01,
+            y: twin.y - 0.01,
+            flux: twin.flux * 0.9,
+            sigma: twin.sigma,
+        });
+        let cfg = RegistrationConfig {
+            distortion: DistortionChoice::Tps,
+            ..Default::default()
+        };
+        let a = align_default(&subject, &reference, geo, geo, &cfg).unwrap();
+        assert_eq!(
+            a.distortion,
+            DistortionFit::Tps,
+            "a coincident pair must not sink the fit: {:?}",
+            a.warnings
+        );
+
+        // The rule itself: an exact duplicate in either direction is
+        // dropped, a pair 1 px away is kept.
+        let linear = Linear::identity();
+        let pairs: Vec<Pair> = vec![
+            ((0.0, 0.0), (0.0, 0.0)),
+            ((100.0, 0.0), (100.0, 0.0)),
+            // same subject position → same forward node
+            ((100.0, 0.0), (400.0, 400.0)),
+            // same reference position → same inverse node
+            ((0.0, 200.0), (0.0, 0.0)),
+            // 1 px away from the first: distinct, kept
+            ((1.0, 0.0), (1.0, 0.0)),
+        ];
+        let (kept, dropped) = dedupe_nodes(&linear, &pairs, (0..pairs.len()).collect());
+        assert_eq!(kept, vec![0, 1, 4], "{kept:?}");
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&2) && dropped.contains(&3));
+        assert!(TPS_MIN_NODE_SEPARATION_PX < 0.1, "safely below a centroid");
+    }
+
+    /// Ruling R-T4-4's node-cap branch: with more inliers than
+    /// [`TPS_MAX_NODES`], the inliers that did NOT become nodes are the
+    /// hold-out set and the SHIPPED model is what gets measured on them —
+    /// no second fit needed.
+    #[test]
+    fn over_the_node_cap_the_non_node_inliers_are_the_holdout() {
+        let (subject, reference, geo) = wobble_scene(37, TPS_MAX_NODES + 400);
+        let cfg = RegistrationConfig {
+            distortion: DistortionChoice::Tps,
+            max_stars: 4000,
+            ..Default::default()
+        };
+        let a = align_default(&subject, &reference, geo, geo, &cfg).unwrap();
+        assert_eq!(a.distortion, DistortionFit::Tps);
+        assert!(
+            a.inliers > TPS_MAX_NODES,
+            "the cap must actually bite: {} inliers",
+            a.inliers
+        );
+        assert!(
+            a.rms_px > 1e-3,
+            "the non-node inliers are a real hold-out: rms {}",
+            a.rms_px
         );
     }
 
@@ -1717,32 +1952,29 @@ mod tests {
         // reaches 4 px at the frame's edge.
         let mut wrong = truth;
         wrong.m[0][1] += 0.005;
-        let (before, _, fit, notes) = build_map(
-            DistortionFit::Tps,
-            wrong,
-            &pairs,
-            None,
-            geo,
-            0.0,
-        )
-        .unwrap();
-        assert_eq!(fit, DistortionFit::Tps);
-        assert!(notes.is_empty(), "{notes:?}");
+        let first = build_map(DistortionFit::Tps, wrong, &pairs, None, geo, 0.0).unwrap();
+        assert_eq!(first.fit, DistortionFit::Tps);
+        assert!(first.notes.is_empty(), "{:?}", first.notes);
+        // Ruling R-T4-4: every inlier is a node here, so the hold-out
+        // fit produced the reported residuals and they are NOT zero.
+        let qa = first.qa.expect("a hold-out QA triple");
+        assert!(qa.0 > 1e-6, "hold-out rms {} must be a real number", qa.0);
+        let before = first.map;
 
         // The corrector the loop would fit on what that map still gets
         // wrong, composed back in — and the distortion refitted.
         let residual: Vec<Pair> = pairs
             .iter()
-            .map(|&((sx, sy), r)| (before.forward(sx, sy), r))
+            .map(|&((sx, sy), r)| (before.forward_exact(sx, sy), r))
             .collect();
         let mut rc = RansacConfig::new(LinearKind::Homography, geo.0 as f64, geo.1 as f64);
         rc.tolerance_px = 1.9;
         rc.min_inliers = MIN_INLIERS;
         let corrector = ransac_fit(&residual, &rc).expect("a corrector fits");
         let composed = compose(&corrector.linear, &wrong);
-        let (after, _, fit, _) =
-            build_map(DistortionFit::Tps, composed, &pairs, None, geo, 0.0).unwrap();
-        assert_eq!(fit, DistortionFit::Tps);
+        let second = build_map(DistortionFit::Tps, composed, &pairs, None, geo, 0.0).unwrap();
+        assert_eq!(second.fit, DistortionFit::Tps);
+        let after = second.map;
 
         // Both maps interpolate their own nodes, so the comparison that
         // means anything is OFF them: how well the map lands a subject
@@ -1760,7 +1992,7 @@ mod tests {
                     tx + 1.5 * (tx / 120.0).sin() * (ty / 100.0).cos(),
                     ty + 1.5 * (tx / 120.0).cos() * (ty / 100.0).sin(),
                 );
-                let (fx, fy) = m.forward(x, y);
+                let (fx, fy) = m.forward_exact(x, y);
                 sum += (fx - tx).powi(2) + (fy - ty).powi(2);
             }
             (sum / 300.0).sqrt()
@@ -1782,53 +2014,21 @@ mod tests {
         );
 
         // The other two plans go through the same function, and the
-        // linear-only plan never refuses.
-        let (poly, poly_linear, fit, _) = build_map(
-            DistortionFit::Polynomial(3),
-            composed,
-            &pairs,
-            None,
-            geo,
-            0.0,
-        )
-        .unwrap();
-        assert_eq!(fit, DistortionFit::Polynomial(3));
+        // linear-only plan never refuses. Neither of them carries a
+        // hold-out QA triple: they do not interpolate, so the map's own
+        // residuals ARE the honest number (ruling R-T4-4).
+        let poly =
+            build_map(DistortionFit::Polynomial(3), composed, &pairs, None, geo, 0.0).unwrap();
+        assert_eq!(poly.fit, DistortionFit::Polynomial(3));
         assert_ne!(
-            poly_linear.m, composed.m,
+            poly.linear.m, composed.m,
             "the joint polynomial fit rebalances the linear part"
         );
-        assert!(poly.distortion.is_some());
-        let (plain, plain_linear, fit, notes) =
-            build_map(DistortionFit::None, composed, &pairs, None, geo, 0.0).unwrap();
-        assert_eq!(fit, DistortionFit::None);
-        assert!(plain.distortion.is_none() && notes.is_empty());
-        assert_eq!(plain_linear.m, composed.m);
-    }
-
-    /// The corrector norm and the 3×3 composition the loop is built on.
-    #[test]
-    fn the_corrector_norm_is_zero_only_at_the_identity() {
-        assert_eq!(corrector_norm(&Linear::identity()), 0.0);
-        let shifted = Linear::from_flat(
-            LinearKind::Affine,
-            [1.0, 0.0, 0.0005, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        );
-        assert!(corrector_norm(&shifted) < LOCAL_DISTORTION_STOP);
-        let shifted = Linear::from_flat(
-            LinearKind::Affine,
-            [1.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        );
-        assert!(corrector_norm(&shifted) > LOCAL_DISTORTION_STOP);
-        // Composition is `a · b`, so applying the composite equals
-        // applying `b` then `a`.
-        let a = similarity(1.1, 3.0, 7.0, -2.0);
-        let b = similarity(0.9, -5.0, -3.0, 11.0);
-        let c = compose(&a, &b);
-        let (bx, by) = b.apply(123.0, 456.0);
-        let (ex, ey) = a.apply(bx, by);
-        let (cx, cy) = c.apply(123.0, 456.0);
-        assert!((cx - ex).abs() < 1e-9 && (cy - ey).abs() < 1e-9);
-        assert_eq!(compose(&Linear::identity(), &b).m, b.m);
+        assert!(poly.map.distortion.is_some() && poly.qa.is_none());
+        let plain = build_map(DistortionFit::None, composed, &pairs, None, geo, 0.0).unwrap();
+        assert_eq!(plain.fit, DistortionFit::None);
+        assert!(plain.map.distortion.is_none() && plain.notes.is_empty() && plain.qa.is_none());
+        assert_eq!(plain.linear.m, composed.m);
     }
 
     #[test]

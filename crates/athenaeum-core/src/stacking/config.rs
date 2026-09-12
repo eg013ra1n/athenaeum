@@ -78,6 +78,17 @@ pub const MIN_EXPOSURE_TOLERANCE_SEC: f64 = 0.01;
 pub const MIN_DETECTION_SIGMA: f64 = 1.0;
 pub const MAX_DETECTION_SIGMA: f64 = 100.0;
 
+/// The range [`resolve_config`] clamps
+/// [`crate::stacking::register::RegistrationConfig::tps_smoothing`] to —
+/// the same 0–10 `RegisterPanel`'s field offers (M4c Task 4 fix round 1,
+/// minor 5). Enforced on the backend for the same reason as
+/// `detectionSigma`: a stored or hand-edited document never went through
+/// that field, and a negative or non-finite λ would otherwise make
+/// `ThinPlateSpline::fit` refuse EVERY frame's spline one at a time, with
+/// a per-frame note instead of one honest warning about the config.
+pub const MIN_TPS_SMOOTHING: f64 = 0.0;
+pub const MAX_TPS_SMOOTHING: f64 = 10.0;
+
 /// spec §9.2 `grouping:` (owner decision 2026-09-10: groups are
 /// camera-agnostic — colour mode, filter, binning and exposure form the
 /// key; exposure ALWAYS splits a group now, so there is no toggle for it
@@ -408,6 +419,7 @@ pub fn resolve_config(
         config.grouping.exposure_tolerance_sec = MIN_EXPOSURE_TOLERANCE_SEC;
     }
     config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
+    config.registration.tps_smoothing = clamp_tps_smoothing(config.registration.tps_smoothing);
     // M4c Task 3: the same backend guard for the large-scale filter's two
     // integers. Out of range these are not preferences but a broken filter
     // — the window doubles with every layer, so a hand-edited
@@ -481,6 +493,30 @@ fn clamp_detection_sigma(value: f64) -> f64 {
             "stacking config: detectionSigma above the maximum; clamped"
         );
         return MAX_DETECTION_SIGMA;
+    }
+    value
+}
+
+/// [`MIN_TPS_SMOOTHING`]..=[`MAX_TPS_SMOOTHING`], with the one-time
+/// `warn!` the other clamps use. `!(value >= MIN)` rather than
+/// `value < MIN` so a NaN clamps too — every comparison against NaN is
+/// false, and a NaN λ would sink every spline in the run.
+fn clamp_tps_smoothing(value: f64) -> f64 {
+    if !(value >= MIN_TPS_SMOOTHING) {
+        warn!(
+            value,
+            min = MIN_TPS_SMOOTHING,
+            "stacking config: tpsSmoothing below the minimum; clamped"
+        );
+        return MIN_TPS_SMOOTHING;
+    }
+    if value > MAX_TPS_SMOOTHING {
+        warn!(
+            value,
+            max = MAX_TPS_SMOOTHING,
+            "stacking config: tpsSmoothing above the maximum; clamped"
+        );
+        return MAX_TPS_SMOOTHING;
     }
     value
 }
@@ -1073,6 +1109,52 @@ mod tests {
             shipped,
             crate::stacking::integrate::LargeScaleRejection::default(),
             "the shipped default is inside both ranges and must not move"
+        );
+    }
+
+    /// M4c Task 4 fix round 1, minor 5: `tpsSmoothing` is clamped to the
+    /// range its own UI field offers, for the same reason
+    /// `detectionSigma` is — a stored or hand-edited document never went
+    /// through that field, and `ThinPlateSpline::fit` refuses a negative
+    /// or non-finite λ, which would degrade EVERY frame one per-frame
+    /// note at a time instead of saying once that the config is wrong.
+    #[test]
+    fn tps_smoothing_is_clamped_to_its_range() {
+        let lambda = |doc: &str| {
+            resolve_config(Some(doc), None)
+                .unwrap()
+                .registration
+                .tps_smoothing
+        };
+        assert_eq!(
+            lambda("{\"registration\":{\"tpsSmoothing\":-1}}"),
+            MIN_TPS_SMOOTHING
+        );
+        assert_eq!(
+            lambda("{\"registration\":{\"tpsSmoothing\":1e9}}"),
+            MAX_TPS_SMOOTHING
+        );
+        // In range, untouched — both ends and the shipped default.
+        for v in ["0", "0.01", "2.5", "10"] {
+            assert_eq!(
+                lambda(&format!("{{\"registration\":{{\"tpsSmoothing\":{v}}}}}")),
+                v.parse::<f64>().unwrap()
+            );
+        }
+        // A non-finite λ clamps rather than surviving (`!(x >= MIN)`).
+        // `serde_json` refuses `1e400` outright ("number out of range"),
+        // so this half of the guard is exercised on the clamp itself —
+        // it is defence in depth, not a reachable JSON shape.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let got = clamp_tps_smoothing(bad);
+            assert!(
+                got.is_finite() && (MIN_TPS_SMOOTHING..=MAX_TPS_SMOOTHING).contains(&got),
+                "{bad} → {got}"
+            );
+        }
+        assert_eq!(
+            resolve_config(None, None).unwrap().registration.tps_smoothing,
+            0.0
         );
     }
 

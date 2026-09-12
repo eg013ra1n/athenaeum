@@ -668,7 +668,11 @@ pub(crate) fn reference_coverage(
         let ry = (gy as f64 + 0.5) * ref_h as f64 / GRID as f64;
         for gx in 0..GRID {
             let rx = (gx as f64 + 0.5) * ref_w as f64 / GRID as f64;
-            let (sx, sy) = map.inverse(rx, ry);
+            // 1024 probes, and NOT followed by a warp of this frame — a
+            // candidate this ranking rejects is never resampled at all.
+            // The exact path (ruling R-T4-3a) keeps that from building a
+            // half-million-sample displacement grid per candidate.
+            let (sx, sy) = map.inverse_exact(rx, ry);
             if sx >= 0.0 && sx < src_w as f64 && sy >= 0.0 && sy < src_h as f64 {
                 covered += 1;
             }

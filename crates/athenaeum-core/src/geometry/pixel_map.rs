@@ -4,7 +4,7 @@
 //! thin-plate spline ([`super::tps`]). Serialized as the `transform_json`
 //! of `registration_results` (spec §9.1).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
 use serde::de::Error as _;
@@ -28,16 +28,24 @@ impl InverseMap for Linear {
     }
 }
 
-/// A bilinear displacement grid over a [`DistortionModel::Tps`] map's
-/// domain, sampled every [`TPS_GRID_PX`] pixels in both directions
-/// (ruling R-M4c-5).
+/// A bilinear displacement grid over ONE direction of a
+/// [`DistortionModel::Tps`] map's domain, sampled every [`TPS_GRID_PX`]
+/// pixels (ruling R-M4c-5).
 ///
 /// Evaluating the spline itself costs one `ln` per node per pixel — at
 /// the 600-node cap that is 600 logarithms for every one of a 26 Mpx
-/// frame's pixels, per direction. The grid pays that once per sample
-/// point instead (a 1024th of the pixels) and reads a bilinear tap
-/// between samples, which on a field as smooth as a registration
-/// residual is exact to a small fraction of a milli-pixel.
+/// frame's pixels. The grid pays that once per sample point instead (a
+/// 1024th of the pixels) and reads a bilinear tap between samples, which
+/// on a field as smooth as a registration residual is exact to a small
+/// fraction of a milli-pixel.
+///
+/// A grid is ONLY for pixel work. Anything that evaluates the map a few
+/// hundred times — residual statistics, star re-pairing, a corner
+/// displacement — must go through the exact spline instead
+/// ([`PixelMap::forward_exact`] / [`PixelMap::inverse_exact`]); building
+/// a 540 k-sample grid to answer 600 queries costs three orders of
+/// magnitude more than answering them directly (fix round 1, ruling
+/// R-T4-3).
 ///
 /// Never serialized: `transform_json` stores the splines, and the grid is
 /// rebuilt lazily on first use.
@@ -55,46 +63,30 @@ pub struct TpsGrid {
     step: f64,
     nx: usize,
     ny: usize,
-    forward: Vec<(f32, f32)>,
-    inverse: Vec<(f32, f32)>,
+    samples: Vec<(f32, f32)>,
 }
 
 impl TpsGrid {
-    /// Samples both splines over `domain` at [`TPS_GRID_PX`] spacing,
-    /// plus one margin cell each way so the last cell is complete. Rows
-    /// are independent, so the build runs over `rayon`; it is a pure
-    /// function of its inputs either way.
-    pub fn build(
-        forward: &ThinPlateSpline,
-        inverse: &ThinPlateSpline,
-        domain: [f64; 4],
-    ) -> TpsGrid {
+    /// Samples `spline` over `domain` at [`TPS_GRID_PX`] spacing, plus one
+    /// margin cell each way so the last cell is complete. Rows are
+    /// independent, so the build runs over `rayon`; it is a pure function
+    /// of its inputs either way.
+    pub fn build(spline: &ThinPlateSpline, domain: [f64; 4]) -> TpsGrid {
         let step = TPS_GRID_PX as f64;
         let [x0, y0, x1, y1] = domain;
         let nx = ((x1 - x0) / step).ceil().max(0.0) as usize + 2;
         let ny = ((y1 - y0) / step).ceil().max(0.0) as usize + 2;
-        let rows: Vec<(Vec<(f32, f32)>, Vec<(f32, f32)>)> = (0..ny)
+        let samples: Vec<(f32, f32)> = (0..ny)
             .into_par_iter()
-            .map(|j| {
+            .flat_map_iter(|j| {
                 let y = y0 + j as f64 * step;
-                let mut f = Vec::with_capacity(nx);
-                let mut i = Vec::with_capacity(nx);
-                for col in 0..nx {
+                (0..nx).map(move |col| {
                     let x = x0 + col as f64 * step;
-                    let (fx, fy) = forward.displacement(x, y);
-                    let (ix, iy) = inverse.displacement(x, y);
-                    f.push((fx as f32, fy as f32));
-                    i.push((ix as f32, iy as f32));
-                }
-                (f, i)
+                    let (dx, dy) = spline.displacement(x, y);
+                    (dx as f32, dy as f32)
+                })
             })
             .collect();
-        let mut fwd = Vec::with_capacity(nx * ny);
-        let mut inv = Vec::with_capacity(nx * ny);
-        for (f, i) in rows {
-            fwd.extend_from_slice(&f);
-            inv.extend_from_slice(&i);
-        }
         TpsGrid {
             x0,
             y0,
@@ -103,13 +95,14 @@ impl TpsGrid {
             step,
             nx,
             ny,
-            forward: fwd,
-            inverse: inv,
+            samples,
         }
     }
 
+    /// The displacement at `(x, y)`, bilinear between samples, the query
+    /// clamped into the fitted domain first.
     #[inline]
-    fn sample(&self, grid: &[(f32, f32)], x: f64, y: f64) -> (f64, f64) {
+    pub fn displacement_at(&self, x: f64, y: f64) -> (f64, f64) {
         let fx = (x.clamp(self.x0, self.x1) - self.x0) / self.step;
         let fy = (y.clamp(self.y0, self.y1) - self.y0) / self.step;
         let i = (fx.floor().max(0.0) as usize).min(self.nx - 2);
@@ -117,8 +110,9 @@ impl TpsGrid {
         let tx = fx - i as f64;
         let ty = fy - j as f64;
         let row = j * self.nx + i;
-        let (a, b) = (grid[row], grid[row + 1]);
-        let (c, d) = (grid[row + self.nx], grid[row + self.nx + 1]);
+        let g = &self.samples;
+        let (a, b) = (g[row], g[row + 1]);
+        let (c, d) = (g[row + self.nx], g[row + self.nx + 1]);
         let lerp = |p: f64, q: f64, t: f64| p + (q - p) * t;
         let dx_top = lerp(a.0 as f64, b.0 as f64, tx);
         let dx_bot = lerp(c.0 as f64, d.0 as f64, tx);
@@ -127,18 +121,34 @@ impl TpsGrid {
         (lerp(dx_top, dx_bot, ty), lerp(dy_top, dy_bot, ty))
     }
 
-    /// Forward (subject → reference) displacement at a reference-space
-    /// point.
-    #[inline]
-    pub fn forward_at(&self, x: f64, y: f64) -> (f64, f64) {
-        self.sample(&self.forward, x, y)
+    /// Samples in this grid — the allocation a clone of a `PixelMap` no
+    /// longer duplicates (ruling R-T4-3b).
+    pub fn len(&self) -> usize {
+        self.samples.len()
     }
 
-    /// Inverse (reference → subject) displacement at a reference pixel.
-    #[inline]
-    pub fn inverse_at(&self, x: f64, y: f64) -> (f64, f64) {
-        self.sample(&self.inverse, x, y)
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
+}
+
+/// The two lazily-built displacement grids of one spline pair, shared by
+/// every clone of the [`PixelMap`] that owns them (fix round 1, ruling
+/// R-T4-3b/c).
+///
+/// `Clone` on a `OnceLock<TpsGrid>` COPIES the built grid, and a
+/// registered frame's map is cloned into run state five times over
+/// (`rc.measured`, `GroupMember`, `StackFrame`, `RegisteredFrame`,
+/// `RegisteredSource`) — at 8.6 MB a direction that was gigabytes of
+/// duplicate. Behind an `Arc` every clone shares one allocation.
+///
+/// The two directions are independent cells because they have
+/// independent consumers: the resampler only ever asks for `inverse`,
+/// drizzle only for `forward`, and neither should pay for the other.
+#[derive(Debug, Default)]
+pub struct TpsGrids {
+    forward: OnceLock<TpsGrid>,
+    inverse: OnceLock<TpsGrid>,
 }
 
 /// The distortion layer sitting on top of a [`PixelMap`]'s linear model
@@ -162,16 +172,21 @@ pub enum DistortionModel {
         /// [`super::polynomial::DOMAIN_MARGIN`]). Evaluation clamps into
         /// it and the grid covers exactly it.
         domain: [f64; 4],
-        /// Built on first use, never serialized, never part of equality.
+        /// Displacement grids, built per direction on first PIXEL use,
+        /// never serialized, never part of equality, and SHARED by every
+        /// clone of this model (ruling R-T4-3b/c). Internal: a caller
+        /// reaches them through [`DistortionModel::forward_displacement`]
+        /// / [`DistortionModel::inverse_displacement`].
         #[serde(skip)]
-        grid: OnceLock<TpsGrid>,
+        grids: Arc<TpsGrids>,
     },
 }
 
-/// The cached grid is a pure function of the two splines and the domain,
+/// The cached grids are a pure function of the two splines and the domain,
 /// so two models that agree on those three ARE equal — a map that has
 /// already been evaluated must compare equal to a freshly deserialized
-/// one.
+/// one, and a clone that shares its parent's grids must compare equal to
+/// one that has none.
 impl PartialEq for DistortionModel {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -208,6 +223,15 @@ impl<'de> Deserialize<'de> for DistortionModel {
     /// Reads the `kind` tag, defaulting to `"polynomial"` when it is
     /// absent: that is every `transform_json` M1–M4b ever wrote, and a
     /// derived internally-tagged enum would reject all of them.
+    ///
+    /// **JSON only.** The tag default needs to look at the input before
+    /// choosing a shape, which it does by buffering through
+    /// `serde_json::Value` — so this decodes from a JSON deserializer and
+    /// nothing else. That is the whole world it lives in
+    /// (`registration_results.transform_json`, [`PixelMap::from_json`]);
+    /// a `PixelMap` has never travelled over postcard or any other
+    /// format, and a future one would need a hand-written tag default of
+    /// its own.
     fn deserialize<D>(deserializer: D) -> Result<DistortionModel, D::Error>
     where
         D: Deserializer<'de>,
@@ -244,7 +268,7 @@ impl DistortionModel {
             forward,
             inverse,
             domain,
-            grid: OnceLock::new(),
+            grids: Arc::new(TpsGrids::default()),
         }
     }
 
@@ -277,42 +301,111 @@ impl DistortionModel {
         }
     }
 
-    /// The grid, built on first use.
+    /// `(x, y)` clamped into the spline's fitted domain — what the grid
+    /// does implicitly, applied to the exact path so the two agree
+    /// outside the star-covered region too.
     #[inline]
-    fn grid(&self) -> Option<&TpsGrid> {
-        match self {
-            DistortionModel::Polynomial(_) => None,
-            DistortionModel::Tps {
-                forward,
-                inverse,
-                domain,
-                grid,
-            } => Some(grid.get_or_init(|| TpsGrid::build(forward, inverse, *domain))),
-        }
+    fn clamp_to_domain(domain: &[f64; 4], x: f64, y: f64) -> (f64, f64) {
+        (
+            x.max(domain[0]).min(domain[2]),
+            y.max(domain[1]).min(domain[3]),
+        )
     }
 
     /// Forward displacement (pixels) at reference-space point `(x, y)` —
-    /// the linear model's output.
+    /// the linear model's output. **The PIXEL path**: for a spline this
+    /// builds and reads the forward displacement grid.
     #[inline]
     pub fn forward_displacement(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             DistortionModel::Polynomial(d) => d.forward_displacement(x, y),
-            DistortionModel::Tps { .. } => self
-                .grid()
-                .map(|g| g.forward_at(x, y))
-                .unwrap_or((0.0, 0.0)),
+            DistortionModel::Tps {
+                forward,
+                domain,
+                grids,
+                ..
+            } => grids
+                .forward
+                .get_or_init(|| TpsGrid::build(forward, *domain))
+                .displacement_at(x, y),
         }
     }
 
-    /// Inverse displacement (pixels) at reference pixel `(x, y)`.
+    /// Inverse displacement (pixels) at reference pixel `(x, y)`. **The
+    /// PIXEL path**: for a spline this builds and reads the inverse
+    /// displacement grid.
     #[inline]
     pub fn inverse_displacement(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             DistortionModel::Polynomial(d) => d.inverse_displacement(x, y),
-            DistortionModel::Tps { .. } => self
-                .grid()
-                .map(|g| g.inverse_at(x, y))
-                .unwrap_or((0.0, 0.0)),
+            DistortionModel::Tps {
+                inverse,
+                domain,
+                grids,
+                ..
+            } => grids
+                .inverse
+                .get_or_init(|| TpsGrid::build(inverse, *domain))
+                .displacement_at(x, y),
+        }
+    }
+
+    /// [`DistortionModel::forward_displacement`] without touching a grid
+    /// (ruling R-T4-3a): the exact spline, `O(nodes)`. For the polynomial
+    /// arm it is the same call — that arm has no grid.
+    ///
+    /// This is what everything that is NOT resampling pixels must use:
+    /// residual statistics, star re-pairing, a QA measurement, a corner
+    /// displacement. Those ask a few hundred questions, and a grid costs
+    /// half a million spline evaluations to build.
+    #[inline]
+    pub fn forward_displacement_exact(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            DistortionModel::Polynomial(d) => d.forward_displacement(x, y),
+            DistortionModel::Tps {
+                forward, domain, ..
+            } => {
+                let (x, y) = Self::clamp_to_domain(domain, x, y);
+                forward.displacement(x, y)
+            }
+        }
+    }
+
+    /// [`DistortionModel::inverse_displacement`] without touching a grid
+    /// (ruling R-T4-3a) — see [`DistortionModel::forward_displacement_exact`].
+    #[inline]
+    pub fn inverse_displacement_exact(&self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            DistortionModel::Polynomial(d) => d.inverse_displacement(x, y),
+            DistortionModel::Tps {
+                inverse, domain, ..
+            } => {
+                let (x, y) = Self::clamp_to_domain(domain, x, y);
+                inverse.displacement(x, y)
+            }
+        }
+    }
+
+    /// Whether each direction's displacement grid has been built yet —
+    /// `(forward, inverse)`. Diagnostic: it is what pins that a
+    /// non-pixel caller never builds one (ruling R-T4-3a) and that a
+    /// clone shares what its parent built (R-T4-3b).
+    pub fn grids_built(&self) -> (bool, bool) {
+        match self {
+            DistortionModel::Polynomial(_) => (false, false),
+            DistortionModel::Tps { grids, .. } => {
+                (grids.forward.get().is_some(), grids.inverse.get().is_some())
+            }
+        }
+    }
+
+    /// The shared grid cache, for the identity check a clone-sharing pin
+    /// needs (`Arc::ptr_eq`). `None` for the polynomial arm, which has no
+    /// grids at all.
+    pub fn grid_cache(&self) -> Option<&Arc<TpsGrids>> {
+        match self {
+            DistortionModel::Polynomial(_) => None,
+            DistortionModel::Tps { grids, .. } => Some(grids),
         }
     }
 }
@@ -348,7 +441,11 @@ impl PixelMap {
         })
     }
 
-    /// Subject pixel → reference pixel.
+    /// Subject pixel → reference pixel. **The PIXEL path** — for a
+    /// thin-plate spline this reads (and, on the first call, builds) the
+    /// forward displacement grid. A caller that evaluates the map a few
+    /// hundred times rather than a few million wants
+    /// [`PixelMap::forward_exact`] (ruling R-T4-3a).
     #[inline]
     pub fn forward(&self, x: f64, y: f64) -> (f64, f64) {
         let (px, py) = self.linear.apply(x, y);
@@ -361,13 +458,45 @@ impl PixelMap {
         }
     }
 
-    /// Reference pixel → subject pixel.
+    /// Reference pixel → subject pixel. **The PIXEL path** — see
+    /// [`PixelMap::forward`]; the gather-style resampler and LN's warp
+    /// are the callers this exists for.
     #[inline]
     pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
         let (rx, ry) = match &self.distortion {
             None => (x, y),
             Some(d) => {
                 let (dx, dy) = d.inverse_displacement(x, y);
+                (x + dx, y + dy)
+            }
+        };
+        self.linear_inv.apply(rx, ry)
+    }
+
+    /// [`PixelMap::forward`] evaluated through the exact distortion, never
+    /// a grid (ruling R-T4-3a). Identical arithmetic for a linear map and
+    /// for the polynomial arm; for a spline it is `O(nodes)` instead of a
+    /// grid build.
+    #[inline]
+    pub fn forward_exact(&self, x: f64, y: f64) -> (f64, f64) {
+        let (px, py) = self.linear.apply(x, y);
+        match &self.distortion {
+            None => (px, py),
+            Some(d) => {
+                let (dx, dy) = d.forward_displacement_exact(px, py);
+                (px + dx, py + dy)
+            }
+        }
+    }
+
+    /// [`PixelMap::inverse`] evaluated through the exact distortion, never
+    /// a grid (ruling R-T4-3a).
+    #[inline]
+    pub fn inverse_exact(&self, x: f64, y: f64) -> (f64, f64) {
+        let (rx, ry) = match &self.distortion {
+            None => (x, y),
+            Some(d) => {
+                let (dx, dy) = d.inverse_displacement_exact(x, y);
                 (x + dx, y + dy)
             }
         };
@@ -456,6 +585,86 @@ mod tests {
         )
     }
 
+    /// Ruling R-T4-3a/c: the exact path builds NO grid, and each
+    /// direction's grid is built only when that direction is asked for
+    /// through the PIXEL path. A registered frame's residual statistics
+    /// evaluate the map a few hundred times, and the resampler only ever
+    /// asks `inverse` while drizzle only asks `forward` — neither should
+    /// pay for the other, and neither should be paid at all by a caller
+    /// that is not resampling.
+    #[test]
+    fn only_the_pixel_path_builds_a_grid_and_only_its_own_direction() {
+        let map = PixelMap::with_distortion_model(Linear::identity(), tps_model(24, 60)).unwrap();
+        let d = || map.distortion.as_ref().unwrap();
+        assert_eq!(d().grids_built(), (false, false), "nothing built yet");
+
+        // The exact path, in both directions, over more points than a
+        // frame has inliers: still nothing built.
+        for i in 0..1000 {
+            let (x, y) = (i as f64 * 0.9, i as f64 * 0.7);
+            map.forward_exact(x, y);
+            map.inverse_exact(x, y);
+            d().forward_displacement_exact(x, y);
+            d().inverse_displacement_exact(x, y);
+        }
+        assert_eq!(
+            d().grids_built(),
+            (false, false),
+            "the exact path must never build a grid"
+        );
+
+        // `residual_stats`-shaped use — what registration QA does — goes
+        // through `forward_exact`, so it too leaves both unbuilt.
+        map.forward_exact(123.0, 456.0);
+        assert_eq!(d().grids_built(), (false, false));
+
+        // One inverse PIXEL query builds the inverse grid and only it.
+        map.inverse(400.0, 300.0);
+        assert_eq!(d().grids_built(), (false, true), "inverse only");
+        // …and then the forward one, when something finally asks.
+        map.forward(400.0, 300.0);
+        assert_eq!(d().grids_built(), (true, true));
+    }
+
+    /// Ruling R-T4-3b: a clone SHARES the grids rather than copying them.
+    /// A registered frame's map is cloned into run state several times
+    /// over (`rc.measured`, `GroupMember`, `StackFrame`,
+    /// `RegisteredFrame`, `RegisteredSource`), and `Clone` on a bare
+    /// `OnceLock<TpsGrid>` copies the built grid — at ~8.6 MB a direction
+    /// on a full-frame map that was gigabytes of duplicate.
+    #[test]
+    fn a_clone_shares_the_grids_it_does_not_copy_them() {
+        let map = PixelMap::with_distortion_model(Linear::identity(), tps_model(25, 60)).unwrap();
+        map.inverse(100.0, 100.0);
+        let built = map.distortion.as_ref().unwrap().grids_built();
+        assert_eq!(built, (false, true));
+
+        let clone = map.clone();
+        let (a, b) = (
+            map.distortion.as_ref().unwrap().grid_cache().unwrap(),
+            clone.distortion.as_ref().unwrap().grid_cache().unwrap(),
+        );
+        assert!(
+            Arc::ptr_eq(a, b),
+            "a clone must share ONE grid cache allocation"
+        );
+        // The clone therefore already has the built grid — no rebuild —
+        // and building the other direction on the clone is visible on the
+        // original, because it is the same cell.
+        assert_eq!(
+            clone.distortion.as_ref().unwrap().grids_built(),
+            (false, true)
+        );
+        clone.forward(100.0, 100.0);
+        assert_eq!(
+            map.distortion.as_ref().unwrap().grids_built(),
+            (true, true),
+            "one cache, both handles"
+        );
+        // And they still compare equal: the cache is not identity.
+        assert_eq!(map, clone);
+    }
+
     /// Step 2: the 8-px bilinear grid the pixel path reads agrees with the
     /// exact spline. A registration residual field is smooth on the scale
     /// of 8 px, so the bilinear error is `~h²/8 · |f''|` — parts in ten
@@ -463,24 +672,28 @@ mod tests {
     #[test]
     fn the_tps_grid_agrees_with_the_exact_spline() {
         let model = tps_model(21, 200);
-        let (forward, inverse) = match &model {
-            DistortionModel::Tps {
-                forward, inverse, ..
-            } => (forward.clone(), inverse.clone()),
-            other => panic!("expected a spline: {other:?}"),
-        };
         let mut rng = SplitMix64(555);
         let mut worst = 0.0f64;
         for _ in 0..500 {
             let (x, y) = (rng.next_f64() * TW, rng.next_f64() * TH);
             let (gx, gy) = model.forward_displacement(x, y);
-            let (ex, ey) = forward.displacement(x, y);
+            let (ex, ey) = model.forward_displacement_exact(x, y);
             worst = worst.max((gx - ex).abs()).max((gy - ey).abs());
             let (gx, gy) = model.inverse_displacement(x, y);
-            let (ex, ey) = inverse.displacement(x, y);
+            let (ex, ey) = model.inverse_displacement_exact(x, y);
             worst = worst.max((gx - ex).abs()).max((gy - ey).abs());
         }
         assert!(worst < 0.02, "grid vs exact spline: worst {worst} px");
+        // Outside the fitted domain both paths clamp to the same edge, so
+        // the grid and the exact spline agree there too — not just inside.
+        for (x, y) in [(-5000.0, -5000.0), (9e4, 9e4), (-1.0, TH + 1.0)] {
+            let (gx, gy) = model.inverse_displacement(x, y);
+            let (ex, ey) = model.inverse_displacement_exact(x, y);
+            assert!(
+                (gx - ex).abs() < 0.02 && (gy - ey).abs() < 0.02,
+                "outside the domain at ({x}, {y}): grid ({gx}, {gy}) vs exact ({ex}, {ey})"
+            );
+        }
     }
 
     /// Step 2: a `Tps` map's JSON keeps the splines (to `serde_json`'s own

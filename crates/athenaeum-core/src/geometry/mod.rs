@@ -15,7 +15,13 @@ pub mod tps;
 
 pub use kdtree::KdTree2;
 pub use linear::{fit_affine, Linear, LinearKind, Pair};
-pub use pixel_map::{DistortionModel, InverseMap, PixelMap, TpsGrid};
+// `TpsGrid`/`TpsGrids` are deliberately NOT re-exported (fix round 1,
+// minor 10): the displacement grids are an implementation detail of
+// `pixel_map`'s spline arm, reached through
+// `DistortionModel::{forward,inverse}_displacement`. Nothing outside
+// `geometry` names them, and `geometry::pixel_map::TpsGrid` stays
+// available for anything that ever needs to.
+pub use pixel_map::{DistortionModel, InverseMap, PixelMap};
 pub use polynomial::{Distortion, Polynomial2D};
 pub use ransac::{ransac_fit, refit_weighted, Quality, RansacConfig, RansacResult, RefitResult};
 pub use tps::{select_nodes, ThinPlateSpline, TPS_GRID_PX, TPS_MAX_NODES, TPS_MIN_NODES};
