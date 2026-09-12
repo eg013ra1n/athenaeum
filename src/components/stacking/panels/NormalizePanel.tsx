@@ -4,8 +4,10 @@
 // enabled only while LN itself (`normalization.local.enabled`) is on — a
 // local-rejection choice with no LN reference to rejection-normalize
 // against isn't a coherent config. `localScale` (the local SCALE model, as
-// opposed to local BACKGROUND normalization) stays disabled — it arrives in
-// M4.
+// opposed to local BACKGROUND normalization) went live in M4c (ruling
+// R-M4c-8) and sits with the other LN parameters, inside the same
+// `enabled` block: a scale surface with no LN pass to carry it would mean
+// nothing.
 
 import { useEffect, useRef, useState } from 'react';
 import { ParamPair } from '../ParamPair';
@@ -180,18 +182,24 @@ export function NormalizePanel({ config, onChange, disabled, defaults }: Normali
                 default {psfModelLabel(defaults.normalization.local.psfModel)}
               </p>
             </div>
+
+            <div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={n.local.localScale}
+                  disabled={disabled}
+                  onChange={(e) => patchLocal({ localScale: e.target.checked })}
+                  className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+                />
+                <span className="text-sm text-content-secondary">Local scale</span>
+              </label>
+              <p className="mt-1 text-[11px] text-content-muted">
+                Model the flux scale as a smooth surface (matched-star flux ratios, thin-plate spline)
+              </p>
+            </div>
           </div>
         )}
-
-        <label
-          className="flex items-center gap-2 cursor-not-allowed pt-1"
-          title="Local scale model arrives in M4"
-        >
-          <input type="checkbox" checked={n.local.localScale} disabled className="w-4 h-4 rounded border-border" />
-          <span className="text-sm text-content-muted">
-            Local scale <span className="italic">(arrives in M4)</span>
-          </span>
-        </label>
       </div>
     </div>
   );

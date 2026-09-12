@@ -540,6 +540,7 @@ registration row for each — run stacking through Register first); found {}",
             measure_opts.max_stars,
             4.0,
             0.3,
+            local_cfg.local_scale,
         );
         if let Err(e) = &scale_result {
             // Should not happen — `normalize_frame` above already ran the
@@ -594,7 +595,10 @@ registration row for each — run stacking through Register first); found {}",
             }
         }
 
+        // `ScaleResult` is no longer `Copy` (M4c: it carries the optional
+        // local-scale spline), so the fields are read through a borrow.
         let scale_ok = scale_result.ok();
+        let scale_ok = scale_ok.as_ref();
         per_channel.push(serde_json::json!({
             "channel": p,
             "scale": scale_ok.map(|r| r.scale),
@@ -602,6 +606,8 @@ registration row for each — run stacking through Register first); found {}",
             "matches": scale_ok.map(|r| r.matches),
             "rcrRejected": scale_ok.map(|r| r.rejected),
             "beta": scale_ok.map(|r| r.beta),
+            "pass": scale_ok.map(|r| r.pass),
+            "localNodes": scale_ok.map(|r| r.local.as_ref().map_or(0, |s| s.nodes.len())),
             "cellsRejected": target_bg.invalid_cells,
             "residualBefore": median_abs(&before),
             "residualAfter": median_abs(&after),

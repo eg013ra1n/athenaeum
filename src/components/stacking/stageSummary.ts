@@ -298,7 +298,10 @@ export function stageSummary(
     case 'normalize': {
       const local = config.normalization.local;
       if (local.enabled) {
-        return `Local · scale ${local.scale} · ref ${local.referenceFrames} frames`;
+        // M4c (ruling R-M4c-8): the local SCALE spline is an option on top
+        // of local BACKGROUND normalization, so it only shows once LN is on.
+        const localScale = local.localScale ? ' · local scale' : '';
+        return `Local · scale ${local.scale} · ref ${local.referenceFrames} frames${localScale}`;
       }
       return `Global · ${outputNormLabel(config.normalization.output)} · ${config.normalization.scaleEstimator.toUpperCase()}`;
     }

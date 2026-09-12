@@ -728,6 +728,40 @@ mod tests {
         );
     }
 
+    /// Ruling R-M4c-8's own "the `.athln` config hash folds `localScale`
+    /// in (it already hashes the whole `local` block — verify)": flipping
+    /// it changes what a `.athln` sidecar CONTAINS (a spatially varying
+    /// `A` grid instead of a constant one), so every cached sidecar
+    /// written under the other setting must be recomputed. It rides
+    /// `cfg.normalization`, which `normalization_subtree` serializes
+    /// whole, so this holds by construction — pinned here so a future
+    /// hand-written subtree cannot quietly drop it. Nothing upstream of
+    /// normalization follows it.
+    #[test]
+    fn local_scale_moves_the_normalization_stage_hash() {
+        let cfg = StackingConfig::default();
+        let mut other = cfg.clone();
+        other.normalization.local.local_scale = !cfg.normalization.local.local_scale;
+        assert_ne!(config_hash(&cfg), config_hash(&other));
+        assert_ne!(
+            stage_hash(&normalization_subtree(&cfg), &[], &[]),
+            stage_hash(&normalization_subtree(&other), &[], &[]),
+            "the LN artifact hash must follow normalization.local.localScale"
+        );
+        assert_eq!(
+            stage_hash(&registration_subtree(&cfg), &[], &[]),
+            stage_hash(&registration_subtree(&other), &[], &[]),
+        );
+        assert_eq!(
+            stage_hash(&measurement_subtree(&cfg), &[], &[]),
+            stage_hash(&measurement_subtree(&other), &[], &[]),
+        );
+        assert_eq!(
+            stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            stage_hash(&calibration_subtree(&other), &[], &[]),
+        );
+    }
+
     /// M4c rulings R-M4c-5/7: the two new registration fields change what
     /// a stored registration artifact IS — a different distortion surface
     /// under the same linear model, or a linear model a corrector was

@@ -19,9 +19,11 @@
 //! own was modelled (just a looser deviation threshold —
 //! [`background::TARGET_DEVIATION_SIGMA`]), takes the PSF relative scale
 //! against the SAME channel of the reference, and folds the two into one
-//! [`LnGrid`] per channel (`A = s`, `B = B_ref − s·B_tgt`) written as one
-//! `.athln` sidecar. `stacking::run` (the orchestration layer, spec §9.3)
-//! owns resolving/caching the [`LnReference`] itself, fanning this out over a
+//! [`LnGrid`] per channel (`A = s` — or, with `localScale` on, the local
+//! scale spline of ruling R-M4c-8 sampled node by node; `B = B_ref −
+//! A·B_tgt`) written as one `.athln` sidecar. `stacking::run` (the
+//! orchestration layer, spec §9.3) owns resolving/caching the
+//! [`LnReference`] itself, fanning this out over a
 //! group's included frames, and recording the outcome in the run's
 //! provenance — none of that DB/artifact bookkeeping belongs in this
 //! low-level module.
@@ -30,6 +32,7 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::geometry::ThinPlateSpline;
 use crate::integration::banded::BandPlanes;
 use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
 use crate::integration::source::FrameSource;
@@ -49,7 +52,11 @@ pub use background::{
 };
 pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
-pub use scale::{relative_scale, relative_scale_against, PreparedReferenceChannel, ScaleResult};
+pub use scale::{
+    relative_scale, relative_scale_against, PreparedReferenceChannel, ScaleResult,
+    LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MAX_DEVIATION, LN_LOCAL_SCALE_MIN_STARS,
+    LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
+};
 
 /// Local-normalization errors shared by every M2 task past detection: a
 /// frame that cannot be trusted for LN (too few matched stars — see
@@ -140,6 +147,52 @@ fn median_of_finite(plane: &[f32]) -> f64 {
         return f64::NAN;
     }
     median_of(&finite) as f64
+}
+
+/// One channel's `A` grid (ruling R-M4c-8): the global `scale` at every
+/// node, or — when `local` carries the local scale spline
+/// [`scale::fit_local_scale`] produced — that spline sampled at each
+/// node's OWN pixel, `A(i, j) = scale + spline(i·stride, j·stride).0`.
+/// Node `(i, j)` sits at `(i·stride, j·stride)` ([`LnGrid`]'s own mesh
+/// convention), which is where the `B` term and the band loop's B-spline
+/// both read it.
+///
+/// The returned flag says whether the spline was actually used. It is
+/// `false` for `local: None` and ALSO when the sampled surface left the
+/// safety band [`scale::LN_LOCAL_SCALE_MAX_DEVIATION`] defines around
+/// `scale` (or produced a non-finite node): such a surface is refused as a
+/// whole — a partially-clamped `A` grid would be a quiet lie about what
+/// was measured — and the channel keeps the constant `A = scale`, which
+/// the caller logs.
+///
+/// With no spline the grid is `vec![scale as f32; gw·gh]`, bit-for-bit
+/// what M2/M3/M4a wrote, which is what keeps every LN pin passing while
+/// `localScale` is off.
+fn a_grid(
+    local: Option<&ThinPlateSpline>,
+    scale: f64,
+    gw: usize,
+    gh: usize,
+    stride: usize,
+) -> (Vec<f32>, bool) {
+    let constant = || (vec![scale as f32; gw * gh], false);
+    let Some(spline) = local else {
+        return constant();
+    };
+    let band = LN_LOCAL_SCALE_MAX_DEVIATION * scale.abs();
+    let mut a = Vec::with_capacity(gw * gh);
+    for j in 0..gh {
+        let y = (j * stride) as f64;
+        for i in 0..gw {
+            let x = (i * stride) as f64;
+            let v = scale + spline.displacement(x, y).0;
+            if !v.is_finite() || (v - scale).abs() > band {
+                return constant();
+            }
+            a.push(v as f32);
+        }
+    }
+    (a, true)
 }
 
 /// The reference-side inputs [`normalize_frame`] needs for star detection,
@@ -236,9 +289,16 @@ impl<'a> LnReferenceForDetection<'a> {
 /// read once through the [`FrameSource`] trait exactly like every other
 /// registered-frame consumer), models both backgrounds, takes the PSF scale
 /// against the SAME channel of `reference`, builds `A = s`,
-/// `B = B_ref − s·B_tgt` on the stride grid (spec §5.2/math §4.4) and writes
+/// `B = B_ref − A·B_tgt` on the stride grid (spec §5.2/math §4.4) and writes
 /// `<stem>.athln` at `sidecar` ([`LnFrameGrids::write`] — tmp file + atomic
 /// rename, so a reader never observes a half-written sidecar).
+///
+/// With `cfg.local_scale` on (ruling R-M4c-8) `A` is no longer that one
+/// number: [`scale::relative_scale_against`] also fits a thin-plate spline
+/// through the matched stars' scale residuals and [`a_grid`] samples it at
+/// every node, so `A` varies smoothly over the frame. Nothing else about
+/// the sidecar changes — the format has always carried a full `A` grid —
+/// and with the flag off every value written is what M2/M3/M4a wrote.
 ///
 /// `interpolation`/`clamping` are the SAME choices the group's own
 /// registration uses (`GroupInput::interpolation`/`::clamping`, threaded in
@@ -396,6 +456,7 @@ pub fn normalize_frame(
             measure.max_stars,
             4.0,
             0.3,
+            cfg.local_scale,
         )?;
         matches_total += scale_result.matches;
         scales.push(scale_result.scale);
@@ -407,19 +468,53 @@ pub fn normalize_frame(
         // `ref_bg` matching `target_bg`, e.g. a caller-supplied `ref_backgrounds`
         // built at a different scale). `zip` would otherwise silently
         // truncate to the shorter of the two in release builds.
-        if ref_bg.cells.len() != target_bg.cells.len() {
+        // M4c: the mesh the `A` grid is built on is a third party to this
+        // check now (`a_grid` sizes itself from `expected_gw`/`expected_gh`
+        // and `b` is zipped against it), so the release-build check covers
+        // all three lengths rather than just reference-vs-target — a short
+        // `b` would otherwise be a silently corrupt grid.
+        let expected_cells = expected_gw * expected_gh;
+        if ref_bg.cells.len() != target_bg.cells.len() || ref_bg.cells.len() != expected_cells {
             return Err(LnError::Other(format!(
-                "background grid size mismatch: reference has {} cells, target has {}",
+                "background grid size mismatch: reference has {} cells, target has {}, the stride mesh has {expected_cells}",
                 ref_bg.cells.len(),
                 target_bg.cells.len()
             )));
         }
-        let s = scale_result.scale as f32;
+        // M4c ruling R-M4c-8: `A` is the global scale at every node unless
+        // a local scale spline was fitted for this channel, in which case
+        // it is that spline sampled node by node. `B = B_ref − A·B_tgt`
+        // uses THIS node's own `A` either way — with no spline every
+        // `a[k]` is the same `scale as f32` the M2 code multiplied by, so
+        // the `b` cells come out bit-identical.
+        let (a, local_used) = a_grid(
+            scale_result.local.as_ref(),
+            scale_result.scale,
+            expected_gw,
+            expected_gh,
+            stride,
+        );
+        if let Some(spline) = scale_result.local.as_ref() {
+            if local_used {
+                tracing::debug!(
+                    ln_scale = scale_result.scale,
+                    ln_local_nodes = spline.nodes.len(),
+                    "local scale: A sampled from the spline"
+                );
+            } else {
+                tracing::warn!(
+                    ln_scale = scale_result.scale,
+                    ln_local_nodes = spline.nodes.len(),
+                    "local scale: the sampled A grid left the safety band around the global scale; A stays the global scale"
+                );
+            }
+        }
         let b: Vec<f32> = ref_bg
             .cells
             .iter()
             .zip(target_bg.cells.iter())
-            .map(|(&br, &bt)| br - s * bt)
+            .zip(a.iter())
+            .map(|((&br, &bt), &ak)| br - ak * bt)
             .collect();
 
         grids.push(LnGrid {
@@ -428,7 +523,7 @@ pub fn normalize_frame(
             scale: cfg.scale,
             gw: expected_gw,
             gh: expected_gh,
-            a: vec![s; expected_gw * expected_gh],
+            a,
             b,
             global_scale: scale_result.scale,
             location_ref: reference_for_detection.locations[p],
@@ -506,5 +601,99 @@ mod tests {
             }
             Cow::Borrowed(_) => panic!("a plane with a NaN must not be borrowed as-is"),
         }
+    }
+
+    // ---- M4c ruling R-M4c-8: the `A` grid from the local scale spline --
+
+    const GRID_W: usize = 1024;
+    const GRID_H: usize = 768;
+    const GRID_STRIDE: usize = 128;
+    /// The global scale the tests below build their surface around — a
+    /// realistic relative scale, not 1.0, so a bug that returns the
+    /// residual instead of `scale + residual` cannot pass.
+    const TEST_SCALE: f64 = 0.835;
+
+    /// A linear scale residual across the frame, the shape a flat-field
+    /// residual has: `±0.0175` at the two edges, so `A` runs from
+    /// `0.8175` to `0.8525` — a 4 % swing, well inside the safety band.
+    fn linear_residual(x: f64) -> f64 {
+        0.035 * (x / GRID_W as f64 - 0.5)
+    }
+
+    /// A thin-plate spline fitted (interpolating, λ = 0) on a 5×4 node
+    /// grid carrying [`linear_residual`] as its x channel and zeros as its
+    /// y channel — exactly the shape `scale::fit_local_scale` produces.
+    fn linear_residual_spline(amplify: f64) -> ThinPlateSpline {
+        let mut nodes = Vec::new();
+        let mut dx = Vec::new();
+        for j in 0..4 {
+            for i in 0..5 {
+                let x = 60.0 + i as f64 * 220.0;
+                let y = 50.0 + j as f64 * 220.0;
+                nodes.push((x, y));
+                dx.push(amplify * linear_residual(x));
+            }
+        }
+        let dy = vec![0.0f64; nodes.len()];
+        ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0)
+            .expect("a 5x4 node grid with a linear x channel must be fittable")
+    }
+
+    #[test]
+    fn a_grid_without_a_spline_is_the_constant_global_scale() {
+        let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
+        let (a, used) = a_grid(None, TEST_SCALE, gw, gh, GRID_STRIDE);
+        assert!(!used, "no spline means no local scale");
+        assert_eq!(a.len(), gw * gh);
+        assert!(
+            a.iter().all(|&v| v == TEST_SCALE as f32),
+            "every node must be the constant RCR location"
+        );
+    }
+
+    /// The brief's own acceptance for the local scale: the sampled `A`
+    /// grid follows the gradient at the grid's left, centre and right
+    /// columns, within 0.01.
+    #[test]
+    fn a_grid_follows_the_spline_at_the_left_centre_and_right_columns() {
+        let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
+        let spline = linear_residual_spline(1.0);
+        let (a, used) = a_grid(Some(&spline), TEST_SCALE, gw, gh, GRID_STRIDE);
+        assert!(used, "the sampled surface is well inside the safety band");
+
+        let row = gh / 2;
+        for i in [0usize, gw / 2, gw - 1] {
+            let x = (i * GRID_STRIDE) as f64;
+            let got = a[row * gw + i] as f64;
+            let want = TEST_SCALE + linear_residual(x);
+            assert!(
+                (got - want).abs() < 0.01,
+                "node column {i} (x = {x}): A = {got}, expected {want} within 0.01"
+            );
+        }
+        // And it is genuinely a GRADIENT, not a constant that happens to
+        // sit near the middle of it.
+        let left = a[row * gw] as f64;
+        let right = a[row * gw + gw - 1] as f64;
+        assert!(
+            right - left > 0.02,
+            "left {left} to right {right} — the grid did not follow the gradient"
+        );
+    }
+
+    /// A surface that leaves the safety band is refused AS A WHOLE: the
+    /// channel keeps the constant `A`, never a partially-clamped grid.
+    #[test]
+    fn a_sampled_surface_outside_the_safety_band_falls_back_to_the_constant() {
+        let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
+        // 30x the residual above puts the edges at ±0.525 of a 0.835
+        // scale, far past `LN_LOCAL_SCALE_MAX_DEVIATION` (0.25).
+        let spline = linear_residual_spline(30.0);
+        let (a, used) = a_grid(Some(&spline), TEST_SCALE, gw, gh, GRID_STRIDE);
+        assert!(!used, "the surface left the band and must be refused");
+        assert!(
+            a.iter().all(|&v| v == TEST_SCALE as f32),
+            "the fallback must be the constant global scale, not a clamp"
+        );
     }
 }

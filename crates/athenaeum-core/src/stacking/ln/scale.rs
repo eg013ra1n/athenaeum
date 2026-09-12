@@ -12,26 +12,34 @@
 //! never its own independent `Auto` search — which is what makes the
 //! ratios comparable (see `relative_scale`'s own doc for why). Both planes
 //! are assumed already in the reference geometry (registered), so a
-//! shared pixel position means the same sky position. Matching is a single
+//! shared pixel position means the same sky position. Matching is a
 //! nearest-neighbour pass: a [`crate::geometry::kdtree::KdTree2`] built
 //! over the reference fits' centroids, queried once per target fit within
 //! `match_radius_px`. The spec's "square half-side 4" window and this
 //! nearest-within-a-circle query differ only at the corners of that box —
-//! close enough that a second shape is not worth the code. **The
-//! barycentre second-pass match (spec §4.3) is deferred to M4** (ruling
-//! R2): this is the first pass only, so a frame whose stars moved enough
-//! between passes that fewer than 80 % still fall within `match_radius_px`
-//! of their reference counterpart will under-match — recorded, not fixed,
-//! here.
+//! close enough that a second shape is not worth the code.
+//!
+//! **M4c (rulings R-M4c-8/9) added the two pieces M2 recorded as
+//! deferred:** a BARYCENTRE second matching pass — when pass 1's pairing
+//! covered fewer than [`LN_BARYCENTRE_PASS_THRESHOLD`] of the reference's
+//! own accepted fits, the same nearest-within query runs again over the
+//! DETECTION barycentres each fit came from and the larger of the two
+//! pairings wins ([`choose_pairing`]) — and an optional LOCAL SCALE model:
+//! with `normalization.local.localScale` on, the surviving ratios'
+//! residuals `z_k − s` are fitted with an approximating thin-plate spline
+//! ([`fit_local_scale`]) that `ln::normalize_frame` samples on the stride
+//! grid as `A(x, y) = s + spline(x, y)`.
 
-use std::f64::consts::PI;
+use std::collections::HashSet;
+use std::f64::consts::{PI, SQRT_2};
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::LnError;
 use crate::geometry::kdtree::KdTree2;
+use crate::geometry::{select_nodes, Pair, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES};
 use crate::stacking::psf_signal::{
-    fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed,
+    fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
 };
 use crate::stacking::register::detect::{detect_stars, Star};
 use crate::stacking::register::DetectionConfig;
@@ -40,7 +48,40 @@ use crate::stacking::register::DetectionConfig;
 /// local normalization (spec §5.2 ruling: `LnError::TooFewMatches`).
 pub const MIN_MATCHES: usize = 20;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Ruling R-M4c-9: a pass-1 pairing covering less than this FRACTION of
+/// the reference plane's own accepted fits triggers the barycentre second
+/// pass. `0.8` is math §4.3 step 2's "a second pass using barycentres runs
+/// when < 80 % matched".
+pub const LN_BARYCENTRE_PASS_THRESHOLD: f64 = 0.8;
+
+/// Ruling R-M4c-8: fewer than this many pairs surviving RCR and no local
+/// scale spline is fitted at all — `A` stays the constant RCR location and
+/// the frame is logged as such. A surface fitted on a handful of stars is
+/// noise dressed as a flat-field residual.
+pub const LN_LOCAL_SCALE_MIN_STARS: usize = 40;
+
+/// Ruling R-M4c-8 / math §4.3 step 5: the local-scale spline's smoothing
+/// `λ` is this many RCR dispersions of the ratio sample (`5·σ_z`). A scale
+/// field is smooth by physics — it is a flat-field residual — so a `λ`
+/// this far above the kernel's own magnitude (`|φ| ≤ 0.184` on normalized
+/// coordinates, see [`ThinPlateSpline::fit`]) deliberately leaves little
+/// but the spline's affine part on a noisy sample and only lets the radial
+/// terms in when the residuals are genuinely tighter than the structure
+/// they carry.
+pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
+
+/// Safety band on the SAMPLED local-scale surface, as a fraction of the
+/// global scale `s` (an addition to ruling R-M4c-8's own wording, see
+/// `ln::a_grid`): a flat-field residual that moves the relative scale by
+/// more than a quarter of `s` between two corners of the same frame is not
+/// a flat-field residual — it is a spline that left its node cloud or a
+/// fit that went wrong. Such a surface is refused as a whole and the
+/// channel keeps the constant `A = s`, loudly. Real vignetting-driven
+/// residuals are a few percent, so this is an order of magnitude of
+/// headroom, not a working limit.
+pub const LN_LOCAL_SCALE_MAX_DEVIATION: f64 = 0.25;
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScaleResult {
     /// RCR location of the matched flux ratios — the global relative scale.
     pub scale: f64,
@@ -54,6 +95,18 @@ pub struct ScaleResult {
     /// resolved (`psf::PsfModel::Moffat4`'s fixed 4.0, or `Auto`'s own
     /// per-plane search run once, on the reference only).
     pub beta: f64,
+    /// Which matching pass the sample above came from (ruling R-M4c-9):
+    /// `1` = the PSF-fit centroids, `2` = the detection barycentres. A tie
+    /// keeps pass 1, so `2` means the barycentre pairing was strictly
+    /// larger.
+    pub pass: u8,
+    /// The local scale model (ruling R-M4c-8), `None` unless the caller
+    /// asked for one AND at least [`LN_LOCAL_SCALE_MIN_STARS`] pairs
+    /// survived RCR AND the spline could be fitted. The surface is the
+    /// RESIDUAL around [`Self::scale`]: `A(x, y) = scale +
+    /// local.displacement(x, y).0` (the y channel is fitted on zeros and
+    /// carries nothing — see [`fit_local_scale`]).
+    pub local: Option<ThinPlateSpline>,
 }
 
 /// Detect star seeds on one plane: registration's own detector for
@@ -97,6 +150,249 @@ fn to_seed(star: &Star) -> Seed {
     }
 }
 
+/// Radius, in pixels, within which an accepted fit is linked back to the
+/// detection seed (barycentre) it was fitted from — ruling R-M4c-9's pass
+/// 2 needs that link, and [`FitOutcome`] carries no seed index. DERIVED,
+/// not chosen: [`crate::stacking::psf_signal::fit_one`] refuses any fit
+/// whose centre left its own seed by more than `centroid_tolerance_px` on
+/// EITHER axis, so the seed is always within `tolerance·√2` of the fit it
+/// produced, and no other seed can be closer than the `dedupe` pass allows
+/// (fits within ±1 px of a brighter one are already gone). A fit whose
+/// nearest seed still falls outside this radius — which the tolerance
+/// makes impossible for the seed list it was fitted from — takes no part
+/// in pass 2 rather than being paired with a stranger.
+fn seed_link_radius(p: &FitParams) -> f64 {
+    p.centroid_tolerance_px * SQRT_2
+}
+
+/// Per accepted fit, the detection barycentre it came from — the nearest
+/// seed within [`seed_link_radius`], or `None` when there is none (see
+/// that function for why that is a degenerate case, not a normal one).
+/// Positions are in the same plane coordinates as the fits themselves.
+fn link_barycentres(fits: &[StarFit], seeds: &[Seed]) -> Vec<Option<(f64, f64)>> {
+    let radius = seed_link_radius(&FitParams::default());
+    let points: Vec<(f64, f64)> = seeds.iter().map(|s| (s.x, s.y)).collect();
+    let tree = KdTree2::build(&points);
+    fits.iter()
+        .map(|f| {
+            tree.nearest_within(f.x, f.y, radius)
+                .map(|(i, _)| (seeds[i].x, seeds[i].y))
+        })
+        .collect()
+}
+
+/// A [`KdTree2`] over the PRESENT positions of `positions`, plus the map
+/// from tree point index back to the slot (fit index) it came from. With
+/// every slot present the map is the identity and the tree is exactly what
+/// `KdTree2::build` over the fits' own centroids has always produced — the
+/// property that keeps pass 1 bit-identical to M2's single-pass code.
+fn tree_over(positions: &[Option<(f64, f64)>]) -> (KdTree2, Vec<usize>) {
+    let mut points = Vec::with_capacity(positions.len());
+    let mut of_point = Vec::with_capacity(positions.len());
+    for (i, p) in positions.iter().enumerate() {
+        if let Some(&(x, y)) = p.as_ref() {
+            points.push((x, y));
+            of_point.push(i);
+        }
+    }
+    (KdTree2::build(&points), of_point)
+}
+
+/// One positional matching pass: each target slot claims its single
+/// nearest reference point within `radius`, one way, in target-slot order.
+/// Returns `(reference fit index, target fit index)` pairs — a reference
+/// fit can be claimed by more than one target fit in a crowded field, and
+/// RCR downstream absorbs the resulting duplicate ratios (that is M2's own
+/// documented behaviour, unchanged; the local-scale spline dedupes on the
+/// reference index itself, see [`fit_local_scale`]).
+fn pair_positions(
+    ref_tree: &KdTree2,
+    ref_fit_of_point: &[usize],
+    tgt_positions: &[Option<(f64, f64)>],
+    radius: f64,
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::with_capacity(tgt_positions.len());
+    for (tgt_idx, p) in tgt_positions.iter().enumerate() {
+        let Some(&(x, y)) = p.as_ref() else {
+            continue;
+        };
+        if let Some((point, _dist)) = ref_tree.nearest_within(x, y, radius) {
+            pairs.push((ref_fit_of_point[point], tgt_idx));
+        }
+    }
+    pairs
+}
+
+/// Ruling R-M4c-9 in one place. Pass 1 matches the two planes' PSF-FIT
+/// centroids; if its pairing covered fewer than
+/// [`LN_BARYCENTRE_PASS_THRESHOLD`] of `ref_fits` (the reference plane's
+/// own accepted fits), a second pass matches the DETECTION BARYCENTRES
+/// with the same radius, and the LARGER of the two pairings wins.
+///
+/// A tie keeps pass 1 — so a frame pass 1 already handled cannot have its
+/// numbers changed by this rule, whatever the second pass finds. `ref_fits
+/// == 0` has no denominator and no pairing to improve: pass 1 (empty)
+/// stands.
+///
+/// `tgt_barycentres` is a CLOSURE, not a slice: linking a plane's fits
+/// back to their seeds costs a tree over every one of them
+/// ([`link_barycentres`]), and on the overwhelming majority of frames pass
+/// 1 is enough — so that work happens only when the threshold actually
+/// sends us to pass 2. The REFERENCE side is prepared eagerly instead
+/// (once per group, amortized over its whole fan-out — see
+/// [`PreparedReferenceChannel`]).
+#[allow(clippy::too_many_arguments)]
+fn choose_pairing(
+    ref_tree: &KdTree2,
+    ref_fit_of_point: &[usize],
+    tgt_fit_positions: &[Option<(f64, f64)>],
+    ref_barycentre_tree: &KdTree2,
+    ref_barycentre_of_point: &[usize],
+    tgt_barycentres: impl FnOnce() -> Vec<Option<(f64, f64)>>,
+    ref_fits: usize,
+    radius: f64,
+) -> (Vec<(usize, usize)>, u8) {
+    let pass1 = pair_positions(ref_tree, ref_fit_of_point, tgt_fit_positions, radius);
+    if ref_fits == 0 || pass1.len() as f64 >= LN_BARYCENTRE_PASS_THRESHOLD * ref_fits as f64 {
+        return (pass1, 1);
+    }
+    let pass2 = pair_positions(
+        ref_barycentre_tree,
+        ref_barycentre_of_point,
+        &tgt_barycentres(),
+        radius,
+    );
+    if pass2.len() > pass1.len() {
+        (pass2, 2)
+    } else {
+        (pass1, 1)
+    }
+}
+
+/// The flux-ratio sample one pairing produces: `z_k =
+/// signal_ref,k / signal_tgt,k` (math §4.3 step 3), the REFERENCE fit's
+/// own centroid for each sample (where the local-scale spline is
+/// evaluated) and that fit's index (what the spline dedupes on). All three
+/// are index-aligned and in the pairing's own order, so the sample handed
+/// to RCR is exactly what M2's inline loop built.
+struct RatioSample {
+    ratios: Vec<f64>,
+    positions: Vec<(f64, f64)>,
+    ref_idx: Vec<usize>,
+}
+
+fn ratio_sample(
+    prepared: &PreparedReferenceChannel,
+    tgt_outcome: &FitOutcome,
+    pairs: &[(usize, usize)],
+) -> RatioSample {
+    let mut out = RatioSample {
+        ratios: Vec::with_capacity(pairs.len()),
+        positions: Vec::with_capacity(pairs.len()),
+        ref_idx: Vec::with_capacity(pairs.len()),
+    };
+    for &(r, t) in pairs {
+        let rf = &prepared.outcome.fits[r];
+        let (flux_ref, flux_tgt) = (rf.signal, tgt_outcome.fits[t].signal);
+        if flux_ref > 0.0 && flux_tgt > 0.0 {
+            out.ratios.push(flux_ref / flux_tgt);
+            out.positions.push((rf.x, rf.y));
+            out.ref_idx.push(r);
+        }
+    }
+    out
+}
+
+/// The local scale model of ruling R-M4c-8: an approximating thin-plate
+/// spline through the RESIDUALS `z_k − scale` of the pairs RCR kept, at
+/// their REFERENCE positions, with smoothing
+/// `LN_LOCAL_SCALE_SMOOTHING_SIGMAS · σ_z`.
+///
+/// The spline is a two-channel object ([`ThinPlateSpline`] fits an x and a
+/// y displacement over one node set) and only the x channel means anything
+/// here: `dy` is all zeros and `displacement(..).1` is never read. Nodes
+/// are grid-stratified ([`select_nodes`], cap [`TPS_MAX_NODES`]) so a
+/// crowded corner cannot buy the whole budget, and deduped on the
+/// REFERENCE fit index first: the one-way match lets two target fits claim
+/// one reference star, and two coincident nodes make the bordered system
+/// singular (`fit` would return `None` for the whole frame).
+///
+/// `None` — `A` stays the constant `scale` — when fewer than
+/// [`LN_LOCAL_SCALE_MIN_STARS`] pairs survived RCR, when the node cap's
+/// own floor ([`TPS_MIN_NODES`]) is not met, or when the system is
+/// singular anyway. Every one of those says so at `warn`.
+fn fit_local_scale(
+    sample: &RatioSample,
+    kept: &[bool],
+    scale: f64,
+    sigma: f64,
+    width: usize,
+    height: usize,
+) -> Option<ThinPlateSpline> {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut nodes: Vec<(f64, f64)> = Vec::new();
+    let mut residuals: Vec<f64> = Vec::new();
+    let mut survivors = 0usize;
+    for (k, &keep) in kept.iter().enumerate().take(sample.ratios.len()) {
+        if !keep {
+            continue;
+        }
+        survivors += 1;
+        if !seen.insert(sample.ref_idx[k]) {
+            continue;
+        }
+        nodes.push(sample.positions[k]);
+        residuals.push(sample.ratios[k] - scale);
+    }
+
+    if survivors < LN_LOCAL_SCALE_MIN_STARS {
+        warn!(
+            count = survivors,
+            "local scale: too few matched stars survived RCR; A stays the global scale"
+        );
+        return None;
+    }
+
+    // `select_nodes` stratifies over each pair's REFERENCE coordinate (its
+    // second element) — which is the only coordinate an LN pair has, both
+    // planes already living in the reference geometry — and orders by σ
+    // within a cell. There is no per-star σ here, so `None`: the order
+    // inside a cell is the node order, which is the target fits' own
+    // amplitude order (brightest first, `psf_signal::dedupe`).
+    let pairs: Vec<Pair> = nodes.iter().map(|&p| (p, p)).collect();
+    let idx = select_nodes(&pairs, None, (width as f64, height as f64), TPS_MAX_NODES);
+    if idx.len() < TPS_MIN_NODES {
+        warn!(
+            ln_local_nodes = idx.len(),
+            "local scale: too few distinct nodes for a spline; A stays the global scale"
+        );
+        return None;
+    }
+    let chosen_nodes: Vec<(f64, f64)> = idx.iter().map(|&i| nodes[i]).collect();
+    let chosen_dz: Vec<f64> = idx.iter().map(|&i| residuals[i]).collect();
+    let zeros = vec![0.0f64; chosen_nodes.len()];
+
+    let lambda = LN_LOCAL_SCALE_SMOOTHING_SIGMAS * sigma;
+    // A σ that is not a usable number (an RCR sample so degenerate its
+    // dispersion came back NaN, or a negative one, which cannot happen but
+    // would poison the solve) falls back to the interpolating spline
+    // rather than refusing a local scale outright.
+    let lambda = if lambda.is_finite() && lambda >= 0.0 {
+        lambda
+    } else {
+        0.0
+    };
+
+    let spline = ThinPlateSpline::fit(&chosen_nodes, &chosen_dz, &zeros, lambda);
+    if spline.is_none() {
+        warn!(
+            ln_local_nodes = chosen_nodes.len(),
+            "local scale: the spline could not be fitted; A stays the global scale"
+        );
+    }
+    spline
+}
+
 /// The reference side of [`relative_scale`] (detection + PSF fit + the
 /// built match tree), computed ONCE PER GROUP instead of once per frame
 /// (final fix wave, I2): the LN reference plane is immutable for a group's
@@ -110,7 +406,18 @@ fn to_seed(star: &Star) -> Seed {
 /// inline.
 pub struct PreparedReferenceChannel {
     outcome: FitOutcome,
+    /// Tree over every accepted fit's PSF centroid; point index IS the fit
+    /// index (`fit_of_point` is the identity — kept explicit so pass 1 and
+    /// pass 2 share one [`pair_positions`]).
     tree: KdTree2,
+    fit_of_point: Vec<usize>,
+    /// Ruling R-M4c-9's pass-2 side of the same reference: a tree over the
+    /// DETECTION barycentres the accepted fits came from, with the map back
+    /// to fit indices. Built here rather than lazily per frame for exactly
+    /// the reason the fit tree is (I2): the reference is immutable for a
+    /// group's whole fan-out.
+    barycentre_tree: KdTree2,
+    barycentre_of_point: Vec<usize>,
 }
 
 impl PreparedReferenceChannel {
@@ -134,9 +441,18 @@ impl PreparedReferenceChannel {
             psf,
             &FitParams::default(),
         );
-        let ref_points: Vec<(f64, f64)> = outcome.fits.iter().map(|f| (f.x, f.y)).collect();
-        let tree = KdTree2::build(&ref_points);
-        PreparedReferenceChannel { outcome, tree }
+        let fit_positions: Vec<Option<(f64, f64)>> =
+            outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
+        let (tree, fit_of_point) = tree_over(&fit_positions);
+        let barycentres = link_barycentres(&outcome.fits, &ref_seeds);
+        let (barycentre_tree, barycentre_of_point) = tree_over(&barycentres);
+        PreparedReferenceChannel {
+            outcome,
+            tree,
+            fit_of_point,
+            barycentre_tree,
+            barycentre_of_point,
+        }
     }
 }
 
@@ -164,6 +480,13 @@ impl PreparedReferenceChannel {
 /// [`MIN_MATCHES`] surviving pairs is [`LnError::TooFewMatches`] — the
 /// caller excludes the frame from the LN pass rather than trust a scale
 /// from a handful of stars.
+///
+/// `local_scale` is `normalization.local.localScale`: with it on, the
+/// returned [`ScaleResult::local`] carries the local scale spline of
+/// ruling R-M4c-8 (when enough pairs survived — see [`fit_local_scale`]);
+/// with it off that field is `None` and every number this function returns
+/// is what M2/M3/M4a produced, unchanged.
+#[allow(clippy::too_many_arguments)]
 pub fn relative_scale_against(
     prepared: &PreparedReferenceChannel,
     target: &[f32],
@@ -172,6 +495,7 @@ pub fn relative_scale_against(
     max_stars: usize,
     match_radius_px: f64,
     rcr_limit: f64,
+    local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
     let tgt_seeds = detect_seeds(target, width, height, max_stars);
     let tgt_outcome = fit_stars_with_beta(
@@ -183,43 +507,53 @@ pub fn relative_scale_against(
         &FitParams::default(),
     );
 
-    let mut ratios: Vec<f64> = Vec::with_capacity(tgt_outcome.fits.len());
-    for tf in &tgt_outcome.fits {
-        // One-way match, target → reference: each target fit claims its
-        // single nearest reference fit within `match_radius_px`, so a
-        // reference star can be claimed by more than one target fit in a
-        // crowded field — RCR (below) absorbs the resulting duplicate or
-        // skewed ratios. The barycentre one-to-one pass (spec §4.3) is
-        // deferred to M4 (ruling R2), same as the module doc above.
-        let Some((i, _dist)) = prepared.tree.nearest_within(tf.x, tf.y, match_radius_px) else {
-            continue;
-        };
-        let (flux_ref, flux_tgt) = (prepared.outcome.fits[i].signal, tf.signal);
-        if flux_ref > 0.0 && flux_tgt > 0.0 {
-            ratios.push(flux_ref / flux_tgt);
-        }
-    }
+    // Pass 1 on the PSF-fit centroids; pass 2 (ruling R-M4c-9) on the
+    // DETECTION barycentres, only when pass 1 covered too little of the
+    // reference — `choose_pairing` owns the whole rule, including the tie
+    // that keeps pass 1.
+    let tgt_fit_positions: Vec<Option<(f64, f64)>> =
+        tgt_outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
+    let (pairs, pass) = choose_pairing(
+        &prepared.tree,
+        &prepared.fit_of_point,
+        &tgt_fit_positions,
+        &prepared.barycentre_tree,
+        &prepared.barycentre_of_point,
+        || link_barycentres(&tgt_outcome.fits, &tgt_seeds),
+        prepared.outcome.fits.len(),
+        match_radius_px,
+    );
 
-    if ratios.len() < MIN_MATCHES {
+    let sample = ratio_sample(prepared, &tgt_outcome, &pairs);
+    if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
-            matches: ratios.len(),
+            matches: sample.ratios.len(),
         });
     }
 
-    let r = crate::stacking::robust::rcr(&ratios, rcr_limit);
+    let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
+    let local = if local_scale {
+        fit_local_scale(&sample, &r.kept, r.location, r.scale, width, height)
+    } else {
+        None
+    };
     debug!(
         ln_scale = r.location,
         sigma = r.scale,
-        ln_matches = ratios.len(),
+        ln_matches = sample.ratios.len(),
         rejected = r.rejected,
+        ln_pass = pass,
+        ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
         "ln relative scale"
     );
     Ok(ScaleResult {
         scale: r.location,
         sigma: r.scale,
-        matches: ratios.len(),
+        matches: sample.ratios.len(),
         rejected: r.rejected,
         beta: prepared.outcome.beta,
+        pass,
+        local,
     })
 }
 
@@ -230,6 +564,7 @@ pub fn relative_scale_against(
 /// [`relative_scale_against`] directly against the group's ONE prepared
 /// reference channel instead, so it never re-detects or re-fits the
 /// reference plane per frame (final fix wave, I2).
+#[allow(clippy::too_many_arguments)]
 pub fn relative_scale(
     reference: &[f32],
     target: &[f32],
@@ -239,6 +574,7 @@ pub fn relative_scale(
     max_stars: usize,
     match_radius_px: f64,
     rcr_limit: f64,
+    local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
     let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars);
     relative_scale_against(
@@ -249,6 +585,7 @@ pub fn relative_scale(
         max_stars,
         match_radius_px,
         rcr_limit,
+        local_scale,
     )
 }
 
@@ -301,6 +638,7 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect("a clean uniformly-scaled field must match");
 
@@ -339,13 +677,15 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect("a clean uniformly-scaled field must match");
 
         let prepared =
             PreparedReferenceChannel::build(&reference, WIDTH, HEIGHT, PsfModel::Moffat4, 200);
-        let via_prepared = relative_scale_against(&prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3)
-            .expect("the same prepared reference must match the same target");
+        let via_prepared =
+            relative_scale_against(&prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false)
+                .expect("the same prepared reference must match the same target");
 
         assert_eq!(via_wrapper, via_prepared);
     }
@@ -377,6 +717,7 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect("a majority-clean field must still match");
 
@@ -406,6 +747,7 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect_err("a starless target cannot produce 20 matched pairs");
 
@@ -487,6 +829,7 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect("a clean field differing only in seeing must still match");
 
@@ -512,6 +855,7 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect("Auto must resolve on this clean, purely-Moffat4 field");
 
@@ -549,9 +893,291 @@ mod tests {
             200,
             4.0,
             0.3,
+            false,
         )
         .expect("a clean field differing only in seeing must still match");
 
         assert_eq!(r.beta, 4.0);
+    }
+
+    // ---- M4c ruling R-M4c-9: the barycentre second matching pass -------
+
+    fn present(v: &[(f64, f64)]) -> Vec<Option<(f64, f64)>> {
+        v.iter().map(|&p| Some(p)).collect()
+    }
+
+    fn grid_positions(seed: u64) -> Vec<(f64, f64)> {
+        star_grid(seed).iter().map(|&(x, y, _)| (x, y)).collect()
+    }
+
+    /// `choose_pairing` on a target whose PSF-FIT centroids all walked
+    /// away from the reference's while the DETECTION barycentres stayed
+    /// where they were: pass 1 pairs nothing, so the rule runs pass 2 on
+    /// the barycentres and its (strictly larger) pairing wins.
+    ///
+    /// **The displacement is 5 px, not the brief's 2.5 px** — deliberately
+    /// larger than `match_radius_px`, which is what it takes to empty pass
+    /// 1 at all (a 2.5 px walk is comfortably INSIDE the 4 px window and
+    /// pass 1 keeps every pair: that is the next test). It is also larger
+    /// than the fitter's own `centroid_tolerance_px` allows a real fit to
+    /// walk from its own seed, which is exactly why this pins the RULE on
+    /// synthesized position lists rather than on two rendered planes: no
+    /// achievable pair of real planes can empty the window this way.
+    #[test]
+    fn the_barycentre_pass_recovers_a_pairing_the_fit_positions_lost() {
+        let grid = grid_positions(7);
+        let ref_fits = present(&grid);
+        let ref_bary = present(&grid);
+        let (ref_tree, ref_map) = tree_over(&ref_fits);
+        let (bary_tree, bary_map) = tree_over(&ref_bary);
+
+        let walked: Vec<(f64, f64)> = grid.iter().map(|&(x, y)| (x + 5.0, y)).collect();
+        let tgt_fits = present(&walked);
+        let tgt_bary = present(&grid);
+
+        let (pairs, pass) = choose_pairing(
+            &ref_tree,
+            &ref_map,
+            &tgt_fits,
+            &bary_tree,
+            &bary_map,
+            || tgt_bary,
+            grid.len(),
+            4.0,
+        );
+
+        let pass1 = pair_positions(&ref_tree, &ref_map, &tgt_fits, 4.0);
+        assert!(
+            (pass1.len() as f64) < LN_BARYCENTRE_PASS_THRESHOLD * grid.len() as f64,
+            "pass 1 matched {} of {} — the second pass would not even run",
+            pass1.len(),
+            grid.len()
+        );
+        assert_eq!(pass, 2, "the barycentre pairing must win");
+        assert!(
+            pairs.len() as f64 >= 0.9 * grid.len() as f64,
+            "pass 2 matched {} of {}",
+            pairs.len(),
+            grid.len()
+        );
+    }
+
+    /// The negative control at the brief's own 2.5 px: a walk that small
+    /// never leaves the 4 px window, pass 1 covers everything, and the
+    /// barycentre pass does not run at all (`pass == 1`).
+    #[test]
+    fn a_small_fit_walk_keeps_pass_one() {
+        let grid = grid_positions(8);
+        let ref_fits = present(&grid);
+        let (ref_tree, ref_map) = tree_over(&ref_fits);
+        // An EMPTY barycentre side: if pass 2 ran at all it could only
+        // shrink the pairing, so this also pins that it does not run.
+        let (bary_tree, bary_map) = tree_over(&[]);
+
+        let walked: Vec<(f64, f64)> = grid.iter().map(|&(x, y)| (x + 2.5, y)).collect();
+        let tgt_fits = present(&walked);
+
+        let (pairs, pass) = choose_pairing(
+            &ref_tree,
+            &ref_map,
+            &tgt_fits,
+            &bary_tree,
+            &bary_map,
+            || panic!("the barycentre pass must not even be prepared here"),
+            grid.len(),
+            4.0,
+        );
+
+        assert_eq!(pass, 1);
+        assert_eq!(pairs.len(), grid.len());
+    }
+
+    /// A tie keeps pass 1 (ruling R-M4c-9's own wording is "the larger of
+    /// the two pairings"): nothing about a frame pass 1 already handled may
+    /// change because the second pass found the same number of pairs.
+    #[test]
+    fn a_tie_between_the_two_pairings_keeps_pass_one() {
+        let grid = grid_positions(9);
+        // Only the first third of the reference's fits are reachable, so
+        // pass 1 covers 1/3 < 80 % and the second pass runs …
+        let reachable: Vec<(f64, f64)> = grid[..grid.len() / 3].to_vec();
+        let ref_fits = present(&grid);
+        let (ref_tree, ref_map) = tree_over(&ref_fits);
+        let (bary_tree, bary_map) = tree_over(&ref_fits);
+        let tgt = present(&reachable);
+
+        let (pairs, pass) = choose_pairing(
+            &ref_tree,
+            &ref_map,
+            &tgt,
+            &bary_tree,
+            &bary_map,
+            || tgt.clone(),
+            grid.len(),
+            4.0,
+        );
+
+        // … and finds exactly as many pairs, which is not larger.
+        assert_eq!(pass, 1);
+        assert_eq!(pairs.len(), reachable.len());
+    }
+
+    #[test]
+    fn a_clean_field_stays_on_pass_one_and_carries_no_local_model() {
+        let stars = star_grid(1);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 11);
+        let target_stars = scale_stars(&stars, 0.8);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 21);
+
+        let r = relative_scale(
+            &reference,
+            &target,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            4.0,
+            0.3,
+            false,
+        )
+        .expect("a clean uniformly-scaled field must match");
+
+        assert_eq!(r.pass, 1);
+        assert!(r.local.is_none(), "localScale was off");
+    }
+
+    // ---- M4c ruling R-M4c-8: the local scale spline --------------------
+
+    /// The brief's flat-field-like gradient: every target star's amplitude
+    /// is scaled by `k(x) = 1.2 + 0.1·(x/w − 0.5)`, so the RATIO the scale
+    /// measures — `z = flux_ref / flux_tgt` — follows `1/k(x)`, from
+    /// `1/1.15 ≈ 0.870` at the left edge to `1/1.25 = 0.800` at the right.
+    fn gradient_k(x: f64) -> f64 {
+        1.2 + 0.1 * (x / WIDTH as f64 - 0.5)
+    }
+
+    fn gradient_pair(seed: u64) -> (Vec<f32>, Vec<f32>) {
+        let stars = star_grid(seed);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 51);
+        let target_stars: Vec<(f64, f64, f64)> = stars
+            .iter()
+            .map(|&(x, y, a)| (x, y, a * gradient_k(x)))
+            .collect();
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 52);
+        (reference, target)
+    }
+
+    #[test]
+    fn the_local_spline_follows_a_scale_gradient() {
+        let (reference, target) = gradient_pair(11);
+
+        let r = relative_scale(
+            &reference,
+            &target,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            4.0,
+            0.3,
+            true,
+        )
+        .expect("a clean field with a smooth scale gradient must match");
+
+        assert!(
+            r.matches >= LN_LOCAL_SCALE_MIN_STARS,
+            "matched {} — below the local-scale floor, the spline would be skipped",
+            r.matches
+        );
+        let spline = r
+            .local
+            .as_ref()
+            .expect("localScale was on and enough pairs survived");
+
+        let y = (HEIGHT / 2) as f64;
+        // Left / centre / right of the frame, the columns the brief names.
+        for x in [0.0, (WIDTH / 2) as f64, (WIDTH - 1) as f64] {
+            let a = r.scale + spline.displacement(x, y).0;
+            let want = 1.0 / gradient_k(x);
+            assert!(
+                (a - want).abs() < 0.01,
+                "A({x}) = {a}, expected {want} (the 1/k gradient) within 0.01"
+            );
+        }
+    }
+
+    /// With `localScale` off the SAME field yields the identical global
+    /// numbers and no spline: the constant RCR location is all `A` gets.
+    /// This is the "off is byte-identical" contract in one assertion.
+    #[test]
+    fn without_local_scale_the_gradient_field_keeps_the_constant_scale() {
+        let (reference, target) = gradient_pair(11);
+
+        let off = relative_scale(
+            &reference,
+            &target,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            4.0,
+            0.3,
+            false,
+        )
+        .expect("a clean field with a smooth scale gradient must match");
+        let on = relative_scale(
+            &reference,
+            &target,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            4.0,
+            0.3,
+            true,
+        )
+        .expect("a clean field with a smooth scale gradient must match");
+
+        assert!(off.local.is_none());
+        assert!(on.local.is_some());
+        // Everything the global term is made of is untouched by the flag.
+        assert_eq!(off.scale, on.scale);
+        assert_eq!(off.sigma, on.sigma);
+        assert_eq!(off.matches, on.matches);
+        assert_eq!(off.rejected, on.rejected);
+        assert_eq!(off.pass, on.pass);
+    }
+
+    #[test]
+    fn too_few_matched_stars_leave_the_scale_global() {
+        // 24 stars: above `MIN_MATCHES` (20), below
+        // `LN_LOCAL_SCALE_MIN_STARS` (40).
+        let stars: Vec<(f64, f64, f64)> = star_grid(12).into_iter().take(24).collect();
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 61);
+        let target_stars = scale_stars(&stars, 0.8);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 62);
+
+        let r = relative_scale(
+            &reference,
+            &target,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            4.0,
+            0.3,
+            true,
+        )
+        .expect("24 stars still clear MIN_MATCHES");
+
+        assert!(
+            r.matches < LN_LOCAL_SCALE_MIN_STARS,
+            "matched {} — the scene was meant to stay under the floor",
+            r.matches
+        );
+        assert!(
+            r.local.is_none(),
+            "a sample under the floor must not produce a spline"
+        );
     }
 }
