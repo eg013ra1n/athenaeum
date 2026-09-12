@@ -1,6 +1,6 @@
 [package]
 name = "athenaeum-core"
-version = "0.6.0"
+version = "0.6.1"
 description = "Athenaeum core library - shared business logic for desktop and web"
 authors = ["you"]
 edition = "2021"
