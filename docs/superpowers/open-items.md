@@ -255,12 +255,19 @@ run** — everything below is what that run has to weigh or what it inherits.
   test (verified by reading, the sabotage was reverted rather than committed). Pass 1
   also still computes rejection maps that pass 2's replace when `writeRejectionMaps` is
   on.
-- **Deferred (Task 4, TPS):** there is **no grid release mechanism** — a `TpsGrid`
-  lives as long as the last clone of its map, so a run holding 368 registered maps
-  through integration under `distortion: "tps"` accumulates ≈ 8.6 MB × 368 of inverse
-  grids on a 26 Mpx set (Task 7 measures peak RSS and wall clock before anyone
-  recommends TPS; the cheap mitigations are a `release_cache` or a coarser
-  `TPS_GRID_PX` for large frames); `drizzle::band_source_window` costs a few
+- **Deferred (Task 4, TPS):** the grid RELEASE mechanism landed after the acceptance
+  run's first TPS attempt stalled the machine (ruling R-T4-6, `8f7f1242`: every stage
+  releases a frame's grid when done with it; `set_plane` wired so integration opens
+  ONE source per group — R-T4-7); what remains is residency — integration holds one
+  inverse grid per frame for a whole group (≈ 208 × 4.5 MB ≈ 0.9 GB on this set; a
+  per-band release would rebuild every grid every band) and drizzle rebuilds a colour
+  frame's forward grid once per plane (the plane loop is outer; ≈ +8 min on 160 OSC
+  frames — swapping the nesting means restructuring the per-plane I/W accumulators);
+  doc drift left by the last fix round: the enum doc's "≈ 9 builds for a three-plane
+  run" against its own table's 8 (7 by default), five stale "8.6 MB per direction"
+  copies (`pixel_map.rs`, `writer.rs`), three comments made stale by R-T4-7
+  (`integrate.rs` ~1185, `registered_source.rs` ~99, `ln/reference.rs` ~9), and the
+  cost table ignores the large-scale second pass; `drizzle::band_source_window` costs a few
   hundred exact probes × up to 600 nodes per band on a TPS map; **a TPS row's
   hold-out `rms_px` is not
   comparable with a polynomial row's in-sample `rms_px`**, and the frames table shows
@@ -268,13 +275,12 @@ run** — everything below is what that run has to weigh or what it inherits.
   more accurate against the truth field) — the column wants a note or a split; the
   `pair_through` two-subjects-one-reference correspondence ambiguity stands for **every
   model** (TPS is merely the first consumer that cannot tolerate it — `dedupe_nodes`
-  guards the spline, nothing resolves the pairing itself); `dedupe_nodes`'s doc
-  overstates the "cell picked first" rule for the uncapped case (there the lower index
-  wins); in the cap-bites branch an UNselected duplicate pair stays in the hold-out set
-  (asymmetric with the 80/20 branch, never flattering); `TpsGrid::len`/`is_empty` are
-  dead public API; a superseded incumbent's note can survive a kept round in
+  guards the spline, nothing resolves the pairing itself); in the cap-bites branch an
+  UNselected duplicate pair stays in the hold-out set (asymmetric with the 80/20
+  branch, never flattering); a superseded incumbent's note can survive a kept round in
   `warnings`; and nothing in the tests distinguishes the common-set accept guard
-  (R-T4-5) from the old per-model one.
+  (R-T4-5) from the old per-model one (the `dedupe_nodes` doc and the dead
+  `TpsGrid::len`/`is_empty` were fixed in fix round 2).
 - **Deferred (Task 5, LN):** the ±1–2·σ_z local-scale ripple SHIPS — with `localScale`
   on and no true structure the sampled `A` carries a spurious smooth surface of
   peak-to-peak 0.92–2.18·σ_z (10 seeds, σ_z ∈ [0.031, 0.038]), pinned at 3.0·σ_z by a
@@ -298,6 +304,42 @@ run** — everything below is what that run has to weigh or what it inherits.
   panel's three new rejection methods and its Large-scale rejection block, the Register
   panel's `tps` distortion with `TPS smoothing (λ)` and `Local distortion loop`, and
   the Normalize panel's now-live `localScale` checkbox. Task 7 will add its own lines.
+- **Task 7 acceptance (2026-09-12, `docs/superpowers/research/2026-09-12-m4c-acceptance-run.md`):**
+  the Winsorized deferral of spec §6.3 is CLOSED — the real master dark rebuilt with the
+  new reference loop sits inside every target (median −0.002 %, MAD +0.010 %, hot pixels
+  −0.855 %). The lines that stay open from the run:
+  - **RCR and Winsorized clip star cores on the OSC red plane** (RCR: faint-star peak
+    p10 0.67× the baseline's, second-moment width +3.4 %; Winsorized 4/3: p10 0.73×,
+    width +1.0 %; mono, G/B and the brightest stars untouched) — a Chauvenet / k·σ high
+    side on the skewed per-pixel distribution of VNG-interpolated cores. Both are opt-in
+    and outside the Auto ladder at n ≥ 20; the Integrate panel's help owes a caution for
+    colour data (final fix wave), a star-protecting variant is a later item.
+  - **ESD rejects 0.15 %** on this set (the brief's 1–5 % was a guess; the trail is
+    still rejected) and every non-linear-fit method's master is 6–13 % quieter than the
+    5.0/3.5 linear fit's — the Auto linear-fit thresholds cost real noise for their 3 %;
+    a re-tune candidate, not an M4c defect.
+  - **Large-scale rejection costs 3.5× the integration time** (37 vs 11 min) for no
+    visible gain on a set whose one trail the per-pixel clip already removes; its case
+    is the shoulder a per-pixel clip misses (pinned synthetically).
+  - **TPS: ruling R-T7-1 sets `tpsSmoothing`'s default to 0.5** (hold-out rms 0.099 /
+    0.156 px vs 0.145 / 0.203 at λ = 0; 5.6 % of frames reach the 3-round cap at 0.5) —
+    the final fix wave changes the default (the registration hash moves for `tps` sets
+    only). A TPS run costs ≈ +25 % wall (49 vs 40 min) from the per-stage grid
+    rebuilds; drizzle still rebuilds a colour frame's forward grid once per plane
+    (≈ +8 min on 160 OSC frames — the plane loop is outer); integration holds one
+    inverse grid per frame for a whole group (≈ 0.9 GB at 208 frames). No measurable
+    FWHM gain over `polynomial3` on this field.
+  - **The M3 drizzled OSC G/B FWHM residual (≈ +6 % ratio) is unchanged under TPS** —
+    it is not registration distortion; the VNG planes / M4d's Bayer drizzle own it.
+  - **LN local scale's ripple is measurable:** +3.1 / +5.4 % master noise on G/B at
+    σ_z ≈ 0.10 (R −3.4 %), corners < 0.1 %, LN time within noise; the math reference's
+    surface-simplification step (or a node-count-aware λ) is the follow-up before the
+    flag can default on. The barycentre pass won on 6.2 % of channel-frames.
+  - **Owed (owner):** the desktop click-through of the Integrate / Register / Normalize /
+    Measure panels (two Chrome instances were connected to the automation; a static
+    check of the served bundle stands in), and the Windows/Linux runs.
+  - **Release-note line owed (v0.6.1):** every Winsorized master (the n ≥ 15 Auto master
+    recipe) differs from its pre-M4c self — within 0.1 % median / 2 % MAD / 1 % hot pixels.
 
 ### Stacking M4b — mixed pixel scales (2026-09-11)
 

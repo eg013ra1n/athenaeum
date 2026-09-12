@@ -1051,7 +1051,40 @@ coverage for anything under `integration/`. And **`cargo test --lib` hides
 example breakage** — a public-signature change that breaks
 `examples/*_probe.rs` surfaces only under
 `cargo check -p athenaeum-core --all-targets`, which is the re-gate to run
-after one. Acceptance: Task 7 (pending).
+after one. **Acceptance run 2026-09-12**
+(`docs/superpowers/research/2026-09-12-m4c-acceptance-run.md`, runs 22–33 on
+LDN 1272, the M4a acceptance config as the baseline): the rejection variants
+from Integrate — ESD 0.150 / 0.138 % rejected (by design: only genuine single
+extremes; the set's one satellite trail still rejected), RCR 1.81 / 2.25 %,
+min/max exactly 2/n per stack, Winsorized 4/3 0.68 / 0.71 % — all with
+7–13 % LOWER master noise than the 5.0/3.5 linear fit's 3 %; RCR (strongly:
+faint-star peak p10 0.67×, width +3.4 %) and Winsorized 4/3 (mildly: p10
+0.73×) clip medium/faint star cores on the OSC RED plane (the skewed
+per-pixel distribution of VNG-interpolated cores under seeing), mono and the
+G/B planes untouched, the brightest stars untouched — the Auto ladder never
+selects them at n ≥ 20, so a caution ships instead of a default change; the
+Winsorized before/after on a REAL master dark (set 1763, 100 × 180 s bin 2,
+rebuilt through the M4c server) median −0.002 %, MAD +0.010 %, hot pixels
+−0.855 % (targets ± 0.1 / 2 / 1 %). Large-scale rejection: every target
+met (`large_scale_rejected_fraction` 0.137 / 0.049 %, the master unchanged
+within noise, the real trail's sparse pass-1 mask survives the cascade and
+is densified — Task 3's m5 closed) at 3.5× the integration time. TPS: the
+FIRST attempt (run 27) stalled the 16 GB machine in the mono drizzle (0 %
+CPU, 11.3 GB swap) because every frame's grids stayed alive for the run —
+ruling R-T4-6 (a release per stage, `8f7f1242`) fixed it and the three
+re-runs took 49 min each without a stall; hold-out rms λ = 0 / 0.5 / 2:
+0.145 / 0.099 / 0.102 px mono, 0.203 / 0.156 / 0.165 OSC — **ruling
+R-T7-1: `tpsSmoothing` default 0.5**; no measurable FWHM gain on this
+cubic-corrected field and the M3 drizzled OSC G/B residual is unchanged
+(not registration distortion — M4d's Bayer-drizzle item). LN local scale:
+corner/centre change < 0.1 % on every plane, LN stage time within noise
+(12.06 vs 12.6 min in a clean window), a spline on all 688 channel-frames
+(σ_z ≈ 0.10) whose per-frame ripple costs +3.1 / +5.4 % master noise on
+G/B — stays off by default, the reference's simplification step is the
+follow-up; the barycentre pass won on 6.2 % of channel-frames with the
+target-side denominator. The desktop click-through of the four panels is
+owed to the owner (two Chrome instances were connected; a static check of
+the served bundle stands in).
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
