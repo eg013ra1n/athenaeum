@@ -12,8 +12,9 @@
 //! only, the queue permit is acquired inside the run thread). Every other
 //! handler here does its own DB work directly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -922,41 +923,31 @@ pub const DEFAULT_MASTER_PREVIEW_MAX_PX: u32 = 512;
 pub const MIN_MASTER_PREVIEW_MAX_PX: u32 = 64;
 pub const MAX_MASTER_PREVIEW_MAX_PX: u32 = 2048;
 
-/// JPEG bytes for one master light a run wrote (ruling R-M4d-5). Resolves
-/// `(run_id, group_key, kind)` through `master_lights` — the only place a
-/// master light is cataloged — then serves the cached render under
-/// `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<step>.jpg`,
-/// re-rendering whenever the master's own mtime is newer than the cache
-/// file's (a rebuild in place, a restored archive). An unknown run, an
-/// output this run never wrote, or a master file gone from disk is
-/// `NotFound` (404 at the web boundary).
-///
-/// `max_px` is clamped into
-/// `[MIN_MASTER_PREVIEW_MAX_PX, MAX_MASTER_PREVIEW_MAX_PX]` (fix round 1, I1)
-/// and only ever reaches the render as one of three steps; the cache file is
-/// named after that STEP, so two requests asking for different sizes that
-/// resolve to the same picture share one file instead of each minting their
-/// own.
-///
-/// The cache is an optimization, never a requirement: a run row with no
-/// working folder recorded, an unwritable previews directory or an
-/// unreadable cache file all fall through to a fresh render with a `warn!`,
-/// and the bytes are returned either way.
-pub fn get_master_light_preview(
+/// The catalog lookup + on-disk paths behind [`cached_master_light_preview`]
+/// and [`render_master_light_preview`] — a scoped DB read, dropped before a
+/// single pixel is touched (the same discipline
+/// `routes::images::get_frame_preview` follows), plus the `stat` needed to
+/// know the master's own mtime. Resolves `(run_id, group_key, kind)` through
+/// `master_lights` — the only place a master light is cataloged — so both
+/// entry points below share one `NotFound` story for an unknown run, an
+/// output this run never wrote, or a master file gone from disk.
+struct ResolvedMasterLight {
+    master_path: PathBuf,
+    master_mtime: SystemTime,
+    cache_path: Option<PathBuf>,
+    max_px: u32,
+}
+
+fn resolve_master_light(
     ctx: &ServiceContext,
     run_id: i64,
     group_key: &str,
     kind: MasterLightKind,
     max_px: u32,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<ResolvedMasterLight, ApiError> {
     let max_px = max_px.clamp(MIN_MASTER_PREVIEW_MAX_PX, MAX_MASTER_PREVIEW_MAX_PX);
     let step = crate::api::files::preview_step(max_px).1;
 
-    // Everything the render needs is read here and the catalog lock is
-    // dropped before a single pixel is touched — the same discipline
-    // `routes::images::get_frame_preview` follows, so a slow render never
-    // holds the DB against the rest of the app.
-    //
     // Fix round 1, m4: no `heal_interrupted_runs` here, unlike every other
     // handler in this module. Those run once per user action; this one runs
     // per group per panel mount, and a preview of an already-WRITTEN master
@@ -984,11 +975,14 @@ pub fn get_master_light_preview(
         (row.path, row.group_key, run_row.working_dir, set_name)
     };
 
-    let master = Path::new(&master_path);
-    let master_mtime = std::fs::metadata(master)
+    let master_path = PathBuf::from(master_path);
+    let master_mtime = std::fs::metadata(&master_path)
         .and_then(|m| m.modified())
         .map_err(|e| {
-            ApiError::NotFound(format!("master light {} is not on disk: {e}", master.display()))
+            ApiError::NotFound(format!(
+                "master light {} is not on disk: {e}",
+                master_path.display()
+            ))
         })?;
 
     let cache_path = if working_dir.trim().is_empty() {
@@ -1004,38 +998,110 @@ pub fn get_master_light_preview(
         )
     };
 
-    if let Some(cache) = cache_path.as_deref() {
-        // Fresh means "rendered no earlier than the master was last
-        // written" — a rebuilt-in-place master (same path, newer mtime)
-        // therefore invalidates its own thumbnail with no bookkeeping.
-        let fresh = std::fs::metadata(cache)
-            .and_then(|m| m.modified())
-            .map(|cached_at| cached_at >= master_mtime)
-            .unwrap_or(false);
-        if fresh {
-            match std::fs::read(cache) {
-                Ok(bytes) if !bytes.is_empty() => {
-                    tracing::debug!(run_id, %group_key, kind = kind.as_db_str(), path = %cache.display(), "master preview served from cache");
-                    return Ok(bytes);
-                }
-                Ok(_) => tracing::warn!(
-                    run_id,
-                    path = %cache.display(),
-                    "cached master preview is empty; re-rendering"
-                ),
-                Err(error) => tracing::warn!(
-                    run_id,
-                    path = %cache.display(),
-                    %error,
-                    "cached master preview could not be read; re-rendering"
-                ),
-            }
+    Ok(ResolvedMasterLight { master_path, master_mtime, cache_path, max_px })
+}
+
+/// A fresh cache read for an already-resolved master light. Fresh means
+/// "rendered no earlier than the master was last written" — a rebuilt-in-
+/// place master (same path, newer mtime) therefore invalidates its own
+/// thumbnail with no bookkeeping. `None` on any miss (no working folder
+/// recorded, no cache file yet, a stale one, or an unreadable/empty one,
+/// each logged as a `warn!` where it is not simply "no cache file yet") —
+/// never an error; the cache is an optimization, never a requirement.
+fn read_fresh_master_preview(resolved: &ResolvedMasterLight) -> Option<Vec<u8>> {
+    let cache = resolved.cache_path.as_deref()?;
+    let fresh = std::fs::metadata(cache)
+        .and_then(|m| m.modified())
+        .map(|cached_at| cached_at >= resolved.master_mtime)
+        .unwrap_or(false);
+    if !fresh {
+        return None;
+    }
+    match std::fs::read(cache) {
+        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+        Ok(_) => {
+            tracing::warn!(path = %cache.display(), "cached master preview is empty; re-rendering");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(path = %cache.display(), %error, "cached master preview could not be read; re-rendering");
+            None
         }
     }
+}
 
-    let bytes = crate::api::files::render_preview_from_path(master, max_px, &ctx.image_pool)?;
+/// The cache-only half of the master-light preview (M4d final review — the
+/// whole-branch review's Important #1): a caller can check this without
+/// holding any concurrency permit, and fall through to
+/// [`render_master_light_preview`] only on a `None`. The split exists so
+/// both hosts take their image-processing semaphore permit around the
+/// pixel-touching render alone, never around the (frequent) cache hit — a
+/// full read of a drizzled master's float buffer is hundreds of MB, which is
+/// what the permit bounds; a cache hit touches no pixels at all. Same
+/// `NotFound`/clamp semantics as [`render_master_light_preview`] — see its
+/// doc comment.
+pub fn cached_master_light_preview(
+    ctx: &ServiceContext,
+    run_id: i64,
+    group_key: &str,
+    kind: MasterLightKind,
+    max_px: u32,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let resolved = resolve_master_light(ctx, run_id, group_key, kind, max_px)?;
+    let bytes = read_fresh_master_preview(&resolved);
+    if bytes.is_some() {
+        tracing::debug!(run_id, %group_key, kind = kind.as_db_str(), "master preview served from cache");
+    }
+    Ok(bytes)
+}
 
-    if let Some(cache) = cache_path.as_deref() {
+/// JPEG bytes for one master light a run wrote (ruling R-M4d-5), rendering
+/// (and caching) whatever [`cached_master_light_preview`] did not already
+/// have. This is the pixel-touching half — callers that gate concurrent
+/// image processing on a semaphore (both hosts do, matching
+/// `routes::images::get_frame_preview` / `commands_rustafits::
+/// read_fits_image_bytes`) must acquire the permit before calling this, not
+/// before the cache-only check above. Serves the render under
+/// `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<step>.jpg`. An
+/// unknown run, an output this run never wrote, or a master file gone from
+/// disk is `NotFound` (404 at the web boundary).
+///
+/// `max_px` is clamped into
+/// `[MIN_MASTER_PREVIEW_MAX_PX, MAX_MASTER_PREVIEW_MAX_PX]` (fix round 1, I1)
+/// and only ever reaches the render as one of three steps; the cache file is
+/// named after that STEP, so two requests asking for different sizes that
+/// resolve to the same picture share one file instead of each minting their
+/// own.
+///
+/// The cache is an optimization, never a requirement: a run row with no
+/// working folder recorded, an unwritable previews directory or an
+/// unreadable cache file all fall through to a fresh render with a `warn!`,
+/// and the bytes are returned either way.
+pub fn render_master_light_preview(
+    ctx: &ServiceContext,
+    run_id: i64,
+    group_key: &str,
+    kind: MasterLightKind,
+    max_px: u32,
+) -> Result<Vec<u8>, ApiError> {
+    let resolved = resolve_master_light(ctx, run_id, group_key, kind, max_px)?;
+
+    // A concurrent caller may have rendered and cached the same preview
+    // between this call and the caller's own `cached_master_light_preview`
+    // check (or this may be a caller that skipped straight to this
+    // function) — re-check before touching a single pixel.
+    if let Some(bytes) = read_fresh_master_preview(&resolved) {
+        tracing::debug!(run_id, %group_key, kind = kind.as_db_str(), "master preview served from cache");
+        return Ok(bytes);
+    }
+
+    let bytes = crate::api::files::render_preview_from_path(
+        &resolved.master_path,
+        resolved.max_px,
+        &ctx.image_pool,
+    )?;
+
+    if let Some(cache) = resolved.cache_path.as_deref() {
         if let Err(error) = write_preview_cache(cache, &bytes) {
             tracing::warn!(
                 run_id,
@@ -1050,7 +1116,7 @@ pub fn get_master_light_preview(
         run_id,
         %group_key,
         kind = kind.as_db_str(),
-        path = %master.display(),
+        path = %resolved.master_path.display(),
         "master preview rendered"
     );
     Ok(bytes)
@@ -1791,12 +1857,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = get_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
+        let err = render_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
             .unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
 
         let err =
-            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
 
         // A row whose file never existed on disk.
@@ -1818,7 +1884,7 @@ mod tests {
         )
         .unwrap();
         let err =
-            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
     }
 
@@ -1875,7 +1941,7 @@ mod tests {
         .unwrap();
 
         let first =
-            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_eq!(&first[..3], &[0xFF, 0xD8, 0xFF], "JPEG magic");
 
         let cache = WorkingLayout::new(working.path(), &set_slug("LDN 1272")).preview_path(
@@ -1892,7 +1958,7 @@ mod tests {
         let sentinel = b"\xFF\xD8\xFFnot-a-real-render".to_vec();
         std::fs::write(&cache, &sentinel).unwrap();
         let second =
-            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_eq!(second, sentinel, "the cached file must be served as-is");
 
         // Re-writing the master makes its mtime newer than the cache's, so
@@ -1900,9 +1966,80 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
         let third =
-            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_ne!(third, sentinel, "a newer master must invalidate the cache");
         assert_eq!(third, first, "the same pixels render to the same bytes");
+    }
+
+    /// M4d final review, Important #1: `cached_master_light_preview` is the
+    /// permit-free half both hosts check before taking their image
+    /// semaphore. `None` on a cold cache (never an error), `Some` with the
+    /// exact rendered bytes once `render_master_light_preview` has written
+    /// one, and the same `NotFound` an unknown run gets from the render
+    /// path — the cache-only check must not paper over a bad lookup.
+    #[test]
+    fn cached_master_light_preview_is_permit_free_and_matches_the_render() {
+        let (tmp, ctx) = test_ctx();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        let working = tempfile::tempdir().unwrap();
+        let run_id = crate::db::stacking::insert_run(
+            &conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.path().to_str().unwrap(),
+                output_dir: tmp.path().to_str().unwrap(),
+            },
+        )
+        .unwrap();
+
+        // An unknown run is `NotFound` through the cache-only path too.
+        let err = cached_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+        let (width, height) = (32usize, 24usize);
+        let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+        let master = tmp.path().join("master_light.fits");
+        crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+        crate::db::stacking::insert_master_light(
+            &conn,
+            &crate::db::stacking::NewMasterLight {
+                frames_set_id: set_id,
+                run_id,
+                group_key: "g",
+                kind: "master",
+                path: master.to_str().unwrap(),
+                format: "fits",
+                width: width as i64,
+                height: height as i64,
+                channels: 1,
+                frames: 3,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+
+        // Cold cache: `Ok(None)`, no permit needed, nothing rendered.
+        let miss = cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256)
+            .unwrap();
+        assert_eq!(miss, None, "a cold cache must not render");
+
+        let rendered =
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        assert_eq!(&rendered[..3], &[0xFF, 0xD8, 0xFF], "JPEG magic");
+
+        let hit = cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256)
+            .unwrap();
+        assert_eq!(hit, Some(rendered), "a warm cache must match the render exactly");
     }
 
     /// Fix round 1, I1: `max_px` is clamped into
@@ -1985,10 +2122,10 @@ mod tests {
 
         // (1) An out-of-range request clamps: `u32::MAX` writes the SAME file
         // the ceiling writes, and never a `full` one.
-        let huge = get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, u32::MAX)
+        let huge = render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, u32::MAX)
             .unwrap();
         assert_eq!(names(), vec!["g_master_preview.jpg".to_string()], "{:?}", names());
-        let ceiling = get_master_light_preview(
+        let ceiling = render_master_light_preview(
             &ctx,
             run_id,
             "g",
@@ -2001,8 +2138,8 @@ mod tests {
 
         // Same for the floor: 0 clamps up to the smallest real step.
         let zero =
-            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 0).unwrap();
-        let floor = get_master_light_preview(
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 0).unwrap();
+        let floor = render_master_light_preview(
             &ctx,
             run_id,
             "g",
@@ -2013,7 +2150,7 @@ mod tests {
         assert_eq!(zero, floor);
 
         // (2) 64 and 512 both resolve to `thumbnail` — one more file, not two.
-        let _ = get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 512).unwrap();
+        let _ = render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 512).unwrap();
         assert_eq!(
             names(),
             vec![

@@ -197,8 +197,13 @@ thumbnails, and named user presets beside the three built-in transforms.
 **Tasks 1–4 are code-complete with green gates and clean reviews
 (`4748f91c`..`7d5e4780`), and the LDN 1272 acceptance run (Task 6) RAN on
 2026-09-14 — `docs/superpowers/research/2026-09-14-m4d-acceptance-run.md`,
-runs 34–36, verdict "M4d is accepted".** Everything below is what the four
-task reports left open, plus what the acceptance run itself left behind.
+runs 34–36, verdict "M4d is accepted".** The final whole-branch review's one
+Important finding is also fixed: the master-light preview render now takes
+`image_semaphore` on both hosts (a cache hit stays permit-free), and the
+Results card fetches a group's drizzle thumbnail only after its master
+thumbnail has resolved instead of firing both at once. Everything below is
+what the four task reports left open, plus what the acceptance run itself
+left behind.
 
 - **Acceptance run (Task 6), what it settled and what it owes:** Bayer drizzle
   CLOSES the M3/M4a residual "OSC drizzled G/B ≈ 10–12 % broader than the
@@ -248,15 +253,17 @@ task reports left open, plus what the acceptance run itself left behind.
   row-flipped — flipping would have to transform the master's WCS/SIP cards
   too (`CRPIX2`, the CD matrix, the odd-`v` SIP terms), which is its own
   feature; the follow-up is named "flip rows + transform WCS/SIP" (ruling
-  R-T2-1). The rejection maps (always FITS) carry no `ROWORDER` of their
-  own. `XISF:CreationTime` is the wall clock, so an XISF master is not
-  byte-reproducible across two runs of the same input — every byte-identity
-  pin stays on `format = fits`. A non-ASCII card value logs the sanitize
-  warning twice (once in `xisf_keyword_value`, once in the shared card-parity
-  check). **OWNER SMOKE OWED:** open an Athenaeum `.xisf` master in the
-  external tool — the padding declared inside `headerLength`, samples above
-  the defaulted `0:1` bounds, and `colorSpace="RGB"` on a 3-plane weight map
-  are the three header choices most likely to matter to a foreign reader.
+  R-T2-1). The rejection maps' missing `ROWORDER` is fixed in the final
+  review wave (`rejection_map_cards` now copies it through, matching
+  `weight_map_cards`). `XISF:CreationTime` is the wall clock, so an XISF
+  master is not byte-reproducible across two runs of the same input —
+  every byte-identity pin stays on `format = fits`. A non-ASCII card value
+  logs the sanitize warning twice (once in `xisf_keyword_value`, once in
+  the shared card-parity check). **OWNER SMOKE OWED:** open an Athenaeum
+  `.xisf` master in the external tool — the padding declared inside
+  `headerLength`, samples above the defaulted `0:1` bounds, and
+  `colorSpace="RGB"` on a 3-plane weight map are the three header choices
+  most likely to matter to a foreign reader.
 - **Task 3 (`master_lights` + preview):** the group-row `update_group` call
   and the `master_lights` inserts share one pooled connection but are NOT one
   `rusqlite` transaction (the pre-existing shape of `update_group`) — a crash
@@ -279,11 +286,8 @@ task reports left open, plus what the acceptance run itself left behind.
   edit); the plan text is left as-is, as history.
 - **Task 4 (user presets):** `StackingSection.tsx`'s own preset selector
   (Settings → Stacking, the global defaults) was NOT extended with user
-  presets — out of the brief's scope, still built-ins only. The success
-  `notify()` calls use `kind: 'generic'` while the sibling stacking
-  notification in the same file (`StackingTab.tsx`) uses `kind: 'stacking'`
-  — a deliberate brief-literal choice, flagged in case consistency is
-  preferred. **OWNER CLICK-THROUGH OWED:** the tab's preset menu — save-as
+  presets — out of the brief's scope, still built-ins only.
+  **OWNER CLICK-THROUGH OWED:** the tab's preset menu — save-as
   inline form, apply, delete confirm, and the quoted label. Deferred minors
   from the Task 4 review: Escape inside the inline save form closes the
   WHOLE menu, not just the form (an acknowledged trade-off, noted in a code

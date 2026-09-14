@@ -241,6 +241,13 @@ export interface MasterPreview {
  *  the bytes into a blob URL and revokes it on unmount or when the
  *  arguments change.
  *
+ *  `enabled` (M4d final review, Important #1 part 3): `false` holds the
+ *  fetch back entirely — `ResultsPanel.tsx`'s `MasterCard` uses this to
+ *  fetch a group's drizzle thumbnail only after its master thumbnail has
+ *  resolved, so the two no longer fan out two full-master reads into the
+ *  backend at once. Behaves like `runId`/`groupKey` being absent: no
+ *  request, `url`/`error` cleared, `loading` false.
+ *
  *  StrictMode-safe by the cancelled-flag pattern: the object URL is created
  *  only if the effect is still live when the bytes arrive, so a
  *  double-mounted dev render never leaks one. */
@@ -249,13 +256,14 @@ export function useMasterPreview(
   groupKey: string | null,
   kind: MasterLightKind,
   maxPx = 512,
+  enabled = true,
 ): MasterPreview {
   const [url, setUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (runId == null || !groupKey) {
+    if (!enabled || runId == null || !groupKey) {
       setUrl(null);
       setError(null);
       setLoading(false);
@@ -294,7 +302,7 @@ export function useMasterPreview(
       if (objectUrl) URL.revokeObjectURL(objectUrl);
       setUrl(null);
     };
-  }, [runId, groupKey, kind, maxPx]);
+  }, [runId, groupKey, kind, maxPx, enabled]);
 
   return { url, loading, error };
 }

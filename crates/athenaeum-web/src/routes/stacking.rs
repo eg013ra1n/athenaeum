@@ -430,27 +430,64 @@ pub struct MasterLightPreviewArgs {
 /// off the async executor — the render is CPU-bound, exactly like
 /// `routes::images::get_frame_preview`'s.
 ///
-/// Two things that route does and this one deliberately does not:
-/// - **No VNG gate.** A master light is an integrated float image with no
-///   CFA pattern, so `rustafits_processor::needs_vng_gate` is false for it
-///   at every resolution a preview asks for.
-/// - **No `image_semaphore` permit.** That semaphore exists because the
-///   blink viewer's *prefetch* can have dozens of FULL-resolution renders in
-///   flight. `api::stacking::MAX_MASTER_PREVIEW_MAX_PX` puts `Resolution::Full`
-///   out of this command's reach entirely (fix round 1, I1), so the worst a
-///   caller can ask for here is a half-scale render; the fan-out is a run's
-///   group count, once per panel mount, and the CPU is already bounded by
-///   `ctx.image_pool`, which `process_fits_to_jpeg` runs on. Queueing
-///   thumbnails behind the blink viewer's permit would make the Results
-///   panel wait on an unrelated feature.
+/// One thing that route does and this one deliberately does not: **no VNG
+/// gate.** A master light is an integrated float image with no CFA
+/// pattern, so `rustafits_processor::needs_vng_gate` is false for it at
+/// every resolution a preview asks for.
+///
+/// M4d final review, Important #1: this DOES take `image_semaphore`, the
+/// same way `routes::images::get_frame_preview` does. The earlier reasoning
+/// here — that `api::stacking::MAX_MASTER_PREVIEW_MAX_PX` keeps this
+/// endpoint cheap — mistook what the clamp bounds: `Resolution` is a
+/// downscale applied AFTER `ImageConverter::read_raw` reads the file, so
+/// even a half-scale thumbnail of a drizzled master first allocates that
+/// master's full float buffer — hundreds of MB to over a GB for a 3×
+/// drizzled OSC master. The clamp only keeps the ENCODE cheap, not the
+/// read. The cache-only check below (`cached_master_light_preview`) runs
+/// with no permit, so a hit — the common case, one render per group per
+/// panel mount — never waits behind an unrelated render; only a genuine
+/// cache miss takes the permit, carried into the `spawn_blocking` closure
+/// so a client disconnect can't release it under a still-running render.
 async fn render_master_light_preview(
     state: WebAppState,
     args: MasterLightPreviewArgs,
 ) -> Result<Response, (StatusCode, String)> {
     let ctx = state.ctx.clone();
+    let run_id = args.run_id;
+    let group_key = args.group_key;
+    let kind = args.kind;
     let max_px = args.max_px.unwrap_or(api::DEFAULT_MASTER_PREVIEW_MAX_PX);
+
+    let cached = {
+        let ctx = ctx.clone();
+        let group_key = group_key.clone();
+        tokio::task::spawn_blocking(move || {
+            api::cached_master_light_preview(&ctx, run_id, &group_key, kind, max_px)
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Master-preview cache task panicked: {}", e),
+            )
+        })?
+        .map_err(api_err)?
+    };
+    if let Some(bytes) = cached {
+        return Ok(([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response());
+    }
+
+    let sem = state.image_semaphore.read().unwrap().clone();
+    let _permit = sem.acquire_owned().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Semaphore closed: {}", e),
+        )
+    })?;
+
     let bytes = tokio::task::spawn_blocking(move || {
-        api::get_master_light_preview(&ctx, args.run_id, &args.group_key, args.kind, max_px)
+        let _permit = _permit; // hold the permit until the render completes
+        api::render_master_light_preview(&ctx, run_id, &group_key, kind, max_px)
     })
     .await
     .map_err(|e| {
@@ -794,6 +831,88 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "expected JPEG magic");
+    }
+
+    /// M4d final review, Important #1: two concurrent previews for
+    /// DIFFERENT kinds of the same run both succeed against a one-permit
+    /// `image_semaphore` (`db_test_state` builds one — see there) — the
+    /// permit is taken around the pixel-touching render only, so the two
+    /// requests genuinely serialize on it rather than one erroring or the
+    /// pair deadlocking.
+    #[tokio::test]
+    async fn concurrent_previews_for_different_kinds_both_succeed_on_one_permit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let working = tempfile::TempDir::new().unwrap();
+        let db = athenaeum_core::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let (run_id, group_key) = seed_master_light(&db.conn(), tmp.path(), working.path());
+
+        // A second output for the SAME run/group — a weight map — so the
+        // two concurrent requests below resolve to different cache files;
+        // neither can short-circuit on the other's cache write.
+        let frames_set_id: i64 = db
+            .conn()
+            .query_row(
+                "SELECT frames_set_id FROM stacking_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (width, height) = (32usize, 24usize);
+        let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+        let weight_map = tmp.path().join("weight_map.fits");
+        athenaeum_core::fits_writer::write_fits_f32(&weight_map, width, height, 1, &data, &[])
+            .unwrap();
+        athenaeum_core::db::stacking::insert_master_light(
+            &db.conn(),
+            &athenaeum_core::db::stacking::NewMasterLight {
+                frames_set_id,
+                run_id,
+                group_key: &group_key,
+                kind: "weight_map",
+                path: weight_map.to_str().unwrap(),
+                format: "fits",
+                width: width as i64,
+                height: height as i64,
+                channels: 1,
+                frames: 4,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+
+        let state = db_test_state(db);
+        let router = crate::routes::build_router(state, None);
+
+        let request = |kind: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/get_master_light_preview")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"runId":{run_id},"groupKey":"{group_key}","kind":"{kind}","maxPx":256}}"#
+                )))
+                .unwrap()
+        };
+
+        let (a, b) = tokio::join!(
+            router.clone().oneshot(request("master")),
+            router.clone().oneshot(request("weightMap")),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+
+        assert_eq!(a.status(), StatusCode::OK, "master preview");
+        assert_eq!(b.status(), StatusCode::OK, "weight-map preview");
+        let a_body = to_bytes(a.into_body(), usize::MAX).await.unwrap();
+        let b_body = to_bytes(b.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            a_body.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "master: expected JPEG magic"
+        );
+        assert!(
+            b_body.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "weight map: expected JPEG magic"
+        );
     }
 
     // ── M4d Task 4: user presets (ruling R-M4d-6) ────────────────────────

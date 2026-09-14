@@ -151,28 +151,26 @@ function RevealOrPath({ path }: { path: string | null }) {
  *  `drizzlePath` — see the render below. */
 type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 'drizzle'>;
 
-/** One written master light's thumbnail (M4d Task 3, ruling R-M4d-5) —
- *  160 px tall, `object-contain` so a wide master is never cropped, on a
- *  `bg-surface-elevated` ground that IS the loading state (no spinner for a
- *  thumbnail). A failed render says so in one muted line rather than
- *  leaving a blank box: the usual cause is a master that has been moved or
- *  archived since the run, which the user can act on. */
-function MasterThumbnail({
-  runId,
-  groupKey,
-  kind,
-  label,
-}: {
-  runId: number;
-  groupKey: string;
-  kind: MasterLightKind;
-  label: string;
-}) {
-  const { url, error } = useMasterPreview(runId, groupKey, kind);
-
+/** The actual preview render for one written master light (M4d Task 3,
+ *  ruling R-M4d-5) — 160 px tall, `object-contain` so a wide master is
+ *  never cropped, on a `bg-surface-elevated` ground that IS the loading
+ *  state (no spinner for a thumbnail). A failed render says so in one
+ *  muted line rather than leaving a blank box: the usual cause is a master
+ *  that has been moved or archived since the run, which the user can act
+ *  on — `truncate` (M4d final review nit) keeps a long backend message on
+ *  one line, the full text still reachable via `title`.
+ *
+ *  Pure/presentational — no fetch of its own — so `MasterCard` can call
+ *  [`useMasterPreview`] directly for the master thumbnail (it needs that
+ *  state to sequence the drizzle one below) while [`MasterThumbnail`]
+ *  keeps owning the fetch for every other caller. `loading="lazy"` was
+ *  dropped (M4d final review nit): the `src` is always a same-page blob
+ *  URL the hook already fetched eagerly, so the attribute deferred
+ *  nothing. */
+function ThumbnailBox({ url, error, label }: { url: string | null; error: string | null; label: string }) {
   if (error) {
     return (
-      <p className="text-[10px] text-content-muted" title={error}>
+      <p className="text-[10px] text-content-muted truncate" title={error}>
         No preview — {error}
       </p>
     );
@@ -180,16 +178,32 @@ function MasterThumbnail({
 
   return (
     <div className="h-40 w-full rounded bg-surface-elevated border border-border/40 overflow-hidden">
-      {url && (
-        <img
-          src={url}
-          alt={`Preview of ${label}`}
-          className="h-full w-full object-contain"
-          loading="lazy"
-        />
-      )}
+      {url && <img src={url} alt={`Preview of ${label}`} className="h-full w-full object-contain" />}
     </div>
   );
+}
+
+/** Fetches and renders one written master light's thumbnail via
+ *  [`useMasterPreview`] + [`ThumbnailBox`]. `enabled` (M4d final review,
+ *  Important #1 part 3) gates the fetch itself — `MasterCard` uses it to
+ *  hold the drizzle thumbnail's request until the master's own has
+ *  resolved, so the two panels-per-group no longer fan out two full-master
+ *  reads into the backend at once. */
+function MasterThumbnail({
+  runId,
+  groupKey,
+  kind,
+  label,
+  enabled = true,
+}: {
+  runId: number;
+  groupKey: string;
+  kind: MasterLightKind;
+  label: string;
+  enabled?: boolean;
+}) {
+  const { url, error } = useMasterPreview(runId, groupKey, kind, undefined, enabled);
+  return <ThumbnailBox url={url} error={error} label={label} />;
 }
 
 /** `SummaryGroup.lnReferencePath` lives on the run's finished `summary`, not
@@ -225,6 +239,23 @@ function MasterCard({
   const stats = parseGroupStats(group.statsJson);
   const dstats = drizzleSummary?.drizzle ?? null;
 
+  // M4d final review, Important #1 part 3: fetch the master's own thumbnail
+  // first, and hold the drizzle one back until it resolves — a group with
+  // both previews used to fire two renders into the backend at once, each
+  // reading the master light's full float buffer before downscaling.
+  // `useMasterPreview` is called directly here (not through
+  // `MasterThumbnail`) because this card needs the master's `url`/`error`
+  // to know when it has settled; passing `null` args when there is no
+  // master path is the hook's own "nothing to fetch" case, so
+  // `masterResolved` starts (and stays) `true` and the drizzle fetch is
+  // never blocked on an output this group never wrote.
+  const master = useMasterPreview(
+    group.masterPath ? group.runId : null,
+    group.masterPath ? group.groupKey : null,
+    'master',
+  );
+  const masterResolved = !group.masterPath || master.url !== null || master.error !== null;
+
   return (
     <div className="bg-surface rounded-lg border border-border p-3 space-y-2 min-w-0">
       <div className="flex items-start gap-2">
@@ -241,12 +272,7 @@ function MasterCard({
        *  group row records, so a group that never wrote the output asks for
        *  no preview at all (rather than fetching a guaranteed 404). */}
       {group.masterPath && (
-        <MasterThumbnail
-          runId={group.runId}
-          groupKey={group.groupKey}
-          kind="master"
-          label={basename(group.masterPath)}
-        />
+        <ThumbnailBox url={master.url} error={master.error} label={basename(group.masterPath)} />
       )}
       {group.drizzlePath && (
         <MasterThumbnail
@@ -254,6 +280,7 @@ function MasterCard({
           groupKey={group.groupKey}
           kind="drizzle"
           label={basename(group.drizzlePath)}
+          enabled={masterResolved}
         />
       )}
 

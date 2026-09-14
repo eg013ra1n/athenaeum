@@ -18,7 +18,7 @@ const CLEANUP_POLICIES: CleanupPolicy[] = ['keepAll', 'deleteRegistered', 'delet
 
 const FORMATS: { value: OutputFormat; label: string }[] = [
   { value: 'fits', label: 'FITS — float32, the format every tool here reads' },
-  { value: 'xisf', label: 'XISF: one image, uncompressed, the same cards' },
+  { value: 'xisf', label: 'XISF — one image, uncompressed, the same cards' },
 ];
 
 export interface OutputPanelProps {

@@ -526,7 +526,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       closePresetMenu();
       notify({
         tone: 'success',
-        kind: 'generic',
+        kind: 'stacking',
         toast: true,
         title: `Preset '${name}' saved`,
         detail: 'The current stacking settings, without the folders.',
@@ -535,7 +535,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       console.error('[StackingTab] save_stacking_preset failed:', err);
       notify({
         tone: 'warning',
-        kind: 'generic',
+        kind: 'stacking',
         toast: true,
         title: 'Preset not saved',
         detail: String(err),
@@ -554,7 +554,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       setPresetPendingDelete(null);
       notify({
         tone: 'info',
-        kind: 'generic',
+        kind: 'stacking',
         toast: true,
         title: `Preset '${name}' deleted`,
         detail: left.length === 1 ? '1 preset left' : `${left.length} presets left`,
@@ -563,7 +563,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       console.error('[StackingTab] delete_stacking_preset failed:', err);
       notify({
         tone: 'warning',
-        kind: 'generic',
+        kind: 'stacking',
         toast: true,
         title: 'Preset not deleted',
         detail: String(err),

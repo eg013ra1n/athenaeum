@@ -480,8 +480,16 @@ pub struct WrittenMaster {
 /// Header cards for one rejection map: `IMAGETYP` `Rejection Map Low`/`High`
 /// (a plain card, not `FrameKind` — these are Athenaeum-only artifacts, not
 /// one of the frame kinds the catalog knows), `ATH_STK`/`ATH_STKV`, `BUNIT`,
-/// and the master's own `ATH_STKI`/`ATH_STKG` cards copied through so a map
-/// can be traced back to its run and group without opening the master too.
+/// and the master's own `ROWORDER`/`ATH_STKI`/`ATH_STKG` cards copied
+/// through so a map can be traced back to its run and group — and read back
+/// in the master's own row order — without opening the master too.
+///
+/// `ROWORDER` (M4d final review, Minor #3, matching the `weight_map_cards`
+/// precedent from Task 2 fix round 2): a rejection map IS the master's
+/// grid, row for row, so it must declare the same row order — otherwise an
+/// XISF rejection map would claim the synthesized `'BOTTOM-UP'` default
+/// beside a master that says `'TOP-DOWN'` (`fits_writer::xisf_writer`
+/// states the effective order explicitly).
 fn rejection_map_cards(label: &str, master_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
     let mut cards = vec![
         Card::new("IMAGETYP", CardValue::Str(format!("Rejection Map {label}")))?,
@@ -491,7 +499,7 @@ fn rejection_map_cards(label: &str, master_cards: &[Card]) -> Result<Vec<Card>, 
             .with_comment("stacking header version"),
         Card::new("BUNIT", CardValue::Str("count".into()))?.with_comment("rejected-sample count"),
     ];
-    for kw in ["ATH_STKI", "ATH_STKG"] {
+    for kw in ["ROWORDER", "ATH_STKI", "ATH_STKG"] {
         if let Some(c) = master_cards.iter().find(|c| c.keyword == kw) {
             cards.push(c.clone());
         }
@@ -1155,6 +1163,13 @@ mod tests {
         let mut cards = HeaderBuilder::new(FrameKind::MasterLight).build().unwrap();
         cards.push(Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap());
         cards.push(Card::new("ATH_STKG", CardValue::Str("group-1".into())).unwrap());
+        cards.push(
+            Card::new(
+                "ROWORDER",
+                CardValue::Str(crate::orientation::ROW_ORDER_TOP_DOWN.into()),
+            )
+            .unwrap(),
+        );
 
         let output = GroupOutput {
             width: w,
@@ -1199,11 +1214,21 @@ mod tests {
         assert_eq!(low_header.get_str("ATH_STK").as_deref(), Some("T"));
         assert_eq!(low_header.get_str("ATH_STKI").as_deref(), Some("run-1"));
         assert_eq!(low_header.get_str("ATH_STKG").as_deref(), Some("group-1"));
+        // M4d final review, Minor #3: a rejection map carries the master's
+        // own ROWORDER, matching `weight_map_cards`.
+        assert_eq!(
+            low_header.get_str("ROWORDER").as_deref(),
+            Some(crate::orientation::ROW_ORDER_TOP_DOWN)
+        );
 
         let high_header = FitsHeader::from_path(&rejhigh).unwrap();
         assert_eq!(
             high_header.get_str("IMAGETYP").as_deref(),
             Some("Rejection Map High")
+        );
+        assert_eq!(
+            high_header.get_str("ROWORDER").as_deref(),
+            Some(crate::orientation::ROW_ORDER_TOP_DOWN)
         );
         assert_eq!(high_header.get_str("ATH_STK").as_deref(), Some("T"));
 

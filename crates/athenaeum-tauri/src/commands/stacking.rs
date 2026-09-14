@@ -251,6 +251,14 @@ pub async fn cleanup_stacking_work(
 /// for the same reason `read_fits_image` does: the IPC layer would otherwise
 /// serialize the bytes as a JSON number array, several times their size.
 ///
+/// M4d final review, Important #1: `Resolution::Full` is out of this
+/// command's reach (`api::MAX_MASTER_PREVIEW_MAX_PX`), but a preview still
+/// reads the master's FULL float buffer before downscaling — hundreds of MB
+/// for a drizzled master — so this takes `image_semaphore` the same way
+/// `commands_rustafits::read_fits_image_bytes` does, around the render only:
+/// the cache-only check (`cached_master_light_preview`) runs first with no
+/// permit, so a hit never waits behind an unrelated full-resolution render.
+///
 /// `level = "debug"`: the Results panel fetches one of these per group (and
 /// a second per drizzled master), so an `info` span here would flood a run's
 /// log with per-thumbnail boundary events.
@@ -265,8 +273,25 @@ pub async fn get_master_light_preview(
 ) -> Result<tauri::ipc::Response, String> {
     let ctx = state.ctx.clone();
     let max_px = max_px.unwrap_or(api::DEFAULT_MASTER_PREVIEW_MAX_PX);
+
+    let cached = {
+        let ctx = ctx.clone();
+        let group_key = group_key.clone();
+        tokio::task::spawn_blocking(move || {
+            api::cached_master_light_preview(&ctx, run_id, &group_key, kind, max_px)
+        })
+        .await
+        .map_err(|e| format!("Master-preview cache task panicked: {e}"))?
+        .map_err(|e| e.to_string())?
+    };
+    if let Some(bytes) = cached {
+        return Ok(tauri::ipc::Response::new(bytes));
+    }
+
+    let sem = state.image_semaphore.read().unwrap().clone();
+    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
-        api::get_master_light_preview(&ctx, run_id, &group_key, kind, max_px)
+        api::render_master_light_preview(&ctx, run_id, &group_key, kind, max_px)
     })
     .await
     .map_err(|e| format!("Master-preview task panicked: {e}"))?

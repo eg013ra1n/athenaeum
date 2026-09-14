@@ -12855,7 +12855,7 @@ mod tests {
             "a weight map shares its drizzle's geometry"
         );
 
-        // The point lookup `get_master_light_preview` resolves a path with.
+        // The point lookup `render_master_light_preview` resolves a path with.
         let found = crate::db::stacking::find_master_light(
             &fixture.conn,
             started.run_id,
