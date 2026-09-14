@@ -107,6 +107,40 @@ pub struct StackingPresets {
     pub maximum_quality: StackingConfig,
 }
 
+/// One of the user's OWN saved presets (M4d Task 4, ruling R-M4d-6) — a
+/// name and the [`StackingConfig`] applying it installs. Distinct from
+/// [`StackingPresets`] in every way that matters: those three are code
+/// (built-in transforms, never editable, always present), these live in the
+/// `stacking.presets` settings row and are whatever the user put there.
+///
+/// `config.paths` is always the default here: [`save_stacking_preset`]
+/// strips the folder override before writing, so applying a preset can
+/// never move another frame set's working/output folders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedPreset {
+    pub name: String,
+    pub config: StackingConfig,
+}
+
+/// The longest a user preset's (trimmed) name may be, in CHARACTERS — not
+/// bytes, so a name of accented or CJK characters is bounded the way it
+/// reads rather than the way it encodes.
+pub const PRESET_NAME_MAX: usize = 60;
+
+/// How many DISTINCT user presets the `stacking.presets` row may hold. The
+/// row is one settings value read whole on every list, so the cap is what
+/// keeps it a small document; an upsert of an existing name is never a
+/// 51st entry.
+pub const PRESETS_MAX: usize = 50;
+
+/// The one message every name-validation failure reports — kept as a
+/// constant so the handler, the tests and (through the error body) the tab
+/// cannot drift apart on its wording. Both an empty/whitespace-only name
+/// and one over [`PRESET_NAME_MAX`] get this same sentence: the bound is
+/// the interesting part, not which end was missed.
+pub const PRESET_NAME_ERROR: &str = "preset name must be 1–60 characters";
+
 // ── Plan / run lifecycle ─────────────────────────────────────────────────
 
 /// What a stacking run would do for `set_id` right now — groups, gate
@@ -342,6 +376,196 @@ pub fn get_stacking_presets() -> StackingPresets {
         fast_preview: preset(StackingPreset::FastPreview),
         maximum_quality: preset(StackingPreset::MaximumQuality),
     }
+}
+
+// ── User presets (M4d Task 4, ruling R-M4d-6) ────────────────────────────
+
+/// Case-insensitive name equality — the rule that makes `"Foo"` and
+/// `"foo"` ONE preset. `to_lowercase` (not `eq_ignore_ascii_case`): a name
+/// is free text the user typed, so `"Ålesund"` and `"ålesund"` must collide
+/// the same way `"A"` and `"a"` do.
+fn preset_name_eq(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Trim, then bound to 1-[`PRESET_NAME_MAX`] CHARACTERS. Returns the
+/// trimmed name, which is what gets stored — so `"  Foo  "` and `"Foo"`
+/// are the same preset, not two.
+fn validate_preset_name(name: &str) -> Result<String, ApiError> {
+    let trimmed = name.trim();
+    let len = trimmed.chars().count();
+    if len == 0 || len > PRESET_NAME_MAX {
+        return Err(ApiError::Invalid(PRESET_NAME_ERROR.to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// The stored `stacking.presets` document, LENIENTLY — a row that no longer
+/// decodes (a hand edit, a shape from a future/foreign build) warns and
+/// reads as no presets rather than failing the call. `list` uses this: a
+/// broken row must never turn the Stacking tab's preset menu into an error
+/// state, and nothing is lost by showing only the built-ins until it is
+/// fixed. Every WRITE path uses [`read_presets_strict`] instead.
+fn read_presets_lenient(conn: &Connection) -> Result<Vec<NamedPreset>, ApiError> {
+    let Some(raw) = configured_setting(conn, keys::STACKING_PRESETS)? else {
+        return Ok(Vec::new());
+    };
+    match serde_json::from_str::<Vec<NamedPreset>>(&raw) {
+        Ok(presets) => Ok(presets),
+        Err(error) => {
+            tracing::warn!(
+                key = keys::STACKING_PRESETS,
+                %error,
+                "stored stacking presets could not be decoded; reading as none"
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The stored `stacking.presets` document, STRICTLY — a row that no longer
+/// decodes is a [`ApiError::Conflict`] naming the key. The asymmetry with
+/// [`read_presets_lenient`] is deliberate and is the whole point: a read
+/// can shrug a broken row off, but a WRITE built on "it decoded as empty"
+/// would replace the user's whole preset list with one entry and destroy
+/// whatever was actually in there. Refusing hands them the key so they can
+/// rescue or clear it themselves.
+fn read_presets_strict(conn: &Connection) -> Result<Vec<NamedPreset>, ApiError> {
+    let Some(raw) = configured_setting(conn, keys::STACKING_PRESETS)? else {
+        return Ok(Vec::new());
+    };
+    // `warn!` and not `error!`: the command boundary's own `err` already
+    // logs the refusal at error level, and a second error event for the
+    // same failure would double-count it. This line exists only to carry
+    // the serde detail, which is diagnostic and has no place in the
+    // user-facing message below.
+    serde_json::from_str::<Vec<NamedPreset>>(&raw).map_err(|error| {
+        tracing::warn!(
+            key = keys::STACKING_PRESETS,
+            %error,
+            "stored stacking presets could not be decoded; refusing to overwrite them"
+        );
+        ApiError::Conflict(format!(
+            "the saved presets (setting `{}`) could not be read, so they were not changed — \
+             fix or clear that setting first",
+            keys::STACKING_PRESETS
+        ))
+    })
+}
+
+/// Sort by name case-insensitively, with the exact name as the tie-break so
+/// a hand-edited row holding two names that differ only in case still has
+/// ONE stable order. The single ordering rule all three commands answer in.
+fn sort_presets(presets: &mut [NamedPreset]) {
+    presets.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Sort, serialize, store — and hand the sorted list back, which is what
+/// both mutating commands return.
+fn write_presets(
+    conn: &Connection,
+    mut presets: Vec<NamedPreset>,
+) -> Result<Vec<NamedPreset>, ApiError> {
+    sort_presets(&mut presets);
+    let json = serde_json::to_string(&presets)
+        .map_err(|e| ApiError::Internal(format!("failed to serialize stacking presets: {e}")))?;
+    crate::db::set_setting(conn, keys::STACKING_PRESETS, &json)?;
+    Ok(presets)
+}
+
+/// The user's own saved presets, sorted by name (case-insensitively). A
+/// corrupt stored document reads as an empty list with a `warn!` — see
+/// [`read_presets_lenient`].
+pub fn list_stacking_presets(ctx: &ServiceContext) -> Result<Vec<NamedPreset>, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    let mut presets = read_presets_lenient(&conn)?;
+    // Every write goes out sorted, so this only matters for a row that
+    // reached the setting another way — but that is exactly the row whose
+    // order nothing else guarantees.
+    sort_presets(&mut presets);
+    Ok(presets)
+}
+
+/// Save (or replace) one user preset and return the full list.
+///
+/// Upsert is by name, case-insensitively — saving `"Foo"` over an existing
+/// `"foo"` replaces that one entry and the NEW spelling is what sticks (the
+/// user just told us how they want it written). `config.paths` is dropped:
+/// a preset is a recipe, and carrying one set's folders into every other
+/// set that applies it would be a silent, hard-to-see mistake. The cap
+/// applies to DISTINCT names only, so an upsert always succeeds.
+pub fn save_stacking_preset(
+    ctx: &ServiceContext,
+    name: String,
+    config: StackingConfig,
+) -> Result<Vec<NamedPreset>, ApiError> {
+    let name = validate_preset_name(&name)?;
+    let mut config = config;
+    config.paths = PathsConfig::default();
+
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    let mut presets = read_presets_strict(&conn)?;
+
+    match presets.iter().position(|p| preset_name_eq(&p.name, &name)) {
+        Some(i) => presets[i] = NamedPreset { name: name.clone(), config },
+        None => {
+            if presets.len() >= PRESETS_MAX {
+                return Err(ApiError::Invalid(format!(
+                    "too many presets ({PRESETS_MAX})"
+                )));
+            }
+            presets.push(NamedPreset { name: name.clone(), config });
+        }
+    }
+
+    let presets = write_presets(&conn, presets)?;
+    tracing::info!(
+        preset_name = %name,
+        count = presets.len(),
+        "stacking preset saved"
+    );
+    Ok(presets)
+}
+
+/// Delete one user preset by name (trimmed, case-insensitive) and return
+/// what is left. An unknown name is refused with `"no such preset"` rather
+/// than reported as a no-op success — the tab's confirm already told the
+/// user what it was about to remove, so "nothing happened" would be a lie.
+///
+/// Unlike [`save_stacking_preset`] this does NOT bound the name's length:
+/// delete only has to FIND an entry, and refusing an over-long name would
+/// make a row that reached the document another way (a hand edit, an older
+/// build) permanently undeletable through the API. An empty or unmatched
+/// name simply matches nothing.
+pub fn delete_stacking_preset(
+    ctx: &ServiceContext,
+    name: String,
+) -> Result<Vec<NamedPreset>, ApiError> {
+    let name = name.trim().to_string();
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    let mut presets = read_presets_strict(&conn)?;
+
+    let before = presets.len();
+    presets.retain(|p| !preset_name_eq(&p.name, &name));
+    if presets.len() == before {
+        return Err(ApiError::Invalid("no such preset".to_string()));
+    }
+
+    let presets = write_presets(&conn, presets)?;
+    tracing::info!(
+        preset_name = %name,
+        count = presets.len(),
+        "stacking preset deleted"
+    );
+    Ok(presets)
 }
 
 /// The global stacking defaults (the config a NEW frame set with no
@@ -1744,6 +1968,254 @@ mod tests {
         assert_ne!(
             layout.preview_path(run_id, "g", "master", "thumbnail"),
             layout.preview_path(run_id, "g", "master", "preview")
+        );
+    }
+
+    // ── M4d Task 4 (ruling R-M4d-6): user presets ─────────────────────────
+
+    /// A subscriber that records every event's level + message for the span
+    /// of one closure. Mirrors `api::masters::tests::capture_events` (not
+    /// `pub(crate)` there, and this task's file scope doesn't touch
+    /// `masters.rs`) — the only way to assert that a corrupt stored document
+    /// is announced rather than silently swallowed.
+    fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<(String, String)>>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut msg = Message(String::new());
+                event.record(&mut msg);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((event.metadata().level().to_string(), msg.0));
+            }
+        }
+
+        let seen = Seen::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone());
+        let out = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let events = seen.0.lock().unwrap().clone();
+        (out, events)
+    }
+
+    /// The raw `stacking.presets` settings row, exactly as it was written —
+    /// what the "`paths` is stripped on save" assertion has to look at (the
+    /// returned list is built from the same values in memory, so checking
+    /// only that would prove nothing about what reached the row).
+    fn stored_presets_json(ctx: &ServiceContext) -> Option<String> {
+        let db_handle = db(ctx).unwrap();
+        let conn = db_handle.conn();
+        crate::db::get_setting(&conn, keys::STACKING_PRESETS).unwrap()
+    }
+
+    /// Brief Step 1: two presets list back sorted by name CASE-INSENSITIVELY
+    /// (`"alpha"` before `"Beta"` — a byte-order sort would put every
+    /// uppercase name first), and every mutation returns the full list.
+    #[test]
+    fn presets_list_sorted_case_insensitively() {
+        let (_tmp, ctx) = test_ctx();
+        assert!(list_stacking_presets(&ctx).unwrap().is_empty());
+
+        let after_first =
+            save_stacking_preset(&ctx, "Beta".into(), StackingConfig::default()).unwrap();
+        assert_eq!(
+            after_first
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Beta"],
+            "a save returns the full list, not just the saved entry"
+        );
+
+        save_stacking_preset(&ctx, "alpha".into(), preset(StackingPreset::FastPreview)).unwrap();
+        let listed = list_stacking_presets(&ctx).unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "Beta"]
+        );
+        assert_eq!(
+            listed[0].config,
+            preset(StackingPreset::FastPreview),
+            "each preset keeps its own config"
+        );
+    }
+
+    /// Brief Step 1: saving the SAME name in a different case upserts rather
+    /// than duplicating — and the stored spelling becomes the NEW one.
+    #[test]
+    fn saving_the_same_name_in_another_case_upserts() {
+        let (_tmp, ctx) = test_ctx();
+        save_stacking_preset(&ctx, "foo".into(), StackingConfig::default()).unwrap();
+        let after =
+            save_stacking_preset(&ctx, "  FOO  ".into(), preset(StackingPreset::MaximumQuality))
+                .unwrap();
+
+        assert_eq!(after.len(), 1, "one entry, not two");
+        assert_eq!(
+            after[0].name, "FOO",
+            "the new spelling wins; the name is trimmed"
+        );
+        assert_eq!(after[0].config, preset(StackingPreset::MaximumQuality));
+    }
+
+    /// Brief Step 1: `paths` never travels into a preset — the STORED JSON
+    /// carries the default (both folders `null`), whatever the caller sent.
+    #[test]
+    fn saving_strips_the_paths_override() {
+        let (_tmp, ctx) = test_ctx();
+        let mut cfg = StackingConfig::default();
+        cfg.paths = PathsConfig {
+            working_dir: Some("/tmp/work".into()),
+            output_dir: Some("/tmp/out".into()),
+        };
+
+        let after = save_stacking_preset(&ctx, "with folders".into(), cfg).unwrap();
+        assert_eq!(after[0].config.paths, PathsConfig::default());
+
+        let raw = stored_presets_json(&ctx).expect("the setting row exists");
+        let decoded: Vec<NamedPreset> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            decoded[0].config.paths,
+            PathsConfig::default(),
+            "the stored document must not carry folders either"
+        );
+        assert!(
+            raw.contains("\"workingDir\":null") && raw.contains("\"outputDir\":null"),
+            "unexpected stored shape: {raw}"
+        );
+    }
+
+    /// Brief Step 1: delete removes the entry (case-insensitively, trimmed)
+    /// and returns what is left; deleting a name that isn't there is refused
+    /// with "no such preset" rather than silently succeeding.
+    #[test]
+    fn deleting_removes_and_a_missing_name_is_refused() {
+        let (_tmp, ctx) = test_ctx();
+        save_stacking_preset(&ctx, "Keep".into(), StackingConfig::default()).unwrap();
+        save_stacking_preset(&ctx, "Drop".into(), StackingConfig::default()).unwrap();
+
+        let left = delete_stacking_preset(&ctx, " dROP ".into()).unwrap();
+        assert_eq!(
+            left.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["Keep"]
+        );
+
+        let err = delete_stacking_preset(&ctx, "Drop".into()).unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m == "no such preset"),
+            "{err:?}"
+        );
+    }
+
+    /// Brief Step 1: the 51st DISTINCT name is refused; an upsert of an
+    /// existing name at the cap still works (it adds no entry).
+    #[test]
+    fn the_fifty_first_distinct_preset_is_refused() {
+        let (_tmp, ctx) = test_ctx();
+        for i in 0..PRESETS_MAX {
+            save_stacking_preset(&ctx, format!("p{i:02}"), StackingConfig::default()).unwrap();
+        }
+        assert_eq!(list_stacking_presets(&ctx).unwrap().len(), PRESETS_MAX);
+
+        let err = save_stacking_preset(&ctx, "one too many".into(), StackingConfig::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m == "too many presets (50)"),
+            "{err:?}"
+        );
+
+        // An upsert at the cap is not a 51st entry.
+        save_stacking_preset(&ctx, "P00".into(), preset(StackingPreset::FastPreview)).unwrap();
+        assert_eq!(list_stacking_presets(&ctx).unwrap().len(), PRESETS_MAX);
+    }
+
+    /// Brief Step 1 + Interfaces: the name is trimmed and must be 1-60
+    /// characters — an empty/whitespace-only name and a 61-character one are
+    /// both refused with the same message; exactly 60 is fine.
+    #[test]
+    fn preset_names_are_trimmed_and_bounded() {
+        let (_tmp, ctx) = test_ctx();
+        // The literal the brief specifies, pinned once — every other
+        // assertion below compares against the constant, which would pass
+        // whatever it said.
+        assert_eq!(PRESET_NAME_ERROR, "preset name must be 1\u{2013}60 characters");
+        assert_eq!(PRESET_NAME_MAX, 60);
+
+        for bad in ["", "   ", "\t\n"] {
+            let err =
+                save_stacking_preset(&ctx, bad.into(), StackingConfig::default()).unwrap_err();
+            assert!(
+                matches!(err, ApiError::Invalid(ref m) if m == PRESET_NAME_ERROR),
+                "{bad:?} -> {err:?}"
+            );
+        }
+
+        let too_long = "x".repeat(PRESET_NAME_MAX + 1);
+        let err = save_stacking_preset(&ctx, too_long, StackingConfig::default()).unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m == PRESET_NAME_ERROR),
+            "{err:?}"
+        );
+
+        let exactly = "y".repeat(PRESET_NAME_MAX);
+        let saved = save_stacking_preset(&ctx, exactly.clone(), StackingConfig::default()).unwrap();
+        assert_eq!(saved[0].name, exactly);
+    }
+
+    /// Brief Step 1 + the controller's own requirement: a stored document
+    /// that no longer decodes (a hand edit, a foreign shape) must not crash
+    /// `list` — it warns and reads as empty — but it must not be silently
+    /// overwritten either: a SAVE over it is refused, naming the key, so the
+    /// user can rescue or clear the row themselves.
+    #[test]
+    fn a_corrupt_presets_document_lists_empty_with_a_warn_and_refuses_a_save() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            crate::db::set_setting(&conn, keys::STACKING_PRESETS, "{not json at all").unwrap();
+        }
+
+        let (listed, events) = capture_events(|| list_stacking_presets(&ctx).unwrap());
+        assert!(listed.is_empty(), "a corrupt document reads as no presets");
+        assert!(
+            events.iter().any(|(level, msg)| level == "WARN"
+                && msg.contains("stored stacking presets could not be decoded")),
+            "the corrupt document must be announced, never swallowed: {events:?}"
+        );
+
+        let err = save_stacking_preset(&ctx, "new".into(), StackingConfig::default()).unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict(ref m) if m.contains(keys::STACKING_PRESETS)),
+            "a save must refuse rather than discard the row: {err:?}"
+        );
+        assert!(
+            delete_stacking_preset(&ctx, "new".into()).is_err(),
+            "so must a delete"
+        );
+        assert_eq!(
+            stored_presets_json(&ctx).as_deref(),
+            Some("{not json at all"),
+            "the corrupt row is left exactly as it was"
         );
     }
 }

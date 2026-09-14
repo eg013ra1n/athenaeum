@@ -231,6 +231,16 @@ pub mod keys {
     /// (and drizzle outputs) into. Empty/unset = no folder; the Stacking tab
     /// blocks Run.
     pub const STACKING_OUTPUT_DIR: &str = "stacking.output_dir";
+    /// The user's own saved stacking presets (M4d Task 4, ruling R-M4d-6) —
+    /// a JSON ARRAY of `{ "name": …, "config": StackingConfig }`, at most
+    /// [`crate::api::stacking::PRESETS_MAX`] entries, names unique
+    /// case-insensitively and 1-[`crate::api::stacking::PRESET_NAME_MAX`]
+    /// characters. `config.paths` is stripped before the row is written — a
+    /// preset is a recipe, never a pair of folders. Empty/unset = the user
+    /// has none; the three BUILT-IN presets are code
+    /// ([`crate::stacking::config::preset`]), not this row, and
+    /// `get_stacking_presets` never reads it.
+    pub const STACKING_PRESETS: &str = "stacking.presets";
 }
 
 /// Bounds for `blink.memory_cache_max_mb`. The Settings page validates the

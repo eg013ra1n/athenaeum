@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Play, Square, ChevronDown, ChevronRight, FolderOpen, AlertTriangle, Loader2 } from 'lucide-react';
+import { Play, Square, ChevronDown, ChevronRight, FolderOpen, AlertTriangle, Loader2, Trash2 } from 'lucide-react';
 import { api } from '../../api';
 import { useStackingContext } from '../../contexts/StackingContext';
 import { useNotifications } from '../../contexts/NotificationContext';
 import type {
+  NamedPreset,
   Stage,
   StackingConfig,
   StackingPlan,
@@ -58,6 +59,12 @@ const PRESET_LABEL: Record<StackingPreset, string> = {
   maximumQuality: 'Maximum quality',
 };
 
+/** Mirrors `api::stacking::PRESET_NAME_MAX` (M4d Task 4, ruling R-M4d-6) —
+ *  the backend refuses anything longer, so the field simply cannot produce
+ *  one. The bound is enforced on BOTH sides on purpose: a `maxLength` is a
+ *  courtesy, the server's check is the rule. */
+const PRESET_NAME_MAX = 60;
+
 function formatGB(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
@@ -84,6 +91,18 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   const [draftConfig, setDraftConfig] = useState<StackingConfig | null>(null);
   const [excludedFrameIds, setExcludedFrameIds] = useState<number[]>([]);
   const [presets, setPresets] = useState<StackingPresets | null>(null);
+  // M4d Task 4 (ruling R-M4d-6): the user's OWN presets, a second list
+  // beside the three built-ins above. Kept as component state rather than
+  // context — the list is one settings row, only this menu reads it, and a
+  // save/delete already returns the full list so it never needs a refetch.
+  const [userPresets, setUserPresets] = useState<NamedPreset[]>([]);
+  const [savePresetOpen, setSavePresetOpen] = useState(false);
+  const [presetNameDraft, setPresetNameDraft] = useState('');
+  const [presetBusy, setPresetBusy] = useState(false);
+  /** The user preset whose inline "Delete '<name>'?" confirm is showing —
+   *  the brief's no-browser-dialog rule (no `confirm()`), so the row itself
+   *  turns into the question. */
+  const [presetPendingDelete, setPresetPendingDelete] = useState<string | null>(null);
   const [plan, setPlan] = useState<StackingPlan | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -243,6 +262,18 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
         const presetsResult = await api.invoke<StackingPresets>('get_stacking_presets', {});
         if (cancelled) return;
         setPresets(presetsResult);
+        // The user's own presets are a separate, catalog-backed list. A
+        // failure here must NOT take the whole tab down with it (the
+        // built-ins and the plan below are what the tab actually needs to
+        // work), so it is caught on its own and only logged — the menu
+        // simply shows no user presets.
+        try {
+          const saved = await api.invoke<NamedPreset[]>('list_stacking_presets', {});
+          if (cancelled) return;
+          setUserPresets(saved);
+        } catch (err) {
+          console.error('[StackingTab] list_stacking_presets failed:', err);
+        }
         // This plan fetch is one of four call sites that can write `plan`
         // (the other three go through `refetchPlan`) — guarded by the same
         // `planSeqRef`/`framesSetIdRef` those share, so whichever response
@@ -409,12 +440,21 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   // open/close pattern in this same file).
   const presetMenuRef = useRef<HTMLDivElement>(null);
   const rerunMenuRef = useRef<HTMLDivElement>(null);
+  // M4d Task 4: closing the menu also discards whatever inline form was
+  // open inside it — a half-typed preset name or an unanswered delete
+  // confirm must not still be waiting there the next time it opens.
+  const closePresetMenu = useCallback(() => {
+    setPresetMenuOpen(false);
+    setSavePresetOpen(false);
+    setPresetNameDraft('');
+    setPresetPendingDelete(null);
+  }, []);
   useEffect(() => {
     if (!presetMenuOpen && !rerunMenuOpen) return;
     const handlePointerDown = (e: MouseEvent) => {
       const target = e.target as Node;
       if (presetMenuOpen && presetMenuRef.current && !presetMenuRef.current.contains(target)) {
-        setPresetMenuOpen(false);
+        closePresetMenu();
       }
       if (rerunMenuOpen && rerunMenuRef.current && !rerunMenuRef.current.contains(target)) {
         setRerunMenuOpen(false);
@@ -422,7 +462,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     };
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      setPresetMenuOpen(false);
+      closePresetMenu();
       setRerunMenuOpen(false);
     };
     document.addEventListener('mousedown', handlePointerDown);
@@ -431,27 +471,107 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [presetMenuOpen, rerunMenuOpen]);
+  }, [presetMenuOpen, rerunMenuOpen, closePresetMenu]);
 
   // Preset selector (plan Ruling 1): the label is computed, never stored —
   // comparing the draft (minus its per-set folder override) against each
-  // built-in preset via canonical JSON.
+  // built-in preset via canonical JSON. M4d Task 4 (ruling R-M4d-6) extends
+  // it to the user's own presets by exactly the same rule; built-ins win a
+  // tie, since a user preset saved as a copy of "Default" IS Default and
+  // showing the built-in name is the less surprising of the two answers.
+  // Canonicalized once per list change, not once per draft edit: `presetLabel`
+  // below re-runs on every keystroke in any inspector field, and there can be
+  // up to 50 user presets whose configs are the same size as the draft's.
+  const userPresetKeys = useMemo(
+    () => userPresets.map((p) => [stableStringify(withoutPaths(p.config)), p.name] as const),
+    [userPresets],
+  );
   const presetLabel = useMemo<string>(() => {
     if (!draftConfig || !presets) return 'Custom';
     const draftKey = stableStringify(withoutPaths(draftConfig));
     if (draftKey === stableStringify(withoutPaths(presets.default))) return 'Default';
     if (draftKey === stableStringify(withoutPaths(presets.fastPreview))) return 'Fast preview';
     if (draftKey === stableStringify(withoutPaths(presets.maximumQuality))) return 'Maximum quality';
+    const mine = userPresetKeys.find(([key]) => key === draftKey);
+    if (mine) return `'${mine[1]}'`;
     return 'Custom';
-  }, [draftConfig, presets]);
+  }, [draftConfig, presets, userPresetKeys]);
 
   const applyPreset = useCallback((preset: StackingPreset) => {
     setUserConfig((prev) => {
       if (!presets || !prev) return prev;
       return { ...presets[preset], paths: prev.paths };
     });
-    setPresetMenuOpen(false);
-  }, [presets, setUserConfig]);
+    closePresetMenu();
+  }, [presets, setUserConfig, closePresetMenu]);
+
+  // A saved preset never carries folders (the backend strips `paths` before
+  // storing), so applying one keeps THIS set's own working/output override —
+  // same rule as a built-in above.
+  const applyUserPreset = useCallback((saved: NamedPreset) => {
+    setUserConfig((prev) => (prev ? { ...saved.config, paths: prev.paths } : prev));
+    closePresetMenu();
+  }, [setUserConfig, closePresetMenu]);
+
+  const handleSavePreset = useCallback(async () => {
+    const name = presetNameDraft.trim();
+    if (!draftConfig || !name || presetBusy) return;
+    setPresetBusy(true);
+    try {
+      const saved = await api.invoke<NamedPreset[]>('save_stacking_preset', {
+        name,
+        config: draftConfig,
+      });
+      setUserPresets(saved);
+      closePresetMenu();
+      notify({
+        tone: 'success',
+        kind: 'generic',
+        toast: true,
+        title: `Preset '${name}' saved`,
+        detail: 'The current stacking settings, without the folders.',
+      });
+    } catch (err) {
+      console.error('[StackingTab] save_stacking_preset failed:', err);
+      notify({
+        tone: 'warning',
+        kind: 'generic',
+        toast: true,
+        title: 'Preset not saved',
+        detail: String(err),
+      });
+    } finally {
+      setPresetBusy(false);
+    }
+  }, [presetNameDraft, draftConfig, presetBusy, notify, closePresetMenu]);
+
+  const handleDeletePreset = useCallback(async (name: string) => {
+    if (presetBusy) return;
+    setPresetBusy(true);
+    try {
+      const left = await api.invoke<NamedPreset[]>('delete_stacking_preset', { name });
+      setUserPresets(left);
+      setPresetPendingDelete(null);
+      notify({
+        tone: 'info',
+        kind: 'generic',
+        toast: true,
+        title: `Preset '${name}' deleted`,
+        detail: left.length === 1 ? '1 preset left' : `${left.length} presets left`,
+      });
+    } catch (err) {
+      console.error('[StackingTab] delete_stacking_preset failed:', err);
+      notify({
+        tone: 'warning',
+        kind: 'generic',
+        toast: true,
+        title: 'Preset not deleted',
+        detail: String(err),
+      });
+    } finally {
+      setPresetBusy(false);
+    }
+  }, [presetBusy, notify]);
 
   // `starting` bridges the click-to-run gap. `startRun`'s invoke does not
   // resolve until the backend has synchronously built the WHOLE plan
@@ -596,7 +716,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
           <div className="relative shrink-0" ref={presetMenuRef}>
             <button
               type="button"
-              onClick={() => setPresetMenuOpen((v) => !v)}
+              onClick={() => (presetMenuOpen ? closePresetMenu() : setPresetMenuOpen(true))}
               disabled={presetSelectorDisabled}
               className={`flex items-center gap-1 font-medium transition-colors ${
                 presetSelectorDisabled
@@ -608,7 +728,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
               <ChevronDown size={14} />
             </button>
             {presetMenuOpen && !presetSelectorDisabled && (
-              <div className="absolute left-0 mt-1 w-40 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
+              <div className="absolute left-0 mt-1 w-64 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
                 {(Object.keys(PRESET_LABEL) as StackingPreset[]).map((p) => (
                   <button
                     key={p}
@@ -619,6 +739,125 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
                     {PRESET_LABEL[p]}
                   </button>
                 ))}
+
+                {/* M4d Task 4 (ruling R-M4d-6): the user's own presets below
+                    a divider. Each row applies on click; the trash icon
+                    turns that same row into an inline confirm — no browser
+                    `confirm()`, which would sit outside the app's own
+                    surface and cannot be styled or dismissed with Escape
+                    like everything else here. */}
+                {userPresets.length > 0 && (
+                  <>
+                    <div className="my-1 border-t border-border" />
+                    {userPresets.map((saved) =>
+                      presetPendingDelete === saved.name ? (
+                        <div
+                          key={saved.name}
+                          className="px-3 py-1.5 text-sm text-content-secondary"
+                        >
+                          <div className="truncate" title={saved.name}>
+                            Delete preset '{saved.name}'?
+                          </div>
+                          <div className="mt-1 flex items-center gap-2">
+                            <button
+                              type="button"
+                              disabled={presetBusy}
+                              onClick={() => void handleDeletePreset(saved.name)}
+                              className="px-2 py-0.5 rounded text-xs font-medium bg-error text-white hover:brightness-110 disabled:opacity-50"
+                            >
+                              Delete
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPresetPendingDelete(null)}
+                              className="px-2 py-0.5 rounded text-xs text-content-muted hover:text-content"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div
+                          key={saved.name}
+                          className="flex items-center hover:bg-surface-hover"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => applyUserPreset(saved)}
+                            title={saved.name}
+                            className="flex-1 min-w-0 text-left px-3 py-1.5 text-sm text-content-secondary truncate"
+                          >
+                            {saved.name}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPresetPendingDelete(saved.name)}
+                            title={`Delete preset '${saved.name}'`}
+                            aria-label={`Delete preset '${saved.name}'`}
+                            className="px-2 py-1.5 text-content-muted hover:text-error shrink-0"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      ),
+                    )}
+                  </>
+                )}
+
+                <div className="my-1 border-t border-border" />
+                {savePresetOpen ? (
+                  <div className="px-3 py-1.5">
+                    <input
+                      type="text"
+                      autoFocus
+                      value={presetNameDraft}
+                      maxLength={PRESET_NAME_MAX}
+                      placeholder="Preset name"
+                      onChange={(e) => setPresetNameDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        // Escape is handled by the menu-wide listener; Enter
+                        // is the form's own submit, so it must not bubble up
+                        // into anything else on the toolbar.
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void handleSavePreset();
+                        }
+                      }}
+                      className="w-full px-2 py-1 text-sm rounded border border-border bg-surface text-content placeholder:text-content-muted focus:outline-none focus:border-accent"
+                    />
+                    <div className="mt-1.5 flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={presetBusy || presetNameDraft.trim().length === 0}
+                        onClick={() => void handleSavePreset()}
+                        className="px-2 py-0.5 rounded text-xs font-medium bg-accent text-surface hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSavePresetOpen(false);
+                          setPresetNameDraft('');
+                        }}
+                        className="px-2 py-0.5 rounded text-xs text-content-muted hover:text-content"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPresetPendingDelete(null);
+                      setSavePresetOpen(true);
+                    }}
+                    className="w-full text-left px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover"
+                  >
+                    Save current as…
+                  </button>
+                )}
               </div>
             )}
           </div>

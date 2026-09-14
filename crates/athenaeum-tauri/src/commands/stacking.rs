@@ -17,7 +17,8 @@ use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
 
 pub use athenaeum_core::api::stacking::{
-    StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary, StackingSetConfig,
+    NamedPreset, StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary,
+    StackingSetConfig,
 };
 
 /// Desktop has no path sandbox — every stacking folder handler uses
@@ -140,6 +141,37 @@ pub async fn set_stacking_config(
 #[tracing::instrument(skip_all, err)]
 pub async fn get_stacking_presets() -> Result<StackingPresets, String> {
     Ok(api::get_stacking_presets())
+}
+
+/// The user's OWN saved presets (M4d Task 4, ruling R-M4d-6), sorted by
+/// name case-insensitively. Separate from the three built-ins above: those
+/// are code, these live in the `stacking.presets` settings row.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_stacking_presets(state: State<'_, AppState>) -> Result<Vec<NamedPreset>, String> {
+    api::list_stacking_presets(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Save (or replace, by case-insensitive name) one user preset. Returns the
+/// full list afterwards, so the caller never needs a follow-up list call.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn save_stacking_preset(
+    state: State<'_, AppState>,
+    name: String,
+    config: StackingConfig,
+) -> Result<Vec<NamedPreset>, String> {
+    api::save_stacking_preset(&state.ctx, name, config).map_err(|e| e.to_string())
+}
+
+/// Delete one user preset by name. Returns the full list afterwards.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn delete_stacking_preset(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<NamedPreset>, String> {
+    api::delete_stacking_preset(&state.ctx, name).map_err(|e| e.to_string())
 }
 
 /// The global stacking defaults.

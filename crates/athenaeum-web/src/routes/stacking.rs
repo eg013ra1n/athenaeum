@@ -25,7 +25,8 @@ use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
 pub use athenaeum_core::api::stacking::{
-    StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary, StackingSetConfig,
+    NamedPreset, StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary,
+    StackingSetConfig,
 };
 
 // ── Request structs ───────────────────────────────────────────────────────
@@ -90,6 +91,19 @@ pub struct SetStackingConfigArgs {
 #[serde(rename_all = "camelCase")]
 pub struct SetStackingDefaultsArgs {
     pub config: StackingConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveStackingPresetArgs {
+    pub name: String,
+    pub config: StackingConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteStackingPresetArgs {
+    pub name: String,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +273,42 @@ pub async fn get_stacking_presets(
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<StackingPresets>, (StatusCode, String)> {
     Ok(Json(api::get_stacking_presets()))
+}
+
+/// POST /api/list_stacking_presets
+///
+/// The user's OWN saved presets (M4d Task 4, ruling R-M4d-6) — unlike the
+/// built-ins above this one does read the catalog's settings row.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_stacking_presets(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<Vec<NamedPreset>>, (StatusCode, String)> {
+    api::list_stacking_presets(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/save_stacking_preset
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn save_stacking_preset(
+    State(state): State<WebAppState>,
+    Json(args): Json<SaveStackingPresetArgs>,
+) -> Result<Json<Vec<NamedPreset>>, (StatusCode, String)> {
+    api::save_stacking_preset(&state.ctx, args.name, args.config)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/delete_stacking_preset
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn delete_stacking_preset(
+    State(state): State<WebAppState>,
+    Json(args): Json<DeleteStackingPresetArgs>,
+) -> Result<Json<Vec<NamedPreset>>, (StatusCode, String)> {
+    api::delete_stacking_preset(&state.ctx, args.name)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/get_stacking_defaults
@@ -744,5 +794,114 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "expected JPEG magic");
+    }
+
+    // ── M4d Task 4: user presets (ruling R-M4d-6) ────────────────────────
+
+    /// POSTs `body` to `uri` on a fresh router over `state` and returns the
+    /// status plus the decoded JSON body — the three preset routes are all
+    /// the same shape, and spelling the oneshot out four times would bury
+    /// what each case is actually asserting.
+    async fn post_json(
+        state: WebAppState,
+        uri: &str,
+        body: String,
+    ) -> (StatusCode, serde_json::Value) {
+        let router = crate::routes::build_router(state, None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    /// Brief Step 1: the three preset endpoints round trip over HTTP —
+    /// save, list (sorted, camelCase body), delete. Mirrors the core test
+    /// `api::stacking::tests::presets_list_sorted_case_insensitively`.
+    #[tokio::test]
+    async fn preset_routes_round_trip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = athenaeum_core::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = db_test_state(db);
+
+        let cfg = serde_json::to_string(&StackingConfig::default()).unwrap();
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/api/save_stacking_preset",
+            format!(r#"{{"name":"Beta","config":{cfg}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 1);
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/save_stacking_preset",
+            format!(r#"{{"name":"alpha","config":{cfg}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) =
+            post_json(state.clone(), "/api/list_stacking_presets", "{}".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "Beta"]);
+        assert_eq!(
+            body[0]["config"]["version"], 1,
+            "the entry carries the whole config, camelCase: {body}"
+        );
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/api/delete_stacking_preset",
+            r#"{"name":"Beta"}"#.into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["name"], "alpha");
+    }
+
+    /// Brief Step 1: a bad name is a 400 on both mutating routes — the
+    /// `ApiError::Invalid` → `BAD_REQUEST` mapping, not a 500.
+    #[tokio::test]
+    async fn preset_routes_reject_a_bad_name_with_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = athenaeum_core::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = db_test_state(db);
+        let cfg = serde_json::to_string(&StackingConfig::default()).unwrap();
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/save_stacking_preset",
+            format!(r#"{{"name":"   ","config":{cfg}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/delete_stacking_preset",
+            r#"{"name":"never saved"}"#.into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

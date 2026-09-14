@@ -52,7 +52,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 **`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4), `config`/`groups`/`paths`/`plan`/`run`/`provenance` (config precedence, group discovery, artifact paths, the plan gate, the run thread, provenance rows — Plan 5a orchestration), `ln` (local normalization — reference build, background model, PSF-flux scale, `.athln` sidecars, M2) plus `api/stacking.rs` (the command-facing orchestration layer both hosts call); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs`, `examples/integrate_probe.rs` and `examples/ln_probe.rs`. See **## Stacking** below for the tab, the commands and the acceptance state.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 250 functions across 23 modules (M4d Task 3 added `get_master_light_preview` to the `stacking` module, 249 → 250; the 249/23 measurement below is otherwise unchanged — re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 253 functions across 23 modules (M4d Task 4 added `list_stacking_presets`/`save_stacking_preset`/`delete_stacking_preset` to the `stacking` module, 250 → 253; M4d Task 3 added `get_master_light_preview` there, 249 → 250; the 249/23 measurement below is otherwise unchanged — re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
 `core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar` `stacking`
 
@@ -468,7 +468,7 @@ Progress rides `stacking-progress` (per stage/group/frame, throttled 300 ms)
 and exactly one `stacking-complete` fires from the run's single exit path
 regardless of success/cancel/failure/panic.
 
-**16 commands** (`api/stacking.rs` + `commands/stacking.rs` +
+**19 commands** (`api/stacking.rs` + `commands/stacking.rs` +
 `routes/stacking.rs`, all mirrored on both hosts): `get_stacking_plan`,
 `start_stacking`, `cancel_stacking`, `get_stacking_runs`, `get_stacking_run`,
 `get_stacking_config`, `set_stacking_config`, `get_stacking_presets` (Default
@@ -481,7 +481,16 @@ light, `maxPx` clamped to `[64, 2048]` and cached per resolved render step;
 the web host answers it at `POST /api/get_master_light_preview`, the mirror
 `api.invoke` uses on both targets, AND at
 `GET /api/stacking/master-preview?runId=…` for direct browser access when no
-API key is configured).
+API key is configured), `list_stacking_presets`, `save_stacking_preset`,
+`delete_stacking_preset` (M4d Task 4, ruling R-M4d-6 — the user's OWN
+presets, ONE settings row `stacking.presets` holding a JSON array of
+`{ name, config }`: max 50, names 1–60 chars trimmed and unique
+case-insensitively (an upsert keeps the NEW spelling), `config.paths`
+stripped on save so a preset never carries folders, and all three return the
+full list sorted by name case-insensitively. A stored document that no
+longer decodes reads as empty on `list` with a `warn!` but is refused with a
+`Conflict` naming the key on either write — a read may shrug a broken row
+off, a write must never replace the user's whole list with one entry).
 
 **The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
 the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →

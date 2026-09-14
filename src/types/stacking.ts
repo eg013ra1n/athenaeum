@@ -286,6 +286,8 @@ export type StackingPreset = "default" | "fastPreview" | "maximumQuality";
 
 export type StackingPresets = { default: StackingConfig, fastPreview: StackingConfig, maximumQuality: StackingConfig, };
 
+export type NamedPreset = { name: string, config: StackingConfig, };
+
 export type ColorMode = "mono" | "osc";
 
 export type ScaleSource = "solve" | "header";
