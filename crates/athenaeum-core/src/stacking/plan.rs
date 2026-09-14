@@ -32,7 +32,7 @@ use crate::registration::db::{
 use crate::settings::{keys, SettingsManager};
 use crate::stacking::config::{
     calibration_subtree, config_hash, measurement_subtree, normalization_subtree,
-    registration_subtree, resolve_config, stage_hash, ReferenceMode, SourceIdentity,
+    registration_subtree, resolve_config, stage_hash, CleanupPolicy, ReferenceMode, SourceIdentity,
     StackingConfig,
 };
 use crate::stacking::groups::{
@@ -852,6 +852,69 @@ pub(crate) fn registration_row_is_fresh(
             "aligned" | "aligned_flipped" | "reference"
         )
         && row.config_hash.as_deref() == Some(expected_hash)
+}
+
+/// Why a stage is stale, when the reason is the last run's OWN cleanup
+/// (v0.6.3): `deleteIntermediates` removes every calibrated and registered
+/// frame (and their rows) after a successful run, `deleteRegistered` the
+/// registered ones — so the next run, whatever "Re-run from" it was asked
+/// for, has to start at Calibrate (or Register). Returns the warning line
+/// naming the run and the policy, or `None` when the staleness has another
+/// cause (a config change, a first run, an interrupted run), which the
+/// stage rows already show as `Stale` without needing a story.
+///
+/// `metrics` rows survive `deleteIntermediates` since v0.6.3
+/// (`paths::INTERMEDIATE_ARTIFACT_KINDS`), so the line says whether the
+/// measurements are still cached — read off the plan's own counters, not
+/// assumed, because a set cleaned by v0.6.2 lost them too.
+fn cleanup_stale_note(
+    conn: &Connection,
+    frames_set_id: i64,
+    plan_groups: &[PlanGroup],
+    stale_stages: &[Stage],
+) -> Result<Option<String>, ApiError> {
+    let calibrate_stale = stale_stages.contains(&Stage::Calibrate);
+    let register_stale = stale_stages.contains(&Stage::Register);
+    if !calibrate_stale && !register_stale {
+        return Ok(None);
+    }
+    let Some(last) = list_runs(conn, frames_set_id, 1)?.into_iter().next() else {
+        return Ok(None);
+    };
+    if last.status != "done" {
+        return Ok(None);
+    }
+    let Some(cleanup) = serde_json::from_str::<StackingConfig>(&last.config_json)
+        .ok()
+        .map(|c| c.output.cleanup)
+    else {
+        return Ok(None);
+    };
+    let nothing_calibrated = plan_groups.iter().all(|g| g.calibrated_cached == 0);
+    let metrics_kept = plan_groups.iter().any(|g| g.metrics_cached > 0);
+    let note = match cleanup {
+        CleanupPolicy::DeleteIntermediates if calibrate_stale && nothing_calibrated => {
+            let tail = if metrics_kept {
+                "; the measurements are still cached"
+            } else {
+                ""
+            };
+            format!(
+                "Run #{} deleted its calibrated and registered frames afterwards (Output › \
+                 cleanup: delete intermediates) — nothing is cached, so the next run starts \
+                 from Calibrate whichever stage it is re-run from{tail}",
+                last.id
+            )
+        }
+        CleanupPolicy::DeleteRegistered if register_stale && !calibrate_stale => format!(
+            "Run #{} deleted its registered frames afterwards (Output › cleanup: delete \
+             registered) — the next run re-registers every frame whichever stage it is \
+             re-run from",
+            last.id
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(note))
 }
 
 /// Register-stage staleness (spec §9.3, gate step's `stale_stages`) — final
@@ -1742,8 +1805,7 @@ pub fn build_plan(
                             // ABSENCE of a registration row at all (no entry
                             // in the map) stays "can't verify".
                             Some(hash_opt) => {
-                                let frame_registration_hash =
-                                    hash_opt.clone().unwrap_or_default();
+                                let frame_registration_hash = hash_opt.clone().unwrap_or_default();
                                 let expected = normalization_hash_for(
                                     &cfg,
                                     &frame_registration_hash,
@@ -1825,8 +1887,7 @@ pub fn build_plan(
                 if sources.is_empty() {
                     None
                 } else {
-                    let solve_count =
-                        sources.iter().filter(|s| **s == ScaleSource::Solve).count();
+                    let solve_count = sources.iter().filter(|s| **s == ScaleSource::Solve).count();
                     if solve_count * 2 >= sources.len() {
                         Some(ScaleSource::Solve)
                     } else {
@@ -1860,6 +1921,12 @@ pub fn build_plan(
     }
     if local_normalization_active && normalize_stale {
         stale_stages.push(Stage::Normalize);
+    }
+    // v0.6.3: when the caches a re-run would reuse are gone because the LAST
+    // run's own cleanup policy removed them, say so — a "Re-run from
+    // Integrate" that silently starts at Calibrate was the owner's report.
+    if let Some(note) = cleanup_stale_note(conn, frames_set_id, &plan_groups, &stale_stages)? {
+        warnings.push(note);
     }
 
     // Gate 6: unsupported — checked last, so a user only sees these once
@@ -2115,8 +2182,7 @@ mod tests {
             let stem = format!("ref{i}");
             // Real file on disk: `Manual` mode's `resolve_reference` checks
             // `reference.on_disk` for the chosen frame.
-            let (id, _path) =
-                test_fixtures::add_light(&f, &light_spec_written(&stem, t));
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec_written(&stem, t));
             test_fixtures::seed_plate_solve_scale(&f.conn, id, 0.78);
             ref_ids.push(id);
         }
@@ -2374,7 +2440,11 @@ mod tests {
             .filter(|w| w.contains("\u{d7}2.0"))
             .collect();
         assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(far_warnings[0].contains(&small_group.key), "{:?}", far_warnings);
+        assert!(
+            far_warnings[0].contains(&small_group.key),
+            "{:?}",
+            far_warnings
+        );
 
         let big_ratio = big_group
             .scale_ratio_to_reference
@@ -2463,7 +2533,11 @@ mod tests {
             .filter(|w| w.contains("\u{d7}0.5"))
             .collect();
         assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(far_warnings[0].contains(&big_group.key), "{:?}", far_warnings);
+        assert!(
+            far_warnings[0].contains(&big_group.key),
+            "{:?}",
+            far_warnings
+        );
 
         let small_ratio = small_group.scale_ratio_to_reference.unwrap();
         assert!(
@@ -2567,7 +2641,11 @@ mod tests {
             .filter(|w| w.contains("\u{d7}2.0"))
             .collect();
         assert_eq!(far_warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(far_warnings[0].contains(&big_group.key), "{:?}", far_warnings);
+        assert!(
+            far_warnings[0].contains(&big_group.key),
+            "{:?}",
+            far_warnings
+        );
 
         assert!(
             (small_group.scale_ratio_to_reference.unwrap() - 1.0).abs() < 1e-9,
@@ -2681,7 +2759,10 @@ mod tests {
         set_set_config(&f.conn, f.set_id, "{}", &[outlier_id]).unwrap();
         let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
         assert!(
-            !plan.warnings.iter().any(|w| w.contains("mixes pixel scales")),
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("mixes pixel scales")),
             "the outlier is manually excluded — no spread left to warn about: {:?}",
             plan.warnings
         );
@@ -4471,6 +4552,93 @@ mod tests {
             plan3.stale_stages.contains(&Stage::Normalize),
             "an LN exclusion recorded under a DIFFERENT config must not be trusted: {:?}",
             plan3.stale_stages
+        );
+    }
+
+    /// v0.6.3: a set whose caches were wiped by the last run's own cleanup
+    /// policy gets a warning that NAMES the run and the policy, and says the
+    /// next run starts from Calibrate whichever stage it is re-run from —
+    /// the owner's "re-run from Integrate doesn't work" was exactly this
+    /// case with nothing telling them. A `keepAll` run, a first run and an
+    /// interrupted run get no such line: their staleness has other causes
+    /// the stage rows already show.
+    #[test]
+    fn a_cleanup_wiped_cache_is_explained_by_the_plan() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let settings = SettingsManager::new();
+
+        let finished_run = |cleanup: CleanupPolicy, status: &str| {
+            let mut cfg = StackingConfig::default();
+            cfg.output.cleanup = cleanup;
+            let run_id = crate::db::stacking::insert_run(
+                &f.conn,
+                &crate::db::stacking::NewRun {
+                    frames_set_id: f.set_id,
+                    config_json: &serde_json::to_string(&cfg).unwrap(),
+                    config_hash: "h",
+                    reference_frame_id: Some(ids[0]),
+                    reference_mode: "auto",
+                    working_dir: "/w",
+                    output_dir: "/o",
+                },
+            )
+            .unwrap();
+            crate::db::stacking::finish_run(&f.conn, run_id, status, None, None).unwrap();
+            run_id
+        };
+
+        // No run at all: stale for the ordinary reason, no story.
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            plan.stale_stages.contains(&Stage::Calibrate),
+            "{:?}",
+            plan.stale_stages
+        );
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("cleanup")),
+            "{:?}",
+            plan.warnings
+        );
+
+        // A finished keepAll run: still no story.
+        finished_run(CleanupPolicy::KeepAll, "done");
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("cleanup")),
+            "{:?}",
+            plan.warnings
+        );
+
+        // A finished deleteIntermediates run with nothing cached: named.
+        let run_id = finished_run(CleanupPolicy::DeleteIntermediates, "done");
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let note = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("delete intermediates"))
+            .unwrap_or_else(|| panic!("no cleanup note in {:?}", plan.warnings));
+        assert!(note.contains(&format!("Run #{run_id}")), "{note}");
+        assert!(note.contains("starts from Calibrate"), "{note}");
+        assert!(
+            !note.contains("measurements are still cached"),
+            "no metrics row exists here: {note}"
+        );
+
+        // An INTERRUPTED deleteIntermediates run never ran its cleanup —
+        // no story either.
+        finished_run(CleanupPolicy::DeleteIntermediates, "failed");
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("cleanup")),
+            "{:?}",
+            plan.warnings
         );
     }
 

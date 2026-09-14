@@ -680,8 +680,35 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     );
   }
 
-  const rerunOptions = Array.from(new Set<Stage>([...plan.staleStages, 'integrate']));
-  const rerunDisabled = plan.staleStages.length === 0 || running || starting;
+  // Spec §8: "Re-run from" lists the stages whose cached outputs would be
+  // REUSED above it — the cacheable stages a run would not otherwise redo,
+  // each forcing itself and everything after it fresh. Plan 5b built the
+  // menu the other way round (`staleStages ∪ {integrate}`, disabled when
+  // nothing was stale): forcing a stage that is already stale is exactly
+  // what ▶ Run does, so every entry was a no-op and the one case a user
+  // reaches for it — "just re-integrate, everything is cached" — was the
+  // one case the menu refused to open. Stale stages stay listed but inert,
+  // saying so; Integrate has no cache and is always there (its own re-run
+  // IS ▶ Run, stated explicitly). Where ▶ Run actually starts is shown on
+  // its tooltip and under the menu — after a `deleteIntermediates` run
+  // that is Calibrate whatever the menu says, and `plan.warnings` names
+  // the run that deleted the caches.
+  const lnActive =
+    draftConfig.normalization.local.enabled || draftConfig.normalization.rejection === 'local';
+  const cacheableStages: Stage[] = (['calibrate', 'measure', 'register', 'normalize'] as Stage[])
+    .filter((s) => s !== 'normalize' || lnActive);
+  const firstStale = cacheableStages.find((s) => plan.staleStages.includes(s));
+  const rerunOptions: { stage: Stage; stale: boolean }[] = [
+    ...cacheableStages.map((stage) => ({ stage, stale: plan.staleStages.includes(stage) })),
+    { stage: 'integrate', stale: false },
+  ];
+  const rerunDisabled = running || starting;
+  const runStartsAt =
+    firstStale === undefined
+      ? 'Every cached stage is reused — the run re-integrates from the cached registered frames'
+      : firstStale === 'calibrate'
+        ? 'Nothing is cached — the run starts from Calibrate'
+        : `Starts from ${STAGE_LABEL[firstStale]} — the stages before it are reused from cache`;
   // Fix round 1, Minor #8: APPLYING a preset edits the config the same way
   // every inspector panel does, so it is disabled while a run is active for
   // the same reason those panels are (`StageInspector`'s own `disabled`
@@ -700,7 +727,7 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     ? 'A run is in progress — the settings cannot change until it finishes'
     : undefined;
   const runDisabled = plan.blockers.length > 0 || running || starting;
-  const runTooltip = plan.blockers.length > 0 ? plan.blockers[0].message : undefined;
+  const runTooltip = plan.blockers.length > 0 ? plan.blockers[0].message : runStartsAt;
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
 
   return (
@@ -942,17 +969,35 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
               <ChevronDown size={14} />
             </button>
             {rerunMenuOpen && !rerunDisabled && (
-              <div className="absolute right-0 mt-1 w-48 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
-                {rerunOptions.map((stage) => (
+              <div className="absolute right-0 mt-1 w-64 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
+                {rerunOptions.map(({ stage, stale }) => (
                   <button
                     key={stage}
                     type="button"
+                    disabled={stale}
                     onClick={() => void handleRerunFrom(stage)}
-                    className="w-full text-left px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover"
+                    title={
+                      stale
+                        ? 'Not cached — every run redoes this stage already'
+                        : stage === 'integrate'
+                          ? 'Reuse every cached stage and integrate again'
+                          : `Redo ${STAGE_LABEL[stage]} and everything after it; reuse the stages before`
+                    }
+                    className={`w-full text-left px-3 py-1.5 text-sm ${
+                      stale
+                        ? 'text-content-muted cursor-not-allowed'
+                        : 'text-content-secondary hover:bg-surface-hover'
+                    }`}
                   >
-                    {STAGE_LABEL[stage]}
+                    <span className="flex items-center justify-between gap-2">
+                      <span>{STAGE_LABEL[stage]}</span>
+                      {stale && <span className="text-xs">stale</span>}
+                    </span>
                   </button>
                 ))}
+                <p className="px-3 pt-1.5 pb-1 text-xs text-content-muted border-t border-border mt-1">
+                  {runStartsAt}
+                </p>
               </div>
             )}
           </div>

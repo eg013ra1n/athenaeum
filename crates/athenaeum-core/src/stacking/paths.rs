@@ -688,6 +688,14 @@ pub enum CleanupWhat {
 /// [`crate::db::stacking::delete_all_artifacts`] instead — a future kind
 /// this list doesn't yet name must not survive "delete everything" and keep
 /// pointing at files cleanup just removed.
+///
+/// `metrics` is deliberately NOT here (v0.6.3): a frame's measurement is a
+/// payload row with no file behind it — deleting it frees no disk and
+/// throws away the stage that costs a real set ten minutes. Its hash is
+/// keyed on the frame's calibration CONFIG hash (`measurement_hash_for`),
+/// not on the calibrated file's identity, so a re-calibration after this
+/// cleanup regenerates a byte-identical frame and the kept row is a valid
+/// cache hit for it. Only `All` — "delete everything" — drops it.
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "registered",
     "calibrated",
@@ -697,7 +705,6 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "calibrated_mosaic",
     "ln",
     "ln_reference",
-    "metrics",
 ];
 
 /// Remove a working layout's subtrees per `what` and the matching
@@ -1471,8 +1478,12 @@ mod tests {
         // understands it does. `Intermediates` (a fixed kind list) must
         // leave it alone; only `All` may sweep it.
         seed_artifact(&c, set_id, "future", "/nowhere", 0);
+        // A measurement row: no file, no bytes — a cache the next run can
+        // still hit after its calibrated frame is regenerated (v0.6.3).
+        seed_artifact(&c, set_id, "metrics", "/nowhere", 0);
 
-        // Intermediates: also removes calibrated/, but not the unknown kind.
+        // Intermediates: also removes calibrated/, but not the unknown kind
+        // and not the file-less measurement row.
         let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
         assert_eq!(freed, 300);
         assert!(!layout.registered_dir("g").exists());
@@ -1481,13 +1492,17 @@ mod tests {
             layout.root.exists(),
             "the layout's own root is never removed"
         );
-        let remaining = list_artifacts(&c, set_id, None).unwrap();
+        let mut remaining: Vec<String> = list_artifacts(&c, set_id, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.kind)
+            .collect();
+        remaining.sort();
         assert_eq!(
-            remaining.len(),
-            1,
-            "Intermediates does not touch a kind it doesn't name: {remaining:?}"
+            remaining,
+            vec!["future".to_string(), "metrics".to_string()],
+            "Intermediates keeps the measurement rows and any kind it doesn't name"
         );
-        assert_eq!(remaining[0].kind, "future");
 
         // The output folder — a sibling directory this function never sees a
         // path for — is never touched by any level.
@@ -1551,7 +1566,12 @@ mod tests {
 
         assert_eq!(
             layout.rej_path(7, "g", "f1"),
-            layout.root.join("rej").join("run-7").join("g").join("f1.rej")
+            layout
+                .root
+                .join("rej")
+                .join("run-7")
+                .join("g")
+                .join("f1.rej")
         );
 
         let rej_file = layout.rej_dir(7, "g").join("f1.rej");
