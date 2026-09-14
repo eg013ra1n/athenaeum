@@ -1,3 +1,4 @@
+import { FolderTypeBreakdown } from './FolderTypeBreakdown';
 import { AlertTriangle, CheckCircle2, ExternalLink, RefreshCw } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
@@ -114,22 +115,49 @@ export function RoleInspector(props: RoleInspectorProps) {
 
       {relinkResult && (
         <div className="mt-4 p-4 bg-surface rounded-lg border border-border">
-          <h4 className="text-sm font-semibold text-content flex items-center gap-2 mb-2"><CheckCircle2 className="text-success" size={16} /> Relinking complete</h4>
+          <h4 className="text-sm font-semibold text-content flex items-center gap-2 mb-2">
+            <CheckCircle2 className="text-success" size={16} /> Relinking complete
+          </h4>
           <div className="grid grid-cols-3 gap-4 text-sm">
-            <div><p className="text-content-muted text-xs">Matched</p><p className="text-lg font-bold text-success">{relinkResult.files_matched}</p></div>
-            <div><p className="text-content-muted text-xs">New files</p><p className="text-lg font-bold text-accent">{relinkResult.files_new}</p></div>
-            <div><p className="text-content-muted text-xs">Orphaned</p><p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p></div>
+            <div>
+              <p className="text-content-muted text-xs">Matched</p>
+              <p className="text-lg font-bold text-success">{relinkResult.files_matched}</p>
+            </div>
+            <div>
+              <p className="text-content-muted text-xs">New files</p>
+              <p className="text-lg font-bold text-accent">{relinkResult.files_new}</p>
+            </div>
+            <div>
+              <p className="text-content-muted text-xs">Orphaned</p>
+              <p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p>
+            </div>
           </div>
         </div>
       )}
 
-      <div className={`mt-4 p-3 rounded-lg bg-surface border text-xs text-content-muted ${props.kind === 'calibration_library' ? 'border-purple/40' : 'border-border'}`}>
+      <div
+        className={`mt-4 p-3 rounded-lg bg-surface border text-xs text-content-muted ${props.kind === 'calibration_library' ? 'border-purple/40' : 'border-border'}`}
+      >
         {meta.explainer}
-        {overview && <span className="font-semibold text-content"> {overview.file_count.toLocaleString()} files cataloged.</span>}
+        {overview && (
+          <span className="font-semibold text-content">
+            {' '}
+            {overview.file_count.toLocaleString()} files cataloged.
+          </span>
+        )}
       </div>
 
+      <FolderTypeBreakdown
+        key={dir}
+        path={dir}
+        refreshKey={`${root?.last_scan}:${props.isScanning}`}
+      />
+
       <div className="flex flex-wrap gap-2 mt-3">
-        <Stat label="placement" value={coveredBy ? `inside ${basename(coveredBy)}` : 'standalone · own scanned folder'} />
+        <Stat
+          label="placement"
+          value={coveredBy ? `inside ${basename(coveredBy)}` : 'standalone · own scanned folder'}
+        />
         {root?.last_scan && <Stat label="last scan" value={formatTimestamp(root.last_scan)} />}
         {overview && <Stat label="on disk" value={formatBytes(overview.total_bytes)} />}
       </div>

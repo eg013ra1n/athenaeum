@@ -1,3 +1,4 @@
+import { FolderTypeBreakdown } from './FolderTypeBreakdown';
 import { useEffect, useState } from 'react';
 import { RefreshCw, ExternalLink, AlertTriangle, AlertCircle, ChevronDown, ChevronRight, Loader2, CheckCircle2, Info } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
@@ -125,39 +126,85 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
       {/* Relink result */}
       {relinkResult && (
         <div className="mt-4 p-4 bg-surface rounded-lg border border-border">
-          <h4 className="text-sm font-semibold text-content flex items-center gap-2 mb-2"><CheckCircle2 className="text-success" size={16} /> Relinking complete</h4>
+          <h4 className="text-sm font-semibold text-content flex items-center gap-2 mb-2">
+            <CheckCircle2 className="text-success" size={16} /> Relinking complete
+          </h4>
           <div className="grid grid-cols-3 gap-4 text-sm">
-            <div><p className="text-content-muted text-xs">Matched</p><p className="text-lg font-bold text-success">{relinkResult.files_matched}</p></div>
-            <div><p className="text-content-muted text-xs">New files</p><p className="text-lg font-bold text-accent">{relinkResult.files_new}</p></div>
-            <div><p className="text-content-muted text-xs">Orphaned</p><p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p></div>
+            <div>
+              <p className="text-content-muted text-xs">Matched</p>
+              <p className="text-lg font-bold text-success">{relinkResult.files_matched}</p>
+            </div>
+            <div>
+              <p className="text-content-muted text-xs">New files</p>
+              <p className="text-lg font-bold text-accent">{relinkResult.files_new}</p>
+            </div>
+            <div>
+              <p className="text-content-muted text-xs">Orphaned</p>
+              <p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p>
+            </div>
           </div>
         </div>
       )}
 
+      <FolderTypeBreakdown
+        key={root.path}
+        path={root.path}
+        refreshKey={`${root.last_scan}:${props.isScanning}`}
+      />
+
       {/* Stats */}
       <div className="flex flex-wrap gap-2 mt-4">
-        <Stat label="files cataloged" value={overview ? overview.file_count.toLocaleString() : '—'} />
+        <Stat
+          label="files cataloged"
+          value={overview ? overview.file_count.toLocaleString() : '—'}
+        />
         <Stat label="on disk" value={overview ? formatBytes(overview.total_bytes) : '—'} />
-        <Stat label="last scan" value={root.last_scan ? formatTimestamp(root.last_scan) : 'never'} />
-        <Stat label="watching" value={root.monitor_enabled ? 'background interval' : 'manual only'} />
+        <Stat
+          label="last scan"
+          value={root.last_scan ? formatTimestamp(root.last_scan) : 'never'}
+        />
+        <Stat
+          label="watching"
+          value={root.monitor_enabled ? 'background interval' : 'manual only'}
+        />
       </div>
 
       {/* Last scan result strip */}
       {scanResult && (
         <div className="mt-3 p-3 bg-success-muted border border-success/50 rounded-lg flex items-center justify-between text-sm">
-          <span className="flex items-center gap-2 text-success font-semibold"><CheckCircle2 size={14} /> Scan complete — {scanResult.files_processed} processed</span>
-          <button onClick={props.onShowScanDetails} title="View scan details" className="p-1 rounded hover:bg-surface-hover transition"><Info size={14} className="text-content-muted" /></button>
+          <span className="flex items-center gap-2 text-success font-semibold">
+            <CheckCircle2 size={14} /> Scan complete — {scanResult.files_processed} processed
+          </span>
+          <button
+            onClick={props.onShowScanDetails}
+            title="View scan details"
+            className="p-1 rounded hover:bg-surface-hover transition"
+          >
+            <Info size={14} className="text-content-muted" />
+          </button>
         </div>
       )}
 
       {!offline && (
         <Section title="Behavior">
-          <SwitchRow title="Watch for new files" checked={root.monitor_enabled} onChange={props.onToggleMonitor}
-            description="Re-scan this folder periodically in the background. The interval is global — Settings → Scanning." />
-          <SwitchRow title="Include in duplicate detection" checked={root.find_duplicates} onChange={props.onToggleDuplicates}
-            description="Files here are content-hashed and compared against every other folder with this enabled." />
-          <SwitchRow title="Treat camera as unique to this folder" checked={root.unique_camera} onChange={props.onToggleUniqueCamera}
-            description="Two rigs with the same camera model? Keeps their calibration frames apart. Takes effect after the next scan." />
+          <SwitchRow
+            title="Watch for new files"
+            checked={root.monitor_enabled}
+            onChange={props.onToggleMonitor}
+            description="Re-scan this folder periodically in the background. The interval is global — Settings → Scanning."
+          />
+          <SwitchRow
+            title="Include in duplicate detection"
+            checked={root.find_duplicates}
+            onChange={props.onToggleDuplicates}
+            description="Files here are content-hashed and compared against every other folder with this enabled."
+          />
+          <SwitchRow
+            title="Treat camera as unique to this folder"
+            checked={root.unique_camera}
+            onChange={props.onToggleUniqueCamera}
+            description="Two rigs with the same camera model? Keeps their calibration frames apart. Takes effect after the next scan."
+          />
         </Section>
       )}
 
