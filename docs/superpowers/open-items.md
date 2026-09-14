@@ -276,8 +276,10 @@ left behind.
   coarse-mtime filesystems. `list_master_lights` has no production caller —
   it is brief-mandated API surface, not dead code. The default preview size
   512 is stated on both sides of the boundary (the command's default arg and
-  the frontend hook's default). `loading="lazy"` on the Results card's
-  `<img>` defers nothing, since `useMasterPreview` fetches eagerly on mount.
+  the frontend hook's default). The Results card's `<img>` used to carry
+  `loading="lazy"`, which deferred nothing because `useMasterPreview` fetches
+  eagerly on mount — removed in the final review wave (`89bc6d9c`), which also
+  made the card fetch the drizzle thumbnail only after the master's resolves.
   The plan text's own R-M4d-5 wording and one test doc comment
   (`api/stacking.rs`, near `master_preview_caches_and_re_renders_when_the_
   master_changes`) still showed the superseded `_<max_px>.jpg` cache-file
