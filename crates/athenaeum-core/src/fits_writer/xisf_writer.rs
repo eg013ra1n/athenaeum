@@ -25,17 +25,29 @@
 //! so the header is padded up to the next multiple.
 //!
 //! The `<Image>` element carries `geometry="w:h:c"`, `sampleFormat="Float32"`,
-//! `colorSpace="Gray"` (1 channel) or `"RGB"` (3), `pixelStorage="Planar"`
-//! and `location="attachment:<offset>:<size>"`. `byteOrder` and `bounds` are
-//! left off: their format defaults (little-endian, `0:1`) are exactly what
-//! this writer produces, and the reader treats an explicit `0:1` as the same
-//! identity mapping. A sample ABOVE 1.0 therefore sits outside the defaulted
-//! range, and what a foreign reader does with that (ignore the range, or
-//! clamp/rescale to it) is reader-defined — declaring the array's true
-//! min/max instead would oblige every honouring reader to rescale the data,
-//! which is worse, so the default stays. That question and the
-//! padding-inside-`headerLength` one above are what the owner's
-//! external-tool smoke (ruling R-M4d-7) has to confirm.
+//! `colorSpace="Gray"` (1 channel) or `"RGB"` (3), `pixelStorage="Planar"`,
+//! `bounds="0:1"`, `location="attachment:<offset>:<size>"` and, when the
+//! cards' `IMAGETYP` maps onto one of the format's own image-type literals
+//! (`Master Light` → `MasterLight`, `Drizzle Weight` → `WeightMap`), an
+//! `imageType`. `byteOrder` is left off: its default (little-endian) is what
+//! this writer produces.
+//!
+//! `bounds` is NOT optional. XISF 1.0 §8.5.6: the attribute "shall be
+//! specified for all Image elements serializing floating point real pixel
+//! data" — there is no default representable range for a Float32 image,
+//! and the external tool refuses the file outright without it ("Missing
+//! bounds Image attribute, which is mandatory for a floating point real
+//! image", the v0.6.2 masters). The v0.6.2 writer left it off on the belief
+//! that `0:1` was the format's default; that was only OUR reader's
+//! default. The declared range is the pipeline's own convention — every
+//! master's samples are the u16 domain divided by 65535 (`ATH_CSCL`), so
+//! `0:1` names the black and white points the array was built against, and
+//! the reader this crate ships treats an explicit `0:1` as the identity
+//! mapping it already applied. The range is a REPRESENTABLE range, not a
+//! clip: a saturated star core above 1.0 is a sample beyond the white
+//! point, which the format allows. Declaring the array's true min/max
+//! instead would oblige every honouring reader to rescale the data, which
+//! is worse.
 //!
 //! Samples are little-endian f32 in the SAME plane-major order the FITS
 //! writer uses (all of channel 0, then 1, then 2), which is what
@@ -209,6 +221,27 @@ fn with_explicit_row_order(cards: &[Card]) -> Result<Cow<'_, [Card]>, FitsWriteE
     Ok(Cow::Owned(owned))
 }
 
+/// The representable range every master this writer serializes was built
+/// against: the u16 domain divided by 65535 (`ATH_CSCL`), i.e. `[0, 1]`.
+/// Mandatory on a Float32 `<Image>` (XISF 1.0 §8.5.6).
+const FLOAT_BOUNDS: &str = "0:1";
+
+/// The `imageType` literal (XISF 1.0 table 12) for the cards' `IMAGETYP`,
+/// when the two vocabularies coincide: the master light and the drizzle
+/// weight map have exact counterparts; everything else (the rejection maps
+/// are FITS-only anyway) gets no attribute rather than a guessed one.
+fn image_type_for(cards: &[Card]) -> Option<&'static str> {
+    let imagetyp = cards.iter().find(|c| c.keyword == "IMAGETYP")?;
+    let Some(CardValue::Str(s)) = &imagetyp.value else {
+        return None;
+    };
+    match s.trim() {
+        "Master Light" => Some("MasterLight"),
+        "Drizzle Weight" => Some("WeightMap"),
+        _ => None,
+    }
+}
+
 /// The XML header for one image, with the attachment at `attachment_pos`.
 fn build_xml(
     width: usize,
@@ -220,6 +253,9 @@ fn build_xml(
     creation_time: &str,
 ) -> String {
     let color_space = if channels == 3 { "RGB" } else { "Gray" };
+    let image_type_attr = image_type_for(cards)
+        .map(|t| format!(" imageType=\"{t}\""))
+        .unwrap_or_default();
     let mut xml = String::with_capacity(512 + cards.len() * 96);
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str(&format!(
@@ -227,9 +263,12 @@ fn build_xml(
          xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
          xsi:schemaLocation=\"{XSD_LOCATION}\">\n"
     ));
+    // `bounds` is mandatory for a floating point real image (see the
+    // module docs) — the pipeline's `[0, 1]` convention, stated explicitly.
     xml.push_str(&format!(
         "  <Image geometry=\"{width}:{height}:{channels}\" sampleFormat=\"Float32\" \
          colorSpace=\"{color_space}\" pixelStorage=\"Planar\" \
+         bounds=\"{FLOAT_BOUNDS}\"{image_type_attr} \
          location=\"attachment:{attachment_pos}:{data_bytes}\">\n"
     ));
     for card in cards {
@@ -454,6 +493,9 @@ mod tests {
         assert!(xml.contains("sampleFormat=\"Float32\""), "{xml}");
         assert!(xml.contains("colorSpace=\"RGB\""), "{xml}");
         assert!(xml.contains("pixelStorage=\"Planar\""), "{xml}");
+        // v0.6.3: mandatory for a Float32 image (XISF 1.0 §8.5.6) — the
+        // v0.6.2 masters lacked it and the external tool refused them.
+        assert!(xml.contains("bounds=\"0:1\""), "{xml}");
         assert!(
             xml.contains(&format!(
                 "location=\"attachment:{attachment_pos}:{}\"",
@@ -488,6 +530,30 @@ mod tests {
     /// Ruling R-T2-1: the keyword list always states the stored array's row
     /// order — the source's own value when it has one, the astronomical
     /// default when it does not, and never two `ROWORDER` cards.
+
+    /// `imageType` (XISF 1.0 table 12) follows the cards' `IMAGETYP` only
+    /// where the two vocabularies coincide — a master light and a drizzle
+    /// weight map — and is absent, never guessed, for anything else.
+    #[test]
+    fn image_type_follows_imagetyp_where_the_format_names_it() {
+        let (w, h, ch) = (4usize, 2usize, 1usize);
+        let data = ramp(w, h, ch);
+        let write = |imagetyp: Option<&str>| -> String {
+            let mut cards = Vec::new();
+            if let Some(t) = imagetyp {
+                cards.push(Card::new("IMAGETYP", CardValue::Str(t.to_string())).unwrap());
+            }
+            let mut out: Vec<u8> = Vec::new();
+            write_xisf_f32_to(&mut out, w, h, ch, &data, &cards).unwrap();
+            split_header(&out).1
+        };
+        assert!(write(Some("Master Light")).contains("imageType=\"MasterLight\""));
+        assert!(write(Some("Drizzle Weight")).contains("imageType=\"WeightMap\""));
+        assert!(!write(Some("Rejection Map Low")).contains("imageType="));
+        assert!(!write(None).contains("imageType="));
+        // Every one of them still declares the mandatory range.
+        assert!(write(None).contains("bounds=\"0:1\""));
+    }
     #[test]
     fn row_order_is_always_stated_explicitly() {
         let with = vec![Card::new(
