@@ -1,6 +1,29 @@
 import { Circle, CircleDot, CheckCircle2, XCircle, MinusCircle, AlertCircle } from 'lucide-react';
 import type { BoardStage, RowState } from './stageSummary';
 import type { RunProgress } from '../../hooks/useStackingRuns';
+import { formatBytes } from './formatBytes';
+
+/** What a running row says beside its bar (v0.6.3). Every stage now ticks
+ *  in its natural unit — Masters per build, Calibrate/Measure/Register/
+ *  Normalize per FRAME (stage-wide `current`/`total`, the fan-out stages
+ *  used to report only when a whole group returned), Integrate per band
+ *  with the plane/pass in `message`, Drizzle per frame-plane, Output per
+ *  group — so the text is: the count where it is a count, the percent
+ *  always, bytes when the stage reads them, the group, and the stage's
+ *  own message when it sends one. Integrate's `current`/`total` are the
+ *  plane index within the group (`emit_integrate_tick`), not a frame
+ *  tally, so the count is dropped there (Plan 5b click-through A3) and
+ *  the message carries the plane and band instead. */
+export function progressText(stage: BoardStage, p: RunProgress): string {
+  const pct = `${Math.round(p.percent)}%`;
+  const parts: string[] = [];
+  if (stage !== 'integrate' && p.total > 0) parts.push(`${p.current} / ${p.total}`);
+  parts.push(pct);
+  if (p.bytesTotal > 0) parts.push(`${formatBytes(p.bytesDone)} / ${formatBytes(p.bytesTotal)}`);
+  if (p.groupKey) parts.push(p.groupKey);
+  if (p.message) parts.push(p.message);
+  return parts.join(' · ');
+}
 
 /** A stage row's optional toggle (drizzle / write-registered-frames — local
  *  normalization edits `config` through the Normalize inspector panel
@@ -105,25 +128,9 @@ export function StageRow({ index, stage, label, state, summary, progress, select
                   style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }}
                 />
               </span>
-              {stage === 'integrate' ? (
-                // Plan 5b final fix wave, click-through item A3: Integrate's
-                // `current`/`total` are the PLANE/channel index within the
-                // group being integrated (`emit_integrate_tick`), not a
-                // frame count — pairing them with a per-group label read as
-                // a frame tally that never moved (`0 / 1 · 100 %`). One
-                // group integrates at a time, so the count adds nothing;
-                // show the group and the plane's own percent only.
-                <span className="tabular-nums truncate">
-                  {progress.groupKey ?? ''} · {Math.round(progress.percent)}%
-                </span>
-              ) : (
-                <>
-                  <span className="tabular-nums">
-                    {progress.current} / {progress.total} · {Math.round(progress.percent)}%
-                  </span>
-                  {progress.groupKey && <span className="truncate">{progress.groupKey}</span>}
-                </>
-              )}
+              <span className="tabular-nums truncate" title={progressText(stage, progress)}>
+                {progressText(stage, progress)}
+              </span>
             </span>
           ) : (
             summary

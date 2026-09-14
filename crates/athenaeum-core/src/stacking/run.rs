@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,9 +73,8 @@ use crate::stacking::ln::{
     LnReferenceForDetection, DEFAULT_PARAMS,
 };
 use crate::stacking::master_cards::{
-    build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up,
-    master_file_name, write_drizzled_master,
-    write_master_light, MasterCardInputs, WrittenDrizzle,
+    build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
+    write_drizzled_master, write_master_light, MasterCardInputs, WrittenDrizzle,
 };
 use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
@@ -1536,10 +1535,8 @@ fn calibrate_one_frame(
             // is this second freshness check — a frame calibrated by an
             // earlier run that wanted no mosaic regenerates BOTH files in one
             // generation, exactly once.
-            let mosaic_fresh = !want_mosaic
-                || mosaic_row
-                    .as_ref()
-                    .is_some_and(|row| is_fresh(row, &hash));
+            let mosaic_fresh =
+                !want_mosaic || mosaic_row.as_ref().is_some_and(|row| is_fresh(row, &hash));
             if is_fresh(row, &hash) && mosaic_fresh {
                 return Ok(CalibrateOutcome::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
@@ -1967,6 +1964,121 @@ where
     results.into_inner().unwrap()
 }
 
+/// Per-frame progress from INSIDE a fan-out (v0.6.3). [`RunContext::progress`]
+/// needs `&mut rc`, which the workers of [`fan_out`] cannot hold, so a
+/// stage builds one of these before its fan-out and the item closure ticks
+/// it as each frame finishes. Measure, Register and Normalize used to
+/// report only after a whole group's fan-out had RETURNED — on a real set
+/// that is a bar frozen for minutes and then jumping by a group (the
+/// owner's report). Same stage-wide `current`/`total` convention Calibrate
+/// uses: `done` starts at whatever count the stage had already reached
+/// (cached frames, earlier groups), so the bar continues across groups
+/// instead of restarting; same `PROGRESS_THROTTLE_MS` throttle, with a tick
+/// that lands on `total` always emitted; and the guard is held ACROSS the
+/// emit (the `emit_integrate_tick` lesson), so two workers finishing at
+/// once cannot deliver their ticks backwards.
+pub(crate) struct FanOutTicker {
+    emitter: Arc<dyn ProgressEmitter>,
+    run_id: i64,
+    set_id: i64,
+    stage: Stage,
+    group_key: Option<String>,
+    total: usize,
+    done: AtomicUsize,
+    gate: Mutex<(Instant, usize)>,
+}
+
+impl FanOutTicker {
+    fn new(
+        rc: &RunContext,
+        stage: Stage,
+        group_key: Option<String>,
+        done_so_far: usize,
+        total: usize,
+    ) -> Self {
+        Self::from_parts(
+            rc.emitter.clone(),
+            rc.run_id,
+            rc.set_id,
+            stage,
+            group_key,
+            done_so_far,
+            total,
+        )
+    }
+
+    fn from_parts(
+        emitter: Arc<dyn ProgressEmitter>,
+        run_id: i64,
+        set_id: i64,
+        stage: Stage,
+        group_key: Option<String>,
+        done_so_far: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            emitter,
+            run_id,
+            set_id,
+            stage,
+            group_key,
+            total,
+            done: AtomicUsize::new(done_so_far),
+            // Armed so the FIRST tick emits: the throttle measures from the
+            // last emit, and there has been none.
+            gate: Mutex::new((
+                Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS),
+                0,
+            )),
+        }
+    }
+
+    /// One more frame finished; emits (throttled) and returns the running
+    /// count.
+    fn tick(&self, frame_id: Option<i64>) -> usize {
+        let current = self.done.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = Instant::now();
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let (last_emit, last_current) = *gate;
+        if current < last_current {
+            return current;
+        }
+        let force = current >= self.total;
+        if !force && now.duration_since(last_emit) < Duration::from_millis(PROGRESS_THROTTLE_MS) {
+            return current;
+        }
+        *gate = (now, current);
+        let percent = if self.total == 0 {
+            100.0
+        } else {
+            100.0 * current as f64 / self.total as f64
+        };
+        emit_event(
+            self.emitter.as_ref(),
+            STACKING_PROGRESS_EVENT,
+            &StackingProgressEvent {
+                run_id: self.run_id,
+                set_id: self.set_id,
+                stage: self.stage,
+                group_key: self.group_key.clone(),
+                current,
+                total: self.total,
+                percent,
+                bytes_done: 0,
+                bytes_total: 0,
+                frame_id,
+                message: None,
+            },
+        );
+        current
+    }
+
+    /// The count reached so far (cached + ticked).
+    fn done(&self) -> usize {
+        self.done.load(Ordering::SeqCst)
+    }
+}
+
 /// Stage 3 (measure & select, spec §4.1-4.3): per group, measure every
 /// frame that reached calibration (manually- and stage-1-excluded frames
 /// never do — Task 6's calibrate never wrote them a file), reusing a fresh
@@ -2171,6 +2283,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         // `rerun_from`): a `metrics` artifact whose hash matches this
         // frame's CURRENT stage-1 hash is reused straight from
         // `payload_json`, never re-measured.
+        let group_measurable = to_measure.len();
         let mut needing_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
         for (idx, frame, path) in to_measure {
             let calib_hash = {
@@ -2218,19 +2331,48 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
             }
         }
 
+        // Cached frames count as done the moment the group starts (they
+        // cost nothing), so the bar shows the reuse straight away.
+        let reused_in_group = group_measurable - needing_measure.len();
+        if reused_in_group > 0 {
+            rc.progress(
+                Stage::Measure,
+                Some(group.key.clone()),
+                current + reused_in_group,
+                total,
+                0,
+                0,
+                None,
+                None,
+            );
+        }
+
         if !needing_measure.is_empty() {
             let admission_n = admission(8 * max_planes as u64 * group_max_w * group_max_h * 4);
             let meta: Vec<(usize, GroupFrame)> = needing_measure
                 .iter()
                 .map(|(idx, f, _)| (*idx, f.clone()))
                 .collect();
-            let items: Vec<PathBuf> = needing_measure.into_iter().map(|(_, _, p)| p).collect();
+            let items: Vec<(i64, PathBuf)> = needing_measure
+                .into_iter()
+                .map(|(_, f, p)| (f.frame_id, p))
+                .collect();
 
+            let ticker = FanOutTicker::new(
+                rc,
+                Stage::Measure,
+                Some(group.key.clone()),
+                current + reused_in_group,
+                total,
+            );
             let cancel_ref: &AtomicBool = &rc.cancel;
             let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
-            let results = fan_out(items, admission_n, cancel_ref, move |path| {
-                measure_frame(&path, &opts, Some(pool_ref), cancel_ref)
-                    .map_err(|e| format!("measurement failed: {e}"))
+            let ticker_ref = &ticker;
+            let results = fan_out(items, admission_n, cancel_ref, move |(frame_id, path)| {
+                let out = measure_frame(&path, &opts, Some(pool_ref), cancel_ref)
+                    .map_err(|e| format!("measurement failed: {e}"));
+                ticker_ref.tick(Some(frame_id));
+                out
             });
 
             rc.check_cancel()?;
@@ -2851,6 +2993,7 @@ struct PendingRegistration {
 /// What one fan-out worker needs — the pixel-side half of a
 /// [`PendingRegistration`]. The bookkeeping half stays on the run thread.
 struct RegisterItem {
+    frame_id: i64,
     path: PathBuf,
     is_reference: bool,
     scale_gate: (f64, f64),
@@ -3129,6 +3272,7 @@ fn register_group_pass(
     let items: Vec<RegisterItem> = to_register
         .into_iter()
         .map(|p| RegisterItem {
+            frame_id: p.frame.frame_id,
             path: p.path,
             is_reference: p.is_reference,
             scale_gate: p.scale_gate,
@@ -3137,35 +3281,46 @@ fn register_group_pass(
         })
         .collect();
 
+    // v0.6.3: per-frame ticks from inside the fan-out. `progress.0` already
+    // counts this group's reused frames (emitted one by one above), so the
+    // ticker continues from it; the results loop below then adopts the
+    // ticker's count instead of re-counting — re-emitting from the
+    // pre-fan-out value would run the bar backwards.
+    let ticker = FanOutTicker::new(
+        rc,
+        Stage::Register,
+        Some(group.key.clone()),
+        progress.0,
+        progress.1,
+    );
+    let ticker_ref = &ticker;
     let cancel_ref: &AtomicBool = &rc.cancel;
     let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
     let reg_cfg = &cfg.registration;
     let ref_stars_ref = ref_stars;
 
-    let results = fan_out(
-        items,
-        admission_n,
-        cancel_ref,
-        move |item: RegisterItem| {
-            if item.is_reference {
-                Ok(identity_registration(ref_stars_ref))
-            } else {
-                register_frame(
-                    ref_stars_ref,
-                    &item.path,
-                    reg_cfg,
-                    Some(pool_ref),
-                    cancel_ref,
-                    item.hint.as_ref(),
-                    item.policy,
-                    item.scale_gate,
-                )
-                .map_err(|e| format!("registration failed: {e}"))
-            }
-        },
-    );
+    let results = fan_out(items, admission_n, cancel_ref, move |item: RegisterItem| {
+        let out = if item.is_reference {
+            Ok(identity_registration(ref_stars_ref))
+        } else {
+            register_frame(
+                ref_stars_ref,
+                &item.path,
+                reg_cfg,
+                Some(pool_ref),
+                cancel_ref,
+                item.hint.as_ref(),
+                item.policy,
+                item.scale_gate,
+            )
+            .map_err(|e| format!("registration failed: {e}"))
+        };
+        ticker_ref.tick(Some(item.frame_id));
+        out
+    });
 
     rc.check_cancel()?;
+    progress.0 = ticker.done();
 
     for (pos, res) in results.into_iter().enumerate() {
         let (idx, frame, hash, policy) = &meta[pos];
@@ -3318,18 +3473,19 @@ fn register_group_pass(
                 }
             },
         }
-        progress.0 += 1;
-        rc.progress(
-            Stage::Register,
-            Some(group.key.clone()),
-            progress.0,
-            progress.1,
-            0,
-            0,
-            Some(frame.frame_id),
-            None,
-        );
     }
+    // One settled tick after the bookkeeping, so the last throttled
+    // in-flight tick is never the stage's final word.
+    rc.progress(
+        Stage::Register,
+        Some(group.key.clone()),
+        progress.0,
+        progress.1,
+        0,
+        0,
+        None,
+        None,
+    );
 
     Ok(pass)
 }
@@ -4616,6 +4772,7 @@ fn emit_integrate_tick(
     bytes_done: u64,
     bytes_total: u64,
     force: bool,
+    message: Option<String>,
 ) {
     let now = Instant::now();
     let percent = 100.0 * (plane as f64 + frac) / channels.max(1) as f64;
@@ -4669,9 +4826,29 @@ fn emit_integrate_tick(
             bytes_done,
             bytes_total,
             frame_id: None,
-            message: None,
+            message,
         },
     );
+}
+
+/// The Integrate row's own words for a tick (v0.6.3): which plane of how
+/// many, a `pass 2` marker when large-scale rejection integrates the group
+/// twice (`plane >= channels`), and the band or the combine step — the
+/// row used to show a bare percentage for a stage that takes twenty
+/// minutes on a real set.
+fn integrate_tick_message(
+    plane: usize,
+    planes_total: usize,
+    channels: usize,
+    step: &str,
+) -> String {
+    let channels = channels.max(1);
+    let pass = if planes_total > channels && plane >= channels {
+        " · pass 2"
+    } else {
+        ""
+    };
+    format!("plane {}/{channels}{pass} · {step}", plane % channels + 1)
 }
 
 /// Throttle state for the Drizzle stage's per-frame progress ticks (M3 Task
@@ -4956,7 +5133,10 @@ fn process_group_output(
     let pick_reference_idx = |members: &[GroupMember]| -> Option<AnchorPick> {
         let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
         let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
-        let sky: Vec<f64> = members.iter().map(|m| m.measurement.mean_median()).collect();
+        let sky: Vec<f64> = members
+            .iter()
+            .map(|m| m.measurement.mean_median())
+            .collect();
 
         let coverage: Vec<f64> = members
             .iter()
@@ -5341,11 +5521,8 @@ fn process_group_output(
     let mut rej_set: Option<RejBitmapSet> = None;
     let mut rej_set_failure: Option<String> = None;
     if bitmaps_for_drizzle || bitmaps_for_large_scale {
-        let included_for_rej = included_after_min_weight(
-            &stack_frames,
-            reference_idx,
-            group_integration.min_weight,
-        );
+        let included_for_rej =
+            included_after_min_weight(&stack_frames, reference_idx, group_integration.min_weight);
         let stems: Vec<String> = included_for_rej
             .iter()
             .map(|&i| {
@@ -5452,9 +5629,15 @@ fn process_group_output(
             0,
             0,
             true,
+            Some(integrate_tick_message(
+                p,
+                integrate_planes_total,
+                channels,
+                "reading",
+            )),
         );
     };
-    let on_band = |_band: usize, _bands: usize, bytes_done: u64, bytes_total: u64| {
+    let on_band = |band: usize, bands: usize, bytes_done: u64, bytes_total: u64| {
         let plane = current_plane.load(Ordering::Relaxed);
         let frac = if bytes_total > 0 {
             (bytes_done as f64 / bytes_total as f64).min(1.0)
@@ -5473,6 +5656,12 @@ fn process_group_output(
             bytes_done,
             bytes_total,
             false,
+            Some(integrate_tick_message(
+                plane,
+                integrate_planes_total,
+                channels,
+                &format!("band {band}/{bands}"),
+            )),
         );
     };
     let on_combine = |_rows: usize, _rows_total: usize, bytes_done: u64, bytes_total: u64| {
@@ -5489,6 +5678,12 @@ fn process_group_output(
             bytes_done,
             bytes_total,
             false,
+            Some(integrate_tick_message(
+                plane,
+                integrate_planes_total,
+                channels,
+                "combining",
+            )),
         );
     };
     let progress = GroupProgress {
@@ -5533,6 +5728,7 @@ fn process_group_output(
         0,
         0,
         true,
+        None,
     );
     let integrate_dur = integrate_start.elapsed();
 
@@ -5945,20 +6141,21 @@ fn process_group_output(
                     )?
                     .and_then(|a| a.path)
                     .map(PathBuf::from);
-                    let pattern = match crate::calibration_library::light_resolve::
-                        resolve_cfa_geometry(&conn, frame_id)
-                    {
-                        Ok(geom) => geom.map(crate::export::calibrated_generator::bayer_for),
-                        Err(error) => {
-                            tracing::warn!(
-                                run_id = rc.run_id,
-                                frame_id,
-                                error = %format!("{error:#}"),
-                                "bayer drizzle: reading the frame's mosaic phase failed"
-                            );
-                            None
-                        }
-                    };
+                    let pattern =
+                        match crate::calibration_library::light_resolve::resolve_cfa_geometry(
+                            &conn, frame_id,
+                        ) {
+                            Ok(geom) => geom.map(crate::export::calibrated_generator::bayer_for),
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id = rc.run_id,
+                                    frame_id,
+                                    error = %format!("{error:#}"),
+                                    "bayer drizzle: reading the frame's mosaic phase failed"
+                                );
+                                None
+                            }
+                        };
                     bayer_sources[k] = match (path, pattern) {
                         (Some(path), Some(pattern)) => Some((path, pattern)),
                         _ => None,
@@ -6022,11 +6219,10 @@ fn process_group_output(
                     // (outer: plane, inner: included frame) into a
                     // per-frame, per-plane slice — the shape
                     // `DrizzleFrame::output_pair` wants.
-                    let output_pairs_by_frame: Vec<Vec<NormalizationPair>> = (0..output
-                        .included
-                        .len())
-                        .map(|k| (0..channels).map(|p| output.output_pairs[p][k]).collect())
-                        .collect();
+                    let output_pairs_by_frame: Vec<Vec<NormalizationPair>> =
+                        (0..output.included.len())
+                            .map(|k| (0..channels).map(|p| output.output_pairs[p][k]).collect())
+                            .collect();
                     // M4c Task 3, fix round 1 (ruling R-T3-1): drizzle reads
                     // exactly the bits the master was built with — see
                     // `drizzle_rejection_paths`.
@@ -6145,11 +6341,11 @@ fn process_group_output(
                     // block ends, so this stays a plain immutable borrow the
                     // same way `integrate_group`'s own call above does.
                     'attempt: {
-                        let drz = match drizzle_group(&drizzle_input, pool, cancel, &drizzle_progress)
-                        {
-                            Ok(o) => o,
-                            Err(e) => break 'attempt Err(e.into()),
-                        };
+                        let drz =
+                            match drizzle_group(&drizzle_input, pool, cancel, &drizzle_progress) {
+                                Ok(o) => o,
+                                Err(e) => break 'attempt Err(e.into()),
+                            };
                         let scaled = match wcs.map(|w| scale_plate_solve(w, scale)).transpose() {
                             Ok(s) => s,
                             Err(e) => break 'attempt Err(DrizzleFailure::Other(e.to_string())),
@@ -6469,7 +6665,10 @@ fn run_group_normalization(
     // (already the right SET), never changes WHICH `n` are used.
     let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
     let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
-    let sky: Vec<f64> = members.iter().map(|m| m.measurement.mean_median()).collect();
+    let sky: Vec<f64> = members
+        .iter()
+        .map(|m| m.measurement.mean_median())
+        .collect();
     let (ref_width, ref_height) = {
         let geometry = rc.geometry_of(&group.key);
         (geometry.width, geometry.height)
@@ -6794,7 +6993,7 @@ fn run_group_normalization(
     rc.progress(
         Stage::Normalize,
         Some(group.key.clone()),
-        0,
+        total - needs_normalize.len(),
         total,
         0,
         0,
@@ -6813,12 +7012,24 @@ fn run_group_normalization(
     let reference_for_detection_ref: &LnReferenceForDetection = &reference_for_detection;
     let sidecar_paths_ref: &[PathBuf] = &sidecar_paths;
 
+    // v0.6.3: per-frame ticks from inside the fan-out; the cached members
+    // (`total - needs_normalize.len()`) count as done from the start.
+    let ticker = FanOutTicker::new(
+        rc,
+        Stage::Normalize,
+        Some(group.key.clone()),
+        total - needs_normalize.len(),
+        total,
+    );
+    let ticker_ref = &ticker;
+    let member_ids: Vec<i64> = members.iter().map(|m| m.frame_id).collect();
+    let member_ids_ref: &[i64] = &member_ids;
     let results = fan_out(
         needs_normalize.clone(),
         admission_n,
         cancel_ref,
         move |i: usize| {
-            normalize_frame(
+            let out = normalize_frame(
                 ln_reference_ref,
                 reference_for_detection_ref,
                 ref_backgrounds_ref,
@@ -6830,7 +7041,9 @@ fn run_group_normalization(
                 &sidecar_paths_ref[i],
                 cancel_ref,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+            ticker_ref.tick(member_ids_ref.get(i).copied());
+            out
         },
     );
     rc.check_cancel()?;
@@ -7010,12 +7223,41 @@ fn build_and_write_ln_reference(
     reference_member_ids: &[i64],
 ) -> Result<LnReference, RunError> {
     let build_start = Instant::now();
+    // v0.6.3: the reference build is an integration of the group's best
+    // `n` members — a minute or more on a real set that used to show as a
+    // Normalize row sitting at 0 of N. Plane-level ticks with a message
+    // are what `build_reference` offers; enough to say what is happening.
+    let build_emitter = rc.emitter.clone();
+    let (build_run_id, build_set_id, build_group_key) = (rc.run_id, rc.set_id, group.key.clone());
+    let build_total = included.len();
+    let build_n = n.min(included.len());
+    let on_build_progress = |plane: usize, planes: usize| {
+        emit_event(
+            build_emitter.as_ref(),
+            STACKING_PROGRESS_EVENT,
+            &StackingProgressEvent {
+                run_id: build_run_id,
+                set_id: build_set_id,
+                stage: Stage::Normalize,
+                group_key: Some(build_group_key.clone()),
+                current: 0,
+                total: build_total,
+                percent: 0.0,
+                bytes_done: 0,
+                bytes_total: 0,
+                frame_id: None,
+                message: Some(format!(
+                    "building the LN reference from {build_n} frames · plane {}/{planes}",
+                    plane + 1
+                )),
+            },
+        );
+    };
     let cancel: &AtomicBool = &rc.cancel;
     let pool: &rayon::ThreadPool = rc.ctx.image_pool.as_ref();
-    let no_progress = |_: usize, _: usize| {};
 
-    let built =
-        build_ln_reference(input, included, n, pool, cancel, io, &no_progress).map_err(|e| {
+    let built = build_ln_reference(input, included, n, pool, cancel, io, &on_build_progress)
+        .map_err(|e| {
             if matches!(e, IntegrationError::Cancelled) {
                 RunError::Cancelled
             } else {
@@ -10266,8 +10508,9 @@ mod tests {
                     v,
                     TOTAL,
                     true, // force: every value must reach the recorder, or
-                          // a throttle-skipped tick could hide a real
-                          // ordering violation.
+                    // a throttle-skipped tick could hide a real
+                    // ordering violation.
+                    None,
                 );
                 turn.store(v + 1, Ordering::SeqCst);
             }
@@ -10292,6 +10535,76 @@ mod tests {
             );
             last = percent;
         }
+    }
+
+    /// v0.6.3: the fan-out stages' per-frame ticker. Two workers race 250
+    /// ticks through one ticker: the recorded percents never go backwards
+    /// (the gate is held across the emit), the first tick is emitted (the
+    /// gate is armed at construction), the count continues from
+    /// `done_so_far` instead of restarting, and the tick that lands on
+    /// `total` is always emitted whatever the throttle says.
+    #[test]
+    fn fan_out_ticker_is_monotonic_continues_and_always_lands_on_total() {
+        struct Rec {
+            events: Mutex<Vec<(usize, f64)>>,
+        }
+        impl ProgressEmitter for Rec {
+            fn emit_json(&self, _event_name: &str, payload: serde_json::Value) {
+                let current = payload["current"].as_u64().unwrap() as usize;
+                let percent = payload["percent"].as_f64().unwrap();
+                self.events.lock().unwrap().push((current, percent));
+            }
+        }
+        const DONE_SO_FAR: usize = 50;
+        const TICKS: usize = 250;
+        const TOTAL: usize = DONE_SO_FAR + TICKS;
+
+        let rec = Arc::new(Rec {
+            events: Mutex::new(Vec::new()),
+        });
+        let ticker = FanOutTicker::from_parts(
+            rec.clone(),
+            1,
+            1,
+            Stage::Measure,
+            Some("g".to_string()),
+            DONE_SO_FAR,
+            TOTAL,
+        );
+        let counter = AtomicUsize::new(0);
+        let worker = || loop {
+            if counter.fetch_add(1, Ordering::SeqCst) >= TICKS {
+                break;
+            }
+            ticker.tick(Some(7));
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(worker);
+            scope.spawn(worker);
+        });
+
+        assert_eq!(ticker.done(), TOTAL);
+        let events = rec.events.lock().unwrap().clone();
+        assert!(!events.is_empty(), "no ticks recorded at all");
+        assert_eq!(
+            events[0].0,
+            DONE_SO_FAR + 1,
+            "the first tick continues from done_so_far and is emitted: {events:?}"
+        );
+        let mut last = -1.0f64;
+        for &(_, percent) in &events {
+            assert!(
+                percent + 1e-9 >= last,
+                "percent went backwards: {last} -> {percent}"
+            );
+            last = percent;
+        }
+        let final_event = events.last().unwrap();
+        assert_eq!(
+            final_event.0, TOTAL,
+            "the tick on total is always emitted: {events:?}"
+        );
+        assert!((final_event.1 - 100.0).abs() < 1e-9, "{events:?}");
     }
 
     #[test]
@@ -10351,8 +10664,9 @@ mod tests {
                     v,
                     TOTAL,
                     true, // force: bypass the throttle so every fetched
-                          // value reaches the latch — the latch, not the
-                          // throttle, is what this test exercises.
+                    // value reaches the latch — the latch, not the
+                    // throttle, is what this test exercises.
+                    None,
                 );
             };
 
@@ -11834,7 +12148,10 @@ mod tests {
 
         let cfg = StackingConfig::default();
         assert!(!cfg.normalization.local.enabled);
-        assert_eq!(cfg.normalization.rejection, RejectionNormalization::ScaleZeroOffset);
+        assert_eq!(
+            cfg.normalization.rejection,
+            RejectionNormalization::ScaleZeroOffset
+        );
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -11896,9 +12213,12 @@ mod tests {
             STAR_FIELD_HEIGHT,
         );
 
-        let plan_groups_probe =
-            group_frames(&fixture.conn, fixture.set_id, &StackingConfig::default().grouping)
-                .unwrap();
+        let plan_groups_probe = group_frames(
+            &fixture.conn,
+            fixture.set_id,
+            &StackingConfig::default().grouping,
+        )
+        .unwrap();
         let group_key = plan_groups_probe[0].key.clone();
 
         // ── Run A: rejection = local, group-level fallback forced ──
@@ -12130,7 +12450,8 @@ mod tests {
         assert!(
             rc_a.warnings
                 .iter()
-                .any(|w| w.contains(&blocked_frame_id.to_string()) && w.contains("local normalization")),
+                .any(|w| w.contains(&blocked_frame_id.to_string())
+                    && w.contains("local normalization")),
             "the per-frame failure must warn: {:?}",
             rc_a.warnings
         );
@@ -12454,7 +12775,11 @@ mod tests {
         let plane_on = reader_on.read_plane(0).unwrap();
         let w = reader_off.width();
         let row_mean = |data: &[f32], y: usize| -> f64 {
-            data[y * w..(y + 1) * w].iter().map(|&v| v as f64).sum::<f64>() / w as f64
+            data[y * w..(y + 1) * w]
+                .iter()
+                .map(|&v| v as f64)
+                .sum::<f64>()
+                / w as f64
         };
         // A star-free control row from the same strip as the trail.
         let control_off = row_mean(&plane_off, 108);
@@ -12582,8 +12907,7 @@ mod tests {
             "drizzle never ran: {:?}",
             group.drizzle_path
         );
-        let stats: GroupStats =
-            serde_json::from_str(group.stats_json.as_deref().unwrap()).unwrap();
+        let stats: GroupStats = serde_json::from_str(group.stats_json.as_deref().unwrap()).unwrap();
         assert!(
             stats.large_scale_rejected_fraction.is_some(),
             "the second pass must have run: {stats:?}"
@@ -12636,7 +12960,9 @@ mod tests {
             let path = with_second[k].as_ref().expect("a path per frame");
             assert_eq!(path, &set.second_pass_path(k));
             assert_eq!(
-                path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()),
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str()),
                 Some(crate::stacking::rej::SECOND_PASS_DIR),
                 "the second pass's own directory, not the first pass's"
             );
@@ -12653,7 +12979,10 @@ mod tests {
             assert_eq!(without[k].as_deref(), Some(set.path(k)));
         }
         // And no bitmaps at all when the run never made a set.
-        assert_eq!(drizzle_rejection_paths(None, 3, true), vec![None, None, None]);
+        assert_eq!(
+            drizzle_rejection_paths(None, 3, true),
+            vec![None, None, None]
+        );
     }
 
     /// Fix round 1 (ruling R-T3-1) end to end: drizzle and large-scale
@@ -12720,7 +13049,10 @@ mod tests {
         let summary: RunSummary =
             serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
         assert!(
-            !summary.warnings.iter().any(|w| w.contains("drizzle skipped")),
+            !summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("drizzle skipped")),
             "drizzle must not have been skipped: {:?}",
             summary.warnings
         );
@@ -12802,8 +13134,7 @@ mod tests {
         let group = &groups[0];
         assert_eq!(group.status, "done", "{group:?}");
 
-        let rows =
-            crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
+        let rows = crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
         let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(
             kinds,
@@ -13009,9 +13340,7 @@ mod tests {
                 .expect("a completed run has finished_at"),
         )
         .expect("finished_at parses as RFC3339");
-        let wall_ms = (run_finished_at - run_started_at)
-            .num_milliseconds()
-            .max(0) as u64;
+        let wall_ms = (run_finished_at - run_started_at).num_milliseconds().max(0) as u64;
         assert!(
             output_ms + drizzle_ms <= wall_ms,
             "output_ms={output_ms} drizzle_ms={drizzle_ms} wall_ms={wall_ms} — Output must not \
@@ -13192,8 +13521,7 @@ mod tests {
                 name.starts_with("c_") && !name.ends_with("_d.fits"),
                 "the mosaic takes the mono spelling: {name}"
             );
-            let debayered = Path::new(&path)
-                .with_file_name(name.replace(".fits", "_d.fits"));
+            let debayered = Path::new(&path).with_file_name(name.replace(".fits", "_d.fits"));
             assert!(
                 debayered.exists(),
                 "the debayered sibling must be there too: {}",
@@ -13447,7 +13775,8 @@ mod tests {
         );
 
         let second = run_once();
-        let frames: Vec<&SummaryFrame> = second.groups.iter().flat_map(|g| g.frames.iter()).collect();
+        let frames: Vec<&SummaryFrame> =
+            second.groups.iter().flat_map(|g| g.frames.iter()).collect();
         assert_eq!(frames.len(), light_ids.len(), "{frames:?}");
         assert!(
             frames.iter().all(|f| f.cached_calibrated),
@@ -14040,8 +14369,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row_on.status, "done", "{row_on:?}");
-        let groups_on =
-            crate::db::stacking::list_groups(&fixture.conn, started_on.run_id).unwrap();
+        let groups_on = crate::db::stacking::list_groups(&fixture.conn, started_on.run_id).unwrap();
         let master_on = groups_on[0].master_path.clone().expect("second master");
         assert_ne!(
             master_off, master_on,
@@ -14591,11 +14919,11 @@ mod tests {
             serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
         assert_eq!(summary.groups.len(), 1, "{:?}", summary.groups);
         let group_summary = &summary.groups[0];
-        let stats = group_summary
-            .stats
-            .as_ref()
-            .expect("group stats recorded");
-        assert_eq!(stats.frames, 5, "all 5 frames must reach integration: {stats:?}");
+        let stats = group_summary.stats.as_ref().expect("group stats recorded");
+        assert_eq!(
+            stats.frames, 5,
+            "all 5 frames must reach integration: {stats:?}"
+        );
         assert_eq!(
             stats.dropped_below_min_weight, 1,
             "expected exactly one frame dropped below the weight floor: {stats:?}"
@@ -14618,17 +14946,18 @@ mod tests {
         // 110..130) is comfortably outside any star's PSF wing at sigma
         // 1.6px) and averaged over a 20x20 patch there to wash out the
         // (small, near-zero) per-pixel noise.
-        let region_mean = |plane: &[f32], width: usize, x0: usize, y0: usize, w: usize, h: usize| -> f64 {
-            let mut sum = 0.0f64;
-            let mut count = 0usize;
-            for y in y0..y0 + h {
-                for x in x0..x0 + w {
-                    sum += plane[y * width + x] as f64;
-                    count += 1;
+        let region_mean =
+            |plane: &[f32], width: usize, x0: usize, y0: usize, w: usize, h: usize| -> f64 {
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for y in y0..y0 + h {
+                    for x in x0..x0 + w {
+                        sum += plane[y * width + x] as f64;
+                        count += 1;
+                    }
                 }
-            }
-            sum / count as f64
-        };
+                sum / count as f64
+            };
 
         let kept_indices = [0usize, 2, 3, 4];
         let kept_weights = [1.0f64, 0.5, 0.25, 0.125]; // exptime / max(exptime) = 60/60, 30/60, 15/60, 7.5/60
@@ -14668,10 +14997,7 @@ mod tests {
 
         let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
         let group = &groups[0];
-        let drizzle_path = group
-            .drizzle_path
-            .clone()
-            .expect("drizzle path recorded");
+        let drizzle_path = group.drizzle_path.clone().expect("drizzle path recorded");
         let drizzle_reader = PlaneReader::open(Path::new(&drizzle_path)).unwrap();
         let drizzle_plane = drizzle_reader.read_plane(0).unwrap();
         // Scale-2 output: the same (165..185, 110..130) source patch maps
@@ -15105,8 +15431,9 @@ mod tests {
             "an anchor must still be chosen: {group_summary:?}"
         );
         assert!(
-            rc.warnings.iter().any(|w| w
-                .contains("no admissible member has a usable measured background")),
+            rc.warnings
+                .iter()
+                .any(|w| w.contains("no admissible member has a usable measured background")),
             "the fallback must be visible in the run's own warnings: {:?}",
             rc.warnings
         );
@@ -15400,7 +15727,11 @@ mod tests {
             astroimage::ImageConverter::read_raw(Path::new(&weight_map_path)).unwrap();
         assert_eq!(
             (weight_meta.width, weight_meta.height, weight_meta.channels),
-            (drizzle_meta.width, drizzle_meta.height, drizzle_meta.channels),
+            (
+                drizzle_meta.width,
+                drizzle_meta.height,
+                drizzle_meta.channels
+            ),
             "the weight map shares the drizzled master's grid"
         );
 
@@ -15440,11 +15771,7 @@ mod tests {
     /// the card. The raw file's own bytes are deliberately left alone: the
     /// pipeline never re-reads a light's header off disk, so rewriting the
     /// file would change nothing and prove nothing.
-    fn set_lights_row_order(
-        conn: &rusqlite::Connection,
-        frame_ids: &[i64],
-        order: Option<&str>,
-    ) {
+    fn set_lights_row_order(conn: &rusqlite::Connection, frame_ids: &[i64], order: Option<&str>) {
         let card_line = order.map(|order| {
             let records = crate::fits_writer::card::format_card(
                 &crate::fits_writer::Card::new(
@@ -15611,10 +15938,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, "done", "{row:?}");
         let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
-        let master_path = groups[0]
-            .master_path
-            .clone()
-            .expect("master path recorded");
+        let master_path = groups[0].master_path.clone().expect("master path recorded");
 
         let keys = crate::fits_parser::stored_header::parse_stored_header_keys(
             crate::models::FileFormat::XISF,
