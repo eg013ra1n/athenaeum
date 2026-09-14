@@ -162,11 +162,13 @@ export function SelectionDialog({
             <>
               <div className="bg-surface-hover rounded p-4 space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-content-secondary">Frames Found:</span>
+                  <span className="text-content-secondary">Files Found:</span>
                   <span className="text-accent font-semibold">{result.count}</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-content-secondary">Total Exposure:</span>
+                  <span className="text-content-secondary">
+                    Integration (versions counted once):
+                  </span>
                   <span className="text-accent font-semibold">{totalHours}h</span>
                 </div>
               </div>

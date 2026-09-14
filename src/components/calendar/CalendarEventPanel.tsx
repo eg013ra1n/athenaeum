@@ -90,7 +90,7 @@ function FrameSetCard({
       <div className="flex items-center gap-3 text-xs text-content-muted">
         <span className="flex items-center gap-1">
           <Camera size={12} />
-          {frameSet.frameCount} frames
+          {frameSet.frameCount} exposures
         </span>
         <span className="flex items-center gap-1">
           <Clock size={12} />
@@ -156,7 +156,7 @@ function UnorganizedCard({
       <div className="flex items-center gap-3 text-xs text-content-muted">
         <span className="flex items-center gap-1">
           <Camera size={12} />
-          {group.frameCount} frames
+          {group.frameCount} exposures
         </span>
         <span className="flex items-center gap-1">
           <Clock size={12} />
@@ -306,7 +306,7 @@ export function CalendarEventPanel({
 
         {/* Summary */}
         <div className="pt-2 border-t border-border text-xs text-content-muted">
-          Total: {events.totalFrameCount} frames | {formatExposure(events.totalExposureSeconds)}
+          Total: {events.totalFrameCount} exposures | {formatExposure(events.totalExposureSeconds)}
         </div>
       </div>
 
@@ -320,7 +320,7 @@ export function CalendarEventPanel({
           ) : (
             <>
               <h5 className="text-sm font-medium text-content mb-2">
-                Create Frame Set from {creatingFromGroup.frameCount} frames
+                Create Frame Set from {creatingFromGroup.frameCount} exposures
               </h5>
               <input
                 type="text"

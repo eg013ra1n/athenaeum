@@ -526,7 +526,10 @@ pub fn insert_fits_header(conn: &Connection, file_id: i64, header: &str) -> Resu
         "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
     )?;
     stmt.execute(params![file_id, header, fingerprint])?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    crate::exposure_versions::refresh_file(conn, file_id)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+    Ok(id)
 }
 
 /// Fill `header_fingerprint` for any `fits_header` rows still missing it
@@ -2654,7 +2657,7 @@ pub fn get_frames_sets_by_project(
     _project_id: i64, // Kept for backwards compatibility, but ignored
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
-        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
+        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, (SELECT SUM(ef.exptime) FROM exposure_members em JOIN frames ef ON ef.id=em.frame_id WHERE em.frames_set_id=fs.id), fs.flat_pattern,
                 COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived,
                 fs.archived_at, fs.archive_operation_id, fs.uuid, fs.updated_at
          FROM frames_set fs
@@ -3160,7 +3163,18 @@ pub fn get_sessions_for_night(
         })
     })?;
 
-    sessions.collect()
+    let mut result = sessions.collect::<Result<Vec<_>>>()?;
+    for session in &mut result {
+        let ids = conn
+            .prepare("SELECT frame_id FROM session_members WHERE session_id=?1")?
+            .query_map([session.id], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>>>()?;
+        session.total_exp_time = Some(
+            crate::exposure_versions::exposure_seconds(conn, &ids)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
+        );
+    }
+    Ok(result)
 }
 
 /// Get frames with their files by frame IDs (for session generation during auto-clustering)
@@ -3351,7 +3365,7 @@ pub fn get_imaging_nights_with_sessions(
         let mut sessions_with_frames = Vec::new();
 
         for session in sessions {
-            let session = session?;
+            let mut session = session?;
             let session_id = session.id.unwrap();
 
             // Get frames for this session
@@ -3375,10 +3389,24 @@ pub fn get_imaging_nights_with_sessions(
                 })
             })?;
 
-            let frames_vec: Result<Vec<_>> = frames.collect();
+            let frames_vec: Vec<_> = frames.collect::<Result<Vec<_>>>()?;
+            let ids: Vec<i64> = frames_vec
+                .iter()
+                .filter_map(|f| f.frame.as_ref().and_then(|f| f.id))
+                .collect();
+            let effective = crate::exposure_versions::effective_ids(conn, &ids)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            session.total_exp_time = Some(
+                frames_vec
+                    .iter()
+                    .filter_map(|f| f.frame.as_ref())
+                    .filter(|f| f.id.is_some_and(|id| effective.contains(&id)))
+                    .filter_map(|f| f.exptime)
+                    .sum(),
+            );
             sessions_with_frames.push(crate::models::SessionWithFrames {
                 session,
-                frames: frames_vec?,
+                frames: frames_vec,
             });
         }
 

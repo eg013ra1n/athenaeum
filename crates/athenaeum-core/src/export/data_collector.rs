@@ -135,11 +135,14 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
 
     // Calculate totals
     let total_light_frames: i32 = filters.iter().map(|f| f.light_frames.len() as i32).sum();
-    let total_exposure_seconds: f64 = filters
-        .iter()
-        .flat_map(|f| &f.light_frames)
-        .filter_map(|f| f.exptime)
-        .sum();
+    let total_exposure_seconds = crate::exposure_versions::exposure_seconds(
+        conn,
+        &filters
+            .iter()
+            .flat_map(|f| &f.light_frames)
+            .map(|f| f.frame_id)
+            .collect::<Vec<_>>(),
+    )?;
 
     Ok(ExportData {
         frame_set_id,
@@ -1254,9 +1257,18 @@ fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Resul
         groups_map.entry(key).or_default().push(frame);
     }
 
-    tracing::debug!(count = groups_map.len(), "distinct (filter, camera_type) groups found");
+    tracing::debug!(
+        count = groups_map.len(),
+        "distinct (filter, camera_type) groups found"
+    );
 
     let mut export_groups = Vec::new();
+    let effective: std::collections::HashSet<i64> = crate::exposure_versions::effective_ids(
+        conn,
+        &light_frames.iter().map(|f| f.frame_id).collect::<Vec<_>>(),
+    )?
+    .into_iter()
+    .collect();
 
     for ((filter, camera_type), frames) in groups_map {
         let group_key = ExportGroup::make_group_key(filter.as_deref(), &camera_type);
@@ -1269,7 +1281,12 @@ fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Resul
 
         // Calculate totals
         let total_frames = frames.len() as i32;
-        let total_exposure: f64 = frames.iter().filter_map(|f| f.exptime).sum();
+        let total_exposure = frames
+            .iter()
+            .filter(|f| effective.contains(&f.frame_id))
+            .filter_map(|f| f.exptime)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .sum();
 
         // Collect warnings
         let mut warnings = Vec::new();

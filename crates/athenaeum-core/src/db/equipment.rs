@@ -11,7 +11,7 @@ pub fn get_all_cameras(conn: &Connection) -> Result<Vec<CameraStats>> {
         "SELECT
             instrume,
             COUNT(*) as frame_count,
-            SUM(exptime) / 3600.0 as total_hours,
+            SUM(CASE WHEN id IN (SELECT frame_id FROM exposure_frames) THEN exptime ELSE 0 END) / 3600.0 as total_hours,
             MIN(date_obs) as first_use,
             MAX(date_obs) as last_use
         FROM frames

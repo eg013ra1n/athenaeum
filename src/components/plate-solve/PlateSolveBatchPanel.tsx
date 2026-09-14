@@ -158,7 +158,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
       {/* Active progress bar — Cancel sits inline at the right end of the
           top row instead of in a separate block above, so the whole widget
           stays on one tight line. */}
-      {isActive && progress && (
+      {isActive && (
         <div className="rounded-lg border border-border bg-surface p-3 space-y-2">
           <div className="flex items-center justify-between gap-3 text-sm">
             <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
@@ -172,12 +172,12 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
               </span>
             </div>
             <span className="text-content-muted flex-shrink-0 tabular-nums">
-              {progress.current} / {progress.total}
+              {progress?.current ?? 0} / {progress?.total ?? myBatch?.frameIds.length ?? 0}
             </span>
             {hideTriggerButtons && (
               <button
                 onClick={handleCancel}
-                disabled={isCancelling}
+                disabled={isCancelling || !progress}
                 title={isCancelling ? 'Cancelling…' : 'Cancel batch'}
                 className="flex-shrink-0 inline-flex items-center justify-center w-6 h-6 rounded text-content-muted hover:text-error hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 aria-label="Cancel plate-solve batch"

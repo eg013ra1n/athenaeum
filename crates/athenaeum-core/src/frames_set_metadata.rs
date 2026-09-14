@@ -23,6 +23,7 @@ pub fn calculate_metadata_from_frame_ids(
     frame_ids: &[i64],
     conn: &Connection,
 ) -> Result<FrameSetMetadata> {
+    let effective_ids = crate::exposure_versions::effective_ids(conn, frame_ids)?;
     if frame_ids.is_empty() {
         return Ok(FrameSetMetadata {
             date_obs_start: None,
@@ -109,7 +110,18 @@ pub fn calculate_metadata_from_frame_ids(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    calculate_metadata_from_frames(&frames)
+    // Products still supply dates, pointing and rotation. Only the exposure
+    // total uses confirmed representatives; a stack-only set retains its position.
+    let mut metadata = calculate_metadata_from_frames(&frames)?;
+    metadata.total_exp_time = Some(
+        frames
+            .iter()
+            .filter(|f| f.id.is_some_and(|id| effective_ids.contains(&id)))
+            .filter_map(|f| f.exptime)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .sum(),
+    );
+    Ok(metadata)
 }
 
 /// Calculate frame set metadata from a list of frames

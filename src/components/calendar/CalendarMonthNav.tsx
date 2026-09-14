@@ -78,7 +78,7 @@ export function CalendarMonthNav({
       {/* Stats */}
       <div className="flex items-center gap-4 text-sm text-content-muted">
         <span>
-          <span className="text-content font-medium">{totalFrameCount}</span> frames
+          <span className="text-content font-medium">{totalFrameCount}</span> exposures
         </span>
         <span>
           <span className="text-content font-medium">{totalExposureHours.toFixed(1)}</span>h exposure
