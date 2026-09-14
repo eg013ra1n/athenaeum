@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
 import type {
+  MasterLightKind,
   Stage,
   StackingConfig,
   StackingCompleteEvent,
@@ -209,4 +210,91 @@ export function useStackingRuns() {
   const isRunning = useCallback((setId: number): boolean => progress.has(setId), [progress]);
 
   return { progress, lastOutcome, startRun, cancelRun, isRunning };
+}
+
+/** Normalize a JPEG payload from either backend — desktop's
+ *  `tauri::ipc::Response` crosses the IPC boundary as an `ArrayBuffer`,
+ *  `httpApi.invoke` already decodes an `image/*` response into a
+ *  `Uint8Array`, and the `number[]` arm is what a JSON-serialized `Vec<u8>`
+ *  looks like (an older backend). Same three-arm shape `BlinkViewer` uses
+ *  for its own previews. */
+function toJpegBytes(
+  payload: Uint8Array<ArrayBuffer> | ArrayBuffer | number[],
+): Uint8Array<ArrayBuffer> {
+  if (payload instanceof Uint8Array) return payload;
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  return new Uint8Array(payload);
+}
+
+export interface MasterPreview {
+  /** A blob URL, revoked when the hook unmounts or its arguments change. */
+  url: string | null;
+  loading: boolean;
+  /** The backend's message — a run/output/file that is gone reads as a
+   *  404-class `NotFound` and is shown, never swallowed. */
+  error: string | null;
+}
+
+/** JPEG thumbnail for one master light a run wrote (M4d Task 3, ruling
+ *  R-M4d-5). Fetches through `get_master_light_preview` on both targets
+ *  (the web host answers the same command name with `image/jpeg`), turns
+ *  the bytes into a blob URL and revokes it on unmount or when the
+ *  arguments change.
+ *
+ *  StrictMode-safe by the cancelled-flag pattern: the object URL is created
+ *  only if the effect is still live when the bytes arrive, so a
+ *  double-mounted dev render never leaks one. */
+export function useMasterPreview(
+  runId: number | null,
+  groupKey: string | null,
+  kind: MasterLightKind,
+  maxPx = 512,
+): MasterPreview {
+  const [url, setUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (runId == null || !groupKey) {
+      setUrl(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    setLoading(true);
+    setError(null);
+
+    api
+      .invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>('get_master_light_preview', {
+        runId,
+        groupKey,
+        kind,
+        maxPx,
+      })
+      .then((payload) => {
+        if (cancelled) return;
+        const blob = new Blob([toJpegBytes(payload)], { type: 'image/jpeg' });
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.error('[useMasterPreview] get_master_light_preview failed:', err);
+        setError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setUrl(null);
+    };
+  }, [runId, groupKey, kind, maxPx]);
+
+  return { url, loading, error };
 }

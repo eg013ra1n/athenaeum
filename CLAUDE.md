@@ -52,7 +52,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 **`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4), `config`/`groups`/`paths`/`plan`/`run`/`provenance` (config precedence, group discovery, artifact paths, the plan gate, the run thread, provenance rows — Plan 5a orchestration), `ln` (local normalization — reference build, background model, PSF-flux scale, `.athln` sidecars, M2) plus `api/stacking.rs` (the command-facing orchestration layer both hosts call); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs`, `examples/integrate_probe.rs` and `examples/ln_probe.rs`. See **## Stacking** below for the tab, the commands and the acceptance state.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 249 functions across 23 modules (re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 250 functions across 23 modules (M4d Task 3 added `get_master_light_preview` to the `stacking` module, 249 → 250; the 249/23 measurement below is otherwise unchanged — re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
 `core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar` `stacking`
 
@@ -170,6 +170,7 @@ Key tables:
 - `frames_set` + `imaging_nights` + `sessions` + `session_members` — frame-set/session lifecycle. **Frame sets are global, not project-scoped** (the `projects` table is vestigial; `project_id` parameters are accepted but ignored). **A night is the grouping unit, not the calendar date**: the Analysis / Coverage tree groups by `imaging_nights.id` and labels the span (`October 18–19, 2025`), and the Shoot Calendar keys each day on the night that STARTED there (`DATE(imaging_nights.start_time, '-12 hours')` for organized frames, the same noon-to-noon rule over `date_obs` for loose ones) — `get_calibration_hierarchy_for_frame_set` used to group by `DATE(f.date_obs)`, which cut every through-midnight night in two (the original LDN 1272 report). **Nights are derived data, never stitched**: every merge (manual `api::frame_sets::merge_frame_sets`, `auto_merge`) and the `recalculate_frame_set_nights` command re-derive a set's nights/sessions from the union of its member frames via `sessions::rederive_for_frame_set` (delete the set's night rows — sessions/members cascade — then `detect_sessions` over the whole membership; a member without DATE-OBS lands on a fallback night, never dropped). Matching night rows by calendar date + range overlap is what stored one night as two rows after a post-flip merge (LDN 1272, 2026-09-05) — `frames_set_merge.rs` is gone with it.
 - `calibration_set` + `calibration_set_frames` + `calibration_set_to_frames` — grouped calibration frames + consumer links.
 - `tags` + `frame_tags`, `settings` (the `export_templates` and `sync_sources` tables are vestigial — created by the schema, referenced by no code).
+- `master_lights` — what a stacking run WROTE (M4d, ruling R-M4d-4): one row per written output (`kind` = `master | drizzle | weight_map`), `UNIQUE(run_id, group_key, kind)`, cascading with its `stacking_runs` row. **A master light is cataloged here and NOWHERE else** — it never becomes a `frames` row (the scanner's `CALSTAT` + `ATH_CSRC` skip rule is untouched).
 - Archive: `archive_roots`, `archive_operations`, `archive_operation_files`, `archive_operation_steps`; `frames_set.archived_at` + `archive_operation_id`; `files.archived_in_operation` + `archive_zip_path` + `archive_path_in_zip`.
 - File-op: `file_operations`, `file_operation_files`, `file_operation_steps`.
 
@@ -467,14 +468,18 @@ Progress rides `stacking-progress` (per stage/group/frame, throttled 300 ms)
 and exactly one `stacking-complete` fires from the run's single exit path
 regardless of success/cancel/failure/panic.
 
-**15 commands** (`api/stacking.rs` + `commands/stacking.rs` +
+**16 commands** (`api/stacking.rs` + `commands/stacking.rs` +
 `routes/stacking.rs`, all mirrored on both hosts): `get_stacking_plan`,
 `start_stacking`, `cancel_stacking`, `get_stacking_runs`, `get_stacking_run`,
 `get_stacking_config`, `set_stacking_config`, `get_stacking_presets` (Default
 / Fast preview / Maximum quality, a single Rust source of truth so the tab
 never re-implements the transforms), `get_stacking_defaults`,
 `set_stacking_defaults`, `reset_stacking_defaults`, `get_stacking_paths`,
-`set_stacking_paths`, `get_stacking_work_usage`, `cleanup_stacking_work`.
+`set_stacking_paths`, `get_stacking_work_usage`, `cleanup_stacking_work`,
+`get_master_light_preview` (M4d Task 3 — JPEG bytes for one written master
+light; the web host answers it at `POST /api/get_master_light_preview`, the
+mirror `api.invoke` uses, AND at `GET /api/stacking/master-preview?runId=…`
+for an `<img src>`).
 
 **The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
 the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →
@@ -497,7 +502,9 @@ the set having light frames.
 global config defaults (`get/set/reset_stacking_defaults`, the same
 `StackingConfig` tree a set can override) and the working/output folders
 (`get/set_stacking_paths` — `stacking::paths`, on-disk layout
-`<working_dir>/<set_slug>/{calibrated,registered,ln,runs}/…`; the web folder
+`<working_dir>/<set_slug>/{calibrated,registered,ln,runs,rej,previews}/…` —
+`previews/run-<id>/<group>_<kind>_<max_px>.jpg` is the M4d master-light
+thumbnail cache, swept only by `CleanupWhat::All`; the web folder
 picker's `browse_directories` scope `"stacking"` resolves against the same
 roots as `"scan"`, plan 5b ruling 6). Per-set override lives in
 `stacking_set_config`; precedence is WHOLE-CONFIG (spec §9.2, `resolve_config`)

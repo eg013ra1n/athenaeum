@@ -128,6 +128,32 @@ impl WorkingLayout {
     pub fn run_json(&self, run_id: i64) -> PathBuf {
         self.runs_dir().join(format!("run-{run_id}.json"))
     }
+
+    /// `root/previews` — the parent of every run's master-light preview
+    /// cache (M4d Task 3, ruling R-M4d-5). Like `rej/`, these are per-RUN
+    /// and nest one level deeper than the cached-artifact subtrees; unlike
+    /// `rej/`, they are pure derived JPEGs — removing them costs nothing but
+    /// a re-render, so they are swept by `CleanupWhat::All` and never by the
+    /// narrower policies.
+    pub fn previews_root(&self) -> PathBuf {
+        self.root.join("previews")
+    }
+
+    /// `root/previews/run-<run_id>` — one run's preview cache.
+    pub fn previews_dir(&self, run_id: i64) -> PathBuf {
+        self.previews_root().join(format!("run-{run_id}"))
+    }
+
+    /// `root/previews/run-<run_id>/<group_key>_<kind>_<max_px>.jpg` — the
+    /// cached render of one written master light at one requested size
+    /// (ruling R-M4d-5's own layout). `kind` is the `master_lights.kind`
+    /// spelling (`master | drizzle | weight_map`); `max_px` is part of the
+    /// name so two callers asking for different sizes never overwrite each
+    /// other's file.
+    pub fn preview_path(&self, run_id: i64, group_key: &str, kind: &str, max_px: u32) -> PathBuf {
+        self.previews_dir(run_id)
+            .join(format!("{group_key}_{kind}_{max_px}.jpg"))
+    }
 }
 
 /// The two stacking folders after precedence (spec §9.6): a non-empty,
@@ -586,7 +612,7 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
     total
 }
 
-/// Byte usage of a working layout's four subtrees. A missing subtree (never
+/// Byte usage of a working layout's subtrees. A missing subtree (never
 /// written, or already cleaned up) reads as `0`, not an error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -598,6 +624,11 @@ pub struct WorkUsage {
     /// M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
     /// (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.
     pub rej_bytes: u64,
+    /// M4d Task 3: bytes under `previews/` — the cached master-light JPEGs
+    /// (ruling R-M4d-5). Reported so the working folder's `total_bytes` is
+    /// the whole tree and not just the subtrees that existed before this
+    /// cache did; `CleanupWhat::All` frees them.
+    pub previews_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -613,13 +644,20 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
     let ln_bytes = crate::api::sync::dir_size_bytes(&layout.ln_root());
     let runs_bytes = crate::api::sync::dir_size_bytes(&layout.runs_root());
     let rej_bytes = crate::api::sync::dir_size_bytes(&layout.rej_root());
+    let previews_bytes = crate::api::sync::dir_size_bytes(&layout.previews_root());
     WorkUsage {
         calibrated_bytes,
         registered_bytes,
         ln_bytes,
         runs_bytes,
         rej_bytes,
-        total_bytes: calibrated_bytes + registered_bytes + ln_bytes + runs_bytes + rej_bytes,
+        previews_bytes,
+        total_bytes: calibrated_bytes
+            + registered_bytes
+            + ln_bytes
+            + runs_bytes
+            + rej_bytes
+            + previews_bytes,
     }
 }
 
@@ -688,6 +726,11 @@ pub fn cleanup_work(
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
             dirs.push(layout.runs_root());
+            // M4d Task 3: the master-light preview cache (ruling R-M4d-5).
+            // Only under `All` — a preview describes a written master, not
+            // an intermediate, so clearing intermediates must not throw the
+            // Results cards' thumbnails away.
+            dirs.push(layout.previews_root());
         }
     }
 

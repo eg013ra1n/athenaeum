@@ -363,6 +363,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::paths::CleanupWhat,
             crate::stacking::integrate::GroupStats,
             crate::stacking::drizzle::DrizzleStats,
+            crate::api::stacking::MasterLightKind,
         ]))),
     ]
 }

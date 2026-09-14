@@ -29,12 +29,13 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::api::stacking::MasterLightKind;
 use crate::api::{db, ApiError, PathPolicy};
 use crate::calibration_library::cosmetic::HotPixelMapOutcome;
 use crate::db::stacking::{
-    finish_run, get_run, insert_group, insert_run, set_frame_rejected_fraction, set_run_reference,
-    set_run_status, update_group, upsert_artifact, upsert_frame_row, GroupUpdate, NewArtifact,
-    NewFrameRow, NewGroup, NewRun,
+    finish_run, get_run, insert_group, insert_master_light, insert_run,
+    set_frame_rejected_fraction, set_run_reference, set_run_status, update_group, upsert_artifact,
+    upsert_frame_row, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewMasterLight, NewRun,
 };
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::{execute_generation, resolve_generation_cached};
@@ -5759,6 +5760,21 @@ fn process_group_output(
         .as_ref()
         .map(|p| p.display().to_string());
 
+    // M4d Task 3 (ruling R-M4d-4): the `master_lights` row's own facts.
+    // `frames` is the group's included count — the SAME number the group row
+    // and the master's `ATH_STKN` card carry, so the three can never
+    // disagree. `total_exposure_s` is the PLAIN sum of those frames'
+    // exposures (not `weighted_exposure_s`, which is the integration's own
+    // weighted figure): `Option`'s own `Sum` collapses to `None` the moment
+    // one member carries no `EXPTIME`, which is exactly the nullable column
+    // the schema asks for — a partial total would be a lie.
+    let output_format_str = enum_serde_name(&rc.config.output.format)?;
+    let total_exposure_s: Option<f64> = output
+        .included
+        .iter()
+        .map(|&i| members[i].exposure_s)
+        .sum::<Option<f64>>();
+
     let mut rejected_by_frame: HashMap<i64, f64> = HashMap::with_capacity(output.included.len());
     {
         let conn = db(&rc.ctx)?.conn();
@@ -5773,6 +5789,28 @@ fn process_group_output(
                 stats_json: Some(&stats_json),
                 status: Some("done"),
                 ..Default::default()
+            },
+        )?;
+
+        // M4d Task 3: one row per WRITTEN output, alongside the group-row
+        // update that records the same master — the master light is
+        // cataloged here and nowhere else (it never becomes a `frames`
+        // row). `width`/`height`/`channels` are what the writer actually
+        // wrote: this group's own reference geometry and plane count.
+        insert_master_light(
+            &conn,
+            &NewMasterLight {
+                frames_set_id: rc.set_id,
+                run_id: rc.run_id,
+                group_key: &group.key,
+                kind: MasterLightKind::Master.as_db_str(),
+                path: &master_path_str,
+                format: &output_format_str,
+                width: width as i64,
+                height: height as i64,
+                channels: channels as i64,
+                frames: output.stats.included as i64,
+                total_exposure_s,
             },
         )?;
 
@@ -6172,6 +6210,51 @@ fn process_group_output(
                                 ..Default::default()
                             },
                         )?;
+                        // M4d Task 3 (ruling R-M4d-4): the drizzled master
+                        // and — when one was written — its weight map are
+                        // outputs of this run just as the master is, and
+                        // get their own rows in the same DB touch as the
+                        // group-row update that records the drizzle path.
+                        // Their geometry is the drizzle's OWN output grid
+                        // (`scale x` the master's), which the stats report;
+                        // the weight map shares it exactly. `frames` and
+                        // `total_exposure_s` are the same group figures the
+                        // master row carries — a drizzle deposits the same
+                        // included frames.
+                        insert_master_light(
+                            &conn,
+                            &NewMasterLight {
+                                frames_set_id: rc.set_id,
+                                run_id: rc.run_id,
+                                group_key: &group.key,
+                                kind: MasterLightKind::Drizzle.as_db_str(),
+                                path: &drizzle_path_str,
+                                format: &output_format_str,
+                                width: stats.out_width as i64,
+                                height: stats.out_height as i64,
+                                channels: channels as i64,
+                                frames: output.stats.included as i64,
+                                total_exposure_s,
+                            },
+                        )?;
+                        if let Some(weight_map) = weight_map_path_str.as_deref() {
+                            insert_master_light(
+                                &conn,
+                                &NewMasterLight {
+                                    frames_set_id: rc.set_id,
+                                    run_id: rc.run_id,
+                                    group_key: &group.key,
+                                    kind: MasterLightKind::WeightMap.as_db_str(),
+                                    path: weight_map,
+                                    format: &output_format_str,
+                                    width: stats.out_width as i64,
+                                    height: stats.out_height as i64,
+                                    channels: channels as i64,
+                                    frames: output.stats.included as i64,
+                                    total_exposure_s,
+                                },
+                            )?;
+                        }
                     }
                     // Fix round 1, Important I1: the final, forced
                     // `current == total` tick — `rc.progress` is available
@@ -12653,6 +12736,124 @@ mod tests {
                 "both passes' sets have the same geometry, so the same file size"
             );
         }
+    }
+
+    // ── M4d Task 3: every written output is cataloged ───────────────────
+
+    /// Ruling R-M4d-4: stage 9 records one `master_lights` row per output it
+    /// actually WROTE — the master, and with drizzle + `writeWeightMap` on,
+    /// the drizzled master and that drizzle's weight map. Every geometry
+    /// column is checked against the FILE the writer produced (not against
+    /// the config that asked for it), `frames` is the group's own included
+    /// count, and `total_exposure_s` is the plain sum of those frames'
+    /// exposures — 60 s each in this fixture.
+    #[test]
+    fn a_run_catalogs_every_written_master_light() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+        cfg.drizzle.use_rejection = true;
+        cfg.drizzle.write_weight_map = true;
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        assert_eq!(group.status, "done", "{group:?}");
+
+        let rows =
+            crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
+        let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["master", "drizzle", "weight_map"],
+            "one row per written output, in write order: {rows:?}"
+        );
+
+        let master = rows.iter().find(|r| r.kind == "master").unwrap();
+        assert_eq!(master.frames_set_id, fixture.set_id);
+        assert_eq!(master.run_id, started.run_id);
+        assert_eq!(master.group_key, group.group_key);
+        assert_eq!(
+            Some(master.path.clone()),
+            group.master_path,
+            "the row must name the same file the group row does"
+        );
+        assert_eq!(master.format, "fits");
+        assert_eq!(master.frames, group.included_count);
+        assert_eq!(
+            master.total_exposure_s,
+            Some(60.0 * group.included_count as f64),
+            "{master:?}"
+        );
+        assert!(!master.created_at.is_empty());
+        let master_reader = PlaneReader::open(Path::new(&master.path)).unwrap();
+        assert_eq!(master.width, master_reader.width() as i64);
+        assert_eq!(master.height, master_reader.height() as i64);
+        assert_eq!(master.channels, master_reader.channels() as i64);
+
+        let drizzle = rows.iter().find(|r| r.kind == "drizzle").unwrap();
+        assert_eq!(Some(drizzle.path.clone()), group.drizzle_path);
+        assert_eq!(drizzle.frames, master.frames);
+        assert_eq!(drizzle.total_exposure_s, master.total_exposure_s);
+        let drizzle_reader = PlaneReader::open(Path::new(&drizzle.path)).unwrap();
+        assert_eq!(drizzle.width, drizzle_reader.width() as i64);
+        assert_eq!(drizzle.height, drizzle_reader.height() as i64);
+        assert_eq!(drizzle.channels, drizzle_reader.channels() as i64);
+        assert_eq!(drizzle.width, 2 * master.width, "scale 2 on the long axis");
+        assert_eq!(drizzle.height, 2 * master.height);
+
+        let weight = rows.iter().find(|r| r.kind == "weight_map").unwrap();
+        assert_ne!(weight.path, drizzle.path);
+        let weight_reader = PlaneReader::open(Path::new(&weight.path)).unwrap();
+        assert_eq!(weight.width, weight_reader.width() as i64);
+        assert_eq!(weight.height, weight_reader.height() as i64);
+        assert_eq!(
+            (weight.width, weight.height),
+            (drizzle.width, drizzle.height),
+            "a weight map shares its drizzle's geometry"
+        );
+
+        // The point lookup `get_master_light_preview` resolves a path with.
+        let found = crate::db::stacking::find_master_light(
+            &fixture.conn,
+            started.run_id,
+            &group.group_key,
+            "master",
+        )
+        .unwrap()
+        .expect("the master row is findable by (run, group, kind)");
+        assert_eq!(found.id, master.id);
     }
 
     // ── M3 Task 5: the Drizzle stage wired into the run ─────────────────

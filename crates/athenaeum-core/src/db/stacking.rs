@@ -201,6 +201,57 @@ fn row_to_artifact(r: &Row) -> rusqlite::Result<StackingArtifactRow> {
 const ARTIFACT_COLUMNS: &str = "id, frames_set_id, frame_id, group_key, kind, path, config_hash, \
     size, modified_at, payload_json, created_at";
 
+/// One master light a run WROTE (M4d Task 3, ruling R-M4d-4, spec §9.1):
+/// the group's master, its drizzled master, that drizzle's weight map. A
+/// master light is cataloged here and nowhere else — it never becomes a
+/// `frames` row (the scanner's `CALSTAT` + `ATH_CSRC` skip rule is
+/// untouched), so this table is the only record of what a run produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterLight {
+    pub id: i64,
+    pub frames_set_id: i64,
+    pub run_id: i64,
+    pub group_key: String,
+    /// `master | drizzle | weight_map`.
+    pub kind: String,
+    pub path: String,
+    /// `fits | xisf` — the run's own `output.format`.
+    pub format: String,
+    /// The geometry the writer actually wrote: a drizzled master is
+    /// `scale x` the master's, and a weight map matches its drizzle.
+    pub width: i64,
+    pub height: i64,
+    pub channels: i64,
+    /// Frames that went INTO this output (the group's included count).
+    pub frames: i64,
+    /// Sum of the included frames' exposures, or `None` when a member
+    /// carries no `EXPTIME` and the total would be a lie.
+    pub total_exposure_s: Option<f64>,
+    pub created_at: String,
+}
+
+fn row_to_master_light(r: &Row) -> rusqlite::Result<MasterLight> {
+    Ok(MasterLight {
+        id: r.get(0)?,
+        frames_set_id: r.get(1)?,
+        run_id: r.get(2)?,
+        group_key: r.get(3)?,
+        kind: r.get(4)?,
+        path: r.get(5)?,
+        format: r.get(6)?,
+        width: r.get(7)?,
+        height: r.get(8)?,
+        channels: r.get(9)?,
+        frames: r.get(10)?,
+        total_exposure_s: r.get(11)?,
+        created_at: r.get(12)?,
+    })
+}
+
+const MASTER_LIGHT_COLUMNS: &str = "id, frames_set_id, run_id, group_key, kind, path, format, \
+    width, height, channels, frames, total_exposure_s, created_at";
+
 pub struct NewArtifact<'a> {
     pub frames_set_id: i64,
     pub frame_id: Option<i64>,
@@ -211,6 +262,20 @@ pub struct NewArtifact<'a> {
     pub size: Option<i64>,
     pub modified_at: Option<&'a str>,
     pub payload_json: Option<&'a str>,
+}
+
+pub struct NewMasterLight<'a> {
+    pub frames_set_id: i64,
+    pub run_id: i64,
+    pub group_key: &'a str,
+    pub kind: &'a str,
+    pub path: &'a str,
+    pub format: &'a str,
+    pub width: i64,
+    pub height: i64,
+    pub channels: i64,
+    pub frames: i64,
+    pub total_exposure_s: Option<f64>,
 }
 
 pub struct NewRun<'a> {
@@ -687,6 +752,79 @@ pub fn delete_all_artifacts(conn: &Connection, frames_set_id: i64) -> Result<usi
 }
 
 // ---------------------------------------------------------------------
+// Master lights
+// ---------------------------------------------------------------------
+
+/// Record a master light a run wrote, keyed on `UNIQUE(run_id, group_key,
+/// kind)` so a stage that writes the same output twice (a re-entered stage
+/// 9, a group re-processed after a partial failure) REFRESHES the row
+/// instead of growing a second one. Returns the row id — the existing one
+/// when the key conflicted.
+pub fn insert_master_light(conn: &Connection, m: &NewMasterLight<'_>) -> Result<i64> {
+    let created_at = now();
+    conn.query_row(
+        "INSERT INTO master_lights
+         (frames_set_id, run_id, group_key, kind, path, format, width, height, channels,
+          frames, total_exposure_s, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(run_id, group_key, kind) DO UPDATE SET
+           frames_set_id = excluded.frames_set_id,
+           path = excluded.path,
+           format = excluded.format,
+           width = excluded.width,
+           height = excluded.height,
+           channels = excluded.channels,
+           frames = excluded.frames,
+           total_exposure_s = excluded.total_exposure_s,
+           created_at = excluded.created_at
+         RETURNING id",
+        params![
+            m.frames_set_id,
+            m.run_id,
+            m.group_key,
+            m.kind,
+            m.path,
+            m.format,
+            m.width,
+            m.height,
+            m.channels,
+            m.frames,
+            m.total_exposure_s,
+            created_at,
+        ],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Every master light a run wrote, oldest row first.
+pub fn list_master_lights(conn: &Connection, run_id: i64) -> Result<Vec<MasterLight>> {
+    let sql =
+        format!("SELECT {MASTER_LIGHT_COLUMNS} FROM master_lights WHERE run_id = ?1 ORDER BY id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![run_id], row_to_master_light)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The point lookup the preview command resolves a file path with.
+pub fn find_master_light(
+    conn: &Connection,
+    run_id: i64,
+    group_key: &str,
+    kind: &str,
+) -> Result<Option<MasterLight>> {
+    let sql = format!(
+        "SELECT {MASTER_LIGHT_COLUMNS} FROM master_lights \
+         WHERE run_id = ?1 AND group_key = ?2 AND kind = ?3"
+    );
+    Ok(conn
+        .query_row(&sql, params![run_id, group_key, kind], row_to_master_light)
+        .optional()?)
+}
+
+// ---------------------------------------------------------------------
 // Per-frame-set persisted configuration
 // ---------------------------------------------------------------------
 
@@ -1019,5 +1157,132 @@ mod tests {
         set_set_config(&c, set, "{\"version\":1}", &[4]).unwrap();
         let row = get_set_config(&c, set).unwrap().unwrap();
         assert_eq!(row.excluded_frame_ids, vec![4]);
+    }
+
+    /// M4d Task 3, brief Step 1: `insert_master_light` then
+    /// `list_master_lights(run_id)` round-trips EVERY column, the
+    /// `UNIQUE(run_id, group_key, kind)` key upserts rather than
+    /// duplicating, and a run delete cascades the rows away.
+    #[test]
+    fn master_light_round_trip_and_cascade() {
+        let c = conn();
+        let set = seed_set(&c);
+        let run = insert_run(
+            &c,
+            &NewRun {
+                frames_set_id: set,
+                config_json: "{}",
+                config_hash: "abc",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: "/w",
+                output_dir: "/o",
+            },
+        )
+        .unwrap();
+
+        let id = insert_master_light(
+            &c,
+            &NewMasterLight {
+                frames_set_id: set,
+                run_id: run,
+                group_key: "mono__NoFilter__bin1__180s",
+                kind: "master",
+                path: "/o/LDN_1272_mono_180s_12x.fits",
+                format: "fits",
+                width: 6224,
+                height: 4168,
+                channels: 1,
+                frames: 12,
+                total_exposure_s: Some(2160.0),
+            },
+        )
+        .unwrap();
+        assert!(id > 0);
+
+        let rows = list_master_lights(&c, run).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.id, id);
+        assert_eq!(r.frames_set_id, set);
+        assert_eq!(r.run_id, run);
+        assert_eq!(r.group_key, "mono__NoFilter__bin1__180s");
+        assert_eq!(r.kind, "master");
+        assert_eq!(r.path, "/o/LDN_1272_mono_180s_12x.fits");
+        assert_eq!(r.format, "fits");
+        assert_eq!(r.width, 6224);
+        assert_eq!(r.height, 4168);
+        assert_eq!(r.channels, 1);
+        assert_eq!(r.frames, 12);
+        assert_eq!(r.total_exposure_s, Some(2160.0));
+        assert!(!r.created_at.is_empty());
+
+        // A second kind for the same group is its own row; the same
+        // (run, group, kind) is an UPSERT, never a duplicate.
+        insert_master_light(
+            &c,
+            &NewMasterLight {
+                kind: "drizzle",
+                path: "/o/LDN_1272_mono_180s_12x_drizzle2x.fits",
+                width: 12448,
+                height: 8336,
+                ..NewMasterLight {
+                    frames_set_id: set,
+                    run_id: run,
+                    group_key: "mono__NoFilter__bin1__180s",
+                    kind: "master",
+                    path: "",
+                    format: "fits",
+                    width: 0,
+                    height: 0,
+                    channels: 1,
+                    frames: 12,
+                    total_exposure_s: Some(2160.0),
+                }
+            },
+        )
+        .unwrap();
+        let re_id = insert_master_light(
+            &c,
+            &NewMasterLight {
+                frames_set_id: set,
+                run_id: run,
+                group_key: "mono__NoFilter__bin1__180s",
+                kind: "master",
+                path: "/o/LDN_1272_mono_180s_12x_2.fits",
+                format: "xisf",
+                width: 6224,
+                height: 4168,
+                channels: 1,
+                frames: 11,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(re_id, id, "the unique key upserts the same row");
+        let rows = list_master_lights(&c, run).unwrap();
+        assert_eq!(rows.len(), 2, "master (upserted) + drizzle");
+        let master = rows.iter().find(|r| r.kind == "master").unwrap();
+        assert_eq!(master.path, "/o/LDN_1272_mono_180s_12x_2.fits");
+        assert_eq!(master.format, "xisf");
+        assert_eq!(master.frames, 11);
+        assert_eq!(master.total_exposure_s, None);
+
+        // The point-lookup the preview command resolves its path with.
+        assert_eq!(
+            find_master_light(&c, run, "mono__NoFilter__bin1__180s", "drizzle")
+                .unwrap()
+                .unwrap()
+                .width,
+            12448
+        );
+        assert!(find_master_light(&c, run, "nope", "master")
+            .unwrap()
+            .is_none());
+
+        // Cascade: the rows die with their run.
+        c.execute("DELETE FROM stacking_runs WHERE id = ?1", params![run])
+            .unwrap();
+        assert!(list_master_lights(&c, run).unwrap().is_empty());
     }
 }

@@ -1250,6 +1250,33 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
+    // M4d Task 3 (ruling R-M4d-4, spec §9.1): the master lights a stacking
+    // run WROTE — one row per written output (the master, its drizzled
+    // master, that drizzle's weight map). This is the ONLY place a master
+    // light is cataloged: it never becomes a `frames` row, and the
+    // scanner's `CALSTAT` + `ATH_CSRC` skip rule is untouched. `kind` is
+    // `master | drizzle | weight_map`, `format` is `fits | xisf` (the run's
+    // own `output.format`); `total_exposure_s` is nullable because a group
+    // whose members carry no `EXPTIME` has no honest total to state.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS master_lights (
+            id INTEGER PRIMARY KEY,
+            frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
+            run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+            group_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            path TEXT NOT NULL,
+            format TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            channels INTEGER NOT NULL,
+            frames INTEGER NOT NULL,
+            total_exposure_s REAL,
+            created_at TEXT NOT NULL,
+            UNIQUE(run_id, group_key, kind)
+        )",
+        [],
+    )?;
     for stmt in [
         "CREATE INDEX IF NOT EXISTS idx_stacking_runs_set ON stacking_runs(frames_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_stacking_run_groups_run ON stacking_run_groups(run_id)",
@@ -1269,6 +1296,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_group ON stacking_run_frames(group_id)",
         "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_frame ON stacking_artifacts(frame_id)",
         "CREATE INDEX IF NOT EXISTS idx_stacking_set_config_set ON stacking_set_config(frames_set_id)",
+        // M4d Task 3: both of `master_lights`' FK child columns, per
+        // R-M4d-4's own index list and the same `every_foreign_key_child_
+        // column_is_indexed` invariant every table above satisfies.
+        "CREATE INDEX IF NOT EXISTS idx_master_lights_set ON master_lights(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_master_lights_run ON master_lights(run_id)",
     ] {
         conn.execute(stmt, [])?;
     }

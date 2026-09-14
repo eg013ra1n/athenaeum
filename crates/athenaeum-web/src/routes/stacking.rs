@@ -5,7 +5,12 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::Deserialize;
 
 use athenaeum_core::api::stacking as api;
@@ -355,6 +360,81 @@ pub async fn cleanup_stacking_work(
     Ok(Json(result))
 }
 
+// ── Master-light preview (M4d Task 3, ruling R-M4d-5) ────────────────────
+
+/// The preview's arguments, shared by the two entry points below: the
+/// browser-friendly `GET` with query parameters and the `POST` mirror of the
+/// Tauri command. `kind` decodes as [`api::MasterLightKind`]'s camelCase wire
+/// form (`master` / `drizzle` / `weightMap`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterLightPreviewArgs {
+    pub run_id: i64,
+    pub group_key: String,
+    pub kind: api::MasterLightKind,
+    #[serde(default)]
+    pub max_px: Option<u32>,
+}
+
+/// Render (or serve from the on-disk cache) one written master light,
+/// off the async executor — the render is CPU-bound, exactly like
+/// `routes::images::get_frame_preview`'s.
+///
+/// Two things that route does and this one deliberately does not:
+/// - **No VNG gate.** A master light is an integrated float image with no
+///   CFA pattern, so `rustafits_processor::needs_vng_gate` is false for it
+///   at every resolution a preview asks for.
+/// - **No `image_semaphore` permit.** That semaphore bounds the blink
+///   viewer's *prefetch*, which can have dozens of full-resolution renders
+///   in flight; here the fan-out is a run's group count (a handful, once per
+///   panel mount, at a quarter resolution) and the CPU is already bounded by
+///   `ctx.image_pool`, which `process_fits_to_jpeg` runs on. Queueing
+///   thumbnails behind the blink viewer's permit would make the Results
+///   panel wait on an unrelated feature.
+async fn render_master_light_preview(
+    state: WebAppState,
+    args: MasterLightPreviewArgs,
+) -> Result<Response, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let max_px = args.max_px.unwrap_or(api::DEFAULT_MASTER_PREVIEW_MAX_PX);
+    let bytes = tokio::task::spawn_blocking(move || {
+        api::get_master_light_preview(&ctx, args.run_id, &args.group_key, args.kind, max_px)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Master-preview task panicked: {}", e),
+        )
+    })?
+    .map_err(api_err)?;
+
+    Ok(([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response())
+}
+
+/// `GET /api/stacking/master-preview?runId=&groupKey=&kind=&maxPx=` — raw
+/// JPEG bytes with `Content-Type: image/jpeg`; 404 for an unknown run, an
+/// output this run never wrote, or a master file gone from disk.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_master_light_preview_query(
+    State(state): State<WebAppState>,
+    Query(args): Query<MasterLightPreviewArgs>,
+) -> Result<Response, (StatusCode, String)> {
+    render_master_light_preview(state, args).await
+}
+
+/// `POST /api/get_master_light_preview` — the one-for-one mirror of the
+/// Tauri command of the same name, and what the frontend's `api.invoke`
+/// calls on the web target (`httpApi.invoke` already turns an `image/*`
+/// response into bytes). Same body, same status codes, as the `GET` above.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_master_light_preview(
+    State(state): State<WebAppState>,
+    Json(args): Json<MasterLightPreviewArgs>,
+) -> Result<Response, (StatusCode, String)> {
+    render_master_light_preview(state, args).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +520,219 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── M4d Task 3: the master-light preview ────────────────────────────
+
+    /// A `WebAppState` backed by a real (file-based, temp) catalog — the
+    /// preview route resolves a `master_lights` row before it renders
+    /// anything, so the shared `test_state(None)` (deliberately DB-less)
+    /// cannot exercise it. Mirrors `routes::analysis::tests::test_state`.
+    fn db_test_state(db: athenaeum_core::db::Database) -> WebAppState {
+        use athenaeum_core::cache::MemoryImageCache;
+        use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+        use athenaeum_core::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock, RwLock};
+
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_stacks: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
+            operation_queue: OperationQueue::start(),
+            compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<crate::events::SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths: Vec::new(),
+            export_dir: None,
+            api_key: None,
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+            sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
+            sync_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+            collab_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+        }
+    }
+
+    /// Seeds a frame set, a finished run and one `master_lights` row whose
+    /// `path` is a small real FITS written into `dir`. Returns the run id
+    /// and the group key.
+    fn seed_master_light(
+        conn: &rusqlite::Connection,
+        dir: &std::path::Path,
+        working_dir: &std::path::Path,
+    ) -> (i64, String) {
+        use athenaeum_core::db::stacking::{insert_run, NewMasterLight, NewRun};
+
+        conn.execute(
+            "INSERT INTO frames_set (name) VALUES ('LDN 1272')",
+            rusqlite::params![],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+
+        let run_id = insert_run(
+            conn,
+            &NewRun {
+                frames_set_id: set_id,
+                config_json: "{}",
+                config_hash: "hash",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working_dir.to_str().unwrap(),
+                output_dir: dir.to_str().unwrap(),
+            },
+        )
+        .unwrap();
+
+        // A 32x24 gradient is enough for the renderer to produce a real
+        // JPEG; the route's contract is the bytes' format, not their content.
+        let (width, height) = (32usize, 24usize);
+        let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+        let master = dir.join("master_light.fits");
+        athenaeum_core::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+
+        let group_key = "mono__NoFilter__bin1__60s".to_string();
+        athenaeum_core::db::stacking::insert_master_light(
+            conn,
+            &NewMasterLight {
+                frames_set_id: set_id,
+                run_id,
+                group_key: &group_key,
+                kind: "master",
+                path: master.to_str().unwrap(),
+                format: "fits",
+                width: width as i64,
+                height: height as i64,
+                channels: 1,
+                frames: 4,
+                total_exposure_s: Some(240.0),
+            },
+        )
+        .unwrap();
+
+        (run_id, group_key)
+    }
+
+    /// Brief Step 2: `GET /api/stacking/master-preview` on a seeded catalog
+    /// returns `200 image/jpeg` with JPEG magic; an unknown run is 404, not
+    /// a 500 and not an empty 200.
+    #[tokio::test]
+    async fn master_preview_route_renders_jpeg_and_404s_an_unknown_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let working = tempfile::TempDir::new().unwrap();
+        let db = athenaeum_core::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let (run_id, group_key) = seed_master_light(&db.conn(), tmp.path(), working.path());
+        let state = db_test_state(db);
+        let router = crate::routes::build_router(state, None);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/stacking/master-preview?runId={run_id}&groupKey={group_key}\
+                         &kind=master&maxPx=256"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/jpeg")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            body.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "expected JPEG magic, got {:?}",
+            &body[..body.len().min(8)]
+        );
+
+        // The cache file R-M4d-5 names must exist after the first render.
+        let cache = working
+            .path()
+            .join("LDN_1272")
+            .join("previews")
+            .join(format!("run-{run_id}"))
+            .join(format!("{group_key}_master_256.jpg"));
+        assert!(cache.exists(), "preview cache not written: {cache:?}");
+
+        let missing = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/stacking/master-preview?runId={}&groupKey={group_key}\
+                         &kind=master&maxPx=256",
+                        run_id + 999
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The same handler is also reachable as `POST
+    /// /api/get_master_light_preview` — the one-for-one mirror of the Tauri
+    /// command, which is what the frontend's `api.invoke` uses on both
+    /// targets (`httpApi.invoke` already decodes an `image/*` response into
+    /// bytes). Registered past the auth layer like every other route here.
+    #[tokio::test]
+    async fn master_preview_post_mirror_renders_the_same_jpeg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let working = tempfile::TempDir::new().unwrap();
+        let db = athenaeum_core::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let (run_id, group_key) = seed_master_light(&db.conn(), tmp.path(), working.path());
+        let state = db_test_state(db);
+        let router = crate::routes::build_router(state, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/get_master_light_preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"runId":{run_id},"groupKey":"{group_key}","kind":"master","maxPx":256}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "expected JPEG magic");
     }
 }

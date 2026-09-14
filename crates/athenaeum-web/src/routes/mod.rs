@@ -241,6 +241,12 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_stacking_paths", post(stacking::set_stacking_paths))
         .route("/api/get_stacking_work_usage", post(stacking::get_stacking_work_usage))
         .route("/api/cleanup_stacking_work", post(stacking::cleanup_stacking_work))
+        // M4d Task 3 (ruling R-M4d-5): one handler, two entry points — the
+        // browser-friendly GET the Results card can point an `<img>` at, and
+        // the POST that mirrors the Tauri command name so `api.invoke`
+        // reaches it unchanged on both targets.
+        .route("/api/stacking/master-preview", get(stacking::get_master_light_preview_query))
+        .route("/api/get_master_light_preview", post(stacking::get_master_light_preview))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
         .route("/api/set_archive_root_path", post(archive::set_archive_root_path))

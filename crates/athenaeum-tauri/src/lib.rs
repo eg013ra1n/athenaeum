@@ -448,6 +448,7 @@ pub fn run() {
             commands::set_stacking_paths,
             commands::get_stacking_work_usage,
             commands::cleanup_stacking_work,
+            commands::get_master_light_preview,
             commands::get_sync_pairing_ticket,
             commands::get_sync_status,
             commands::list_sync_history,

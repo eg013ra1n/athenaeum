@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::api::sync::{validate_transfer_dir, OverlapRule, PathSetting};
 use crate::api::{db, ApiError, PathPolicy};
 use crate::db::stacking::{
-    active_run_for_set, get_run, get_set_config, list_frame_rows, list_groups, list_runs,
-    set_set_config, SetConfigRow, StackingRunFrameRow, StackingRunGroupRow, StackingRunRow,
+    active_run_for_set, find_master_light, get_run, get_set_config, list_frame_rows, list_groups,
+    list_runs, set_set_config, SetConfigRow, StackingRunFrameRow, StackingRunGroupRow,
+    StackingRunRow,
 };
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -574,6 +575,193 @@ pub fn cleanup_stacking_work(
     let layout = WorkingLayout::new(Path::new(&working), &set_slug(&set_name));
     let freed = cleanup_work(&conn, set_id, &layout, what)?;
     Ok(freed)
+}
+
+// ── Master lights (M4d Task 3, rulings R-M4d-4/5) ───────────────────────
+
+/// Which of a group's written outputs a preview is asked for. The wire form
+/// is camelCase (`master` / `drizzle` / `weightMap`); the `master_lights.kind`
+/// column's own spelling is snake_case (`master | drizzle | weight_map`,
+/// ruling R-M4d-4). [`Self::as_db_str`]/[`Self::from_db_str`] are the ONE
+/// place those two spellings are mapped onto each other — `stacking::run`
+/// writes its rows through `as_db_str` so a hand-typed literal can never
+/// drift from what this command looks up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum MasterLightKind {
+    Master,
+    Drizzle,
+    WeightMap,
+}
+
+impl MasterLightKind {
+    /// The `master_lights.kind` column value.
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            MasterLightKind::Master => "master",
+            MasterLightKind::Drizzle => "drizzle",
+            MasterLightKind::WeightMap => "weight_map",
+        }
+    }
+
+    /// The inverse of [`Self::as_db_str`] — `None` for a column value this
+    /// build does not know (a row written by a newer version).
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "master" => Some(MasterLightKind::Master),
+            "drizzle" => Some(MasterLightKind::Drizzle),
+            "weight_map" => Some(MasterLightKind::WeightMap),
+            _ => None,
+        }
+    }
+}
+
+/// R-M4d-5's default requested size — what the Results card asks for when
+/// it does not say otherwise.
+pub const DEFAULT_MASTER_PREVIEW_MAX_PX: u32 = 512;
+
+/// JPEG bytes for one master light a run wrote (ruling R-M4d-5). Resolves
+/// `(run_id, group_key, kind)` through `master_lights` — the only place a
+/// master light is cataloged — then serves the cached render under
+/// `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<max_px>.jpg`,
+/// re-rendering whenever the master's own mtime is newer than the cache
+/// file's (a rebuild in place, a restored archive). An unknown run, an
+/// output this run never wrote, or a master file gone from disk is
+/// `NotFound` (404 at the web boundary).
+///
+/// The cache is an optimization, never a requirement: a run row with no
+/// working folder recorded, an unwritable previews directory or an
+/// unreadable cache file all fall through to a fresh render with a `warn!`,
+/// and the bytes are returned either way.
+pub fn get_master_light_preview(
+    ctx: &ServiceContext,
+    run_id: i64,
+    group_key: &str,
+    kind: MasterLightKind,
+    max_px: u32,
+) -> Result<Vec<u8>, ApiError> {
+    // Everything the render needs is read here and the catalog lock is
+    // dropped before a single pixel is touched — the same discipline
+    // `routes::images::get_frame_preview` follows, so a slow render never
+    // holds the DB against the rest of the app.
+    let (master_path, row_group_key, working_dir, set_name) = {
+        let db_handle = db(ctx)?;
+        let conn = db_handle.conn();
+        run::heal_interrupted_runs(ctx, &conn)?;
+
+        let run_row = get_run(&conn, run_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("stacking run {run_id} not found")))?;
+        let row = find_master_light(&conn, run_id, group_key, kind.as_db_str())?.ok_or_else(
+            || {
+                ApiError::NotFound(format!(
+                    "stacking run {run_id} wrote no {} for group {group_key}",
+                    kind.as_db_str()
+                ))
+            },
+        )?;
+        let set_name = frame_set_name(&conn, run_row.frames_set_id)?;
+        // The cache path is built from the ROW's own `group_key`, not the
+        // caller's argument — the two are equal by construction (the lookup
+        // matched on it exactly), but sourcing every path component from the
+        // catalog keeps a caller-supplied string out of a `create_dir_all`
+        // target on principle rather than by argument.
+        (row.path, row.group_key, run_row.working_dir, set_name)
+    };
+
+    let master = Path::new(&master_path);
+    let master_mtime = std::fs::metadata(master)
+        .and_then(|m| m.modified())
+        .map_err(|e| {
+            ApiError::NotFound(format!("master light {} is not on disk: {e}", master.display()))
+        })?;
+
+    let cache_path = if working_dir.trim().is_empty() {
+        None
+    } else {
+        Some(
+            WorkingLayout::new(Path::new(&working_dir), &set_slug(&set_name)).preview_path(
+                run_id,
+                &row_group_key,
+                kind.as_db_str(),
+                max_px,
+            ),
+        )
+    };
+
+    if let Some(cache) = cache_path.as_deref() {
+        // Fresh means "rendered no earlier than the master was last
+        // written" — a rebuilt-in-place master (same path, newer mtime)
+        // therefore invalidates its own thumbnail with no bookkeeping.
+        let fresh = std::fs::metadata(cache)
+            .and_then(|m| m.modified())
+            .map(|cached_at| cached_at >= master_mtime)
+            .unwrap_or(false);
+        if fresh {
+            match std::fs::read(cache) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    tracing::debug!(run_id, %group_key, kind = kind.as_db_str(), path = %cache.display(), "master preview served from cache");
+                    return Ok(bytes);
+                }
+                Ok(_) => tracing::warn!(
+                    run_id,
+                    path = %cache.display(),
+                    "cached master preview is empty; re-rendering"
+                ),
+                Err(error) => tracing::warn!(
+                    run_id,
+                    path = %cache.display(),
+                    %error,
+                    "cached master preview could not be read; re-rendering"
+                ),
+            }
+        }
+    }
+
+    let bytes = crate::api::files::render_preview_from_path(master, max_px, &ctx.image_pool)?;
+
+    if let Some(cache) = cache_path.as_deref() {
+        if let Err(error) = write_preview_cache(cache, &bytes) {
+            tracing::warn!(
+                run_id,
+                path = %cache.display(),
+                error = %format!("{error:#}"),
+                "master preview could not be cached; the bytes were still rendered"
+            );
+        }
+    }
+
+    tracing::debug!(
+        run_id,
+        %group_key,
+        kind = kind.as_db_str(),
+        path = %master.display(),
+        "master preview rendered"
+    );
+    Ok(bytes)
+}
+
+/// Write the preview cache file atomically (sibling temp + rename), so a
+/// concurrent reader never sees a half-written JPEG and a crash mid-write
+/// leaves a stray `.tmp` rather than a corrupt cache entry. The temp name
+/// carries a process-wide sequence number as well as the pid — the same
+/// shape `fits_writer::write_fits_f32` uses — because two concurrent
+/// requests for the SAME thumbnail are ordinary (React's StrictMode
+/// double-mount alone produces a pair) and must not write one file.
+fn write_preview_cache(cache: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(parent) = cache.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = cache.with_extension(format!("jpg.tmp.{}.{seq}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, cache) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1224,5 +1412,178 @@ mod tests {
         assert_eq!(usage.registered_bytes, 0);
         assert_eq!(usage.ln_bytes, 0);
         assert_eq!(usage.runs_bytes, 0);
+        assert_eq!(usage.previews_bytes, 0);
+    }
+
+    // ── M4d Task 3: the master-light preview ────────────────────────────
+
+    /// Rulings R-M4d-4/5: the wire spelling (`weightMap`) and the
+    /// `master_lights.kind` column spelling (`weight_map`) are DIFFERENT,
+    /// and `as_db_str`/`from_db_str` are the only bridge between them —
+    /// pinned in both directions so the run writing a row and the preview
+    /// looking it back up can never drift apart.
+    #[test]
+    fn master_light_kind_maps_both_ways() {
+        for kind in [
+            MasterLightKind::Master,
+            MasterLightKind::Drizzle,
+            MasterLightKind::WeightMap,
+        ] {
+            assert_eq!(MasterLightKind::from_db_str(kind.as_db_str()), Some(kind));
+        }
+        assert_eq!(MasterLightKind::Master.as_db_str(), "master");
+        assert_eq!(MasterLightKind::Drizzle.as_db_str(), "drizzle");
+        assert_eq!(MasterLightKind::WeightMap.as_db_str(), "weight_map");
+        assert_eq!(MasterLightKind::from_db_str("nope"), None);
+
+        // The wire form is camelCase and is NOT the column's spelling.
+        assert_eq!(
+            serde_json::to_string(&MasterLightKind::WeightMap).unwrap(),
+            "\"weightMap\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MasterLightKind>("\"weightMap\"").unwrap(),
+            MasterLightKind::WeightMap
+        );
+    }
+
+    /// An unknown run, and a run that never wrote the asked-for output, are
+    /// both `NotFound` (404 at the web boundary) — never a 500 and never an
+    /// empty 200. A row pointing at a file that is gone from disk is
+    /// `NotFound` too: the catalog remembers a master the user has since
+    /// moved or archived.
+    #[test]
+    fn master_preview_not_found_cases() {
+        let (tmp, ctx) = test_ctx();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        let run_id = crate::db::stacking::insert_run(
+            &conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: tmp.path().to_str().unwrap(),
+                output_dir: tmp.path().to_str().unwrap(),
+            },
+        )
+        .unwrap();
+
+        let err = get_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+        let err =
+            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+        // A row whose file never existed on disk.
+        crate::db::stacking::insert_master_light(
+            &conn,
+            &crate::db::stacking::NewMasterLight {
+                frames_set_id: set_id,
+                run_id,
+                group_key: "g",
+                kind: "master",
+                path: tmp.path().join("gone.fits").to_str().unwrap(),
+                format: "fits",
+                width: 8,
+                height: 8,
+                channels: 1,
+                frames: 3,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+        let err =
+            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+    }
+
+    /// The cache is content-addressed by the master's mtime: a first call
+    /// writes `previews/run-<id>/<group>_<kind>_<max_px>.jpg` and a second
+    /// serves those exact bytes back, while touching the master forward in
+    /// time makes the next call re-render.
+    #[test]
+    fn master_preview_caches_and_re_renders_when_the_master_changes() {
+        let (tmp, ctx) = test_ctx();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        let working = tempfile::tempdir().unwrap();
+        let run_id = crate::db::stacking::insert_run(
+            &conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.path().to_str().unwrap(),
+                output_dir: tmp.path().to_str().unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (width, height) = (32usize, 24usize);
+        let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+        let master = tmp.path().join("master_light.fits");
+        crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+        crate::db::stacking::insert_master_light(
+            &conn,
+            &crate::db::stacking::NewMasterLight {
+                frames_set_id: set_id,
+                run_id,
+                group_key: "g",
+                kind: "master",
+                path: master.to_str().unwrap(),
+                format: "fits",
+                width: width as i64,
+                height: height as i64,
+                channels: 1,
+                frames: 3,
+                total_exposure_s: Some(180.0),
+            },
+        )
+        .unwrap();
+
+        let first =
+            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        assert_eq!(&first[..3], &[0xFF, 0xD8, 0xFF], "JPEG magic");
+
+        let cache = WorkingLayout::new(working.path(), &set_slug("LDN 1272")).preview_path(
+            run_id,
+            "g",
+            "master",
+            256,
+        );
+        assert!(cache.exists(), "the cache file must be written: {cache:?}");
+        assert_eq!(std::fs::read(&cache).unwrap(), first);
+
+        // A hand-written cache body proves the second call SERVED the file
+        // rather than re-rendering: the bytes come back verbatim.
+        let sentinel = b"\xFF\xD8\xFFnot-a-real-render".to_vec();
+        std::fs::write(&cache, &sentinel).unwrap();
+        let second =
+            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        assert_eq!(second, sentinel, "the cached file must be served as-is");
+
+        // Re-writing the master makes its mtime newer than the cache's, so
+        // the next call re-renders and overwrites the sentinel.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+        let third =
+            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        assert_ne!(third, sentinel, "a newer master must invalidate the cache");
+        assert_eq!(third, first, "the same pixels render to the same bytes");
     }
 }

@@ -1147,7 +1147,28 @@ CREATE UNIQUE INDEX stacking_artifacts_key
 stacking_set_config(frames_set_id PK FK ON DELETE CASCADE,
   config_json TEXT NOT NULL, excluded_frame_ids_json TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL)
+
+-- M4d Task 3 (ruling R-M4d-4): what a run WROTE. One row per written
+-- output, inserted by stage 9 in the same DB touch as the group-row
+-- update; a run's rows cascade with the run. This is the ONLY place a
+-- master light is cataloged — it never becomes a `frames` row, and the
+-- scanner's `CALSTAT` + `ATH_CSRC` skip rule is untouched.
+master_lights(id PK, frames_set_id FK→frames_set ON DELETE CASCADE,
+  run_id FK→stacking_runs ON DELETE CASCADE, group_key TEXT NOT NULL,
+  kind TEXT NOT NULL,          -- master|drizzle|weight_map
+  path TEXT NOT NULL, format TEXT NOT NULL,   -- fits|xisf (the run's output.format)
+  width INTEGER NOT NULL, height INTEGER NOT NULL, channels INTEGER NOT NULL,
+  frames INTEGER NOT NULL,     -- the group's included count
+  total_exposure_s REAL,       -- NULL when a member carries no EXPTIME
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, group_key, kind))
+-- indexes: master_lights(frames_set_id), master_lights(run_id)
 ```
+
+`width`/`height`/`channels` are what the writer actually wrote: a drizzled
+master is `scale ×` the master's, and a weight map shares its drizzle's
+geometry. `get_stacking_run` does NOT return these rows — the results card
+already holds `(run_id, group_key, kind)` and fetches the preview by it.
 
 `registration_results` gains, via the guarded `ALTER TABLE` pattern:
 `model TEXT`, `transform_json TEXT`, `inlier_ratio REAL`,
@@ -1405,6 +1426,7 @@ actually written).
 | `get_stacking_paths` / `set_stacking_paths` | `{ working: PathSetting, output: PathSetting }` / `{ working?, output? }` (`null` = reset) |
 | `get_stacking_work_usage` / `cleanup_stacking_work` | `{ setId }` → bytes per artifact kind / `{ setId, what: "registered" | "intermediates" | "all" }` |
 | `get_stacking_presets` (plan 5b Task 1, the 15th command) | `{}` → `StackingPresets { default, fastPreview, maximumQuality }` — pure, no ctx; the one Rust source of truth the preset selector diffs the current config against, so the tab never re-implements the transforms |
+| `get_master_light_preview` (M4d Task 3, ruling R-M4d-5, the 16th command) | `{ runId, groupKey, kind: "master" \| "drizzle" \| "weightMap", maxPx? }` → raw JPEG bytes (Tauri: `tauri::ipc::Response`; web: `image/jpeg`). `maxPx` defaults to 512 and selects the render step, not an exact output size. `NotFound` (404) for an unknown run, an output this run never wrote, or a master file gone from disk. Cached under `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<maxPx>.jpg`, re-rendered when the master's mtime is newer. The web host answers it at `POST /api/get_master_light_preview` (the one-for-one mirror `api.invoke` uses) AND at `GET /api/stacking/master-preview?runId=&groupKey=&kind=&maxPx=`, the browser-friendly form an `<img src>` can point at directly; both are the same handler. Instrumented at `level = "debug"` on both hosts — the results panel fetches one per group |
 
 **Retirement DONE (plan 5b Task 6, 2026-09-09):** `register_frame_set`,
 `cancel_frame_set_registration`, `get_frame_set_registration` are retired —
@@ -1517,10 +1539,13 @@ Below 1200 px the inspector drops under the board as an accordion.
 - `GroupsTable.tsx`, `FramesTable.tsx` (sortable; the include checkbox writes
   the manual exclusion list through `set_stacking_config`; status chips
   reuse `getSeverityColor`), `ResultsPanel.tsx` (runs dropdown from
-  `get_stacking_runs`, master cards with a static glyph in place of a
-  thumbnail until M4 catalogs masters and the existing preview route can
-  render them, a stats line, Reveal / Open / Provenance (the run JSON in a
-  modal), working-folder usage with "Delete intermediates").
+  `get_stacking_runs`, master cards carrying the master's own 160 px-tall
+  thumbnail — and the drizzled master's when the group has one — fetched
+  through `get_master_light_preview` by the `(runId, groupKey, kind)` the
+  card already holds (M4d Task 3, ruling R-M4d-5; the `useMasterPreview`
+  hook in `useStackingRuns.ts` owns the blob URL and revokes it), a stats
+  line, Reveal / Open / Provenance (the run JSON in a modal),
+  working-folder usage with "Delete intermediates").
 - `stackingPrefs.ts` — only UI conveniences (collapsed panels, selected
   stage) in `localStorage`; the config itself is server-side.
 - Hook `src/hooks/useStackingRuns.ts` + `StackingContext.tsx` — modelled on

@@ -491,7 +491,14 @@ export type WorkUsage = { calibratedBytes: number, registeredBytes: number, lnBy
  * M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
  * (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.
  */
-rejBytes: number, totalBytes: number, };
+rejBytes: number, 
+/**
+ * M4d Task 3: bytes under `previews/` — the cached master-light JPEGs
+ * (ruling R-M4d-5). Reported so the working folder's `total_bytes` is
+ * the whole tree and not just the subtrees that existed before this
+ * cache did; `CleanupWhat::All` frees them.
+ */
+previewsBytes: number, totalBytes: number, };
 
 export type CleanupWhat = "registered" | "intermediates" | "all";
 
@@ -577,4 +584,6 @@ fwhmPx: Array<number>, eccentricity: Array<number>, noise: Array<number>,
  * Per plane, the fraction of output pixels with `W > 0`.
  */
 coverage: Array<number>, readMs: number, depositMs: number, bytesRead: number, };
+
+export type MasterLightKind = "master" | "drizzle" | "weightMap";
 

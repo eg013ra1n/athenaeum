@@ -311,6 +311,63 @@ pub fn get_frame_preview_path(ctx: &ServiceContext, frame_id: i64) -> Result<Str
     .map_err(|e| ApiError::NotFound(format!("Failed to find frame {}: {}", frame_id, e)))
 }
 
+/// Render any FITS or XISF file on disk to JPEG bytes (M4d Task 3, ruling
+/// R-M4d-5) — the SAME format-agnostic path `get_frame_preview` uses for a
+/// catalog frame on both hosts, lifted out so a caller that has a file path
+/// rather than a `frames` row (the stacking pipeline's written masters,
+/// which are deliberately never cataloged as frames) renders identically.
+///
+/// `max_px` is the caller's requested longest edge; it selects one of
+/// [`Resolution`]'s three fixed steps, which are downscale FACTORS, not
+/// target sizes:
+/// - `<= 512` → [`Resolution::Thumbnail`] (native / 4, JPEG quality 70),
+/// - `<= 2048` → [`Resolution::Preview`] (2x2 binning, i.e. native / 2,
+///   quality 85),
+/// - otherwise → [`Resolution::Full`] (native resolution, quality 95; a CFA
+///   frame is VNG-debayered at native resolution there).
+///
+/// So the returned image is never SMALLER than `max_px` asked for — it is a
+/// floor on the detail rendered, not an exact output size. The caller scales
+/// the result down for display (an `<img>` does this for free).
+///
+/// Runs synchronously on the calling thread, on `pool` — the app's bounded
+/// image pool — never the global rayon pool. The Tauri host wraps the call
+/// in `block_in_place` and the web host in `spawn_blocking`, exactly as they
+/// already do for `get_frame_preview`.
+#[cfg(feature = "render")]
+pub fn render_preview_from_path(
+    path: &Path,
+    max_px: u32,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<Vec<u8>, ApiError> {
+    use crate::rustafits_processor::{process_fits_to_jpeg, Resolution};
+
+    let resolution = if max_px <= 512 {
+        Resolution::Thumbnail
+    } else if max_px <= 2048 {
+        Resolution::Preview
+    } else {
+        Resolution::Full
+    };
+
+    if !path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "file not found: {}",
+            path.display()
+        )));
+    }
+
+    let rendered = process_fits_to_jpeg(path, resolution, None, pool).map_err(|e| {
+        tracing::error!(
+            path = %path.display(),
+            error = %format!("{e:#}"),
+            "preview render failed"
+        );
+        ApiError::Internal(format!("failed to render {}: {e:#}", path.display()))
+    })?;
+    Ok(rendered.image_data)
+}
+
 /// Get files with frames by frame IDs. Useful for loading full file data
 /// when you only have frame IDs.
 pub fn get_files_with_frames_by_ids(

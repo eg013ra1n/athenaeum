@@ -213,3 +213,31 @@ pub async fn cleanup_stacking_work(
         .map_err(|e| format!("Cleanup task panicked: {e}"))?
         .map_err(|e| e.to_string())
 }
+
+/// JPEG bytes for one master light a run wrote (M4d Task 3, ruling
+/// R-M4d-5). Returns [`tauri::ipc::Response`] rather than a bare `Vec<u8>`
+/// for the same reason `read_fits_image` does: the IPC layer would otherwise
+/// serialize the bytes as a JSON number array, several times their size.
+///
+/// `level = "debug"`: the Results panel fetches one of these per group (and
+/// a second per drizzled master), so an `info` span here would flood a run's
+/// log with per-thumbnail boundary events.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_master_light_preview(
+    state: State<'_, AppState>,
+    run_id: i64,
+    group_key: String,
+    kind: api::MasterLightKind,
+    max_px: Option<u32>,
+) -> Result<tauri::ipc::Response, String> {
+    let ctx = state.ctx.clone();
+    let max_px = max_px.unwrap_or(api::DEFAULT_MASTER_PREVIEW_MAX_PX);
+    tokio::task::spawn_blocking(move || {
+        api::get_master_light_preview(&ctx, run_id, &group_key, kind, max_px)
+    })
+    .await
+    .map_err(|e| format!("Master-preview task panicked: {e}"))?
+    .map(tauri::ipc::Response::new)
+    .map_err(|e| e.to_string())
+}

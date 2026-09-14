@@ -5,10 +5,12 @@ import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useStackingContext } from '../../contexts/StackingContext';
+import { useMasterPreview } from '../../hooks/useStackingRuns';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   GroupStats,
+  MasterLightKind,
   StackingRunDetail,
   StackingRunGroupRow,
   StackingRunSummary,
@@ -149,6 +151,47 @@ function RevealOrPath({ path }: { path: string | null }) {
  *  `drizzlePath` — see the render below. */
 type DrizzleGroupSummary = Pick<SummaryGroup, 'drizzlePath' | 'weightMapPath' | 'drizzle'>;
 
+/** One written master light's thumbnail (M4d Task 3, ruling R-M4d-5) —
+ *  160 px tall, `object-contain` so a wide master is never cropped, on a
+ *  `bg-surface-elevated` ground that IS the loading state (no spinner for a
+ *  thumbnail). A failed render says so in one muted line rather than
+ *  leaving a blank box: the usual cause is a master that has been moved or
+ *  archived since the run, which the user can act on. */
+function MasterThumbnail({
+  runId,
+  groupKey,
+  kind,
+  label,
+}: {
+  runId: number;
+  groupKey: string;
+  kind: MasterLightKind;
+  label: string;
+}) {
+  const { url, error } = useMasterPreview(runId, groupKey, kind);
+
+  if (error) {
+    return (
+      <p className="text-[10px] text-content-muted" title={error}>
+        No preview — {error}
+      </p>
+    );
+  }
+
+  return (
+    <div className="h-40 w-full rounded bg-surface-elevated border border-border/40 overflow-hidden">
+      {url && (
+        <img
+          src={url}
+          alt={`Preview of ${label}`}
+          className="h-full w-full object-contain"
+          loading="lazy"
+        />
+      )}
+    </div>
+  );
+}
+
 /** `SummaryGroup.lnReferencePath` lives on the run's finished `summary`, not
  *  on the `StackingRunGroupRow` this card is built from (that row updates
  *  progressively while the run is still in flight; the LN reference path is
@@ -190,9 +233,29 @@ function MasterCard({
           <p className="text-sm font-medium text-content truncate" title={group.masterPath ?? group.groupKey}>
             {group.masterPath ? basename(group.masterPath) : group.groupKey}
           </p>
-          <p className="text-[10px] text-content-muted">Thumbnail preview — arrives in M4</p>
         </div>
       </div>
+
+      {/* M4d Task 3 (ruling R-M4d-5): the master's own thumbnail, and the
+       *  drizzled master's when the group has one. Gated on the PATH the
+       *  group row records, so a group that never wrote the output asks for
+       *  no preview at all (rather than fetching a guaranteed 404). */}
+      {group.masterPath && (
+        <MasterThumbnail
+          runId={group.runId}
+          groupKey={group.groupKey}
+          kind="master"
+          label={basename(group.masterPath)}
+        />
+      )}
+      {group.drizzlePath && (
+        <MasterThumbnail
+          runId={group.runId}
+          groupKey={group.groupKey}
+          kind="drizzle"
+          label={basename(group.drizzlePath)}
+        />
+      )}
 
       <p className="text-xs text-content-secondary tabular-nums">
         {group.includedCount} frames
@@ -533,7 +596,7 @@ export function ResultsPanel({ setId, running, onSelectedRunDetailChange }: Resu
       <div className="pt-2 border-t border-border/60 flex items-center justify-between gap-3 flex-wrap">
         <p className="text-xs text-content-muted">
           {usage
-            ? `Working folder: ${formatBytes(usage.totalBytes)} total — ${formatBytes(usage.calibratedBytes)} calibrated · ${formatBytes(usage.registeredBytes)} registered · ${formatBytes(usage.lnBytes)} local-norm · ${formatBytes(usage.runsBytes)} run archives · ${formatBytes(usage.rejBytes)} rejection bitmaps`
+            ? `Working folder: ${formatBytes(usage.totalBytes)} total — ${formatBytes(usage.calibratedBytes)} calibrated · ${formatBytes(usage.registeredBytes)} registered · ${formatBytes(usage.lnBytes)} local-norm · ${formatBytes(usage.runsBytes)} run archives · ${formatBytes(usage.rejBytes)} rejection bitmaps · ${formatBytes(usage.previewsBytes)} previews`
             : usageError
               ? 'Working folder usage: unavailable'
               : 'Working folder usage: loading…'}
