@@ -487,10 +487,17 @@ presets, ONE settings row `stacking.presets` holding a JSON array of
 `{ name, config }`: max 50, names 1–60 chars trimmed and unique
 case-insensitively (an upsert keeps the NEW spelling), `config.paths`
 stripped on save so a preset never carries folders, and all three return the
-full list sorted by name case-insensitively. A stored document that no
-longer decodes reads as empty on `list` with a `warn!` but is refused with a
-`Conflict` naming the key on either write — a read may shrug a broken row
-off, a write must never replace the user's whole list with one entry).
+full list sorted by name case-insensitively. The row is decoded ENTRY BY
+ENTRY, so one undecodable entry costs only itself — dropped with one `warn!`
+carrying its `count`, and the next write rewrites the row without it; only a
+document that is not a JSON array at all reads as empty on `list` and is
+refused with a `Conflict` naming the key on either write, since that is the
+one case where overwriting destroys something unknowable. Both writes are
+ONE `BEGIN IMMEDIATE` read-modify-write — the whole list is a single
+settings value, so two interleaved saves would otherwise drop a sibling
+preset. In the tab, a run disables APPLY only: the menu still opens and
+Save-as / delete stay live, because a run is exactly when a user wants to
+save the settings they just launched with).
 
 **The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
 the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →

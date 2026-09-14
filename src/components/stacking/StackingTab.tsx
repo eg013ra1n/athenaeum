@@ -682,11 +682,23 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
 
   const rerunOptions = Array.from(new Set<Stage>([...plan.staleStages, 'integrate']));
   const rerunDisabled = plan.staleStages.length === 0 || running || starting;
-  // Fix round 1, Minor #8: the preset selector edits the config the same
-  // way every inspector panel does, so it is disabled while a run is
-  // active for the same reason those panels are (`StageInspector`'s own
-  // `disabled` prop below).
-  const presetSelectorDisabled = running || starting;
+  // Fix round 1, Minor #8: APPLYING a preset edits the config the same way
+  // every inspector panel does, so it is disabled while a run is active for
+  // the same reason those panels are (`StageInspector`'s own `disabled`
+  // prop below).
+  //
+  // M4d Task 4 fix round 1 (review I1): that gate used to close the whole
+  // MENU, which took the new Save-as and delete actions down with it — for
+  // the length of a run, which on a real set is the better part of an hour,
+  // and which is exactly the moment a user wants to save the settings they
+  // just launched with. Neither of those two touches the draft config, so
+  // only APPLY is gated now: the menu opens during a run, the preset rows
+  // are inert with the existing disabled styling and a title saying why,
+  // and Save-as / delete stay live.
+  const presetApplyDisabled = running || starting;
+  const presetApplyTitle = presetApplyDisabled
+    ? 'A run is in progress — the settings cannot change until it finishes'
+    : undefined;
   const runDisabled = plan.blockers.length > 0 || running || starting;
   const runTooltip = plan.blockers.length > 0 ? plan.blockers[0].message : undefined;
   const freeLabel = plan.freeBytes == null ? 'free space unknown' : `Free ${formatGB(plan.freeBytes)}`;
@@ -717,24 +729,25 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             <button
               type="button"
               onClick={() => (presetMenuOpen ? closePresetMenu() : setPresetMenuOpen(true))}
-              disabled={presetSelectorDisabled}
-              className={`flex items-center gap-1 font-medium transition-colors ${
-                presetSelectorDisabled
-                  ? 'text-content-muted cursor-not-allowed'
-                  : 'text-content hover:text-content-secondary'
-              }`}
+              className="flex items-center gap-1 font-medium transition-colors text-content hover:text-content-secondary"
             >
               {presetLabel}
               <ChevronDown size={14} />
             </button>
-            {presetMenuOpen && !presetSelectorDisabled && (
+            {presetMenuOpen && (
               <div className="absolute left-0 mt-1 w-64 bg-surface-elevated border border-border rounded-lg shadow-lg z-10 py-1">
                 {(Object.keys(PRESET_LABEL) as StackingPreset[]).map((p) => (
                   <button
                     key={p}
                     type="button"
                     onClick={() => applyPreset(p)}
-                    className="w-full text-left px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover"
+                    disabled={presetApplyDisabled}
+                    title={presetApplyTitle}
+                    className={`w-full text-left px-3 py-1.5 text-sm ${
+                      presetApplyDisabled
+                        ? 'text-content-muted cursor-not-allowed'
+                        : 'text-content-secondary hover:bg-surface-hover'
+                    }`}
                   >
                     {PRESET_LABEL[p]}
                   </button>
@@ -779,13 +792,20 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
                       ) : (
                         <div
                           key={saved.name}
-                          className="flex items-center hover:bg-surface-hover"
+                          className={`flex items-center ${
+                            presetApplyDisabled ? '' : 'hover:bg-surface-hover'
+                          }`}
                         >
                           <button
                             type="button"
                             onClick={() => applyUserPreset(saved)}
-                            title={saved.name}
-                            className="flex-1 min-w-0 text-left px-3 py-1.5 text-sm text-content-secondary truncate"
+                            disabled={presetApplyDisabled}
+                            title={presetApplyTitle ?? saved.name}
+                            className={`flex-1 min-w-0 text-left px-3 py-1.5 text-sm truncate ${
+                              presetApplyDisabled
+                                ? 'text-content-muted cursor-not-allowed'
+                                : 'text-content-secondary'
+                            }`}
                           >
                             {saved.name}
                           </button>

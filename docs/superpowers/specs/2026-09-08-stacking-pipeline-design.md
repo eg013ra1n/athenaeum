@@ -1340,7 +1340,21 @@ document that no longer decodes reads as *no presets* with a `warn!` on
 naming the key rather than replacing the user's whole list with one entry.
 The tab's preset label (a canonical-JSON comparison, `paths` excluded)
 covers user presets too and shows the matched one quoted — `'My narrowband'`
-— with a built-in winning a tie.
+— with a built-in winning a tie. **While a run is active the menu still
+opens and Save-as / delete stay live — only APPLY is disabled** (the
+inspector's own rule: the draft config may not change mid-run), because a
+run is precisely when a user wants to save the settings they just launched
+with, and closing the whole menu for the length of one would deny them that
+for the better part of an hour.
+
+A stored entry that no longer decodes costs exactly that entry: the row is
+read element by element, the bad ones are dropped with one `warn!` carrying
+their `count`, and the next save or delete rewrites the row without them.
+Only a document that is not a JSON array **at all** refuses a write — that
+is the one case where overwriting would destroy something unknowable. Both
+writes run as one `BEGIN IMMEDIATE` read-modify-write, since the whole list
+is a single settings value and two interleaved saves would otherwise drop a
+sibling preset the user never touched.
 
 ### 9.3 Artifacts and config hashes
 
@@ -1441,7 +1455,7 @@ actually written).
 | `get_stacking_paths` / `set_stacking_paths` | `{ working: PathSetting, output: PathSetting }` / `{ working?, output? }` (`null` = reset) |
 | `get_stacking_work_usage` / `cleanup_stacking_work` | `{ setId }` → bytes per artifact kind / `{ setId, what: "registered" | "intermediates" | "all" }` |
 | `get_stacking_presets` (plan 5b Task 1, the 15th command) | `{}` → `StackingPresets { default, fastPreview, maximumQuality }` — pure, no ctx; the one Rust source of truth the preset selector diffs the current config against, so the tab never re-implements the transforms |
-| `list_stacking_presets` / `save_stacking_preset` / `delete_stacking_preset` (M4d Task 4, ruling R-M4d-6, the 17th-19th commands) | `{}` / `{ name, config }` / `{ name }` → `NamedPreset[]` — the user's OWN presets (§9.2 "User presets"), stored in the `stacking.presets` settings row, NOT the three built-ins `get_stacking_presets` returns. Every one of the three returns the **full list** after the change, sorted by name case-insensitively, so the caller never needs a follow-up list call. `save` upserts by case-insensitive name, strips `config.paths` and refuses a 51st DISTINCT name (`"too many presets (50)"`) or a name that isn't 1–60 characters after trimming (`"preset name must be 1–60 characters"`) — both `Invalid` (400). `delete` refuses an unknown name with `"no such preset"` (also 400, so the three validation failures answer alike) and deliberately does NOT bound the name's length: it only has to FIND an entry, and a length check would make a row that reached the document another way permanently undeletable. A stored document that no longer decodes reads as empty on `list` (a `warn!`) and is a `Conflict` (409) on both writes, naming the key |
+| `list_stacking_presets` / `save_stacking_preset` / `delete_stacking_preset` (M4d Task 4, ruling R-M4d-6, the 17th-19th commands) | `{}` / `{ name, config }` / `{ name }` → `NamedPreset[]` — the user's OWN presets (§9.2 "User presets"), stored in the `stacking.presets` settings row, NOT the three built-ins `get_stacking_presets` returns. Every one of the three returns the **full list** after the change, sorted by name case-insensitively, so the caller never needs a follow-up list call. `save` upserts by case-insensitive name, strips `config.paths` and refuses a 51st DISTINCT name (`"too many presets (50)"`) or a name that isn't 1–60 characters after trimming (`"preset name must be 1–60 characters"`) — both `Invalid` (400). `delete` refuses an unknown name with `"no such preset"` (also 400, so the three validation failures answer alike) and deliberately does NOT bound the name's length: it only has to FIND an entry, and a length check would make a row that reached the document another way permanently undeletable. A stored ENTRY that no longer decodes is dropped (one `warn!` with its `count`) and the next write rewrites the row without it; only a document that is not a JSON array at all reads as empty on `list` and is a `Conflict` (409) on both writes, naming the key. Both writes are one `BEGIN IMMEDIATE` read-modify-write — the list is a single settings value, so interleaved saves would otherwise drop a sibling |
 | `get_master_light_preview` (M4d Task 3, ruling R-M4d-5, the 16th command) | `{ runId, groupKey, kind: "master" \| "drizzle" \| "weightMap", maxPx? }` → raw JPEG bytes (Tauri: `tauri::ipc::Response`; web: `image/jpeg`). `maxPx` defaults to 512, is **clamped to `[64, 2048]`** and selects one of three render steps rather than an exact output size — the ceiling is the last value that resolves to `Preview` (2x2 binning), so a native-resolution quality-95 encode of a ~100 Mpx drizzled master is out of this endpoint's reach by construction. `NotFound` (404) for an unknown run, an output this run never wrote, or a master file gone from disk. Cached under `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<step>.jpg` — the last component is the RESOLVED step (`thumbnail` \| `preview` \| `full`), never the raw `maxPx`, so requests at different sizes that render the same picture share one file — re-rendered when the master's mtime is newer. The web host answers it at `POST /api/get_master_light_preview` (the one-for-one mirror `api.invoke` uses, and what the app itself calls on both targets) AND at `GET /api/stacking/master-preview?runId=&groupKey=&kind=&maxPx=`, which exists for direct/browser access (an `<img src>`, `curl`, a bookmark) and works that way only when no API key is configured — the whole router sits behind `auth::require_api_key`, which an `<img>` cannot satisfy; both are the same handler. Instrumented at `level = "debug"` on both hosts — the results panel fetches one per group. Unlike every other handler in `api::stacking` it does NOT run `heal_interrupted_runs`: it fires per group per panel mount, and a preview of an already-written master has nothing to heal |
 
 **Retirement DONE (plan 5b Task 6, 2026-09-09):** `register_frame_set`,

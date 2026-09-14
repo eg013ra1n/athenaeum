@@ -400,50 +400,84 @@ fn validate_preset_name(name: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
-/// The stored `stacking.presets` document, LENIENTLY — a row that no longer
-/// decodes (a hand edit, a shape from a future/foreign build) warns and
-/// reads as no presets rather than failing the call. `list` uses this: a
-/// broken row must never turn the Stacking tab's preset menu into an error
-/// state, and nothing is lost by showing only the built-ins until it is
-/// fixed. Every WRITE path uses [`read_presets_strict`] instead.
+/// The stored `stacking.presets` document, decoded ENTRY BY ENTRY.
+///
+/// Fix round 1 (review m2): the row is first read as a `Vec<Value>` and
+/// each element decoded on its own, so one entry that no longer fits
+/// [`NamedPreset`] (a hand edit, a field from a future build) costs exactly
+/// that entry — the other 49 survive. The dropped ones are announced once,
+/// with their `count`, rather than one warn per entry.
+///
+/// `None` for the whole document means it is not a JSON ARRAY at all —
+/// truncated, replaced by an object, garbage. That is the one case a caller
+/// cannot make a safe decision from, so [`list_stacking_presets`] treats it
+/// as no presets (with its own warn) while every WRITE refuses outright;
+/// see [`read_presets_for_write`].
+fn decode_presets_entrywise(raw: &str) -> Option<Vec<NamedPreset>> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    let total = entries.len();
+    let mut presets = Vec::with_capacity(total);
+    for entry in entries {
+        match serde_json::from_value::<NamedPreset>(entry) {
+            Ok(p) => presets.push(p),
+            Err(error) => tracing::debug!(
+                key = keys::STACKING_PRESETS,
+                %error,
+                "stacking preset entry could not be decoded; dropping it"
+            ),
+        }
+    }
+    let dropped = total - presets.len();
+    if dropped > 0 {
+        tracing::warn!(
+            key = keys::STACKING_PRESETS,
+            count = dropped,
+            "stored stacking preset entries could not be decoded; dropping them — \
+             the next save or delete will rewrite the row without them"
+        );
+    }
+    Some(presets)
+}
+
+/// The stored presets for a READ. A document that is not a JSON array at
+/// all warns and reads as none: a broken row must never turn the Stacking
+/// tab's preset menu into an error state, and nothing is lost by showing
+/// only the built-ins until it is fixed.
 fn read_presets_lenient(conn: &Connection) -> Result<Vec<NamedPreset>, ApiError> {
     let Some(raw) = configured_setting(conn, keys::STACKING_PRESETS)? else {
         return Ok(Vec::new());
     };
-    match serde_json::from_str::<Vec<NamedPreset>>(&raw) {
-        Ok(presets) => Ok(presets),
-        Err(error) => {
-            tracing::warn!(
-                key = keys::STACKING_PRESETS,
-                %error,
-                "stored stacking presets could not be decoded; reading as none"
-            );
-            Ok(Vec::new())
-        }
-    }
+    Ok(decode_presets_entrywise(&raw).unwrap_or_else(|| {
+        tracing::warn!(
+            key = keys::STACKING_PRESETS,
+            "stored stacking presets are not a list; reading as none"
+        );
+        Vec::new()
+    }))
 }
 
-/// The stored `stacking.presets` document, STRICTLY — a row that no longer
-/// decodes is a [`ApiError::Conflict`] naming the key. The asymmetry with
-/// [`read_presets_lenient`] is deliberate and is the whole point: a read
-/// can shrug a broken row off, but a WRITE built on "it decoded as empty"
-/// would replace the user's whole preset list with one entry and destroy
-/// whatever was actually in there. Refusing hands them the key so they can
-/// rescue or clear it themselves.
-fn read_presets_strict(conn: &Connection) -> Result<Vec<NamedPreset>, ApiError> {
+/// The stored presets for a WRITE. Identical to [`read_presets_lenient`]
+/// except at the one boundary where the two must differ: a document that is
+/// not a JSON ARRAY is an [`ApiError::Conflict`] naming the key instead of
+/// an empty list, because a write built on "it decoded as empty" would
+/// replace the user's whole preset list with one entry and destroy
+/// something unknowable. Refusing hands them the key so they can rescue or
+/// clear it themselves.
+///
+/// A bad ENTRY inside a well-formed array is NOT that case: it is already
+/// invisible to every reader, so the write simply rewrites the row without
+/// it (announced by [`decode_presets_entrywise`]'s own warn).
+fn read_presets_for_write(conn: &Connection) -> Result<Vec<NamedPreset>, ApiError> {
     let Some(raw) = configured_setting(conn, keys::STACKING_PRESETS)? else {
         return Ok(Vec::new());
     };
-    // `warn!` and not `error!`: the command boundary's own `err` already
-    // logs the refusal at error level, and a second error event for the
-    // same failure would double-count it. This line exists only to carry
-    // the serde detail, which is diagnostic and has no place in the
-    // user-facing message below.
-    serde_json::from_str::<Vec<NamedPreset>>(&raw).map_err(|error| {
+    decode_presets_entrywise(&raw).ok_or_else(|| {
+        // `warn!` and not `error!`: the command boundary's own `err` already
+        // logs the refusal at error level, and a second error event for the
+        // same failure would double-count it.
         tracing::warn!(
             key = keys::STACKING_PRESETS,
-            %error,
-            "stored stacking presets could not be decoded; refusing to overwrite them"
+            "stored stacking presets are not a list; refusing to overwrite them"
         );
         ApiError::Conflict(format!(
             "the saved presets (setting `{}`) could not be read, so they were not changed — \
@@ -463,6 +497,25 @@ fn sort_presets(presets: &mut [NamedPreset]) {
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.name.cmp(&b.name))
     });
+}
+
+/// `BEGIN IMMEDIATE` around one preset read-modify-write.
+///
+/// Fix round 1 (review m4): the whole preset list is ONE settings value, so
+/// a plain read-then-write lets two concurrent saves interleave and the
+/// second silently drop the first's entry — not last-write-wins on one
+/// document (which is what `set_stacking_defaults` risks, and is
+/// recoverable), but the loss of a SIBLING the user never touched.
+/// `Immediate` rather than the default deferred behaviour: it takes the
+/// write lock at `BEGIN`, so the second writer waits out the connection's
+/// `busy_timeout` and then reads the FIRST one's result, instead of reading
+/// a stale snapshot and failing to upgrade at commit time. `new_unchecked`
+/// is the `&Connection` form (the pool hands out a shared handle, not a
+/// `&mut`); the transaction rolls back on drop, so an early `?` between
+/// here and `commit` leaves the row untouched.
+fn begin_presets_write(conn: &Connection) -> Result<rusqlite::Transaction<'_>, ApiError> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(ApiError::from)
 }
 
 /// Sort, serialize, store — and hand the sorted list back, which is what
@@ -511,7 +564,8 @@ pub fn save_stacking_preset(
 
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
-    let mut presets = read_presets_strict(&conn)?;
+    let tx = begin_presets_write(&conn)?;
+    let mut presets = read_presets_for_write(&tx)?;
 
     match presets.iter().position(|p| preset_name_eq(&p.name, &name)) {
         Some(i) => presets[i] = NamedPreset { name: name.clone(), config },
@@ -525,7 +579,8 @@ pub fn save_stacking_preset(
         }
     }
 
-    let presets = write_presets(&conn, presets)?;
+    let presets = write_presets(&tx, presets)?;
+    tx.commit()?;
     tracing::info!(
         preset_name = %name,
         count = presets.len(),
@@ -551,7 +606,8 @@ pub fn delete_stacking_preset(
     let name = name.trim().to_string();
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
-    let mut presets = read_presets_strict(&conn)?;
+    let tx = begin_presets_write(&conn)?;
+    let mut presets = read_presets_for_write(&tx)?;
 
     let before = presets.len();
     presets.retain(|p| !preset_name_eq(&p.name, &name));
@@ -559,7 +615,8 @@ pub fn delete_stacking_preset(
         return Err(ApiError::Invalid("no such preset".to_string()));
     }
 
-    let presets = write_presets(&conn, presets)?;
+    let presets = write_presets(&tx, presets)?;
+    tx.commit()?;
     tracing::info!(
         preset_name = %name,
         count = presets.len(),
@@ -2181,25 +2238,30 @@ mod tests {
         assert_eq!(saved[0].name, exactly);
     }
 
+    /// Write `raw` straight into the `stacking.presets` row, bypassing every
+    /// validation — how a hand edit or an older/foreign build's document
+    /// gets in.
+    fn plant_presets_row(ctx: &ServiceContext, raw: &str) {
+        let db_handle = db(ctx).unwrap();
+        let conn = db_handle.conn();
+        crate::db::set_setting(&conn, keys::STACKING_PRESETS, raw).unwrap();
+    }
+
     /// Brief Step 1 + the controller's own requirement: a stored document
-    /// that no longer decodes (a hand edit, a foreign shape) must not crash
-    /// `list` — it warns and reads as empty — but it must not be silently
-    /// overwritten either: a SAVE over it is refused, naming the key, so the
-    /// user can rescue or clear the row themselves.
+    /// that is not a JSON LIST at all must not crash `list` — it warns and
+    /// reads as empty — but it must not be silently overwritten either: a
+    /// SAVE over it is refused, naming the key, so the user can rescue or
+    /// clear the row themselves.
     #[test]
     fn a_corrupt_presets_document_lists_empty_with_a_warn_and_refuses_a_save() {
         let (_tmp, ctx) = test_ctx();
-        {
-            let db_handle = db(&ctx).unwrap();
-            let conn = db_handle.conn();
-            crate::db::set_setting(&conn, keys::STACKING_PRESETS, "{not json at all").unwrap();
-        }
+        plant_presets_row(&ctx, "{not json at all");
 
         let (listed, events) = capture_events(|| list_stacking_presets(&ctx).unwrap());
         assert!(listed.is_empty(), "a corrupt document reads as no presets");
         assert!(
             events.iter().any(|(level, msg)| level == "WARN"
-                && msg.contains("stored stacking presets could not be decoded")),
+                && msg.contains("stored stacking presets are not a list")),
             "the corrupt document must be announced, never swallowed: {events:?}"
         );
 
@@ -2217,5 +2279,95 @@ mod tests {
             Some("{not json at all"),
             "the corrupt row is left exactly as it was"
         );
+    }
+
+    /// Fix round 1 (review m2): ONE undecodable ENTRY must not hide the
+    /// others or brick a write — the array itself is well-formed, so the
+    /// bad entry is dropped (announced once, with its count) and everything
+    /// else survives. A write then rewrites the row WITHOUT it: the entry
+    /// was already invisible to every reader, so keeping it would only mean
+    /// it stays broken for ever.
+    #[test]
+    fn one_bad_entry_does_not_hide_the_good_ones_or_block_a_write() {
+        let (_tmp, ctx) = test_ctx();
+        save_stacking_preset(&ctx, "good one".into(), StackingConfig::default()).unwrap();
+        save_stacking_preset(&ctx, "good two".into(), preset(StackingPreset::FastPreview)).unwrap();
+
+        // Splice a third entry the current `NamedPreset` cannot decode
+        // (no `config` at all) into the otherwise-valid array.
+        let raw = stored_presets_json(&ctx).unwrap();
+        let mut entries: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        entries.push(serde_json::json!({ "name": "from the future" }));
+        plant_presets_row(&ctx, &serde_json::to_string(&entries).unwrap());
+
+        let (listed, events) = capture_events(|| list_stacking_presets(&ctx).unwrap());
+        assert_eq!(
+            listed.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["good one", "good two"],
+            "the good entries survive their bad sibling"
+        );
+        assert!(
+            events.iter().any(|(level, msg)| level == "WARN"
+                && msg.contains("stored stacking preset entries could not be decoded")),
+            "the dropped entry must be announced once: {events:?}"
+        );
+
+        // …and a save still works, rewriting the row without the bad entry.
+        let after =
+            save_stacking_preset(&ctx, "good three".into(), StackingConfig::default()).unwrap();
+        assert_eq!(
+            after.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["good one", "good three", "good two"]
+        );
+        let raw = stored_presets_json(&ctx).unwrap();
+        assert!(
+            !raw.contains("from the future"),
+            "the write must not carry the undecodable entry forward: {raw}"
+        );
+    }
+
+    /// Fix round 1 (review m3): the two Unicode decisions, pinned.
+    /// (1) the bound is CHARACTERS — `chars().count()`, not `len()` — so a
+    /// 60-character name of multibyte characters is accepted (120 bytes for
+    /// "ä", 180 for a CJK glyph) while 61 is not; (2) the upsert match is
+    /// `to_lowercase`, not `eq_ignore_ascii_case`, so a non-ASCII name
+    /// collides with its own other casing the way an ASCII one does.
+    #[test]
+    fn preset_names_are_unicode_aware() {
+        let (_tmp, ctx) = test_ctx();
+
+        for ch in ['ä', '名'] {
+            let exactly = std::iter::repeat(ch).take(PRESET_NAME_MAX).collect::<String>();
+            assert!(
+                exactly.len() > PRESET_NAME_MAX,
+                "the fixture must be multibyte, or it proves nothing"
+            );
+            let saved =
+                save_stacking_preset(&ctx, exactly.clone(), StackingConfig::default()).unwrap();
+            assert!(saved.iter().any(|p| p.name == exactly));
+
+            let one_too_many = std::iter::repeat(ch)
+                .take(PRESET_NAME_MAX + 1)
+                .collect::<String>();
+            let err =
+                save_stacking_preset(&ctx, one_too_many, StackingConfig::default()).unwrap_err();
+            assert!(
+                matches!(err, ApiError::Invalid(ref m) if m == PRESET_NAME_ERROR),
+                "{err:?}"
+            );
+        }
+
+        let (_tmp2, ctx2) = test_ctx();
+        save_stacking_preset(&ctx2, "ålesund".into(), StackingConfig::default()).unwrap();
+        let after =
+            save_stacking_preset(&ctx2, "Ålesund".into(), preset(StackingPreset::FastPreview))
+                .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "a non-ASCII name must upsert against its own other casing, not duplicate"
+        );
+        assert_eq!(after[0].name, "Ålesund", "the new spelling wins");
+        assert_eq!(after[0].config, preset(StackingPreset::FastPreview));
     }
 }
