@@ -38,10 +38,13 @@ supervisor `Elapsed(())` timeouts, one `expect_err` that succeeded for the
 wrong reason, and 27 more hidden in raw-string fixtures a first, too-narrow
 drift guard could not see.
 
-**One measurement is still owed on real CI hardware.** Every green reading is
-from one developer Windows box (31.5 GB, `-j 4`). A `windows-latest` runner is
-4 CPUs and 16 GB with no such headroom, and no amount of measuring on that box
-settles it — the first run on the actual runner is the only thing that will.
+**The real-CI measurement is taken.** The `windows-latest` job (4 CPUs,
+16 GB) has run green on `main` — first at `43270607` (2026-09-08, GitHub
+run 34241175780) — so the developer-box readings are confirmed on the
+runner. (From v0.6.1 to v0.6.2 both CI jobs were red on ONE deterministic
+test, `a_tps_run_never_holds_more_than_a_few_displacement_grids_at_once`,
+whose bound assumed a pool-bounded grid residency; fixed in v0.6.3 — see
+the Stacking v0.6.3 subsection below.)
 
 **`crates/perseus/src/` still has 14 slash-literal `join("M31/…")` fixture
 sites** (3 in `pending.rs`, 3 in `library.rs`, 6 in `web.rs`, 2 in
@@ -187,6 +190,53 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking v0.6.3 — fix round (2026-09-15)
+
+Four owner-reported bugs after v0.6.2 plus the red CI, on `fix/v0.6.3`
+(`56f1cf53`..): the grid-residency test bound (`peak <= tps_frames` — the
+integration source holds one inverse grid per spline frame for the whole
+group, by design, R-T4-7), XISF `bounds`/`imageType`, the "Re-run from"
+menu rebuilt to spec §8 + the plan's cleanup note + `metrics` rows surviving
+`deleteIntermediates`, and per-frame progress from inside the fan-out stages
+(`FanOutTicker`) with an Integrate message. Unit-pinned: the ticker's
+monotonicity under free racing, the plan note's four cases, the cleanup
+kind list, the XISF attributes. Not run by hand:
+
+- **OWNER SMOKE OWED — XISF in the external tool:** header-patched copies of
+  the v0.6.2 masters were written beside the originals for exactly this
+  (`~/Pictures/ldn_test/ldn_final/LDN_1272_NoFilter_{osc_180s_160x,mono_180s_208x}_bounds.xisf`,
+  the only change being `bounds="0:1" imageType="MasterLight"` in the XML);
+  a v0.6.3-written master is the same header. What remains to confirm once
+  it opens: levels (samples above 1.0 in saturated cores — the range is
+  representable, not a clip), the mirrored orientation of a bottom-up set
+  (R-T2-1, unchanged), `colorSpace="RGB"` on a 3-plane weight map.
+- **OWNER CLICK-THROUGH OWED — progress on a real run:** Measure, Register
+  and Local normalization rows now move per frame during a group's
+  fan-out (they used to jump per group); the LN reference build shows
+  "building the LN reference from N frames · plane p/n" at 0 %; the
+  Integrate row reads `<group> · 37% · 3.2 GB / 8.1 GB · plane 1/3 · band
+  12/51`. Every running row is `count · percent · bytes · group ·
+  message` (`StageRow.tsx::progressText`). The throttle is unchanged
+  (300 ms), so a fast stage may still show only its first and last tick.
+- **OWNER CLICK-THROUGH OWED — the "Re-run from" menu:** with everything
+  cached the menu lists Calibrate / Measure / Register (/ Local
+  normalization) / Integrate, each live; after a `deleteIntermediates`
+  run the cacheable entries show `stale` and are inert, the footer says
+  "Nothing is cached — the run starts from Calibrate", and the plan
+  warning line names the run and the policy. The owner's own set (109,
+  prod catalog) is in exactly that state: run 1 cleaned it under v0.6.2,
+  so its `metrics` rows are gone too and the line will NOT say
+  "measurements are still cached" until a v0.6.3 run has measured it.
+- **Deferred, named:** `metrics` rows kept by `deleteIntermediates` are a
+  behaviour change for `get_stacking_work_usage`'s consumers only in the
+  sense that nothing counts them (they hold no bytes) — verify the
+  Working-folder card still reads 0 after a cleanup. The plan's
+  `cleanup_stale_note` keys on the LAST run only: a `deleteIntermediates`
+  run followed by a failed keepAll run yields no line (the staleness is
+  then two runs old); acceptable, the stage rows still show `Stale`.
+- **CI:** the next push to `main` is the first green reading since
+  v0.6.0's `43270607` — confirm both jobs on the release commit.
+
 ### Stacking M4d — outputs (2026-09-14)
 
 M4d (plan `docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`,
@@ -219,10 +269,11 @@ left behind.
   registration on the G-dominated frame cannot follow), not of the deposit —
   bounded by the 0.036 px same-star G agreement with the debayered control.
   Cost if the ruling is wrong: a real sub-0.1-px deposit bias hiding under a
-  data-borne 0.3-px chromatic offset. **OWNER SMOKES OWED:** open an Athenaeum
-  `.xisf` master (`~/Pictures/Astro/Stacking/output/LDN_1272_NoFilter_*_180s_*.xisf`,
-  run 36) in the external tool — padding inside `headerLength`, samples above
-  the defaulted `0:1` bounds, `colorSpace=RGB` on the 3-plane weight map; the
+  data-borne 0.3-px chromatic offset. **The XISF smoke FAILED on the owner's
+  machine (2026-09-15):** the external tool refused the v0.6.2 masters —
+  "Missing bounds Image attribute, which is mandatory for a floating point
+  real image" — fixed in v0.6.3 (`bounds="0:1"` + `imageType`, see the
+  Stacking v0.6.3 subsection). **OWNER SMOKES OWED:** the
   desktop click-through of the preset menu (save-as inline form, apply disabled
   during a run, delete confirm, the `'<name>'` label) and of the results-card
   thumbnails (master + drizzle, both groups). Not exercised by the run:
@@ -259,11 +310,11 @@ left behind.
   master is not byte-reproducible across two runs of the same input —
   every byte-identity pin stays on `format = fits`. A non-ASCII card value
   logs the sanitize warning twice (once in `xisf_keyword_value`, once in
-  the shared card-parity check). **OWNER SMOKE OWED:** open an Athenaeum
-  `.xisf` master in the external tool — the padding declared inside
-  `headerLength`, samples above the defaulted `0:1` bounds, and
-  `colorSpace="RGB"` on a 3-plane weight map are the three header choices
-  most likely to matter to a foreign reader.
+  the shared card-parity check). The "defaulted `0:1` bounds" premise was
+  wrong — the format has NO default for a float image and the attribute is
+  mandatory; v0.6.3 writes it. What the external tool still has to confirm
+  (v0.6.3 subsection): the padding declared inside `headerLength`, samples
+  above `1.0`, and `colorSpace="RGB"` on a 3-plane weight map.
 - **Task 3 (`master_lights` + preview):** the group-row `update_group` call
   and the `master_lights` inserts share one pooled connection but are NOT one
   `rusqlite` transaction (the pre-existing shape of `update_group`) — a crash
@@ -346,10 +397,6 @@ left behind.
   on real stacks — measured on 21 LDN 1272 mono frames, rejection ×2.54 at +2.0 %
   master noise and −3.9 % PSF SNR. Task 7's call, the same kind of calibration
   `LINEAR_FIT_SIGMA_SCALE` got in M4a.
-- **RELEASE-NOTE LINE OWED (Task 2):** every master built with Winsorized sigma
-  clipping now differs from its pre-M4c self — a `rebuild_master` produces different
-  pixels than the original build. No migration exists or is needed (provenance shape
-  and the `ATH_REJ` text are unchanged).
 - **Cost, bounded (Task 2, ruling R-T2-1):** a zero-MAD stack always burns the 20-pass
   cap, ≈ 4.8× a non-degenerate stack of the same size, so the worst case is ≈ 5× the
   combine phase on a fully tied integer bias master. Outcome-insensitive (any cap ≥ ~8
@@ -498,8 +545,6 @@ left behind.
   - **Owed (owner):** the desktop click-through of the Integrate / Register / Normalize /
     Measure panels (two Chrome instances were connected to the automation; a static
     check of the served bundle stands in), and the Windows/Linux runs.
-  - **Release-note line owed (v0.6.1):** every Winsorized master (the n ≥ 15 Auto master
-    recipe) differs from its pre-M4c self — within 0.1 % median / 2 % MAD / 1 % hot pixels.
 
 ### Stacking M4b — mixed pixel scales (2026-09-11)
 
@@ -621,9 +666,6 @@ M4a (plan `docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`, ruli
 - **Owed:** one M4a run on Windows and one on Linux (the web build) — the two-pass dry pass and the `.rej`
   sink condition are the platform-neutral parts; nothing platform-specific was added, but the suite's two
   load flakes (below) are worth watching there.
-- **Release-note lines owed** (drafted in the acceptance note §11): noise-relative star detection for frame
-  weighting with the new `Detection threshold (σ)` setting, the two-pass reference pick, the robust linear-fit
-  rejection (rejects ≈ 3 % at the default thresholds, like the reference), the faster local normalization.
 
 ### Stacking M3 — drizzle (2026-09-10)
 
@@ -656,9 +698,6 @@ Task 8. Two misses/gaps recorded below.
 - **Owed:** one drizzled run on Windows and one on Linux — the `.rej`
   positional writes (`write_at` / `seek_write`) and the memory refusal are
   the platform-specific parts.
-- **Release-note lines owed** (drafted in the acceptance note §9): drizzle,
-  the Drizzle panel/results, the "Maximum quality" preset now turning on LN
-  and 2× drizzle, the sky-penalized normalization anchor.
 
 ### Stacking M2 — local normalization (2026-09-10)
 
@@ -692,9 +731,6 @@ misses, both recorded below.
 - **Owed:** one LN run on Windows and one on Linux (the web build) — the
   sidecar writer's tmp-and-rename and the fan-out's RAM probe are the
   platform-specific parts.
-- **Release-note lines owed** (drafted in the acceptance note §9): local
-  normalization, the LN rejection option, camera-agnostic integration groups
-  (below), the `Scale` column and the `LN: n/m` results line.
 
 ### Stacking M2 — camera-agnostic grouping (2026-09-10)
 
@@ -724,12 +760,6 @@ catalog on 2026-09-10 — note `docs/superpowers/research/2026-09-09-m1-acceptan
 masters are bit-identical to Checkpoint B's; one attributed miss: measurement
 time on a 16 GB machine). The tab is enabled for every build since that run.
 
-- **Release-note line owed:** `browse_directories` now answers `400 Bad
-  Request` to an unknown `scope` instead of silently falling through to the
-  scan roots (task 6 fix round 1, `crates/athenaeum-web/src/routes/files.rs`)
-  — every known caller already passes `"scan"`/`"export"`/`"stacking"`, so
-  this is not expected to be user-visible, but the behavior change itself
-  needs a line at the next tag.
 - **Owed:** the owner's own click-through of the Stacking tab on the desktop
   build — board/inspector/frames/results, Settings → Stacking, the frame-set
   page showing no Registration tab — and specifically the **narrow-layout
@@ -738,9 +768,6 @@ time on a 16 GB machine). The tab is enabled for every build since that run.
 - **Owed:** one stacking run on Windows and one on Linux (the web build) — the
   acceptance run was macOS only; the folder validator, `statvfs` free space and
   the fan-out's RAM probe are the platform-specific parts.
-- **Release-note lines owed** (drafted in the acceptance note §10): the
-  Stacking tab itself, "the run builds the masters it needs", Settings →
-  Stacking, the retired dev-only registration preview.
 - **Follow-up (web host, found by the acceptance run):** opening Settings →
   General wedged the web server — `api::account::build_status` →
   `TokenStore::load` → `SecKeychainFindGenericPassword` blocked in a mach

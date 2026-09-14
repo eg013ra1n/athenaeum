@@ -1,70 +1,63 @@
-*Athenaeum v0.6.2: the stacking outputs round — Bayer drizzle for colour cameras, XISF masters, a catalog of every master light with a preview on its results card, and named presets you save yourself.*
-
-## What's New
-
-- **Bayer drizzle.** The Drizzle panel gains a *Bayer drizzle* switch for
-  one-shot-colour groups. Calibration now keeps the calibrated CFA mosaic
-  of every colour frame beside its debayered copy — one read, one
-  calibration, two files — and drizzle deposits each sensor pixel into the
-  colour plane it actually recorded, instead of drizzling the interpolated
-  colour image. On the same two-camera set every earlier release was
-  measured on, the drizzled colour master's green and blue stars are now
-  within 0.5 % and 0.2 % of another application's CFA drizzle of the
-  identical frames — where drizzling the debayered frames had left them
-  10–12 % broader — and the colour deposit runs in about half the time.
-  Colour-pure sampling also shows the colour offsets the night put into the
-  data: red and blue stars sit a fraction of a pixel off green by exactly
-  the amount that other application's CFA drizzle shows for the same
-  frames, where debayering used to blend it away. Off by default; a
-  re-run from Register re-uses the mosaics.
-- **XISF output.** *Output format* in the Output panel: **FITS** (as
-  before) or **XISF** — a monolithic XISF 1.0 file, one uncompressed
-  32-bit float image, every master card carried as a FITS keyword, for the
-  master, the drizzled master and its weight map alike (rejection maps stay
-  FITS). Read back through Athenaeum's own reader, an XISF master matches
-  the FITS master of the same run to every measured digit. The file states
-  its row order explicitly; a set shot bottom-up produces one warning per
-  group, because an XISF viewer will show that master mirrored against its
-  FITS twin (the WCS stays correct for the stored array). Tested with
-  Athenaeum's own reader — if another application opens one with the
-  wrong levels, please report it.
-- **Every master light is in the catalog.** A run records each file it
-  writes — master, drizzled master, weight map — with its geometry, frame
-  count and total exposure, per group, in a new `master_lights` table. It
-  is the only place a master light is cataloged: it never becomes a frame,
-  and the scanner's rule for calibrated artifacts is untouched.
-- **Previews on the results cards.** The results card shows a thumbnail
-  of each master and, when present, of its drizzled master — the same
-  auto-stretched render the file browser uses, from FITS and from XISF,
-  cached under the working folder and re-rendered when the master
-  changes. The Working folder card counts the previews and the cleanup
-  removes them.
-- **Your own presets.** The Stacking tab's preset menu lists the three
-  built-ins, a divider, and the presets you saved: **Save current as…**
-  names the current configuration inline, a click applies one, the trash
-  icon asks before deleting, and the toolbar label shows `'<name>'` when
-  the configuration matches a saved preset. Presets never carry folders.
-  The menu stays open during a run so you can save the settings you just
-  launched with; only applying one waits for the run to finish. Stored in
-  Settings, up to 50, names unique regardless of case.
-
-## Changes
-
-- Runs with *Bayer drizzle* off and *Output format* FITS produce
-  byte-identical masters to v0.6.1 — no cached stage is invalidated by the
-  new options, and turning Bayer drizzle on regenerates only the colour
-  group's mosaics.
-- A run's cached calibration is reported stale for a colour group whose
-  mosaics the run would need and does not have yet, so the plan says what
-  the first Bayer-drizzle run will redo.
-- The master preview render takes the same image-processing permit the
-  file browser's previews take, on desktop and on the web host, and a
-  results card loads its drizzle thumbnail after its master's, so opening
-  the results of a large run never reads several multi-hundred-megabyte
-  masters at once.
-- Rejection maps now carry the master's row order like the weight map
-  does, so a FITS viewer overlays them the right way up.
+*Athenaeum v0.6.3: a fix round for the stacking outputs — XISF masters that other applications open, a progress bar that moves frame by frame in every stage, a "Re-run from" menu that does what it says, and measurements that survive a cleanup.*
 
 ## Bug Fixes
 
-- None reported against v0.6.1 in this cycle.
+- **XISF masters open in other applications.** A v0.6.2 XISF master was
+  refused by another application with *"Missing bounds Image attribute,
+  which is mandatory for a floating point real image"*. The XISF 1.0
+  specification does require it for every floating-point image, and the
+  writer had left it off. Every XISF file Athenaeum writes — master,
+  drizzled master, weight map — now declares its representable range
+  (`bounds="0:1"`, the range every master is built in) and its image type
+  (`MasterLight` / `WeightMap`). A master written by v0.6.2 needs one
+  **Re-run from › Integrate** — every cached stage is reused, only the
+  integration and the header are redone; the pixels were never wrong.
+- **"Re-run from" now lists what a run would reuse.** The menu used to
+  offer the stages that were *already* stale — which every run redoes
+  anyway — and refused to open when everything was cached, so no entry ever
+  did anything ▶ Run did not. It now lists Calibrate, Measure, Register
+  (and Local normalization when it is on) plus Integrate; each entry redoes
+  that stage and everything after it and reuses the stages before. Stages
+  with no usable cache stay visible but inert and say so, and the menu's
+  footer — and ▶ Run's tooltip — state where the next run actually starts.
+- **A cleanup that emptied the cache is explained.** After a run finished
+  with *Output › cleanup: delete intermediates*, the next run silently
+  started from Calibrate whichever stage it was re-run from. The plan now
+  says so in one line naming the run and the policy ("Run #1 deleted its
+  calibrated and registered frames afterwards … nothing is cached, so the
+  next run starts from Calibrate"), and the *delete registered* case gets
+  its own sentence.
+- **Measurements survive "delete intermediates".** The cleanup used to
+  discard every frame's measurement along with the calibrated files — a
+  cached result that occupies no disk and costs a real set ten minutes to
+  recompute. It is kept now (only *delete everything* removes it), so a
+  re-run after that cleanup re-calibrates and re-registers but does not
+  re-measure. Sets cleaned by v0.6.2 lost theirs already; the plan's line
+  says whether measurements are still cached.
+- **Progress moves frame by frame in every stage.** Measure, Register and
+  Local normalization reported only when a whole group had finished — on a
+  real set that is a bar frozen for minutes and then jumping by a group.
+  Each now ticks per frame from inside the parallel workers, cached
+  frames count from the start, the local-normalization reference build
+  says what it is doing, and the Integrate row names the plane, the pass
+  and the band it is reading beside its percentage and bytes. Every
+  running stage row shows the same shape: count, percent, bytes when the
+  stage reads them, the group, and the stage's own message.
+- **Continuous integration is green again.** One test of the thin-plate-
+  spline memory discipline assumed the number of resident displacement
+  grids is bounded by the worker pool; it is bounded by the group's frame
+  count during integration — one inverse grid per frame, by design, on any
+  machine — and the test passed on a 10-core development machine only by
+  coincidence, failing on every 4-core runner since v0.6.1. The bound now
+  states the real invariant.
+
+## Changes
+
+- Stage rows during a run show `current / total · percent · bytes · group
+  · message`, in the stage's own unit: builds, frames, frame-planes
+  (Drizzle), groups (Output); Integrate shows no count — its plane, pass
+  and band ride in the message.
+- Web host: the folder picker's `browse_directories` answers `400 Bad
+  Request` to an unknown `scope` instead of silently falling back to the
+  scan roots (every shipped caller passes `scan`, `export` or `stacking`;
+  landed with the Stacking tab in v0.6.0, unlisted until now).

@@ -1269,6 +1269,52 @@ since T1) are both in
 a run disables APPLY only (fix round 1, I1) — the menu, Save current as…,
 and delete stay live during a run.
 
+**v0.6.3 — fix round (2026-09-15)**, four owner-reported bugs after
+v0.6.2 plus the red CI, no command surface changed: (1) **XISF `bounds` is
+mandatory** — XISF 1.0 §11.5.1 has NO default representable range for a
+Float32 image and the external tool refuses a file without it; the writer
+stamps `bounds="0:1"` (every master is u16-domain/65535, `ATH_CSCL`; a
+representable range, not a clip — saturated cores above 1.0 are legal) and
+`imageType` (`MasterLight`/`WeightMap`, nothing guessed for other
+`IMAGETYP`s). (2) **"Re-run from" follows spec §8**: the menu lists the
+CACHEABLE stages (Calibrate/Measure/Register, Normalize when LN is on) plus
+Integrate — each forcing itself and everything after it fresh, reusing what
+is before — with stale entries visible but inert; Plan 5b had built it as
+`staleStages ∪ {integrate}`, disabled when nothing was stale, so no entry
+ever differed from ▶ Run. The plan gate's `cleanup_stale_note` adds a
+warning naming the last `done` run and its `output.cleanup` policy when
+that policy is why nothing is cached ("Run #N deleted its calibrated and
+registered frames afterwards … the next run starts from Calibrate whichever
+stage it is re-run from"); `paths::INTERMEDIATE_ARTIFACT_KINDS` no longer
+lists `metrics` — a file-less payload row whose hash keys on the
+calibration CONFIG hash (`measurement_hash_for`), so it stays a valid cache
+hit after the calibrated frame is regenerated; only `CleanupWhat::All`
+drops it. (3) **Per-frame progress from inside the fan-out stages**:
+`run.rs::FanOutTicker` (thread-safe, stage-wide `current`/`total`
+continuing from the cached count, the 300 ms throttle with the tick on
+`total` always emitted, the gate held ACROSS the emit so racing workers
+never deliver ticks backwards) is what Measure, Register and Normalize tick
+from their `fan_out` closures — they used to report only when a whole
+group's fan-out returned; `register_group_pass` adopts the ticker's count
+after the fan-out instead of re-emitting in its results loop; the LN
+reference build emits per-plane messages; `emit_integrate_tick` carries a
+`message` (`integrate_tick_message`: `plane i/n [· pass 2] · band b/B |
+combining | reading`); `StageRow.tsx::progressText` renders every running
+row as `count · percent · bytes · group · message`, Integrate's plane index
+dropped as a count. (4) **The R-T4-6d grid-residency pin** asserts `peak <=
+tps_frames`, not `peak <= threads + 4`: `integrate_planes` opens ONE
+`RegisteredSource` per group (R-T4-7) and every band reads every included
+frame through its inverse grid, so the spline frames' grids are all
+resident for the whole integration by design (~3 MB each at the 8-px grid
+step), independent of the pool — the old bound held on the 10-worker Mac
+only because 11 ≤ 14 and was red on every 4-worker GitHub runner from
+v0.6.1 through v0.6.2. The stacking measurement (`stacking::measure`)
+shares rustafits' primitives (fast detector, Moffat fit, background mesh,
+MRS noise) with the Analysis tab but reads NOTHING from its tables: it
+measures the CALIBRATED frame from scratch (PSF Signal Weight, PSF SNR,
+normalization stats — the weighting the external tool's is calibrated
+against, M4a) and caches the result as the per-frame `metrics` artifact.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,
