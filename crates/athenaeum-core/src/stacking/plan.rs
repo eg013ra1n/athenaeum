@@ -894,15 +894,18 @@ fn cleanup_stale_note(
     let metrics_kept = plan_groups.iter().any(|g| g.metrics_cached > 0);
     let note = match cleanup {
         CleanupPolicy::DeleteIntermediates if calibrate_stale && nothing_calibrated => {
-            let tail = if metrics_kept {
-                "; the measurements are still cached"
+            let (what, tail) = if metrics_kept {
+                (
+                    "no calibrated or registered frame is cached",
+                    "; the measurements are still cached and will be reused",
+                )
             } else {
-                ""
+                ("nothing is cached", "")
             };
             format!(
                 "Run #{} deleted its calibrated and registered frames afterwards (Output › \
-                 cleanup: delete intermediates) — nothing is cached, so the next run starts \
-                 from Calibrate whichever stage it is re-run from{tail}",
+                 cleanup: delete intermediates) — {what}, so the next run starts from \
+                 Calibrate whichever stage it is re-run from{tail}",
                 last.id
             )
         }
@@ -4630,6 +4633,44 @@ mod tests {
             !note.contains("measurements are still cached"),
             "no metrics row exists here: {note}"
         );
+
+        // With a measurement still cached (a v0.6.3 cleanup keeps the rows),
+        // the line says so instead of claiming nothing is cached.
+        {
+            let cfg = StackingConfig::default();
+            let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+            let gf = &groups[0].frames[0];
+            let mut divisors = DivisorCache::new();
+            let calib_hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: f.set_id,
+                    frame_id: Some(gf.frame_id),
+                    group_key: &groups[0].key,
+                    kind: "metrics",
+                    path: None,
+                    config_hash: &measurement_hash_for(&cfg, &calib_hash),
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+        }
+        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let note = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("delete intermediates"))
+            .unwrap_or_else(|| panic!("no cleanup note in {:?}", plan.warnings));
+        assert!(
+            note.contains("no calibrated or registered frame is cached"),
+            "{note}"
+        );
+        assert!(note.contains("measurements are still cached"), "{note}");
+        assert!(!note.contains("nothing is cached"), "{note}");
+        crate::db::stacking::delete_artifacts(&f.conn, f.set_id, &["metrics"]).unwrap();
 
         // An INTERRUPTED deleteIntermediates run never ran its cleanup —
         // no story either.

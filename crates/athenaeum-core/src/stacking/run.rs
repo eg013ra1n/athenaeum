@@ -7229,7 +7229,10 @@ fn build_and_write_ln_reference(
     // are what `build_reference` offers; enough to say what is happening.
     let build_emitter = rc.emitter.clone();
     let (build_run_id, build_set_id, build_group_key) = (rc.run_id, rc.set_id, group.key.clone());
-    let build_total = included.len();
+    // The stage's own total (every included member of the group), not the
+    // top-`n` slice — the row's count must be the same number the per-frame
+    // ticks that follow climb towards.
+    let build_total = input.frames.len();
     let build_n = n.min(included.len());
     let on_build_progress = |plane: usize, planes: usize| {
         emit_event(
@@ -11195,6 +11198,50 @@ mod tests {
             Path::new(&master_path).exists(),
             "cleanup must never touch the output folder"
         );
+
+        // v0.6.3: the cleanup keeps the `metrics` rows (file-less, keyed on
+        // the calibration CONFIG hash — `paths::INTERMEDIATE_ARTIFACT_KINDS`),
+        // so a second run re-calibrates and re-registers but does NOT
+        // re-measure. Pinned end to end on the second run's own summary,
+        // not on the kind list: a regression in `measurement_hash_for`'s
+        // inputs (a calibrated-file identity sneaking into the hash) would
+        // make every kept row a miss while the kind list still passed.
+        let mut cfg2 = StackingConfig::default();
+        cfg2.output.cleanup = CleanupPolicy::DeleteIntermediates;
+        cfg2.registration.write_registered_frames = true;
+        let second = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg2),
+            None,
+        )
+        .expect("second start should succeed");
+        wait_for_run(&ctx, second.run_id);
+        let row2 = crate::db::stacking::get_run(&fixture.conn, second.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.status, "done", "{row2:?}");
+        let summary2: RunSummary =
+            serde_json::from_str(row2.summary_json.as_deref().unwrap()).unwrap();
+        let frames2: Vec<&crate::stacking::provenance::SummaryFrame> = summary2
+            .groups
+            .iter()
+            .flat_map(|g| g.frames.iter())
+            .collect();
+        assert!(!frames2.is_empty());
+        for f in &frames2 {
+            assert!(
+                !f.cached_calibrated,
+                "the cleanup removed every calibrated frame, so run 2 must regenerate: {f:?}"
+            );
+            assert!(
+                f.cached_metrics,
+                "the kept metrics row must be a cache hit for the regenerated frame: {f:?}"
+            );
+        }
         let _ = output;
     }
 

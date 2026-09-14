@@ -32,7 +32,7 @@
 //! `imageType`. `byteOrder` is left off: its default (little-endian) is what
 //! this writer produces.
 //!
-//! `bounds` is NOT optional. XISF 1.0 §8.5.6: the attribute "shall be
+//! `bounds` is NOT optional. XISF 1.0 §11.5.1: the attribute "shall be
 //! specified for all Image elements serializing floating point real pixel
 //! data" — there is no default representable range for a Float32 image,
 //! and the external tool refuses the file outright without it ("Missing
@@ -223,7 +223,7 @@ fn with_explicit_row_order(cards: &[Card]) -> Result<Cow<'_, [Card]>, FitsWriteE
 
 /// The representable range every master this writer serializes was built
 /// against: the u16 domain divided by 65535 (`ATH_CSCL`), i.e. `[0, 1]`.
-/// Mandatory on a Float32 `<Image>` (XISF 1.0 §8.5.6).
+/// Mandatory on a Float32 `<Image>` (XISF 1.0 §11.5.1).
 const FLOAT_BOUNDS: &str = "0:1";
 
 /// The `imageType` literal (XISF 1.0 table 12) for the cards' `IMAGETYP`,
@@ -493,7 +493,7 @@ mod tests {
         assert!(xml.contains("sampleFormat=\"Float32\""), "{xml}");
         assert!(xml.contains("colorSpace=\"RGB\""), "{xml}");
         assert!(xml.contains("pixelStorage=\"Planar\""), "{xml}");
-        // v0.6.3: mandatory for a Float32 image (XISF 1.0 §8.5.6) — the
+        // v0.6.3: mandatory for a Float32 image (XISF 1.0 §11.5.1) — the
         // v0.6.2 masters lacked it and the external tool refused them.
         assert!(xml.contains("bounds=\"0:1\""), "{xml}");
         assert!(
@@ -527,10 +527,6 @@ mod tests {
         }
     }
 
-    /// Ruling R-T2-1: the keyword list always states the stored array's row
-    /// order — the source's own value when it has one, the astronomical
-    /// default when it does not, and never two `ROWORDER` cards.
-
     /// `imageType` (XISF 1.0 table 12) follows the cards' `IMAGETYP` only
     /// where the two vocabularies coincide — a master light and a drizzle
     /// weight map — and is absent, never guessed, for anything else.
@@ -554,6 +550,10 @@ mod tests {
         // Every one of them still declares the mandatory range.
         assert!(write(None).contains("bounds=\"0:1\""));
     }
+
+    /// Ruling R-T2-1: the keyword list always states the stored array's row
+    /// order — the source's own value when it has one, the astronomical
+    /// default when it does not, and never two `ROWORDER` cards.
     #[test]
     fn row_order_is_always_stated_explicitly() {
         let with = vec![Card::new(

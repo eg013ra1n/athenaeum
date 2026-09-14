@@ -1159,6 +1159,7 @@ mod tests {
         let measure = MeasureOptions::default();
         let input = base_input(&frames, &measure);
 
+        crate::geometry::pixel_map::grid_counters::reset();
         let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
         assert!(out.stats.coverage[0] > 0.5, "the deposit really ran");
 
@@ -1169,6 +1170,18 @@ mod tests {
                 "frame {i}'s grid outlived the deposit"
             );
         }
+        // v0.6.3: the release is per FRAME, not per call — the run pin
+        // (`a_tps_run_never_holds_more_than_a_few_displacement_grids_at_once`)
+        // bounds the peak by the spline-frame count, which integration
+        // legitimately reaches, so a drizzle that held every forward grid
+        // until its plane loop ended would hide under it. This is where
+        // that regression shows: two frames, one grid alive at a time.
+        let (builds, _alive, peak) = crate::geometry::pixel_map::grid_counters::snapshot();
+        assert_eq!(builds, 2, "one forward grid per frame");
+        assert_eq!(
+            peak, 1,
+            "drizzle must release each frame's grid before the next"
+        );
     }
 
     // ── (a) level: a uniform field comes out at its own level, with full

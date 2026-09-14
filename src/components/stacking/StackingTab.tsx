@@ -634,9 +634,8 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
   }, [running, starting, beginStarting, startRun, framesSetId, draftConfig]);
 
   // Measure panel's own "Re-measure" button (spec: rerunFrom: 'measure').
-  // Independent disabled logic from the toolbar's "Re-run from" menu, which
-  // gates on staleness — this one gates on the plan's blockers directly,
-  // per the brief.
+  // Gates on the plan's blockers and on a live run, the same way the
+  // toolbar's "Re-run from" menu does since v0.6.3.
   const remeasureDisabled = running || starting || (plan?.blockers.length ?? 0) > 0;
   const handleRemeasure = useCallback(() => {
     void handleRerunFrom('measure');
@@ -702,12 +701,17 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     ...cacheableStages.map((stage) => ({ stage, stale: plan.staleStages.includes(stage) })),
     { stage: 'integrate', stale: false },
   ];
-  const rerunDisabled = running || starting;
+  // Blocked exactly like ▶ Run: every entry ends in `start_stacking`, which
+  // refuses a blocked plan, so an open menu would only offer failures.
+  const rerunDisabled = running || starting || plan.blockers.length > 0;
+  const measureCached = !plan.staleStages.includes('measure');
   const runStartsAt =
     firstStale === undefined
       ? 'Every cached stage is reused — the run re-integrates from the cached registered frames'
       : firstStale === 'calibrate'
-        ? 'Nothing is cached — the run starts from Calibrate'
+        ? measureCached
+          ? 'No calibrated or registered frames are cached — the run starts from Calibrate; the measurements are reused'
+          : 'Nothing is cached — the run starts from Calibrate'
         : `Starts from ${STAGE_LABEL[firstStale]} — the stages before it are reused from cache`;
   // Fix round 1, Minor #8: APPLYING a preset edits the config the same way
   // every inspector panel does, so it is disabled while a run is active for
