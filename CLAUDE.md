@@ -564,7 +564,8 @@ that used to stand here ("the only defence is registration's fixed
 `[0.8, 1.25]` gate, no plan-time signal names the group") no longer
 describes the code. Bayer drizzle, XISF output, cataloging masters and
 preset management SHIPPED as M4d — Tasks 1–4 code-complete, see its own
-paragraph below; the LDN 1272 acceptance run (Task 6) is still ahead.
+paragraph below; accepted 2026-09-14 on LDN 1272 (runs 34–36,
+`docs/superpowers/research/2026-09-14-m4d-acceptance-run.md`).
 
 **M2 — local normalization** (spec §5.2, executed 2026-09-10 alongside Task
 10's camera-agnostic grouping rule — see "The plan gate" above, same
@@ -1136,7 +1137,22 @@ the served bundle stands in).
 R-M4d-1…7 plus the fix-round ruling R-T2-1): Tasks 1–4 landed 2026-09-12
 (Bayer drizzle, XISF output) through 2026-09-14 (`master_lights` + preview,
 user presets) — `4748f91c`..`7d5e4780`, code-complete with green gates and
-clean reviews; the LDN 1272 acceptance run is Task 6 and has not run yet.
+clean reviews; **accepted 2026-09-14** on LDN 1272 (runs 34–36,
+`docs/superpowers/research/2026-09-14-m4d-acceptance-run.md`): Bayer drizzle
+level within 0.1 % and coverage 1.0 on every plane, the G plane 3 % sharper
+than the debayered drizzle, and the M3/M4a "OSC drizzled G/B ≈ 10–12 %
+broader than the external tool's" residual CLOSED — G +0.5 %, B +0.2 %
+against the external CFA drizzle of the same frames (R +4 %); the R−G/B−G
+colour offsets (0.36/0.23 px) and the broader R plane are in the DATA — the
+external CFA drizzle shows the same offsets (0.28/0.21 px) and the same R/G
+ratio — so ruling R-T6-1 re-states the plan's unattainable absolute
+"≤ 0.1 px" as "within 25 % of the external CFA drizzle's, same directions";
+the 160 mosaics are re-used on a re-run from Register (Calibrate 0.00 min);
+the XISF masters read back through the harness identical to the FITS ones
+(mono every term, OSC ≤ 1.9e-10); `master_lights` 6 rows per run; previews
+6/6 from FITS and from XISF; presets round-trip through the API. Owed to the
+owner: the external-tool open of an Athenaeum `.xisf`, and the desktop
+click-through of the preset menu and the results-card thumbnails.
 **The calibrated CFA mosaic and Bayer drizzle** (rulings R-M4d-1/2):
 `execute_generation` gains an optional second write — beside the debayered
 `c_<stem>_d.fits` it writes the corrected, pre-debayer CFA mosaic

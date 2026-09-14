@@ -1757,8 +1757,15 @@ Split into four plans, each with its own acceptance re-run:
   and a preview in the Results cards), and preset management. Tasks 1–4
   landed 2026-09-12 (Bayer drizzle, XISF output) through 2026-09-14
   (`master_lights` + preview, user presets) — `4748f91c`..`7d5e4780`,
-  **code-complete with green gates and clean reviews**; the LDN 1272
-  acceptance run is Task 6 and has not run yet.
+  **code-complete with green gates and clean reviews**; **accepted
+  2026-09-14** on LDN 1272 (runs 34–36,
+  `docs/superpowers/research/2026-09-14-m4d-acceptance-run.md`): Bayer
+  drizzle closes the M3/M4a OSC G/B residual against the external CFA
+  drizzle (G +0.5 %, B +0.2 %), the mosaics are re-used across runs, the
+  XISF masters read back identical to the FITS ones, the catalog rows,
+  previews and presets round-trip; ruling R-T6-1 re-states the
+  colour-fringing target against the external CFA drizzle (the plan's
+  absolute 0.1 px is below what the data itself carries).
 
 ## 15. Deferred and open
 

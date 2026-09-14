@@ -195,8 +195,41 @@ artifact and Bayer drizzle, an XISF writer for masters/drizzled masters/weight
 maps, the `master_lights` catalog table with a preview command and Results-card
 thumbnails, and named user presets beside the three built-in transforms.
 **Tasks 1–4 are code-complete with green gates and clean reviews
-(`4748f91c`..`7d5e4780`); the LDN 1272 acceptance run (Task 6) has not run
-yet.** Everything below is what the four task reports left open.
+(`4748f91c`..`7d5e4780`), and the LDN 1272 acceptance run (Task 6) RAN on
+2026-09-14 — `docs/superpowers/research/2026-09-14-m4d-acceptance-run.md`,
+runs 34–36, verdict "M4d is accepted".** Everything below is what the four
+task reports left open, plus what the acceptance run itself left behind.
+
+- **Acceptance run (Task 6), what it settled and what it owes:** Bayer drizzle
+  CLOSES the M3/M4a residual "OSC drizzled G/B ≈ 10–12 % broader than the
+  external tool's" — against the external CFA drizzle of the same frames our G
+  is +0.5 %, B +0.2 %, R +4 %. **Ruling R-T6-1:** the plan's colour-fringing
+  target "R/B centroid offset from G ≤ 0.1 px" is unattainable on this data by
+  construction — the external tool's own CFA drizzle measures 0.28 / 0.21 px and
+  the VNG-debayered control 0.15 / 0.13 — so it is re-stated as "offsets and
+  per-plane FWHM ratios within 25 % of the external CFA drizzle's, same
+  directions" (ours 0.36 / 0.23 px, R/G 1.24 vs 1.20): PASS. The broader R
+  plane in colour-pure drizzle (R/G 1.24 here, 1.20 external, 1.06 debayered) is
+  therefore a property of the data (a wavelength-dependent displacement that
+  registration on the G-dominated frame cannot follow), not of the deposit —
+  bounded by the 0.036 px same-star G agreement with the debayered control.
+  Cost if the ruling is wrong: a real sub-0.1-px deposit bias hiding under a
+  data-borne 0.3-px chromatic offset. **OWNER SMOKES OWED:** open an Athenaeum
+  `.xisf` master (`~/Pictures/Astro/Stacking/output/LDN_1272_NoFilter_*_180s_*.xisf`,
+  run 36) in the external tool — padding inside `headerLength`, samples above
+  the defaulted `0:1` bounds, `colorSpace=RGB` on the 3-plane weight map; the
+  desktop click-through of the preset menu (save-as inline form, apply disabled
+  during a run, delete confirm, the `'<name>'` label) and of the results-card
+  thumbnails (master + drizzle, both groups). Not exercised by the run:
+  `output.cleanup = deleteIntermediates` removing the mosaics (every acceptance
+  run keeps `keepAll`; the policy is the one already governing `calibrated/`,
+  unit-pinned in Task 1). Observation: the G plane's row-profile FFT line at the
+  512-row band period is 1.8× its neighbourhood on the Bayer drizzle (R 0.66×,
+  B 0.41×; the fold test shows no seam) — mild, worth a look if a seam is ever
+  reported on a colour-pure drizzle. Deferred minor: the stacking paths gate
+  reuses `api::sync::validate_transfer_dir`, so its overlap warning about the
+  stacking OUTPUT folder reads "transfer folder overlaps a scan root"
+  (`api/sync.rs:267`) — log wording, pre-existing since Plan 5a.
 
 - **Task 1 (Bayer drizzle):** `DrizzleStats` carries no Bayer marker of its
   own — a run's provenance says whether it drizzled Bayer-pure only through
