@@ -562,7 +562,9 @@ the plan-time scale WARNING, the per-frame scale gate, the WCS seed and the
 co-registered / native modes all landed together, so the M2-era correction
 that used to stand here ("the only defence is registration's fixed
 `[0.8, 1.25]` gate, no plan-time signal names the group") no longer
-describes the code.
+describes the code. Bayer drizzle, XISF output, cataloging masters and
+preset management SHIPPED as M4d — Tasks 1–4 code-complete, see its own
+paragraph below; the LDN 1272 acceptance run (Task 6) is still ahead.
 
 **M2 — local normalization** (spec §5.2, executed 2026-09-10 alongside Task
 10's camera-agnostic grouping rule — see "The plan gate" above, same
@@ -1129,6 +1131,128 @@ target-side denominator. The desktop click-through of the four panels is
 owed to the owner (two Chrome instances were connected; a static check of
 the served bundle stands in).
 
+**M4d — outputs** (spec §6.4/§7/§9.1/§9.2/§10.1, plan
+`docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`, rulings
+R-M4d-1…7 plus the fix-round ruling R-T2-1): Tasks 1–4 landed 2026-09-12
+(Bayer drizzle, XISF output) through 2026-09-14 (`master_lights` + preview,
+user presets) — `4748f91c`..`7d5e4780`, code-complete with green gates and
+clean reviews; the LDN 1272 acceptance run is Task 6 and has not run yet.
+**The calibrated CFA mosaic and Bayer drizzle** (rulings R-M4d-1/2):
+`execute_generation` gains an optional second write — beside the debayered
+`c_<stem>_d.fits` it writes the corrected, pre-debayer CFA mosaic
+`c_<stem>.fits` from the SAME in-memory frame (one read, one calibration,
+two writes) whenever `CalibratedLightOptions.keep_mosaic` is set (a
+run-internal `#[serde(skip)]` flag, never on the wire). `wants_cfa_mosaic`
+(`stacking/plan.rs`, read by the plan gate, stage 1 and stage 8 alike)
+requires `drizzle.enabled && drizzle.bayer && calibration.debayer_osc` for
+an OSC group — turning `bayer` on with the debayer off costs one run-level
+warning instead of a permanent recalibration loop (fix round 1, I1). The
+mosaic is its own `stacking_artifacts` row (`kind = "calibrated_mosaic"`)
+under the SAME calibration hash as the debayered artifact — `drizzle.bayer`
+enters the whole-config run fingerprint but no per-stage hash, and the plan
+gate's Calibrate staleness follows the pair (I2): a cached calibrated frame
+whose mosaic row is missing regenerates BOTH files in one generation.
+`drizzle.bayer` (default false) makes stage 8's deposit colour-pure:
+`cfa_plane_of(pattern, x, y)` (`stacking/drizzle/geom.rs`, four const
+tables keyed on `(y&1)*2+(x&1)`) routes every output plane's source read to
+the mosaic's own colour sites — R and B each cover a quarter of the pixels,
+G half — while everything else (the `.rej` lookup at the reference
+coordinate, honouring whichever bitmap set is live including M4c's
+`pass2/` large-scale set, the plane weight, the LN grid, the output pair)
+stays the DEBAYERED run's, read through the SAME `ForwardEval` handle the
+debayered deposit uses (no second map path — the M4c grid-release rule
+R-T4-6 is untouched). `DrizzleStats` carries no Bayer flag — coverage is
+read honestly off the mask, the level-preserving `I/W` is unchanged, and a
+mono group ignores `bayer` (a `CfaSource` is refused for a non-3-channel
+group at the engine boundary); a frame whose own `BAYERPAT` the catalog
+cannot parse falls back to depositing its debayered planes, counted and
+warned once per group.
+
+**XISF output** (`output.format`, ruling R-M4d-3): a new
+`fits_writer/xisf_writer.rs` (ungated, like `writer.rs`) writes monolithic
+XISF 1.0 — signature block, one `<Image>` element with every master card as
+a `<FITSKeyword>` (values formatted and sanitized through the SAME
+`card::fmt_real`/`sanitize_text` the FITS writer uses, so a master's two
+containers never disagree about what a card says), padded to a 4096-byte
+boundary, then uncompressed little-endian Float32 planar samples.
+`stacking/master_cards.rs::write_master_light`/`write_drizzled_master`
+branch on `output.format` at the ONE point that decides a master's
+extension — the drizzled master and its weight map follow the master's
+format, the rejection maps stay FITS always. Row order is NOT flipped
+(ruling R-T2-1): flipping would have to transform the master's WCS/SIP
+cards too (`CRPIX2`, the CD matrix, the odd-`v` SIP terms), which is its
+own follow-up (open-items). Instead the XISF keyword list always states the
+EFFECTIVE order explicitly — the source's own `ROWORDER`, copied through
+calibration → registration → master via `calibration_library::light_headers`'
+`COPY_THROUGH_KEYWORDS`, or the synthesized `'BOTTOM-UP'` when the source
+carries no card at all — and the run pushes ONE warning per GROUP (not per
+output file) when the effective order is bottom-up. Fix round 2 found that
+row-order copy-through is real end to end; fix round 1 had believed
+otherwise because the M4d Task 2 test fixture wrote no `fits_header` row at
+all, a state no scanned file is ever in — `stacking::test_fixtures::
+insert_light_row` now inserts a real header (and `frames.roworder`) so
+every run test exercises the same copy-through path a scanned file does.
+XISF values are byte-identical to what the FITS cards say
+(`card_grammar_parity_with_the_fits_writer` pins full grammar parity,
+comment-length rule included); `XISF:CreationTime` is the wall clock, so an
+XISF master is NOT byte-reproducible across two runs of the same input —
+every M1–M4c byte-identity pin stays on `format = fits`.
+
+**`master_lights` and the preview** (rulings R-M4d-4/5, amended by Task 3
+fix round 1): stage 9 writes one `master_lights` row per WRITTEN output
+(`master | drizzle | weight_map`, `UNIQUE(run_id, group_key, kind)`) in the
+same connection scope as the `update_group` call that records the same
+path — not a real `rusqlite` transaction (the pre-existing stage-9 shape
+was one pooled connection, not a transaction; a crash between the writes is
+an open item, not a regression this task introduced). Geometry is per
+GROUP — the master's row is the group's reference geometry and plane
+count, the drizzle/weight-map rows are the writer's actual output grid.
+`get_master_light_preview(run_id, group_key, kind, maxPx)` renders through
+the SAME format-aware path a catalog frame's preview uses
+(`api::files::render_preview_from_path` → `rustafits_processor::
+process_fits_to_jpeg` — `PlaneReader` cannot read `.xisf`, a Task 2
+finding). Fix round 1 clamped `maxPx` to `[64, 2048]`
+(`MIN_MASTER_PREVIEW_MAX_PX`/`MAX_MASTER_PREVIEW_MAX_PX`) at the API
+boundary and made the cache key the RESOLVED RENDER STEP (`thumbnail |
+preview | full`, `api::files::preview_step`) instead of the raw number — an
+unclamped `maxPx` was itself the cache-file key, so a caller could force a
+native-resolution render of a ~100 Mpx drizzled master and mint `2^32`
+distinct cache files; the ceiling at 2048 keeps `Resolution::Full`
+unreachable from this command entirely, not merely bounded. The web host
+answers both `POST /api/get_master_light_preview` (the `api.invoke` mirror
+both hosts use) and `GET /api/stacking/master-preview?…` (browser-friendly
+only when no API key is configured — the router sits behind
+`require_api_key`, which an `<img src>` cannot satisfy). The path takes no
+`heal_interrupted_runs` pass (a written master's file cannot be made wrong
+by a stuck run row) and no `image_semaphore` permit (the clamp keeps the
+expensive case unreachable; the fan-out is a run's group count, once per
+panel mount). Cached under `previews/run-<id>/<group>_<kind>_<step>.jpg`,
+reported in `WorkUsage.previews_bytes` and swept only by `CleanupWhat::All`
+(a preview describes a WRITTEN master, not an intermediate).
+
+**User presets** (ruling R-M4d-6): `stacking.presets` is one settings row —
+a JSON array of `{ name, config }`, `config.paths` stripped on save so a
+preset never carries folders — with `list_stacking_presets`/
+`save_stacking_preset`/`delete_stacking_preset` (the 16th–19th stacking
+commands) returning the full list sorted by name case-insensitively after
+every change. All three validation failures (name length, too many
+presets, unknown name on delete) answer `ApiError::Invalid` (400) with
+fixed strings; a document that fails to decode as a JSON array at all
+answers `ApiError::Conflict` (409) on either write (naming the settings key,
+so a client can tell a state problem from a validation problem) while
+`list` reads it as an empty list with a `warn!`. Fix round 1 made the read
+ENTRY-WISE (`decode_presets_entrywise`) — one undecodable element inside an
+otherwise-good array no longer hides its siblings or blocks a write, it is
+dropped with one `warn!(key, count)` and the next write rewrites the row
+without it — and wrapped both writes in one `BEGIN IMMEDIATE` transaction
+(`begin_presets_write`) so a read-modify-write cannot lose a concurrent
+saver's entry. Logging dictionary: `preset_name` (the trimmed name an event
+is about) and the formalized `key` (the `settings` row key, in informal use
+since T1) are both in
+`docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`. In the tab,
+a run disables APPLY only (fix round 1, I1) — the menu, Save current as…,
+and delete stay live during a run.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,
@@ -1137,8 +1261,12 @@ integrate,master_cards}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
 `crates/athenaeum-core/src/integration/student_t.rs`,
 `crates/athenaeum-core/src/geometry/tps.rs`,
-`crates/athenaeum-core/src/api/stacking.rs`, `crates/athenaeum-core/src/
-fits_writer/wcs.rs`; dev probes
+`crates/athenaeum-core/src/api/stacking.rs` (also `list_stacking_presets`/
+`save_stacking_preset`/`delete_stacking_preset`, M4d Task 4),
+`crates/athenaeum-core/src/api/files.rs` (`render_preview_from_path`/
+`preview_step`, M4d Task 3), `crates/athenaeum-core/src/db/stacking.rs`
+(`master_lights` rows, M4d Task 3), `crates/athenaeum-core/src/
+fits_writer/{wcs,xisf_writer}.rs`; dev probes
 `examples/{measure,register,integrate,ln}_probe.rs` and the weight-audit
 harness `examples/weight_audit.rs` (+ `docs/superpowers/research/scripts/
 weight_audit_compare.py`).

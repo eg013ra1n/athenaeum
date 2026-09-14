@@ -1751,10 +1751,14 @@ Split into four plans, each with its own acceptance re-run:
   local-scale spline + barycentre second matching pass (R-M4c-8/9,
   R-T5-1/2) — **SHIPPED pending acceptance**: the LDN 1272 re-run (variants
   A–E over the real trail found for R-M4c-10) is Task 7.
-- **M4d — outputs and product** (`docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`):
-  Bayer drizzle, XISF output, cataloging masters (a `master_lights` entity
-  linked to the set and a preview in the Results cards), and preset
-  management.
+- **M4d — outputs and product** (`docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`,
+  rulings R-M4d-1…7 plus the fix-round ruling R-T2-1): Bayer drizzle, XISF
+  output, cataloging masters (a `master_lights` entity linked to the set
+  and a preview in the Results cards), and preset management. Tasks 1–4
+  landed 2026-09-12 (Bayer drizzle, XISF output) through 2026-09-14
+  (`master_lights` + preview, user presets) — `4748f91c`..`7d5e4780`,
+  **code-complete with green gates and clean reviews**; the LDN 1272
+  acceptance run is Task 6 and has not run yet.
 
 ## 15. Deferred and open
 
@@ -1765,6 +1769,8 @@ Split into four plans, each with its own acceptance re-run:
   values, to be set from the M4 acceptance run.
 - Whether masters should be cataloged and how they appear in the Objects
   page: M4 decision, after the owner has used M1–M3 output for a while.
+  Masters are cataloged in `master_lights` since M4d; their appearance on
+  the Objects page is still the owner's call.
 - **Mixed pixel scales in one set — required (owner, 2026-09-09), DONE in
   M4b** (`docs/superpowers/plans/2026-09-10-stacking-m4b-plan-mixed-pixel-scales.md`;
   the shipped design is §3.8 above, the config field §9.2's

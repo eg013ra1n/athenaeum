@@ -187,6 +187,85 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking M4d — outputs (2026-09-14)
+
+M4d (plan `docs/superpowers/plans/2026-09-10-stacking-m4d-plan-outputs.md`,
+rulings R-M4d-1…7 plus the fix-round ruling R-T2-1): the calibrated CFA mosaic
+artifact and Bayer drizzle, an XISF writer for masters/drizzled masters/weight
+maps, the `master_lights` catalog table with a preview command and Results-card
+thumbnails, and named user presets beside the three built-in transforms.
+**Tasks 1–4 are code-complete with green gates and clean reviews
+(`4748f91c`..`7d5e4780`); the LDN 1272 acceptance run (Task 6) has not run
+yet.** Everything below is what the four task reports left open.
+
+- **Task 1 (Bayer drizzle):** `DrizzleStats` carries no Bayer marker of its
+  own — a run's provenance says whether it drizzled Bayer-pure only through
+  `summary.config.drizzle.bayer`. At drizzle scale 1 with Bayer on, the R and
+  B planes are 75 % zeros (only their own colour sites deposited), so their
+  per-plane `fwhm`/`noise` stats are meaningless at that scale — don't read
+  them there. The mosaic file is read once per OUTPUT plane, i.e. 3× per OSC
+  frame, instead of once — a per-frame mosaic-plane cache would cut that I/O
+  3× if Task 6's timings show it matters. A frame whose own `BAYERPAT` the
+  catalog cannot parse never gets a mosaic and recalibrates on every run —
+  by design (warned once per frame, never eliminated: eliminating it needs a
+  per-frame phase read in both the plan gate and the run, or a "nothing to
+  keep" marker artifact). Coverage above drizzle scale 1 is unpinned by any
+  test — Task 6 measures it against R-M4d-7's target (R/B ≈ 0.25–0.5 of G's).
+- **Task 2 (XISF output):** XISF masters of bottom-up sets are NOT
+  row-flipped — flipping would have to transform the master's WCS/SIP cards
+  too (`CRPIX2`, the CD matrix, the odd-`v` SIP terms), which is its own
+  feature; the follow-up is named "flip rows + transform WCS/SIP" (ruling
+  R-T2-1). The rejection maps (always FITS) carry no `ROWORDER` of their
+  own. `XISF:CreationTime` is the wall clock, so an XISF master is not
+  byte-reproducible across two runs of the same input — every byte-identity
+  pin stays on `format = fits`. A non-ASCII card value logs the sanitize
+  warning twice (once in `xisf_keyword_value`, once in the shared card-parity
+  check). **OWNER SMOKE OWED:** open an Athenaeum `.xisf` master in the
+  external tool — the padding declared inside `headerLength`, samples above
+  the defaulted `0:1` bounds, and `colorSpace="RGB"` on a 3-plane weight map
+  are the three header choices most likely to matter to a foreign reader.
+- **Task 3 (`master_lights` + preview):** the group-row `update_group` call
+  and the `master_lights` inserts share one pooled connection but are NOT one
+  `rusqlite` transaction (the pre-existing shape of `update_group`) — a crash
+  between them leaves a group row naming a master with no catalog row for it.
+  A `master_lights` insert failure in the drizzle-success arm fails the group
+  even though the master is already written on disk (consistent with the
+  adjacent `update_group(...)?`, which has the same property; if the policy
+  is revisited, move the three inserts and two updates together). Cache
+  freshness (`cached_at >= master_mtime`) has a same-second window on
+  coarse-mtime filesystems. `list_master_lights` has no production caller —
+  it is brief-mandated API surface, not dead code. The default preview size
+  512 is stated on both sides of the boundary (the command's default arg and
+  the frontend hook's default). `loading="lazy"` on the Results card's
+  `<img>` defers nothing, since `useMasterPreview` fetches eagerly on mount.
+  The plan text's own R-M4d-5 wording and one test doc comment
+  (`api/stacking.rs`, near `master_preview_caches_and_re_renders_when_the_
+  master_changes`) still showed the superseded `_<max_px>.jpg` cache-file
+  pattern (fix round 1 keyed the cache on the resolved render STEP instead)
+  — the test doc comment was fixed as part of this docs task (a comment-only
+  edit); the plan text is left as-is, as history.
+- **Task 4 (user presets):** `StackingSection.tsx`'s own preset selector
+  (Settings → Stacking, the global defaults) was NOT extended with user
+  presets — out of the brief's scope, still built-ins only. The success
+  `notify()` calls use `kind: 'generic'` while the sibling stacking
+  notification in the same file (`StackingTab.tsx`) uses `kind: 'stacking'`
+  — a deliberate brief-literal choice, flagged in case consistency is
+  preferred. **OWNER CLICK-THROUGH OWED:** the tab's preset menu — save-as
+  inline form, apply, delete confirm, and the quoted label. Deferred minors
+  from the Task 4 review: Escape inside the inline save form closes the
+  WHOLE menu, not just the form (an acknowledged trade-off, noted in a code
+  comment); `StackingTab.tsx` grew +259 lines this task — a `PresetMenu`
+  component is the obvious seam the next time the file is touched; the
+  `<input maxLength>` counts UTF-16 units while the server counts scalar
+  values (the client is stricter for astral characters, so this can never
+  cause a spurious server-side rejection); and no test exercises real
+  contention on the presets' `BEGIN IMMEDIATE` transaction (`begin_presets_
+  write`).
+- **Cross-task:** the headless check (`cargo check -p athenaeum-core
+  --no-default-features`) does not exercise `integration/` or `stacking/` —
+  already recorded under Stacking M4c below; one pointer is enough rather
+  than repeating the finding.
+
 ### Stacking M4c — algorithms (2026-09-12)
 
 M4c (plan `docs/superpowers/plans/2026-09-10-stacking-m4c-plan-algorithms.md`,

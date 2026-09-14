@@ -1823,9 +1823,11 @@ mod tests {
     }
 
     /// The cache is content-addressed by the master's mtime: a first call
-    /// writes `previews/run-<id>/<group>_<kind>_<max_px>.jpg` and a second
-    /// serves those exact bytes back, while touching the master forward in
-    /// time makes the next call re-render.
+    /// writes `previews/run-<id>/<group>_<kind>_<step>.jpg` (`step` is the
+    /// resolved render step — `thumbnail`/`preview`/`full`, not the raw
+    /// `max_px`, since fix round 1 made the step the cache key) and a
+    /// second serves those exact bytes back, while touching the master
+    /// forward in time makes the next call re-render.
     #[test]
     fn master_preview_caches_and_re_renders_when_the_master_changes() {
         let (tmp, ctx) = test_ctx();
