@@ -13730,42 +13730,41 @@ mod tests {
         // it would have measured teardown rather than the releases. What
         // the releases are pinned by is `peak` below and the three
         // per-stage tests (`writer`, `registered_source`, `drizzle`).
-        // A stage that releases per frame holds at most the grids its
-        // parallel workers have in flight at that instant — bounded by
-        // the POOL, not by the frame count. Measured on this Mac (10
-        // rayon workers, 11 of the 20 frames carrying `+tps`): 33 grids
-        // built over the run — registration releases, drizzle rebuilds,
-        // which is the documented cost of the spline arm — and 11
-        // resident at the peak. The un-released shape is one inverse grid
-        // per frame surviving registration plus one forward grid per
-        // frame in drizzle, i.e. 2 × included.
+        // Where the peak comes from — traced build by build (v0.6.3 CI
+        // fix, `GRID_TRACE` instrumentation on `grid_counters`): the
+        // registration writer and drizzle each hold ONE grid at a time
+        // (build, warp, release, next frame), while `integrate_planes`
+        // opens ONE `RegisteredSource` per group (ruling R-T4-7) and every
+        // band reads every included frame through its inverse grid, so
+        // the group's spline frames' inverse grids are all resident for
+        // the whole integration — one per frame, by design (rebuilding
+        // 600-node splines per band would cost far more than the ~3 MB a
+        // grid holds), and independent of the rayon pool. Measured: 33
+        // grids built over the run (registration releases, drizzle
+        // rebuilds — the documented cost of the spline arm) and a peak of
+        // exactly `tps_frames` (11), on a 10-worker Mac AND on a 4-worker
+        // CI runner alike.
         //
-        // Caveat, stated rather than hidden: on a machine with many more
-        // cores than this group has frames the bound degrades towards the
-        // frame count itself, since that is all the concurrency there is
-        // to find.
+        // The assertion this replaces read `peak <= threads + 4` — the
+        // hypothesis that a per-frame release bounds residency by the POOL.
+        // It held on the 10-worker dev Mac only because 11 <= 14, and
+        // failed on every 4-worker GitHub runner (11 > 8) from v0.6.1 to
+        // v0.6.2 — a wrong model of the integration source, not a leak.
+        // The shape R-T4-6 actually refuses is the 2x one: inverse grids
+        // surviving integration into drizzle's forward grids (what
+        // thrashed acceptance run 27), so the bound is the frame count
+        // itself: every spline frame contributes at most ONE resident
+        // grid at any instant, and no stage's grids overlap another's.
         let threads = rayon::current_num_threads().max(1);
         eprintln!(
             "R-T4-6d measured: builds {builds} peak_alive {peak} threads {threads} \
              tps_frames {tps_frames}"
         );
-        // The absolute bound, independent of this machine's core count:
-        // one inverse grid per frame surviving registration plus one
-        // forward grid per frame in drizzle is `2 * tps_frames`, and that
-        // is precisely the shape that thrashed the acceptance run.
         assert!(
-            peak < 2 * tps_frames,
-            "peak resident grids {peak} vs {tps_frames} spline frames — the \
-             un-released shape is 2x that"
-        );
-        // Slack of 4 over the pool size: the run thread itself
-        // participates in `install`, and a straggler from the previous
-        // stage can still hold one. Measured on this 10-worker Mac: peak
-        // 11. The shape this refuses is 2 x included (22 here).
-        assert!(
-            peak <= threads + 4,
-            "peak resident grids {peak} over {threads} workers (builds \
-             {builds}) — a stage is holding grids across frames"
+            peak <= tps_frames,
+            "peak resident grids {peak} over {tps_frames} spline frames (builds \
+             {builds}, {threads} workers) — a stage is holding a second grid per \
+             frame, or one stage's grids survived into the next"
         );
     }
 
