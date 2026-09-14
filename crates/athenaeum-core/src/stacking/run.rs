@@ -10426,6 +10426,17 @@ mod tests {
             serde_json::from_str(group.stats_json.as_deref().expect("stats_json set")).unwrap();
         assert_eq!(stats.frames, 4, "{stats:?}");
 
+        // M4d Task 3 (ruling R-M4d-4), fix round 1 m2: a run WITHOUT drizzle
+        // catalogs exactly one output — the master. The drizzle + weight-map
+        // case has its own test; this is the other half of the rule, that
+        // stage 9 records what it WROTE and nothing it did not.
+        let master_lights =
+            crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
+        let kinds: Vec<&str> = master_lights.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["master"], "{master_lights:?}");
+        assert_eq!(master_lights[0].path, master_path);
+        assert_eq!(master_lights[0].frames, group.included_count);
+
         let header = FitsHeader::from_path(Path::new(&master_path)).unwrap();
         assert_eq!(header.get_str("IMAGETYP").as_deref(), Some("Master Light"));
         assert_eq!(header.get_i32("NCOMBINE"), Some(4));

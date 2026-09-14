@@ -144,15 +144,20 @@ impl WorkingLayout {
         self.previews_root().join(format!("run-{run_id}"))
     }
 
-    /// `root/previews/run-<run_id>/<group_key>_<kind>_<max_px>.jpg` — the
-    /// cached render of one written master light at one requested size
-    /// (ruling R-M4d-5's own layout). `kind` is the `master_lights.kind`
-    /// spelling (`master | drizzle | weight_map`); `max_px` is part of the
-    /// name so two callers asking for different sizes never overwrite each
-    /// other's file.
-    pub fn preview_path(&self, run_id: i64, group_key: &str, kind: &str, max_px: u32) -> PathBuf {
+    /// `root/previews/run-<run_id>/<group_key>_<kind>_<step>.jpg` — the
+    /// cached render of one written master light at one render step (ruling
+    /// R-M4d-5's layout, with fix round 1's correction to the last
+    /// component). `kind` is the `master_lights.kind` spelling
+    /// (`master | drizzle | weight_map`); `step` is the RESOLVED render step
+    /// (`thumbnail` | `preview` | `full` — [`crate::api::files::preview_step`]),
+    /// never the caller's raw `max_px`: the render has only three behaviours,
+    /// so a raw pixel count in the name would mint up to `2^32` cache files
+    /// for three distinct pictures, in a folder only `CleanupWhat::All`
+    /// sweeps. Two requests that resolve to the same step therefore share one
+    /// file, and two that resolve to different steps still never collide.
+    pub fn preview_path(&self, run_id: i64, group_key: &str, kind: &str, step: &str) -> PathBuf {
         self.previews_dir(run_id)
-            .join(format!("{group_key}_{kind}_{max_px}.jpg"))
+            .join(format!("{group_key}_{kind}_{step}.jpg"))
     }
 }
 
@@ -804,6 +809,39 @@ mod tests {
         assert_eq!(
             layout.run_json(42),
             PathBuf::from("/work/LDN_1272/runs/run-42.json")
+        );
+    }
+
+    /// M4d Task 3 (ruling R-M4d-5) + fix round 1 (I1): the preview cache's
+    /// layout, and specifically that the last name component is the RESOLVED
+    /// render step — so two requests at different sizes that render the same
+    /// picture land on one file, while different steps still never collide.
+    #[test]
+    fn preview_path_layout_is_keyed_on_the_render_step() {
+        let layout = WorkingLayout::new(Path::new("/work"), "LDN_1272");
+        assert_eq!(
+            layout.previews_root(),
+            PathBuf::from("/work/LDN_1272/previews")
+        );
+        assert_eq!(
+            layout.previews_dir(7),
+            PathBuf::from("/work/LDN_1272/previews/run-7")
+        );
+        assert_eq!(
+            layout.preview_path(7, "mono__NoFilter__bin1__180s", "master", "thumbnail"),
+            PathBuf::from(
+                "/work/LDN_1272/previews/run-7/mono__NoFilter__bin1__180s_master_thumbnail.jpg"
+            )
+        );
+        // Different kinds and different steps are different files; the same
+        // (kind, step) is the same file whatever size asked for it.
+        assert_ne!(
+            layout.preview_path(7, "g", "master", "thumbnail"),
+            layout.preview_path(7, "g", "drizzle", "thumbnail")
+        );
+        assert_ne!(
+            layout.preview_path(7, "g", "master", "thumbnail"),
+            layout.preview_path(7, "g", "master", "preview")
         );
     }
 

@@ -620,14 +620,42 @@ impl MasterLightKind {
 /// it does not say otherwise.
 pub const DEFAULT_MASTER_PREVIEW_MAX_PX: u32 = 512;
 
+/// The band a caller's `max_px` is clamped into (fix round 1, I1). Both
+/// bounds are read straight off [`crate::api::files::preview_step`]'s own
+/// three steps rather than picked round:
+///
+/// - `64` is the floor because every request at or below 512 already resolves
+///   to `Thumbnail`; the floor therefore rejects nothing a caller could
+///   meaningfully ask for, it only turns `0` and other degenerate values into
+///   the smallest real step.
+/// - `2048` is the ceiling because it is the last value that resolves to
+///   `Preview` (2x2 binning). `Full` — a native-resolution, quality-95 encode
+///   — is deliberately OUT of this command's reach: this endpoint exists to
+///   draw a 160 px results-card thumbnail, and the largest file the pipeline
+///   writes is a 3x-drizzled master of ~100 Mpx, whose full-resolution RGB
+///   buffer is several hundred MB. Preview of that same file is already four
+///   times more detail than any card can show, and is the same cost class the
+///   blink viewer serves by default. A future "open the master at full size"
+///   feature can raise this deliberately; nothing should be able to reach it
+///   by naming a large number.
+pub const MIN_MASTER_PREVIEW_MAX_PX: u32 = 64;
+pub const MAX_MASTER_PREVIEW_MAX_PX: u32 = 2048;
+
 /// JPEG bytes for one master light a run wrote (ruling R-M4d-5). Resolves
 /// `(run_id, group_key, kind)` through `master_lights` — the only place a
 /// master light is cataloged — then serves the cached render under
-/// `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<max_px>.jpg`,
+/// `<working_dir>/<set_slug>/previews/run-<id>/<group>_<kind>_<step>.jpg`,
 /// re-rendering whenever the master's own mtime is newer than the cache
 /// file's (a rebuild in place, a restored archive). An unknown run, an
 /// output this run never wrote, or a master file gone from disk is
 /// `NotFound` (404 at the web boundary).
+///
+/// `max_px` is clamped into
+/// `[MIN_MASTER_PREVIEW_MAX_PX, MAX_MASTER_PREVIEW_MAX_PX]` (fix round 1, I1)
+/// and only ever reaches the render as one of three steps; the cache file is
+/// named after that STEP, so two requests asking for different sizes that
+/// resolve to the same picture share one file instead of each minting their
+/// own.
 ///
 /// The cache is an optimization, never a requirement: a run row with no
 /// working folder recorded, an unwritable previews directory or an
@@ -640,14 +668,21 @@ pub fn get_master_light_preview(
     kind: MasterLightKind,
     max_px: u32,
 ) -> Result<Vec<u8>, ApiError> {
+    let max_px = max_px.clamp(MIN_MASTER_PREVIEW_MAX_PX, MAX_MASTER_PREVIEW_MAX_PX);
+    let step = crate::api::files::preview_step(max_px).1;
+
     // Everything the render needs is read here and the catalog lock is
     // dropped before a single pixel is touched — the same discipline
     // `routes::images::get_frame_preview` follows, so a slow render never
     // holds the DB against the rest of the app.
+    //
+    // Fix round 1, m4: no `heal_interrupted_runs` here, unlike every other
+    // handler in this module. Those run once per user action; this one runs
+    // per group per panel mount, and a preview of an already-WRITTEN master
+    // has nothing to heal — a stuck row cannot make a written file wrong.
     let (master_path, row_group_key, working_dir, set_name) = {
         let db_handle = db(ctx)?;
         let conn = db_handle.conn();
-        run::heal_interrupted_runs(ctx, &conn)?;
 
         let run_row = get_run(&conn, run_id)?
             .ok_or_else(|| ApiError::NotFound(format!("stacking run {run_id} not found")))?;
@@ -683,7 +718,7 @@ pub fn get_master_light_preview(
                 run_id,
                 &row_group_key,
                 kind.as_db_str(),
-                max_px,
+                step,
             ),
         )
     };
@@ -1564,7 +1599,7 @@ mod tests {
             run_id,
             "g",
             "master",
-            256,
+            "thumbnail",
         );
         assert!(cache.exists(), "the cache file must be written: {cache:?}");
         assert_eq!(std::fs::read(&cache).unwrap(), first);
@@ -1585,5 +1620,130 @@ mod tests {
             get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_ne!(third, sentinel, "a newer master must invalidate the cache");
         assert_eq!(third, first, "the same pixels render to the same bytes");
+    }
+
+    /// Fix round 1, I1: `max_px` is clamped into
+    /// `[MIN_MASTER_PREVIEW_MAX_PX, MAX_MASTER_PREVIEW_MAX_PX]` and the cache
+    /// file is keyed on the RESOLVED render step, never the raw number.
+    /// Pinned three ways, all through the real command and its real cache
+    /// files: (1) an absurd `max_px` lands on the same file as the clamped
+    /// value — `Resolution::Full` is unreachable, so no `…_full.jpg` is ever
+    /// written; (2) two different `max_px` that resolve to the same step
+    /// share ONE file; (3) two that resolve to DIFFERENT steps do not
+    /// collide.
+    #[test]
+    fn master_preview_clamps_max_px_and_caches_per_step() {
+        let (tmp, ctx) = test_ctx();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('LDN 1272')", [])
+            .unwrap();
+        let set_id = conn.last_insert_rowid();
+        let working = tempfile::tempdir().unwrap();
+        let run_id = crate::db::stacking::insert_run(
+            &conn,
+            &crate::db::stacking::NewRun {
+                frames_set_id: set_id,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.path().to_str().unwrap(),
+                output_dir: tmp.path().to_str().unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (width, height) = (32usize, 24usize);
+        let data: Vec<f32> = (0..width * height).map(|i| i as f32).collect();
+        let master = tmp.path().join("master_light.fits");
+        crate::fits_writer::write_fits_f32(&master, width, height, 1, &data, &[]).unwrap();
+        crate::db::stacking::insert_master_light(
+            &conn,
+            &crate::db::stacking::NewMasterLight {
+                frames_set_id: set_id,
+                run_id,
+                group_key: "g",
+                kind: "master",
+                path: master.to_str().unwrap(),
+                format: "fits",
+                width: width as i64,
+                height: height as i64,
+                channels: 1,
+                frames: 3,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+
+        let layout = WorkingLayout::new(working.path(), &set_slug("LDN 1272"));
+        let previews = layout.previews_dir(run_id);
+        let names = || -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&previews)
+                .map(|rd| {
+                    rd.map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+
+        // The step boundaries themselves: 512 is the last `thumbnail`, 513
+        // the first `preview`, 2048 the last `preview` — and the clamp's
+        // ceiling IS that last value, so `u32::MAX` renders as `preview`.
+        assert_eq!(crate::api::files::preview_step(512).1, "thumbnail");
+        assert_eq!(crate::api::files::preview_step(513).1, "preview");
+        assert_eq!(
+            crate::api::files::preview_step(MAX_MASTER_PREVIEW_MAX_PX).1,
+            "preview"
+        );
+
+        // (1) An out-of-range request clamps: `u32::MAX` writes the SAME file
+        // the ceiling writes, and never a `full` one.
+        let huge = get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, u32::MAX)
+            .unwrap();
+        assert_eq!(names(), vec!["g_master_preview.jpg".to_string()], "{:?}", names());
+        let ceiling = get_master_light_preview(
+            &ctx,
+            run_id,
+            "g",
+            MasterLightKind::Master,
+            MAX_MASTER_PREVIEW_MAX_PX,
+        )
+        .unwrap();
+        assert_eq!(huge, ceiling, "the clamped request is the ceiling request");
+        assert_eq!(names(), vec!["g_master_preview.jpg".to_string()]);
+
+        // Same for the floor: 0 clamps up to the smallest real step.
+        let zero =
+            get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 0).unwrap();
+        let floor = get_master_light_preview(
+            &ctx,
+            run_id,
+            "g",
+            MasterLightKind::Master,
+            MIN_MASTER_PREVIEW_MAX_PX,
+        )
+        .unwrap();
+        assert_eq!(zero, floor);
+
+        // (2) 64 and 512 both resolve to `thumbnail` — one more file, not two.
+        let _ = get_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 512).unwrap();
+        assert_eq!(
+            names(),
+            vec![
+                "g_master_preview.jpg".to_string(),
+                "g_master_thumbnail.jpg".to_string()
+            ],
+            "two steps, two files — and no third for the extra size"
+        );
+
+        // (3) …and the two steps' files are genuinely distinct.
+        assert_ne!(
+            layout.preview_path(run_id, "g", "master", "thumbnail"),
+            layout.preview_path(run_id, "g", "master", "preview")
+        );
     }
 }

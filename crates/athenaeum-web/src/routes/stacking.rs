@@ -384,10 +384,12 @@ pub struct MasterLightPreviewArgs {
 /// - **No VNG gate.** A master light is an integrated float image with no
 ///   CFA pattern, so `rustafits_processor::needs_vng_gate` is false for it
 ///   at every resolution a preview asks for.
-/// - **No `image_semaphore` permit.** That semaphore bounds the blink
-///   viewer's *prefetch*, which can have dozens of full-resolution renders
-///   in flight; here the fan-out is a run's group count (a handful, once per
-///   panel mount, at a quarter resolution) and the CPU is already bounded by
+/// - **No `image_semaphore` permit.** That semaphore exists because the
+///   blink viewer's *prefetch* can have dozens of FULL-resolution renders in
+///   flight. `api::stacking::MAX_MASTER_PREVIEW_MAX_PX` puts `Resolution::Full`
+///   out of this command's reach entirely (fix round 1, I1), so the worst a
+///   caller can ask for here is a half-scale render; the fan-out is a run's
+///   group count, once per panel mount, and the CPU is already bounded by
 ///   `ctx.image_pool`, which `process_fits_to_jpeg` runs on. Queueing
 ///   thumbnails behind the blink viewer's permit would make the Results
 ///   panel wait on an unrelated feature.
@@ -415,6 +417,12 @@ async fn render_master_light_preview(
 /// `GET /api/stacking/master-preview?runId=&groupKey=&kind=&maxPx=` — raw
 /// JPEG bytes with `Content-Type: image/jpeg`; 404 for an unknown run, an
 /// output this run never wrote, or a master file gone from disk.
+///
+/// Fix round 1, m3: this form exists for direct/browser access — an `<img
+/// src>`, `curl`, a bookmark — and only works that way when no API key is
+/// configured, since the whole router sits behind `auth::require_api_key`
+/// and an `<img>` cannot send the header. The app itself never uses it: the
+/// frontend goes through the `POST` mirror below, like every other command.
 #[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_master_light_preview_query(
     State(state): State<WebAppState>,
@@ -677,13 +685,15 @@ mod tests {
             &body[..body.len().min(8)]
         );
 
-        // The cache file R-M4d-5 names must exist after the first render.
+        // The cache file R-M4d-5 names must exist after the first render —
+        // keyed on the RESOLVED step (`maxPx=256` → `thumbnail`), not the
+        // raw number (fix round 1, I1).
         let cache = working
             .path()
             .join("LDN_1272")
             .join("previews")
             .join(format!("run-{run_id}"))
-            .join(format!("{group_key}_master_256.jpg"));
+            .join(format!("{group_key}_master_thumbnail.jpg"));
         assert!(cache.exists(), "preview cache not written: {cache:?}");
 
         let missing = router

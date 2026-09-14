@@ -477,9 +477,11 @@ never re-implements the transforms), `get_stacking_defaults`,
 `set_stacking_defaults`, `reset_stacking_defaults`, `get_stacking_paths`,
 `set_stacking_paths`, `get_stacking_work_usage`, `cleanup_stacking_work`,
 `get_master_light_preview` (M4d Task 3 — JPEG bytes for one written master
-light; the web host answers it at `POST /api/get_master_light_preview`, the
-mirror `api.invoke` uses, AND at `GET /api/stacking/master-preview?runId=…`
-for an `<img src>`).
+light, `maxPx` clamped to `[64, 2048]` and cached per resolved render step;
+the web host answers it at `POST /api/get_master_light_preview`, the mirror
+`api.invoke` uses on both targets, AND at
+`GET /api/stacking/master-preview?runId=…` for direct browser access when no
+API key is configured).
 
 **The tab** (`src/components/stacking/`, mounted from `FrameSetDetail.tsx` as
 the **Stacking** tab): `StackingTab` (toolbar, run/cancel) →
@@ -503,8 +505,10 @@ global config defaults (`get/set/reset_stacking_defaults`, the same
 `StackingConfig` tree a set can override) and the working/output folders
 (`get/set_stacking_paths` — `stacking::paths`, on-disk layout
 `<working_dir>/<set_slug>/{calibrated,registered,ln,runs,rej,previews}/…` —
-`previews/run-<id>/<group>_<kind>_<max_px>.jpg` is the M4d master-light
-thumbnail cache, swept only by `CleanupWhat::All`; the web folder
+`previews/run-<id>/<group>_<kind>_<step>.jpg` is the M4d master-light
+thumbnail cache (`step` = the RESOLVED render step, `thumbnail | preview |
+full`, never the caller's raw `maxPx`), swept only by `CleanupWhat::All`;
+the web folder
 picker's `browse_directories` scope `"stacking"` resolves against the same
 roots as `"scan"`, plan 5b ruling 6). Per-set override lives in
 `stacking_set_config`; precedence is WHOLE-CONFIG (spec §9.2, `resolve_config`)
