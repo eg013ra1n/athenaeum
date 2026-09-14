@@ -18,6 +18,8 @@ import type { ObjectsTab } from '../components/ObjectsTableView';
 import { ToolbarContainer, ToolbarButton, ToolbarDivider, ToolbarInfo } from '../components/Toolbar';
 import { useNotifications } from '../contexts/NotificationContext';
 import { useSessionState } from '../contexts/SessionStateContext';
+import { useObjectSelection } from '../hooks/useObjectSelection';
+import { ObjectPlateSolveToolbar } from '../components/ObjectPlateSolveToolbar';
 import { HistoryNav } from '../components/HistoryNav';
 
 export default function Objects() {
@@ -733,12 +735,22 @@ export default function Objects() {
     return result;
   }, [frameSets, filters, activeTab, isMergeMode]);
 
+  const visibleObjectIds = useMemo(
+    () =>
+      filteredFrameSets.flatMap(({ frames_set }) => (frames_set.id == null ? [] : [frames_set.id])),
+    [filteredFrameSets],
+  );
+  const selection = useObjectSelection(visibleObjectIds, isMergeMode);
+
   // Tab counts for badges
-  const tabCounts = useMemo(() => ({
-    stage: frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length,
-    wip: frameSets.filter(fs => fs.frames_set.is_custom && !fs.frames_set.is_archived).length,
-    archive: frameSets.filter(fs => fs.frames_set.is_archived).length,
-  }), [frameSets]);
+  const tabCounts = useMemo(
+    () => ({
+      stage: frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length,
+      wip: frameSets.filter(fs => fs.frames_set.is_custom && !fs.frames_set.is_archived).length,
+      archive: frameSets.filter(fs => fs.frames_set.is_archived).length,
+    }),
+    [frameSets],
+  );
 
   const activeFilterCount = countActiveFilters(filters);
 
@@ -933,16 +945,22 @@ export default function Objects() {
       )}
 
       {/* Filter Panel */}
-      <ObjectsFilterPanel
-        filters={filters}
-        onChange={setFilters}
-        isOpen={showFilterPanel}
+      <ObjectsFilterPanel filters={filters} onChange={setFilters} isOpen={showFilterPanel} />
+
+      <ObjectPlateSolveToolbar
+        selectedIds={selection.selectedIds}
+        visibleCount={visibleObjectIds.length}
+        disabled={loading || generating || merging || isMergeMode}
+        onSelectAll={selection.selectAll}
+        onClear={selection.clear}
+        onSolveComplete={loadFrameSets}
       />
 
       {/* Results Summary */}
       {activeFilterCount > 0 && (
         <div className="mb-4 text-sm text-content-muted">
-          Showing {filteredFrameSets.length} of {tabCounts[activeTab]} frame set{tabCounts[activeTab] !== 1 ? 's' : ''}
+          Showing {filteredFrameSets.length} of {tabCounts[activeTab]} frame set
+          {tabCounts[activeTab] !== 1 ? 's' : ''}
         </div>
       )}
 
@@ -1074,6 +1092,8 @@ export default function Objects() {
       ) : viewMode === 'table' ? (
         <ObjectsTableView
           frameSets={filteredFrameSets}
+          selectedIds={selection.selectedIds}
+          onToggleSelection={selection.toggle}
           activeTab={activeTab}
           isMergeMode={isMergeMode}
           isDragging={isDragging}
@@ -1092,22 +1112,38 @@ export default function Objects() {
           onArchive={handleArchive}
         />
       ) : (
-        <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
+        <div
+          className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3 ${isDragging || isMergeMode ? 'select-none' : ''}`}
+        >
           {filteredFrameSets.map(({ frames_set, member_count }) => (
             <div
               key={frames_set.id}
               data-set-id={frames_set.id}
-              onMouseDown={(e) => !editingSetId && isMergeMode && handleMouseDown(e, frames_set.id!)}
+              onMouseDown={e => !editingSetId && isMergeMode && handleMouseDown(e, frames_set.id!)}
               className={`bg-surface-elevated rounded-lg p-3 border border-l-4 transition-all duration-200 group ${
                 isDragging && draggedSetId === frames_set.id
                   ? 'opacity-40 border-accent shadow-lg shadow-accent/50 cursor-grabbing select-none'
                   : dropTargetId === frames_set.id
-                  ? 'border-success bg-success-muted scale-105 shadow-lg shadow-success/50'
-                  : activeTab === 'wip' && !frames_set.is_custom
-                  ? 'border-dashed border-border border-l-accent opacity-60'
-                  : `border-border ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`
+                    ? 'border-success bg-success-muted scale-105 shadow-lg shadow-success/50'
+                    : activeTab === 'wip' && !frames_set.is_custom
+                      ? 'border-dashed border-border border-l-accent opacity-60'
+                      : `border-border ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`
               } ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''} ${isDragging ? 'select-none' : ''}`}
             >
+              <label
+                className="flex items-center gap-2 text-xs text-content-muted mb-2"
+                onMouseDown={e => e.stopPropagation()}
+              >
+                <input
+                  type="checkbox"
+                  checked={selection.selectedIds.includes(frames_set.id!)}
+                  disabled={isMergeMode}
+                  onChange={() => selection.toggle(frames_set.id!)}
+                  aria-label={`Select ${frames_set.name || 'Untitled'} (object ${frames_set.id})`}
+                  className="accent-accent"
+                />
+                Select object
+              </label>
               {/* Name row */}
               <div className="flex-1 min-w-0 mb-1.5">
                 {editingSetId === frames_set.id ? (

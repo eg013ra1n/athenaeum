@@ -9,7 +9,8 @@ import type {
 
 export type FrameSolveStatus =
   | { kind: 'pending' }
-  | { kind: 'solving' }
+  | { kind: 'solving'; filename?: string; startedAt: number }
+  | { kind: 'cancelled' }
   | { kind: 'solved'; matched_stars: number; rms_arcsec: number }
   | { kind: 'failed'; error: string; code?: string; filename?: string };
 
@@ -18,9 +19,12 @@ export interface PlateSolveSummary {
   failed: number;
   total: number;
   total_time_ms: number;
+  cancelled?: boolean;
+  not_processed?: number;
 }
 
 export interface QueueItem {
+  sequential?: boolean;
   batchId: number;
   label: string;
   frameIds: number[];
@@ -32,6 +36,7 @@ export interface ActivePlateSolveBatch {
   frameIds: number[];
   progress: { current: number; total: number } | null;
   currentFrameId: number | null;
+  startedAt: number | null;
   frameStatuses: Map<number, FrameSolveStatus>;
   isComplete: boolean;
   isCancelling: boolean;
@@ -57,6 +62,9 @@ export function usePlateSolveQueue() {
   );
   const [precheckError, setPrecheckError] = useState<PlateSolvePrecheckError | null>(null);
   const processingRef = useRef(false);
+  const cancelRequested = useRef(new Set<number>());
+  const backendStarted = useRef(false);
+  const completeRef = useRef<(() => void) | null>(null);
   const queueRef = useRef(queue);
   queueRef.current = queue;
 
@@ -105,7 +113,7 @@ export function usePlateSolveQueue() {
         for (const id of next.frameIds) {
           if (!frameStatuses.has(id)) frameStatuses.set(id, { kind: 'pending' });
         }
-        updated.set(next.batchId, { ...entry, frameStatuses });
+        updated.set(next.batchId, { ...entry, frameStatuses, startedAt: Date.now() });
       }
       return updated;
     });
@@ -124,7 +132,7 @@ export function usePlateSolveQueue() {
           setPrecheckError({ kind: 'catalog_missing', message });
           processingRef.current = false;
           currentBatchIdRef.current = null;
-          setQueue(q => q.slice(1));
+          setQueue(q => q.filter(item => item.batchId !== next.batchId));
           return;
         }
         catalogVerifiedRef.current = true;
@@ -136,13 +144,45 @@ export function usePlateSolveQueue() {
         setPrecheckError({ kind: 'unknown', message });
         processingRef.current = false;
         currentBatchIdRef.current = null;
-        setQueue(q => q.slice(1));
+        setQueue(q => q.filter(item => item.batchId !== next.batchId));
         return;
       }
     }
 
+    if (cancelRequested.current.delete(next.batchId)) {
+      setActiveBatches(prev => {
+        const updated = new Map(prev),
+          entry = updated.get(next.batchId);
+        if (entry)
+          updated.set(next.batchId, {
+            ...entry,
+            isComplete: true,
+            isCancelling: false,
+            summary: {
+              solved: 0,
+              failed: 0,
+              total: next.frameIds.length,
+              total_time_ms: 0,
+              cancelled: true,
+              not_processed: next.frameIds.length,
+            },
+          });
+        return updated;
+      });
+      processingRef.current = false;
+      currentBatchIdRef.current = null;
+      setQueue(q => q.filter(item => item.batchId !== next.batchId));
+      return;
+    }
     try {
-      await api.invoke<void>('plate_solve_batch', { frameIds: next.frameIds });
+      const completion = new Promise<void>(resolve => {
+        completeRef.current = resolve;
+      });
+      await api.invoke<void>('plate_solve_batch', {
+        frameIds: next.frameIds,
+        sequential: next.sequential ?? false,
+      });
+      await completion;
     } catch (err) {
       console.error(`Plate solve batch ${next.batchId} failed:`, err);
       const message = String(err);
@@ -156,9 +196,12 @@ export function usePlateSolveQueue() {
       failBatch(next.batchId, next.frameIds.length, message);
     }
 
+    completeRef.current = null;
+    backendStarted.current = false;
+    cancelRequested.current.delete(next.batchId);
     processingRef.current = false;
     currentBatchIdRef.current = null;
-    setQueue(q => q.slice(1));
+    setQueue(q => q.filter(item => item.batchId !== next.batchId));
   }, [failBatch]);
 
   // Kick the processor whenever the queue has pending items.
@@ -175,85 +218,122 @@ export function usePlateSolveQueue() {
     let unlistenComplete: (() => void) | null = null;
 
     api
-      .listen<PlateSolveProgressEvent>(
-        'plate-solve-progress',
-        (payload) => {
-          if (cancelled) return;
-          const batchId = currentBatchIdRef.current;
-          if (batchId == null) return;
+      .listen<PlateSolveProgressEvent>('plate-solve-progress', payload => {
+        if (cancelled) return;
+        const batchId = currentBatchIdRef.current;
+        if (batchId == null) return;
 
-          setActiveBatches(prev => {
-            const entry = prev.get(batchId);
-            if (!entry) return prev;
-            const frameStatuses = new Map(entry.frameStatuses);
-            if (payload.status === 'solving') {
-              frameStatuses.set(payload.frame_id, { kind: 'solving' });
-            } else if (payload.status === 'solved') {
-              frameStatuses.set(payload.frame_id, {
-                kind: 'solved',
-                matched_stars: payload.matched_stars ?? 0,
-                rms_arcsec: payload.rms_arcsec ?? 0,
+        if (!backendStarted.current) {
+          backendStarted.current = true;
+          if (cancelRequested.current.has(batchId)) {
+            api.invoke('cancel_plate_solve').catch(error => {
+              console.error('Cancel plate solve failed:', error);
+              cancelRequested.current.delete(batchId);
+              setActiveBatches(prev => {
+                const next = new Map(prev),
+                  entry = next.get(batchId);
+                if (entry) next.set(batchId, { ...entry, isCancelling: false });
+                return next;
               });
-            } else if (payload.status === 'failed') {
-              frameStatuses.set(payload.frame_id, {
-                kind: 'failed',
-                error: payload.error ?? 'Solve failed',
-                code: payload.failure_code,
-                filename: payload.filename,
+              notify({
+                title: 'Could not cancel plate solving',
+                detail: String(error),
+                kind: 'platesolve',
+                tone: 'warning',
+                hasErrors: true,
               });
-            }
-            const updated = new Map(prev);
-            updated.set(batchId, {
-              ...entry,
-              progress: { current: payload.current, total: payload.total },
-              currentFrameId: payload.frame_id,
-              frameStatuses,
             });
-            return updated;
+          }
+        }
+        setActiveBatches(prev => {
+          const entry = prev.get(batchId);
+          if (!entry) return prev;
+          const frameStatuses = new Map(entry.frameStatuses);
+          if (payload.status === 'solving') {
+            frameStatuses.set(payload.frameId, {
+              kind: 'solving',
+              filename: payload.filename ?? undefined,
+              startedAt: Date.now(),
+            });
+          } else if (payload.status === 'solved') {
+            frameStatuses.set(payload.frameId, {
+              kind: 'solved',
+              matched_stars: payload.matchedStars ?? 0,
+              rms_arcsec: payload.rmsArcsec ?? 0,
+            });
+          } else if (payload.status === 'cancelled') {
+            frameStatuses.set(payload.frameId, { kind: 'cancelled' });
+          } else if (payload.status === 'failed') {
+            frameStatuses.set(payload.frameId, {
+              kind: 'failed',
+              error: payload.error ?? 'Solve failed',
+              code: payload.failureCode ?? undefined,
+              filename: payload.filename ?? undefined,
+            });
+          }
+          const updated = new Map(prev);
+          updated.set(batchId, {
+            ...entry,
+            progress: {
+              current: Math.max(entry.progress?.current ?? 0, payload.current),
+              total: payload.total,
+            },
+            currentFrameId: payload.frameId,
+            frameStatuses,
           });
-        },
-      )
-      .then((fn) => { if (cancelled) fn(); else unlistenProgress = fn; })
-      .catch((err) => console.error('[usePlateSolveQueue] listen failed:', err));
+          return updated;
+        });
+      })
+      .then(fn => {
+        if (cancelled) fn();
+        else unlistenProgress = fn;
+      })
+      .catch(err => console.error('[usePlateSolveQueue] listen failed:', err));
 
     api
-      .listen<PlateSolveCompleteEvent>(
-        'plate-solve-complete',
-        (payload) => {
-          if (cancelled) return;
-          const batchId = currentBatchIdRef.current;
-          if (batchId == null) return;
-          setActiveBatches(prev => {
-            const entry = prev.get(batchId);
-            if (!entry) return prev;
-            const updated = new Map(prev);
-            updated.set(batchId, {
-              ...entry,
-              isComplete: true,
-              isCancelling: false,
-              summary: {
-                solved: payload.solved,
-                failed: payload.failed,
-                total: payload.total,
-                total_time_ms: payload.total_time_ms,
-              },
-            });
-            return updated;
+      .listen<PlateSolveCompleteEvent>('plate-solve-complete', payload => {
+        if (cancelled) return;
+        const batchId = currentBatchIdRef.current;
+        if (batchId == null) return;
+        setActiveBatches(prev => {
+          const entry = prev.get(batchId);
+          if (!entry) return prev;
+          const updated = new Map(prev);
+          updated.set(batchId, {
+            ...entry,
+            isComplete: true,
+            isCancelling: false,
+            summary: {
+              solved: payload.solved,
+              failed: payload.failed,
+              total: payload.total,
+              total_time_ms: payload.totalTimeMs,
+              cancelled: payload.cancelled,
+              not_processed: payload.notProcessed,
+            },
           });
+          return updated;
+        });
 
-          notify({
-            title: `Plate-solve finished — ${payload.solved}/${payload.total} solved`,
-            detail: payload.failed
-              ? `${payload.failed} failed`
+        completeRef.current?.();
+        completeRef.current = null;
+        notify({
+          title: `Plate-solve ${payload.cancelled ? 'cancelled' : 'finished'} — ${payload.solved}/${payload.total} solved`,
+          detail: payload.failed
+            ? `${payload.failed} failed`
+            : payload.cancelled
+              ? `${payload.notProcessed ?? payload.total - payload.solved} not processed`
               : 'All frames solved',
-            kind: 'platesolve',
-            hasErrors: payload.failed > 0,
-            tone: payload.failed > 0 ? 'warning' : 'success',
-          });
-        },
-      )
-      .then((fn) => { if (cancelled) fn(); else unlistenComplete = fn; })
-      .catch((err) => console.error('[usePlateSolveQueue] listen failed:', err));
+          kind: 'platesolve',
+          hasErrors: payload.failed > 0,
+          tone: payload.failed > 0 ? 'warning' : 'success',
+        });
+      })
+      .then(fn => {
+        if (cancelled) fn();
+        else unlistenComplete = fn;
+      })
+      .catch(err => console.error('[usePlateSolveQueue] listen failed:', err));
 
     return () => {
       cancelled = true;
@@ -263,7 +343,7 @@ export function usePlateSolveQueue() {
   }, []);
 
   const enqueuePlateSolve = useCallback(
-    (frameIds: number[], label?: string): number => {
+    (frameIds: number[], label?: string, sequential = false): number => {
       if (frameIds.length === 0) return -1;
       const batchId = nextBatchId++;
       const resolvedLabel = label ?? `${frameIds.length} frame${frameIds.length === 1 ? '' : 's'}`;
@@ -278,6 +358,7 @@ export function usePlateSolveQueue() {
           frameIds,
           progress: null,
           currentFrameId: null,
+          startedAt: null,
           frameStatuses,
           isComplete: false,
           isCancelling: false,
@@ -286,49 +367,71 @@ export function usePlateSolveQueue() {
         });
         return updated;
       });
-      setQueue(q => [...q, { batchId, label: resolvedLabel, frameIds }]);
+      setQueue(q => [...q, { batchId, label: resolvedLabel, frameIds, sequential }]);
       return batchId;
     },
     [],
   );
 
-  const cancelBatch = useCallback(async (batchId: number) => {
-    setQueue(q => q.filter(item => item.batchId !== batchId));
-    setActiveBatches(prev => {
-      const entry = prev.get(batchId);
-      if (!entry || entry.isComplete) return prev;
-      const updated = new Map(prev);
-      updated.set(batchId, { ...entry, isCancelling: true });
-      return updated;
-    });
-    if (currentBatchIdRef.current === batchId) {
-      try {
-        await api.invoke('cancel_plate_solve');
-      } catch {
-        // May fail if the batch already finished — safe to ignore.
-      }
-    }
-  }, []);
-
-  const cancelAll = useCallback(async () => {
-    setQueue([]);
-    if (currentBatchIdRef.current != null) {
-      try {
-        await api.invoke('cancel_plate_solve');
-      } catch {
-        // ignore
-      }
-    }
-    setActiveBatches(prev => {
-      const updated = new Map(prev);
-      for (const [, entry] of updated) {
-        if (!entry.isComplete) {
-          updated.set(entry.batchId, { ...entry, isCancelling: true });
+  const cancelBatch = useCallback(
+    async (batchId: number) => {
+      const running = currentBatchIdRef.current === batchId;
+      if (running) cancelRequested.current.add(batchId);
+      setQueue(q => q.filter(item => item.batchId !== batchId || running));
+      setActiveBatches(prev => {
+        const entry = prev.get(batchId);
+        if (!entry || entry.isComplete) return prev;
+        const updated = new Map(prev);
+        updated.set(
+          batchId,
+          running
+            ? { ...entry, isCancelling: true }
+            : {
+                ...entry,
+                isComplete: true,
+                isCancelling: false,
+                summary: {
+                  solved: 0,
+                  failed: 0,
+                  total: entry.frameIds.length,
+                  total_time_ms: 0,
+                  cancelled: true,
+                  not_processed: entry.frameIds.length,
+                },
+              },
+        );
+        return updated;
+      });
+      // Before the first progress event there may not be a backend cancel handle.
+      // Keep the intent and cancel as soon as that event confirms the worker exists.
+      if (running && backendStarted.current) {
+        try {
+          await api.invoke('cancel_plate_solve');
+        } catch (error) {
+          console.error('Cancel plate solve failed:', error);
+          cancelRequested.current.delete(batchId);
+          setActiveBatches(prev => {
+            const next = new Map(prev),
+              entry = next.get(batchId);
+            if (entry) next.set(batchId, { ...entry, isCancelling: false });
+            return next;
+          });
+          notify({
+            title: 'Could not cancel plate solving',
+            detail: String(error),
+            kind: 'platesolve',
+            tone: 'warning',
+            hasErrors: true,
+          });
         }
       }
-      return updated;
-    });
-  }, []);
+    },
+    [notify],
+  );
+
+  const cancelAll = useCallback(async () => {
+    await Promise.all(queueRef.current.map(item => cancelBatch(item.batchId)));
+  }, [cancelBatch]);
 
   const dismissCompleted = useCallback((batchId: number) => {
     setActiveBatches(prev => {
@@ -351,7 +454,9 @@ export function usePlateSolveQueue() {
     [activeBatches],
   );
 
-  const currentBatch = queue.length > 0 ? activeBatches.get(queue[0].batchId) ?? null : null;
+  const currentBatch =
+    Array.from(activeBatches.values()).find(b => !b.isComplete && b.startedAt !== null) ??
+    (queue.length > 0 ? (activeBatches.get(queue[0].batchId) ?? null) : null);
   const queueLength = queue.length;
   const hasActiveBatches = Array.from(activeBatches.values()).some(b => !b.isComplete);
 

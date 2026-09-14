@@ -848,3 +848,14 @@ pub async fn get_frame_set_merge_log(
     crate::auto_merge::log_ops::get_log_entries(&conn, frames_set_id, limit)
         .map_err(|e| e.to_string())
 }
+
+/// Resolve eligible frames without starting a second solver outside the shared queue.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_object_plate_solve_frame_ids(
+    frames_set_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    athenaeum_core::api::frame_sets::get_object_plate_solve_frame_ids(&state.ctx, frames_set_ids)
+        .map_err(|e| e.to_string())
+}
