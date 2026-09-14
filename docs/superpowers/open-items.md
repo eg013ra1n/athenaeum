@@ -1357,30 +1357,7 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 ## Release notes owed at the next tag
 
-(The v0.5.1–v0.5.5 lines were paid at their own tags.)
-
-- Full resolution in the Blink viewer now debayers one-shot-colour frames at their
-  native resolution with gradient interpolation, instead of halving them. Colour
-  frames finally show every pixel the sensor recorded.
-- The Blink image cache is now bounded in megabytes as well as in frame count, so a
-  full-resolution session cannot quietly grow to gigabytes.
-- The plate-solve input gate — the check that refuses a frame whose stars are
-  streaks before a solve is attempted — now has controls in Settings → Plate
-  Solving: an on/off toggle and the two thresholds it compares. The worker count
-  for batch solving is adjustable in the same place.
-- Deleting a missing file that happens to be a master no longer strands the raw
-  frames it was built from: the source set goes back to being matchable, exactly
-  as it does when a master is removed any other way.
-- Files that could not be read during a scan can now be revealed in the file
-  manager straight from the scan-error list.
-- A folder whose drive went away can be re-checked in place. Plug the drive back
-  in, press **Check again**, and the folder comes back — no more scanning some
-  other folder to make the app notice.
-- The **Lights + calibration sets** export and send now land the raw calibration
-  frames again once masters have been built from them. Building a master had
-  quietly turned this mode into a copy of **Lights + masters**; the raw sets are
-  back, with their own darks and biases beneath them. Raw frames that were
-  archived after the build are reported up front, before anything is written.
-- The Calibration Library folder now lists its missing files like any other
-  folder, so a master whose file is gone can be removed from the catalog right
-  there — which also hands its raw frames back to the matcher.
+(The v0.5.1–v0.6.1 lines were paid at their own tags — the Blink full-resolution debayer,
+the cache limit, the plate-solve gate controls, the master-deletion un-supersede, the
+scan-error reveal and **Check again** at v0.5.6; the **Lights + calibration sets** raw
+originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.6.2.)
