@@ -544,5 +544,37 @@ assert_eq "amd64-absent run never calls imagetools create" "" "$(cat "$CREATE_AR
 rm -f "$CREATE_ARGS_TMP"
 
 echo
+echo "-- artifact_names.sh --"
+
+# shellcheck disable=SC1091
+. "$HELPERS_DIR/artifact_names.sh"
+
+out=$(VERSION=0.6.4 artifact_name athenaeum macos arm64 dmg)
+assert_eq "athenaeum dmg name" "athenaeum-0.6.4-macos-arm64.dmg" "$out"
+out=$(VERSION=0.6.4-beta.1 artifact_name athenaeum windows x64 exe setup)
+assert_eq "windows setup name with variant and beta" "athenaeum-0.6.4-beta.1-windows-x64-setup.exe" "$out"
+out=$(VERSION=0.6.4 artifact_name perseus linux arm64 tar.gz)
+assert_eq "perseus tarball name" "perseus-0.6.4-linux-arm64.tar.gz" "$out"
+out=$(alias_name athenaeum linux x64 AppImage)
+assert_eq "alias drops the version only" "athenaeum-linux-x64.AppImage" "$out"
+
+rc=0
+out=$(VERSION=0.6.4 artifact_name athenaeum linux amd64 deb 2>&1) || rc=$?
+assert_eq "amd64 is refused as an arch" "1" "$rc"
+assert_contains "refusal names the vocabulary" "arch must be x64 or arm64" "$out"
+
+inventory=$(VERSION=0.6.4 all_release_artifacts)
+assert_eq "inventory has 13 shipped files" "13" "$(printf '%s\n' "$inventory" | wc -l | tr -d ' ')"
+assert_contains "inventory: msi" "athenaeum windows x64 msi - windows athenaeum-0.6.4-windows-x64.msi athenaeum-windows-x64.msi" "$inventory"
+assert_contains "inventory: perseus x64 deb" "perseus linux x64 deb - perseus perseus-0.6.4-linux-x64.deb perseus-linux-x64.deb" "$inventory"
+assert_not_contains "inventory never says amd64" "amd64" "$inventory"
+assert_not_contains "inventory never says aarch64" "aarch64" "$inventory"
+assert_not_contains "inventory never says x86_64" "x86_64" "$inventory"
+
+legacy=$(VERSION=0.6.4 legacy_alias_pairs)
+assert_contains "legacy: old macOS alias maps to the new file" "macos Athenaeum-macos-aarch64.dmg athenaeum-0.6.4-macos-arm64.dmg" "$legacy"
+assert_contains "legacy: old perseus deb alias" "perseus perseus-linux-amd64.deb perseus-0.6.4-linux-x64.deb" "$legacy"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
