@@ -623,13 +623,13 @@ assert_contains "post: title" "title: Athenaeum v0.7.0" "$out"
 assert_contains "post: date" "date: 2026-10-01" "$out"
 assert_contains "post: author" "  - vilen" "$out"
 assert_contains "post: tag" "  - release" "$out"
-assert_contains "post: excerpt is the tagline without stars, YAML-quoted" 'excerpt: "Athenaeum v0.7.0: a \"quoted\" tagline — with a dash & an ampersand."' "$out"
+assert_contains "post: excerpt strips the Athenaeum vX.Y.Z: prefix and re-capitalizes, YAML-quoted" 'excerpt: "A \"quoted\" tagline — with a dash & an ampersand."' "$out"
 assert_not_contains "post: body does not repeat the tagline" "*Athenaeum v0.7.0: a" "$out"
 assert_contains "post: body keeps the sections" "## Bug Fixes" "$out"
 first_body_line=$(printf '%s\n' "$out" | awk 'f&&NF{print;exit} /^---$/{c++; if(c==2)f=1}')
 assert_eq "post: body starts at the first heading" "## What's New" "$first_body_line"
 out=$("$HELPERS_DIR/gen_release_post.sh" --tagline < "$FIXTURES_DIR/release_notes_sample.md")
-assert_eq "post: --tagline prints the bare tagline" 'Athenaeum v0.7.0: a "quoted" tagline — with a dash & an ampersand.' "$out"
+assert_eq "post: --tagline strips the Athenaeum vX.Y.Z: prefix and re-capitalizes" 'A "quoted" tagline — with a dash & an ampersand.' "$out"
 # Regression: TAG with double quote must not execute code (injection safety).
 out=$(TAG='v0.7.0"x' RELEASE_DATE=2026-10-01 "$HELPERS_DIR/gen_release_post.sh" < "$FIXTURES_DIR/release_notes_sample.md" 2>&1)
 assert_contains "post: TAG injection is safe" 'title: Athenaeum v0.7.0"x' "$out"
@@ -653,6 +653,13 @@ assert_contains "page: old row kept" "| v0.6.3 | 2026-09-15 | old row |" "$page"
 # newest row directly under the marker
 after_marker=$(grep -A1 -F '<!-- version-history:rows -->' "$DP_TMP" | tail -n1)
 assert_contains "page: new row is first" "| v0.7.0 |" "$after_marker"
+
+# The Latest Build block must never drift from the inventory: every athenaeum
+# filename all_release_artifacts knows about has to appear on the page.
+while read -r product os arch ext variant subdir filename alias; do
+  [ "$product" = "athenaeum" ] || continue
+  assert_contains "page: inventory filename $filename present" "$filename" "$page"
+done < <(VERSION=0.7.0 all_release_artifacts)
 
 # Same tag again: the row is replaced, not duplicated.
 PAGE="$DP_TMP" TAG=v0.7.0 RELEASE_DATE=2026-10-01 TAGLINE="Second wording" "$HELPERS_DIR/update_download_page.sh" >/dev/null 2>&1
@@ -691,6 +698,21 @@ assert_contains "publish: would commit the page" "src/content/docs/releases/down
 assert_contains "publish: commit message" "docs: v0.7.0 release post + download-page row" "$out"
 assert_contains "publish: dry run does not push" "DRY_RUN=1: not pushing" "$out"
 rm -rf "$DOCS_TMP"
+
+# The token must never reach the clone URL: a refused clone (connection
+# refused) must fail loudly without ever echoing the token anywhere in the
+# combined output.
+rc=0
+out=$(DOCS_REPO_TOKEN="SECRET-TOKEN-XYZ" DOCS_REPO_URL="http://127.0.0.1:9/nothing.git" TAG=v0.7.0 \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/docs_publish.sh" 2>&1) || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "  ok: publish: refused clone exits non-zero (actual: $rc)"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: publish: refused clone should exit non-zero (actual: $rc)"
+  FAIL=$((FAIL + 1))
+fi
+assert_not_contains "publish: token never appears in the output" "SECRET-TOKEN-XYZ" "$out"
 
 echo
 echo "-- github_checks_gate.sh --"
@@ -739,6 +761,15 @@ assert_contains "gate: names the failed check on first poll" "ERROR: Build, test
 assert_eq "gate: does not poll again after failure" "1" "$(cat "$SEQ_TMP/count")"
 rm -rf "$SEQ_TMP"
 
+# A malformed 200 body (rate-limit HTML served as 200) must warn and retry,
+# never crash the script with a Python traceback under `set -e`.
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_BODY_FILE="$FIXTURES_DIR/github_checks_notjson.txt" \
+  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 GATE_TIMEOUT_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
+assert_eq "gate: non-JSON 200 body times out" "1" "$rc"
+assert_contains "gate: non-JSON 200 body warns" "warning: GitHub answered 200 with a body that is not JSON" "$out"
+assert_not_contains "gate: non-JSON 200 body has no traceback" "Traceback" "$out"
+
 echo
 echo "-- verify_release.sh --"
 
@@ -774,9 +805,18 @@ assert_eq "verify: arm64 missing accepted with the variable" "0" "$rc"
 assert_contains "verify: still warns" "WARNING: publishing amd64-only" "$out"
 
 rc=0
-out=$(env "${common[@]}" MOCK_CURL_HUB_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+out=$(env "${common[@]}" VERIFY_DOCKER_ATTEMPTS=1 MOCK_CURL_HUB_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
 assert_eq "verify: docker tag absent exits 1" "1" "$rc"
 assert_contains "verify: docker absent message" "ERROR: Docker Hub has no tag 0.7.0" "$out"
+
+# The tag API is eventually consistent right after imagetools create: with
+# the default attempt count, a persistent non-200 retries up to the last
+# attempt (printing it) before the ERROR fires.
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: docker tag absent (default attempts) exits 1" "1" "$rc"
+assert_contains "verify: docker retry shows the last attempt" "attempt 3/3" "$out"
+assert_contains "verify: docker retry still errors after the last attempt" "ERROR: Docker Hub has no tag 0.7.0" "$out"
 
 rc=0
 out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_notjson.txt" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
@@ -814,8 +854,14 @@ rm -f "$REL_TMP"
 rc=0
 out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_RELEASE_HTTP=409 CI_COMMIT_TAG=v0.7.0 CI_API_V4_URL=http://gitlab.local/api/v4 CI_PROJECT_ID=1 CI_JOB_TOKEN=t \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/create_gitlab_release.sh" 2>&1) || rc=$?
-assert_eq "release: API error exits 1" "1" "$rc"
-assert_contains "release: API error message" "ERROR: GitLab release API answered HTTP 409" "$out"
+assert_eq "release: 409 (already exists) exits 0" "0" "$rc"
+assert_contains "release: 409 warns kept as is" "warning: GitLab Release v0.7.0 already exists — kept as is" "$out"
+
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_RELEASE_HTTP=500 CI_COMMIT_TAG=v0.7.0 CI_API_V4_URL=http://gitlab.local/api/v4 CI_PROJECT_ID=1 CI_JOB_TOKEN=t \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/create_gitlab_release.sh" 2>&1) || rc=$?
+assert_eq "release: 500 API error exits 1" "1" "$rc"
+assert_contains "release: 500 API error message" "ERROR: GitLab release API answered HTTP 500" "$out"
 
 echo
 echo "Passed: $PASS  Failed: $FAIL"

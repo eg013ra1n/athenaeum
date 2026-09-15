@@ -35,7 +35,18 @@ if [ "${SKIP_DOCKER_CHECK:-0}" = "1" ]; then
   echo "skipped: docker check (SKIP_DOCKER_CHECK=1)"
 else
   case "$CI_COMMIT_TAG" in *-beta*) channel=beta ;; *) channel=latest ;; esac
-  code=$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' --max-time 60 "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/${VERSION}" || echo 000)
+  # The tag API is eventually consistent right after `imagetools create` —
+  # retry a non-200 a few times before calling the tag missing.
+  DOCKER_ATTEMPTS="${VERIFY_DOCKER_ATTEMPTS:-3}"
+  attempt=1
+  code=000
+  while [ "$attempt" -le "$DOCKER_ATTEMPTS" ]; do
+    code=$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' --max-time 60 "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/${VERSION}" || echo 000)
+    [ "$code" = "200" ] && break
+    echo "waiting: Docker Hub tag ${VERSION} is HTTP ${code} (attempt ${attempt}/${DOCKER_ATTEMPTS})"
+    attempt=$((attempt + 1))
+    [ "$attempt" -le "$DOCKER_ATTEMPTS" ] && sleep "$POLL"
+  done
   if [ "$code" != "200" ]; then
     echo "ERROR: Docker Hub has no tag ${VERSION} for ${DOCKERHUB_REPO} (HTTP $code)" >&2; fail=1
   else

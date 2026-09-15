@@ -27,9 +27,12 @@ if [ "$DRY_RUN" = "1" ]; then
   git clone -q "$DOCS_REPO_LOCAL" "$WORK/site"
 else
   : "${DOCS_REPO_TOKEN:?DOCS_REPO_TOKEN must be set (artfrom-space project access token, write_repository)}"
-  # Any non-empty username works with a GitLab project access token.
-  AUTH_URL="$(printf '%s' "$DOCS_REPO_URL" | sed -E "s#^(https?://)#\1release-bot:${DOCS_REPO_TOKEN}@#")"
-  git clone -q --depth 1 --branch main "$AUTH_URL" "$WORK/site"
+  # The token travels via a credential helper, never embedded in the clone
+  # URL — a rejected clone/push prints the URL in git's error output, and an
+  # embedded token would leak straight into the job log. Any non-empty
+  # username works with a GitLab project access token.
+  git -c credential.helper='!f() { echo "username=release-bot"; echo "password=${DOCS_REPO_TOKEN}"; }; f' \
+    clone -q --depth 1 --branch main "$DOCS_REPO_URL" "$WORK/site"
 fi
 
 POST="$WORK/site/src/content/docs/blog/${TAG}.md"
@@ -51,5 +54,5 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1: not pushing"
   exit 0
 fi
-git push -q origin HEAD:main
+git -c credential.helper='!f() { echo "username=release-bot"; echo "password=${DOCS_REPO_TOKEN}"; }; f' push -q origin HEAD:main
 echo "docs: pushed ${TAG} post + download-page row to main"

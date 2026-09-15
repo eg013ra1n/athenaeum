@@ -12,7 +12,7 @@ trap 'rm -f "$NOTES_FILE"' EXIT
 cat > "$NOTES_FILE"
 
 python3 - "$MODE" "${TAG:-}" "${RELEASE_DATE:-}" "$NOTES_FILE" <<'PY'
-import datetime, json, sys
+import datetime, json, re, sys
 mode, tag, date, notes_file = sys.argv[1:5]
 
 with open(notes_file, encoding="utf-8") as f:
@@ -26,6 +26,12 @@ if i == len(lines):
 tagline = lines[i].strip()
 if tagline.startswith("*") and tagline.endswith("*") and len(tagline) > 2:
     tagline = tagline[1:-1].strip()
+# The Version History row sits inside a table whose first column is already
+# the version, and a hand-written excerpt never repeats the product name —
+# so strip a leading "Athenaeum vX.Y.Z:" and re-capitalize what remains.
+tagline = re.sub(r"^Athenaeum v\S+:\s*", "", tagline)
+if tagline:
+    tagline = tagline[0].upper() + tagline[1:]
 body = lines[i + 1:]
 while body and not body[0].strip():
     body.pop(0)

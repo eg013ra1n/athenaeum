@@ -51,5 +51,9 @@ RESP=$(mktemp -t release_resp.XXXXXX)
 code=$(printf '%s' "$PAYLOAD" | curl --silent --show-error --request POST --output "$RESP" --write-out '%{http_code}' \
   --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --header "Content-Type: application/json" --data @- \
   "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases" || echo 000)
+if [ "$code" = "409" ]; then
+  echo "warning: GitLab Release ${CI_COMMIT_TAG} already exists — kept as is"
+  exit 0
+fi
 if [ "$code" != "201" ]; then echo "ERROR: GitLab release API answered HTTP $code: $(cat "$RESP")" >&2; exit 1; fi
 echo "ok: GitLab Release ${CI_COMMIT_TAG} created with $(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["assets"]["links"]))') links"

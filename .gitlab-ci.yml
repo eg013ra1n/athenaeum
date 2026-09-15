@@ -513,6 +513,10 @@ gate:tests:
 .ssh_deploy_setup:
   before_script:
     - eval $(ssh-agent -s)
+    # after_script runs in a FRESH shell with no SSH_AGENT_PID, so `ssh-agent
+    # -k` there is a silent no-op and agents pile up on the runner host —
+    # stash the pid on disk so after_script can kill it by hand.
+    - echo "$SSH_AGENT_PID" > "$CI_PROJECT_DIR/.ssh-agent.pid"
     - chmod 400 "$DEPLOY_SSH_KEY"
     - ssh-add "$DEPLOY_SSH_KEY"
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -524,7 +528,8 @@ gate:tests:
     - export SSH_CMD="ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
     - export SCP_CMD="scp -P ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
   after_script:
-    - ssh-agent -k 2>/dev/null || true
+    - |
+      [ -f "$CI_PROJECT_DIR/.ssh-agent.pid" ] && kill "$(cat "$CI_PROJECT_DIR/.ssh-agent.pid")" 2>/dev/null; rm -f "$CI_PROJECT_DIR/.ssh-agent.pid"; true
 
 # --- Deploy to Web Server (tags only) ---
 deploy:
@@ -620,7 +625,12 @@ docs:publish:
 # there, then prove the published DMGs are accepted by a real macOS Gatekeeper.
 verify:release:
   stage: verify
-  tags: [linux]
+  # runs on the macOS runner on purpose: the linux runner is one slot shared
+  # with the docs site's own pipeline (runner 2 serves both projects) — a
+  # linux verify would sit polling for a blog page whose builder is queued
+  # behind it. By the time this job is pending, publish:dockerhub:arm64 and
+  # verify:macos-gatekeeper are done, so it contends with nothing on the Mac.
+  tags: [macos]
   only: [tags]
   needs:
     - job: deploy

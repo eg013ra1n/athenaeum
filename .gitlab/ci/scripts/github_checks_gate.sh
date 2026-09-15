@@ -28,7 +28,10 @@ while :; do
     echo "warning: GitHub API answered HTTP $code (elapsed ${elapsed}s)"
     verdict=retry
   else
-    verdict=$(python3 - "$RESP" "$REQUIRED" <<'PY'
+    # Guarded parse, mirroring verify_release.sh: a 200 with a body that is
+    # not JSON (rate-limit HTML, a CDN error page) must yield one warning and
+    # another poll, never a Python traceback aborting the script under `set -e`.
+    py_out=$(python3 - "$RESP" "$REQUIRED" 2>/dev/null <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
 required = [r for r in sys.argv[2].split(";") if r]
@@ -51,9 +54,14 @@ for name in required:
         print(f"ERROR: {name} concluded {r['conclusion']}"); verdict = worst(verdict, "fail")
 print(verdict)
 PY
-)
-    printf '%s\n' "$verdict" | sed '$d'
-    verdict=$(printf '%s\n' "$verdict" | tail -n1)
+) || true
+    if [ -z "$py_out" ]; then
+      echo "warning: GitHub answered 200 with a body that is not JSON (elapsed ${elapsed}s)"
+      verdict=retry
+    else
+      printf '%s\n' "$py_out" | sed '$d'
+      verdict=$(printf '%s\n' "$py_out" | tail -n1)
+    fi
   fi
   case "$verdict" in
     ok)   echo "ok: GitHub check-suite green for ${CI_COMMIT_SHA}"; exit 0 ;;

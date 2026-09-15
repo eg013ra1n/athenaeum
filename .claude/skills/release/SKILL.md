@@ -19,9 +19,16 @@ that can be released and to read its verdicts.
   anyone: `gh run list --commit $(git rev-parse HEAD) --json name,conclusion`.
 - Keep the dev Mac idle while `build:macos` and `build:perseus:macos` run — the
   macOS runner is this machine and a saturated box times the job out.
+- `root/artfrom-space` `main` must carry the three `download.md` markers
+  (`<!-- latest-build:start -->`, `<!-- latest-build:end -->`,
+  `<!-- version-history:rows -->`) — `docs:publish` fails naming the missing
+  one otherwise.
 - Four CI/CD variables the pipeline needs: `DOCS_REPO_TOKEN` (required:
   artfrom-space project access token, Maintainer, write_repository),
-  `GITHUB_API_TOKEN` (optional, raises the gate's API limit), `SSH_KNOWN_HOSTS`
+  `GITHUB_API_TOKEN` (recommended — effectively required if a gate ever has
+  to wait or a tag is redone within the hour: the unauthenticated GitHub API
+  limit is 60 calls/hour and the gate polls once a minute for up to 50
+  minutes), `SSH_KNOWN_HOSTS`
   (optional, MUST be the `[host]:40022` form that `ssh-keyscan -p 40022 <host>`
   prints, else `StrictHostKeyChecking=yes` refuses the upload), `RELEASE_ALLOW_AMD64_ONLY`
   (only while the arm64 Docker runner is down; unset afterwards).
@@ -43,7 +50,10 @@ that can be released and to read its verdicts.
    `git push all main` → wait for the GitHub run of that commit
    (`gh run watch` or poll `gh run list --commit <sha>`) → `git tag vX.Y.Z && git push all vX.Y.Z`.
    Pushing the tag before the run is green is allowed (the gate waits) but
-   pointless; a red run means fix-then-retag, never force.
+   pointless; a red run means fix-then-retag, never force. The tag push
+   starts a second GitHub run for the same commit; the gate reads whichever
+   is the latest, so wait for the main-branch run to be green before tagging
+   rather than relying on the tag's own run.
 5. **Read the pipeline** (`http://192.168.31.208:9080/root/athenaeum/-/pipelines`, or
    the API with the PAT in `~/.config/athenaeum-ci/gitlab-pat`):
    - `gate` — `check:versions` (the only job in stage `gate`) red: a version file disagrees with the tag → fix,
