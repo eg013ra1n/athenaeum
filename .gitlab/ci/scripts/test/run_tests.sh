@@ -740,5 +740,77 @@ assert_eq "gate: does not poll again after failure" "1" "$(cat "$SEQ_TMP/count")
 rm -rf "$SEQ_TMP"
 
 echo
+echo "-- verify_release.sh --"
+
+common=(PATH="$MOCK_BIN:$PATH" CI_COMMIT_TAG=v0.7.0 VERIFY_POLL_SECONDS=0 VERIFY_BLOG_TIMEOUT_SECONDS=0)
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: everything present exits 0" "0" "$rc"
+assert_contains "verify: checks 13 artifacts" "ok: 13 artifacts present" "$out"
+assert_contains "verify: docker both arches" "ok: docker.io/vsharifov/athenaeum:0.7.0 has amd64 + arm64" "$out"
+assert_contains "verify: channel tag matches" "ok: :latest -> sha256:aaaa" "$out"
+assert_contains "verify: blog reachable" "ok: blog https://artfrom.space/blog/v070/" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" \
+  MOCK_CURL_MISSING_ARTIFACTS="athenaeum-0.7.0-macos-x64.dmg" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: a missing installer exits 1" "1" "$rc"
+assert_contains "verify: names the missing URL" "ERROR: HTTP 404 for https://artfrom.space/builds/v0.7.0/macos/athenaeum-0.7.0-macos-x64.dmg" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" \
+  MOCK_CURL_ARTIFACT_LENGTH=12 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: a tiny file exits 1" "1" "$rc"
+assert_contains "verify: names the size" "ERROR: 12 bytes (< 1048576) at https://artfrom.space/builds/v0.7.0/windows/athenaeum-0.7.0-windows-x64.msi" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_amd64only.json" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: arm64 missing exits 1 by default" "1" "$rc"
+assert_contains "verify: arm64 message names the escape hatch" "ERROR: docker.io/vsharifov/athenaeum:0.7.0 has no arm64 image (set RELEASE_ALLOW_AMD64_ONLY=1 to accept)" "$out"
+
+rc=0
+out=$(env "${common[@]}" RELEASE_ALLOW_AMD64_ONLY=1 MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_amd64only.json" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: arm64 missing accepted with the variable" "0" "$rc"
+assert_contains "verify: still warns" "WARNING: publishing amd64-only" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: docker tag absent exits 1" "1" "$rc"
+assert_contains "verify: docker absent message" "ERROR: Docker Hub has no tag 0.7.0" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" MOCK_CURL_BLOG_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: blog 404 past the budget exits 1" "1" "$rc"
+assert_contains "verify: blog message" "ERROR: blog https://artfrom.space/blog/v070/ still HTTP 404 after" "$out"
+
+rc=0
+out=$(env "${common[@]}" SKIP_DOCKER_CHECK=1 SKIP_BLOG_CHECK=1 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: skips honoured" "0" "$rc"
+assert_contains "verify: says what it skipped" "skipped: docker check (SKIP_DOCKER_CHECK=1)" "$out"
+
+echo
+echo "-- create_gitlab_release.sh --"
+
+REL_TMP=$(mktemp -t release_body.XXXXXX)
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_CAPTURE_RELEASE_BODY="$REL_TMP" CI_COMMIT_TAG=v0.7.0 CI_API_V4_URL=http://gitlab.local/api/v4 CI_PROJECT_ID=1 CI_JOB_TOKEN=t \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/create_gitlab_release.sh" 2>&1) || rc=$?
+assert_eq "release: exits 0" "0" "$rc"
+payload=$(cat "$REL_TMP")
+assert_contains "release: tag" '"tag_name": "v0.7.0"' "$payload"
+assert_contains "release: name" '"name": "Athenaeum v0.7.0"' "$payload"
+assert_contains "release: description carries the notes" "## Bug Fixes" "$payload"
+assert_contains "release: msi link" 'https://artfrom.space/builds/v0.7.0/windows/athenaeum-0.7.0-windows-x64.msi' "$payload"
+assert_contains "release: perseus arm64 deb link" 'https://artfrom.space/builds/v0.7.0/perseus/perseus-0.7.0-linux-arm64.deb' "$payload"
+assert_eq "release: 13 asset links" "13" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["assets"]["links"]))' "$REL_TMP")"
+rm -f "$REL_TMP"
+
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_RELEASE_HTTP=409 CI_COMMIT_TAG=v0.7.0 CI_API_V4_URL=http://gitlab.local/api/v4 CI_PROJECT_ID=1 CI_JOB_TOKEN=t \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/create_gitlab_release.sh" 2>&1) || rc=$?
+assert_eq "release: API error exits 1" "1" "$rc"
+assert_contains "release: API error message" "ERROR: GitLab release API answered HTTP 409" "$out"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
