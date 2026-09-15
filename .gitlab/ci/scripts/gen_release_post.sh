@@ -11,13 +11,11 @@ NOTES_FILE=$(mktemp -t release_notes.XXXXXX)
 trap 'rm -f "$NOTES_FILE"' EXIT
 cat > "$NOTES_FILE"
 
-python3 <<PY
+python3 - "$MODE" "${TAG:-}" "${RELEASE_DATE:-}" "$NOTES_FILE" <<'PY'
 import datetime, json, sys
-mode = "$MODE"
-tag = "${TAG:-}"
-date = "${RELEASE_DATE:-}"
+mode, tag, date, notes_file = sys.argv[1:5]
 
-with open("$NOTES_FILE") as f:
+with open(notes_file, encoding="utf-8") as f:
     lines = f.read().splitlines()
 
 i = 0

@@ -64,7 +64,7 @@ Every release is also archived by tag — [browse all builds](${BUILDS_BASE_URL}
 EOF
 
 python3 - "$PAGE" "$TAG" "$RELEASE_DATE" "$TAGLINE" "$block_file" <<'PY'
-import re, sys
+import sys
 page, tag, date, tagline, block_path = sys.argv[1:6]
 text = open(page, encoding="utf-8").read()
 is_beta = "-beta" in tag

@@ -630,6 +630,9 @@ first_body_line=$(printf '%s\n' "$out" | awk 'f&&NF{print;exit} /^---$/{c++; if(
 assert_eq "post: body starts at the first heading" "## What's New" "$first_body_line"
 out=$("$HELPERS_DIR/gen_release_post.sh" --tagline < "$FIXTURES_DIR/release_notes_sample.md")
 assert_eq "post: --tagline prints the bare tagline" 'Athenaeum v0.7.0: a "quoted" tagline — with a dash & an ampersand.' "$out"
+# Regression: TAG with double quote must not execute code (injection safety).
+out=$(TAG='v0.7.0"x' RELEASE_DATE=2026-10-01 "$HELPERS_DIR/gen_release_post.sh" < "$FIXTURES_DIR/release_notes_sample.md" 2>&1)
+assert_contains "post: TAG injection is safe" 'title: Athenaeum v0.7.0"x' "$out"
 
 echo
 echo "-- update_download_page.sh --"
