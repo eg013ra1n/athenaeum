@@ -13,7 +13,7 @@ that can be released and to read its verdicts.
 
 - You are in the main checkout on `main`, clean, and `main` == `origin/main` on
   both remotes (`git fetch all && git status -sb`). A worktree session cannot
-  release — see memory `reference-worktree-session-release`.
+  release — see memory `reference_worktree_session_release`.
 - The GitHub run of the commit you will tag must be green. The pipeline's
   `gate:tests` job enforces it; you check first so a red gate never surprises
   anyone: `gh run list --commit $(git rev-parse HEAD) --json name,conclusion`.
@@ -47,10 +47,17 @@ that can be released and to read its verdicts.
 5. **Read the pipeline** (`http://192.168.31.208:9080/root/athenaeum/-/pipelines`, or
    the API with the PAT in `~/.config/athenaeum-ci/gitlab-pat`):
    - `gate` — `check:versions` (the only job in stage `gate`) red: a version file disagrees with the tag → fix,
-     delete the tag on both remotes, retag. `gate:tests` (stage `build`, after linux build chain, polls GitHub up to 50 min) red: GitHub is red →
-     same.
-   - `build` — a runner problem: memory `reference-macos-runner-wedge` (Mac),
-     `reference-linux-ci-runner`. A plain retry of the one job is the first move.
+     delete the tag on both remotes, retag.
+   - `build` — three kinds of jobs run here. The seven platform-build jobs (`build:windows`,
+     `build:linux`, `build:macos`, `build:perseus:*`) usually fail on runner problems (memory
+     `reference_macos_runner_wedge` for Mac, `reference_linux_ci_runner` for Linux); a plain
+     retry of the one job is the first move. `check:headless-core` red: a feature-gated compile
+     break — a module reaching into `plate_solve`/`registration`/`catalog` without the matching
+     `#[cfg]` (every `--workspace` command builds with `default = ["render", "solver"]`, so it
+     compiles locally and fails only here and in Perseus jobs; this is exactly what happened to
+     v0.5.5) → fix the code on `main`, get green, delete the tag on both remotes, retag; never
+     retry the job. `gate:tests` (stage `build`, polls GitHub up to 50 min) red: GitHub is red →
+     same fix-and-retag.
    - `publish` — `docs:publish` red without `DOCS_REPO_TOKEN`: create the token
      (artfrom-space, Maintainer, write_repository), set the variable, retry the
      job. Docker jobs are yellow-on-failure by design; the verify stage decides.
