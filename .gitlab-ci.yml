@@ -10,7 +10,7 @@ stages:
   - deploy    # rename + upload to artfrom.space/builds/<tag>/
   - publish   # Docker Hub (3 jobs) + the docs site
   - verify    # fetch everything back; Gatekeeper on the real DMGs; BLOCKING
-  - announce  # GitLab Release, version.json, Discord, Telegram — only after verify
+  - announce  # GitLab Release, version.json, channel symlinks, Discord, Telegram — only after verify
 
 variables:
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
@@ -47,7 +47,7 @@ build:windows:
   # Dedicated windows machine — starts parallel to linux/macos, gated only on
   # the (seconds-long) check:versions job. (The old `needs: build:linux` gate
   # predates the dedicated runner and cost every release a serialized ~14 min.)
-  needs: [check:versions]
+  needs: ["check:versions"]
   cache:
     key: "main-windows"
     # pull-push: each release refreshes the machine-local cache with the dep
@@ -86,7 +86,7 @@ build:linux:
     - linux
   only:
     - tags
-  needs: [check:versions]
+  needs: ["check:versions"]
   variables:
     # The ubuntu24 runner has fuse3 only; the linuxdeploy AppImage that
     # tauri-bundler downloads dlopens libfuse.so.2 and dies without this.
@@ -228,7 +228,7 @@ build:macos:
     - macos
   only:
     - tags
-  needs: [check:versions]
+  needs: ["check:versions"]
   cache:
     key: "main-macos"
     # pull-push: see build:windows — releases keep their own cache warm.
@@ -252,7 +252,8 @@ build:macos:
     # import the cert WITHOUT a key-partition-list, and codesign then fails with
     # "Developer ID Application: … no identity found". Signing instead uses
     # APPLE_SIGNING_IDENTITY against the keychain set up in before_script (which
-    # DOES have the partition-list). Notarization still uses APPLE_API_* (untouched).
+    # DOES have the partition-list). The `unset` above does not touch
+    # APPLE_API_* — the DMG loop below needs them.
     - unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
     # Tauri SIGNS the .app (APPLE_SIGNING_IDENTITY) but does NOT notarize it:
     # the three APPLE_API_* variables are withheld from this step, so the only
@@ -327,7 +328,7 @@ build:perseus:macos:
     - macos
   only:
     - tags
-  needs: [check:versions]
+  needs: ["check:versions"]
   script:
     - export PATH="$HOME/.cargo/bin:$PATH"
     - rustup target add x86_64-apple-darwin
@@ -398,7 +399,7 @@ build:perseus:linux:
     - linux
   only:
     - tags
-  needs: [check:versions]
+  needs: ["check:versions"]
   before_script:
     - source "$HOME/.cargo/env"
     # The desktop (tray) variant links against gtk/appindicator AND libxdo (-lxdo).
@@ -461,7 +462,7 @@ build:perseus:linux-arm64:
     - macos          # OrbStack docker, native arm64 container build
   only:
     - tags
-  needs: [check:versions]
+  needs: ["check:versions"]
   script:
     # Drop stale perseus artifacts from a prior run (persistent runner host).
     - rm -f target/debian/perseus*.deb target/debian/perseus*.tar.gz
@@ -500,9 +501,35 @@ gate:tests:
   script:
     - .gitlab/ci/scripts/github_checks_gate.sh
 
+# --- Shared SSH deploy setup (hidden template job) ---
+# Single source of truth for the pinned-host-key ssh-agent dance shared by
+# deploy, publish_version and publish:channel-link. before_script starts the
+# agent, adds the deploy key, pins ~/.ssh/known_hosts from SSH_KNOWN_HOSTS
+# (falling back to an unpinned ssh-keyscan TOFU with a warning — the same
+# contract as the docs site's CI), then exports SSH_CMD/SCP_CMD with
+# StrictHostKeyChecking=yes; after_script kills the agent. Each consumer
+# keeps its own stage/tags/only/needs/variables/script and must set
+# DEPLOY_PORT (and, if it uses ${BUILDS_PATH}, that too).
+.ssh_deploy_setup:
+  before_script:
+    - eval $(ssh-agent -s)
+    - chmod 400 "$DEPLOY_SSH_KEY"
+    - ssh-add "$DEPLOY_SSH_KEY"
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    # Pin the host key from SSH_KNOWN_HOSTS when set (ssh-keyscan -p 40022 <host>),
+    # fall back to TOFU with a warning — the same contract as the docs site's CI.
+    - |
+      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts; echo "known_hosts pinned"
+      else echo "WARNING: SSH_KNOWN_HOSTS unset — unpinned ssh-keyscan (TOFU)"; ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null; fi
+    - export SSH_CMD="ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
+    - export SCP_CMD="scp -P ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
+  after_script:
+    - ssh-agent -k 2>/dev/null || true
+
 # --- Deploy to Web Server (tags only) ---
 deploy:
   stage: deploy
+  extends: .ssh_deploy_setup
   tags:
     - linux
   only:
@@ -527,18 +554,6 @@ deploy:
       artifacts: true
     - job: gate:tests
       artifacts: false
-  before_script:
-    - eval $(ssh-agent -s)
-    - chmod 400 "$DEPLOY_SSH_KEY"
-    - ssh-add "$DEPLOY_SSH_KEY"
-    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    # Pin the host key from SSH_KNOWN_HOSTS when set (ssh-keyscan -p 40022 <host>),
-    # fall back to TOFU with a warning — the same contract as the docs site's CI.
-    - |
-      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts; echo "known_hosts pinned"
-      else echo "WARNING: SSH_KNOWN_HOSTS unset — unpinned ssh-keyscan (TOFU)"; ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null; fi
-    - export SSH_CMD="ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
-    - export SCP_CMD="scp -P ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
   script:
     - . .gitlab/ci/scripts/artifact_names.sh
     - export VERSION="${CI_COMMIT_TAG#v}"
@@ -565,19 +580,21 @@ deploy:
     - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos ${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus"
     - for d in windows macos linux perseus; do ${SCP_CMD} release_stage/$d/* ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/$d/; done
     # Stable aliases (version-less) + legacy aliases (pre-rename spellings, until v0.7.0).
+    # Written via mktemp (outside the checkout) and removed right after use so
+    # the job leaves nothing behind in the working tree.
     - |
+      ALIAS_CMDS="$(mktemp)"
       { echo "set -e"
         all_release_artifacts | while read -r product os arch ext variant subdir filename alias; do
           echo "ln -sfn '$filename' '${BUILDS_PATH}/${CI_COMMIT_TAG}/$subdir/$alias'"; done
         legacy_alias_pairs | while read -r subdir legacy current; do
           echo "ln -sfn '$current' '${BUILDS_PATH}/${CI_COMMIT_TAG}/$subdir/$legacy'"; done
-      } > alias_cmds.sh
-      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "bash -s" < alias_cmds.sh
-    - |
-      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/beta"
-      else ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"; fi
-  after_script:
-    - ssh-agent -k 2>/dev/null || true
+      } > "$ALIAS_CMDS"
+      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "bash -s" < "$ALIAS_CMDS"
+      rm -f "$ALIAS_CMDS"
+    # The `builds/latest` / `builds/beta` channel symlink flip does NOT happen
+    # here any more — it moved to publish:channel-link (stage announce, after
+    # verify): see that job's comment for why.
 
 # --- Docs site publish (tags only) ---
 docs:publish:
@@ -590,7 +607,12 @@ docs:publish:
   script:
     # DOCS_REPO_TOKEN: artfrom-space project access token (Maintainer, write_repository).
     # This job is REQUIRED — the chat announcements link the post it writes.
-    - TAG="${CI_COMMIT_TAG}" RELEASE_DATE="$(date -u -d "${CI_COMMIT_TIMESTAMP}" +%Y-%m-%d)" .gitlab/ci/scripts/docs_publish.sh
+    # RELEASE_DATE uses the commit's own recorded offset (no `-u`): GNU date on
+    # the runner parses CI_COMMIT_TIMESTAMP's ISO-8601 offset directly, so a
+    # tag pushed at 01:00-02:00 local (+03:00, this project's normal release
+    # time) dates the post/history row that SAME calendar day instead of the
+    # UTC-converted previous one.
+    - TAG="${CI_COMMIT_TAG}" RELEASE_DATE="$(date -d "${CI_COMMIT_TIMESTAMP}" +%Y-%m-%d)" .gitlab/ci/scripts/docs_publish.sh
 
 # --- Verify (tags only, BLOCKING) ---
 # Nothing in `announce` runs until both of these pass: fetch every published
@@ -635,8 +657,17 @@ verify:macos-gatekeeper:
         spctl -a -t open --context context:primary-signature -v "gk/$f"
         mnt="$PWD/gk/mnt-$arch"; mkdir -p "$mnt"
         hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "gk/$f" >/dev/null
-        spctl -a -t exec -vv "$mnt/Athenaeum.app" 2>&1 | tee "gk/spctl-$arch.txt"
-        grep -q "source=Notarized Developer ID" "gk/spctl-$arch.txt" || { echo "ERROR: $f: app inside is not accepted as Notarized Developer ID"; hdiutil detach "$mnt" >/dev/null || true; exit 1; }
+        # Capture spctl's verdict instead of piping it straight to tee: the
+        # runner's shell runs with `set -eo pipefail`, so a REJECTED app
+        # (spctl exits non-zero) would abort the pipeline right here and the
+        # ERROR line below would never run.
+        set +e; out=$(spctl -a -t exec -vv "$mnt/Athenaeum.app" 2>&1); rc=$?; set -e
+        printf '%s\n' "$out" | tee "gk/spctl-$arch.txt"
+        if [ "$rc" -ne 0 ] || ! grep -q "source=Notarized Developer ID" "gk/spctl-$arch.txt"; then
+          echo "ERROR: $f: app inside is not accepted as Notarized Developer ID (spctl rc=$rc)"
+          hdiutil detach "$mnt" >/dev/null || true
+          exit 1
+        fi
         hdiutil detach "$mnt" >/dev/null
         echo "ok: $f accepted by Gatekeeper"
       done
@@ -660,6 +691,7 @@ release:
 
 publish_version:
   stage: announce
+  extends: .ssh_deploy_setup
   tags:
     - linux
   only:
@@ -671,18 +703,6 @@ publish_version:
       artifacts: false
   variables:
     DEPLOY_PORT: "40022"
-  before_script:
-    - eval $(ssh-agent -s)
-    - chmod 400 "$DEPLOY_SSH_KEY"
-    - ssh-add "$DEPLOY_SSH_KEY"
-    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    # Pin the host key from SSH_KNOWN_HOSTS when set (ssh-keyscan -p 40022 <host>),
-    # fall back to TOFU with a warning — the same contract as the docs site's CI.
-    - |
-      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts; echo "known_hosts pinned"
-      else echo "WARNING: SSH_KNOWN_HOSTS unset — unpinned ssh-keyscan (TOFU)"; ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null; fi
-    - export SSH_CMD="ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
-    - export SCP_CMD="scp -P ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
   script:
     - VERSION=${CI_COMMIT_TAG#v}
     - |
@@ -697,8 +717,35 @@ publish_version:
     # makes the scp overwrite fail with EACCES; unlink only needs dir write.
     - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "rm -f /var/www/artfrom.space/${TARGET}"
     - ${SCP_CMD} "$TARGET" ${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/artfrom.space/"$TARGET"
-  after_script:
-    - ssh-agent -k 2>/dev/null || true
+
+# --- Channel link (only on tags) ---
+# The version-less `builds/latest` / `builds/beta` symlink flip used to run
+# inside `deploy`, two stages before verify — which meant a DMG that later
+# failed verify:macos-gatekeeper was ALREADY reachable through the permanent
+# `builds/latest/...` links a rejected build must never be linkable from. The
+# flip moves here instead: the version-less links move only after verify — a
+# rejected build never becomes `latest`. verify_release.sh only ever reads
+# `builds/<tag>/…` (the frozen, tag-scoped paths `deploy` already wrote), so
+# nothing there needs to change.
+publish:channel-link:
+  stage: announce
+  extends: .ssh_deploy_setup
+  tags:
+    - linux
+  only:
+    - tags
+  needs:
+    - job: verify:release
+      artifacts: false
+    - job: verify:macos-gatekeeper
+      artifacts: false
+  variables:
+    DEPLOY_PORT: "40022"
+    BUILDS_PATH: "/var/www/artfrom.space/builds"
+  script:
+    - |
+      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/beta"
+      else ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"; fi
 
 # --- Chat Notifications (only on tags) ---
 # After everything is verified as published (stage `verify`), post the
