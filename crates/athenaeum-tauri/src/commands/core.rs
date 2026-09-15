@@ -196,10 +196,11 @@ async fn fetch_version_json(
     installation_id: &str,
 ) -> Option<VersionJson> {
     let url = format!(
-        "https://artfrom.space/{}?v={}&os={}&commit={}&id={}",
+        "https://artfrom.space/{}?v={}&os={}&arch={}&commit={}&id={}",
         filename,
         current_version,
         std::env::consts::OS,
+        std::env::consts::ARCH,
         env!("ATHENAEUM_GIT_HASH"),
         installation_id,
     );

@@ -5,9 +5,12 @@ workflow:
     - when: never
 
 stages:
-  - build
-  - deploy
-  - release
+  - gate      # check:versions — refuse a tag that cannot be a release
+  - build     # the seven installers + check:headless-core + gate:tests
+  - deploy    # rename + upload to artfrom.space/builds/<tag>/
+  - publish   # Docker Hub (3 jobs) + the docs site
+  - verify    # fetch everything back; Gatekeeper on the real DMGs; BLOCKING
+  - announce  # GitLab Release, version.json, Discord, Telegram — only after verify
 
 variables:
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
@@ -20,6 +23,20 @@ variables:
   GIT_SUBMODULE_STRATEGY: recursive
   GIT_SUBMODULE_DEPTH: 1
 
+# --- Gate (tags only) ---
+# One refusal before a single build minute is spent: the six version files
+# must equal the tag (bump.sh's job to make them so). The other half of the
+# gate, gate:tests — the tagged commit's GitHub check-suite, the only place
+# tests actually run — lives down in the `build` stage, not here (see its
+# own comment below for why); the `gate` stage itself holds only this job.
+check:versions:
+  stage: gate
+  tags: [linux]
+  only: [tags]
+  needs: []
+  script:
+    - TAG="${CI_COMMIT_TAG}" .gitlab/ci/scripts/check_versions.sh
+
 # --- Windows Build ---
 build:windows:
   stage: build
@@ -27,10 +44,10 @@ build:windows:
     - windows
   only:
     - tags
-  # Dedicated windows machine — start immediately, parallel to linux/macos.
-  # (The old `needs: build:linux` gate predates the dedicated runner and cost
-  # every release a serialized ~14 min.)
-  needs: []
+  # Dedicated windows machine — starts parallel to linux/macos, gated only on
+  # the (seconds-long) check:versions job. (The old `needs: build:linux` gate
+  # predates the dedicated runner and cost every release a serialized ~14 min.)
+  needs: [check:versions]
   cache:
     key: "main-windows"
     # pull-push: each release refreshes the machine-local cache with the dep
@@ -69,6 +86,7 @@ build:linux:
     - linux
   only:
     - tags
+  needs: [check:versions]
   variables:
     # The ubuntu24 runner has fuse3 only; the linuxdeploy AppImage that
     # tauri-bundler downloads dlopens libfuse.so.2 and dies without this.
@@ -210,6 +228,7 @@ build:macos:
     - macos
   only:
     - tags
+  needs: [check:versions]
   cache:
     key: "main-macos"
     # pull-push: see build:windows — releases keep their own cache warm.
@@ -235,12 +254,13 @@ build:macos:
     # APPLE_SIGNING_IDENTITY against the keychain set up in before_script (which
     # DOES have the partition-list). Notarization still uses APPLE_API_* (untouched).
     - unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-    # With APPLE_SIGNING_IDENTITY + APPLE_API_* present, these sign + notarize +
-    # staple the .app for each arch automatically.
-    - npm run tauri build -- --target aarch64-apple-darwin
-    - npm run tauri build -- --target x86_64-apple-darwin
-    # Notarize + staple the DMGs themselves (robust on macOS Sequoia, where a
-    # downloaded non-notarized dmg can still trigger Gatekeeper).
+    # Tauri SIGNS the .app (APPLE_SIGNING_IDENTITY) but does NOT notarize it:
+    # the three APPLE_API_* variables are withheld from this step, so the only
+    # notarization per architecture is the DMG's below (ruling F5.1 — two
+    # notary waits per release instead of four; the DMG ticket covers the app
+    # inside, which verify:macos-gatekeeper proves on the published file).
+    - env -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH npm run tauri build -- --target aarch64-apple-darwin
+    - env -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH npm run tauri build -- --target x86_64-apple-darwin
     - |
       for DMG in target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
                  target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do
@@ -255,72 +275,30 @@ build:macos:
       - target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
     expire_in: 30 days
 
-# --- Cache Warmers (update cache periodically on main) ---
-update-cache:windows:
+# --- Runner smoke (main, manual) ---
+# A ten-second job per runner to prove it takes work — the thing to play after
+# a runner restart or a machine reboot. It is NOT a build. Replaces the old
+# update-cache:{windows,linux,macos} warmers: the build jobs are `pull-push`
+# since `8baaaedb`, so every tagged release already refreshes its own
+# machine-local cache and a separate manual warmer was dead weight.
+.runner_smoke:
   stage: build
-  tags:
-    - windows
-  only:
-    - main
+  only: [main]
   when: manual
-  cache:
-    key: "main-windows"
-    policy: push
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
   script:
-    # No cmake/nasm bootstrap — see build:windows.
-    - npm install
-    - npm run tauri build
+    - echo "runner ok on $(hostname)"; pwd; echo "PWD=$PWD"
 
-update-cache:linux:
-  stage: build
-  tags:
-    - linux
-  only:
-    - main
-  when: manual
-  before_script:
-    - source "$HOME/.cargo/env"
-    # No cmake/nasm host precheck — see build:linux.
-  cache:
-    key: "main-linux"
-    policy: push
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
+smoke:macos:
+  extends: .runner_smoke
+  tags: [macos]
+smoke:linux:
+  extends: .runner_smoke
+  tags: [linux]
+smoke:windows:
+  extends: .runner_smoke
+  tags: [windows]
   script:
-    - export RUSTAFITS_PORTABLE=1
-    - npm install
-    - npm run tauri build
-
-update-cache:macos:
-  stage: build
-  tags:
-    - macos
-  only:
-    - main
-  when: manual
-  cache:
-    key: "main-macos"
-    policy: push
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
-  script:
-    # No cmake/nasm bootstrap — see build:macos.
-    - export PATH="$HOME/.cargo/bin:$PATH"
-    - rustup target add x86_64-apple-darwin
-    - npm install
-    - npm run tauri build -- --target aarch64-apple-darwin
-    - npm run tauri build -- --target x86_64-apple-darwin
+    - Write-Output "runner ok on $env:COMPUTERNAME"; Get-Location
 
 # --- Perseus (headless sync agent) — desktop installers (tags only) ---
 # Perseus ships as its own set of installers alongside Athenaeum. What each job
@@ -349,6 +327,7 @@ build:perseus:macos:
     - macos
   only:
     - tags
+  needs: [check:versions]
   script:
     - export PATH="$HOME/.cargo/bin:$PATH"
     - rustup target add x86_64-apple-darwin
@@ -379,7 +358,7 @@ build:perseus:windows:
   only:
     - tags
   needs:
-    # Serialize on the shared windows runner (warm target/, no concurrent cargo).
+    - check:versions
     - job: build:windows
       artifacts: false
   script:
@@ -419,6 +398,7 @@ build:perseus:linux:
     - linux
   only:
     - tags
+  needs: [check:versions]
   before_script:
     - source "$HOME/.cargo/env"
     # The desktop (tray) variant links against gtk/appindicator AND libxdo (-lxdo).
@@ -481,6 +461,7 @@ build:perseus:linux-arm64:
     - macos          # OrbStack docker, native arm64 container build
   only:
     - tags
+  needs: [check:versions]
   script:
     # Drop stale perseus artifacts from a prior run (persistent runner host).
     - rm -f target/debian/perseus*.deb target/debian/perseus*.tar.gz
@@ -492,6 +473,33 @@ build:perseus:linux-arm64:
       - target/debian/*.tar.gz
     expire_in: 30 days
 
+# --- Test gate (tags only) ---
+# Answers "did the tagged commit's tests pass?" by polling the tagged
+# commit's GitHub check-suite — the only place tests actually run (GitHub
+# Actions, .github/workflows/ci.yml). It sits in the `build` stage, not
+# `gate`, on purpose: the linux runner runs one job at a time, so a
+# gate-stage job here — which can poll for up to 50 minutes — would hold
+# the runner and delay every linux build behind it. Anchored on `needs:`
+# instead of the stage boundary, it only starts once build:linux,
+# build:perseus:linux and check:headless-core have cleared the linux
+# runner (~30 min into a normal release, well inside the macOS build's own
+# critical path), so its poll costs no wall clock — deploy (stage `deploy`)
+# still `needs` it before uploading anything.
+gate:tests:
+  stage: build
+  tags: [linux]
+  only: [tags]
+  needs:
+    - job: build:linux
+      artifacts: false
+    - job: build:perseus:linux
+      artifacts: false
+    - job: check:headless-core
+      artifacts: false
+  timeout: 55m
+  script:
+    - .gitlab/ci/scripts/github_checks_gate.sh
+
 # --- Deploy to Web Server (tags only) ---
 deploy:
   stage: deploy
@@ -502,8 +510,6 @@ deploy:
   variables:
     DEPLOY_PORT: "40022"
     BUILDS_PATH: "/var/www/artfrom.space/builds"
-    SSH_CMD: "ssh -p ${DEPLOY_PORT}"
-    SCP_CMD: "scp -P ${DEPLOY_PORT}"
   needs:
     - job: build:linux
       artifacts: true
@@ -519,140 +525,164 @@ deploy:
       artifacts: true
     - job: build:perseus:linux-arm64
       artifacts: true
+    - job: gate:tests
+      artifacts: false
   before_script:
     - eval $(ssh-agent -s)
     - chmod 400 "$DEPLOY_SSH_KEY"
     - ssh-add "$DEPLOY_SSH_KEY"
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+    # Pin the host key from SSH_KNOWN_HOSTS when set (ssh-keyscan -p 40022 <host>),
+    # fall back to TOFU with a warning — the same contract as the docs site's CI.
+    - |
+      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts; echo "known_hosts pinned"
+      else echo "WARNING: SSH_KNOWN_HOSTS unset — unpinned ssh-keyscan (TOFU)"; ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null; fi
+    - export SSH_CMD="ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
+    - export SCP_CMD="scp -P ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
   script:
-    # Rename artifacts to include tag in filename
-    - mv target/release/bundle/appimage/*.AppImage "target/release/bundle/appimage/athenaeum_${CI_COMMIT_TAG}_amd64.AppImage"
-    - mv target/release/bundle/deb/*.deb "target/release/bundle/deb/athenaeum_${CI_COMMIT_TAG}_amd64.deb"
-    - mv target/release/bundle/msi/*.msi "target/release/bundle/msi/Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi"
-    - mv target/release/bundle/nsis/*.exe "target/release/bundle/nsis/Athenaeum_${CI_COMMIT_TAG}_x64-setup.exe"
-    - mv target/aarch64-apple-darwin/release/bundle/dmg/*.dmg "target/aarch64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg"
-    - mv target/x86_64-apple-darwin/release/bundle/dmg/*.dmg "target/x86_64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_x64.dmg"
-    # Create directories on remote
+    - . .gitlab/ci/scripts/artifact_names.sh
+    - export VERSION="${CI_COMMIT_TAG#v}"
+    # One staging dir laid out exactly like the server: <subdir>/<final name>.
+    - rm -rf release_stage && mkdir -p release_stage/windows release_stage/macos release_stage/linux release_stage/perseus
+    - cp target/release/bundle/msi/*.msi                          "release_stage/windows/$(artifact_name athenaeum windows x64 msi)"
+    - cp target/release/bundle/nsis/*.exe                         "release_stage/windows/$(artifact_name athenaeum windows x64 exe setup)"
+    - cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg     "release_stage/macos/$(artifact_name athenaeum macos arm64 dmg)"
+    - cp target/x86_64-apple-darwin/release/bundle/dmg/*.dmg      "release_stage/macos/$(artifact_name athenaeum macos x64 dmg)"
+    - cp target/release/bundle/appimage/*.AppImage                "release_stage/linux/$(artifact_name athenaeum linux x64 AppImage)"
+    - cp target/release/bundle/deb/*.deb                          "release_stage/linux/$(artifact_name athenaeum linux x64 deb)"
+    - cp target/aarch64-apple-darwin/release/bundle/perseus-*-macos-arm64.dmg "release_stage/perseus/$(artifact_name perseus macos arm64 dmg)"
+    - cp target/x86_64-apple-darwin/release/bundle/perseus-*-macos-x64.dmg    "release_stage/perseus/$(artifact_name perseus macos x64 dmg)"
+    - cp crates/perseus/packaging/windows/perseus-*-setup.exe     "release_stage/perseus/$(artifact_name perseus windows x64 exe setup)"
+    - cp target/debian/perseus_*_amd64.deb                        "release_stage/perseus/$(artifact_name perseus linux x64 deb)"
+    - cp target/debian/perseus-*-linux-amd64.tar.gz               "release_stage/perseus/$(artifact_name perseus linux x64 tar.gz)"
+    - cp target/debian/perseus-headless_*_arm64.deb               "release_stage/perseus/$(artifact_name perseus linux arm64 deb)"
+    - cp target/debian/perseus-*-linux-arm64.tar.gz               "release_stage/perseus/$(artifact_name perseus linux arm64 tar.gz)"
+    # Every inventory line must now exist — a glob that matched nothing above fails here, not on the server.
+    - |
+      while read -r product os arch ext variant subdir filename alias; do
+        [ -s "release_stage/$subdir/$filename" ] || { echo "ERROR: missing release_stage/$subdir/$filename"; exit 1; }
+      done < <(all_release_artifacts)
     - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos ${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus"
-    # Upload Linux artifacts
-    - ${SCP_CMD} target/release/bundle/appimage/*.AppImage target/release/bundle/deb/*.deb ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/linux/
-    # Upload Windows artifacts
-    - ${SCP_CMD} target/release/bundle/msi/*.msi target/release/bundle/nsis/*.exe ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/windows/
-    # Upload macOS artifacts
-    - ${SCP_CMD} target/aarch64-apple-darwin/release/bundle/dmg/*.dmg target/x86_64-apple-darwin/release/bundle/dmg/*.dmg ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/macos/
-    # Stable-named aliases inside the release dir so the download page can carry
-    # permanent direct links via builds/latest/... (real filenames embed the tag,
-    # which would break static links on every release).
+    - for d in windows macos linux perseus; do ${SCP_CMD} release_stage/$d/* ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/$d/; done
+    # Stable aliases (version-less) + legacy aliases (pre-rename spellings, until v0.7.0).
     - |
-      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "set -e
-        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows
-        ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi Athenaeum-windows-x64.msi
-        ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64-setup.exe Athenaeum-windows-x64-setup.exe
-        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux
-        ln -sfn athenaeum_${CI_COMMIT_TAG}_amd64.AppImage athenaeum-linux-x86_64.AppImage
-        ln -sfn athenaeum_${CI_COMMIT_TAG}_amd64.deb athenaeum-linux-amd64.deb
-        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos
-        ln -sfn Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg Athenaeum-macos-aarch64.dmg
-        ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64.dmg Athenaeum-macos-x64.dmg"
-    # --- Perseus artifacts ---
-    # dmg/exe names already embed the version (no `v`); the debs get renamed to
-    # carry the tag. Headless arm64 deb PREFIXES the package name (perseus-headless_*).
-    # VERSION (tag without the leading v) is interpolated locally into the alias
-    # block below because ${CI_COMMIT_TAG#v} does not expand inside the remote
-    # double-quoted ssh payload.
-    - VERSION="${CI_COMMIT_TAG#v}"
-    # Retry guard: on a re-run the previously renamed debs still match the source
-    # globs below (perseus_*_amd64.deb), so `mv` would see two sources and fail.
-    # Drop the prior renamed targets first (perseus lines only).
-    - rm -f "target/debian/perseus_${CI_COMMIT_TAG}_amd64.deb" "target/debian/perseus_${CI_COMMIT_TAG}_arm64.deb"
-    - mv target/debian/perseus_*_amd64.deb "target/debian/perseus_${CI_COMMIT_TAG}_amd64.deb"
-    - mv target/debian/perseus-headless_*_arm64.deb "target/debian/perseus_${CI_COMMIT_TAG}_arm64.deb"
-    - ${SCP_CMD}
-        target/aarch64-apple-darwin/release/bundle/perseus-*-macos-arm64.dmg
-        target/x86_64-apple-darwin/release/bundle/perseus-*-macos-x64.dmg
-        crates/perseus/packaging/windows/perseus-*-setup.exe
-        target/debian/perseus_${CI_COMMIT_TAG}_amd64.deb
-        target/debian/perseus_${CI_COMMIT_TAG}_arm64.deb
-        target/debian/perseus-*-linux-amd64.tar.gz
-        target/debian/perseus-*-linux-arm64.tar.gz
-        ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus/
-    # Stable-named aliases (download page carries permanent beta links)
+      { echo "set -e"
+        all_release_artifacts | while read -r product os arch ext variant subdir filename alias; do
+          echo "ln -sfn '$filename' '${BUILDS_PATH}/${CI_COMMIT_TAG}/$subdir/$alias'"; done
+        legacy_alias_pairs | while read -r subdir legacy current; do
+          echo "ln -sfn '$current' '${BUILDS_PATH}/${CI_COMMIT_TAG}/$subdir/$legacy'"; done
+      } > alias_cmds.sh
+      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "bash -s" < alias_cmds.sh
     - |
-      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "set -e
-        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus
-        ln -sfn perseus-${VERSION}-macos-arm64.dmg perseus-macos-arm64.dmg
-        ln -sfn perseus-${VERSION}-macos-x64.dmg perseus-macos-x64.dmg
-        ln -sfn perseus-${VERSION}-windows-x64-setup.exe perseus-windows-x64-setup.exe
-        ln -sfn perseus_${CI_COMMIT_TAG}_amd64.deb perseus-linux-amd64.deb
-        ln -sfn perseus_${CI_COMMIT_TAG}_arm64.deb perseus-linux-arm64.deb"
-    # Update symlink: beta tags → builds/beta, stable tags → builds/latest
-    - |
-      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
-        ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/beta"
-      else
-        ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"
-      fi
+      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/beta"
+      else ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"; fi
   after_script:
     - ssh-agent -k 2>/dev/null || true
 
-# --- Release (only on tags) ---
-release:
-  stage: release
-  tags:
-    - linux
-  only:
-    - tags
+# --- Docs site publish (tags only) ---
+docs:publish:
+  stage: publish
+  tags: [linux]
+  only: [tags]
   needs:
     - job: deploy
       artifacts: false
   script:
-    - |
-      curl --fail --silent --show-error \
-        --request POST \
-        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-        --header "Content-Type: application/json" \
-        --data "{
-          \"tag_name\": \"${CI_COMMIT_TAG}\",
-          \"name\": \"Athenaeum ${CI_COMMIT_TAG}\",
-          \"description\": $(cat RELEASE_NOTES.md 2>/dev/null | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '\"Release '${CI_COMMIT_TAG}'\"'),
-          \"assets\": {
-            \"links\": [
-              {\"name\": \"Windows Installer (MSI)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/windows/Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi\"},
-              {\"name\": \"Windows Installer (EXE)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/windows/Athenaeum_${CI_COMMIT_TAG}_x64-setup.exe\"},
-              {\"name\": \"Linux AppImage\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/linux/athenaeum_${CI_COMMIT_TAG}_amd64.AppImage\"},
-              {\"name\": \"Linux Debian Package\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/linux/athenaeum_${CI_COMMIT_TAG}_amd64.deb\"},
-              {\"name\": \"macOS Disk Image (Apple Silicon)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg\"},
-              {\"name\": \"macOS Disk Image (Intel)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/Athenaeum_${CI_COMMIT_TAG}_x64.dmg\"},
-              {\"name\": \"Perseus for macOS (Apple Silicon)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-macos-arm64.dmg\"},
-              {\"name\": \"Perseus for macOS (Intel)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-macos-x64.dmg\"},
-              {\"name\": \"Perseus for Windows\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-windows-x64-setup.exe\"},
-              {\"name\": \"Perseus for Linux (amd64 deb)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-linux-amd64.deb\"},
-              {\"name\": \"Perseus for Linux (arm64 deb, headless)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-linux-arm64.deb\"}
-            ]
-          }
-        }" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+    # DOCS_REPO_TOKEN: artfrom-space project access token (Maintainer, write_repository).
+    # This job is REQUIRED — the chat announcements link the post it writes.
+    - TAG="${CI_COMMIT_TAG}" RELEASE_DATE="$(date -u -d "${CI_COMMIT_TIMESTAMP}" +%Y-%m-%d)" .gitlab/ci/scripts/docs_publish.sh
 
-publish_version:
-  stage: release
+# --- Verify (tags only, BLOCKING) ---
+# Nothing in `announce` runs until both of these pass: fetch every published
+# artifact/manifest/blog post back over the network and prove it is really
+# there, then prove the published DMGs are accepted by a real macOS Gatekeeper.
+verify:release:
+  stage: verify
+  tags: [linux]
+  only: [tags]
+  needs:
+    - job: deploy
+      artifacts: false
+    - job: docs:publish
+      artifacts: false
+    - job: publish:dockerhub:manifest
+      artifacts: false
+      optional: true
+  timeout: 30m
+  script:
+    - .gitlab/ci/scripts/verify_release.sh
+
+# Gatekeeper on the PUBLISHED DMGs, on a Mac, every release: the battery from
+# memory project_macos_signing, automated. Proves ruling F5.1 (one notarization
+# per DMG) on the real files users download.
+verify:macos-gatekeeper:
+  stage: verify
+  tags: [macos]
+  only: [tags]
+  needs:
+    - job: deploy
+      artifacts: false
+  script:
+    - . .gitlab/ci/scripts/artifact_names.sh
+    - export VERSION="${CI_COMMIT_TAG#v}"
+    - rm -rf gk && mkdir gk
+    - |
+      set -e
+      for arch in arm64 x64; do
+        f="$(artifact_name athenaeum macos "$arch" dmg)"
+        curl -fsSL -o "gk/$f" "https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/$f"
+        xcrun stapler validate "gk/$f"
+        spctl -a -t open --context context:primary-signature -v "gk/$f"
+        mnt="$PWD/gk/mnt-$arch"; mkdir -p "$mnt"
+        hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "gk/$f" >/dev/null
+        spctl -a -t exec -vv "$mnt/Athenaeum.app" 2>&1 | tee "gk/spctl-$arch.txt"
+        grep -q "source=Notarized Developer ID" "gk/spctl-$arch.txt" || { echo "ERROR: $f: app inside is not accepted as Notarized Developer ID"; hdiutil detach "$mnt" >/dev/null || true; exit 1; }
+        hdiutil detach "$mnt" >/dev/null
+        echo "ok: $f accepted by Gatekeeper"
+      done
+  after_script:
+    - for m in gk/mnt-*; do [ -d "$m" ] && hdiutil detach "$m" >/dev/null 2>&1 || true; done
+
+# --- Release (only on tags) ---
+release:
+  stage: announce
   tags:
     - linux
   only:
     - tags
   needs:
-    - job: deploy
+    - job: verify:release
+      artifacts: false
+    - job: verify:macos-gatekeeper
+      artifacts: false
+  script:
+    - .gitlab/ci/scripts/create_gitlab_release.sh
+
+publish_version:
+  stage: announce
+  tags:
+    - linux
+  only:
+    - tags
+  needs:
+    - job: verify:release
+      artifacts: false
+    - job: verify:macos-gatekeeper
       artifacts: false
   variables:
     DEPLOY_PORT: "40022"
-    SSH_CMD: "ssh -p ${DEPLOY_PORT}"
-    SCP_CMD: "scp -P ${DEPLOY_PORT}"
   before_script:
     - eval $(ssh-agent -s)
     - chmod 400 "$DEPLOY_SSH_KEY"
     - ssh-add "$DEPLOY_SSH_KEY"
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+    # Pin the host key from SSH_KNOWN_HOSTS when set (ssh-keyscan -p 40022 <host>),
+    # fall back to TOFU with a warning — the same contract as the docs site's CI.
+    - |
+      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts; echo "known_hosts pinned"
+      else echo "WARNING: SSH_KNOWN_HOSTS unset — unpinned ssh-keyscan (TOFU)"; ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null; fi
+    - export SSH_CMD="ssh -p ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
+    - export SCP_CMD="scp -P ${DEPLOY_PORT} -o StrictHostKeyChecking=yes"
   script:
     - VERSION=${CI_COMMIT_TAG#v}
     - |
@@ -671,9 +701,11 @@ publish_version:
     - ssh-agent -k 2>/dev/null || true
 
 # --- Chat Notifications (only on tags) ---
-# After the GitLab Release exists, post the contents of RELEASE_NOTES.md to
-# Discord and Telegram. Both are siblings under `needs: [release]` so a failure
-# in one platform does not prevent the other from posting.
+# After everything is verified as published (stage `verify`), post the
+# contents of RELEASE_NOTES.md to Discord and Telegram. Both are siblings
+# under the same verify-pair `needs:` (verify:release + verify:macos-gatekeeper)
+# so a failure in one platform does not prevent the other from posting, and
+# neither can fire before the release is actually confirmed live.
 #
 # Required CI/CD variables (Settings -> CI/CD -> Variables; Masked, Protected):
 #   - DISCORD_WEBHOOK_URL  (full webhook URL)
@@ -686,26 +718,30 @@ publish_version:
 # Spec: docs/superpowers/specs/2026-05-11-release-notes-chat-notifications-design.md
 
 notify:discord:
-  stage: release
+  stage: announce
   tags:
     - linux
   only:
     - tags
   needs:
-    - job: release
+    - job: verify:release
+      artifacts: false
+    - job: verify:macos-gatekeeper
       artifacts: false
   allow_failure: true
   script:
     - .gitlab/ci/scripts/notify_discord.sh
 
 notify:telegram:
-  stage: release
+  stage: announce
   tags:
     - linux
   only:
     - tags
   needs:
-    - job: release
+    - job: verify:release
+      artifacts: false
+    - job: verify:macos-gatekeeper
       artifacts: false
   allow_failure: true
   script:
@@ -723,10 +759,16 @@ notify:telegram:
 #     ${IMAGE}:${VERSION} + ${IMAGE}:${CHANNEL_TAG} via
 #     `docker buildx imagetools create` (index-only, no rebuild/re-push of
 #     image layers).
-# All three are siblings under `needs: [release]` (`artifacts: false`) so a
-# Docker Hub outage cannot fail the GitLab Release itself; the manifest job
-# additionally `needs` both arch jobs, with arm64 `optional: true` so a
-# failed/absent arm64 build never blocks an amd64-only publish.
+# All three now hang off `deploy` (stage `publish`, `needs: [{job: deploy,
+# artifacts: false}]`) instead of the old release job — they start as soon
+# as the installers are uploaded, in parallel with docs:publish, well before
+# the GitLab Release exists. `allow_failure: true` stays on all three: a
+# Docker Hub outage must not fail this stage by itself. It's `verify:release`
+# (stage `verify`) that turns a missing/failed Docker Hub publish into a
+# pipeline-blocking failure — nothing in `announce` fires until verify
+# confirms the manifest tag is really there. The manifest job additionally
+# `needs` both arch jobs, with arm64 `optional: true` so a failed/absent
+# arm64 build never blocks an amd64-only publish.
 #
 # Tag derivation (mirrors the retired .github/workflows/docker.yml):
 #   v0.2.0           -> :0.2.0 + :latest
@@ -771,13 +813,13 @@ notify:telegram:
 #     replaces, which required emulation for the non-native arch.
 
 publish:dockerhub:amd64:
-  stage: release
+  stage: publish
   tags:
     - linux
   only:
     - tags
   needs:
-    - job: release
+    - job: deploy
       artifacts: false
   allow_failure: true
   variables:
@@ -824,13 +866,13 @@ publish:dockerhub:amd64:
     - docker logout docker.io 2>/dev/null || true
 
 publish:dockerhub:arm64:
-  stage: release
+  stage: publish
   tags:
     - macos
   only:
     - tags
   needs:
-    - job: release
+    - job: deploy
       artifacts: false
   allow_failure: true
   variables:
@@ -883,13 +925,13 @@ publish:dockerhub:arm64:
     - docker logout docker.io 2>/dev/null || true
 
 publish:dockerhub:manifest:
-  stage: release
+  stage: publish
   tags:
     - linux
   only:
     - tags
   needs:
-    - job: release
+    - job: deploy
       artifacts: false
     - job: publish:dockerhub:amd64
       artifacts: false
