@@ -36,16 +36,19 @@ runs = {r["name"]: r for r in data.get("check_runs", [])}
 if data.get("total_count", 0) == 0:
     print("none"); sys.exit(0)
 verdict = "ok"
+rank = {"ok": 0, "retry": 1, "fail": 2}
+def worst(v1, v2):
+    return v2 if rank.get(v2, -1) > rank.get(v1, -1) else v1
 for name in required:
     r = runs.get(name)
     if r is None:
-        print(f"waiting: {name} has not started"); verdict = "retry"; continue
+        print(f"waiting: {name} has not started"); verdict = worst(verdict, "retry"); continue
     if r["status"] != "completed":
-        print(f"waiting: {name} is {r['status']}"); verdict = "retry"; continue
+        print(f"waiting: {name} is {r['status']}"); verdict = worst(verdict, "retry"); continue
     if r["conclusion"] in ("success", "skipped", "neutral"):
         print(f"ok: {name} — {r['conclusion']}")
     else:
-        print(f"ERROR: {name} concluded {r['conclusion']}"); verdict = "fail"
+        print(f"ERROR: {name} concluded {r['conclusion']}"); verdict = worst(verdict, "fail")
 print(verdict)
 PY
 )

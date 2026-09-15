@@ -726,6 +726,19 @@ out=$(PATH="$MOCK_BIN:$PATH" CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 GATE_INI
 assert_eq "gate: no runs exits 1" "1" "$rc"
 assert_contains "gate: no-runs message" "ERROR: no GitHub check runs for deadbeef" "$out"
 
+# failure + pending: the gate must fail on the same poll when one check fails,
+# regardless of what its siblings are doing. Regression test for verdict aggregation.
+SEQ_TMP=$(mktemp -d -t gate_fail_regress.XXXXXX)
+cp "$FIXTURES_DIR/github_checks_failure_then_pending.json" "$SEQ_TMP/1.json"
+cp "$FIXTURES_DIR/github_checks_success.json" "$SEQ_TMP/2.json"
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_SEQUENCE_DIR="$SEQ_TMP" MOCK_CURL_COUNTER_FILE="$SEQ_TMP/count" \
+  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
+assert_eq "gate: failure beats pending, exits 1 on first poll" "1" "$rc"
+assert_contains "gate: names the failed check on first poll" "ERROR: Build, test and typecheck concluded failure" "$out"
+assert_eq "gate: does not poll again after failure" "1" "$(cat "$SEQ_TMP/count")"
+rm -rf "$SEQ_TMP"
+
 echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
