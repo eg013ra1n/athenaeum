@@ -70,18 +70,21 @@ pub struct FrameOriginalSnapshot {
 /// Format-aware dispatcher: pulls the canonical FITS keys (UPPERCASE) out
 /// of the stored blob into a HashMap.
 pub fn parse_stored_header_keys(format: FileFormat, header_text: &str) -> HashMap<String, String> {
-    let primary = match format {
+    let mut primary = match format {
         FileFormat::FITS => parse_fits_card_text(header_text),
         FileFormat::XISF => parse_xisf_xml_text(header_text),
     };
     if !primary.is_empty() {
+        primary.insert("__RA_COMMENT".into(), super::ra_units::comment(header_text));
         return primary;
     }
     // Some capture tools (notably ASIAIR) persist the header as a plain
     // "KEY = value" text dump rather than 80-col FITS cards or XISF XML, so
     // the format-specific parser yields nothing. Fall back to a line parser
     // so "revert to original" / metadata snapshots still work.
-    parse_keyword_eq_text(header_text)
+    let mut keys = parse_keyword_eq_text(header_text);
+    keys.insert("__RA_COMMENT".into(), super::ra_units::comment(header_text));
+    keys
 }
 
 /// Parse a plain "KEY = value" header dump (one keyword per line, banner /
@@ -168,7 +171,19 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
     // with `rotation`, which already picks up CD-matrix derived values.
     let ra = get("OBJCTRA")
         .and_then(|s| crate::coordinates::parse_ra_sexagesimal(&s).ok())
-        .or_else(|| get("RA").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| {
+            get("RA").and_then(|s| s.parse::<f64>().ok()).and_then(|r| {
+                super::ra_units::resolve(
+                    r,
+                    get("RAUNIT")
+                        .or_else(|| get("__RA_COMMENT"))
+                        .as_deref()
+                        .unwrap_or(""),
+                    None,
+                    None,
+                )
+            })
+        })
         .or_else(|| get("CRVAL1").and_then(|s| s.parse::<f64>().ok()));
     let dec = get("OBJCTDEC")
         .and_then(|s| crate::coordinates::parse_dec_sexagesimal(&s).ok())
