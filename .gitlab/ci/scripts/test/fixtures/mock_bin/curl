@@ -96,6 +96,21 @@ case "$url" in
     [ -n "$notify_body" ] || notify_body='{"ok":true}'
     printf '%s' "$notify_body" > "$output_file"
     ;;
+  *api.github.com/repos/*/check-runs*)
+    # github_checks_gate.sh. MOCK_CURL_GITHUB_HTTP (200), MOCK_CURL_GITHUB_BODY_FILE,
+    # or MOCK_CURL_GITHUB_SEQUENCE_DIR + MOCK_CURL_COUNTER_FILE: call N answers <dir>/N.json,
+    # the highest-numbered file repeating once the sequence is exhausted.
+    http_code="${MOCK_CURL_GITHUB_HTTP:-200}"
+    body_file="${MOCK_CURL_GITHUB_BODY_FILE:-}"
+    if [ -n "${MOCK_CURL_GITHUB_SEQUENCE_DIR:-}" ]; then
+      counter_file="${MOCK_CURL_COUNTER_FILE:?MOCK_CURL_COUNTER_FILE must be set with a sequence dir}"
+      n=$(( $(cat "$counter_file" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$counter_file"
+      while [ "$n" -gt 1 ] && [ ! -f "$MOCK_CURL_GITHUB_SEQUENCE_DIR/$n.json" ]; do n=$((n - 1)); done
+      body_file="$MOCK_CURL_GITHUB_SEQUENCE_DIR/$n.json"
+    fi
+    if [ -n "$body_file" ] && [ -f "$body_file" ]; then cp "$body_file" "$output_file"; else printf '{"total_count":0,"check_runs":[]}' > "$output_file"; fi
+    ;;
   *)
     echo "mock curl: unrecognised URL: $url" >&2
     http_code="000"

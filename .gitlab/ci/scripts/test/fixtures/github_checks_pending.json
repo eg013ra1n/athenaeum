@@ -1,0 +1,4 @@
+{"total_count": 2, "check_runs": [
+  {"name": "Build, test and typecheck", "status": "completed", "conclusion": "success"},
+  {"name": "Build and test (Windows)", "status": "in_progress", "conclusion": null}
+]}

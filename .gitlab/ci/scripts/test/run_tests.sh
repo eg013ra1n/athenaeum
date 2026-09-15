@@ -693,5 +693,39 @@ assert_contains "publish: dry run does not push" "DRY_RUN=1: not pushing" "$out"
 rm -rf "$DOCS_TMP"
 
 echo
+echo "-- github_checks_gate.sh --"
+
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_BODY_FILE="$FIXTURES_DIR/github_checks_success.json" \
+  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
+assert_eq "gate: all green exits 0" "0" "$rc"
+assert_contains "gate: reports both checks" "ok: Build and test (Windows) — success" "$out"
+
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_BODY_FILE="$FIXTURES_DIR/github_checks_failure.json" \
+  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
+assert_eq "gate: a failed check exits 1" "1" "$rc"
+assert_contains "gate: names the failed check" "ERROR: Build and test (Windows) concluded failure" "$out"
+
+# pending, then success — the gate polls and passes.
+SEQ_TMP=$(mktemp -d -t gate_seq.XXXXXX)
+cp "$FIXTURES_DIR/github_checks_pending.json" "$SEQ_TMP/1.json"
+cp "$FIXTURES_DIR/github_checks_success.json" "$SEQ_TMP/2.json"
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_GITHUB_SEQUENCE_DIR="$SEQ_TMP" MOCK_CURL_COUNTER_FILE="$SEQ_TMP/count" \
+  CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
+assert_eq "gate: pending then green exits 0" "0" "$rc"
+assert_contains "gate: says it waited" "waiting: Build and test (Windows) is in_progress" "$out"
+assert_eq "gate: polled exactly twice" "2" "$(cat "$SEQ_TMP/count")"
+rm -rf "$SEQ_TMP"
+
+# no check runs at all and the initial wait exhausted → fail, name the sha.
+rc=0
+out=$(PATH="$MOCK_BIN:$PATH" CI_COMMIT_SHA=deadbeef GATE_POLL_SECONDS=0 GATE_INITIAL_WAIT_SECONDS=0 \
+  "$HELPERS_DIR/github_checks_gate.sh" 2>&1) || rc=$?
+assert_eq "gate: no runs exits 1" "1" "$rc"
+assert_contains "gate: no-runs message" "ERROR: no GitHub check runs for deadbeef" "$out"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
