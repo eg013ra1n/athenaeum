@@ -4363,14 +4363,28 @@ mod init_db_concurrency_tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    /// Mirror production's connection setup (`db::mod::setup_connection`) for the
-    /// bits that matter to serialized DDL: `busy_timeout` + WAL. The busy_timeout
-    /// stops a serialized run from returning `SQLITE_BUSY` if the two connections
-    /// ever contend for the write lock; WAL matches how the app opens the catalog.
+    /// A connection set up exactly the way production sets one up — by calling
+    /// production's own `setup_connection`, not by restating its pragma list.
+    ///
+    /// The list used to be restated here and it had drifted: it named
+    /// `busy_timeout` and WAL but not `synchronous = NORMAL`, so these
+    /// connections ran at SQLite's FULL default and fsynced every one of
+    /// init_db's ~83 implicit transactions. At 8 threads x 50 iterations that
+    /// is ~33 000 fsyncs the app itself never pays. On macOS fsync does not
+    /// flush to media, so the test read as 1.3 s and nobody noticed; on the
+    /// Windows CI runner the same test took about 60 s, and under a runner that
+    /// gives each test its own process it ballooned to 4-8 minutes and became
+    /// the critical path of the whole job (2026-09-15).
+    ///
+    /// Measured on this test with `PRAGMA fullfsync = ON` to make macOS behave
+    /// like a platform whose fsync is real: 67.8 s at the FULL default, 1.5 s
+    /// at production's NORMAL. The race under test is DDL interleaving between
+    /// two connections, which no durability setting affects — verified by
+    /// removing init_db's mutex and watching this test still fail 5 runs out of
+    /// 5 with the production pragmas in place.
     fn open_like_prod(path: &std::path::Path) -> Connection {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
-            .unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
         conn
     }
 
@@ -4395,6 +4409,13 @@ mod init_db_concurrency_tests {
         // widen the window in which one thread's `CREATE TRIGGER` can land after
         // another's for the same trigger. The production failure was a two-caller
         // race; the extra threads only make the pre-fix reproduction reliable.
+        //
+        // ITERS is not padding, so do not trim it to speed the test up (the
+        // pragmas above are where the time went, and that is fixed). Measured
+        // 2026-09-15 with init_db's mutex removed: the race first landed on
+        // iterations 0, 4, 5, 10, 23 and 27 across six runs. Anything under ~40
+        // would let the pre-fix bug through on a good fraction of runs, which
+        // is the one thing this test must never do.
         const THREADS: usize = 8;
         const ITERS: usize = 50;
 

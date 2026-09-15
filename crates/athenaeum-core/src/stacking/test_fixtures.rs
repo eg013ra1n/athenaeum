@@ -54,6 +54,15 @@ pub(crate) fn frame_set(name: &str) -> Fixture {
 /// `add_light`/`add_master_dark_and_flat` row becomes visible through
 /// `ctx.db`'s own pooled connections too.
 pub(crate) fn frame_set_with_conn(conn: Connection, name: &str) -> Fixture {
+    // Production's pragmas before the schema goes in. Most callers here hand us
+    // a FILE-backed connection, and a bare `Connection::open` leaves
+    // `synchronous` at SQLite's FULL default, which fsyncs every one of
+    // init_db's ~83 implicit transactions. That is free on macOS, where fsync
+    // does not flush to media, and expensive on the Windows CI runner — the two
+    // slowest tests in the workspace there were both this drift (2026-09-15).
+    // Harmless for the in-memory caller above: an in-memory database ignores
+    // journal and durability settings.
+    crate::db::SqliteConnectionManager::setup_connection(&conn).expect("fixture pragmas");
     init_db(&conn).expect("init fixture schema");
 
     conn.execute("INSERT INTO frames_set (name) VALUES (?1)", params![name])

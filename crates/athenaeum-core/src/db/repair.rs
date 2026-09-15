@@ -182,6 +182,15 @@ mod tests {
         // stamped, and a frame whose CFA columns were erased in transit
         // while its header blob kept the Bayer cards.
         let conn = Connection::open(&db_path).unwrap();
+        // Production's pragmas, not the bare defaults. A bare `Connection::open`
+        // leaves the rollback journal and `synchronous = FULL` in place, so each
+        // of init_db's ~83 implicit transactions fsyncs and creates a journal
+        // file; this test calls init_db twice. Free on macOS, where fsync does
+        // not flush to media, and just over a minute on the Windows CI runner —
+        // it was the second-slowest test in the workspace there until this line
+        // (2026-09-15). See `db::schema`'s init_db concurrency test for the
+        // same drift and the measurement behind it.
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
         init_db(&conn).unwrap();
         conn.execute(
             "DELETE FROM settings WHERE key = ?1",

@@ -425,3 +425,75 @@ plan:
 Owner decisions needed before cycle 2: one release text or two (F3); and
 before cycle 4: one Windows installer, and whether betas go through the
 updater at all.
+
+## 5. Measured: nextest (Task 8, 2026-09-15)
+
+`cargo nextest` replaced `cargo test` in the `Test workspace` step of both
+GitHub jobs and was measured against run 34908768151, the last plain run on
+`main`. Run 34981151619 carried it over two attempts, cold cache and warm. Both
+were green over an identical test set (3172 baseline passes plus 35 ignored
+against nextest's 3171 run plus 35 skipped; the one difference is the
+CI-self-skipping `ingest_releases_conn_between_frames`, a pass for the plain
+runner and an exclusion for the filter expression).
+
+| Job | Step, baseline | Step, cold | Step, warm | nextest's own run |
+| ---- | ---- | ---- | ---- | ---- |
+| Linux | 3:55 | 3:31 | 3:32 | 2:45 |
+| Windows | 6:41 | 7:49 | 10:25 | 6:30 / 9:21 |
+
+Linux is a real 30 % cut on the run itself; the step shows only 6 % because
+installing nextest, listing the tests and relinking cost about 45 s the plain
+runner does not pay. Windows is a loss, and the loss is one test.
+
+### One test was 82 % of the Windows run
+
+`db::schema::init_db_concurrency_tests::concurrent_init_db_on_shared_file_is_race_free`
+took 4 min 24 s (cold) and 7 min 38 s (warm) under nextest against about 60 s
+under the plain runner, and everything else finished long before it. The next
+slowest, `db::repair::tests::init_db_repairs_a_catalog_that_already_holds_erased_rows`,
+was just over a minute. Both are `init_db` tests on a file-backed database.
+
+### Root cause: a hand-copied pragma list that had drifted
+
+Neither test was slow because of nextest, and neither was slow because of what
+it tests. Both opened their connection with SQLite's default durability instead
+of production's. `SqliteConnectionManager::setup_connection` runs
+`synchronous = NORMAL` under WAL; the concurrency test restated a shortened
+pragma list (`busy_timeout` and WAL only, so `synchronous` stayed at the FULL
+default) and the repair test opened a bare connection (rollback journal, FULL).
+`init_db` is about 83 statements, each its own implicit transaction, and the
+concurrency test runs it 400 times. That is roughly 33 000 fsyncs the
+application itself never performs.
+
+It stayed invisible because the whole team's development machines are macOS,
+where `fsync` does not flush to media unless a connection asks for
+`F_FULLFSYNC`. Forcing that locally reproduces the CI behaviour exactly:
+
+| Configuration, same test, same machine | Time |
+| ---- | ---- |
+| as written, macOS default fsync | 1.3 s |
+| as written, `PRAGMA fullfsync = ON` | 67.8 s |
+| production pragmas, `PRAGMA fullfsync = ON` | 1.5 s |
+
+67.8 s against the Windows runner's ~60 s is the same number, so the mechanism
+is settled.
+
+### The fix, and what was checked
+
+Both tests now call `SqliteConnectionManager::setup_connection` instead of
+restating its pragmas, which is also why it became `pub(crate)`: a copied list
+is what drifted, so there is no longer a copy. `stacking::test_fixtures`'s
+shared constructor got the same treatment, since most of its callers hand it a
+file-backed connection too.
+
+Durability is orthogonal to what the concurrency test proves, and that was
+verified rather than assumed: with `init_db`'s mutex removed and the production
+pragmas in place, the test still fails 5 runs out of 5, on the original
+`CREATE TRIGGER ... already exists`. Its 50 iterations were left alone. Across
+six such runs the race first landed on iterations 0, 4, 5, 10, 23 and 27, so
+trimming the loop to make the test look fast would have quietly cost it the bug
+it exists for. The whole crate is green: 2370 passed.
+
+nextest therefore stays in the workflow and the next run on `main` re-measures
+it against these same baselines. If Windows still misses the bar with both
+outliers gone, it comes out then.

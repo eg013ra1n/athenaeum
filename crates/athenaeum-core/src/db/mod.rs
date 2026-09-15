@@ -37,7 +37,15 @@ impl SqliteConnectionManager {
     }
 
     /// Apply PRAGMAs and register custom functions on a connection.
-    fn setup_connection(conn: &Connection) -> Result<()> {
+    ///
+    /// `pub(crate)` so tests that need a production-shaped connection call THIS
+    /// rather than restating the pragma list. A hand-copied list drifted once
+    /// and it was expensive: `schema.rs`'s init_db concurrency test omitted
+    /// `synchronous = NORMAL`, so it ran at SQLite's FULL default and fsynced
+    /// every one of init_db's ~83 implicit transactions. Invisible on macOS,
+    /// where fsync does not flush to media, it made that one test a 60-second
+    /// item on the Windows CI runner. Keep new callers pointed here.
+    pub(crate) fn setup_connection(conn: &Connection) -> Result<()> {
         // foreign_keys is already the bundled build's compile-time default;
         // stating it makes enforcement survive a switch to a system SQLite or
         // a build-flag change.
