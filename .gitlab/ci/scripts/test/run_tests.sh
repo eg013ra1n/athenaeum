@@ -779,6 +779,12 @@ assert_eq "verify: docker tag absent exits 1" "1" "$rc"
 assert_contains "verify: docker absent message" "ERROR: Docker Hub has no tag 0.7.0" "$out"
 
 rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_notjson.txt" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: non-JSON docker body exits 1" "1" "$rc"
+assert_contains "verify: non-JSON docker message" "ERROR: Docker Hub answered 200 for tag 0.7.0 with a body that is not JSON" "$out"
+assert_not_contains "verify: no traceback on non-JSON" "Traceback" "$out"
+
+rc=0
 out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" MOCK_CURL_BLOG_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
 assert_eq "verify: blog 404 past the budget exits 1" "1" "$rc"
 assert_contains "verify: blog message" "ERROR: blog https://artfrom.space/blog/v070/ still HTTP 404 after" "$out"

@@ -39,18 +39,27 @@ else
   if [ "$code" != "200" ]; then
     echo "ERROR: Docker Hub has no tag ${VERSION} for ${DOCKERHUB_REPO} (HTTP $code)" >&2; fail=1
   else
-    arches=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(" ".join(sorted(i["architecture"] for i in d.get("images",[]))))' "$BODY")
-    digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("digest",""))' "$BODY")
-    case " $arches " in *" amd64 "*) ;; *) echo "ERROR: docker.io/${DOCKERHUB_REPO}:${VERSION} has no amd64 image" >&2; fail=1 ;; esac
-    case " $arches " in
-      *" arm64 "*) echo "ok: docker.io/${DOCKERHUB_REPO}:${VERSION} has amd64 + arm64" ;;
-      *) if [ "${RELEASE_ALLOW_AMD64_ONLY:-0}" = "1" ]; then echo "WARNING: publishing amd64-only — RELEASE_ALLOW_AMD64_ONLY=1 is set; unset it when the arm64 runner is back"
-         else echo "ERROR: docker.io/${DOCKERHUB_REPO}:${VERSION} has no arm64 image (set RELEASE_ALLOW_AMD64_ONLY=1 to accept)" >&2; fail=1; fi ;;
-    esac
-    code=$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' --max-time 60 "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/${channel}" || echo 000)
-    cdigest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("digest",""))' "$BODY" 2>/dev/null || true)
-    if [ "$code" = "200" ] && [ -n "$digest" ] && [ "$cdigest" = "$digest" ]; then echo "ok: :${channel} -> ${digest}"
-    else echo "ERROR: :${channel} does not point at ${VERSION} (channel digest '${cdigest}', version digest '${digest}', HTTP $code)" >&2; fail=1; fi
+    # One combined, guarded parse: a 200 with a non-JSON body (rate-limit
+    # HTML, a CDN error page) must yield one ERROR line, never a Python
+    # traceback aborting the script under `set -e`.
+    parsed=$(python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+print(" ".join(sorted(i["architecture"] for i in d.get("images", []))) + "\t" + d.get("digest", ""))' "$BODY" 2>/dev/null || true)
+    if [ -z "$parsed" ]; then
+      echo "ERROR: Docker Hub answered 200 for tag ${VERSION} with a body that is not JSON" >&2; fail=1
+    else
+      IFS=$'\t' read -r arches digest <<< "$parsed"
+      case " $arches " in *" amd64 "*) ;; *) echo "ERROR: docker.io/${DOCKERHUB_REPO}:${VERSION} has no amd64 image" >&2; fail=1 ;; esac
+      case " $arches " in
+        *" arm64 "*) echo "ok: docker.io/${DOCKERHUB_REPO}:${VERSION} has amd64 + arm64" ;;
+        *) if [ "${RELEASE_ALLOW_AMD64_ONLY:-0}" = "1" ]; then echo "WARNING: publishing amd64-only — RELEASE_ALLOW_AMD64_ONLY=1 is set; unset it when the arm64 runner is back"
+           else echo "ERROR: docker.io/${DOCKERHUB_REPO}:${VERSION} has no arm64 image (set RELEASE_ALLOW_AMD64_ONLY=1 to accept)" >&2; fail=1; fi ;;
+      esac
+      code=$(curl --silent --show-error --output "$BODY" --write-out '%{http_code}' --max-time 60 "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/${channel}" || echo 000)
+      cdigest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("digest",""))' "$BODY" 2>/dev/null || true)
+      if [ "$code" = "200" ] && [ -n "$digest" ] && [ "$cdigest" = "$digest" ]; then echo "ok: :${channel} -> ${digest}"
+      else echo "ERROR: :${channel} does not point at ${VERSION} (channel digest '${cdigest}', version digest '${digest}', HTTP $code)" >&2; fail=1; fi
+    fi
   fi
 fi
 
