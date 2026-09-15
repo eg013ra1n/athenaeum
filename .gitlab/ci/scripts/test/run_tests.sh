@@ -6,6 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd "$HELPERS_DIR/../../.." && pwd)"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 
 PASS=0
@@ -574,6 +575,45 @@ assert_not_contains "inventory never says x86_64" "x86_64" "$inventory"
 legacy=$(VERSION=0.6.4 legacy_alias_pairs)
 assert_contains "legacy: old macOS alias maps to the new file" "macos Athenaeum-macos-aarch64.dmg athenaeum-0.6.4-macos-arm64.dmg" "$legacy"
 assert_contains "legacy: old perseus deb alias" "perseus perseus-linux-amd64.deb perseus-0.6.4-linux-x64.deb" "$legacy"
+
+echo
+echo "-- check_versions.sh / bump.sh --"
+
+VT_TMP=$(mktemp -d -t version_tree.XXXXXX)
+cp -R "$FIXTURES_DIR/version_tree/." "$VT_TMP/"
+
+# Matching tag passes and lists all six.
+rc=0
+out=$(REPO_ROOT="$VT_TMP" TAG="v0.6.3" "$HELPERS_DIR/check_versions.sh" 2>&1) || rc=$?
+assert_eq "check: matching tag exits 0" "0" "$rc"
+assert_contains "check: lists package.json" "package.json: 0.6.3" "$out"
+assert_contains "check: lists perseus" "crates/perseus/Cargo.toml: 0.6.3" "$out"
+assert_contains "check: success line" "ok: all six versions match 0.6.3" "$out"
+
+# Mismatching tag fails and names the file.
+rc=0
+out=$(REPO_ROOT="$VT_TMP" TAG="v0.6.4" "$HELPERS_DIR/check_versions.sh" 2>&1) || rc=$?
+assert_eq "check: mismatch exits 1" "1" "$rc"
+assert_contains "check: mismatch names a file" "ERROR: package.json is 0.6.3, tag v0.6.4 expects 0.6.4" "$out"
+
+# bump rewrites all six (tauri gets the -N form for a beta) and re-checks.
+rc=0
+out=$(REPO_ROOT="$VT_TMP" BUMP_SKIP_CARGO=1 "$REPO_DIR/scripts/release/bump.sh" 0.7.0-beta.2 2>&1) || rc=$?
+assert_eq "bump: exits 0" "0" "$rc"
+assert_contains "bump: package.json rewritten" '"version": "0.7.0-beta.2"' "$(cat "$VT_TMP/package.json")"
+assert_contains "bump: perseus Cargo.toml rewritten" 'version = "0.7.0-beta.2"' "$(cat "$VT_TMP/crates/perseus/Cargo.toml")"
+assert_not_contains "bump: dependency version lines untouched" 'serde = { version = "0.7.0-beta.2"' "$(cat "$VT_TMP/crates/perseus/Cargo.toml")"
+assert_contains "bump: tauri.conf gets the -N form" '"version": "0.7.0-2"' "$(cat "$VT_TMP/crates/athenaeum-tauri/tauri.conf.json")"
+assert_contains "bump: re-check passes" "ok: all six versions match 0.7.0-beta.2" "$out"
+
+# A malformed version is refused before touching anything.
+rc=0
+out=$(REPO_ROOT="$VT_TMP" BUMP_SKIP_CARGO=1 "$REPO_DIR/scripts/release/bump.sh" 0.7 2>&1) || rc=$?
+assert_eq "bump: malformed version exits 1" "1" "$rc"
+assert_contains "bump: malformed version message" "ERROR: version must look like X.Y.Z or X.Y.Z-beta.N" "$out"
+assert_contains "bump: nothing rewritten on refusal" '"version": "0.7.0-beta.2"' "$(cat "$VT_TMP/package.json")"
+
+rm -rf "$VT_TMP"
 
 echo
 echo "Passed: $PASS  Failed: $FAIL"
