@@ -616,5 +616,79 @@ assert_contains "bump: nothing rewritten on refusal" '"version": "0.7.0-beta.2"'
 rm -rf "$VT_TMP"
 
 echo
+echo "-- gen_release_post.sh --"
+
+out=$(TAG=v0.7.0 RELEASE_DATE=2026-10-01 "$HELPERS_DIR/gen_release_post.sh" < "$FIXTURES_DIR/release_notes_sample.md")
+assert_contains "post: title" "title: Athenaeum v0.7.0" "$out"
+assert_contains "post: date" "date: 2026-10-01" "$out"
+assert_contains "post: author" "  - vilen" "$out"
+assert_contains "post: tag" "  - release" "$out"
+assert_contains "post: excerpt is the tagline without stars, YAML-quoted" 'excerpt: "Athenaeum v0.7.0: a \"quoted\" tagline — with a dash & an ampersand."' "$out"
+assert_not_contains "post: body does not repeat the tagline" "*Athenaeum v0.7.0: a" "$out"
+assert_contains "post: body keeps the sections" "## Bug Fixes" "$out"
+first_body_line=$(printf '%s\n' "$out" | awk 'f&&NF{print;exit} /^---$/{c++; if(c==2)f=1}')
+assert_eq "post: body starts at the first heading" "## What's New" "$first_body_line"
+out=$("$HELPERS_DIR/gen_release_post.sh" --tagline < "$FIXTURES_DIR/release_notes_sample.md")
+assert_eq "post: --tagline prints the bare tagline" 'Athenaeum v0.7.0: a "quoted" tagline — with a dash & an ampersand.' "$out"
+
+echo
+echo "-- update_download_page.sh --"
+
+DP_TMP=$(mktemp -t download_page.XXXXXX)
+cp "$FIXTURES_DIR/download_page_sample.md" "$DP_TMP"
+rc=0
+out=$(PAGE="$DP_TMP" TAG=v0.7.0 RELEASE_DATE=2026-10-01 TAGLINE="A tagline | with a pipe" "$HELPERS_DIR/update_download_page.sh" 2>&1) || rc=$?
+assert_eq "page: stable update exits 0" "0" "$rc"
+page=$(cat "$DP_TMP")
+assert_not_contains "page: old block gone" "old block that must be replaced" "$page"
+assert_contains "page: versioned msi link" "[athenaeum-0.7.0-windows-x64.msi](https://artfrom.space/builds/v0.7.0/windows/athenaeum-0.7.0-windows-x64.msi)" "$page"
+assert_contains "page: versioned arm64 dmg link" "[athenaeum-0.7.0-macos-arm64.dmg](https://artfrom.space/builds/v0.7.0/macos/athenaeum-0.7.0-macos-arm64.dmg)" "$page"
+assert_contains "page: AppImage link" "builds/v0.7.0/linux/athenaeum-0.7.0-linux-x64.AppImage" "$page"
+assert_contains "page: markers survive" "<!-- latest-build:end -->" "$page"
+assert_contains "page: history row inserted with the pipe escaped" "| v0.7.0 | 2026-10-01 | A tagline \| with a pipe |" "$page"
+assert_contains "page: old row kept" "| v0.6.3 | 2026-09-15 | old row |" "$page"
+# newest row directly under the marker
+after_marker=$(grep -A1 -F '<!-- version-history:rows -->' "$DP_TMP" | tail -n1)
+assert_contains "page: new row is first" "| v0.7.0 |" "$after_marker"
+
+# Same tag again: the row is replaced, not duplicated.
+PAGE="$DP_TMP" TAG=v0.7.0 RELEASE_DATE=2026-10-01 TAGLINE="Second wording" "$HELPERS_DIR/update_download_page.sh" >/dev/null 2>&1
+assert_eq "page: re-run keeps one v0.7.0 row" "1" "$(grep -c '^| v0.7.0 |' "$DP_TMP")"
+assert_contains "page: re-run row carries the new wording" "| v0.7.0 | 2026-10-01 | Second wording |" "$(cat "$DP_TMP")"
+
+# Beta: history row only, Latest Build untouched.
+before_block=$(sed -n '/latest-build:start/,/latest-build:end/p' "$DP_TMP")
+PAGE="$DP_TMP" TAG=v0.7.1-beta.1 RELEASE_DATE=2026-10-02 TAGLINE="Beta" "$HELPERS_DIR/update_download_page.sh" >/dev/null 2>&1
+after_block=$(sed -n '/latest-build:start/,/latest-build:end/p' "$DP_TMP")
+assert_eq "page: beta leaves Latest Build alone" "$before_block" "$after_block"
+assert_contains "page: beta row added" "| v0.7.1-beta.1 | 2026-10-02 | Beta |" "$(cat "$DP_TMP")"
+
+# Missing marker is a loud failure.
+printf '# no markers\n' > "$DP_TMP"
+rc=0
+out=$(PAGE="$DP_TMP" TAG=v0.7.0 RELEASE_DATE=2026-10-01 TAGLINE="x" "$HELPERS_DIR/update_download_page.sh" 2>&1) || rc=$?
+assert_eq "page: missing marker exits 1" "1" "$rc"
+assert_contains "page: names the marker" "ERROR: marker <!-- latest-build:start --> not found" "$out"
+rm -f "$DP_TMP"
+
+echo
+echo "-- docs_publish.sh (dry run against a local clone) --"
+
+DOCS_TMP=$(mktemp -d -t docs_repo.XXXXXX)
+git -C "$DOCS_TMP" init -q -b main
+mkdir -p "$DOCS_TMP/src/content/docs/blog" "$DOCS_TMP/src/content/docs/releases"
+cp "$FIXTURES_DIR/download_page_sample.md" "$DOCS_TMP/src/content/docs/releases/download.md"
+git -C "$DOCS_TMP" -c user.name=t -c user.email=t@t add -A
+git -C "$DOCS_TMP" -c user.name=t -c user.email=t@t commit -q -m init
+rc=0
+out=$(DRY_RUN=1 DOCS_REPO_LOCAL="$DOCS_TMP" TAG=v0.7.0 RELEASE_DATE=2026-10-01 RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/docs_publish.sh" 2>&1) || rc=$?
+assert_eq "publish: dry run exits 0" "0" "$rc"
+assert_contains "publish: would commit the post" "src/content/docs/blog/v0.7.0.md" "$out"
+assert_contains "publish: would commit the page" "src/content/docs/releases/download.md" "$out"
+assert_contains "publish: commit message" "docs: v0.7.0 release post + download-page row" "$out"
+assert_contains "publish: dry run does not push" "DRY_RUN=1: not pushing" "$out"
+rm -rf "$DOCS_TMP"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
