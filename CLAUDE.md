@@ -1342,10 +1342,16 @@ Frontend: `src/components/stacking/` (above),
 
 ## Release workflow
 
-1. Rewrite `RELEASE_NOTES.md` (file is fully REPLACED each release): italic tagline line, then `## What's New` / `## Changes` / `## Bug Fixes` — user-facing EN prose.
-2. Version bump ×6: `package.json`, `crates/{athenaeum-core,athenaeum-tauri,athenaeum-web,perseus}/Cargo.toml`, `crates/athenaeum-tauri/tauri.conf.json` (Tauri uses `X.Y.Z-N`, not `-beta.N` — bundle naming rejects the dotted form); refresh `Cargo.lock` via `cargo check`.
-3. One commit `chore(release): vX.Y.Z — …` on `main`; gates (`cargo build --workspace`, `cargo test --workspace`, **`cargo check -p athenaeum-core --no-default-features`**, `npx tsc --noEmit` — the workspace, not just core: `athenaeum-web`/`athenaeum-tauri` route tests are where a core-only run goes blind, and the headless check is where a *feature-gated* break hides: every `--workspace` command builds with `default = ["render", "solver"]`, so a module that reaches into `plate_solve`/`registration`/`catalog` without the matching `#[cfg]` compiles locally and fails only in `check:headless-core` and the three Perseus jobs — which is exactly what happened to v0.5.5); tag `vX.Y.Z`; push `main` and the tag to both remotes (`git push all main && git push all vX.Y.Z`). The tag pipeline then: builds ×3 platforms → uploads to `artfrom.space/builds/<tag>/` (+ `latest` symlink + stable-named aliases) → GitLab Release from RELEASE_NOTES.md → publishes `version.json` → Discord/Telegram notifications.
-4. **Docs site (easy to forget — separate repo `../artfrom-space`):** add blog post `src/content/docs/blog/vX.Y.Z.md` (frontmatter: title/date/authors: vilen/tags: release/excerpt; Starlight de-dots the slug → `/blog/vXYZ/`) + a Version History row in `src/content/docs/releases/download.md`. Commit `docs: vX.Y.Z release post + download-page row`, push `main` — its CI builds and rsync-deploys the site. Refresh guides/manuals only when UI flows actually changed.
+The procedure is the `release` skill (`.claude/skills/release/SKILL.md`): notes
+(`RELEASE_NOTES.md` is the blog post), `scripts/release/bump.sh`, a release
+commit that holds only notes + the six version files + `Cargo.lock`, push, green
+GitHub run, tag. The tag pipeline (`.gitlab-ci.yml`) runs
+`gate → build → deploy → publish → verify → announce`: it refuses a tag whose
+versions or GitHub checks are not green, uploads to `artfrom.space/builds/<tag>/`
+under the one naming scheme (`.gitlab/ci/scripts/artifact_names.sh`), publishes
+Docker Hub and the docs site (post + download page generated from the notes),
+fetches all of it back, and only then creates the GitLab Release, `version.json`
+and the chat posts. Nothing is done by hand after the tag.
 
 **Branching.** `main` is the development trunk and releases are tags on it. This
 replaces the older "develop on a branch named after the version, ff-merge at
