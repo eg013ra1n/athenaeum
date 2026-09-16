@@ -26,6 +26,7 @@ mod duplicates;
 mod export;
 mod spatial;
 mod calendar;
+mod updates;
 mod images;
 mod missing_files;
 mod analysis;
@@ -190,6 +191,12 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_frame_preview", post(images::get_frame_preview))
         // Calendar
         .route("/api/get_calendar_month_data", post(calendar::get_calendar_month_data))
+        // In-app updates
+        .route("/api/check_for_updates", post(updates::check_for_updates))
+        .route("/api/get_whats_new", post(updates::get_whats_new))
+        .route("/api/get_release_notes", post(updates::get_release_notes))
+        .route("/api/install_update", post(updates::install_update))
+        .route("/api/restart_app", post(updates::restart_app))
         // Analysis
         .route("/api/get_analysis_config", post(analysis::get_analysis_config))
         .route("/api/set_analysis_config", post(analysis::set_analysis_config))
@@ -339,7 +346,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_log_path", post(get_log_path))
         .route("/api/get_database_path", post(get_database_path))
         // Category A — Desktop-only stubs
-        .route("/api/check_for_updates", post(check_for_updates))
         .route("/api/read_fits_image_rustafits", post(read_fits_image_rustafits_stub))
         // Opt-in ATHENAEUM_API_KEY auth (routes/auth.rs). Layered BEFORE
         // `.with_state` below, on a self-contained key-holder state rather
@@ -430,19 +436,6 @@ async fn get_database_path(
 }
 
 // ── Category A — Desktop-only stubs ──────────────────────────────────────────
-
-/// POST /api/check_for_updates — returns static no-update response
-#[tracing::instrument(skip_all)]
-async fn check_for_updates(
-    Json(_): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    Json(serde_json::json!({
-        "current_version": version,
-        "latest_version": version,
-        "is_update_available": false,
-    }))
-}
 
 /// POST /api/relocate_missing_file — 501 in web mode (needs native file picker)
 #[tracing::instrument(skip_all)]
