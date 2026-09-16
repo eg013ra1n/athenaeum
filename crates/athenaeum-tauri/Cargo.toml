@@ -30,15 +30,6 @@ chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 rustafits = { path = "../../rustafits" }
 base64 = "0.23"
-# Explicit TLS backend — see the reqwest comment in athenaeum-core/Cargo.toml.
-reqwest = { version = "0.13", default-features = false, features = [
-    "native-tls-no-alpn",
-    "charset",
-    "http2",
-    "system-proxy",
-    "json",
-] }
-uuid = { version = "1", features = ["v4"] }
 tauri-plugin-updater = "2"
 solvemyastro = { path = "../../solvemyastro" }
 tracing = "0.1"

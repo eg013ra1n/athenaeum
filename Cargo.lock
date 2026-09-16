@@ -437,7 +437,6 @@ dependencies = [
  "base64 0.23.0",
  "chrono",
  "rayon",
- "reqwest",
  "rusqlite",
  "rustafits",
  "serde",
@@ -451,7 +450,6 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

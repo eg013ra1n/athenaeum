@@ -79,7 +79,10 @@ fn early_refusals() -> Result<(), String> {
         tracing::warn!("install_update refused: development build");
         return Err("updates are disabled in development builds".to_string());
     }
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate the running executable: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        tracing::warn!(error = %e, "install_update refused: cannot locate the running executable");
+        format!("cannot locate the running executable: {e}")
+    })?;
 
     #[cfg(target_os = "macos")]
     {
@@ -92,8 +95,14 @@ fn early_refusals() -> Result<(), String> {
         let app_dir = exe
             .ancestors()
             .find(|p| p.extension().map(|e| e == "app").unwrap_or(false))
-            .ok_or_else(|| "cannot find the .app bundle of the running executable".to_string())?;
-        let parent = app_dir.parent().ok_or_else(|| "the .app bundle has no parent directory".to_string())?;
+            .ok_or_else(|| {
+                tracing::warn!(path = %exe.display(), "install_update refused: cannot find the .app bundle of the running executable");
+                "cannot find the .app bundle of the running executable".to_string()
+            })?;
+        let parent = app_dir.parent().ok_or_else(|| {
+            tracing::warn!(path = %app_dir.display(), "install_update refused: the .app bundle has no parent directory");
+            "the .app bundle has no parent directory".to_string()
+        })?;
         probe_writable(parent, app_dir)?;
     }
 
@@ -104,7 +113,10 @@ fn early_refusals() -> Result<(), String> {
             tracing::warn!(path = %exe.display(), "install_update refused: not running as an AppImage");
             return Err("Athenaeum can't replace itself — this copy was not started as an AppImage".to_string());
         };
-        let parent = appimage.parent().ok_or_else(|| "the AppImage has no parent directory".to_string())?;
+        let parent = appimage.parent().ok_or_else(|| {
+            tracing::warn!(path = %appimage.display(), "install_update refused: the AppImage has no parent directory");
+            "the AppImage has no parent directory".to_string()
+        })?;
         probe_writable(parent, &appimage)?;
     }
 
@@ -132,15 +144,13 @@ fn probe_writable(dir: &std::path::Path, subject: &std::path::Path) -> Result<()
     }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstallArgs {
-    pub channel: Channel,
-}
-
+/// Downloads and installs the update for `channel`, emitting
+/// `update-progress { downloaded: u64, total: Option<u64>, finished?: bool }`
+/// as it goes (`finished` is present and `true` only on the last event) and
+/// `update-ready { version: String }` once installed.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn install_update(app: AppHandle, state: State<'_, AppState>, args: InstallArgs) -> Result<(), String> {
+pub async fn install_update(app: AppHandle, state: State<'_, AppState>, channel: Channel) -> Result<(), String> {
     if state.update_in_flight.swap(true, Ordering::SeqCst) {
         tracing::warn!("install_update refused: another install in flight");
         return Err("an update is already being installed".to_string());
@@ -148,7 +158,7 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>, args: In
     let _guard = InFlightGuard(&state.update_in_flight);
     early_refusals()?;
 
-    let url = format!("{}/{}", MANIFEST_BASE_URL.trim_end_matches('/'), args.channel.file());
+    let url = format!("{}/{}", MANIFEST_BASE_URL.trim_end_matches('/'), channel.file());
     let endpoint: tauri::Url = url.parse().map_err(|e| format!("bad update endpoint {url}: {e}"))?;
     let updater = app
         .updater_builder()
@@ -167,23 +177,34 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>, args: In
         })?
         .ok_or_else(|| "no update is available for this build".to_string())?;
     let version = update.version.clone();
-    tracing::info!(channel = ?args.channel, latest_version = %version, "update download started");
+    tracing::info!(channel = ?channel, latest_version = %version, "update download started");
 
-    let mut downloaded: u64 = 0;
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    // Shared with the `FnOnce` finish closure below so its final tick can
+    // report the real running totals instead of `null`s.
+    let progress: std::sync::Arc<std::sync::Mutex<(u64, Option<u64>)>> =
+        std::sync::Arc::new(std::sync::Mutex::new((0, None)));
+    let progress_for_chunk = std::sync::Arc::clone(&progress);
+    let progress_for_finish = std::sync::Arc::clone(&progress);
+    let mut last_emit: Option<Instant> = None;
     let app_for_progress = app.clone();
     let app_for_finish = app.clone();
     update
         .download_and_install(
             move |chunk, total| {
-                downloaded += chunk as u64;
-                if last_emit.elapsed() >= Duration::from_millis(300) {
-                    last_emit = Instant::now();
-                    let _ = app_for_progress.emit("update-progress", serde_json::json!({ "downloaded": downloaded, "total": total }));
+                let (downloaded, total_seen) = {
+                    let mut state = progress_for_chunk.lock().unwrap();
+                    state.0 += chunk as u64;
+                    state.1 = total;
+                    *state
+                };
+                if last_emit.map_or(true, |t| t.elapsed() >= Duration::from_millis(300)) {
+                    last_emit = Some(Instant::now());
+                    let _ = app_for_progress.emit("update-progress", serde_json::json!({ "downloaded": downloaded, "total": total_seen }));
                 }
             },
             move || {
-                let _ = app_for_finish.emit("update-progress", serde_json::json!({ "downloaded": null, "total": null, "finished": true }));
+                let (downloaded, total_seen) = *progress_for_finish.lock().unwrap();
+                let _ = app_for_finish.emit("update-progress", serde_json::json!({ "downloaded": downloaded, "total": total_seen, "finished": true }));
             },
         )
         .await
@@ -227,6 +248,10 @@ mod tests {
             ("0.6.5", "0.6.5", "0.6.5"),
             ("0.6.5", "0.6.5", "v0.7.0"),
             ("0.6.5-1", "0.6.5-beta.1", "garbage"),
+            // An already-dotted tauri form passes through the normalizer untouched.
+            ("0.6.5-beta.1", "0.6.5-beta.1", "0.6.5-beta.2"),
+            // Two-digit `-N`; numeric prerelease ordering (beta.10 > beta.9).
+            ("0.6.5-10", "0.6.5-beta.10", "0.6.5-beta.9"),
         ];
         for (tauri_form, dotted, manifest) in table {
             assert_eq!(

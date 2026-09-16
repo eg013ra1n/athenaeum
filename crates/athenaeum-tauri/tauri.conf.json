@@ -32,8 +32,7 @@
             "dialog:allow-confirm",
             "fs:allow-read-dir",
             "fs:allow-read-file",
-            "opener:default",
-            "updater:default"
+            "opener:default"
           ]
         }
       ]

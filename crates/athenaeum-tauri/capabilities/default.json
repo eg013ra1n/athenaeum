@@ -10,7 +10,6 @@
     "opener:default",
     "dialog:default",
     "dialog:allow-confirm",
-    "fs:default",
-    "updater:default"
+    "fs:default"
   ]
 }
