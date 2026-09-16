@@ -453,6 +453,28 @@ under the plain runner, and everything else finished long before it. The next
 slowest, `db::repair::tests::init_db_repairs_a_catalog_that_already_holds_erased_rows`,
 was just over a minute. Both are `init_db` tests on a file-backed database.
 
+### Correction (2026-09-16): why the caches really had to go
+
+The first version of this section, and the commit that removed the caches,
+justified it by claiming the runners' build directories keep `target/` between
+jobs, so a cache could only restore what was already there. **That was wrong.**
+The runner's default clean is `git clean -ffdx`, which deletes every
+untracked path: `target/`, the Cargo registry (CARGO_HOME points inside the
+project directory) and the npm cache. Every job did start cold, and the cache
+was plugging a real hole. The macOS runner's build directory, inspected
+afterwards, held 90 MB and no `target/` at all.
+
+Removing the caches was still right, for a different reason than the one given:
+the hole cost about six minutes of compile and the plug cost 27. On the same two
+macOS targets, compile took 4:02 and 6:50 with the cache and 9:34 and 7:24
+without, while restore + archive was 2:05 + 25:05.
+
+The real fix is neither. `GIT_CLEAN_FLAGS: -ffdx -e target/ -e .cargo/ -e .npm/` keeps the build
+products where they were written, so builds are warm AND nothing is packed or
+unpacked; everything tracked is still cleaned, so a stale working tree cannot
+survive. That is what the pipeline runs now, and it should beat both earlier
+configurations.
+
 ### Root cause: a hand-copied pragma list that had drifted
 
 Neither test was slow because of nextest, and neither was slow because of what

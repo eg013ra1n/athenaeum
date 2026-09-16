@@ -22,6 +22,21 @@ variables:
   # itself might add later.
   GIT_SUBMODULE_STRATEGY: recursive
   GIT_SUBMODULE_DEPTH: 1
+  # Keep the build products between jobs. The runner's default clean is
+  # `-ffdx`, which deletes every untracked path — `target/`, the Cargo registry
+  # (CARGO_HOME above points inside the project dir) and the npm cache with it —
+  # so every job used to start cold and re-download its crates. That is the hole
+  # the `cache:` blocks were plugging, at a cost far higher than the hole: on
+  # macOS, 2:05 to restore and 25:05 to archive, to save about six minutes of
+  # compile (measured 2026-09-16, pipelines 369 and 372 — with the cache the two
+  # macOS targets compiled in 4:02 and 6:50, without it 9:34 and 7:24).
+  #
+  # Excluding those three paths from the clean is the cheap way to the same
+  # result: the runners are persistent machines with per-slot build directories,
+  # so the products simply stay where they were written, and nothing is packed
+  # or unpacked at all. Everything tracked is still cleaned, so a stale working
+  # tree cannot survive. Disk cost is one `target/` per runner slot.
+  GIT_CLEAN_FLAGS: -ffdx -e target/ -e .cargo/ -e .npm/
 
 # --- Gate (tags only) ---
 # One refusal before a single build minute is spent: the six version files
@@ -48,23 +63,23 @@ build:windows:
   # the (seconds-long) check:versions job. (The old `needs: build:linux` gate
   # predates the dedicated runner and cost every release a serialized ~14 min.)
   needs: ["check:versions"]
-  # No cache, deliberately — do not add one back. Every runner in this
-  # pipeline is a SHELL executor on a machine we own, and each checks out by
-  # "Fetching changes" into a repository it reinitializes in place, so the
-  # build directory (target/ included) is still there from the previous job.
-  # None of the three has a shared cache server either: all of them log "No
-  # URL provided, cache will not be uploaded to shared cache server". A cache
-  # can therefore only ever be restored onto the machine that already holds
-  # the same files. The comment this replaces justified it as letting "a
-  # fresh runner machine warm itself on the first tag", which a machine-local
-  # cache cannot do — a fresh machine has no cache to restore.
+  # No cache, deliberately — GIT_CLEAN_FLAGS at the top of this file does the
+  # same job for free. What a cache bought here was a warm `target/` after the
+  # runner's default `-ffdx` clean deleted it; not deleting it in the first
+  # place is strictly cheaper, because nothing is packed or unpacked.
   #
-  # What it cost, measured on pipeline 369 (v0.6.4-beta.1), restore + archive:
+  # What the cache cost, measured on pipeline 369 (v0.6.4-beta.1),
+  # restore + archive:
   #   macOS    2:05 + 25:05  of a 41:42 job
   #   Windows  1:00 +  2:08  of a 15:24 job
   #   Linux    1:35 +  1:40  of a 15:12 job
-  # The macOS figure is why a release took over an hour: 29 438 registry
-  # files and 12 480 target files packed into a local archive nobody reads.
+  # against roughly six minutes of compile saved on macOS. 29 438 registry
+  # files and 12 480 target files were being packed into a LOCAL archive on
+  # every release: none of the three runners has a shared cache server (all
+  # log "No URL provided"), so it could only ever be restored onto the machine
+  # that wrote it. The comment removed with the cache claimed it let "a fresh
+  # runner machine warm itself on the first tag", which a machine-local cache
+  # cannot do — a fresh machine has no cache to restore.
   script:
     # No cmake/nasm bootstrap here any more. turbojpeg-sys (the only crate that
     # needed cmake, and the only one that shelled out to nasm — via
