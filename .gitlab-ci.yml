@@ -665,7 +665,15 @@ verify:macos-gatekeeper:
         curl -fsSL -o "gk/$f" "https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/$f"
         xcrun stapler validate "gk/$f"
         spctl -a -t open --context context:primary-signature -v "gk/$f"
-        mnt="$PWD/gk/mnt-$arch"; mkdir -p "$mnt"
+        # The mountpoint must NOT live in the build directory. The runner's
+        # builds_dir is on a volume mounted nodev,nosuid,noowners, and macOS
+        # refuses to attach a disk image inside one: `hdiutil: attach failed -
+        # Permission denied`, which is what failed this job on the first real
+        # tag (v0.6.4-beta.1, pipeline 369). Reproduced by hand on the same
+        # machine: the identical attach succeeds with a mountpoint under
+        # /private/tmp and fails under the builds_dir. TMPDIR is on the boot
+        # volume, so mktemp puts it somewhere attachable.
+        mnt="$(mktemp -d -t athenaeum-gk-"$arch")"
         hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "gk/$f" >/dev/null
         # Capture spctl's verdict instead of piping it straight to tee: the
         # runner's shell runs with `set -eo pipefail`, so a REJECTED app
@@ -682,7 +690,9 @@ verify:macos-gatekeeper:
         echo "ok: $f accepted by Gatekeeper"
       done
   after_script:
-    - for m in gk/mnt-*; do [ -d "$m" ] && hdiutil detach "$m" >/dev/null 2>&1 || true; done
+    # Detach whatever the script left mounted — it mounts under TMPDIR now, not
+    # in the build directory, so this has to look there.
+    - for m in "${TMPDIR:-/tmp}"/athenaeum-gk-*; do [ -d "$m" ] && hdiutil detach "$m" >/dev/null 2>&1; rmdir "$m" 2>/dev/null; done; true
 
 # --- Release (only on tags) ---
 release:
