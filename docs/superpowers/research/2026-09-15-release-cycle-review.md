@@ -494,6 +494,28 @@ six such runs the race first landed on iterations 0, 4, 5, 10, 23 and 27, so
 trimming the loop to make the test look fast would have quietly cost it the bug
 it exists for. The whole crate is green: 2370 passed.
 
-nextest therefore stays in the workflow and the next run on `main` re-measures
-it against these same baselines. If Windows still misses the bar with both
-outliers gone, it comes out then.
+### Settled: the plain runner wins (2026-09-16)
+
+The plan's bar was 65 % of a baseline, and that baseline turned out to be
+worthless — it predated the fix above, which helps BOTH runners and on Windows
+helps a great deal. So the pair was measured again on the fixed tests, doctests
+counted on both sides (nextest cannot run them and needs a step of its own):
+
+| Job | `cargo test` | nextest |
+| ---- | ---- | ---- |
+| Linux | 165 s | 187 s and 212 s |
+| Windows | 357 s | 388 s and 390 s |
+
+The plain runner is faster on both, so it stays and nextest is out. Its whole
+advantage here had been overlapping those two slow tests with everything else;
+once they stopped being slow there was nothing left to overlap, and
+process-per-test scheduling is pure overhead on a 4-CPU runner with ~3 200
+tests. Re-opening this needs new numbers, not a new opinion.
+
+It was still worth doing. nextest is what made the slow tests findable: under
+the plain runner that test was one minute lost among two thousand siblings;
+given a process of its own it became seven minutes and 82 % of the job. The
+pipeline is faster today because of a tool we then removed.
+
+The path filter from the same task (`What changed`, PR-only) is orthogonal and
+stays — both extra jobs skipped correctly on the push to `main`.
