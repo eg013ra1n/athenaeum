@@ -96,9 +96,14 @@ pub fn run() {
                 sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
                 sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
                 collab_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+                update_in_flight: std::sync::atomic::AtomicBool::new(false),
             }
         })
         .setup(|app| {
+            // The updater is registered in setup (the plugin's documented
+            // placement); it reads `plugins.updater` from tauri.conf.json.
+            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+
             let app_handle = app.handle();
             let state: State<AppState> = app.state();
 
@@ -237,6 +242,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::initialize_database,
             commands::check_for_updates,
+            commands::get_whats_new,
+            commands::get_release_notes,
+            commands::install_update,
+            commands::restart_app,
             commands::add_scan_root,
             commands::get_scan_roots,
             commands::get_calibration_library_root,

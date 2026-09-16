@@ -37,6 +37,9 @@ pub struct AppState {
     /// store, audit m7). Held here so the request-to-serve handler, the publish
     /// path, and the Transfers UI all share the one instance.
     pub collab_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
+    /// One install at a time (spec §6.2): set by `install_update`, cleared by
+    /// its guard on every exit path.
+    pub update_in_flight: std::sync::atomic::AtomicBool,
 }
 
 pub mod core;
@@ -62,6 +65,7 @@ pub mod sync;
 pub mod account;
 pub mod collab;
 pub mod stacking;
+pub mod updates;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -86,3 +90,4 @@ pub use sync::*;
 pub use account::*;
 pub use collab::*;
 pub use stacking::*;
+pub use updates::*;
