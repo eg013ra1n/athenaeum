@@ -583,7 +583,7 @@ assert_file_has_line "updater: macos x64 app.tar.gz" "athenaeum macos x64 app.ta
 assert_file_has_line "updater: windows nsis" "athenaeum windows x64 exe setup windows athenaeum-0.7.0-windows-x64-setup.exe windows-x86_64-nsis" <(printf '%s\n' "$ua")
 assert_file_has_line "updater: windows msi" "athenaeum windows x64 msi - windows athenaeum-0.7.0-windows-x64.msi windows-x86_64-msi" <(printf '%s\n' "$ua")
 assert_file_has_line "updater: linux appimage" "athenaeum linux x64 AppImage - linux athenaeum-0.7.0-linux-x64.AppImage linux-x86_64" <(printf '%s\n' "$ua")
-assert_not_contains "updater: no plain windows key" " windows-x86_64$" "$ua"
+assert_eq "updater: no plain windows key" "0" "$(printf '%s\n' "$ua" | awk '{print $8}' | grep -cx 'windows-x86_64' || true)"
 
 echo
 echo "-- check_versions.sh / bump.sh --"
@@ -871,6 +871,53 @@ out=$(PATH="$MOCK_BIN:$PATH" MOCK_CURL_RELEASE_HTTP=500 CI_COMMIT_TAG=v0.7.0 CI_
   RELEASE_NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/create_gitlab_release.sh" 2>&1) || rc=$?
 assert_eq "release: 500 API error exits 1" "1" "$rc"
 assert_contains "release: 500 API error message" "ERROR: GitLab release API answered HTTP 500" "$out"
+
+echo
+echo "-- .gitlab-ci.yml shape --"
+
+# Class protection for the build:windows bug found in review: an unquoted
+# PowerShell script line containing ": " parses as a YAML mapping, not a
+# string, and GitLab rejects the whole config. Load every job (top-level
+# keys, including hidden `.`-prefixed templates; a non-dict top-level value
+# like `stages` is skipped) and assert every `script`/`before_script`/
+# `after_script` entry is a str, or a nested list of str — never a dict.
+ci_shape_out=$(python3 - "$REPO_DIR/.gitlab-ci.yml" <<'PYEOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+
+def entry_ok(e):
+    if isinstance(e, str):
+        return True
+    if isinstance(e, list):
+        return all(isinstance(x, str) for x in e)
+    return False
+
+errors = []
+for job_name, job in doc.items():
+    if not isinstance(job, dict):
+        continue
+    for key in ("script", "before_script", "after_script"):
+        if key not in job:
+            continue
+        entries = job[key]
+        if not isinstance(entries, list):
+            errors.append("%s.%s: not a list (%s)" % (job_name, key, type(entries).__name__))
+            continue
+        for i, e in enumerate(entries):
+            if not entry_ok(e):
+                errors.append("%s.%s[%d]: %s" % (job_name, key, i, type(e).__name__))
+
+if errors:
+    for e in errors:
+        print(e)
+else:
+    print("ok")
+PYEOF
+)
+assert_eq "ci yaml: every script entry is a string" "ok" "$ci_shape_out"
 
 echo
 echo "Passed: $PASS  Failed: $FAIL"

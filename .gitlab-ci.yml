@@ -81,7 +81,7 @@ build:windows:
   # runner machine warm itself on the first tag", which a machine-local cache
   # cannot do — a fresh machine has no cache to restore.
   script:
-    - if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { Write-Error "FATAL: TAURI_SIGNING_PRIVATE_KEY is empty - is the tag a Protected tag?"; exit 1 }
+    - 'if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { Write-Error "FATAL: TAURI_SIGNING_PRIVATE_KEY is empty - is the tag a Protected tag?"; exit 1 }'
     # No cmake/nasm bootstrap here any more. turbojpeg-sys (the only crate that
     # needed cmake, and the only one that shelled out to nasm — via
     # libjpeg-turbo's own build) is out of Cargo.lock since both rustafits and
@@ -624,7 +624,7 @@ deploy:
   artifacts:
     name: "release-sigs-${CI_COMMIT_TAG}"
     paths:
-      - release_stage/**/*.sig
+      - release_stage/*/*.sig
     expire_in: 30 days
 
 # --- Docs site publish (tags only) ---
