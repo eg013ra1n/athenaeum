@@ -1389,6 +1389,49 @@ cycle, so anything from them that matters later belongs here or in a plan.
   Settings card, with the full-hash confirm unchanged as the safety net. A
   mismatch (WCS written into one copy, parser drift between versions) costs a
   re-transfer, never a loss. A protocol cycle of its own; proposed: defer.
+- **The full analysis path under-reports eccentricity on trailed frames**
+  (full detail: `docs/backlog-v0.5.6.md` item 4). The full detector's shape
+  stamp (`1.5 × field FWHM`) is self-reinforcing on a streak's small-FWHM
+  bright head — measured 0.56 where the fast path (stamp follows the star's
+  own size, `2 × HFD`) sees 0.88 on the same real frame. Consequence: the
+  Analysis table rates a badly-trailed frame well, and the plate-solve input
+  gate (which reads this number) misses it — plate-solving itself is not
+  fooled, it re-measures shape at its own scale. Not the maths that's open:
+  changing the stamp changes `median_eccentricity` for every frame already
+  catalogued, so the open call is the re-analysis story (bulk re-analysis pass
+  vs. the two measurements coexisting for a while). Branch
+  `feature/star-detection-fix` exists in both repos, **not pushed**.
+- **One place to watch what the app is doing** (full detail:
+  `docs/backlog-v0.5.6.md` item 5). Progress today is scattered per feature:
+  the sidebar `ComputeQueueIndicator` lists `running`/`queued` only, no
+  stage/percent; a master build's stage and percent render nowhere but a 10px
+  table cell on the Coverage tab; Analysis, transfers, scan, export and
+  archive each own a separate widget. Owner's 2026-09-07 verdict: current
+  state acceptable for now, not blocking. Open: sidebar slide-over vs. a page;
+  whether `ComputeQueueEntry` growing a subject id (enough to join an existing
+  progress stream) is sufficient on its own; whether the per-feature widgets
+  fold into it or stay as they are.
+- **Duplicate cache rebuild is quadratic, unthrottled, and runs
+  unconditionally on every scan** (full detail: `docs/backlog-v0.5.6.md` item
+  9, raised 2026-09-16). Scan Phase 4 (`scanner/mod.rs:1941-2015`) rebuilds
+  the *entire* duplicate-groups cache — twice, once per `DuplicateKey::Header`
+  and once per `DuplicateKey::Master`, each a full recompute with a separate
+  prepared statement and row-by-row insert per duplicate group — plus the
+  O(folders²) folder-similarity pass, on **every** scan, gated only on
+  `!result.cancelled` (no check for "nothing changed"). This includes
+  unattended monitor polls every 10 minutes (`MONITORING_INTERVAL_MINUTES`,
+  default), whose own doc comment assumes an unchanged re-scan is "effectively
+  free" — true for the file walk, not for this phase.
+  `duplicates/backfill.rs::fill_master_strong_hashes` also runs synchronous,
+  single-threaded, unthrottled full-file hashing on the scan's own thread,
+  unlike its sibling `run_content_index`, which is deliberately chunked and
+  throttled to protect the app's IO. Diagnosis only — no fix shape chosen, no
+  per-phase timing measured yet on a large catalog. Candidates worth
+  evaluating once measured: skip Phase 4 when nothing changed and no stale
+  duplicate rows exist; background/throttle `fill_master_strong_hashes` the
+  way `run_content_index` already is; make the cache rebuild incremental
+  instead of a full recompute; replace the O(folders²) folder-similarity
+  comparison with an indexed SQL join.
 
 ---
 
