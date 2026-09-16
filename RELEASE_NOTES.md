@@ -33,6 +33,8 @@ not reach you at all, and there is no reason to install it.
   They used to be written by hand after the fact, which is why the site could
   describe a release slightly differently from the release. There is now one
   text, and the site is built from it.
-- **macOS packages are notarized once each instead of twice.** Apple's
-  turnaround is the slowest part of building a release, and half of it was
-  being spent twice on the same file.
+- **macOS packages are notarized once each instead of twice.** The duplicate
+  submission was pure waste, though a smaller waste than it looked from the
+  outside: Apple's notary service answers in about half a minute, so both disk
+  images together spend a little over a minute there. The release time that
+  actually mattered was going somewhere else entirely, and that is fixed too.
