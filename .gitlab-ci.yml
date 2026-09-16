@@ -697,6 +697,8 @@ verify:release:
       optional: true
   timeout: 30m
   script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - command -v rsign >/dev/null || cargo install rsign2 --locked
     - .gitlab/ci/scripts/verify_release.sh
 
 # Gatekeeper on the PUBLISHED DMGs, on a Mac, every release: the battery from
@@ -764,6 +766,31 @@ release:
   script:
     - .gitlab/ci/scripts/create_gitlab_release.sh
 
+# The updater's channel file moves ONLY here, after both verify jobs — the
+# same rule as builds/latest: a rejected build is never what the app offers.
+# Idempotent (copies the frozen per-tag file), safe to re-run.
+publish:updater-channel:
+  stage: announce
+  extends: .ssh_deploy_setup
+  tags: [linux]
+  only: [tags]
+  needs:
+    - job: verify:release
+      artifacts: false
+    - job: verify:macos-gatekeeper
+      artifacts: false
+  variables:
+    DEPLOY_PORT: "40022"
+    UPDATES_PATH: "/var/www/artfrom.space/updates"
+  script:
+    - |
+      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then CHANNEL_FILE=latest-beta.json; else CHANNEL_FILE=latest.json; fi
+      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "cp ${UPDATES_PATH}/${CI_COMMIT_TAG}.json ${UPDATES_PATH}/${CHANNEL_FILE}.tmp && mv -f ${UPDATES_PATH}/${CHANNEL_FILE}.tmp ${UPDATES_PATH}/${CHANNEL_FILE}"
+
+# LEGACY FEED — keep until v0.7.0 (in-app updates spec §3.8): installs
+# ≤ 0.6.4 read only version.json / version-beta.json and would otherwise never
+# learn that a version with the in-app updater exists. Goes with the legacy
+# filename aliases.
 publish_version:
   stage: announce
   extends: .ssh_deploy_setup

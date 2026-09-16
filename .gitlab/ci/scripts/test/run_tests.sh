@@ -782,7 +782,8 @@ assert_not_contains "gate: non-JSON 200 body has no traceback" "Traceback" "$out
 echo
 echo "-- verify_release.sh --"
 
-common=(PATH="$MOCK_BIN:$PATH" CI_COMMIT_TAG=v0.7.0 VERIFY_POLL_SECONDS=0 VERIFY_BLOG_TIMEOUT_SECONDS=0)
+common=(PATH="$MOCK_BIN:$PATH" CI_COMMIT_TAG=v0.7.0 VERIFY_POLL_SECONDS=0 VERIFY_BLOG_TIMEOUT_SECONDS=0 \
+  TAURI_CONF_PATH="$FIXTURES_DIR/updater_tauri.conf.json" MOCK_CURL_MANIFEST_FILE="$FIXTURES_DIR/updater_manifest_good.json")
 rc=0
 out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
 assert_eq "verify: everything present exits 0" "0" "$rc"
@@ -842,6 +843,32 @@ rc=0
 out=$(env "${common[@]}" SKIP_DOCKER_CHECK=1 SKIP_BLOG_CHECK=1 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
 assert_eq "verify: skips honoured" "0" "$rc"
 assert_contains "verify: says what it skipped" "skipped: docker check (SKIP_DOCKER_CHECK=1)" "$out"
+
+assert_contains "verify: updater manifest ok" "ok: updater manifest v0.7.0 — 5 platforms, every URL present, every signature verified" "$out"
+
+rc=0
+UM_BAD=$(mktemp -t um_bad.XXXXXX)
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["version"]="0.6.9"; json.dump(d,open(sys.argv[2],"w"))' "$FIXTURES_DIR/updater_manifest_good.json" "$UM_BAD"
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" MOCK_CURL_MANIFEST_FILE="$UM_BAD" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: wrong manifest version exits 1" "1" "$rc"
+assert_contains "verify: names the version mismatch" "ERROR: updater manifest version is 0.6.9, tag v0.7.0 expects 0.7.0" "$out"
+
+rc=0
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); del d["platforms"]["linux-x86_64"]; json.dump(d,open(sys.argv[2],"w"))' "$FIXTURES_DIR/updater_manifest_good.json" "$UM_BAD"
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" MOCK_CURL_MANIFEST_FILE="$UM_BAD" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: missing platform key exits 1" "1" "$rc"
+assert_contains "verify: names the missing key" "ERROR: updater manifest has no entry for linux-x86_64" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" MOCK_RSIGN_FAIL_FILES="athenaeum-0.7.0-linux-x64.AppImage" "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: a bad signature exits 1" "1" "$rc"
+assert_contains "verify: names the file whose signature failed" "ERROR: updater signature does not verify for https://artfrom.space/builds/v0.7.0/linux/athenaeum-0.7.0-linux-x64.AppImage" "$out"
+
+rc=0
+out=$(env "${common[@]}" MOCK_CURL_HUB_BODY_FILE="$FIXTURES_DIR/dockerhub_tag_both.json" MOCK_CURL_MANIFEST_HTTP=404 "$HELPERS_DIR/verify_release.sh" 2>&1) || rc=$?
+assert_eq "verify: no manifest exits 1" "1" "$rc"
+assert_contains "verify: names the manifest URL" "ERROR: HTTP 404 for https://artfrom.space/updates/v0.7.0.json" "$out"
+rm -f "$UM_BAD"
 
 echo
 echo "-- create_gitlab_release.sh --"

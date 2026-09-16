@@ -1,0 +1,27 @@
+{
+  "version": "0.7.0",
+  "notes": "n",
+  "pub_date": "2026-10-01T12:00:00Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://artfrom.space/builds/v0.7.0/macos/athenaeum-0.7.0-macos-arm64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHRlc3QKUldUdGVzdA=="
+    },
+    "darwin-x86_64": {
+      "url": "https://artfrom.space/builds/v0.7.0/macos/athenaeum-0.7.0-macos-x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHRlc3QKUldUdGVzdA=="
+    },
+    "windows-x86_64-nsis": {
+      "url": "https://artfrom.space/builds/v0.7.0/windows/athenaeum-0.7.0-windows-x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHRlc3QKUldUdGVzdA=="
+    },
+    "windows-x86_64-msi": {
+      "url": "https://artfrom.space/builds/v0.7.0/windows/athenaeum-0.7.0-windows-x64.msi",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHRlc3QKUldUdGVzdA=="
+    },
+    "linux-x86_64": {
+      "url": "https://artfrom.space/builds/v0.7.0/linux/athenaeum-0.7.0-linux-x64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHRlc3QKUldUdGVzdA=="
+    }
+  }
+}

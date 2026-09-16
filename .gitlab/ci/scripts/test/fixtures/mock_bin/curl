@@ -78,17 +78,33 @@ case "$url" in
       printf '{"detail": "mock login failure"}' > "$output_file"
     fi
     ;;
+  *artfrom.space/updates/*)
+    # verify_release.sh's manifest fetch. MOCK_CURL_MANIFEST_HTTP (200),
+    # MOCK_CURL_MANIFEST_FILE (body).
+    http_code="${MOCK_CURL_MANIFEST_HTTP:-200}"
+    if [ "$is_head" -eq 1 ]; then printf 'HTTP/2 %s\n' "$http_code" > "$output_file"
+    elif [ -n "${MOCK_CURL_MANIFEST_FILE:-}" ] && [ -f "$MOCK_CURL_MANIFEST_FILE" ]; then cp "$MOCK_CURL_MANIFEST_FILE" "$output_file"
+    else printf '{}' > "$output_file"; fi
+    ;;
   *artfrom.space/builds/*)
     # verify_release.sh's per-artifact HEAD. MOCK_CURL_ARTIFACT_HTTP (200),
     # MOCK_CURL_ARTIFACT_LENGTH (5000000 bytes), MOCK_CURL_MISSING_ARTIFACTS
     # (space-separated basenames that answer 404 regardless of the above).
+    # A non-HEAD GET (the updater manifest's per-file download) writes
+    # MOCK_CURL_ARTIFACT_LENGTH bytes of 'x' to --output, capped at 4096 for
+    # the mock, unless the basename is in MOCK_CURL_MISSING_ARTIFACTS (404,
+    # empty body).
     http_code="${MOCK_CURL_ARTIFACT_HTTP:-200}"
     base=$(basename "$url")
     for missing in ${MOCK_CURL_MISSING_ARTIFACTS:-}; do [ "$base" = "$missing" ] && http_code=404; done
     if [ "$is_head" -eq 1 ]; then
       printf 'HTTP/2 %s\ncontent-length: %s\n' "$http_code" "${MOCK_CURL_ARTIFACT_LENGTH:-5000000}" > "$output_file"
-    else
+    elif [ "$http_code" != "200" ]; then
       : > "$output_file"
+    else
+      len="${MOCK_CURL_ARTIFACT_LENGTH:-5000000}"
+      [ "$len" -gt 4096 ] && len=4096
+      head -c "$len" /dev/zero | tr '\0' 'x' > "$output_file"
     fi
     ;;
   *hub.docker.com/v2/repositories/*/tags/*)

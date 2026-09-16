@@ -30,6 +30,48 @@ while read -r product os arch ext variant subdir filename alias; do
 done < <(all_release_artifacts)
 [ "$fail" -eq 0 ] && echo "ok: $count artifacts present under ${BUILDS_BASE_URL}/${CI_COMMIT_TAG}/"
 
+# --- 1b. the updater manifest: version, every platform, every URL, every signature
+UPDATES_BASE_URL="${UPDATES_BASE_URL:-https://artfrom.space/updates}"
+TAURI_CONF_PATH="${TAURI_CONF_PATH:-crates/athenaeum-tauri/tauri.conf.json}"
+if [ "${SKIP_UPDATER_CHECK:-0}" = "1" ]; then
+  echo "skipped: updater manifest check (SKIP_UPDATER_CHECK=1)"
+else
+  murl="${UPDATES_BASE_URL}/${CI_COMMIT_TAG}.json"
+  # DL is a directory, not a single file: each artifact downloads to
+  # "$DL/<real filename>" so a downstream signature-verification failure can
+  # be reported against the artifact it actually names, not a mktemp path.
+  MAN=$(mktemp -t verify_manifest.XXXXXX); PUB=$(mktemp -t verify_pub.XXXXXX); DL=$(mktemp -d -t verify_dl.XXXXXX); SIG=$(mktemp -t verify_sig.XXXXXX)
+  trap 'rm -rf "$HDR" "$BODY" "$MAN" "$PUB" "$DL" "$SIG"' EXIT
+  code=$(curl --silent --show-error --output "$MAN" --write-out '%{http_code}' --max-time 60 "$murl" || echo 000)
+  if [ "$code" != "200" ]; then
+    echo "ERROR: HTTP $code for $murl" >&2; fail=1
+  else
+    mver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$MAN" 2>/dev/null || true)
+    if [ -z "$mver" ]; then echo "ERROR: updater manifest at $murl is not the expected JSON" >&2; fail=1
+    elif [ "$mver" != "$VERSION" ]; then echo "ERROR: updater manifest version is $mver, tag $CI_COMMIT_TAG expects $VERSION" >&2; fail=1
+    else
+      # The committed public key (base64 of the minisign key file) → rsign's key file.
+      python3 -c 'import base64,json,sys; sys.stdout.write(base64.b64decode(json.load(open(sys.argv[1]))["plugins"]["updater"]["pubkey"]).decode())' "$TAURI_CONF_PATH" > "$PUB"
+      command -v rsign >/dev/null || { echo "ERROR: rsign (rsign2) is not installed on this runner — cargo install rsign2 --locked" >&2; exit 1; }
+      mcount=0
+      while read -r product os arch ext variant subdir filename key; do
+        expected="${BUILDS_BASE_URL}/${CI_COMMIT_TAG}/${subdir}/${filename}"
+        entry=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["platforms"].get(sys.argv[2]); print(p["url"]+"\t"+p["signature"] if p else "")' "$MAN" "$key")
+        if [ -z "$entry" ]; then echo "ERROR: updater manifest has no entry for $key" >&2; fail=1; continue; fi
+        IFS=$'\t' read -r url signature <<< "$entry"
+        if [ "$url" != "$expected" ]; then echo "ERROR: updater manifest $key points at $url, expected $expected" >&2; fail=1; continue; fi
+        dlfile="$DL/$filename"
+        code=$(curl --silent --show-error --output "$dlfile" --write-out '%{http_code}' --max-time 600 "$url" || echo 000)
+        if [ "$code" != "200" ] || [ ! -s "$dlfile" ]; then echo "ERROR: HTTP $code (or empty body) for $url" >&2; fail=1; continue; fi
+        printf '%s' "$signature" | python3 -c 'import base64,sys; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode())' > "$SIG"
+        if rsign verify -p "$PUB" -x "$SIG" "$dlfile" >/dev/null 2>&1; then mcount=$((mcount + 1))
+        else echo "ERROR: updater signature does not verify for $url" >&2; fail=1; fi
+      done < <(updater_artifacts)
+      [ "$fail" -eq 0 ] && echo "ok: updater manifest v${VERSION} — ${mcount} platforms, every URL present, every signature verified"
+    fi
+  fi
+fi
+
 # --- 2. Docker Hub: the version tag exists, carries the arches, the channel tag moved
 if [ "${SKIP_DOCKER_CHECK:-0}" = "1" ]; then
   echo "skipped: docker check (SKIP_DOCKER_CHECK=1)"
