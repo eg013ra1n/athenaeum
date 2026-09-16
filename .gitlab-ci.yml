@@ -81,6 +81,7 @@ build:windows:
   # runner machine warm itself on the first tag", which a machine-local cache
   # cannot do — a fresh machine has no cache to restore.
   script:
+    - if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { Write-Error "FATAL: TAURI_SIGNING_PRIVATE_KEY is empty - is the tag a Protected tag?"; exit 1 }
     # No cmake/nasm bootstrap here any more. turbojpeg-sys (the only crate that
     # needed cmake, and the only one that shelled out to nasm — via
     # libjpeg-turbo's own build) is out of Cargo.lock since both rustafits and
@@ -96,7 +97,9 @@ build:windows:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
     paths:
       - target/release/bundle/msi/*.msi
+      - target/release/bundle/msi/*.msi.sig
       - target/release/bundle/nsis/*.exe
+      - target/release/bundle/nsis/*.exe.sig
     expire_in: 30 days
 
 # --- Linux Build ---
@@ -122,6 +125,7 @@ build:linux:
     # still be installed on the runner host; this job simply no longer cares.)
   # No cache — see the comment in build:windows for why this pipeline has none.
   script:
+    - '[ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "FATAL: TAURI_SIGNING_PRIVATE_KEY is empty — is the tag a Protected tag?"; exit 1; }'
     - export RUSTAFITS_PORTABLE=1
     - rm -rf target/release/bundle/
     - npm install
@@ -130,6 +134,7 @@ build:linux:
     name: "athenaeum-linux-${CI_COMMIT_SHORT_SHA}"
     paths:
       - target/release/bundle/appimage/*.AppImage
+      - target/release/bundle/appimage/*.AppImage.sig
       - target/release/bundle/deb/*.deb
     expire_in: 30 days
 
@@ -237,6 +242,7 @@ build:macos:
   needs: ["check:versions"]
   # No cache — see the comment in build:windows for why this pipeline has none.
   script:
+    - '[ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "FATAL: TAURI_SIGNING_PRIVATE_KEY is empty — is the tag a Protected tag?"; exit 1; }'
     # No `brew install cmake nasm` here any more — turbojpeg-sys is out of
     # Cargo.lock (see build:windows). Apple targets never took `ring`'s nasm
     # path anyway: its macosx/ios64 perlasm output assembles through cc.
@@ -253,13 +259,12 @@ build:macos:
     # DOES have the partition-list). The `unset` above does not touch
     # APPLE_API_* — the DMG loop below needs them.
     - unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-    # Tauri SIGNS the .app (APPLE_SIGNING_IDENTITY) but does NOT notarize it:
-    # the three APPLE_API_* variables are withheld from this step, so the only
-    # notarization per architecture is the DMG's below (ruling F5.1 — two
-    # notary waits per release instead of four; the DMG ticket covers the app
-    # inside, which verify:macos-gatekeeper proves on the published file).
-    - env -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH npm run tauri build -- --target aarch64-apple-darwin
-    - env -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH npm run tauri build -- --target x86_64-apple-darwin
+    # D4 (in-app updates spec): tauri build notarizes + staples the .app
+    # itself again, so the updater's .app.tar.gz carries a stapled bundle.
+    # Ruling F5.1 (DMG-only notarization) is reversed by that spec; the DMG
+    # loop below still notarizes the DMG a first-time user downloads.
+    - npm run tauri build -- --target aarch64-apple-darwin
+    - npm run tauri build -- --target x86_64-apple-darwin
     - |
       for DMG in target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
                  target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do
@@ -272,6 +277,10 @@ build:macos:
     paths:
       - target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
       - target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+      - target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+      - target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+      - target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
+      - target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
     expire_in: 30 days
 
 # --- Runner smoke (main, manual) ---
@@ -575,11 +584,25 @@ deploy:
     - cp target/debian/perseus-*-linux-amd64.tar.gz               "release_stage/perseus/$(artifact_name perseus linux x64 tar.gz)"
     - cp target/debian/perseus-headless_*_arm64.deb               "release_stage/perseus/$(artifact_name perseus linux arm64 deb)"
     - cp target/debian/perseus-*-linux-arm64.tar.gz               "release_stage/perseus/$(artifact_name perseus linux arm64 tar.gz)"
+    # Updater artifacts (in-app updates spec §3.4/§3.5): the macOS app
+    # archives and every signature, beside the installers they belong to.
+    - cp target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz     "release_stage/macos/$(artifact_name athenaeum macos arm64 app.tar.gz)"
+    - cp target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig "release_stage/macos/$(artifact_name athenaeum macos arm64 app.tar.gz).sig"
+    - cp target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz      "release_stage/macos/$(artifact_name athenaeum macos x64 app.tar.gz)"
+    - cp target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig  "release_stage/macos/$(artifact_name athenaeum macos x64 app.tar.gz).sig"
+    - cp target/release/bundle/nsis/*.exe.sig                              "release_stage/windows/$(artifact_name athenaeum windows x64 exe setup).sig"
+    - cp target/release/bundle/msi/*.msi.sig                               "release_stage/windows/$(artifact_name athenaeum windows x64 msi).sig"
+    - cp target/release/bundle/appimage/*.AppImage.sig                     "release_stage/linux/$(artifact_name athenaeum linux x64 AppImage).sig"
     # Every inventory line must now exist — a glob that matched nothing above fails here, not on the server.
     - |
       while read -r product os arch ext variant subdir filename alias; do
         [ -s "release_stage/$subdir/$filename" ] || { echo "ERROR: missing release_stage/$subdir/$filename"; exit 1; }
       done < <(all_release_artifacts)
+    - |
+      while read -r product os arch ext variant subdir filename key; do
+        [ -s "release_stage/$subdir/$filename" ]     || { echo "ERROR: missing release_stage/$subdir/$filename"; exit 1; }
+        [ -s "release_stage/$subdir/$filename.sig" ] || { echo "ERROR: missing release_stage/$subdir/$filename.sig"; exit 1; }
+      done < <(updater_artifacts)
     - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos ${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus"
     - for d in windows macos linux perseus; do ${SCP_CMD} release_stage/$d/* ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/$d/; done
     # Stable aliases (version-less) + legacy aliases (pre-rename spellings, until v0.7.0).
@@ -598,6 +621,11 @@ deploy:
     # The `builds/latest` / `builds/beta` channel symlink flip does NOT happen
     # here any more — it moved to publish:channel-link (stage announce, after
     # verify): see that job's comment for why.
+  artifacts:
+    name: "release-sigs-${CI_COMMIT_TAG}"
+    paths:
+      - release_stage/**/*.sig
+    expire_in: 30 days
 
 # --- Docs site publish (tags only) ---
 docs:publish:

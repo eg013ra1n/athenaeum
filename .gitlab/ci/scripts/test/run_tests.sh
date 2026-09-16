@@ -576,6 +576,15 @@ legacy=$(VERSION=0.6.4 legacy_alias_pairs)
 assert_contains "legacy: old macOS alias maps to the new file" "macos Athenaeum-macos-aarch64.dmg athenaeum-0.6.4-macos-arm64.dmg" "$legacy"
 assert_contains "legacy: old perseus deb alias" "perseus perseus-linux-amd64.deb perseus-0.6.4-linux-x64.deb" "$legacy"
 
+ua=$(VERSION=0.7.0 updater_artifacts)
+assert_eq "updater: 5 lines" "5" "$(printf '%s\n' "$ua" | wc -l | tr -d ' ')"
+assert_file_has_line "updater: macos arm64 app.tar.gz" "athenaeum macos arm64 app.tar.gz - macos athenaeum-0.7.0-macos-arm64.app.tar.gz darwin-aarch64" <(printf '%s\n' "$ua")
+assert_file_has_line "updater: macos x64 app.tar.gz" "athenaeum macos x64 app.tar.gz - macos athenaeum-0.7.0-macos-x64.app.tar.gz darwin-x86_64" <(printf '%s\n' "$ua")
+assert_file_has_line "updater: windows nsis" "athenaeum windows x64 exe setup windows athenaeum-0.7.0-windows-x64-setup.exe windows-x86_64-nsis" <(printf '%s\n' "$ua")
+assert_file_has_line "updater: windows msi" "athenaeum windows x64 msi - windows athenaeum-0.7.0-windows-x64.msi windows-x86_64-msi" <(printf '%s\n' "$ua")
+assert_file_has_line "updater: linux appimage" "athenaeum linux x64 AppImage - linux athenaeum-0.7.0-linux-x64.AppImage linux-x86_64" <(printf '%s\n' "$ua")
+assert_not_contains "updater: no plain windows key" " windows-x86_64$" "$ua"
+
 echo
 echo "-- check_versions.sh / bump.sh --"
 

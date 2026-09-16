@@ -70,6 +70,30 @@ all_release_artifacts() {
   done
 }
 
+# updater_artifacts — the files the in-app updater downloads, each published
+# beside its `<filename>.sig`. One line each:
+#   product os arch ext variant subdir filename plugin_key
+# plugin_key is tauri-plugin-updater's manifest key ({os}-{arch}[-{installer}]).
+# The two Windows installers get installer-specific keys and there is NO plain
+# `windows-x86_64` key on purpose: the plugin falls back to the plain key for
+# a build of unknown installer type, which must not be handed the NSIS exe.
+# Not on the download page — these are not for people.
+updater_artifacts() {
+  : "${VERSION:?VERSION must be set (no leading v)}"
+  local spec product os arch ext variant subdir key
+  for spec in \
+    "athenaeum macos arm64 app.tar.gz - macos darwin-aarch64" \
+    "athenaeum macos x64 app.tar.gz - macos darwin-x86_64" \
+    "athenaeum windows x64 exe setup windows windows-x86_64-nsis" \
+    "athenaeum windows x64 msi - windows windows-x86_64-msi" \
+    "athenaeum linux x64 AppImage - linux linux-x86_64"; do
+    read -r product os arch ext variant subdir key <<< "$spec"
+    local v="" ; [ "$variant" != "-" ] && v="$variant"
+    printf '%s %s %s %s %s %s %s %s\n' "$product" "$os" "$arch" "$ext" "$variant" "$subdir" \
+      "$(artifact_name "$product" "$os" "$arch" "$ext" "$v")" "$key"
+  done
+}
+
 # legacy_alias_pairs — old alias spellings kept as extra symlinks until
 # v0.7.0 so links published before the rename keep resolving.
 # One line each: subdir legacy_alias current_filename
