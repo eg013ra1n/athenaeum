@@ -25,6 +25,8 @@ import { NotificationPanel } from './NotificationPanel';
 import { TransfersProvider } from '../contexts/TransfersContext';
 import { TransferIndicator } from './transfers/TransferIndicator';
 import { TransfersPanel } from './transfers/TransfersPanel';
+import { UpdatesProvider } from '../contexts/UpdatesContext';
+import { UpdateDialog } from './updates/UpdateDialog';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
 import { useProjectMatches } from '../hooks/useProjectMatches';
 import { useContentIndexNotifications } from '../hooks/useContentIndex';
@@ -85,6 +87,7 @@ export default function Layout() {
     <SessionStateProvider>
     <NotificationProvider>
     <TransfersProvider>
+    <UpdatesProvider>
     <ScanProgressProvider>
       <ExportProgressProvider>
         <AnalysisProgressProvider>
@@ -164,6 +167,7 @@ export default function Layout() {
           <PlateSolveIndexMissingModal />
           <ToastStack />
           <NotificationPanel />
+          <UpdateDialog />
           <TransfersPanel />
           <AutoUpdateCheck />
           <ProjectMatchesListener />
@@ -176,6 +180,7 @@ export default function Layout() {
         </AnalysisProgressProvider>
       </ExportProgressProvider>
     </ScanProgressProvider>
+    </UpdatesProvider>
     </TransfersProvider>
     </NotificationProvider>
     </SessionStateProvider>

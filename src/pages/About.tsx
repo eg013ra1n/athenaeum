@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
-import { api } from '../api';
+import { useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { HistoryNav } from '../components/HistoryNav';
 import { openUrl } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
-import type { UpdateInfo } from '../types/helpers';
+import { useUpdates } from '../contexts/UpdatesContext';
 
 interface Dependency {
   name: string;
@@ -40,75 +40,43 @@ const backendDeps: Dependency[] = [
 ];
 
 function UpdateSection() {
-  const [checking, setChecking] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
-  const [checkError, setCheckError] = useState<string | null>(null);
+  const { check, checking, checkError, runCheck, openAvailable, openReleaseNotes } = useUpdates();
+  const [params, setParams] = useSearchParams();
 
-  const handleCheck = async () => {
-    setChecking(true);
-    setCheckError(null);
-    setUpdateInfo(null);
-    try {
-      const info = await api.invoke<UpdateInfo>('check_for_updates');
-      setUpdateInfo(info);
-    } catch (err) {
-      const msg = typeof err === 'string' ? err : 'Failed to check for updates';
-      console.error('check_for_updates:', err);
-      setCheckError(msg);
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  // Auto-populate on mount so arriving here (e.g. from the update
-  // notification) shows the result + Download button without a manual click.
+  // Arriving from the update toast (/about?update): check, then open the dialog.
   useEffect(() => {
-    handleCheck();
+    if (!params.has('update')) return;
+    setParams({}, { replace: true });
+    runCheck().then((r) => { if (r?.isUpdateAvailable) openAvailable(); });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-4">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Updates</h2>
-      <button
-        onClick={handleCheck}
-        disabled={checking}
-        className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-      >
-        <RefreshCw size={15} className={checking ? 'animate-spin' : ''} />
-        {checking ? 'Checking…' : 'Check for Updates'}
-      </button>
-
+      <div className="flex flex-wrap items-center gap-3 text-sm">
+        <span className="text-content-secondary">Athenaeum v{__APP_VERSION__}</span>
+        <button onClick={() => void runCheck()} disabled={checking} className="flex items-center gap-2 px-3 py-1.5 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 text-sm">
+          <RefreshCw size={14} className={checking ? 'animate-spin' : ''} />
+          {checking ? 'Checking…' : 'Check for updates'}
+        </button>
+        <button onClick={() => void openReleaseNotes()} className="text-accent hover:underline">View release notes</button>
+      </div>
       {checkError && (
         <div className="flex items-start gap-2 p-3 bg-error/10 border border-error/40 rounded-lg text-sm text-error">
-          <AlertCircle size={15} className="flex-shrink-0 mt-0.5" />
-          {checkError}
+          <AlertCircle size={15} className="flex-shrink-0 mt-0.5" />{checkError}
         </div>
       )}
-
-      {updateInfo && !updateInfo.is_update_available && (
+      {check && !check.isUpdateAvailable && (
         <div className="flex items-center gap-2 p-3 bg-success/10 border border-success/40 rounded-lg text-sm text-success">
-          <CheckCircle2 size={15} />
-          You're up to date! (v{updateInfo.current_version})
+          <CheckCircle2 size={15} /> You're up to date (v{check.currentVersion}).
         </div>
       )}
-
-      {updateInfo && updateInfo.is_update_available && (
-        <div className="p-3 bg-accent/10 border border-accent/40 rounded-lg space-y-2">
-          <div className="flex items-center gap-2 text-sm font-semibold text-accent">
-            <Info size={15} />
-            Version {updateInfo.latest_version} is available
-          </div>
-          <p className="text-sm text-content-muted">
-            You are running v{updateInfo.current_version}.
-          </p>
-          <button
-            onClick={() => openUrl(updateInfo.download_url)}
-            className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition text-sm"
-          >
-            <Download size={15} />
-            Download v{updateInfo.latest_version}
-            <ExternalLink size={13} />
+      {check && check.isUpdateAvailable && (
+        <div className="flex items-center justify-between p-3 bg-accent/10 border border-accent/40 rounded-lg text-sm">
+          <span className="flex items-center gap-2 font-semibold text-accent"><Info size={15} /> Version {check.latestVersion} is available</span>
+          <button onClick={openAvailable} className="flex items-center gap-2 px-3 py-1.5 bg-accent hover:bg-accent-hover rounded-lg text-sm">
+            <Download size={14} /> {check.platformSupported ? 'Install' : 'Details'}
           </button>
         </div>
       )}
@@ -182,7 +150,7 @@ export default function About() {
         </p>
       </section>
 
-      {isTauri && <UpdateSection />}
+      <UpdateSection />
 
       <div className="grid grid-cols-3 gap-6">
         <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">

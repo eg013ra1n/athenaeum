@@ -1,45 +1,51 @@
 import { useEffect, useRef } from 'react';
 import { api } from '../api';
-import { isTauri } from '../utils/platform';
 import { useNotifications } from '../contexts/NotificationContext';
-import type { UpdateInfo } from '../types/helpers';
+import { useUpdates } from '../contexts/UpdatesContext';
+import type { WhatsNew } from '../types/models';
 
 /**
- * On desktop startup, run the existing update check once per launch (unless the
- * user opted out via `updates.auto_check`). If a newer version exists, surface
- * it as a toast + notification-bell entry. Failures (e.g. offline at launch)
- * are logged only — never surfaced, never block startup.
+ * Launch sequence (spec §5.3), both hosts:
+ *  1. `get_whats_new` — once per version; opens the What's-new dialog.
+ *  2. unless `updates.auto_check` is off: `check_for_updates`; a newer
+ *     version raises a toast + bell entry linking to /about?update.
+ * Failures are console-only — offline at launch is normal, never a toast.
  */
 export function useAutoUpdateCheck() {
   const { notify } = useNotifications();
+  const { runCheck, openWhatsNew } = useUpdates();
   const ran = useRef(false);
 
   useEffect(() => {
-    if (!isTauri) return;
-    if (ran.current) return; // guard React StrictMode double-invoke
+    if (ran.current) return; // React StrictMode double-invoke guard
     ran.current = true;
 
     (async () => {
       try {
-        const enabled = await api.invoke<string>('get_setting', {
-          key: 'updates.auto_check',
-          defaultValue: 'true',
-        });
+        const w = await api.invoke<WhatsNew | null>('get_whats_new');
+        if (w) openWhatsNew(w);
+      } catch (err) {
+        console.error('get_whats_new:', err);
+      }
+      try {
+        const enabled = await api.invoke<string>('get_setting', { key: 'updates.auto_check', defaultValue: 'true' });
         if (enabled.toLowerCase() !== 'true') return;
-
-        const info = await api.invoke<UpdateInfo>('check_for_updates');
-        if (info.is_update_available) {
+        const info = await runCheck();
+        if (info?.isUpdateAvailable) {
           notify({
-            title: `Update available: v${info.latest_version}`,
-            detail: `You have v${info.current_version}. Click to view and download on the About page.`,
+            title: `Update available: v${info.latestVersion}`,
+            detail: info.platformSupported
+              ? `You have v${info.currentVersion}. Click to read the notes and install.`
+              : `You have v${info.currentVersion}. Click to read the notes.`,
             tone: 'success',
             kind: 'update',
-            link: '/about',
+            link: '/about?update',
+            dedupeKey: `update-${info.latestVersion}`,
           });
         }
       } catch (err) {
         console.error('auto update check:', err);
       }
     })();
-  }, [notify]);
+  }, [notify, runCheck, openWhatsNew]);
 }

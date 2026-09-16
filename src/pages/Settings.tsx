@@ -834,8 +834,7 @@ export default function Settings() {
 
           <div className="bg-surface-elevated rounded-lg p-6 space-y-6">
 
-        {/* Updates section - desktop only */}
-        {isTauri && (
+        {/* Updates section - both desktop and web */}
         <div>
           <h3 className="text-lg font-semibold mb-4">Updates</h3>
           <div className="space-y-4">
@@ -851,7 +850,7 @@ export default function Settings() {
                   Automatically check for updates on startup
                 </span>
                 <span className="block text-xs text-content-muted mt-1">
-                  When enabled, Athenaeum checks for a newer version each time it starts and shows a notification if one is available. Disable to only check manually via the button on the About page.
+                  When enabled, Athenaeum checks for a newer version each time it starts and shows a notification if one is available — on the desktop app and in the web build alike. Disable to only check manually from the About page.
                 </span>
               </div>
             </label>
@@ -873,7 +872,6 @@ export default function Settings() {
             </label>
           </div>
         </div>
-        )}
 
         <div>
           <h3 className="text-lg font-semibold mb-4">Clustering Parameters</h3>
