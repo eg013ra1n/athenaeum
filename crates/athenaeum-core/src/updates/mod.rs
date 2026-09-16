@@ -4,4 +4,5 @@
 //! once-per-version "What's new". Download/verify/install live in the
 //! desktop host (`tauri-plugin-updater`); this module never touches a file.
 
+pub mod manifest;
 pub mod version;
