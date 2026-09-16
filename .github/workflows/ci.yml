@@ -140,28 +140,16 @@ jobs:
       # skipping for a developer running this same command locally without `CI`
       # in the environment.
       #
-      # nextest runs every test binary's tests in parallel processes instead of
-      # one after another the way the plain `cargo test` runner above did — that
-      # serial runner spent most of this step waiting on the slowest binary.
-      # Same unit graph as the --no-run step above, so nextest relinks rather
-      # than recompiles. `-E 'not (test(...) | test(...))'` is nextest's filter
-      # expression for the same two `--skip` names this step used before.
-      # Baseline this replaces (2026-09-14, run 34908768151, plain `cargo test`):
-      # Linux 3 min 55 s, Windows 6 min 41 s for this step alone.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-
+      # MEASUREMENT IN PROGRESS (2026-09-16) — this step is deliberately the
+      # plain runner for one run, and the next commit decides which one stays.
+      # nextest was measured here first, but against a baseline taken BEFORE the
+      # two slow init_db tests were fixed (a7ed3879), so the comparison was
+      # worthless: the fix helps both runners, and on Windows it helps a lot.
+      # nextest with the tests fixed, run 35111887046: Linux 203 s + 9 s of
+      # doctests, Windows 375 s + 15 s. This run measures the same workload
+      # through `cargo test`, which needs no separate doctest step.
       - name: Test workspace
-        run: cargo nextest run --workspace --no-fail-fast -E 'not (test(unclean_shutdown_mid_transfer_resumes_on_restart) | test(ingest_releases_conn_between_frames))'
-
-      # nextest does not run doctests (it only collects unittest/integration-test
-      # binaries), so they still need the plain runner. The workspace has very
-      # few (2026-09-15 count: athenaeum-core 0 passed/1 ignored, solvemyastro
-      # 1 passed/1 ignored, 0 in every other crate) — seconds, not worth a
-      # separate cache key.
-      - name: Doctests
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames
 
       - name: Typecheck frontend
         run: npx tsc --noEmit
@@ -262,14 +250,5 @@ jobs:
       #
       # See the Linux job's comment above the same step for why this now runs
       # through nextest and what the filter expression replaces.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-
       - name: Test workspace
-        run: cargo nextest run --workspace --no-fail-fast -E 'not (test(unclean_shutdown_mid_transfer_resumes_on_restart) | test(ingest_releases_conn_between_frames))'
-
-      # See the Linux job's comment above the same step: nextest skips
-      # doctests, so they run separately here too.
-      - name: Doctests
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --no-fail-fast -- --skip unclean_shutdown_mid_transfer_resumes_on_restart --skip ingest_releases_conn_between_frames
