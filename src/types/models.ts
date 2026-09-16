@@ -1655,3 +1655,38 @@ export type ThresholdRuleView = { metricKey: string, op: string,
  */
 value: number | boolean, };
 
+export type Channel = "stable" | "beta";
+
+export type UpdateCheck = { 
+/**
+ * `CARGO_PKG_VERSION`, dotted form.
+ */
+currentVersion: string, 
+/**
+ * The winning manifest's version, dotted form.
+ */
+latestVersion: string, isUpdateAvailable: boolean, 
+/**
+ * Which channel file won.
+ */
+channel: Channel, 
+/**
+ * The manifest's `notes` (Markdown), when present.
+ */
+notes: string | null, 
+/**
+ * RFC 3339 as published; the frontend formats it.
+ */
+pubDate: string | null, 
+/**
+ * The plugin can install this on THIS build: desktop, and a manifest key
+ * for the running `<os>-<arch>[-installer]` exists.
+ */
+platformSupported: boolean, downloadPageUrl: string, blogUrl: string, 
+/**
+ * `vsharifov/athenaeum:<latest>` on the web host, `None` on desktop.
+ */
+dockerImage: string | null, };
+
+export type WhatsNew = { version: string, notes: string, blogUrl: string, };
+

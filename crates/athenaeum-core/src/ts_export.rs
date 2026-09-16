@@ -223,6 +223,9 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab_exchange::ContributionView,
             crate::collab::gate::FrameGateRow,
             crate::collab::gate::ThresholdRuleView,
+            crate::updates::manifest::Channel,
+            crate::updates::UpdateCheck,
+            crate::updates::WhatsNew,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,
