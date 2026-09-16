@@ -19,6 +19,7 @@ target/
 CLAUDE.md
 *.md
 !README.md
+!RELEASE_NOTES.md
 
 # CI
 .gitlab-ci.yml

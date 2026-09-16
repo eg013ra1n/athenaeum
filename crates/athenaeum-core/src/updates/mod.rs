@@ -206,6 +206,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     fn ctx() -> (tempfile::TempDir, ServiceContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -225,9 +226,14 @@ mod tests {
 
     /// A one-shot HTTP/1.1 server on 127.0.0.1: answers `routes` by path
     /// (status, body) and 404 otherwise, for `hits` requests, then exits.
-    fn serve(routes: Vec<(&'static str, u16, String)>, hits: usize) -> String {
+    /// Returns the base URL plus every request's full path (including its
+    /// query string), in arrival order, so a caller can assert on exactly
+    /// what `check_at` sent — not just re-derive it from the URL builder.
+    fn serve(routes: Vec<(&'static str, u16, String)>, hits: usize) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_thread = Arc::clone(&requests);
         std::thread::spawn(move || {
             for _ in 0..hits {
                 let (mut s, _) = listener.accept().unwrap();
@@ -235,6 +241,7 @@ mod tests {
                 let n = s.read(&mut buf).unwrap();
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                requests_thread.lock().unwrap().push(path.clone());
                 let path_only = path.split('?').next().unwrap();
                 let (status, body) = routes
                     .iter()
@@ -250,7 +257,7 @@ mod tests {
                 .unwrap();
             }
         });
-        base
+        (base, requests)
     }
 
     fn manifest(version: &str, keys: &[&str]) -> String {
@@ -306,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn stable_only_by_default_and_newer_wins() {
         let (_d, ctx) = ctx();
-        let base = serve(vec![("/latest.json", 200, manifest("99.0.0", &["darwin-aarch64"]))], 1);
+        let (base, _reqs) = serve(vec![("/latest.json", 200, manifest("99.0.0", &["darwin-aarch64"]))], 1);
         let r = check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap();
         assert_eq!(r.current_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(r.latest_version, "99.0.0");
@@ -323,7 +330,7 @@ mod tests {
     async fn beta_is_fetched_only_when_opted_in_and_newer_beta_wins() {
         let (_d, ctx) = ctx();
         set(&ctx, SETTING_CHECK_BETA, "true");
-        let base = serve(
+        let (base, _reqs) = serve(
             vec![
                 ("/latest.json", 200, manifest("99.0.0", &["darwin-aarch64"])),
                 ("/latest-beta.json", 200, manifest("99.1.0-beta.1", &["darwin-aarch64"])),
@@ -339,7 +346,7 @@ mod tests {
     async fn stable_beats_an_older_beta() {
         let (_d, ctx) = ctx();
         set(&ctx, SETTING_CHECK_BETA, "true");
-        let base = serve(
+        let (base, _reqs) = serve(
             vec![
                 ("/latest.json", 200, manifest("99.1.0", &["darwin-aarch64"])),
                 ("/latest-beta.json", 200, manifest("99.1.0-beta.3", &["darwin-aarch64"])),
@@ -354,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn older_manifest_is_up_to_date() {
         let (_d, ctx) = ctx();
-        let base = serve(vec![("/latest.json", 200, manifest("0.0.1", &["darwin-aarch64"]))], 1);
+        let (base, _reqs) = serve(vec![("/latest.json", 200, manifest("0.0.1", &["darwin-aarch64"]))], 1);
         let r = check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap();
         assert!(!r.is_update_available);
         assert_eq!(r.latest_version, "0.0.1");
@@ -363,22 +370,32 @@ mod tests {
     #[tokio::test]
     async fn platform_support_follows_the_host() {
         let (_d, ctx) = ctx();
-        let base = serve(vec![("/latest.json", 200, manifest("99.0.0", &["linux-x86_64"]))], 3);
-        let mac = check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap();
-        assert!(!mac.platform_supported, "no darwin key");
-        let web = check_at(&ctx, &WEB, &base).await.unwrap();
+        // A key no real host can ever match, so this half of the test is
+        // independent of which OS/arch the test itself is running on.
+        let (unsupported, _reqs) = serve(vec![("/latest.json", 200, manifest("99.0.0", &["plan9-sparc"]))], 3);
+        let mac = check_at(&ctx, &DESKTOP_MAC, &unsupported).await.unwrap();
+        assert!(!mac.platform_supported, "no key can ever match an unsupported platform");
+        let web = check_at(&ctx, &WEB, &unsupported).await.unwrap();
         assert!(!web.platform_supported, "web is never installable");
         assert_eq!(web.docker_image.as_deref(), Some("vsharifov/athenaeum:99.0.0"));
         let deb = HostInfo { kind: HostKind::Desktop, git_hash: "abc", installer: Some("deb") };
-        let d = check_at(&ctx, &deb, &base).await.unwrap();
+        let d = check_at(&ctx, &deb, &unsupported).await.unwrap();
         assert!(!d.platform_supported, "package-manager installs are refused by rule");
+
+        // The running host's own key, built the same way `check_at` builds
+        // it, is supported — this is the positive case, and it must hold on
+        // whatever OS/arch actually runs this test (dev Mac or CI Linux).
+        let own_key = format!("{}-{}", manifest::plugin_target_os(std::env::consts::OS), std::env::consts::ARCH);
+        let (supported, _reqs2) = serve(vec![("/latest.json", 200, manifest("99.0.0", &[own_key.as_str()]))], 1);
+        let ok = check_at(&ctx, &DESKTOP_MAC, &supported).await.unwrap();
+        assert!(ok.platform_supported, "the running host's own os/arch key is served");
     }
 
     #[tokio::test]
     async fn one_channel_failing_does_not_hide_the_other() {
         let (_d, ctx) = ctx();
         set(&ctx, SETTING_CHECK_BETA, "true");
-        let base = serve(vec![("/latest-beta.json", 200, manifest("99.0.0-beta.1", &["darwin-aarch64"]))], 2);
+        let (base, _reqs) = serve(vec![("/latest-beta.json", 200, manifest("99.0.0-beta.1", &["darwin-aarch64"]))], 2);
         let r = check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap();
         assert_eq!(r.latest_version, "99.0.0-beta.1");
     }
@@ -386,7 +403,8 @@ mod tests {
     #[tokio::test]
     async fn both_channels_failing_is_an_error() {
         let (_d, ctx) = ctx();
-        let base = serve(vec![], 1);
+        set(&ctx, SETTING_CHECK_BETA, "true");
+        let (base, _reqs) = serve(vec![], 2);
         let err = check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap_err().to_string();
         assert!(err.contains("HTTP 404"), "{err}");
     }
@@ -394,19 +412,16 @@ mod tests {
     #[tokio::test]
     async fn the_request_carries_the_telemetry_query() {
         let (_d, ctx) = ctx();
-        // The one-shot server ignores the query, so assert on the URL builder
-        // with the same inputs `check_at` uses.
-        let db = ctx.db.get().unwrap();
-        let id = installation_id(&db.conn()).unwrap();
-        let ping = TelemetryPing {
-            app_version: env!("CARGO_PKG_VERSION"),
-            os: std::env::consts::OS,
-            arch: std::env::consts::ARCH,
-            commit: "abc",
-            installation_id: &id,
-        };
-        let url = manifest::manifest_url("http://h", Channel::Stable, &ping);
-        assert!(url.contains(&format!("&id={id}")));
-        assert!(url.contains(&format!("?v={}&", env!("CARGO_PKG_VERSION"))));
+        let (base, requests) = serve(vec![("/latest.json", 200, manifest("0.0.1", &["darwin-aarch64"]))], 1);
+        check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap();
+        let id = setting(&ctx, SETTING_INSTALLATION_ID).expect("check_at stores an installation id");
+        let expected = format!(
+            "/latest.json?v={}&os={}&arch={}&commit=abc&id={}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            id
+        );
+        assert_eq!(requests.lock().unwrap().as_slice(), [expected]);
     }
 }
