@@ -48,18 +48,23 @@ build:windows:
   # the (seconds-long) check:versions job. (The old `needs: build:linux` gate
   # predates the dedicated runner and cost every release a serialized ~14 min.)
   needs: ["check:versions"]
-  cache:
-    key: "main-windows"
-    # pull-push: each release refreshes the machine-local cache with the dep
-    # set it just built — a fresh runner machine warms itself on the first tag
-    # instead of building cold forever (the manual main-branch warmer compiles
-    # a months-stale dep tree and nobody remembers to run it).
-    policy: pull-push
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
+  # No cache, deliberately — do not add one back. Every runner in this
+  # pipeline is a SHELL executor on a machine we own, and each checks out by
+  # "Fetching changes" into a repository it reinitializes in place, so the
+  # build directory (target/ included) is still there from the previous job.
+  # None of the three has a shared cache server either: all of them log "No
+  # URL provided, cache will not be uploaded to shared cache server". A cache
+  # can therefore only ever be restored onto the machine that already holds
+  # the same files. The comment this replaces justified it as letting "a
+  # fresh runner machine warm itself on the first tag", which a machine-local
+  # cache cannot do — a fresh machine has no cache to restore.
+  #
+  # What it cost, measured on pipeline 369 (v0.6.4-beta.1), restore + archive:
+  #   macOS    2:05 + 25:05  of a 41:42 job
+  #   Windows  1:00 +  2:08  of a 15:24 job
+  #   Linux    1:35 +  1:40  of a 15:12 job
+  # The macOS figure is why a release took over an hour: 29 438 registry
+  # files and 12 480 target files packed into a local archive nobody reads.
   script:
     # No cmake/nasm bootstrap here any more. turbojpeg-sys (the only crate that
     # needed cmake, and the only one that shelled out to nasm — via
@@ -100,15 +105,7 @@ build:linux:
     # libjpeg-turbo-rs. On ELF targets `ring` assembles through cc/gas, not
     # nasm. Nothing else in the tree uses the `cmake` crate. (The tools may
     # still be installed on the runner host; this job simply no longer cares.)
-  cache:
-    key: "main-linux"
-    # pull-push: see build:windows — releases keep their own cache warm.
-    policy: pull-push
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
+  # No cache — see the comment in build:windows for why this pipeline has none.
   script:
     - export RUSTAFITS_PORTABLE=1
     - rm -rf target/release/bundle/
@@ -144,13 +141,7 @@ check:headless-core:
     - linux
   before_script:
     - source "$HOME/.cargo/env"
-  cache:
-    key: "main-linux"
-    policy: pull
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
+  # No cache — see the comment in build:windows for why this pipeline has none.
   script:
     - cargo check -p athenaeum-core --no-default-features
 
@@ -229,15 +220,7 @@ build:macos:
   only:
     - tags
   needs: ["check:versions"]
-  cache:
-    key: "main-macos"
-    # pull-push: see build:windows — releases keep their own cache warm.
-    policy: pull-push
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
+  # No cache — see the comment in build:windows for why this pipeline has none.
   script:
     # No `brew install cmake nasm` here any more — turbojpeg-sys is out of
     # Cargo.lock (see build:windows). Apple targets never took `ring`'s nasm
@@ -279,9 +262,9 @@ build:macos:
 # --- Runner smoke (main, manual) ---
 # A ten-second job per runner to prove it takes work — the thing to play after
 # a runner restart or a machine reboot. It is NOT a build. Replaces the old
-# update-cache:{windows,linux,macos} warmers: the build jobs are `pull-push`
-# since `8baaaedb`, so every tagged release already refreshes its own
-# machine-local cache and a separate manual warmer was dead weight.
+# update-cache:{windows,linux,macos} warmers, which had nothing left to warm:
+# every runner here is a shell executor whose build directory survives between
+# jobs, so `target/` is already there — see the comment in build:windows.
 .runner_smoke:
   stage: build
   only: [main]
