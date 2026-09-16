@@ -32,7 +32,7 @@ done < <(all_release_artifacts)
 
 # --- 1b. the updater manifest: version, every platform, every URL, every signature
 UPDATES_BASE_URL="${UPDATES_BASE_URL:-https://artfrom.space/updates}"
-TAURI_CONF_PATH="${TAURI_CONF_PATH:-crates/athenaeum-tauri/tauri.conf.json}"
+TAURI_CONF_PATH="${TAURI_CONF_PATH:-$SCRIPT_DIR/../../../crates/athenaeum-tauri/tauri.conf.json}"
 if [ "${SKIP_UPDATER_CHECK:-0}" = "1" ]; then
   echo "skipped: updater manifest check (SKIP_UPDATER_CHECK=1)"
 else
@@ -56,17 +56,24 @@ else
       mcount=0
       while read -r product os arch ext variant subdir filename key; do
         expected="${BUILDS_BASE_URL}/${CI_COMMIT_TAG}/${subdir}/${filename}"
-        entry=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["platforms"].get(sys.argv[2]); print(p["url"]+"\t"+p["signature"] if p else "")' "$MAN" "$key")
+        if ! entry=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["platforms"].get(sys.argv[2]); print(p["url"]+"\t"+p["signature"] if p else "")' "$MAN" "$key" 2>/dev/null); then
+          echo "ERROR: updater manifest entry for $key is malformed" >&2; fail=1; continue
+        fi
         if [ -z "$entry" ]; then echo "ERROR: updater manifest has no entry for $key" >&2; fail=1; continue; fi
         IFS=$'\t' read -r url signature <<< "$entry"
         if [ "$url" != "$expected" ]; then echo "ERROR: updater manifest $key points at $url, expected $expected" >&2; fail=1; continue; fi
         dlfile="$DL/$filename"
         code=$(curl --silent --show-error --output "$dlfile" --write-out '%{http_code}' --max-time 600 "$url" || echo 000)
         if [ "$code" != "200" ] || [ ! -s "$dlfile" ]; then echo "ERROR: HTTP $code (or empty body) for $url" >&2; fail=1; continue; fi
-        printf '%s' "$signature" | python3 -c 'import base64,sys; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode())' > "$SIG"
-        if rsign verify -p "$PUB" -x "$SIG" "$dlfile" >/dev/null 2>&1; then mcount=$((mcount + 1))
-        else echo "ERROR: updater signature does not verify for $url" >&2; fail=1; fi
+        if ! printf '%s' "$signature" | python3 -c 'import base64,sys; sys.stdout.write(base64.b64decode(sys.stdin.read()).decode())' > "$SIG" 2>/dev/null; then
+          echo "ERROR: updater signature for $url is not valid base64" >&2; fail=1; continue
+        fi
+        if rsout=$(rsign verify -p "$PUB" -x "$SIG" "$dlfile" 2>&1); then mcount=$((mcount + 1))
+        else echo "ERROR: updater signature does not verify for $url — $rsout" >&2; fail=1; fi
       done < <(updater_artifacts)
+      if [ "$fail" -eq 0 ] && [ "$mcount" -ne 5 ]; then
+        echo "ERROR: updater manifest verified $mcount platforms, expected 5" >&2; fail=1
+      fi
       [ "$fail" -eq 0 ] && echo "ok: updater manifest v${VERSION} — ${mcount} platforms, every URL present, every signature verified"
     fi
   fi

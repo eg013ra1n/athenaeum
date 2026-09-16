@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
-# Mock rsign2 for verify_release.sh tests. `rsign verify -p PUB -x SIG FILE`
-# exits MOCK_RSIGN_RC (default 0); MOCK_RSIGN_FAIL_FILES (space-separated
-# basenames) exit 1 regardless.
+# Mock rsign2 for verify_release.sh tests. Pins the exact argv shape
+# verify_release.sh calls: `rsign verify -p PUB -x SIG FILE` (exactly six
+# args, in that order, PUB/SIG/FILE existing files) — any other invocation
+# (wrong flag order, a `-P` key string instead of `-p` a key file, missing
+# args) is a real rsign usage error and must fail loudly with exit 2, not
+# silently succeed or be mistaken for "signature does not verify".
+# After the shape check: MOCK_RSIGN_FAIL_FILES (space-separated basenames of
+# the FILE argument) exit 1 regardless; MOCK_RSIGN_RC overrides the success
+# exit code (default 0).
 set -euo pipefail
-file="${@: -1}"
+usage() { echo "usage: rsign verify -p PUB -x SIG FILE" >&2; exit 2; }
+[ "$#" -eq 6 ] || usage
+[ "$1" = "verify" ] || usage
+[ "$2" = "-p" ] || usage
+[ -f "$3" ] || usage
+[ "$4" = "-x" ] || usage
+[ -f "$5" ] || usage
+[ -f "$6" ] || usage
+file="$6"
 for f in ${MOCK_RSIGN_FAIL_FILES:-}; do [ "$(basename "$file")" = "$f" ] && { echo "Signature verification failed" >&2; exit 1; }; done
 exit "${MOCK_RSIGN_RC:-0}"
