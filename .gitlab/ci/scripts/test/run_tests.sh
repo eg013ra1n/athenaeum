@@ -920,5 +920,52 @@ PYEOF
 assert_eq "ci yaml: every script entry is a string" "ok" "$ci_shape_out"
 
 echo
+echo "-- gen_updater_manifest.sh --"
+
+UM_STAGE=$(mktemp -d -t updater_stage.XXXXXX)
+mkdir -p "$UM_STAGE/macos" "$UM_STAGE/windows" "$UM_STAGE/linux"
+printf 'SIGMACARM\n' > "$UM_STAGE/macos/athenaeum-0.7.0-macos-arm64.app.tar.gz.sig"
+printf 'SIGMACX64'   > "$UM_STAGE/macos/athenaeum-0.7.0-macos-x64.app.tar.gz.sig"
+printf 'SIGNSIS'     > "$UM_STAGE/windows/athenaeum-0.7.0-windows-x64-setup.exe.sig"
+printf 'SIGMSI'      > "$UM_STAGE/windows/athenaeum-0.7.0-windows-x64.msi.sig"
+printf 'SIGAPPIMG'   > "$UM_STAGE/linux/athenaeum-0.7.0-linux-x64.AppImage.sig"
+UM_OUT=$(mktemp -t updater_manifest.XXXXXX)
+rc=0
+CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" PUB_DATE=2026-10-01T12:00:00Z \
+  "$HELPERS_DIR/gen_updater_manifest.sh" > "$UM_OUT" 2>/dev/null || rc=$?
+assert_eq "manifest: exits 0" "0" "$rc"
+um_field() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$UM_OUT" "$1"; }
+assert_eq "manifest: version without v" "0.7.0" "$(um_field 'd["version"]')"
+assert_eq "manifest: pub_date passed through" "2026-10-01T12:00:00Z" "$(um_field 'd["pub_date"]')"
+assert_eq "manifest: 5 platforms" "5" "$(um_field 'len(d["platforms"])')"
+assert_eq "manifest: arm64 url" "https://artfrom.space/builds/v0.7.0/macos/athenaeum-0.7.0-macos-arm64.app.tar.gz" "$(um_field 'd["platforms"]["darwin-aarch64"]["url"]')"
+assert_eq "manifest: arm64 signature trimmed" "SIGMACARM" "$(um_field 'd["platforms"]["darwin-aarch64"]["signature"]')"
+assert_eq "manifest: nsis key" "https://artfrom.space/builds/v0.7.0/windows/athenaeum-0.7.0-windows-x64-setup.exe" "$(um_field 'd["platforms"]["windows-x86_64-nsis"]["url"]')"
+assert_eq "manifest: msi key" "SIGMSI" "$(um_field 'd["platforms"]["windows-x86_64-msi"]["signature"]')"
+assert_eq "manifest: no plain windows key" "False" "$(um_field '"windows-x86_64" in d["platforms"]')"
+assert_eq "manifest: notes are the whole file" "same" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("same" if d["notes"]==open(sys.argv[2],encoding="utf-8").read() else "differs")' "$UM_OUT" "$FIXTURES_DIR/release_notes_sample.md")"
+assert_contains "manifest: notes keep a quoted tagline" 'a \"quoted\" tagline' "$(cat "$UM_OUT")"
+
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0-beta.2 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: beta tag exits 1 when its files are missing (stage holds 0.7.0)" "1" "$rc"
+assert_contains "manifest: names the missing signature" "ERROR: missing signature $UM_STAGE/macos/athenaeum-0.7.0-beta.2-macos-arm64.app.tar.gz.sig" "$out"
+
+rm -f "$UM_STAGE/linux/athenaeum-0.7.0-linux-x64.AppImage.sig"
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: one missing sig exits 1" "1" "$rc"
+assert_contains "manifest: names it" "athenaeum-0.7.0-linux-x64.AppImage.sig" "$out"
+: > "$UM_STAGE/linux/athenaeum-0.7.0-linux-x64.AppImage.sig"
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: an EMPTY sig exits 1" "1" "$rc"
+
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" PUB_DATE="yesterday" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: a non-RFC3339 PUB_DATE exits 1" "1" "$rc"
+rm -rf "$UM_STAGE" "$UM_OUT"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
