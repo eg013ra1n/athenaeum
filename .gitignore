@@ -31,6 +31,13 @@ dist-ssr
 *.db-shm
 *.db-wal
 
+# Orphaned SQLite shared-memory files that arrive with a catalog copied off a
+# FUSE mount (an Unraid user share is one). FUSE will not unlink a file another
+# handle still holds, so it renames it to .fuse_hiddenXXXXXXXX and cleans up on
+# the last close; a killed process or a dropped mount leaves it behind forever.
+# They have no extension, so the three lines above never covered them.
+.fuse_hidden*
+
 # GitLab Runner leftovers. The runner service's --working-directory points at
 # this repo, so without an absolute builds_dir/cache_dir in its config.toml it
 # drops its checkouts and its local cache straight into the working tree.
