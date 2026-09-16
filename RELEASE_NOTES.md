@@ -1,63 +1,38 @@
-*Athenaeum v0.6.3: a fix round for the stacking outputs — XISF masters that other applications open, a progress bar that moves frame by frame in every stage, a "Re-run from" menu that does what it says, and measurements that survive a cleanup.*
+*Athenaeum v0.6.4-beta.1: nothing inside the application changed — this one rebuilds how a release is built, verified and delivered.*
 
-## Bug Fixes
+This is a beta, and an unusual one: it carries no changes to Athenaeum itself.
+Every commit in it is about the machinery that produces a release. It exists so
+that machinery gets exercised end to end on a build nobody depends on, rather
+than on the next real one. If you are on the stable channel this release does
+not reach you at all, and there is no reason to install it.
 
-- **XISF masters open in other applications.** A v0.6.2 XISF master was
-  refused by another application with *"Missing bounds Image attribute,
-  which is mandatory for a floating point real image"*. The XISF 1.0
-  specification does require it for every floating-point image, and the
-  writer had left it off. Every XISF file Athenaeum writes — master,
-  drizzled master, weight map — now declares its representable range
-  (`bounds="0:1"`, the range every master is built in) and its image type
-  (`MasterLight` / `WeightMap`). A master written by v0.6.2 needs one
-  **Re-run from › Integrate** — every cached stage is reused, only the
-  integration and the header are redone; the pixels were never wrong.
-- **"Re-run from" now lists what a run would reuse.** The menu used to
-  offer the stages that were *already* stale — which every run redoes
-  anyway — and refused to open when everything was cached, so no entry ever
-  did anything ▶ Run did not. It now lists Calibrate, Measure, Register
-  (and Local normalization when it is on) plus Integrate; each entry redoes
-  that stage and everything after it and reuses the stages before. Stages
-  with no usable cache stay visible but inert and say so, and the menu's
-  footer — and ▶ Run's tooltip — state where the next run actually starts.
-- **A cleanup that emptied the cache is explained.** After a run finished
-  with *Output › cleanup: delete intermediates*, the next run silently
-  started from Calibrate whichever stage it was re-run from. The plan now
-  says so in one line naming the run and the policy ("Run #1 deleted its
-  calibrated and registered frames afterwards … nothing is cached, so the
-  next run starts from Calibrate"), and the *delete registered* case gets
-  its own sentence.
-- **Measurements survive "delete intermediates".** The cleanup used to
-  discard every frame's measurement along with the calibrated files — a
-  cached result that occupies no disk and costs a real set ten minutes to
-  recompute. It is kept now (only *delete everything* removes it), so a
-  re-run after that cleanup re-calibrates and re-registers but does not
-  re-measure. Sets cleaned by v0.6.2 lost theirs already; the plan's line
-  says whether measurements are still cached.
-- **Progress moves frame by frame in every stage.** Measure, Register and
-  Local normalization reported only when a whole group had finished — on a
-  real set that is a bar frozen for minutes and then jumping by a group.
-  Each now ticks per frame from inside the parallel workers, cached
-  frames count from the start, the local-normalization reference build
-  says what it is doing, and the Integrate row names the plane, the pass
-  and the band it is reading beside its percentage and bytes. Every
-  running stage row shows the same shape: count, percent, bytes when the
-  stage reads them, the group, and the stage's own message.
-- **Continuous integration is green again.** One test of the thin-plate-
-  spline memory discipline assumed the number of resident displacement
-  grids is bounded by the worker pool; it is bounded by the group's frame
-  count during integration — one inverse grid per frame, by design, on any
-  machine — and the test passed on a 10-core development machine only by
-  coincidence, failing on every 4-core runner since v0.6.1. The bound now
-  states the real invariant.
+## What's New
+
+- **A release is now verified before anyone hears about it.** Every installer,
+  both Docker architectures and the release post itself are fetched back from
+  their public addresses, and the macOS disk images are put through the same
+  Gatekeeper check a new Mac performs, *before* the release page, the update
+  feed and the announcements go out. Previously the announcement went first and
+  the evidence, if any, came after. A build that fails any of those checks now
+  never becomes the one the app offers you.
+- **Every release keeps permanent download links.** Each version has its own
+  folder that stays for good, so a link in a forum post or a bug report still
+  resolves years later. The version-less *latest* and *beta* links still point
+  at the current build, but they only move after the verification above has
+  passed.
 
 ## Changes
 
-- Stage rows during a run show `current / total · percent · bytes · group
-  · message`, in the stage's own unit: builds, frames, frame-planes
-  (Drizzle), groups (Output); Integrate shows no count — its plane, pass
-  and band ride in the message.
-- Web host: the folder picker's `browse_directories` answers `400 Bad
-  Request` to an unknown `scope` instead of silently falling back to the
-  scan roots (every shipped caller passes `scan`, `export` or `stacking`;
-  landed with the Stacking tab in v0.6.0, unlisted until now).
+- **One naming scheme for every download**, across all three operating systems:
+  `athenaeum-0.6.4-beta.1-macos-arm64.dmg` is the product, the version, the
+  system and the processor architecture, in that order. Architectures are
+  spelled `x64` and `arm64` everywhere, replacing the mix of `amd64`, `x86_64`
+  and `aarch64` that varied by platform. The previous link spellings keep
+  working until v0.7.0, so nothing saved or scripted breaks today.
+- **The download page and this post are generated from the release notes.**
+  They used to be written by hand after the fact, which is why the site could
+  describe a release slightly differently from the release. There is now one
+  text, and the site is built from it.
+- **macOS packages are notarized once each instead of twice.** Apple's
+  turnaround is the slowest part of building a release, and half of it was
+  being spent twice on the same file.
