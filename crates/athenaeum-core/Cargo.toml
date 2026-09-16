@@ -18,6 +18,9 @@ anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.41"
 uuid = { version = "1", features = ["v4"] }
+# SemVer 2.0 precedence for the update check (moved here from athenaeum-tauri
+# so both hosts compare versions with one function).
+semver = "1"
 # Optional submodule path deps. Gated behind the `render`/`solver` features so
 # headless consumers (e.g. Perseus) can depend on athenaeum-core with
 # `default-features = false` and skip them. Neither pulls a C toolchain any

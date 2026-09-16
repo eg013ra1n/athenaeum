@@ -52,6 +52,7 @@ pub mod stacking;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod ts_export;
 pub mod api;
+pub mod updates;
 // Shared test fixtures. Test-only — nothing outside `#[cfg(test)]` may use it.
 #[cfg(test)]
 pub(crate) mod test_support;
