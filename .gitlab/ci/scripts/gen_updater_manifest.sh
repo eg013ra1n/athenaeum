@@ -20,6 +20,17 @@ PUB_DATE="${PUB_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 [ -s "$NOTES_PATH" ] || { echo "ERROR: release notes not found at $NOTES_PATH" >&2; exit 1; }
 
+# updater_artifacts can abort mid-stream (e.g. VERSION empty, from a tag
+# literally named "v") without bash ever noticing: a `while read < <(...)`
+# process substitution's exit status is not checked, so the loop below would
+# just read zero lines, `fail` would stay 0, and the script would emit a
+# VALID manifest with "platforms": {} at exit 0. Count the inventory once,
+# up front (`|| expected=0` so `set -e` doesn't abort ON the substitution
+# itself before we get to report it), so an empty or partial inventory is a
+# loud failure instead of a manifest that silently serves no platform.
+expected=$(updater_artifacts | wc -l | tr -d ' ') || expected=0
+[ "$expected" -gt 0 ] || { echo "ERROR: updater inventory is empty" >&2; exit 1; }
+
 # One line per platform: key<TAB>url<TAB>sig_path — python assembles the JSON
 # (never printf-built JSON: notes carry quotes, backslashes and newlines).
 ROWS=$(mktemp -t updater_rows.XXXXXX); trap 'rm -f "$ROWS"' EXIT
@@ -29,6 +40,7 @@ while read -r product os arch ext variant subdir filename key; do
   if [ ! -s "$sig" ]; then echo "ERROR: missing signature $sig" >&2; fail=1; continue; fi
   printf '%s\t%s\t%s\n' "$key" "${BUILDS_BASE_URL}/${CI_COMMIT_TAG}/${subdir}/${filename}" "$sig" >> "$ROWS"
 done < <(updater_artifacts)
+[ "$(wc -l < "$ROWS" | tr -d ' ')" -eq "$expected" ] || { echo "ERROR: inventory produced no/partial rows" >&2; exit 1; }
 [ "$fail" -eq 0 ] || exit 1
 
 python3 - "$VERSION" "$PUB_DATE" "$NOTES_PATH" "$ROWS" <<'PY'
@@ -36,6 +48,8 @@ import datetime, json, sys
 version, pub_date, notes_path, rows_path = sys.argv[1:5]
 try:
     datetime.datetime.strptime(pub_date, "%Y-%m-%dT%H:%M:%SZ")
+    if len(pub_date) != 20:
+        raise ValueError("PUB_DATE components must be zero-padded")
 except ValueError:
     sys.exit("ERROR: PUB_DATE must be RFC 3339 UTC like 2026-10-01T12:00:00Z, got %r" % pub_date)
 platforms = {}
@@ -47,6 +61,8 @@ with open(rows_path, encoding="utf-8") as f:
         if not signature:
             sys.exit("ERROR: missing signature %s" % sig_path)
         platforms[key] = {"url": url, "signature": signature}
+if not platforms:
+    sys.exit("ERROR: manifest has no platforms")
 with open(notes_path, encoding="utf-8") as f:
     notes = f.read()
 json.dump({"version": version, "notes": notes, "pub_date": pub_date, "platforms": platforms},

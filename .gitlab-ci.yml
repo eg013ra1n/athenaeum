@@ -664,7 +664,7 @@ publish:updater-manifest:
     UPDATES_PATH: "/var/www/artfrom.space/updates"
   script:
     - CI_COMMIT_TAG="${CI_COMMIT_TAG}" STAGE_DIR=release_stage .gitlab/ci/scripts/gen_updater_manifest.sh > "updater-${CI_COMMIT_TAG}.json"
-    - python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "updater-${CI_COMMIT_TAG}.json"
+    - 'python3 -c ''import json,sys; d=json.load(open(sys.argv[1])); n=len(d["platforms"]); sys.exit(0 if n==5 else "ERROR: manifest has %d platforms, expected 5" % n)'' "updater-${CI_COMMIT_TAG}.json"'
     - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${UPDATES_PATH}"
     - ${SCP_CMD} "updater-${CI_COMMIT_TAG}.json" ${DEPLOY_USER}@${DEPLOY_HOST}:${UPDATES_PATH}/${CI_COMMIT_TAG}.json
   artifacts:

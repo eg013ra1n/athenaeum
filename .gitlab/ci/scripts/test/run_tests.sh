@@ -946,6 +946,24 @@ assert_eq "manifest: no plain windows key" "False" "$(um_field '"windows-x86_64"
 assert_eq "manifest: notes are the whole file" "same" "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("same" if d["notes"]==open(sys.argv[2],encoding="utf-8").read() else "differs")' "$UM_OUT" "$FIXTURES_DIR/release_notes_sample.md")"
 assert_contains "manifest: notes keep a quoted tagline" 'a \"quoted\" tagline' "$(cat "$UM_OUT")"
 
+# A tag literally named "v" makes VERSION empty. updater_artifacts() aborts on
+# that (via its own `${VERSION:?}` guard), but a `while read < <(...)` process
+# substitution never surfaces a producer's exit status — without the
+# up-front inventory count, the script would have silently emitted a valid
+# manifest with "platforms": {} at exit 0. Run against the still-fully-valid
+# stage so the failure can only be attributed to the empty inventory itself.
+rc=0
+out=$(CI_COMMIT_TAG=v STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: tag literally 'v' (empty VERSION) exits 1" "1" "$rc"
+assert_contains "manifest: names the empty inventory" "ERROR: updater inventory is empty" "$out"
+
+# strptime() alone accepts non-zero-padded components ("2026-10-1" parses
+# fine) — the length check catches what the format string doesn't. Still
+# against the fully-valid stage so this is the ONLY thing that can fail.
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" PUB_DATE="2026-10-1T12:00:00Z" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: a non-zero-padded PUB_DATE exits 1" "1" "$rc"
+
 rc=0
 out=$(CI_COMMIT_TAG=v0.7.0-beta.2 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
 assert_eq "manifest: beta tag exits 1 when its files are missing (stage holds 0.7.0)" "1" "$rc"
@@ -964,6 +982,18 @@ assert_eq "manifest: an EMPTY sig exits 1" "1" "$rc"
 rc=0
 out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" PUB_DATE="yesterday" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
 assert_eq "manifest: a non-RFC3339 PUB_DATE exits 1" "1" "$rc"
+
+# A whitespace-only .sig is non-empty at the filesystem level (bash's `-s`
+# check passes it through), so this exercises the PYTHON-side guard
+# (`signature = s.read().strip()`), distinct from the bash-side missing/empty
+# check above. Last mutation of $UM_STAGE before cleanup — nothing after
+# this needs a valid linux signature.
+printf '\n' > "$UM_STAGE/linux/athenaeum-0.7.0-linux-x64.AppImage.sig"
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: a whitespace-only sig exits 1" "1" "$rc"
+assert_contains "manifest: names the whitespace-only sig's path" "$UM_STAGE/linux/athenaeum-0.7.0-linux-x64.AppImage.sig" "$out"
+
 rm -rf "$UM_STAGE" "$UM_OUT"
 
 echo
