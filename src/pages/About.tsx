@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { HistoryNav } from '../components/HistoryNav';
 import { openUrl } from '../api/desktop';
@@ -42,10 +42,15 @@ const backendDeps: Dependency[] = [
 function UpdateSection() {
   const { check, checking, checkError, runCheck, openAvailable, openReleaseNotes } = useUpdates();
   const [params, setParams] = useSearchParams();
+  const ran = useRef(false);
 
-  // Arriving from the update toast (/about?update): check, then open the dialog.
+  // Arriving from the update toast (/about?update): check, then open the
+  // dialog. Guarded like `useAutoUpdateCheck` — StrictMode double-invokes
+  // this effect in dev, which would otherwise fire `check_for_updates` twice.
   useEffect(() => {
+    if (ran.current) return;
     if (!params.has('update')) return;
+    ran.current = true;
     setParams({}, { replace: true });
     runCheck().then((r) => { if (r?.isUpdateAvailable) openAvailable(); });
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -11,11 +11,19 @@ export type DialogMode = 'closed' | 'available' | 'whatsNew';
 export type InstallPhase =
   | { kind: 'idle' }
   | { kind: 'downloading'; downloaded: number; total: number | null }
+  /** The download finished; the plugin is extracting/replacing on disk.
+   *  `version` is best-effort (the current check's `latestVersion`) — the
+   *  progress event itself carries no version. */
+  | { kind: 'installing'; version?: string }
   | { kind: 'ready'; version: string }
-  | { kind: 'failed'; message: string };
+  | { kind: 'failed'; message: string }
+  /** `restart_app` itself failed — distinct from `failed` (a failed download)
+   *  so the footer never offers a re-download of an update already on disk. */
+  | { kind: 'restartFailed'; message: string };
 
 interface ProgressEvent {
-  downloaded: number | null;
+  /** The backend always sends a real byte count on every non-final tick. */
+  downloaded: number;
   total: number | null;
   finished?: boolean;
 }
@@ -59,7 +67,10 @@ export function UpdatesProvider({ children }: { children: ReactNode }) {
     api
       .listen<ProgressEvent>('update-progress', (p) => {
         if (cancelled) return;
-        if (p.finished || p.downloaded === null) return;
+        if (p.finished) {
+          setPhase({ kind: 'installing', version: checkRef.current?.latestVersion });
+          return;
+        }
         setPhase({ kind: 'downloading', downloaded: p.downloaded, total: p.total });
       })
       .then((fn) => { if (cancelled) fn(); else unlistenProgress = fn; })
@@ -77,6 +88,12 @@ export function UpdatesProvider({ children }: { children: ReactNode }) {
   const runCheck = useCallback(async (): Promise<UpdateCheck | null> => {
     setChecking(true);
     setCheckError(null);
+    // A re-check must not leave the previous result's "up to date" banner
+    // showing above a fresh error, and must not leave a stale terminal
+    // install/restart failure sitting around from a previous attempt.
+    setCheck(null);
+    checkRef.current = null;
+    setPhase((p) => (p.kind === 'failed' || p.kind === 'restartFailed' ? { kind: 'idle' } : p));
     try {
       const result = await api.invoke<UpdateCheck>('check_for_updates');
       checkRef.current = result;
@@ -127,7 +144,9 @@ export function UpdatesProvider({ children }: { children: ReactNode }) {
       await api.invoke('restart_app');
     } catch (err) {
       console.error('restart_app:', err);
-      setPhase({ kind: 'failed', message: typeof err === 'string' ? err : 'Restart failed' });
+      // Distinct from `failed` (a failed download): the update is already on
+      // disk, so the dialog must never offer a re-download here.
+      setPhase({ kind: 'restartFailed', message: typeof err === 'string' ? err : 'Restart failed' });
     }
   }, []);
 
