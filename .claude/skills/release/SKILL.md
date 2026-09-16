@@ -71,20 +71,50 @@ that can be released and to read its verdicts.
    - `publish` — `docs:publish` red without `DOCS_REPO_TOKEN`: create the token
      (artfrom-space, Maintainer, write_repository), set the variable, retry the
      job. Docker jobs are yellow-on-failure by design; the verify stage decides.
+     `publish:updater-manifest` writes the frozen `updates/<tag>.json` from the
+     signed `.sig` files `deploy` uploaded and asserts it names all 5 platforms;
+     red because a `.sig` is missing from a build artifact means the build job
+     did not sign — check that `TAURI_SIGNING_PRIVATE_KEY` (+ `_PASSWORD`)
+     actually reached that job, fix, delete the tag on both remotes, retag.
    - `verify` — `verify:release` red names exactly what is missing (an installer
-     URL, a Docker arch, the blog URL). Fix the cause, retry the failed publish
-     job, then retry `verify:release`; the announce jobs re-run by themselves.
+     URL, a Docker arch, the blog URL) — including, since the in-app updater,
+     a manifest URL or a signature that failed to verify: a signature failure
+     means the published file is not the one the build signed (a stale
+     `TAURI_SIGNING_PRIVATE_KEY`, a re-uploaded artifact) — do NOT announce,
+     fix the cause, delete the tag on both remotes, retag. Fix the cause,
+     retry the failed publish job, then retry `verify:release`; the announce
+     jobs re-run by themselves.
      `RELEASE_ALLOW_AMD64_ONLY=1` (project variable) accepts an amd64-only image
      while the arm64 runner is down — unset it afterwards.
      `verify:macos-gatekeeper` red: the published DMG is not accepted — do NOT
      announce; the notarization step is the suspect.
-   - `announce` — `release` (GitLab Release), `publish_version` (`version.json`),
+   - `announce` — `release` (GitLab Release), `publish:updater-channel`
+     (copies the frozen per-tag manifest to `latest.json` / `latest-beta.json`
+     — the same "only after both verify jobs" rule as the channel link, so a
+     rejected build never becomes what the app offers), `publish_version`
+     (`version.json`, kept until v0.7.0 for pre-updater installs),
      `publish:channel-link` (version-less `builds/latest` or `builds/beta` links
      move ONLY here, after both verify jobs — a rejected build never becomes
      `latest`), `notify:discord`, `notify:telegram`. Only these are user-visible;
      nothing before them is.
 6. **Done when** the pipeline is green. Nothing else to do by hand: the blog post,
    the download page and the Version History row were written by `docs:publish`.
+
+## Signing key
+
+The updater's minisign key pair is generated once (`tauri signer generate`).
+The private key and its password live in 1Password AND in the GitLab project
+variables `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+(protected + masked, so only a tag pipeline sees them). **The key cannot be
+rotated**: a new public key reaches an installed copy only inside an update
+signed by the OLD key, so losing the private key means every installed copy
+updates by hand from the download page, forever. The public half is
+committed in `crates/athenaeum-tauri/tauri.conf.json`
+(`plugins.updater.pubkey`) — before any tag, confirm that committed pubkey
+is the RELEASE key, not a throwaway one from a local rehearsal (§7.2 of the
+spec). Locally, `npm run tauri build` (`bundle.createUpdaterArtifacts:
+true`) refuses to bundle without both variables exported in the shell —
+`npm run tauri dev` does not need them.
 
 ## Re-tagging
 
@@ -96,6 +126,15 @@ NEVER retry a build job of a FINISHED release pipeline — it re-fires the annou
 
 - Pipeline: `.gitlab-ci.yml`; scripts + their tests: `.gitlab/ci/scripts/`,
   `.gitlab/ci/scripts/test/run_tests.sh` (run it after touching any of them).
+  `run_tests.sh` also carries a `.gitlab-ci.yml` shape lint (every `script`/
+  `before_script`/`after_script` entry must be a plain string or a list of
+  strings, never a YAML mapping — the class of bug that silently breaks the
+  whole config) — run it after touching `.gitlab-ci.yml` itself, not only the
+  scripts.
+- Updater manifest generator: `.gitlab/ci/scripts/gen_updater_manifest.sh`
+  (tested inside `run_tests.sh`, not a separate file), invoked by
+  `publish:updater-manifest`; `verify_release.sh`'s manifest checks
+  (§1b, `rsign verify`) are the other half, run by `verify:release`.
 - Artifact names: `.gitlab/ci/scripts/artifact_names.sh` — the only place a
   filename is spelled. Scheme `<product>-<version>-<os>-<arch>[-variant].<ext>`,
   arch ∈ {x64, arm64}.

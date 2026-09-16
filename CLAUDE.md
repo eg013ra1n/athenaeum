@@ -52,9 +52,9 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 **`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`. The stacking pipeline (spec `docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md`) lives in `stacking/` — `measure`/`weights` (frame quality, Plan 2), `register` (registration v2, Plan 3), `integrate`/`master_cards` (group integration + master-light header/naming/writers, Plan 4), `config`/`groups`/`paths`/`plan`/`run`/`provenance` (config precedence, group discovery, artifact paths, the plan gate, the run thread, provenance rows — Plan 5a orchestration), `ln` (local normalization — reference build, background model, PSF-flux scale, `.athln` sidecars, M2) plus `api/stacking.rs` (the command-facing orchestration layer both hosts call); `fits_writer::wcs` (WCS/SIP cards from a stored plate solve); dev probes `examples/measure_probe.rs`, `examples/register_probe.rs`, `examples/integrate_probe.rs` and `examples/ln_probe.rs`. See **## Stacking** below for the tab, the commands and the acceptance state.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 253 functions across 23 modules (M4d Task 4 added `list_stacking_presets`/`save_stacking_preset`/`delete_stacking_preset` to the `stacking` module, 250 → 253; M4d Task 3 added `get_master_light_preview` there, 249 → 250; the 249/23 measurement below is otherwise unchanged — re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 257 functions across 24 modules (2026-09-16: +4 updates — get_whats_new/get_release_notes/install_update/restart_app; check_for_updates moved from core to the new updates module, 253 → 257; M4d Task 4 added `list_stacking_presets`/`save_stacking_preset`/`delete_stacking_preset` to the `stacking` module, 250 → 253; M4d Task 3 added `get_master_light_preview` there, 249 → 250; the 249/23 measurement below is otherwise unchanged — re-measured 2026-09-10 — a `stacking` module added: +15 stacking (Plan 5a's 14 commands + `get_stacking_presets`), −3 registration (the plate-solve-era `register_frame_set`/`get_frame_set_registration`/`cancel_frame_set_registration` trio retired — `set_frame_set_reference`/`get_frame_set_reference` stay), +2 `compute` (`get_integration_band_budget`/`set_integration_band_budget`, added since the last measurement below and untouched by this cycle — the naive 235−3+15=247 the retirement arithmetic alone implies undercounts by exactly those 2); was 235/22 on 2026-09-06 — `resolve_object_name` added; 234/22 on 2026-09-05 with `recalculate_frame_set_nights`, 233/22 on 2026-08-31, 232/23 on 2026-08-24 — the calibrated-export-v2 cycle deleted the `lights` module (4 commands: `get_light_calibration_readiness`/`get_light_calibration_details`/`start_light_calibration`/`cancel_light_calibration`) wholesale, and other tasks in the same cycle net-added 5 elsewhere. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
-`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar` `stacking`
+`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar` `stacking` `updates`
 
 Frontend pages live in `src/pages/`; routing in `src/App.tsx` (React Router v7, `/` → `/files`).
 
@@ -1358,3 +1358,54 @@ replaces the older "develop on a branch named after the version, ff-merge at
 release" rule, which left `main` hundreds of commits stale — unworkable once
 `main` is the default branch outside contributors base their pull requests on.
 A release branch is cut only if a backport is ever actually needed.
+
+## In-app updates
+
+Spec `docs/superpowers/specs/2026-09-16-in-app-updates-design.md`, plan
+`docs/superpowers/plans/2026-09-16-in-app-updates-plan.md`. Hybrid: **core
+owns the check** (`athenaeum-core/src/updates/` — `check` fetches
+`https://artfrom.space/updates/latest.json` (+ `latest-beta.json` under
+`updates.check_beta`) with the telemetry query `v/os/arch/commit/id` the
+retired `version.json` GET used to carry, compares with `semver`, exposes the
+manifest's notes; `whats_new` is once per version via
+`updates.last_seen_version`, from the notes EMBEDDED at build time
+(`include_str!("RELEASE_NOTES.md")` — the release commit holds notes and
+versions together, so they are this build's by construction);
+`release_notes` is the same text any time) and **`tauri-plugin-updater` owns
+download / minisign verify / install / relaunch** (`commands/updates.rs`:
+`install_update(channel: Channel)` — the invoke payload is `{ channel }`
+directly, not a wrapped args struct — runs the plugin with
+`MANIFEST_BASE_URL/<channel file>` and a `version_comparator` that
+normalizes the plugin's `X.Y.Z-N` current version to `X.Y.Z-beta.N` — the
+ONE place that normalization happens; `restart_app` is `AppHandle::restart`,
+no `tauri-plugin-process` dependency). The plugin is used Rust-side only:
+`updater:default` is NOT granted in `capabilities/default.json`, so the
+webview's own ACL never sees it — only the five commands above cross that
+boundary. Web mirrors answer the check and the notes and `501` for
+install/restart (`athenaeum-web` carries its own `build.rs` for
+`ATHENAEUM_GIT_HASH`, same pattern as the Tauri crate's). **Three version
+forms**: Cargo dotted `0.6.5-beta.1`, `tauri.conf.json` `0.6.5-1`, tag +
+manifest dotted. `platform_supported` keys on `<os>-<arch>[-<installer>]`
+with the plugin's lookup order and refuses `deb`/`rpm` installs by rule;
+manifest keys are `darwin-aarch64`, `darwin-x86_64`, `windows-x86_64-nsis`,
+`windows-x86_64-msi`, `linux-x86_64` — no plain Windows key. Early refusals
+before any download: debug build, install in flight, translocated/unwritable
+macOS bundle, non-AppImage Linux. Events `update-progress { downloaded,
+total, finished? }` / `update-ready { version }`; frontend state lives in
+`src/contexts/UpdatesContext.tsx` (dialog phases `idle | downloading |
+installing | ready | failed | restartFailed`), rendered by
+`src/components/updates/{UpdateDialog,ReleaseNotes}.tsx` in `available` /
+`whatsNew` modes. **Pipeline**: `bundle.createUpdaterArtifacts` +
+`TAURI_SIGNING_PRIVATE_KEY` (protected; the key CANNOT be rotated —
+1Password); `build:macos` notarizes the `.app` again (F5.1 reversed);
+`deploy` publishes `.app.tar.gz` + every `.sig` beside the installers
+(`updater_artifacts()` in `artifact_names.sh`, the same five platform keys
+above); `publish:updater-manifest` (stage `publish`) writes the frozen
+`updates/<tag>.json`; `verify:release` (stage `verify`, macOS runner) fetches
+it back and verifies every URL and signature with `rsign2` (`cargo install
+rsign2 --locked`, auto-installed by the job when missing); `publish:updater-
+channel` (stage `announce`) copies it to `latest.json`/`latest-beta.json`.
+`publish_version` (`version.json`) stays until v0.7.0 for pre-updater
+installs. `docker/Dockerfile` copies `RELEASE_NOTES.md` into the image
+(`.dockerignore` re-includes it) so core's `include_str!` has something to
+embed in a Docker build too.
