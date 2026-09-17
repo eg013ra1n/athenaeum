@@ -56,6 +56,7 @@ pub async fn start_content_index(
         db,
         state.ctx.compute_queue.clone(),
         emitter,
+        state.ctx.active_scans.clone(),
     )))
 }
 

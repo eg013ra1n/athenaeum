@@ -1980,8 +1980,22 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             }
         }
 
-        // Phase 4: Rebuild duplicate caches
-        // This runs once after all scanning to pre-compute duplicate data
+        // Phase 4: hash the shortlisted masters, then rebuild the duplicate
+        // caches. Two very different costs under one roof — the caches
+        // rebuild in ~3 s on a 40k-file catalog; the hash pass reads every
+        // shortlisted master in full at the volume's speed, minutes over a
+        // network share — so the pass reports as its own `"hashing"` phase
+        // (per file, with the path) and `"caching"` names only the rebuild
+        // that follows. Neither runs on a scan that found nothing new or
+        // changed: that scan returned above, at `new_files.is_empty()`.
+        //
+        // Masters are shortlisted by header and decided by bytes: hash the
+        // shortlist before the caches are rebuilt. Bounded by the shortlist,
+        // not by the master population (61 files / 7.5 GiB vs 381 / 89.4 GiB
+        // on the owner's catalog), and a scan has just read the whole library
+        // anyway.
+        crate::duplicates::backfill::fill_master_strong_hashes(conn, emitter, &cancel_flag, root_id);
+
         emit_progress(
             emitter,
             root_id,
@@ -1990,13 +2004,6 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             None,
             "caching",
         );
-
-        // Masters are shortlisted by header and decided by bytes: hash the
-        // shortlist before the caches are rebuilt. Bounded by the shortlist,
-        // not by the master population (61 files / 7.5 GiB vs 381 / 89.4 GiB
-        // on the owner's catalog), and a scan has just read the whole library
-        // anyway.
-        crate::duplicates::backfill::fill_master_strong_hashes(conn, emitter, &cancel_flag);
 
         // Rebuild the duplicate groups cache under the default (header) key.
         if let Err(e) = rebuild_duplicate_groups_cache(conn, DuplicateKey::Header) {

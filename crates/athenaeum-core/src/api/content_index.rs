@@ -225,6 +225,7 @@ pub fn start_content_index(
     database: Database,
     queue: ComputeQueue,
     emitter: Arc<dyn ProgressEmitter>,
+    active_scans: crate::services::ActiveScans,
 ) -> bool {
     let Some(guard) = RunningGuard::claim(database.path()) else {
         tracing::debug!(
@@ -277,8 +278,21 @@ pub fn start_content_index(
             }
         };
 
-        let summary =
-            crate::duplicates::backfill::run_content_index(&database, emitter.as_ref(), cancel);
+        // The pass yields to any running scan (the scan is what a user is
+        // waiting on, and both read the same volumes): the probe is the
+        // scanner's own registry of in-flight scans.
+        let scan_active = move || {
+            !active_scans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        };
+        let summary = crate::duplicates::backfill::run_content_index_yielding(
+            &database,
+            emitter.as_ref(),
+            cancel,
+            &scan_active,
+        );
         if summary.cancelled {
             // A partial pass's `skipped` is not a baseline (see
             // CANCELLED_BY_USER): record nothing, and leave whatever an earlier
@@ -376,7 +390,12 @@ pub fn autostart_content_index(ctx: &ServiceContext, emitter: Arc<dyn ProgressEm
             return;
         }
     }
-    if start_content_index(database, ctx.compute_queue.clone(), emitter) {
+    if start_content_index(
+        database,
+        ctx.compute_queue.clone(),
+        emitter,
+        ctx.active_scans.clone(),
+    ) {
         tracing::info!(pending, "content index autostart");
     }
 }
@@ -514,7 +533,8 @@ mod tests {
             !start_content_index(
                 database.clone(),
                 ctx.compute_queue.clone(),
-                Arc::new(NullEmitter)
+                Arc::new(NullEmitter),
+                ctx.active_scans.clone(),
             ),
             "a second start while running must be refused"
         );
@@ -524,7 +544,12 @@ mod tests {
         );
         drop(claim);
         assert!(
-            start_content_index(database, ctx.compute_queue.clone(), Arc::new(NullEmitter)),
+            start_content_index(
+                database,
+                ctx.compute_queue.clone(),
+                Arc::new(NullEmitter),
+                ctx.active_scans.clone()
+            ),
             "once the guard clears, a start is accepted again"
         );
 
@@ -655,6 +680,7 @@ mod tests {
                 queue: ctx.compute_queue.clone(),
                 fired: AtomicBool::new(false),
             }),
+            ctx.active_scans.clone(),
         ));
         wait_until("the cancelled pass releases the single-flight slot", || {
             !get_content_index_status(&ctx).unwrap().running
@@ -783,6 +809,7 @@ mod tests {
                 queue: ctx.compute_queue.clone(),
                 fired: AtomicBool::new(false),
             }),
+            ctx.active_scans.clone(),
         ));
         wait_until("the cancelled pass releases the single-flight slot", || {
             !get_content_index_status(&ctx).unwrap().running
@@ -856,6 +883,6 @@ mod tests {
         emitter: Arc<dyn ProgressEmitter>,
     ) -> bool {
         clear_cancelled_by_user(database.path());
-        start_content_index(database.clone(), queue, emitter)
+        start_content_index(database.clone(), queue, emitter, Default::default())
     }
 }

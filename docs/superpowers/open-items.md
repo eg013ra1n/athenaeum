@@ -182,6 +182,8 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **The calibration-set empty-prune trigger and `prune_orphaned_calibration_sets` are deliberately not identical.** | `db/schema.rs` | The per-row trigger exempts master-library sets because a master legitimately loses and regains its sole member during a re-import and the trigger fires inside that window. The whole-table prune runs only at quiescent points, where a member-less unreferenced master really is garbage. Both doc comments say so at length. |
 | **The XISF parser drops the `comment` attribute of `FITSKeyword`, and fixing it is not a duplicate-detection fix.** | `fits_parser/mod.rs`, stored `fits_header.header` blobs | PixInsight writes history as `value="" comment="ImageIntegration.rejectedHigh_32: …"`, so our blob holds 364 empty `HISTORY =` lines. Including `comment` separates only 4 of 30 master groups — the other 26 share every keyword and property and differ only in pixels, so masters stay excluded from the header key either way. Processed **Light**-derivatives are a different case and the reason this is not free: a GraXpert/ABE output keeps `IMAGETYP = 'Light'` and `is_master = 0`, so the header key admits it and the erased history makes it identical to its source — they are shielded by the header key's `files.filename` component (spec D8), not by the master exclusion. Worth fixing for the metadata pane's per-field revert and light calibration's Bayer copy-through, which read that blob — but NOT in the same release as the duplicate-key change: a changed blob changes the fingerprint, so a re-scanned file stops matching its not-yet-re-scanned copy until both are scanned. |
 | **The three-part sampling hash is not a better default key than the header.** | Any "just use `compute_xxhash`" proposal | It IS `files.content_hash`, so the proposal is the existing `Content` branch. Measured: identical answer to the header key on raw frames (40/40 vs 80/80 against full SHA-256) for 61.4 GiB of reads and ~19 min; and on masters it is wrong in the DELETING direction — three of thirty groups are `..._DBE_WCS.xisf` / `_f.xisf` pairs differing by 3-4 bytes at 0.5-0.9 MiB, past the first sample and nowhere near the middle or end. Spec §2.5. |
+| **The duplicate-cache rebuild is not the slow part of a scan, and it does not run when nothing changed.** | Any "Phase 4 is quadratic / runs on every monitor poll" proposal | Measured 2026-09-17 on the owner's 40,456-file production catalog: both `rebuild_duplicate_groups_cache` calls plus the O(folders²) folder pass total ~3.6 s (711 folders); a scan with nothing new or modified returns at `new_files.is_empty()` before Phase 4. The minutes the UI showed as "Building duplicate cache…" were the master strong-hash pass reading shortlisted masters in full over an 11.7 MB/s SMB share (now its own `"hashing"` phase with per-file progress), and a 15-minute "nothing new" scan was the content-index job saturating the same share (it now yields to active scans). `docs/backlog-v0.5.6.md` item 9 has the numbers. |
+| **An offline scan root logs `scan root offline (path does not exist)` from `check_scan_root_overlap` — it is not a symlink problem.** | The WARN pair at startup for a root on an unmounted share | Verified 2026-09-17: `/Volumes/Universe` is an SMB mount with no symlink anywhere in the chain; `canonicalize()` fails with `NotFound` exactly while the share is not mounted, the check falls back to the stored path (correct), and the line appears twice because both transfer folders are validated against every root. The message now names the `NotFound` case as "offline" so it is not read as damage. |
 
 ---
 
@@ -189,6 +191,27 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Scan Phase 4 — the master-hash phase and the yielding content index (2026-09-17)
+
+Two owner-visible fixes from the open-items triage (`docs/backlog-v0.5.6.md`
+item 9 carries the measurements), code-complete on `main`, unit-pinned
+(`only_header_shortlisted_masters_are_hashed` asserts the `"hashing"` ticks,
+`content_index_yields_while_a_scan_is_active` /
+`content_index_cancel_while_parked_returns_promptly` the park). Owed by hand:
+
+- A production scan of a root that ingests masters with header twins shows
+  **Verifying master duplicates** with `N / M files` and the master's path
+  instead of the indeterminate "Building duplicate cache…", and the modal's
+  cancel stops it between files. Check the log's
+  `master strong-hash: pass finished` line carries `duration_ms`.
+- Start a scan while the content index is running (Settings → Duplicates →
+  build index, then Rescan a root on the same volume): the log shows
+  `content index paused: scan active` then `content index resumed` with a
+  `duration_ms`, and the scan finishes at its normal speed rather than the
+  897 s of 2026-09-16 21:08.
+- Launch with an SMB root unmounted: the startup WARN pair reads
+  `scan root offline (path does not exist); comparing by its stored path`.
 
 ### Stacking v0.6.3 — fix round (2026-09-15)
 
@@ -1411,45 +1434,6 @@ cycle, so anything from them that matters later belongs here or in a plan.
   whether `ComputeQueueEntry` growing a subject id (enough to join an existing
   progress stream) is sufficient on its own; whether the per-feature widgets
   fold into it or stay as they are.
-- **Duplicate cache rebuild is quadratic, unthrottled, and runs
-  unconditionally on every scan** (full detail: `docs/backlog-v0.5.6.md` item
-  9, raised 2026-09-16). Scan Phase 4 (`scanner/mod.rs:1941-2015`) rebuilds
-  the *entire* duplicate-groups cache — twice, once per `DuplicateKey::Header`
-  and once per `DuplicateKey::Master`, each a full recompute with a separate
-  prepared statement and row-by-row insert per duplicate group — plus the
-  O(folders²) folder-similarity pass, on **every** scan, gated only on
-  `!result.cancelled` (no check for "nothing changed"). This includes
-  unattended monitor polls every 10 minutes (`MONITORING_INTERVAL_MINUTES`,
-  default), whose own doc comment assumes an unchanged re-scan is "effectively
-  free" — true for the file walk, not for this phase.
-  `duplicates/backfill.rs::fill_master_strong_hashes` also runs synchronous,
-  single-threaded, unthrottled full-file hashing on the scan's own thread,
-  unlike its sibling `run_content_index`, which is deliberately chunked and
-  throttled to protect the app's IO. Diagnosis only — no fix shape chosen, no
-  per-phase timing measured yet on a large catalog. Candidates worth
-  evaluating once measured: skip Phase 4 when nothing changed and no stale
-  duplicate rows exist; background/throttle `fill_master_strong_hashes` the
-  way `run_content_index` already is; make the cache rebuild incremental
-  instead of a full recompute; replace the O(folders²) folder-similarity
-  comparison with an indexed SQL join.
-- **A symlink-crossing scan root logs as flatly "not resolvable", with no hint
-  it was a symlink.** Raised by the owner 2026-09-17. `check_scan_root_overlap`
-  (`api/scan_roots.rs:340-345`) calls `Path::canonicalize()` on every existing
-  scan root, which walks and resolves every symlink on the path; when a root
-  (or an intermediate component) crosses a symlink whose target volume is
-  momentarily unmounted, this fails with a bare `No such file or directory (os
-  error 2)` and falls back to comparing by the stored path — correct, and
-  already handled gracefully — but the WARN gives no way to tell "the whole
-  root is offline" apart from "a symlink further down the chain briefly lost
-  its target". Observed on `/Volumes/Universe/Astrophotography`: WARNs on
-  2026-09-14/15, then the same root scanned successfully (5611 found) on
-  2026-09-16 — confirms it was the symlink target coming and going, not the
-  root itself, an intermittent condition rather than a defect. Open: worth
-  teaching the WARN to name the first unresolvable path component and whether
-  it is a symlink (`std::fs::symlink_metadata` per component, or
-  `std::fs::read_link` on the failing segment), so this reads as "symlink
-  target N unavailable" instead of an unqualified "root offline" — not
-  researched into a concrete diff yet.
 
 ---
 
@@ -1459,3 +1443,12 @@ cycle, so anything from them that matters later belongs here or in a plan.
 the cache limit, the plate-solve gate controls, the master-deletion un-supersede, the
 scan-error reveal and **Check again** at v0.5.6; the **Lights + calibration sets** raw
 originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.6.2.)
+
+- **Scanning: the master-verification step is visible and the content index
+  yields.** A scan that ingests masters used to spend minutes under
+  "Building duplicate cache…" with no progress — that time was the app
+  reading every candidate master in full to tell true duplicates apart, at
+  the drive's or the share's speed. It is now its own step, **Verifying
+  master duplicates**, counting files and naming the one being read. And the
+  background content index no longer competes with a scan for the same
+  volume: it pauses while a scan runs and resumes when it ends.

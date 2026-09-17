@@ -39,6 +39,14 @@ const CHUNK: usize = 64;
 /// minutes of mostly-idle wall time, never a startup stall (it runs off-thread).
 const CHUNK_SLEEP: Duration = Duration::from_millis(50);
 
+/// How often a paused content-index pass re-checks whether a scan is still
+/// running. The pass yields to ANY active scan (see
+/// [`run_content_index_yielding`]): on the owner's catalog a 5,410-file index
+/// running beside a scan of the same SMB share stretched that scan from
+/// 20 s to 897 s (2026-09-16) — the per-chunk nap above protects the app's
+/// IO in general, but does nothing against a scan walking the same volume.
+const SCAN_YIELD_POLL: Duration = Duration::from_millis(500);
+
 /// Outcome of one backfill pass. Returned for tests/logging; hosts ignore it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackfillSummary {
@@ -116,6 +124,22 @@ pub fn run_content_index(
     emitter: &dyn ProgressEmitter,
     cancel: Arc<AtomicBool>,
 ) -> BackfillSummary {
+    run_content_index_yielding(db, emitter, cancel, &|| false)
+}
+
+/// [`run_content_index`] that yields to a running scan: before every chunk,
+/// while `scan_active()` reports true, the pass sleeps in [`SCAN_YIELD_POLL`]
+/// steps instead of hashing. A scan is interactive work over the same
+/// volumes this job reads — on network storage the two starve each other,
+/// and the scan is the one a user is waiting on. Cancellation is honoured
+/// while parked. The hosts pass a probe over `ServiceContext::active_scans`;
+/// tests and the monitor's own re-index pass `&|| false`.
+pub fn run_content_index_yielding(
+    db: &Database,
+    emitter: &dyn ProgressEmitter,
+    cancel: Arc<AtomicBool>,
+    scan_active: &(dyn Fn() -> bool + Sync),
+) -> BackfillSummary {
     // Snapshot the NULL-hash rows (with their recorded size/modified_at for the
     // stale-row check below) into a Vec up front, then DROP the connection: the
     // pool is small (max 8) and this pass runs for minutes — holding a checked-out
@@ -171,6 +195,30 @@ pub fn run_content_index(
             cancelled = true;
             tracing::info!(updated, skipped, "content index cancelled");
             break;
+        }
+
+        // Yield to a running scan (see `run_content_index_yielding`). Logged
+        // once per pause, with the time it cost, so a slow index has a
+        // visible reason in the log rather than a silent gap.
+        if scan_active() {
+            let paused_at = std::time::Instant::now();
+            tracing::info!(
+                chunk = chunk_idx + 1,
+                of = chunk_total,
+                "content index paused: scan active"
+            );
+            while scan_active() && !cancel.load(Ordering::SeqCst) {
+                std::thread::sleep(SCAN_YIELD_POLL);
+            }
+            tracing::info!(
+                duration_ms = paused_at.elapsed().as_millis() as u64,
+                "content index resumed"
+            );
+            if cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                tracing::info!(updated, skipped, "content index cancelled");
+                break;
+            }
         }
 
         // Hash the chunk's files FIRST (no connection held), then check a pooled
@@ -273,6 +321,16 @@ pub fn run_content_index(
 /// which already holds the connection for the whole scan, so there is no
 /// pool slot to give back.
 ///
+/// This pass is the expensive half of phase 4 by two orders of magnitude —
+/// it reads every shortlisted master in full at the volume's speed (measured
+/// 2026-09-17 on the owner's catalog: 61 local masters in 67 s, a network
+/// share at 11.7 MB/s, 103 masters in 853 s on 2026-09-16) while the two
+/// cache rebuilds after it take ~3 s. So it reports as its OWN scan phase,
+/// `"hashing"`, on `scan-progress` (`root_id` is the scan's), per file, with
+/// the file's path: the UI used to show the whole 14 minutes as an
+/// indeterminate "Building duplicate cache…". The `master-hash-progress`
+/// event stays beside it for consumers that want just this pass.
+///
 /// The `is_master` / `imagetyp` predicate below is a hand-copy of
 /// [`DuplicateKey::Master::eligibility`](crate::db::DuplicateKey) and must stay
 /// identical to it — including its treatment of a NULL `imagetyp`, which under
@@ -302,6 +360,7 @@ pub fn fill_master_strong_hashes(
     conn: &Connection,
     emitter: &dyn ProgressEmitter,
     cancel: &AtomicBool,
+    root_id: i64,
 ) -> usize {
     let pending: Vec<(i64, String, i64, String)> = {
         let sql = "SELECT f.id, f.path, f.size, f.modified_at
@@ -340,8 +399,13 @@ pub fn fill_master_strong_hashes(
         return 0;
     }
     tracing::info!(pending = pending.len(), "master strong-hash: pass starting");
+    let started_at = std::time::Instant::now();
 
     let total = pending.len();
+    // Switch the scan surface to this phase BEFORE the first read: one master
+    // over a network share can take a minute, and until then the UI would
+    // still be showing the previous phase.
+    emit_hashing_progress(emitter, root_id, 0, total, None);
     let mut written = 0usize;
     for (idx, (id, path, size, modified_at)) in pending.into_iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
@@ -382,10 +446,44 @@ pub fn fill_master_strong_hashes(
             "master-hash-progress",
             &MasterHashProgress { done: idx + 1, total, path: path.clone() },
         );
+        emit_hashing_progress(emitter, root_id, idx + 1, total, Some(path));
     }
 
-    tracing::info!(written, total, "master strong-hash: pass finished");
+    tracing::info!(
+        written,
+        total,
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "master strong-hash: pass finished"
+    );
     written
+}
+
+/// The master-hash pass's tick on the scan's own progress surface — phase
+/// `"hashing"`, between the scanner's `"calibrating"` and `"caching"`.
+fn emit_hashing_progress(
+    emitter: &dyn ProgressEmitter,
+    root_id: i64,
+    current: usize,
+    total: usize,
+    current_file: Option<String>,
+) {
+    let percent = if total > 0 {
+        (current as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    emit_event(
+        emitter,
+        "scan-progress",
+        &crate::scanner::ScanProgressEvent {
+            current,
+            total,
+            current_file,
+            percent,
+            root_id,
+            phase: "hashing".to_string(),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -667,8 +765,28 @@ mod tests {
 
         let emitter = CapturingEmitter(std::sync::Mutex::new(Vec::new()));
         let never = std::sync::atomic::AtomicBool::new(false);
-        let n = fill_master_strong_hashes(&conn, &emitter, &never);
+        let n = fill_master_strong_hashes(&conn, &emitter, &never, 42);
         assert_eq!(n, 2, "only the two shortlisted masters are read");
+
+        // The pass reports on the scan's own surface as its own phase: one
+        // tick before the first read (0 of 2, no file), then one per file
+        // with the path, every tick carrying the scan's root id.
+        let hashing: Vec<serde_json::Value> = emitter
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, p)| name == "scan-progress" && p["phase"] == "hashing")
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(hashing.len(), 3, "0/2, 1/2, 2/2: {hashing:?}");
+        assert_eq!(hashing[0]["current"], 0);
+        assert_eq!(hashing[0]["total"], 2);
+        assert!(hashing[0]["current_file"].is_null());
+        assert_eq!(hashing[2]["current"], 2);
+        assert_eq!(hashing[2]["percent"], 100.0);
+        assert_eq!(hashing[2]["current_file"], shared_b);
+        assert!(hashing.iter().all(|p| p["root_id"] == 42));
 
         let hashed: Vec<(i64, Option<String>)> = conn
             .prepare("SELECT id, strong_hash FROM files ORDER BY id")
@@ -681,7 +799,66 @@ mod tests {
         assert!(hashed[0].1.is_some());
         assert!(hashed[2].1.is_none(), "the lonely master must not be read");
 
-        // Idempotent: a second pass hashes nothing.
-        assert_eq!(fill_master_strong_hashes(&conn, &emitter, &never), 0);
+        // Idempotent: a second pass hashes nothing — and emits no hashing
+        // phase at all, so a scan with nothing to hash never flashes it.
+        let before = emitter.0.lock().unwrap().len();
+        assert_eq!(fill_master_strong_hashes(&conn, &emitter, &never, 42), 0);
+        assert_eq!(emitter.0.lock().unwrap().len(), before);
+    }
+
+    /// The pass parks while a scan is active and resumes when it ends —
+    /// hashing everything it was asked to, just later. The probe is polled
+    /// at least once per chunk plus once per park step, so a probe that
+    /// reports "scan active" for its first two answers is seen parking.
+    #[test]
+    fn content_index_yields_while_a_scan_is_active() {
+        let (db, _tmp) = test_db_with_pending_rows(3);
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let scan_active = || polls.fetch_add(1, Ordering::SeqCst) < 2;
+
+        let started = std::time::Instant::now();
+        let summary = run_content_index_yielding(
+            &db,
+            &crate::events::NullEmitter,
+            Arc::new(AtomicBool::new(false)),
+            &scan_active,
+        );
+
+        assert_eq!(summary.updated, 3, "every row is hashed once the scan ends");
+        assert!(!summary.cancelled);
+        assert!(
+            polls.load(Ordering::SeqCst) >= 3,
+            "the probe must be re-asked until it clears: {}",
+            polls.load(Ordering::SeqCst)
+        );
+        assert!(
+            started.elapsed() >= SCAN_YIELD_POLL,
+            "one poll step must have been slept while parked"
+        );
+    }
+
+    /// A cancel while parked ends the pass without waiting for the scan.
+    #[test]
+    fn content_index_cancel_while_parked_returns_promptly() {
+        let (db, _tmp) = test_db_with_pending_rows(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_probe = cancel.clone();
+        // "Scan active" forever — but the second poll also raises cancel.
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let scan_active = move || {
+            if polls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                cancel_for_probe.store(true, Ordering::SeqCst);
+            }
+            true
+        };
+
+        let summary = run_content_index_yielding(
+            &db,
+            &crate::events::NullEmitter,
+            cancel,
+            &scan_active,
+        );
+        assert!(summary.cancelled);
+        assert_eq!(summary.updated, 0, "nothing is hashed while parked");
     }
 }

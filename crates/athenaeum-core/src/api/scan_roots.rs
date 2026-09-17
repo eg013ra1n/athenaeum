@@ -339,6 +339,15 @@ pub fn check_scan_root_overlap(
     for root in existing_roots.iter() {
         let existing_path = match Path::new(&root.path).canonicalize() {
             Ok(p) => normalize_path(&p),
+            // `NotFound` is the ordinary case — a root on a volume that is
+            // not mounted right now (an SMB share, an unplugged drive) — and
+            // is named as such so the log reads "offline", not "broken"
+            // (2026-09-17: an offline share's WARN was read as a symlink
+            // problem). Anything else keeps the raw error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %root.path, "scan root offline (path does not exist); comparing by its stored path");
+                normalize_path(Path::new(&root.path))
+            }
             Err(e) => {
                 tracing::warn!(path = %root.path, error = %e, "scan root not resolvable; comparing by its stored path");
                 normalize_path(Path::new(&root.path))

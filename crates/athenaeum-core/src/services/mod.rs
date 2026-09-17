@@ -21,6 +21,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(all(feature = "render", feature = "solver"))]
 use std::sync::RwLock;
 
+/// The registry of in-flight scans, keyed by scan-root id. Shared with the
+/// content-index job, which yields while it is non-empty.
+pub type ActiveScans = Arc<Mutex<HashMap<i64, ScanHandle>>>;
+
 /// Handle to track an active scan operation.
 pub struct ScanHandle {
     #[allow(dead_code)]
@@ -71,7 +75,7 @@ pub struct ServiceContext {
     pub db: OnceLock<Database>,
     pub settings: Arc<SettingsManager>,
     pub memory_cache: Arc<Mutex<MemoryImageCache>>,
-    pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
+    pub active_scans: ActiveScans,
     pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
     pub active_analyses: Arc<Mutex<HashMap<i64, AnalysisHandle>>>,
     pub active_plate_solves: Arc<Mutex<HashMap<i64, PlateSolveHandle>>>,

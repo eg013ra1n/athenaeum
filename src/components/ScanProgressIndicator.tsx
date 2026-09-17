@@ -7,6 +7,10 @@ const phaseConfig: Record<string, { label: string; icon: typeof Loader2 }> = {
   processing: { label: 'Processing files', icon: Loader2 },
   inserting: { label: 'Saving to database', icon: Database },
   calibrating: { label: 'Creating calibration sets', icon: Sparkles },
+  // The master-hash pass reads every header-shortlisted master in full —
+  // minutes over a network share — so it has its own phase with a per-file
+  // count and the file's path; the cache rebuild that follows takes seconds.
+  hashing: { label: 'Verifying master duplicates', icon: Database },
   caching: { label: 'Building duplicate cache...', icon: Database },
 };
 
