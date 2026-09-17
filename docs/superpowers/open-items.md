@@ -184,6 +184,7 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **The three-part sampling hash is not a better default key than the header.** | Any "just use `compute_xxhash`" proposal | It IS `files.content_hash`, so the proposal is the existing `Content` branch. Measured: identical answer to the header key on raw frames (40/40 vs 80/80 against full SHA-256) for 61.4 GiB of reads and ~19 min; and on masters it is wrong in the DELETING direction — three of thirty groups are `..._DBE_WCS.xisf` / `_f.xisf` pairs differing by 3-4 bytes at 0.5-0.9 MiB, past the first sample and nowhere near the middle or end. Spec §2.5. |
 | **The duplicate-cache rebuild is not the slow part of a scan, and it does not run when nothing changed.** | Any "Phase 4 is quadratic / runs on every monitor poll" proposal | Measured 2026-09-17 on the owner's 40,456-file production catalog: both `rebuild_duplicate_groups_cache` calls plus the O(folders²) folder pass total ~3.6 s (711 folders); a scan with nothing new or modified returns at `new_files.is_empty()` before Phase 4. The minutes the UI showed as "Building duplicate cache…" were the master strong-hash pass reading shortlisted masters in full over an 11.7 MB/s SMB share (now its own `"hashing"` phase with per-file progress), and a 15-minute "nothing new" scan was the content-index job saturating the same share (it now yields to active scans). `docs/backlog-v0.5.6.md` item 9 has the numbers. |
 | **An offline scan root logs `scan root offline (path does not exist)` from `check_scan_root_overlap` — it is not a symlink problem.** | The WARN pair at startup for a root on an unmounted share | Verified 2026-09-17: `/Volumes/Universe` is an SMB mount with no symlink anywhere in the chain; `canonicalize()` fails with `NotFound` exactly while the share is not mounted, the check falls back to the stored path (correct), and the line appears twice because both transfer folders are validated against every root. The message now names the `NotFound` case as "offline" so it is not read as damage. |
+| **`.deb`/`.rpm` installs are refused by the updater by rule — deferred, not a bug.** | `crates/athenaeum-core/src/updates/manifest.rs::platform_supported` | A package-manager install falls back to nothing rather than being handed the AppImage entry and choking on `dpkg -i` after a 100 MB download. The updater plugin itself can install over a `.deb`, so a `linux-x86_64-deb` manifest key plus a `.deb` build/sign leg is a real, scoped follow-up (spec §8 "Out of scope"), pending its own task. |
 
 ---
 
@@ -212,6 +213,32 @@ item 9 carries the measurements), code-complete on `main`, unit-pinned
   897 s of 2026-09-16 21:08.
 - Launch with an SMB root unmounted: the startup WARN pair reads
   `scan root offline (path does not exist); comparing by its stored path`.
+
+### In-app updates — first real update lands on the NEXT tag (2026-09-16/17)
+
+Spec `docs/superpowers/specs/2026-09-16-in-app-updates-design.md` §7.3 has
+the acceptance procedure in full; automated coverage (core, the web routes,
+the comparator parity test, the CI manifest/verify scripts) is green, and
+**v0.6.4** (2026-09-17, pipeline 381 green incl. `verify:release`,
+`updates/v0.6.4.json` + `latest.json` on `artfrom.space`) is the first build
+carrying the updater — so the feature cannot be exercised end to end until
+the tag AFTER it. The astronet parser switch (§6.6) is done: deployed
+2026-09-18, the first `/updates/latest.json` check already counted.
+
+**Owner smokes owed, on the next tag (v0.6.5 or a beta of it):**
+
+- On every OS a v0.6.4 install shows the new version in the dialog →
+  install → restart → *What's new in <version>*; `spctl --assess --type
+  execute` passes on the UPDATED macOS bundle (proves the plugin's
+  replacement is still a validly signed/notarized `.app`, not just the
+  original install); a Docker container still on 0.6.4 shows *available*
+  with `docker pull vsharifov/athenaeum:<version>`.
+- The adoption dashboard shows the new version's pings through the
+  `/updates/latest*.json` paths.
+
+Write the run up as `docs/superpowers/research/<date>-updater-acceptance-run.md`
+per the spec, and delete this subsection once it lands green. The desktop
+click-through of the dialog's `available` / `whatsNew` modes is owed too.
 
 ### Stacking v0.6.3 — fix round (2026-09-15)
 
