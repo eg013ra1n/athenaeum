@@ -4,7 +4,8 @@ Opened 2026-09-06, the day v0.5.5 was tagged. Items 2–4 are carried over from
 `docs/backlog-v0.5.5.md` by owner decision — they were deferred, not dropped.
 Item 1 came out of the v0.5.5 release itself. Items 6–8 were raised by the
 owner on 2026-09-07; item 6 was dropped the same day, after the analysis it
-asked for.
+asked for. Item 9 was raised by the owner on 2026-09-16, after the stacking
+program (M1–M4d) shipped and this doc had otherwise gone quiet.
 
 Each entry states what is already *known* — the code that owns the behaviour,
 what was measured — and the question that has to be answered before it can be
@@ -353,3 +354,63 @@ on a timer, or on an OS mount event? `Path::exists()` against a dead network
 mount can block for that mount's own timeout, so a background poll is a decision
 to take deliberately rather than a default. And when a root does come back: mark
 it available only, or start a scan? Neither answer blocks the button.
+
+## 9. Duplicate cache rebuild is quadratic, unthrottled, and runs unconditionally on every scan
+
+Raised by the owner 2026-09-16, asking why the duplicate cache takes so long to
+build in the production build. Not a regression from any recent cycle — the
+shape has been this way since the 2026-08-27 duplicate-detection redesign
+(`docs/superpowers/specs/2026-08-27-duplicate-detection-design.md`); nobody had
+measured its *recurring* cost before. Diagnosis only below — not researched into
+a fix shape, not planned, not started.
+
+**What's already known — the code that owns the behaviour:**
+
+- `scanner/mod.rs:1941-2015` (scan Phase 4 — rebuild the duplicate caches) is
+  gated only by `if !result.cancelled`. There is no check for
+  `result.files_processed == 0` or `new_file_ids.is_empty()`, so a scan that
+  finds nothing new still pays the full cost below. `monitor/mod.rs` re-scans
+  every monitor-enabled root on a fixed cadence
+  (`MONITORING_INTERVAL_MINUTES`, default 10 minutes) on its own doc comment's
+  premise that "re-running it on unchanged folders is effectively free" — true
+  for phases 1–3 (the file walk), not for Phase 4.
+- `duplicates/backfill.rs::fill_master_strong_hashes` full-hashes every
+  header-shortlisted master candidate synchronously, single-threaded, with
+  **no throttle** — unlike its sibling `run_content_index` in the same file,
+  which is deliberately chunked (64 files) with a 50 ms nap between chunks so
+  it never starves the app's own IO. `fill_master_strong_hashes` runs on the
+  scan's own thread and blocks scan completion; it is bounded by the header
+  shortlist, not the full master population, but the shortlist only grows as
+  the catalog accumulates more duplicate masters.
+- `db/operations.rs::rebuild_duplicate_groups_cache` runs **twice per scan**
+  (once for `DuplicateKey::Header`, once for `DuplicateKey::Master`). Each call
+  is a full `DELETE` of that key's cache plus one aggregate `GROUP BY` over the
+  whole eligible catalog, followed by a **separate `conn.prepare()` and
+  individual per-file `INSERT OR IGNORE` for every duplicate group found** —
+  never batched. The 2026-08-27 design doc measured 2,750 groups under the
+  Header key alone on the owner's production catalog: 2,750 prepared
+  statements and row-by-row inserts, every scan, from scratch.
+- `db/operations_blackhole.rs::find_duplicate_folders` (feeds
+  `rebuild_folder_similarity_cache`, also Phase 4) is an **O(folders²)**
+  all-pairs comparison across every distinct directory the catalog's raw
+  sub-frames sit in, entirely in memory, no chunking, no progress. On the
+  owner's typical night/target/filter folder layout this is plausibly the most
+  expensive single step, and nothing measures it in isolation yet.
+- Neither `rebuild_*` call emits a progress event. The UI sees one `"caching"`
+  event at the start of Phase 4 and then nothing until `scan-complete` (aside
+  from `master-hash-progress` while master hashing runs) — a slow pass reads
+  as a hang, not as working.
+
+**Why it matters:** on a large real catalog this turns *every* scan — including
+unattended monitor polls every 10 minutes, even when nothing on disk changed —
+into a full-catalog recompute, synchronous on the scan's own thread, with no
+visible progress and no way to cancel just this phase.
+
+**Open:** fix shape is unresearched. Candidates worth evaluating: skip Phase 4
+outright when the scan found no new/changed files and no stale duplicate rows
+exist; move `fill_master_strong_hashes` onto the same
+throttled/backgrounded pattern `run_content_index` already uses; make
+`rebuild_duplicate_groups_cache` incremental (touch only the files this scan
+actually inserted or updated, not the whole catalog); replace the O(folders²)
+folder-similarity pass with an indexed SQL join. Needs real measurements on a
+large catalog (per-phase timing) before any of these is worth planning.

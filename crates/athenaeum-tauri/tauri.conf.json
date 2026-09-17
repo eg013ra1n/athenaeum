@@ -60,7 +60,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI5QUQxOTI4RjEyMDUwMjQKUldRa1VDRHhLQm10dVo2NWU4eGlQc1JnUVMxd0hIOU5zeWI0OHZUTTYvUTJqbFFFbmdrdzVFUGkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFEQTJGMzBFRUZCREVDODIKUldTQzdMM3ZEdk9pSFVBbjV2dmtaS2JCR2lmL1YvUDgvd3hhL1JraWdrVGErZldURVBVQjhIZkIK%",
       "endpoints": ["https://artfrom.space/updates/latest.json"],
       "windows": { "installMode": "passive" }
     }

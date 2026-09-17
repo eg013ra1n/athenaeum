@@ -1432,6 +1432,24 @@ cycle, so anything from them that matters later belongs here or in a plan.
   way `run_content_index` already is; make the cache rebuild incremental
   instead of a full recompute; replace the O(folders²) folder-similarity
   comparison with an indexed SQL join.
+- **A symlink-crossing scan root logs as flatly "not resolvable", with no hint
+  it was a symlink.** Raised by the owner 2026-09-17. `check_scan_root_overlap`
+  (`api/scan_roots.rs:340-345`) calls `Path::canonicalize()` on every existing
+  scan root, which walks and resolves every symlink on the path; when a root
+  (or an intermediate component) crosses a symlink whose target volume is
+  momentarily unmounted, this fails with a bare `No such file or directory (os
+  error 2)` and falls back to comparing by the stored path — correct, and
+  already handled gracefully — but the WARN gives no way to tell "the whole
+  root is offline" apart from "a symlink further down the chain briefly lost
+  its target". Observed on `/Volumes/Universe/Astrophotography`: WARNs on
+  2026-09-14/15, then the same root scanned successfully (5611 found) on
+  2026-09-16 — confirms it was the symlink target coming and going, not the
+  root itself, an intermittent condition rather than a defect. Open: worth
+  teaching the WARN to name the first unresolvable path component and whether
+  it is a symlink (`std::fs::symlink_metadata` per component, or
+  `std::fs::read_link` on the failing segment), so this reads as "symlink
+  target N unavailable" instead of an unqualified "root offline" — not
+  researched into a concrete diff yet.
 
 ---
 
