@@ -23,6 +23,13 @@ that can be released and to read its verdicts.
   (`<!-- latest-build:start -->`, `<!-- latest-build:end -->`,
   `<!-- version-history:rows -->`) — `docs:publish` fails naming the missing
   one otherwise.
+- The tag pattern `v*` must be a **Protected tag** in the GitLab project
+  (Settings → Repository → Protected tags, Maintainers). The signing and
+  GitHub variables are Protected, and a Protected variable reaches only a
+  protected ref's pipeline: without the rule every build job dies on
+  "is the tag a Protected tag?" (v0.6.4's first attempt). A protected tag
+  cannot be deleted by `git push :refs/tags/…` — use the API
+  (`DELETE /projects/root%2Fathenaeum/repository/tags/<tag>` with the PAT).
 - Four CI/CD variables the pipeline needs: `DOCS_REPO_TOKEN` (required:
   artfrom-space project access token, Maintainer, write_repository),
   `GITHUB_API_TOKEN` (recommended — effectively required if a gate ever has
@@ -68,6 +75,12 @@ that can be released and to read its verdicts.
      v0.5.5) → fix the code on `main`, get green, delete the tag on both remotes, retag; never
      retry the job. `gate:tests` (stage `build`, polls GitHub up to 50 min) red: GitHub is red →
      same fix-and-retag.
+   - `deploy` red with NO error in the script section, only a
+     `…athenaeum.tmp/DEPLOY_SSH_KEY: Permission denied` line in a later
+     runner stage: `DEPLOY_SSH_KEY` is a file-type variable the runner
+     rewrites before every stage script, so it must stay writable (600 —
+     the `.ssh_deploy_setup` anchor does this since v0.6.4; never chmod it
+     400 again).
    - `publish` — `docs:publish` red without `DOCS_REPO_TOKEN`: create the token
      (artfrom-space, Maintainer, write_repository), set the variable, retry the
      job. Docker jobs are yellow-on-failure by design; the verify stage decides.
@@ -87,6 +100,10 @@ that can be released and to read its verdicts.
      - **An installer URL, a Docker arch or the blog** (nothing signature-related):
        fix the cause, retry the failed publish job, then retry `verify:release`;
        the announce jobs re-run by themselves.
+     A 404 on `updates/<tag>.json` alone means the docs-site deploy's
+     `rsync --delete` wiped it: `artfrom-space/.gitlab-ci.yml` must exclude
+     `/updates/` (it does since 2026-09-17); retry `publish:updater-manifest`,
+     then `verify:release`.
      `RELEASE_ALLOW_AMD64_ONLY=1` (project variable) accepts an amd64-only image
      while the arm64 runner is down — unset it afterwards.
      `verify:macos-gatekeeper` red: the published DMG is not accepted — do NOT
