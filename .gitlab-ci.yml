@@ -527,7 +527,14 @@ gate:tests:
     # -k` there is a silent no-op and agents pile up on the runner host —
     # stash the pid on disk so after_script can kill it by hand.
     - echo "$SSH_AGENT_PID" > "$CI_PROJECT_DIR/.ssh-agent.pid"
-    - chmod 400 "$DEPLOY_SSH_KEY"
+    # 600, not 400: DEPLOY_SSH_KEY is a FILE-type variable the runner rewrites
+    # at the start of EVERY stage script (after_script, the artifact upload,
+    # cleanup). A read-only file makes that rewrite fail with "Permission
+    # denied" — harmless in after_script ("job will continue unaffected"),
+    # fatal in the artifact-upload stage, which is exactly what failed the
+    # v0.6.4 deploy the moment the job gained an `artifacts:` block. ssh-add
+    # only requires the key to be unreadable by group/other; 600 satisfies it.
+    - chmod 600 "$DEPLOY_SSH_KEY"
     - ssh-add "$DEPLOY_SSH_KEY"
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
     # Pin the host key from SSH_KNOWN_HOSTS when set (ssh-keyscan -p 40022 <host>),
