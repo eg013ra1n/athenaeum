@@ -29,6 +29,16 @@ impl Channel {
             Channel::Beta => "latest-beta.json",
         }
     }
+
+    /// The lowercase string a log field carries — never `{:?}`'s
+    /// `Stable`/`Beta`, which would be a second, capitalized spelling of the
+    /// same value the logging dictionary already documents as lowercase.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Beta => "beta",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -182,6 +192,24 @@ mod tests {
     fn channel_files() {
         assert_eq!(Channel::Stable.file(), "latest.json");
         assert_eq!(Channel::Beta.file(), "latest-beta.json");
+    }
+
+    #[test]
+    fn channel_as_str_is_lowercase() {
+        assert_eq!(Channel::Stable.as_str(), "stable");
+        assert_eq!(Channel::Beta.as_str(), "beta");
+    }
+
+    /// The compiled-in default must never point anywhere but the real
+    /// production host over plaintext; the ONLY escape hatch is a
+    /// build-time env var for the local rehearsal (see `MANIFEST_BASE_URL`'s
+    /// own doc comment) — never a runtime one.
+    #[test]
+    fn base_url_is_https_unless_overridden_at_build_time() {
+        assert!(
+            MANIFEST_BASE_URL.starts_with("https://") || option_env!("ATHENAEUM_UPDATES_BASE_URL").is_some(),
+            "MANIFEST_BASE_URL = {MANIFEST_BASE_URL:?}"
+        );
     }
 
     #[test]

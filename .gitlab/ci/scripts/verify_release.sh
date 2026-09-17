@@ -53,6 +53,10 @@ else
       # The committed public key (base64 of the minisign key file) → rsign's key file.
       python3 -c 'import base64,json,sys; sys.stdout.write(base64.b64decode(json.load(open(sys.argv[1]))["plugins"]["updater"]["pubkey"]).decode())' "$TAURI_CONF_PATH" > "$PUB"
       command -v rsign >/dev/null || { echo "ERROR: rsign (rsign2) is not installed on this runner — cargo install rsign2 --locked" >&2; exit 1; }
+      # The inventory itself names how many platforms to expect — never a
+      # literal, so a future platform added to updater_artifacts() doesn't
+      # silently under-count here.
+      expected_platforms=$(updater_artifacts | wc -l | tr -d ' ')
       mcount=0
       while read -r product os arch ext variant subdir filename key; do
         expected="${BUILDS_BASE_URL}/${CI_COMMIT_TAG}/${subdir}/${filename}"
@@ -71,8 +75,8 @@ else
         if rsout=$(rsign verify -p "$PUB" -x "$SIG" "$dlfile" 2>&1); then mcount=$((mcount + 1))
         else echo "ERROR: updater signature does not verify for $url — $rsout" >&2; fail=1; fi
       done < <(updater_artifacts)
-      if [ "$fail" -eq 0 ] && [ "$mcount" -ne 5 ]; then
-        echo "ERROR: updater manifest verified $mcount platforms, expected 5" >&2; fail=1
+      if [ "$fail" -eq 0 ] && [ "$mcount" -ne "$expected_platforms" ]; then
+        echo "ERROR: updater manifest verified $mcount platforms, expected $expected_platforms" >&2; fail=1
       fi
       [ "$fail" -eq 0 ] && echo "ok: updater manifest v${VERSION} — ${mcount} platforms, every URL present, every signature verified"
     fi

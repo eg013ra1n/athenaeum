@@ -605,6 +605,42 @@ out=$(REPO_ROOT="$VT_TMP" TAG="v0.6.4" "$HELPERS_DIR/check_versions.sh" 2>&1) ||
 assert_eq "check: mismatch exits 1" "1" "$rc"
 assert_contains "check: mismatch names a file" "ERROR: package.json is 0.6.3, tag v0.6.4 expects 0.6.4" "$out"
 
+# The committed DEVELOPMENT updater pubkey (key id B9AD1928F1205024) is
+# refused even when every version matches.
+rc=0
+DEVKEY_TMP=$(mktemp -d -t version_tree_devkey.XXXXXX)
+cp -R "$FIXTURES_DIR/version_tree/." "$DEVKEY_TMP/"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.setdefault("plugins", {}).setdefault("updater", {})["pubkey"] = (
+    "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI5QUQxOTI4RjEyMDUwMjQK"
+    "UldRa1VDRHhLQm10dVo2NWU4eGlQc1JnUVMxd0hIOU5zeWI0OHZUTTYvUTJqbFFFbmdrdzVFUGkK"
+)
+json.dump(d, open(path, "w"))
+' "$DEVKEY_TMP/crates/athenaeum-tauri/tauri.conf.json"
+out=$(REPO_ROOT="$DEVKEY_TMP" TAG="v0.6.3" "$HELPERS_DIR/check_versions.sh" 2>&1) || rc=$?
+assert_eq "check: dev pubkey exits 1" "1" "$rc"
+assert_contains "check: dev pubkey names the key id" "ERROR: tauri.conf.json still carries the DEVELOPMENT updater pubkey (key id B9AD1928F1205024) — install the release key before tagging" "$out"
+rm -rf "$DEVKEY_TMP"
+
+# A missing plugins.updater.pubkey is also refused.
+rc=0
+NOKEY_TMP=$(mktemp -d -t version_tree_nokey.XXXXXX)
+cp -R "$FIXTURES_DIR/version_tree/." "$NOKEY_TMP/"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("plugins", None)
+json.dump(d, open(path, "w"))
+' "$NOKEY_TMP/crates/athenaeum-tauri/tauri.conf.json"
+out=$(REPO_ROOT="$NOKEY_TMP" TAG="v0.6.3" "$HELPERS_DIR/check_versions.sh" 2>&1) || rc=$?
+assert_eq "check: missing pubkey exits 1" "1" "$rc"
+assert_contains "check: missing pubkey message" "ERROR: tauri.conf.json has no plugins.updater.pubkey" "$out"
+rm -rf "$NOKEY_TMP"
+
 # bump rewrites all six (tauri gets the -N form for a beta) and re-checks.
 rc=0
 out=$(REPO_ROOT="$VT_TMP" BUMP_SKIP_CARGO=1 "$REPO_DIR/scripts/release/bump.sh" 0.7.0-beta.2 2>&1) || rc=$?
@@ -1017,6 +1053,13 @@ out=$(CI_COMMIT_TAG=v0.7.0-beta.2 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DI
 assert_eq "manifest: beta tag exits 1 when its files are missing (stage holds 0.7.0)" "1" "$rc"
 assert_contains "manifest: names the missing signature" "ERROR: missing signature $UM_STAGE/macos/athenaeum-0.7.0-beta.2-macos-arm64.app.tar.gz.sig" "$out"
 
+# Still against the fully-valid stage — the LAST such case before the .sig
+# mutations below start removing/emptying files, so a failure here can only
+# be attributed to the date string itself.
+rc=0
+out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" PUB_DATE="yesterday" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
+assert_eq "manifest: a non-RFC3339 PUB_DATE exits 1" "1" "$rc"
+
 rm -f "$UM_STAGE/linux/athenaeum-0.7.0-linux-x64.AppImage.sig"
 rc=0
 out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
@@ -1026,10 +1069,6 @@ assert_contains "manifest: names it" "athenaeum-0.7.0-linux-x64.AppImage.sig" "$
 rc=0
 out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
 assert_eq "manifest: an EMPTY sig exits 1" "1" "$rc"
-
-rc=0
-out=$(CI_COMMIT_TAG=v0.7.0 STAGE_DIR="$UM_STAGE" NOTES_PATH="$FIXTURES_DIR/release_notes_sample.md" PUB_DATE="yesterday" "$HELPERS_DIR/gen_updater_manifest.sh" 2>&1) || rc=$?
-assert_eq "manifest: a non-RFC3339 PUB_DATE exits 1" "1" "$rc"
 
 # A whitespace-only .sig is non-empty at the filesystem level (bash's `-s`
 # check passes it through), so this exercises the PYTHON-side guard

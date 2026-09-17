@@ -4,6 +4,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
+import { useNotifications } from './NotificationContext';
 import type { UpdateCheck, WhatsNew } from '../types/models';
 
 export type DialogMode = 'closed' | 'available' | 'whatsNew';
@@ -52,6 +53,7 @@ interface UpdatesContextValue {
 const UpdatesContext = createContext<UpdatesContextValue | null>(null);
 
 export function UpdatesProvider({ children }: { children: ReactNode }) {
+  const { notify } = useNotifications();
   const [check, setCheck] = useState<UpdateCheck | null>(null);
   const [whatsNew, setWhatsNew] = useState<WhatsNew | null>(null);
   const [dialog, setDialog] = useState<DialogMode>('closed');
@@ -79,11 +81,22 @@ export function UpdatesProvider({ children }: { children: ReactNode }) {
       .listen<{ version: string }>('update-ready', (p) => {
         if (cancelled) return;
         setPhase({ kind: 'ready', version: p.version });
+        notify({
+          title: `v${p.version} downloaded — restart to apply`,
+          detail: 'Open the update dialog from the About page to restart.',
+          tone: 'success',
+          kind: 'update',
+          link: '/about?update',
+          dedupeKey: `update-${p.version}`,
+        });
       })
       .then((fn) => { if (cancelled) fn(); else unlistenReady = fn; })
       .catch((err) => console.error('[updates] listen update-ready failed:', err));
     return () => { cancelled = true; unlistenProgress?.(); unlistenReady?.(); };
-  }, []);
+    // `notify` is stable for the life of NotificationProvider (a stable
+    // useCallback chain — see NotificationContext.tsx), so including it here
+    // does not cause this effect to re-subscribe on every render.
+  }, [notify]);
 
   const runCheck = useCallback(async (): Promise<UpdateCheck | null> => {
     setChecking(true);
@@ -136,8 +149,16 @@ export function UpdatesProvider({ children }: { children: ReactNode }) {
       const message = typeof err === 'string' ? err : 'The update could not be installed';
       console.error('install_update:', err);
       setPhase({ kind: 'failed', message });
+      notify({
+        title: 'Update could not be installed',
+        detail: message,
+        tone: 'warning',
+        kind: 'update',
+        hasErrors: true,
+        link: '/about?update',
+      });
     }
-  }, []);
+  }, [notify]);
 
   const restart = useCallback(async () => {
     try {

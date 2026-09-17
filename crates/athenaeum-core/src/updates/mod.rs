@@ -122,6 +122,10 @@ pub async fn check(ctx: &ServiceContext, host: &HostInfo<'_>) -> Result<UpdateCh
 /// Stable is always fetched; beta only when `updates.check_beta`; the newer
 /// of the two wins. Both fetches failing is an error (logged inside
 /// `fetch_manifest`); one failing is logged and the other answers.
+///
+/// Tests only — production always goes through `check`, whose base URL is
+/// fixed at compile time (`MANIFEST_BASE_URL`).
+#[doc(hidden)]
 pub async fn check_at(ctx: &ServiceContext, host: &HostInfo<'_>, base_url: &str) -> Result<UpdateCheck> {
     let current = env!("CARGO_PKG_VERSION");
     let (id, check_beta) = {
@@ -158,7 +162,15 @@ pub async fn check_at(ctx: &ServiceContext, host: &HostInfo<'_>, base_url: &str)
         (Err(e), _) => return Err(e),
     };
 
-    let latest = manifest.version.trim().trim_start_matches('v').to_string();
+    // The manifest's version is re-parsed and rendered back through `semver`
+    // rather than trusted as written: `docker_image` is a copy-to-shell
+    // line, and an unparsed string (which `is_newer` already treats as "no
+    // update", see `version::is_newer`) must never reach it. A version that
+    // fails to parse falls back to the trimmed raw string for display only —
+    // `is_update_available` is already `false` for it either way.
+    let trimmed = manifest.version.trim().trim_start_matches('v').to_string();
+    let parsed_version = version::parse(&trimmed);
+    let latest = parsed_version.as_ref().map(|v| v.to_string()).unwrap_or_else(|| trimmed.clone());
     let keys: Vec<&str> = manifest.platforms.keys().map(String::as_str).collect();
     let platform_supported = host.kind == HostKind::Desktop
         && manifest::platform_supported(
@@ -169,7 +181,7 @@ pub async fn check_at(ctx: &ServiceContext, host: &HostInfo<'_>, base_url: &str)
         );
     let is_update_available = version::is_newer(&latest, current);
     tracing::info!(
-        channel = ?channel,
+        channel = channel.as_str(),
         current_version = current,
         latest_version = %latest,
         is_update_available,
@@ -187,8 +199,8 @@ pub async fn check_at(ctx: &ServiceContext, host: &HostInfo<'_>, base_url: &str)
         download_page_url: DOWNLOAD_PAGE_URL.to_string(),
         blog_url: notes::blog_url(&latest),
         docker_image: match host.kind {
-            HostKind::Web => Some(format!("{DOCKER_IMAGE}:{latest}")),
-            HostKind::Desktop => None,
+            HostKind::Web if parsed_version.is_some() => Some(format!("{DOCKER_IMAGE}:{latest}")),
+            _ => None,
         },
     })
 }
@@ -389,6 +401,23 @@ mod tests {
         let (supported, _reqs2) = serve(vec![("/latest.json", 200, manifest("99.0.0", &[own_key.as_str()]))], 1);
         let ok = check_at(&ctx, &DESKTOP_MAC, &supported).await.unwrap();
         assert!(ok.platform_supported, "the running host's own os/arch key is served");
+    }
+
+    #[tokio::test]
+    async fn manifest_version_is_reparsed_and_rendered_back() {
+        let (_d, ctx) = ctx();
+        let (base, _reqs) = serve(vec![("/latest.json", 200, manifest("v0.7.0", &["darwin-aarch64"]))], 1);
+        let r = check_at(&ctx, &DESKTOP_MAC, &base).await.unwrap();
+        assert_eq!(r.latest_version, "0.7.0");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_manifest_version_never_reaches_docker_image() {
+        let (_d, ctx) = ctx();
+        let (base, _reqs) = serve(vec![("/latest.json", 200, manifest("garbage", &["darwin-aarch64"]))], 1);
+        let r = check_at(&ctx, &WEB, &base).await.unwrap();
+        assert!(!r.is_update_available);
+        assert!(r.docker_image.is_none(), "an unparsed version string must never reach a copy-to-shell docker line");
     }
 
     #[tokio::test]

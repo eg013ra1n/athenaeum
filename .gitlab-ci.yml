@@ -241,6 +241,9 @@ build:macos:
     - tags
   needs: ["check:versions"]
   # No cache — see the comment in build:windows for why this pipeline has none.
+  # Four notary waits per release since D4 reversed F5.1 (two .app + two DMG)
+  # on top of two cold target builds.
+  timeout: 2h
   script:
     - '[ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "FATAL: TAURI_SIGNING_PRIVATE_KEY is empty — is the tag a Protected tag?"; exit 1; }'
     # No `brew install cmake nasm` here any more — turbojpeg-sys is out of
@@ -695,9 +698,15 @@ verify:release:
     - job: publish:dockerhub:manifest
       artifacts: false
       optional: true
-  timeout: 30m
+  # The first tag after a runner rebuild pays a cold `cargo install rsign2`
+  # on top of every network wait below.
+  timeout: 45m
   script:
     - export PATH="$HOME/.cargo/bin:$PATH"
+    # Pre-installing rsign2 on the macOS runner (`cargo install rsign2
+    # --locked` once, in the runner user's own ~/.cargo/bin) is the owner's
+    # step; this line is only the self-healing fallback for a runner that
+    # hasn't had it done yet.
     - command -v rsign >/dev/null || cargo install rsign2 --locked
     - .gitlab/ci/scripts/verify_release.sh
 

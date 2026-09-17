@@ -78,12 +78,15 @@ that can be released and to read its verdicts.
      actually reached that job, fix, delete the tag on both remotes, retag.
    - `verify` — `verify:release` red names exactly what is missing (an installer
      URL, a Docker arch, the blog URL) — including, since the in-app updater,
-     a manifest URL or a signature that failed to verify: a signature failure
-     means the published file is not the one the build signed (a stale
-     `TAURI_SIGNING_PRIVATE_KEY`, a re-uploaded artifact) — do NOT announce,
-     fix the cause, delete the tag on both remotes, retag. Fix the cause,
-     retry the failed publish job, then retry `verify:release`; the announce
-     jobs re-run by themselves.
+     a manifest URL or a signature that failed to verify. Two cases:
+     - **A signature or the manifest** (`verify:release` names a signature or the
+       manifest itself, e.g. "does not verify" or a missing/mismatched platform
+       entry): the published file is not the one the build signed (a stale
+       `TAURI_SIGNING_PRIVATE_KEY`, a re-uploaded artifact) — do NOT announce, fix
+       the cause, delete the tag on both remotes, retag.
+     - **An installer URL, a Docker arch or the blog** (nothing signature-related):
+       fix the cause, retry the failed publish job, then retry `verify:release`;
+       the announce jobs re-run by themselves.
      `RELEASE_ALLOW_AMD64_ONLY=1` (project variable) accepts an amd64-only image
      while the arm64 runner is down — unset it afterwards.
      `verify:macos-gatekeeper` red: the published DMG is not accepted — do NOT

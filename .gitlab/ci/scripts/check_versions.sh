@@ -34,6 +34,23 @@ for crate in athenaeum-core athenaeum-tauri athenaeum-web perseus; do
 done
 check "crates/athenaeum-tauri/tauri.conf.json" "$(read_json_version "$REPO_ROOT/crates/athenaeum-tauri/tauri.conf.json")" "$TAURI_VERSION"
 
+# The updater pubkey committed to tauri.conf.json today is a DEVELOPMENT
+# minisign keypair (key id B9AD1928F1205024) generated for local rehearsal —
+# tagging with it in place would ship a release only the dev private key can
+# sign updates for. The base64 below is that exact committed value; the
+# owner installs the real release key before tagging (this gate is what
+# proves it happened).
+DEV_UPDATER_PUBKEY="dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI5QUQxOTI4RjEyMDUwMjQKUldRa1VDRHhLQm10dVo2NWU4eGlQc1JnUVMxd0hIOU5zeWI0OHZUTTYvUTJqbFFFbmdrdzVFUGkK"
+
+pubkey="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("plugins", {}).get("updater", {}).get("pubkey", ""))' "$REPO_ROOT/crates/athenaeum-tauri/tauri.conf.json")"
+if [ -z "$pubkey" ]; then
+  echo "ERROR: tauri.conf.json has no plugins.updater.pubkey" >&2
+  fail=1
+elif [ "$pubkey" = "$DEV_UPDATER_PUBKEY" ]; then
+  echo "ERROR: tauri.conf.json still carries the DEVELOPMENT updater pubkey (key id B9AD1928F1205024) — install the release key before tagging" >&2
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi

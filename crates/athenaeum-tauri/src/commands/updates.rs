@@ -177,7 +177,7 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>, channel:
         })?
         .ok_or_else(|| "no update is available for this build".to_string())?;
     let version = update.version.clone();
-    tracing::info!(channel = ?channel, latest_version = %version, "update download started");
+    tracing::info!(channel = channel.as_str(), latest_version = %version, "update download started");
 
     // Shared with the `FnOnce` finish closure below so its final tick can
     // report the real running totals instead of `null`s.
@@ -214,7 +214,9 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>, channel:
         })?;
 
     tracing::info!(latest_version = %version, "update installed — restart to apply");
-    let _ = app.emit("update-ready", serde_json::json!({ "version": version.to_string() }));
+    if let Err(e) = app.emit("update-ready", serde_json::json!({ "version": version.to_string() })) {
+        tracing::warn!(error = %e, "update-ready event could not be emitted");
+    }
     Ok(())
 }
 
