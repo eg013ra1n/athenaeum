@@ -193,27 +193,6 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
-### Scan Phase 4 — the master-hash phase and the yielding content index (2026-09-17)
-
-Two owner-visible fixes from the open-items triage (`docs/backlog-v0.5.6.md`
-item 9 carries the measurements), code-complete on `main`, unit-pinned
-(`only_header_shortlisted_masters_are_hashed` asserts the `"hashing"` ticks,
-`content_index_yields_while_a_scan_is_active` /
-`content_index_cancel_while_parked_returns_promptly` the park). Owed by hand:
-
-- A production scan of a root that ingests masters with header twins shows
-  **Verifying master duplicates** with `N / M files` and the master's path
-  instead of the indeterminate "Building duplicate cache…", and the modal's
-  cancel stops it between files. Check the log's
-  `master strong-hash: pass finished` line carries `duration_ms`.
-- Start a scan while the content index is running (Settings → Duplicates →
-  build index, then Rescan a root on the same volume): the log shows
-  `content index paused: scan active` then `content index resumed` with a
-  `duration_ms`, and the scan finishes at its normal speed rather than the
-  897 s of 2026-09-16 21:08.
-- Launch with an SMB root unmounted: the startup WARN pair reads
-  `scan root offline (path does not exist); comparing by its stored path`.
-
 ### In-app updates — first real update lands on the NEXT tag (2026-09-16/17)
 
 Spec `docs/superpowers/specs/2026-09-16-in-app-updates-design.md` §7.3 has
