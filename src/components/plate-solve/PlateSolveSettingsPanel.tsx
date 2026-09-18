@@ -3,10 +3,7 @@ import { Save, RotateCw, CheckCircle, AlertCircle, Download, Info } from 'lucide
 import { api } from '../../api';
 import type { PlateSolveConfig, FovSummary } from '../../types/plate-solve';
 import type { CatalogStatusInfo, CatalogDownloadProgress } from '../../types/helpers';
-import {
-  recommendTier,
-  TIER_POLICY,
-} from './cameraPresets';
+import { buildTierRows, recommendFromFov } from './cameraPresets';
 
 // Fallback default shown while loading, matching backend defaults (see
 // PlateSolveConfig::default() in athenaeum-core/src/plate_solve/config.rs).
@@ -101,26 +98,18 @@ export function PlateSolveSettingsPanel() {
   const [fovSummary, setFovSummary] = useState<FovSummary | null>(null);
 
   // Derived values (not state — recomputed on each render from inputs).
-  // The density→FOV mapping is fixed policy (TIER_POLICY), so the recommendation
-  // and the tier list always work — even before the catalog server/manifest is
-  // reachable. Live install state (and authoritative byte sizes) are merged in
-  // from get_catalog_status when available; tier_status reports installed tiers
-  // via discover_layers even with no manifest, so "Installed" still shows offline.
-  const hasRecommendation = fovSummary?.min_fov_deg != null;
-  const recommended = hasRecommendation
-    ? recommendTier(fovSummary!.min_fov_deg!, TIER_POLICY)
-    : 2000;
-  const tierRows = TIER_POLICY.map((p) => {
-    const live = catalogs.find((c) => c.density === p.density);
-    return {
-      density: p.density,
-      min_fov_deg: p.min_fov_deg,
-      installed: live?.installed ?? false,
-      star_count_approx: live?.star_count_approx ?? 0,
-      size_bytes: live?.size_bytes,
-    };
-  });
-  // True iff any tier at/below the recommended depth is not yet installed.
+  // Tier rows and the recommendation are both built from the LIVE catalog
+  // status (`get_catalog_status`, one row per manifest tier merged with
+  // on-disk install state) so the table only ever shows tiers the server
+  // actually publishes, and the recommendation can only ever name one of
+  // them. Falls back to the fixed TIER_POLICY (inside cameraPresets.ts) only
+  // when the status list is empty (manifest unreachable, nothing installed
+  // yet) so the panel still works offline on first run.
+  const recommendation = recommendFromFov(fovSummary?.min_fov_deg, catalogs);
+  const hasRecommendation = recommendation.isRecommendation;
+  const recommended = recommendation.density;
+  const tierRows = buildTierRows(catalogs);
+  // True iff the recommended tier (or its fallback) is not yet installed.
   const needsDownload = tierRows.some((t) => t.density <= recommended && !t.installed);
 
   useEffect(() => {
@@ -341,7 +330,7 @@ export function PlateSolveSettingsPanel() {
                   <button
                     onClick={() => downloadStarCatalog(recommended)}
                     disabled={downloading}
-                    title="Download the recommended tier set (every tier up to the recommended density)"
+                    title="Downloads this tier and every lower one not yet installed"
                     className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-surface flex-shrink-0"
                   >
                     <Download size={12} />
@@ -361,8 +350,9 @@ export function PlateSolveSettingsPanel() {
               </p>
             )}
 
-            {/* Per-tier table — always shown (built from the fixed tier policy;
-                live install state + byte sizes merged in from get_catalog_status). */}
+            {/* Per-tier table — one row per tier the live catalog status reports
+                (manifest tiers merged with on-disk install state); falls back to
+                the fixed tier policy only when the status list is empty. */}
             <div>
               <div className="text-xs font-semibold uppercase tracking-wide text-content-muted mb-2">
                 Catalog Tiers
@@ -413,7 +403,7 @@ export function PlateSolveSettingsPanel() {
                               <button
                                 onClick={() => downloadStarCatalog(tier.density)}
                                 disabled={downloading}
-                                title={`Downloads every tier up to ${tier.density.toLocaleString()} stars/deg² (additive — includes lower tiers)`}
+                                title="Downloads this tier and every lower one not yet installed"
                                 className="inline-flex items-center gap-1 font-medium text-accent hover:text-accent-hover disabled:opacity-50 transition-colors"
                               >
                                 <Download size={11} />
