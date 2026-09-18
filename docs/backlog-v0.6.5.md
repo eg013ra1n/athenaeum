@@ -459,7 +459,21 @@ Two causes (`PlateSolveSettingsPanel.tsx`, `PlateSolveIndexMissingModal.tsx`,
 come from the manifest; the tooltip says "this tier and every lower one";
 `needsDownload` keys on the recommended tier being installed.
 
-## 4b. Web host: the account and sync routes can wedge the whole server — OPEN
+## 4b. Web host: the account and sync routes can wedge the whole server — SHIPPED
+
+**Shipped 2026-09-18** (`e86466fc`). `sample` on the wedged server showed
+`api::account::build_status` → `TokenStore::load` → keyring →
+`SecKeychainFindGenericPassword` blocking on a tokio worker while macOS
+waited for a keychain prompt for the unsigned binary. `TokenStore::load` now
+runs the keychain read through a process-wide bounded probe (one thread per
+account, every caller waits ≤ 3 s, a timeout falls back to the 0600 file with
+a `warn!`, the next call after the prompt is answered gets the real result),
+and `api::account::status` runs it under `block_in_place`. Measured after:
+`account_status` 200 in 3.0 s three times in a row, `get_sync_status` 1 ms,
+the static route still answering, the Transfers tab renders. Owed: the
+desktop app on a fresh machine — the first sign-in prompt must still be
+answerable and the token found once it is.
+
 
 Found 2026-09-18 while clicking through the redesigned Settings in the web
 build (`athenaeum-web` release binary on a catalog copy, no keychain, no
