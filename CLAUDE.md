@@ -87,6 +87,19 @@ pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse 
 - Custom hooks prefixed `use…`; pages mostly presentational, logic in hooks.
 - TS interfaces in `src/types/models.ts` mirror Rust models; `src/types/calibration-config.ts` mirrors the calibration config.
 
+**Settings page** (`docs/settings/README.md` is the contract — read it before adding a setting).
+Seven tabs in a fixed order — General · Blink · Analysis · Plate Solving · Calibration · Stacking ·
+Transfers — each a list of registered sections. `src/settings/registry.ts` is the ONE description
+of the page (tab → section → field metadata: ids, labels, help, keywords; never values or render
+code); it drives search (`useSettingsSearch`, `?tab=…&section=…` deep links) and per-field /
+per-section reset. A KV key renders through `useSettingField` + `SettingToggle`/`SettingSelect`/
+`SettingNumber`/`SettingText` inside a `SettingsSection`; a typed config (Analysis, Plate Solving,
+Calibration Matching, Logging, Stacking) patches through `useAutosaveDocument`. Discrete controls
+commit on change (300 ms debounce), text/number on blur/Enter, Escape restores, an invalid draft
+never writes. Defaults come from `get_settings_defaults` (both hosts, `api::settings`) built from
+`settings::defaults::all()` + each config's `Default`; the annotation config is the one TS-held
+exception. **Never a Save button, never a banner** — `notify()` on failure only; `Checkbox` is the one checkbox.
+
 ## Notifications
 
 One global notification system. **To raise a notification from anywhere, call

@@ -222,7 +222,21 @@ observer far from UTC seeing a date shifted by one for early-evening starts
 (east of about UTC+6) or a label naming the morning date (west of about
 UTC−6). Accepted; do not re-flag or add local-zone logic unasked.
 
-## 4. Settings — one redesign cycle
+## 4. Settings — one redesign cycle — SHIPPED
+
+**Shipped 2026-09-18** (spec
+`docs/superpowers/specs/2026-09-18-settings-redesign-design.md`, plan
+`docs/superpowers/plans/2026-09-18-settings-redesign.md`, commits
+`ec95bd55..5707a317` on `main`): seven tabs in the wanted order with a new
+Blink tab and Account/Sync under Transfers; every change persists on its own
+(no Save button, no banner); one `Checkbox`; Frame set grouping before Session
+detection with the real explanation; a metadata registry that drives search
+across every tab, `?tab=…&section=…` deep links and per-field / per-section
+reset; defaults from one `get_settings_defaults` command on both hosts; the
+Logging card without its duplication; `docs/settings/README.md` as the
+contract for the next setting. Items 4.1–4.9 below are covered by it (4.6's
+drizzle toggle landed with the quick wins); 4.10–4.12 stand as written. Owed:
+the desktop click-through listed in `docs/superpowers/open-items.md`.
 
 Everything in this item is frontend; the backend commands already exist. It
 should be ONE spec and one cycle, because the pieces share a shape: a settings
@@ -230,7 +244,7 @@ should be ONE spec and one cycle, because the pieces share a shape: a settings
 per-field reset (4.9) and autosave (4.5) cheap, and doing them one at a time
 would build that registry three times.
 
-### 4.1 Tab order and where Account / Sync go
+### 4.1 Tab order and where Account / Sync go — covered
 
 Today (`Settings.tsx:584-651`): General · Transfers · Stacking · Calibration ·
 Analysis · Plate Solving. Wanted: **General · Blink · Analysis · Plate Solving ·
@@ -238,13 +252,13 @@ Calibration · Stacking · Transfers**, with the Account and Sync cards
 (`Settings.tsx:807-833`) moving from General to Transfers. The `?tab=` deep-link
 values stay valid; `blink` is the one new value.
 
-### 4.2 The Blink tab (new)
+### 4.2 The Blink tab (new) — covered
 
 Move out of General: "Blink Viewer" (`Settings.tsx:1113-1293`), "Flat Contour
 Plot" (`939-1016`), "Star Annotation Display" (`1295-1409`). All three are
 already inside the one big saved card, so they carry their keys with them.
 
-### 4.3 Checkboxes — five styles, none the house one
+### 4.3 Checkboxes — five styles, none the house one — covered
 
 `src/components/folders/SwitchRow.tsx` documents the house pattern
 (`accent-accent`, because `@tailwindcss/forms` is not installed so `text-*` /
@@ -256,7 +270,7 @@ a no-ring variant on Star Annotation, `+ disabled:opacity-50` on every stacking
 panel, and a bare `rounded border-border` on Analysis's "Auto". **One shared
 `Checkbox`/`SwitchRow`** used everywhere in Settings and the stacking panels.
 
-### 4.4 Frame-set grouping before session detection, with a real explanation
+### 4.4 Frame-set grouping before session detection, with a real explanation — covered
 
 "Clustering Parameters" (`Settings.tsx:876-910`) sits after Updates; the prose
 "About Frame Set Grouping" card (`1614-1630`) is at the very bottom, after the
@@ -266,7 +280,7 @@ what the threshold does (seed-and-grow single-link on LIGHT RA/Dec, great-circle
 distance, only frames not already in a set) and what a change does NOT do
 (existing sets are not regrouped).
 
-### 4.5 Autosave everywhere
+### 4.5 Autosave everywhere — covered
 
 Persist-on-change exists in exactly one place: `StackingSection.tsx:113-204`
 (500 ms debounce, `dirtyRef` so a load never writes, unmount flush). Every other
@@ -291,7 +305,7 @@ emitted six times (base + five module rows, `148-152` vs `172-176`), the
 `ATHENAEUM_LOG` override is stated in the banner AND in the success toast, and
 there is no dirty state. A `LevelSelect` component + autosave collapses it.
 
-### 4.6 Stacking settings — drizzle "Off" on the left, "2×" on the right
+### 4.6 Stacking settings — drizzle "Off" on the left, "2×" on the right — covered
 
 `stageSummary.ts:317` returns `'Off'` when `!config.drizzle.enabled`;
 `DrizzlePanel.tsx` has **no enabled toggle by design** (its header comment: the
@@ -306,12 +320,12 @@ is the other one.
 
 The "xisf calibration files" note under this heading is item 1b.
 
-### 4.7 The `?tab=` and section anchors
+### 4.7 The `?tab=` and section anchors — covered
 
 Search (4.8) and the "→ Coverage"-style deep links need sections addressable:
 `?tab=calibration&section=dates`. Cheap once the registry exists.
 
-### 4.8 Global settings search
+### 4.8 Global settings search — covered
 
 None exists. Closest reusable pattern: the dual-pane's local filter
 (`DualPaneFileBrowser.tsx:836-852`, `1761-1786` — needle, `includes`, match
@@ -320,7 +334,7 @@ the tabs are replaced by every matching section from every tab (matching on
 section title, field labels, help text and setting key), with the tab name as
 a chip; clearing restores the tab. Needs the section registry (4.5).
 
-### 4.9 Per-field reset to defaults, beside the per-section one
+### 4.9 Per-field reset to defaults, beside the per-section one — covered
 
 Per-section resets exist for Stacking, Analysis, Plate Solving and Calibration
 Matching (each a `reset_*` command); there is **no** reset of any kind on the

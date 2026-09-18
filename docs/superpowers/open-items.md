@@ -193,6 +193,51 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Settings redesign (2026-09-18)
+
+Spec `docs/superpowers/specs/2026-09-18-settings-redesign-design.md`, plan
+`docs/superpowers/plans/2026-09-18-settings-redesign.md`, Tasks A1–E1 on `main`
+(`ec95bd55` … `5707a317`), the contract in `docs/settings/README.md`. Every
+gate is green (`npm test` — registry coverage, hook, search and panel tests —
+`npx tsc --noEmit`, the Rust defaults pins); what is owed is the desktop
+click-through, since only a static check of the served bundle stood in for it:
+
+- **Each of the seven tabs opens and renders its sections** — General · Blink ·
+  Analysis · Plate Solving · Calibration · Stacking · Transfers — with no Save
+  button and no "saved" banner anywhere on the page; Account and Sync sit under
+  Transfers; Frame set grouping comes before Session detection on General.
+- **A text field commits on blur and on Enter, Escape restores** — e.g.
+  General → Monitoring → Polling interval: type a value and Tab away (one write,
+  the tick fades in), type another and press Enter, type a third and press
+  Escape (the committed value comes back, nothing written). An out-of-range
+  value shows the codec's message inline and is never written.
+- **A slider is one write per drag** — Blink → Blink viewer → Preview JPEG
+  Quality: drag, release, one `set_setting` in the log.
+- **Search with two queries** — `gap` shows only Session detection; `blink jpeg`
+  shows the Blink viewer section with the three quality fields ring-highlighted;
+  editing a result commits in place; the tab bar is inert while a query is
+  active; clearing returns to the previous tab; `/` focuses the field, Escape
+  clears it.
+- **A field reset** — change any KV field, the `↺` appears with `Reset to
+  default (X)` in its tooltip, click it, the default is written and the `↺`
+  disappears.
+- **A section reset with confirm** — General → Auto-merge → Reset all: the
+  `Reset Auto-merge?` dialog, then every field in the card back to its default.
+- **The typed-document reset text** — Analysis → Star Detection Parameters →
+  Reset all must read "This resets the whole Analysis configuration back to its
+  default." (not the generic "every setting in this section"); same check on
+  Stacking → Pipeline defaults (its text names per-set overrides and folders as
+  untouched).
+- **The Logging card** — one base level picker, five module rows each with an
+  `Inherit (<base>)` option, a level change writes the whole document after the
+  debounce, the `ATHENAEUM_LOG` banner appears only while the override is
+  actually set.
+- **The Transfers restart badge** — change the incoming working folder: the
+  "Restart Athenaeum to apply" badge shows exactly as before the redesign.
+- **The deep link** — open `?tab=calibration&section=calibration.masterFormat`:
+  the Calibration tab opens, the Master File Format card scrolls into view and
+  flashes once.
+
 ### XISF masters and calibrated lights (2026-09-18)
 
 Plan `docs/superpowers/plans/2026-09-18-xisf-output-masters-and-calibrated-lights.md`,
