@@ -1,17 +1,21 @@
-// Settings → Transfers (task 15). Renders inner content only — the host
-// card/heading are supplied by `Settings.tsx`, matching the `SyncSection` /
-// `LoggingSettings` pattern.
+// Settings → Transfers (task 15; settings redesign Task D3). Four
+// `SettingsSection`s now — Folders, Upload speed limit, Simultaneous
+// incoming transfers, Transfer storage — the registry supplies each card's
+// title/description.
 //
 // The two Folders cards are new (transfer-prepare spec §6.3–6.5: the outgoing
-// staging folder and the incoming working folder). Bandwidth, Receiving and
-// Storage moved here from `SyncSection` unchanged — same commands, same
-// validation, same notifications. Sync keeps account status + pairing.
+// staging folder and the incoming working folder). Upload speed limit and
+// Simultaneous incoming transfers are `SettingNumber` KV fields now — no
+// local Save state, no Save buttons — through `useSettingField`'s own
+// draft/blur/Enter/reset discipline (spec §5). Storage keeps its own local
+// state (a footprint readout + a cleanup action is not a setting). Sync
+// keeps account status + pairing.
 //
 // Everything on this tab is device-local and account-independent, so it loads
 // on mount: the folders must be configurable before this machine is paired.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, Save, Trash2 } from 'lucide-react';
+import { Loader2, Trash2 } from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
@@ -19,6 +23,9 @@ import { FolderBrowserModal } from '../FolderBrowserModal';
 import { FolderCard } from '../stacking/FolderCard';
 import { formatBytes } from '../transfers/presentation';
 import { useNotifications } from '../../contexts/NotificationContext';
+import { SettingsSection } from './SettingsSection';
+import { SettingNumber } from './SettingNumber';
+import { intCodec, type Codec } from '../../settings/codecs';
 import type {
   TransferCleanup,
   TransferPaths,
@@ -49,23 +56,42 @@ function bytesToMbInput(raw: string): string {
   return String(Number((bytes / BYTES_PER_MB).toFixed(3)));
 }
 
+/**
+ * A `Codec<number>` over decimal MB/s — the field's own draft/default text is
+ * in MB/s, but the wire value (both the generic KV default and what a custom
+ * `read`/`write` override exchanges) is BYTES/s. `parse`/`format` work in
+ * MB/s throughout; the `read`/`write` overrides below do the bytes↔MB
+ * conversion, so the codec never sees a raw bytes string except through the
+ * `defaults.kv` fallback — which is exact only because the default is `0`
+ * (unlimited) either way. Empty/`0` = unlimited, matching the pre-redesign
+ * field's semantics exactly.
+ */
+const uploadMbCodec: Codec<number> = {
+  parse(raw) {
+    const trimmed = raw.trim();
+    if (trimmed === '') return 0;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || n < 0) {
+      return new Error('Enter a number in MB/s, or leave the field empty for unlimited.');
+    }
+    if (n > 0 && n < MIN_LIMIT_MB) {
+      return new Error(`Minimum limit is ${MIN_LIMIT_MB} MB/s. Use 0 (or leave empty) for unlimited.`);
+    }
+    if (!Number.isSafeInteger(Math.round(n * BYTES_PER_MB))) {
+      return new Error('That limit is too large — enter a realistic MB/s value.');
+    }
+    return n;
+  },
+  format(value) {
+    return value === 0 ? '' : String(value);
+  },
+};
+
 // Simultaneous incoming transfers (W2 T2.7). `sync.max_concurrent_receives` is
 // stored as a plain integer string; the server accepts 1..=8 and the receiver's
-// getter clamps into the same window. Mirror both here so a bad value never
-// round-trips and the field never shows a cap the receiver isn't using.
+// getter clamps into the same window.
 const MIN_RECEIVES = 1;
 const MAX_RECEIVES = 8;
-const DEFAULT_RECEIVES = '2';
-
-/** Stored value → the integer text shown in the field, clamped the same way the
- *  receiver clamps it (`SettingsManager::get_sync_max_concurrent_receives`), so
- *  a hand-edited or migrated row displays the cap actually in force. Anything
- *  unparseable falls back to the default. */
-function receivesToInput(raw: string): string {
-  const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n)) return DEFAULT_RECEIVES;
-  return String(Math.min(MAX_RECEIVES, Math.max(MIN_RECEIVES, n)));
-}
 
 export default function TransfersSection() {
   const { notify } = useNotifications();
@@ -90,22 +116,6 @@ export default function TransfersSection() {
   // Leftovers (§6.5): what the folders a move left behind still hold.
   const [cleaningLeftovers, setCleaningLeftovers] = useState(false);
   const [leftoverError, setLeftoverError] = useState<string | null>(null);
-
-  // Upload speed limit (W1) — text-backed, not number-backed, so the field can
-  // legitimately be empty (= unlimited). `savedUploadMb` is the last persisted
-  // value and drives the Save button's dirty state.
-  const [uploadMb, setUploadMb] = useState('');
-  const [savedUploadMb, setSavedUploadMb] = useState('');
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [savingUpload, setSavingUpload] = useState(false);
-
-  // Simultaneous incoming transfers (W2 T2.7) — same text-backed shape as the
-  // upload limit: `savedReceives` is the last persisted value and drives the
-  // Save button's dirty state.
-  const [receives, setReceives] = useState(DEFAULT_RECEIVES);
-  const [savedReceives, setSavedReceives] = useState(DEFAULT_RECEIVES);
-  const [receivesError, setReceivesError] = useState<string | null>(null);
-  const [savingReceives, setSavingReceives] = useState(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -140,32 +150,6 @@ export default function TransfersSection() {
   useEffect(() => {
     refreshPaths();
     refreshStorage();
-    (async () => {
-      try {
-        const [uploadVal, receivesVal] = await Promise.all([
-          // Settings cross the boundary as STRINGS; "0" is the unlimited sentinel.
-          api.invoke<string>('get_setting', {
-            key: 'sync.max_upload_bytes_per_sec',
-            defaultValue: '0',
-          }),
-          // No dedicated getter command — the cap is read through generic
-          // `get_setting`, same default ("2") the backend applies.
-          api.invoke<string>('get_setting', {
-            key: 'sync.max_concurrent_receives',
-            defaultValue: DEFAULT_RECEIVES,
-          }),
-        ]);
-        if (!mounted.current) return;
-        const mb = bytesToMbInput(uploadVal ?? '0');
-        setUploadMb(mb);
-        setSavedUploadMb(mb);
-        const lanes = receivesToInput(receivesVal ?? DEFAULT_RECEIVES);
-        setReceives(lanes);
-        setSavedReceives(lanes);
-      } catch (err) {
-        console.error('[transfers] load transfer settings failed:', err);
-      }
-    })();
   }, [refreshPaths, refreshStorage]);
 
   // `undefined` = leave that folder as it is (the current `configured` value is
@@ -301,117 +285,13 @@ export default function TransfersSection() {
     }
   };
 
-  const handleSaveUploadLimit = async () => {
-    const raw = uploadMb.trim();
-    // Empty or 0 → unlimited. Anything else must parse and clear the same floor
-    // the server enforces, checked here so the common case never round-trips.
-    let bytesPerSec = 0;
-    if (raw !== '') {
-      const mbps = Number(raw);
-      if (!Number.isFinite(mbps) || mbps < 0) {
-        setUploadError('Enter a number in MB/s, or leave the field empty for unlimited.');
-        return;
-      }
-      if (mbps > 0 && mbps < MIN_LIMIT_MB) {
-        setUploadError(
-          `Minimum limit is ${MIN_LIMIT_MB} MB/s. Use 0 (or leave empty) for unlimited.`,
-        );
-        return;
-      }
-      bytesPerSec = Math.round(mbps * BYTES_PER_MB);
-      if (!Number.isSafeInteger(bytesPerSec)) {
-        setUploadError('That limit is too large — enter a realistic MB/s value.');
-        return;
-      }
-    }
-    setUploadError(null);
-    setSavingUpload(true);
-    try {
-      await api.invoke('set_sync_upload_limit', { bytesPerSec });
-      // Canonicalise the field to what was actually stored (0 → empty = Unlimited).
-      const shown = bytesToMbInput(String(bytesPerSec));
-      if (mounted.current) {
-        setUploadMb(shown);
-        setSavedUploadMb(shown);
-      }
-      notify({
-        title: 'Upload speed limit saved',
-        detail:
-          bytesPerSec === 0
-            ? 'Sync uploads from this device are unlimited.'
-            : `Sync uploads from this device are capped at ${shown} MB/s.`,
-        kind: 'sync',
-        tone: 'success',
-      });
-    } catch (err) {
-      console.error('[transfers] set upload limit failed:', err);
-      const msg = errMsg(err);
-      if (mounted.current) setUploadError(msg);
-      notify({
-        title: 'Could not save upload speed limit',
-        detail: msg,
-        kind: 'sync',
-        tone: 'warning',
-      });
-    } finally {
-      if (mounted.current) setSavingUpload(false);
-    }
-  };
-
-  const handleSaveConcurrentReceives = async () => {
-    const raw = receives.trim();
-    const n = Number(raw);
-    // Client mirror of the server's 1..=8 guard, so a typo answers inline
-    // instead of round-tripping. Whole numbers only — there is no half a lane.
-    if (raw === '' || !Number.isFinite(n) || !Number.isInteger(n)) {
-      setReceivesError(`Enter a whole number between ${MIN_RECEIVES} and ${MAX_RECEIVES}.`);
-      return;
-    }
-    if (n < MIN_RECEIVES || n > MAX_RECEIVES) {
-      setReceivesError(`Must be between ${MIN_RECEIVES} and ${MAX_RECEIVES}.`);
-      return;
-    }
-    setReceivesError(null);
-    setSavingReceives(true);
-    try {
-      await api.invoke('set_sync_max_concurrent_receives', { maxConcurrentReceives: n });
-      const shown = String(n);
-      if (mounted.current) {
-        setReceives(shown);
-        setSavedReceives(shown);
-      }
-      notify({
-        title: 'Simultaneous incoming transfers saved',
-        detail:
-          n === 1
-            ? 'Incoming transfers download one at a time.'
-            : `Up to ${n} incoming transfers download at once.`,
-        kind: 'sync',
-        tone: 'success',
-      });
-    } catch (err) {
-      console.error('[transfers] set max concurrent receives failed:', err);
-      const msg = errMsg(err);
-      if (mounted.current) setReceivesError(msg);
-      notify({
-        title: 'Could not save simultaneous incoming transfers',
-        detail: msg,
-        kind: 'sync',
-        tone: 'warning',
-      });
-    } finally {
-      if (mounted.current) setSavingReceives(false);
-    }
-  };
-
   // ── render ───────────────────────────────────────────────────────────────────
 
   return (
-    <div className="space-y-6">
+    <>
       {/* Folders (§6.3–6.4): where sends are staged and where downloads are
           verified before they land. */}
-      <div>
-        <h4 className="text-sm font-medium text-content-secondary mb-2">Folders</h4>
+      <SettingsSection id="transfers.folders">
         <div className="space-y-3">
           {paths && (
             <>
@@ -441,109 +321,51 @@ export default function TransfersSection() {
             </p>
           )}
         </div>
-      </div>
+      </SettingsSection>
 
       {/* Upload speed limit (W1): one device-wide cap on sync UPLOAD bandwidth.
           Shown in decimal MB/s, stored as bytes/s; empty or 0 = unlimited. */}
-      <div>
-        <h4 className="text-sm font-medium text-content-secondary mb-2">Upload speed limit</h4>
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <input
-              type="number"
-              inputMode="decimal"
-              value={uploadMb}
-              onChange={(e) => {
-                setUploadMb(e.target.value);
-                setUploadError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleSaveUploadLimit();
-              }}
-              step="0.1"
-              min="0"
-              placeholder="Unlimited"
-              aria-label="Upload speed limit in megabytes per second"
-              className={`w-32 rounded-md border bg-surface-hover px-2.5 py-1.5 text-sm text-content focus:outline-none focus:border-accent transition-colors ${
-                uploadError ? 'border-error' : 'border-border'
-              }`}
-            />
-            <span className="text-sm text-content-muted">MB/s</span>
-          </div>
-          <button
-            type="button"
-            onClick={handleSaveUploadLimit}
-            disabled={savingUpload || uploadMb.trim() === savedUploadMb}
-            className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
-          >
-            {savingUpload ? (
-              <Loader2 size={13} className="animate-spin" />
-            ) : (
-              <Save size={13} />
-            )}
-            Save
-          </button>
-        </div>
-        {uploadError && <p className="mt-1.5 text-xs text-error">{uploadError}</p>}
-        <p className="mt-1.5 text-xs text-content-muted">
-          Caps this device's total sync upload bandwidth. Uploads only — downloads are capped by
-          the sending device's limit. Empty or <span className="text-content-secondary">0</span>{' '}
-          means unlimited.
-        </p>
-      </div>
+      <SettingsSection id="transfers.upload">
+        <SettingNumber
+          section="transfers.upload"
+          field="limit"
+          settingKey="sync.max_upload_bytes_per_sec"
+          codec={uploadMbCodec}
+          unit="MB/s"
+          step={0.1}
+          min={0}
+          placeholder="Unlimited"
+          write={async (mbps) => {
+            const bytesPerSec = mbps <= 0 ? 0 : Math.round(mbps * BYTES_PER_MB);
+            await api.invoke('set_sync_upload_limit', { bytesPerSec });
+          }}
+          read={async () => {
+            const raw = await api.invoke<string>('get_setting', {
+              key: 'sync.max_upload_bytes_per_sec',
+              defaultValue: '0',
+            });
+            return bytesToMbInput(raw ?? '0');
+          }}
+        />
+      </SettingsSection>
 
       {/* Simultaneous incoming transfers (W2 T2.7): how many inbound transfers
           download at once. Integer 1..=8, live-applied by the receive gate. */}
-      <div>
-        <h4 className="text-sm font-medium text-content-secondary mb-2">
-          Simultaneous incoming transfers
-        </h4>
-        <div className="flex items-center gap-3">
-          <input
-            type="number"
-            inputMode="numeric"
-            value={receives}
-            onChange={(e) => {
-              setReceives(e.target.value);
-              setReceivesError(null);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') handleSaveConcurrentReceives();
-            }}
-            step="1"
-            min={MIN_RECEIVES}
-            max={MAX_RECEIVES}
-            aria-label="Number of simultaneous incoming transfers"
-            className={`w-20 rounded-md border bg-surface-hover px-2.5 py-1.5 text-sm text-content focus:outline-none focus:border-accent transition-colors ${
-              receivesError ? 'border-error' : 'border-border'
-            }`}
-          />
-          <button
-            type="button"
-            onClick={handleSaveConcurrentReceives}
-            disabled={savingReceives || receives.trim() === savedReceives}
-            className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
-          >
-            {savingReceives ? (
-              <Loader2 size={13} className="animate-spin" />
-            ) : (
-              <Save size={13} />
-            )}
-            Save
-          </button>
-        </div>
-        {receivesError && <p className="mt-1.5 text-xs text-error">{receivesError}</p>}
-        <p className="mt-1.5 text-xs text-content-muted">
-          How many incoming transfers download at once. Others wait their turn — transfers from the
-          same device always arrive in order. Default{' '}
-          <span className="text-content-secondary">2</span>; raise it only if this machine's disk
-          keeps up.
-        </p>
-      </div>
+      <SettingsSection id="transfers.receiving">
+        <SettingNumber
+          section="transfers.receiving"
+          field="concurrent"
+          settingKey="sync.max_concurrent_receives"
+          codec={intCodec(MIN_RECEIVES, MAX_RECEIVES)}
+          min={MIN_RECEIVES}
+          max={MAX_RECEIVES}
+          step={1}
+          write={(n) => api.invoke('set_sync_max_concurrent_receives', { maxConcurrentReceives: n })}
+        />
+      </SettingsSection>
 
       {/* Transfer storage (B7): footprint + one-click reclaim of finished-transfer temp data. */}
-      <div>
-        <h4 className="text-sm font-medium text-content-secondary mb-2">Transfer storage</h4>
+      <SettingsSection id="transfers.storage">
         <div className="flex items-center justify-between gap-3">
           <p className="text-sm text-content-muted">
             {storage ? (
@@ -600,7 +422,7 @@ export default function TransfersSection() {
           Removes finished transfers' temporary payloads and releases orphaned download data.
           Received files and transfer history are untouched.
         </p>
-      </div>
+      </SettingsSection>
 
       {/* Web mode: the folder browser walks the same allowed roots
           `set_transfer_paths` validates against. */}
@@ -621,6 +443,6 @@ export default function TransfersSection() {
         }}
         onClose={() => setBrowsing(null)}
       />
-    </div>
+    </>
   );
 }

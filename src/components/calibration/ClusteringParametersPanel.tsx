@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { ClusteringConfig, ScoringConfig } from "../../types/calibration-config";
 
 interface ClusteringParametersPanelProps {
@@ -20,6 +21,69 @@ const calibrationTypes = ["flat", "dark", "bias", "darkflat"];
 // Flats cluster by minutes (session-based), others cluster by days
 const usesDaysForTimeCluster = (type: string) => type !== "flat";
 const MINUTES_PER_DAY = 1440;
+
+/**
+ * Settings redesign (spec 2026-09-18 §5): a table-cell number input with the
+ * draft/blur/Enter/Escape discipline — typing edits a local draft only,
+ * blur or Enter commits the parsed value, Escape (and an invalid draft, on
+ * blur) snaps back to the last committed `value`. Re-syncs its draft to an
+ * externally-changed `value` only while unfocused, so a live update (a
+ * reset, another tab writing the same document) never fights an in-progress
+ * edit.
+ */
+function DraftCell({
+  value,
+  onCommit,
+  min,
+  step,
+  parse,
+}: {
+  value: number;
+  onCommit: (n: number) => void;
+  min?: string;
+  step?: string;
+  parse: (raw: string) => number;
+}) {
+  const [draft, setDraft] = useState(() => String(value));
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (document.activeElement !== inputRef.current) {
+      setDraft(String(value));
+    }
+  }, [value]);
+
+  const commit = () => {
+    const n = parse(draft);
+    if (Number.isFinite(n)) {
+      onCommit(n);
+    } else {
+      setDraft(String(value));
+    }
+  };
+
+  return (
+    <input
+      ref={inputRef}
+      type="number"
+      value={draft}
+      min={min}
+      step={step}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          setDraft(String(value));
+        }
+      }}
+      className="w-full px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
+    />
+  );
+}
 
 export default function ClusteringParametersPanel({
   clustering,
@@ -69,58 +133,44 @@ export default function ClusteringParametersPanel({
                       {type === "darkflat" ? "DarkFlat" : type}
                     </td>
                     <td className="p-3 border border-border">
-                      <input
-                        type="number"
+                      <DraftCell
                         value={config.max_age_days}
-                        onChange={(e) =>
-                          onClusteringUpdate(
-                            type,
-                            "max_age_days",
-                            parseInt(e.target.value) || 30
-                          )
-                        }
                         min="1"
-                        className="w-full px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
+                        parse={(raw) => parseInt(raw, 10)}
+                        onCommit={(n) => onClusteringUpdate(type, "max_age_days", n)}
                       />
                     </td>
                     <td className="p-3 border border-border">
                       <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          value={
-                            usesDaysForTimeCluster(type)
-                              ? Math.round(config.time_cluster_minutes / MINUTES_PER_DAY)
-                              : config.time_cluster_minutes
-                          }
-                          onChange={(e) => {
-                            const inputValue = parseInt(e.target.value) || 1;
-                            const minutes = usesDaysForTimeCluster(type)
-                              ? inputValue * MINUTES_PER_DAY
-                              : inputValue;
-                            onClusteringUpdate(type, "time_cluster_minutes", minutes);
-                          }}
-                          min="1"
-                          className="flex-1 px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
-                        />
+                        <div className="flex-1">
+                          <DraftCell
+                            value={
+                              usesDaysForTimeCluster(type)
+                                ? Math.round(config.time_cluster_minutes / MINUTES_PER_DAY)
+                                : config.time_cluster_minutes
+                            }
+                            min="1"
+                            parse={(raw) => parseInt(raw, 10)}
+                            onCommit={(inputValue) => {
+                              const minutes = usesDaysForTimeCluster(type)
+                                ? inputValue * MINUTES_PER_DAY
+                                : inputValue;
+                              onClusteringUpdate(type, "time_cluster_minutes", minutes);
+                            }}
+                          />
+                        </div>
                         <span className="text-xs text-content-muted w-12">
                           {usesDaysForTimeCluster(type) ? "days" : "min"}
                         </span>
                       </div>
                     </td>
                     <td className="p-3 border border-border">
-                      <input
-                        type="number"
+                      <DraftCell
                         value={config.temp_threshold_celsius}
-                        onChange={(e) =>
-                          onClusteringUpdate(
-                            type,
-                            "temp_threshold_celsius",
-                            parseFloat(e.target.value) || 2.0
-                          )
-                        }
                         min="0.1"
                         step="0.1"
-                        className="w-full px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
+                        parse={(raw) => parseFloat(raw)}
+                        onCommit={(n) => onClusteringUpdate(type, "temp_threshold_celsius", n)}
                       />
                     </td>
                   </tr>

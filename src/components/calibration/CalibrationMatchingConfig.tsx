@@ -1,10 +1,15 @@
-import { useState, useEffect } from "react";
+// Settings redesign (spec 2026-09-18 §5, plan Task D3 Step 1): the six
+// collapsible groups stay, but the whole document now saves itself through
+// `useAutosaveDocument` — no Save/Reset Configuration buttons, no success
+// banner. The six groups render inside ONE `SettingsSection
+// id="calibration.matching"`; "Refresh All Calibration Sets" is an action,
+// not a setting, so it stays a button (moved to the section's header
+// actions, always reachable regardless of which group is expanded).
+import { useEffect, useRef, useState } from "react";
 import { api } from '../../api';
 import {
-  Save,
   RefreshCw,
   AlertCircle,
-  CheckCircle,
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
@@ -17,18 +22,102 @@ import type {
 import { MasterPreferenceValues } from "../../types/helpers";
 import type { CameraStats } from "../../types/models";
 import { useNotifications } from "../../contexts/NotificationContext";
+import { useAutosaveDocument } from "../../hooks/useAutosaveDocument";
+import { useSettingsDefaults } from "../../settings/SettingsDefaultsContext";
+import { SettingsSection } from "../settings/SettingsSection";
+import { SavedTick } from "../settings/ResetButton";
 import MatchingMatrixTable from "./MatchingMatrixTable";
 import BehavioralOptionsPanel from "./BehavioralOptionsPanel";
 import ClusteringParametersPanel from "./ClusteringParametersPanel";
 
+/**
+ * A local number field with the draft/blur/Enter/Escape discipline (spec
+ * §5): typing edits a local draft only, blur or Enter commits the parsed
+ * value through `onCommit`, Escape (and an invalid draft, on blur) snaps
+ * back to the last committed `value`. Used for the Date Warning Thresholds
+ * — the clustering table has its own copy in `ClusteringParametersPanel`
+ * (it needs a float variant too).
+ */
+function DraftNumberField({
+  label,
+  help,
+  value,
+  onCommit,
+  min,
+}: {
+  label: string;
+  help?: string;
+  value: number;
+  onCommit: (n: number) => void;
+  min?: number;
+}) {
+  const [draft, setDraft] = useState(() => String(value));
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (document.activeElement !== inputRef.current) {
+      setDraft(String(value));
+    }
+  }, [value]);
+
+  const commit = () => {
+    const n = parseInt(draft, 10);
+    if (Number.isFinite(n) && (min === undefined || n >= min)) {
+      onCommit(n);
+    } else {
+      setDraft(String(value));
+    }
+  };
+
+  return (
+    <div>
+      <label className="block text-sm font-medium text-content-secondary mb-2">
+        {label}
+      </label>
+      <input
+        ref={inputRef}
+        type="number"
+        value={draft}
+        min={min}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            setDraft(String(value));
+          }
+        }}
+        className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
+      />
+      {help && <p className="text-xs text-content-muted mt-2">{help}</p>}
+    </div>
+  );
+}
+
 export default function CalibrationMatchingConfig() {
   const { notify } = useNotifications();
-  const [config, setConfig] = useState<ConfigType | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const { defaults } = useSettingsDefaults();
   const [refreshingAll, setRefreshingAll] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
+
+  const {
+    doc: config,
+    patch,
+    error,
+    saving,
+    savedAt,
+    resetAll,
+  } = useAutosaveDocument<ConfigType>({
+    load: () => api.invoke<ConfigType>("get_calibration_matching_config"),
+    save: (c) => api.invoke("set_calibration_matching_config", { config: c }),
+    resetAll: async () => {
+      await api.invoke("reset_calibration_matching_config");
+    },
+    defaults: defaults?.calibrationMatching ?? null,
+    label: "Calibration matching",
+  });
 
   // Accordion state for source type sections
   const [expandedSections, setExpandedSections] = useState<
@@ -39,47 +128,8 @@ export default function CalibrationMatchingConfig() {
     darks: false,
     clustering: false,
     warnings: false,
-    scoring: false,
     preferences: false,
   });
-
-  useEffect(() => {
-    loadConfig();
-  }, []);
-
-  const loadConfig = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const result = await api.invoke<ConfigType>("get_calibration_matching_config");
-      setConfig(result);
-    } catch (err) {
-      setError(String(err));
-      console.error("Failed to load calibration config:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSave = async () => {
-    if (!config) return;
-
-    try {
-      setSaving(true);
-      setError(null);
-      setSuccess(false);
-
-      await api.invoke("set_calibration_matching_config", { config });
-
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 3000);
-    } catch (err) {
-      setError(String(err));
-      console.error("Failed to save calibration config:", err);
-    } finally {
-      setSaving(false);
-    }
-  };
 
   const handleRefreshAllCameras = async () => {
     try {
@@ -113,20 +163,6 @@ export default function CalibrationMatchingConfig() {
     }
   };
 
-  const handleReset = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const result = await api.invoke<ConfigType>("reset_calibration_matching_config");
-      setConfig(result);
-    } catch (err) {
-      setError(String(err));
-      console.error("Failed to reset calibration config:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const toggleSection = (section: string) => {
     setExpandedSections((prev) => ({
       ...prev,
@@ -142,9 +178,7 @@ export default function CalibrationMatchingConfig() {
   ) => {
     if (!config) return;
 
-    setConfig((prev) => {
-      if (!prev) return prev;
-
+    patch((prev) => {
       const sourceConfig = { ...prev[sourceType] };
       const typeConfig = sourceConfig[calibrationType];
 
@@ -172,9 +206,7 @@ export default function CalibrationMatchingConfig() {
   ) => {
     if (!config) return;
 
-    setConfig((prev) => {
-      if (!prev) return prev;
-
+    patch((prev) => {
       const newBehavioralOptions = { ...prev.behavioral_options };
       if (!newBehavioralOptions[sourceType]) {
         newBehavioralOptions[sourceType] = {
@@ -203,9 +235,7 @@ export default function CalibrationMatchingConfig() {
   ) => {
     if (!config) return;
 
-    setConfig((prev) => {
-      if (!prev) return prev;
-
+    patch((prev) => {
       const newClustering = { ...prev.clustering };
       if (!newClustering[calibrationType]) {
         // Defaults: flat = 30 days max age, 30 min cluster; dark/bias/darkflat = 365 days max age, 30 days cluster
@@ -237,52 +267,53 @@ export default function CalibrationMatchingConfig() {
   ) => {
     if (!config) return;
 
-    setConfig((prev) => {
-      if (!prev) return prev;
-
-      return {
-        ...prev,
-        master_preferences: {
-          ...prev.master_preferences,
-          [calibrationType]: preference,
-        },
-      };
-    });
+    patch((prev) => ({
+      ...prev,
+      master_preferences: {
+        ...prev.master_preferences,
+        [calibrationType]: preference,
+      },
+    }));
   };
 
   const updateScoringConfig = (field: string, value: number) => {
     if (!config) return;
 
-    setConfig((prev) => {
-      if (!prev) return prev;
-
-      return {
-        ...prev,
-        scoring: {
-          ...prev.scoring,
-          [field]: value,
-        },
-      };
-    });
+    patch((prev) => ({
+      ...prev,
+      scoring: {
+        ...prev.scoring,
+        [field]: value,
+      },
+    }));
   };
 
   const updateWarningConfig = (field: string, value: number) => {
     if (!config) return;
 
-    setConfig((prev) => {
-      if (!prev) return prev;
-
-      return {
-        ...prev,
-        warnings: {
-          ...prev.warnings,
-          [field]: value,
-        },
-      };
-    });
+    patch((prev) => ({
+      ...prev,
+      warnings: {
+        ...prev.warnings,
+        [field]: value,
+      },
+    }));
   };
 
-  if (loading) {
+  if (!config) {
+    if (error) {
+      return (
+        <div className="p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
+          <AlertCircle className="text-error flex-shrink-0 mt-0.5" size={20} />
+          <div className="flex-1">
+            <p className="font-medium text-error">
+              Failed to load calibration configuration
+            </p>
+            <p className="text-sm text-error/80">{error}</p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="text-center py-8 text-content-muted">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-accent mx-auto"></div>
@@ -291,330 +322,251 @@ export default function CalibrationMatchingConfig() {
     );
   }
 
-  if (!config) {
-    return (
-      <div className="p-4 bg-error-muted border border-error/50 rounded-lg">
-        <p className="text-error">Failed to load calibration configuration</p>
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-4">
+    <SettingsSection
+      id="calibration.matching"
+      onResetAll={resetAll}
+      actions={
+        <>
+          <SavedTick savedAt={savedAt} />
+          <button
+            onClick={handleRefreshAllCameras}
+            disabled={refreshingAll || saving}
+            title="Re-cluster the existing calibration sets of every camera using the saved clustering settings"
+            className="flex items-center gap-1.5 shrink-0 rounded-md border border-border bg-surface-hover px-2.5 py-1.5 text-xs text-content-secondary hover:bg-surface-hover/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            <RefreshCw size={13} className={refreshingAll ? "animate-spin" : ""} />
+            {refreshingAll ? "Refreshing…" : "Refresh All Calibration Sets"}
+          </button>
+        </>
+      }
+    >
       {error && (
-        <div className="p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
-          <AlertCircle className="text-error flex-shrink-0 mt-0.5" size={20} />
-          <div className="flex-1">
-            <p className="font-medium text-error">Error</p>
-            <p className="text-sm text-error/80">{error}</p>
-          </div>
-        </div>
+        <p className="mb-4 flex items-center gap-2 text-sm text-error">
+          <AlertCircle size={14} className="flex-shrink-0" />
+          {error}
+        </p>
       )}
 
-      {success && (
-        <div className="p-4 bg-success-muted border border-success/50 rounded-lg flex items-start gap-3">
-          <CheckCircle
-            className="text-success flex-shrink-0 mt-0.5"
-            size={20}
-          />
-          <div className="flex-1">
-            <p className="font-medium text-success">
-              Configuration saved successfully
-            </p>
-          </div>
+      <div className="space-y-4">
+        {/* Lights Section */}
+        <div className="bg-surface rounded-lg border border-border">
+          <button
+            onClick={() => toggleSection("lights")}
+            className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
+          >
+            <span className="font-semibold text-lg">For Lights</span>
+            {expandedSections.lights ? (
+              <ChevronDown size={20} />
+            ) : (
+              <ChevronRight size={20} />
+            )}
+          </button>
+          {expandedSections.lights && (
+            <div className="px-4 pt-2 pb-4 space-y-4">
+              <BehavioralOptionsPanel
+                sourceType="lights"
+                options={config.behavioral_options.lights}
+                onUpdate={updateBehavioralOptions}
+              />
+              <MatchingMatrixTable
+                sourceType="lights"
+                sourceConfig={config.lights}
+                onParameterUpdate={updateParameterConfig}
+              />
+            </div>
+          )}
         </div>
-      )}
 
-      {/* Lights Section */}
-      <div className="bg-surface rounded-lg border border-border">
-        <button
-          onClick={() => toggleSection("lights")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
-        >
-          <span className="font-semibold text-lg">For Lights</span>
-          {expandedSections.lights ? (
-            <ChevronDown size={20} />
-          ) : (
-            <ChevronRight size={20} />
+        {/* Flats Section */}
+        <div className="bg-surface rounded-lg border border-border">
+          <button
+            onClick={() => toggleSection("flats")}
+            className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
+          >
+            <span className="font-semibold text-lg">For Flats</span>
+            {expandedSections.flats ? (
+              <ChevronDown size={20} />
+            ) : (
+              <ChevronRight size={20} />
+            )}
+          </button>
+          {expandedSections.flats && (
+            <div className="px-4 pt-2 pb-4 space-y-4">
+              <BehavioralOptionsPanel
+                sourceType="flats"
+                options={config.behavioral_options.flats}
+                onUpdate={updateBehavioralOptions}
+                showFallbackInfo
+              />
+              <MatchingMatrixTable
+                sourceType="flats"
+                sourceConfig={config.flats}
+                onParameterUpdate={updateParameterConfig}
+              />
+            </div>
           )}
-        </button>
-        {expandedSections.lights && (
-          <div className="px-4 pt-2 pb-4 space-y-4">
-            <BehavioralOptionsPanel
-              sourceType="lights"
-              options={config.behavioral_options.lights}
-              onUpdate={updateBehavioralOptions}
-            />
-            <MatchingMatrixTable
-              sourceType="lights"
-              sourceConfig={config.lights}
-              onParameterUpdate={updateParameterConfig}
-            />
-          </div>
-        )}
-      </div>
+        </div>
 
-      {/* Flats Section */}
-      <div className="bg-surface rounded-lg border border-border">
-        <button
-          onClick={() => toggleSection("flats")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
-        >
-          <span className="font-semibold text-lg">For Flats</span>
-          {expandedSections.flats ? (
-            <ChevronDown size={20} />
-          ) : (
-            <ChevronRight size={20} />
+        {/* Darks Section */}
+        <div className="bg-surface rounded-lg border border-border">
+          <button
+            onClick={() => toggleSection("darks")}
+            className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
+          >
+            <span className="font-semibold text-lg">For Darks</span>
+            {expandedSections.darks ? (
+              <ChevronDown size={20} />
+            ) : (
+              <ChevronRight size={20} />
+            )}
+          </button>
+          {expandedSections.darks && (
+            <div className="px-4 pt-2 pb-4 space-y-4">
+              <BehavioralOptionsPanel
+                sourceType="darks"
+                options={config.behavioral_options.darks}
+                onUpdate={updateBehavioralOptions}
+              />
+              <MatchingMatrixTable
+                sourceType="darks"
+                sourceConfig={config.darks}
+                onParameterUpdate={updateParameterConfig}
+              />
+            </div>
           )}
-        </button>
-        {expandedSections.flats && (
-          <div className="px-4 pt-2 pb-4 space-y-4">
-            <BehavioralOptionsPanel
-              sourceType="flats"
-              options={config.behavioral_options.flats}
-              onUpdate={updateBehavioralOptions}
-              showFallbackInfo
-            />
-            <MatchingMatrixTable
-              sourceType="flats"
-              sourceConfig={config.flats}
-              onParameterUpdate={updateParameterConfig}
-            />
-          </div>
-        )}
-      </div>
+        </div>
 
-      {/* Darks Section */}
-      <div className="bg-surface rounded-lg border border-border">
-        <button
-          onClick={() => toggleSection("darks")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
-        >
-          <span className="font-semibold text-lg">For Darks</span>
-          {expandedSections.darks ? (
-            <ChevronDown size={20} />
-          ) : (
-            <ChevronRight size={20} />
-          )}
-        </button>
-        {expandedSections.darks && (
-          <div className="px-4 pt-2 pb-4 space-y-4">
-            <BehavioralOptionsPanel
-              sourceType="darks"
-              options={config.behavioral_options.darks}
-              onUpdate={updateBehavioralOptions}
-            />
-            <MatchingMatrixTable
-              sourceType="darks"
-              sourceConfig={config.darks}
-              onParameterUpdate={updateParameterConfig}
-            />
-          </div>
-        )}
-      </div>
-
-      {/* Clustering Parameters */}
-      <div className="bg-surface rounded-lg border border-border">
-        <button
-          onClick={() => toggleSection("clustering")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
-        >
-          <span className="font-semibold text-lg">
-            Clustering Parameters & Thresholds
-          </span>
-          {expandedSections.clustering ? (
-            <ChevronDown size={20} />
-          ) : (
-            <ChevronRight size={20} />
-          )}
-        </button>
-        {expandedSections.clustering && (
-          <div className="px-4 pt-2 pb-4">
-            <ClusteringParametersPanel
-              clustering={config.clustering}
-              scoring={config.scoring}
-              onClusteringUpdate={updateClusteringConfig}
-              onScoringUpdate={updateScoringConfig}
-            />
-            <div className="mt-4 pt-4 border-t border-border flex items-center justify-between gap-4">
-              <p className="text-xs text-content-muted">
-                Clustering changes apply to newly scanned frames. To regroup the
-                already-cataloged calibration frames with these settings, save
-                first, then refresh all cameras. Masters and superseded sets are
-                left untouched.
+        {/* Clustering Parameters */}
+        <div className="bg-surface rounded-lg border border-border">
+          <button
+            onClick={() => toggleSection("clustering")}
+            className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
+          >
+            <span className="font-semibold text-lg">
+              Clustering Parameters & Thresholds
+            </span>
+            {expandedSections.clustering ? (
+              <ChevronDown size={20} />
+            ) : (
+              <ChevronRight size={20} />
+            )}
+          </button>
+          {expandedSections.clustering && (
+            <div className="px-4 pt-2 pb-4">
+              <ClusteringParametersPanel
+                clustering={config.clustering}
+                scoring={config.scoring}
+                onClusteringUpdate={updateClusteringConfig}
+                onScoringUpdate={updateScoringConfig}
+              />
+              <p className="mt-4 pt-4 border-t border-border text-xs text-content-muted">
+                Clustering changes apply to newly scanned frames. To regroup
+                the already-cataloged calibration frames with these
+                settings, use "Refresh All Calibration Sets" above. Masters
+                and superseded sets are left untouched.
               </p>
-              <button
-                onClick={handleRefreshAllCameras}
-                disabled={refreshingAll || saving}
-                title="Re-cluster the existing calibration sets of every camera using the saved clustering settings"
-                className="flex items-center gap-2 shrink-0 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <RefreshCw size={14} className={refreshingAll ? "animate-spin" : ""} />
-                {refreshingAll ? "Refreshing…" : "Refresh All Calibration Sets"}
-              </button>
             </div>
-          </div>
-        )}
-      </div>
-
-      {/* Date Warning Thresholds */}
-      <div className="bg-surface rounded-lg border border-border">
-        <button
-          onClick={() => toggleSection("warnings")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
-        >
-          <span className="font-semibold text-lg">Date Warning Thresholds</span>
-          {expandedSections.warnings ? (
-            <ChevronDown size={20} />
-          ) : (
-            <ChevronRight size={20} />
           )}
-        </button>
-        {expandedSections.warnings && (
-          <div className="px-4 pt-2 pb-4">
-            <p className="text-sm text-content-muted mb-4">
-              Warn when calibration frames are older than these thresholds.
-            </p>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-content-secondary mb-2">
-                  Flat Date Warning (days)
-                </label>
-                <input
-                  type="number"
+        </div>
+
+        {/* Date Warning Thresholds */}
+        <div className="bg-surface rounded-lg border border-border">
+          <button
+            onClick={() => toggleSection("warnings")}
+            className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
+          >
+            <span className="font-semibold text-lg">Date Warning Thresholds</span>
+            {expandedSections.warnings ? (
+              <ChevronDown size={20} />
+            ) : (
+              <ChevronRight size={20} />
+            )}
+          </button>
+          {expandedSections.warnings && (
+            <div className="px-4 pt-2 pb-4">
+              <p className="text-sm text-content-muted mb-4">
+                Warn when calibration frames are older than these thresholds.
+              </p>
+              <div className="space-y-4">
+                <DraftNumberField
+                  label="Flat Date Warning (days)"
+                  help="Warn if flat frames are older than this many days"
                   value={config.warnings.flat_date_warning_days}
-                  onChange={(e) =>
-                    updateWarningConfig(
-                      "flat_date_warning_days",
-                      parseInt(e.target.value) || 30
-                    )
-                  }
-                  min="1"
-                  className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
+                  min={1}
+                  onCommit={(n) => updateWarningConfig("flat_date_warning_days", n)}
                 />
-                <p className="text-xs text-content-muted mt-2">
-                  Warn if flat frames are older than this many days
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-content-secondary mb-2">
-                  Dark Date Warning (days)
-                </label>
-                <input
-                  type="number"
+                <DraftNumberField
+                  label="Dark Date Warning (days)"
+                  help="Warn if dark frames are older than this many days"
                   value={config.warnings.dark_date_warning_days}
-                  onChange={(e) =>
-                    updateWarningConfig(
-                      "dark_date_warning_days",
-                      parseInt(e.target.value) || 365
-                    )
-                  }
-                  min="1"
-                  className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
+                  min={1}
+                  onCommit={(n) => updateWarningConfig("dark_date_warning_days", n)}
                 />
-                <p className="text-xs text-content-muted mt-2">
-                  Warn if dark frames are older than this many days
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-content-secondary mb-2">
-                  DarkFlat Date Warning (days)
-                </label>
-                <input
-                  type="number"
+                <DraftNumberField
+                  label="DarkFlat Date Warning (days)"
+                  help="Warn if darkflat frames are older than this many days"
                   value={config.warnings.darkflat_date_warning_days}
-                  onChange={(e) =>
-                    updateWarningConfig(
-                      "darkflat_date_warning_days",
-                      parseInt(e.target.value) || 365
-                    )
-                  }
-                  min="1"
-                  className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
+                  min={1}
+                  onCommit={(n) => updateWarningConfig("darkflat_date_warning_days", n)}
                 />
-                <p className="text-xs text-content-muted mt-2">
-                  Warn if darkflat frames are older than this many days
-                </p>
               </div>
             </div>
-          </div>
-        )}
-      </div>
-
-      {/* Master Preferences */}
-      <div className="bg-surface rounded-lg border border-border">
-        <button
-          onClick={() => toggleSection("preferences")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
-        >
-          <span className="font-semibold text-lg">Master Preferences</span>
-          {expandedSections.preferences ? (
-            <ChevronDown size={20} />
-          ) : (
-            <ChevronRight size={20} />
           )}
-        </button>
-        {expandedSections.preferences && (
-          <div className="px-4 pt-2 pb-4">
-            <p className="text-sm text-content-muted mb-4">
-              Choose whether to prefer Master calibration frames or frame sets
-              when both are available.
-            </p>
-            <div className="grid grid-cols-2 gap-4">
-              {["flat", "dark", "bias", "darkflat"].map((type) => (
-                <div key={type}>
-                  <label className="block text-sm font-medium text-content-secondary mb-2 capitalize">
-                    {type}
-                  </label>
-                  <select
-                    value={
-                      config.master_preferences[type] ||
-                      MasterPreferenceValues.NoPreference
-                    }
-                    onChange={(e) =>
-                      updateMasterPreference(type, e.target.value as MasterPreference)
-                    }
-                    className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content text-sm"
-                  >
-                    <option value={MasterPreferenceValues.NoPreference}>
-                      No Preference
-                    </option>
-                    <option value={MasterPreferenceValues.PreferMaster}>
-                      Prefer Master
-                    </option>
-                    <option value={MasterPreferenceValues.PreferFrameset}>
-                      Prefer Frameset
-                    </option>
-                  </select>
-                </div>
-              ))}
+        </div>
+
+        {/* Master Preferences */}
+        <div className="bg-surface rounded-lg border border-border">
+          <button
+            onClick={() => toggleSection("preferences")}
+            className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
+          >
+            <span className="font-semibold text-lg">Master Preferences</span>
+            {expandedSections.preferences ? (
+              <ChevronDown size={20} />
+            ) : (
+              <ChevronRight size={20} />
+            )}
+          </button>
+          {expandedSections.preferences && (
+            <div className="px-4 pt-2 pb-4">
+              <p className="text-sm text-content-muted mb-4">
+                Choose whether to prefer Master calibration frames or frame sets
+                when both are available.
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                {["flat", "dark", "bias", "darkflat"].map((type) => (
+                  <div key={type}>
+                    <label className="block text-sm font-medium text-content-secondary mb-2 capitalize">
+                      {type}
+                    </label>
+                    <select
+                      value={
+                        config.master_preferences[type] ||
+                        MasterPreferenceValues.NoPreference
+                      }
+                      onChange={(e) =>
+                        updateMasterPreference(type, e.target.value as MasterPreference)
+                      }
+                      className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content text-sm"
+                    >
+                      <option value={MasterPreferenceValues.NoPreference}>
+                        No Preference
+                      </option>
+                      <option value={MasterPreferenceValues.PreferMaster}>
+                        Prefer Master
+                      </option>
+                      <option value={MasterPreferenceValues.PreferFrameset}>
+                        Prefer Frameset
+                      </option>
+                    </select>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
-
-      {/* Action Buttons */}
-      <div className="flex items-center gap-4 pt-4">
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="flex items-center gap-2 px-6 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-        >
-          <Save size={18} />
-          {saving ? "Saving..." : "Save Configuration"}
-        </button>
-
-        <button
-          onClick={handleReset}
-          disabled={loading}
-          className="flex items-center gap-2 px-6 py-2 bg-surface-hover hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-        >
-          <RefreshCw size={18} />
-          Reset to Defaults
-        </button>
-      </div>
-    </div>
+    </SettingsSection>
   );
 }

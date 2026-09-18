@@ -1,6 +1,5 @@
-// Settings → Sync (task M2b). Renders inner content only — the host card/heading
-// are supplied by `Settings.tsx`, matching the `AccountSection` / `LoggingSettings`
-// pattern and placed right after Account.
+// Settings → Sync (task M2b; wrapped in its own `SettingsSection
+// id="transfers.sync"` since the settings redesign, Task D3).
 //
 // A2 NOTE — like `useSyncSend`, this reads the offline-resolvable `account_status`
 // command directly (for signed-in) and does NOT import `useAccount` /
@@ -12,7 +11,7 @@
 // cards live in Settings → Transfers (`TransfersSection`); this section is
 // account status + pairing.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Loader2,
   Inbox,
@@ -24,6 +23,7 @@ import {
 } from 'lucide-react';
 import { api } from '../../api';
 import type { AccountStatus, SyncStatus } from '../../types/models';
+import { SettingsSection } from './SettingsSection';
 
 /** Tauri and Axum both reject with a plain string, not an `Error`. */
 function errMsg(err: unknown): string {
@@ -154,26 +154,25 @@ export default function SyncSection() {
 
   // ── render ───────────────────────────────────────────────────────────────────
 
+  let content: ReactNode;
+
   if (loadingStatus) {
-    return (
+    content = (
       <div className="flex items-center gap-2 text-sm text-content-muted">
         <Loader2 size={16} className="animate-spin" />
         Loading sync…
       </div>
     );
-  }
-
-  // SIGNED OUT — quiet empty state (A2 additive rule: the app works signed-out).
-  if (!signedIn) {
-    return (
+  } else if (!signedIn) {
+    // SIGNED OUT — quiet empty state (A2 additive rule: the app works signed-out).
+    content = (
       <p className="text-sm text-content-muted">
         Sign in to configure sync. Use the <span className="text-content-secondary">Account</span>{' '}
         section above to link this machine to your account.
       </p>
     );
-  }
-
-  return (
+  } else {
+    content = (
     <div className="space-y-6">
       {/* Receiver status */}
       <div>
@@ -257,5 +256,8 @@ export default function SyncSection() {
         </div>
       )}
     </div>
-  );
+    );
+  }
+
+  return <SettingsSection id="transfers.sync">{content}</SettingsSection>;
 }

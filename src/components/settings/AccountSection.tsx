@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Mail,
   KeyRound,
@@ -20,6 +20,7 @@ import { formatTimestamp } from '../../utils/dateFormatting';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useAccount, accountErrMsg, SIGNED_OUT_HEALED } from '../../hooks/useAccount';
 import type { AccountDevice, DeviceCapability } from '../../types/models';
+import { SettingsSection } from './SettingsSection';
 
 /** The two first-class hub registries surfaced by the selector. */
 const PROD_HUB_URL = 'https://projects.artfrom.space';
@@ -57,12 +58,13 @@ function CapabilityPill({ capability }: { capability: DeviceCapability }) {
 }
 
 /**
- * Inline editor for this device's display name → `rename_device`. Mirrors
- * `HubUrlDevEditor`'s load/edit/save shape: local `value`/`saving`/`error`
- * state, an explicit Save button (never per-keystroke), a duplicate-name error
- * surfaced inline (the hub maps a clash to `name already in use`). Re-seeds from
- * `initialName` when the resolved device name changes (e.g. after a rename
- * refresh) but never clobbers text the user has started editing.
+ * Inline editor for this device's display name → `rename_device`. Settings
+ * redesign (spec 2026-09-18 §5): the text-field discipline — commit on blur
+ * or Enter, no Save button; Escape restores the last-known name and clears
+ * the error. A duplicate-name error surfaces inline (the hub maps a clash to
+ * `name already in use`). Re-seeds from `initialName` when the resolved
+ * device name changes (e.g. after a rename refresh) but never clobbers text
+ * the user has started editing.
  */
 function DeviceNameEditor({
   deviceId,
@@ -124,6 +126,11 @@ function DeviceNameEditor({
     }
   };
 
+  const handleEscape = () => {
+    setValue(initialName);
+    setError(null);
+  };
+
   return (
     <div className="space-y-1.5">
       <label className="flex items-center gap-1.5 text-sm font-medium text-content-secondary">
@@ -138,10 +145,14 @@ function DeviceNameEditor({
             setValue(e.target.value);
             setError(null);
           }}
+          onBlur={() => void handleSave()}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
               e.preventDefault();
               void handleSave();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              handleEscape();
             }
           }}
           placeholder="This machine's name"
@@ -149,20 +160,12 @@ function DeviceNameEditor({
           autoComplete="off"
           className="flex-1 min-w-0 bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-sm text-content focus:outline-none focus:border-accent"
         />
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={saving || !dirty || trimmed === ''}
-          className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
-        >
-          {saving ? <Loader2 size={13} className="animate-spin" /> : null}
-          Save
-        </button>
+        {saving && <Loader2 size={13} className="animate-spin text-content-muted flex-shrink-0" />}
       </div>
       {error && <p className="text-xs text-error">{error}</p>}
       <p className="text-xs text-content-muted">
-        Shown to your other devices in sync history and transfers. Must be unique across your
-        account.
+        Shown to your other devices in sync history and transfers — a rename is visible to them
+        immediately. Must be unique across your account.
       </p>
     </div>
   );
@@ -255,15 +258,19 @@ function HubSelector({ onSaved }: { onSaved: () => Promise<unknown> }) {
  * Dev-only editor for `account.hub_url` — lets a developer point sign-in at a
  * different hub before signing in. Gated on `import.meta.env.DEV` by the caller,
  * so it is statically tree-shaken out of production builds. Reads the current
- * value on mount; saves on an explicit button (never per-keystroke). Empty input
- * + Save resets to the default hub. After a save it re-polls status via
- * `onSaved` so the signed-in card's read-only hub URL reflects the change.
+ * value on mount; commits on blur or Enter (spec 2026-09-18 §5's text rule,
+ * no Save button). Empty + commit resets to the default hub. Escape restores
+ * the last-loaded value. After a commit it re-polls status via `onSaved` so
+ * the signed-in card's read-only hub URL reflects the change.
  */
 function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
   const [value, setValue] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
+  // Escape restores this — the last value either loaded from disk or
+  // successfully committed, never the mid-edit draft.
+  const lastKnownRef = useRef('');
 
   useEffect(() => {
     mounted.current = true;
@@ -271,7 +278,10 @@ function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
       try {
         const raw = await api.invoke<string | null>('get_setting', { key: 'account.hub_url' });
         // null/empty → leave the field blank so the placeholder shows the default.
-        if (mounted.current && raw != null && raw !== '') setValue(raw);
+        if (mounted.current && raw != null && raw !== '') {
+          setValue(raw);
+          lastKnownRef.current = raw;
+        }
       } catch (err) {
         console.error('[account] load hub url failed:', err);
       }
@@ -281,10 +291,10 @@ function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
     };
   }, []);
 
-  const handleSave = async () => {
+  const handleCommit = async () => {
     if (saving) return;
     const trimmed = value.trim();
-    // Empty + Save resets to the default hub URL.
+    // Empty + commit resets to the default hub URL.
     const next = trimmed === '' ? DEFAULT_HUB_URL : trimmed;
     if (!next.startsWith('http://') && !next.startsWith('https://')) {
       setError('Hub URL must start with http:// or https://');
@@ -294,7 +304,10 @@ function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
     setError(null);
     try {
       await api.invoke('set_setting', { key: 'account.hub_url', value: next });
-      if (mounted.current) setValue(next);
+      if (mounted.current) {
+        setValue(next);
+        lastKnownRef.current = next;
+      }
       await onSaved(); // re-poll account_status so the displayed hubUrl refreshes
     } catch (err) {
       console.error('[account] save hub url failed:', err);
@@ -302,6 +315,11 @@ function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
     } finally {
       if (mounted.current) setSaving(false);
     }
+  };
+
+  const handleEscape = () => {
+    setValue(lastKnownRef.current);
+    setError(null);
   };
 
   return (
@@ -315,32 +333,35 @@ function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
             setValue(e.target.value);
             setError(null);
           }}
+          onBlur={() => void handleCommit()}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              void handleCommit();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              handleEscape();
+            }
+          }}
           placeholder={DEFAULT_HUB_URL}
           spellCheck={false}
           autoComplete="off"
           className="flex-1 min-w-0 bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-xs font-mono text-content focus:outline-none focus:border-accent"
         />
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={saving}
-          className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
-        >
-          {saving ? <Loader2 size={13} className="animate-spin" /> : null}
-          Save
-        </button>
+        {saving && <Loader2 size={13} className="animate-spin text-content-muted flex-shrink-0" />}
       </div>
       {error && <p className="text-xs text-error">{error}</p>}
       <p className="text-xs text-content-muted">
-        Dev only. Points sign-in at a different hub. Empty + Save resets to the default.
+        Dev only. Points sign-in at a different hub. Empty + commit resets to the default.
       </p>
     </div>
   );
 }
 
 /**
- * Settings → Account. Renders inner content only (the card/heading are supplied
- * by the host in `Settings.tsx`, matching the `LoggingSettings` pattern).
+ * Settings → Account. Wrapped in its own `SettingsSection
+ * id="transfers.account"` (settings redesign, Task D3) — the registry
+ * supplies the card's title/description.
  *
  * Three states: loading, signed-out (email → code sign-in), signed-in (account
  * card + device-name editor + device list). All account state is owned by
@@ -540,20 +561,21 @@ export default function AccountSection() {
 
   // ── render ───────────────────────────────────────────────────────────────────
 
+  let content: ReactNode;
+
   if (loading) {
-    return (
+    content = (
       <div className="flex items-center gap-2 text-sm text-content-muted">
         <Loader2 size={16} className="animate-spin" />
         Loading account…
       </div>
     );
-  }
-
-  // The first status poll resolved but returned nothing — the hub is
-  // unreachable (or the command failed). Never leave a dead "Loading…" spinner:
-  // surface the error and a Retry, mirroring the devices-list error treatment.
-  if (!status) {
-    return (
+  } else if (!status) {
+    // The first status poll resolved but returned nothing — the hub is
+    // unreachable (or the command failed). Never leave a dead "Loading…"
+    // spinner: surface the error and a Retry, mirroring the devices-list
+    // error treatment.
+    content = (
       <div className="max-w-md space-y-3">
         <div className="flex items-start gap-2 rounded-lg border border-error/50 bg-error-muted p-3">
           <AlertTriangle size={16} className="text-error flex-shrink-0 mt-0.5" />
@@ -575,11 +597,9 @@ export default function AccountSection() {
         </button>
       </div>
     );
-  }
-
-  // SIGNED OUT — sign-in flow.
-  if (!status.signedIn) {
-    return (
+  } else if (!status.signedIn) {
+    // SIGNED OUT — sign-in flow.
+    content = (
       <div className="space-y-4 max-w-md">
         <p className="text-sm text-content-muted">
           Sign in to link this device to your account for syncing between machines. The app is
@@ -683,10 +703,9 @@ export default function AccountSection() {
         {import.meta.env.DEV && <HubUrlDevEditor onSaved={refreshStatus} />}
       </div>
     );
-  }
-
-  // SIGNED IN — account card, device-name editor, device list.
-  return (
+  } else {
+    // SIGNED IN — account card, device-name editor, device list.
+    content = (
     <div className="space-y-6">
       {/* Account card */}
       <div className="rounded-lg border border-border bg-surface p-4">
@@ -811,5 +830,8 @@ export default function AccountSection() {
         )}
       </div>
     </div>
-  );
+    );
+  }
+
+  return <SettingsSection id="transfers.account">{content}</SettingsSection>;
 }

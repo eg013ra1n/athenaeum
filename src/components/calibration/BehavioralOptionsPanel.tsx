@@ -1,4 +1,5 @@
 import { BehavioralOptions } from "../../types/calibration-config";
+import { Checkbox } from "../settings/Checkbox";
 
 interface BehavioralOptionsPanelProps {
   sourceType: string;
@@ -29,49 +30,23 @@ export default function BehavioralOptionsPanel({
       <h4 className="text-sm font-medium text-content-secondary mb-3">Options</h4>
       <div className="space-y-3">
         {sourceType === "darks" && (
-          <label className="flex items-center gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={safeOptions.use_bias_for_dark_optimization}
-              onChange={(e) =>
-                onUpdate(
-                  sourceType,
-                  "use_bias_for_dark_optimization",
-                  e.target.checked
-                )
-              }
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent"
-            />
-            <div>
-              <span className="text-sm text-content">
-                Use BIAS for Dark Optimization
-              </span>
-              <p className="text-xs text-content-muted">
-                Link Bias sets as sub-calibration to Dark sets
-              </p>
-            </div>
-          </label>
+          <Checkbox
+            checked={safeOptions.use_bias_for_dark_optimization}
+            onChange={(checked) =>
+              onUpdate(sourceType, "use_bias_for_dark_optimization", checked)
+            }
+            label="Use BIAS for Dark Optimization"
+            description="Link Bias sets as sub-calibration to Dark sets"
+          />
         )}
 
         {sourceType === "flats" && (
-          <label className="flex items-center gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={safeOptions.use_bias_if_no_darks}
-              onChange={(e) =>
-                onUpdate(sourceType, "use_bias_if_no_darks", e.target.checked)
-              }
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent"
-            />
-            <div>
-              <span className="text-sm text-content">
-                Use BIAS if no Darks Found
-              </span>
-              <p className="text-xs text-content-muted">
-                Fallback to Bias if Dark calibration is not available
-              </p>
-            </div>
-          </label>
+          <Checkbox
+            checked={safeOptions.use_bias_if_no_darks}
+            onChange={(checked) => onUpdate(sourceType, "use_bias_if_no_darks", checked)}
+            label="Use BIAS if no Darks Found"
+            description="Fallback to Bias if Dark calibration is not available"
+          />
         )}
 
         {showFallbackInfo && safeOptions.fallback_chain.length > 0 && (
