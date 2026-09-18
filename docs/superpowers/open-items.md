@@ -193,6 +193,34 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### v0.6.5 backlog quick wins + nights reconcile (2026-09-18)
+
+Six commits on `main` (`8726f045` … `938c9f58`, not pushed), from
+`docs/backlog-v0.6.5.md`. Owner smokes owed, desktop build:
+
+- **Blink keys**: open Blink from the dual-pane browser with Space, press
+  Space again — it should play/pause, not mark the frame; `S` marks it;
+  the `?` overlay lists the new keys.
+- **Shoot Calendar**: switch to Year, pick a year, leave to another page and
+  come back — the same year view is still there (session only; a restart
+  starts on today's month).
+- **Catalog download**: with no tiers installed, trigger a plate solve so the
+  "Star catalog not downloaded" dialog appears — its copy names the tier it
+  will fetch, and one click fetches that tier and nothing above it; the
+  Settings → Plate Solving table lists only the manifest's tiers and the
+  banner disappears once the recommended tier is installed.
+- **Drizzle default**: Settings → Stacking → Drizzle has "Enable drizzle by
+  default"; ticking it flips the stage list's sub-line from "Off" to "2× …"
+  and a NEW frame set's Stacking tab starts with drizzle on.
+- **Nights reconcile**: open a frame set — the log shows `nights unchanged`
+  at debug (or `nights reconciled` at info once, for a set stored before the
+  2026-09-05 fix), the History tab does not gain entries on repeated opens,
+  and `sessions.uuid` values are stable across two opens of the same set
+  (`SELECT uuid FROM sessions WHERE imaging_night_id IN (…)`). Measure the
+  open time of the largest set (LDN 1272, 368 frames) before/after.
+- **About**: the iroh acknowledgement and the three new dependency rows
+  render with working links.
+
 ### In-app updates — first real update lands on the NEXT tag (2026-09-16/17)
 
 Spec `docs/superpowers/specs/2026-09-16-in-app-updates-design.md` §7.3 has
