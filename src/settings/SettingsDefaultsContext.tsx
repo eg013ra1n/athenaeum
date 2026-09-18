@@ -10,28 +10,10 @@
 
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import { api } from '../api';
-import type { AnalysisConfig } from '../types/analysis-config';
-import type { PlateSolveConfig } from '../types/plate-solve';
-import type { CalibrationMatchingConfig } from '../types/calibration-config';
-import type { LoggingConfig } from '../types/models';
-import type { StackingConfig } from '../types/stacking';
+import type { SettingsDefaults } from '../types/models';
 
-/**
- * Mirrors `athenaeum_core::api::settings::SettingsDefaults` (Task A1, this
- * plan). Declared locally because that Rust struct and its generated TS type
- * may not exist in `src/types/models.ts` yet when this file lands — swap this
- * for the generated `SettingsDefaults` import from `models.ts` once Task A1's
- * `ts_export` run has landed it there. Field names are already the Rust
- * struct's `#[serde(rename_all = "camelCase")]` names.
- */
-export interface SettingsDefaults {
-  kv: Record<string, string>;
-  analysis: AnalysisConfig;
-  plateSolve: PlateSolveConfig;
-  calibrationMatching: CalibrationMatchingConfig;
-  logging: LoggingConfig;
-  stacking: StackingConfig;
-}
+/** The generated mirror of `athenaeum_core::api::settings::SettingsDefaults`. */
+export type { SettingsDefaults } from '../types/models';
 
 interface SettingsDefaultsContextValue {
   defaults: SettingsDefaults | null;
