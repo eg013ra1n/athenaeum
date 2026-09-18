@@ -130,6 +130,18 @@ pub enum NoiseSource {
     BackgroundResidual,
 }
 
+/// Per-phase wall time of one plane's measurement (perf tier 1 Task 0).
+/// Skipped by serde: the cached `metrics` artifact payload must not change
+/// shape, and a timing is not a measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MeasureTimings {
+    pub read_ms: u64,
+    pub background_ms: u64,
+    pub noise_ms: u64,
+    pub detect_ms: u64,
+    pub fit_ms: u64,
+}
+
 /// One channel's measurement, in native `[0, 1]` units.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -159,6 +171,11 @@ pub struct ChannelMeasurement {
     pub scale: f64,
     pub psf_signal_weight: f64,
     pub psf_snr: f64,
+    /// Per-phase wall time of this plane's measurement (perf tier 1 Task 0).
+    /// Not part of the cached `metrics` artifact payload — a timing, not a
+    /// measurement.
+    #[serde(skip)]
+    pub timings: MeasureTimings,
 }
 
 impl ChannelMeasurement {
@@ -262,10 +279,12 @@ pub fn measure_plane_with_seeds(
     // (M4a Task 2 fix round 2, ruling R-M4a-14). Same numbers as before —
     // both are pure functions of `scaled` — computed once and reused for
     // the reported `noise`/`m_star`/`n_star` further down.
+    let t = Instant::now();
     let bg = match pool {
         Some(p) => p.install(|| psf_signal::background_residual(&scaled, w, h)),
         None => psf_signal::background_residual(&scaled, w, h),
     };
+    let background_ms = t.elapsed().as_millis() as u64;
     let (m_star, n_star) = match bg {
         Some(v) => v,
         None => {
@@ -277,6 +296,7 @@ pub fn measure_plane_with_seeds(
             (0.0, 0.0)
         }
     };
+    let t = Instant::now();
     let (noise_adu, noise_source) = match psf_signal::noise_mrs(&scaled, w, h) {
         Some(n) => (n as f64, NoiseSource::Mrs),
         None => {
@@ -287,6 +307,7 @@ pub fn measure_plane_with_seeds(
             (n_star, NoiseSource::BackgroundResidual)
         }
     };
+    let noise_ms = t.elapsed().as_millis() as u64;
 
     // A run selects its detector through the config; `seed_source` is the
     // probe-level override the dev harnesses pass. `Fast` means "whatever
@@ -296,6 +317,7 @@ pub fn measure_plane_with_seeds(
         (s, _) => s,
     };
 
+    let t = Instant::now();
     let seeds: Vec<Seed> = match seed_source {
         SeedSource::Fast => {
             // Detection may run on a pre-filtered copy; EVERYTHING after it
@@ -417,15 +439,18 @@ pub fn measure_plane_with_seeds(
             seeds
         }
     };
+    let detect_ms = t.elapsed().as_millis() as u64;
     let stars_detected = seeds.len();
 
     let params = FitParams::default();
+    let t = Instant::now();
     let outcome = match pool {
         Some(p) => {
             p.install(|| psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params))
         }
         None => psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params),
     };
+    let fit_ms = t.elapsed().as_millis() as u64;
     let totals = psf_signal::signal_totals(&outcome.fits);
     let (fwhm_px, eccentricity) = psf_signal::frame_shape(&outcome.fits).unwrap_or((0.0, 0.0));
     let sample = stats::stratified_sample(data, w, h);
@@ -489,6 +514,13 @@ pub fn measure_plane_with_seeds(
             m_star,
         ),
         psf_snr: psf_signal::psf_snr(totals.tflux, noise_adu),
+        timings: MeasureTimings {
+            read_ms: 0,
+            background_ms,
+            noise_ms,
+            detect_ms,
+            fit_ms,
+        },
     }
 }
 
@@ -519,10 +551,12 @@ pub fn measure_frame_with_seeds(
         if cancel.load(Ordering::Relaxed) {
             return Err(IntegrationError::Cancelled);
         }
-        let data = reader.read_plane(plane)?;
         let t = Instant::now();
+        let data = reader.read_plane(plane)?;
+        let read_ms = t.elapsed().as_millis() as u64;
         let _span = tracing::debug_span!("measure_plane", path = %path.display(), plane).entered();
-        let m = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
+        let mut m = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
+        m.timings.read_ms = read_ms;
         debug!(
             path = %path.display(),
             plane,
@@ -537,6 +571,11 @@ pub fn measure_frame_with_seeds(
             detection_sigma = opts.detection_sigma,
             seed_prefilter = opts.seed_prefilter.as_str(),
             seed_detector = opts.seed_detector.as_str(),
+            read_ms = m.timings.read_ms,
+            background_ms = m.timings.background_ms,
+            noise_ms = m.timings.noise_ms,
+            detect_ms = m.timings.detect_ms,
+            fit_ms = m.timings.fit_ms,
             duration_ms = t.elapsed().as_millis() as u64,
             "frame plane measured"
         );
@@ -588,6 +627,15 @@ mod tests {
         path
     }
 
+    /// Zeroes wall-clock timings before a structural equality check — two
+    /// independent calls of the same math never share a timing, so a pin
+    /// comparing whole `ChannelMeasurement`s has to ignore it (perf tier 1
+    /// Task 0).
+    fn without_timings(mut c: ChannelMeasurement) -> ChannelMeasurement {
+        c.timings = MeasureTimings::default();
+        c
+    }
+
     #[test]
     fn measures_a_synthetic_mono_frame() {
         let (data, w, h) = field(7, 1.0, 0.002);
@@ -621,14 +669,39 @@ mod tests {
         assert_eq!(m.min_stars(), c.stars_fitted);
     }
 
+    /// Perf tier 1 Task 0: the phase splits `measure_plane` (in-memory, no
+    /// `PlaneReader`) reports must sum to no more than the plane's own wall
+    /// time, and a plane measured from memory (not `measure_frame`) never
+    /// carries a read — `measure_frame_with_seeds` is the only place that
+    /// sets `timings.read_ms`.
+    #[test]
+    fn measure_timings_are_components_of_the_plane_duration() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let t = std::time::Instant::now();
+        let m = measure_plane(&data, w, h, &opts, None);
+        let elapsed_ms = t.elapsed().as_millis() as u64;
+        let sum =
+            m.timings.background_ms + m.timings.noise_ms + m.timings.detect_ms + m.timings.fit_ms;
+        assert!(
+            sum <= elapsed_ms + 1,
+            "phase sum {sum} exceeds the plane's own {elapsed_ms}"
+        );
+        assert_eq!(
+            m.timings.read_ms, 0,
+            "a plane measured from memory has no read"
+        );
+    }
+
     #[test]
     fn seed_source_fast_is_bit_identical_to_measure_plane() {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
         let a = measure_plane(&data, w, h, &opts, None);
         let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
-        assert_eq!(a, b);
-        assert!(a.stars_fitted > 0, "fixture should fit stars: {a:?}");
+        let stars_fitted = a.stars_fitted;
+        assert_eq!(without_timings(a), without_timings(b));
+        assert!(stars_fitted > 0, "fixture should fit stars: {stars_fitted}");
     }
 
     #[test]
@@ -849,10 +922,18 @@ mod tests {
         assert_eq!(c.psf_signal_weight, 1.387_068_045_273_481_56e-3);
         assert_eq!(c.fwhm_px, 4.122_658_320_014_302_55);
         // The delegate equality, kept as a cheap structural check — it is
-        // not the pin above.
+        // not the pin above. Timings are wall-clock, not measurement output,
+        // so they're zeroed before the comparison (perf tier 1 Task 0).
         assert_eq!(
-            c,
-            measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast)
+            without_timings(c),
+            without_timings(measure_plane_with_seeds(
+                &data,
+                w,
+                h,
+                &opts,
+                None,
+                SeedSource::Fast
+            ))
         );
     }
 
@@ -920,15 +1001,38 @@ mod tests {
         assert_eq!((b.median, b.mad, b.location), (a.median, a.mad, a.location));
         assert!(b.psf_signal_weight > 0.0 && b.psf_snr > 0.0);
         // The config selects the detector; `SeedSource::Fast` follows it,
-        // and naming the source explicitly is the same measurement.
+        // and naming the source explicitly is the same measurement. Timings
+        // are wall-clock, not measurement output, so they're zeroed before
+        // the comparison (perf tier 1 Task 0).
         assert_eq!(
-            b,
-            measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Structure)
+            without_timings(b),
+            without_timings(measure_plane_with_seeds(
+                &data,
+                w,
+                h,
+                &peak,
+                None,
+                SeedSource::Structure
+            ))
         );
         // ... while an explicit `Full` still wins over the config.
         assert_eq!(
-            measure_plane_with_seeds(&data, w, h, &structure, None, SeedSource::Full),
-            measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Full)
+            without_timings(measure_plane_with_seeds(
+                &data,
+                w,
+                h,
+                &structure,
+                None,
+                SeedSource::Full
+            )),
+            without_timings(measure_plane_with_seeds(
+                &data,
+                w,
+                h,
+                &peak,
+                None,
+                SeedSource::Full
+            ))
         );
     }
 

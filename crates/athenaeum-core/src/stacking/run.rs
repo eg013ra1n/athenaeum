@@ -1926,6 +1926,27 @@ fn admission(working_set_bytes: u64) -> usize {
     n.clamp(1, cores as u64) as usize
 }
 
+/// One line per fan-out stating what `admission` decided and from what —
+/// the number the audit's Δ estimates are measured against (perf tier 1
+/// Task 0).
+fn log_admission(
+    rc: &RunContext,
+    stage: Stage,
+    group_key: &str,
+    working_set_bytes: u64,
+    admission: usize,
+) {
+    tracing::info!(
+        run_id = rc.run_id,
+        stage = stage.as_str(),
+        group_key,
+        working_set_bytes,
+        admission,
+        pool_threads = rc.ctx.image_pool.current_num_threads(),
+        "fan-out admitted"
+    );
+}
+
 /// Fan `items` out across `min(admission, items.len()).max(1)` worker
 /// threads pulling from one shared FIFO queue (`std::thread::scope`) —
 /// never more workers than there is work, and always at least one so a
@@ -2358,7 +2379,15 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         }
 
         if !needing_measure.is_empty() {
-            let admission_n = admission(8 * max_planes as u64 * group_max_w * group_max_h * 4);
+            let working_set_bytes = 8 * max_planes as u64 * group_max_w * group_max_h * 4;
+            let admission_n = admission(working_set_bytes);
+            log_admission(
+                rc,
+                Stage::Measure,
+                &group.key,
+                working_set_bytes,
+                admission_n,
+            );
             let meta: Vec<(usize, GroupFrame)> = needing_measure
                 .iter()
                 .map(|(idx, f, _)| (*idx, f.clone()))
@@ -3274,7 +3303,15 @@ fn register_group_pass(
         let geometry = rc.geometry_of(&group.key);
         (geometry.width, geometry.height)
     };
-    let admission_n = admission(4 * ref_w as u64 * ref_h as u64 * 4);
+    let working_set_bytes = 4 * ref_w as u64 * ref_h as u64 * 4;
+    let admission_n = admission(working_set_bytes);
+    log_admission(
+        rc,
+        Stage::Register,
+        &group.key,
+        working_set_bytes,
+        admission_n,
+    );
     let meta: Vec<(usize, GroupFrame, String, SeedPolicy)> = to_register
         .iter()
         .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone(), p.policy))
@@ -7011,8 +7048,16 @@ fn run_group_normalization(
         None,
     );
 
-    let admission_n =
-        admission(input.channels as u64 * input.width as u64 * input.height as u64 * 4 * 2);
+    let working_set_bytes =
+        input.channels as u64 * input.width as u64 * input.height as u64 * 4 * 2;
+    let admission_n = admission(working_set_bytes);
+    log_admission(
+        rc,
+        Stage::Normalize,
+        &group.key,
+        working_set_bytes,
+        admission_n,
+    );
     let interpolation = input.interpolation;
     let clamping = input.clamping;
     let cancel_ref: &AtomicBool = &rc.cancel;
@@ -7167,6 +7212,10 @@ fn run_group_normalization(
                             ln_scale = outcome.scale,
                             ln_matches = outcome.matches,
                             ln_cells_rejected = outcome.cells_rejected,
+                            warp_ms = outcome.warp_ms,
+                            background_ms = outcome.background_ms,
+                            scale_ms = outcome.scale_ms,
+                            write_ms = outcome.write_ms,
                             "ln frame normalized"
                         );
                         set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);

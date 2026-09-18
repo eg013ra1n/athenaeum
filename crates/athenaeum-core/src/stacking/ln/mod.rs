@@ -31,6 +31,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crate::geometry::ThinPlateSpline;
 use crate::integration::banded::BandPlanes;
@@ -125,12 +126,24 @@ impl std::error::Error for LnError {
 /// value is still exactly what its own [`LnGrid::global_scale`] carries),
 /// `matches`/`cells_rejected` are the SUM over channels (how much data
 /// backed the whole frame's normalization, not just one channel's).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LnFrameOutcome {
     pub sidecar: std::path::PathBuf,
     pub scale: f64,
     pub matches: usize,
     pub cells_rejected: usize,
+    /// Wall time (ms) spent warping into the reference geometry, summed
+    /// across every channel (perf tier 1 Task 0).
+    pub warp_ms: u64,
+    /// Wall time (ms) spent on the target's own background model, summed
+    /// across every channel.
+    pub background_ms: u64,
+    /// Wall time (ms) spent measuring the PSF-flux relative scale, summed
+    /// across every channel.
+    pub scale_ms: u64,
+    /// Wall time (ms) writing the `.athln` sidecar — once for the whole
+    /// frame, not per channel.
+    pub write_ms: u64,
 }
 
 /// Per-channel target background parameters (spec §5.2/math §4.2): same
@@ -392,6 +405,11 @@ pub fn normalize_frame(
     let mut scales = Vec::with_capacity(channels);
     let mut matches_total = 0usize;
     let mut cells_rejected_total = 0usize;
+    // Per-phase wall time, accumulated ACROSS channels — one number per
+    // phase for the whole frame (perf tier 1 Task 0).
+    let mut warp_ms = 0u64;
+    let mut background_ms = 0u64;
+    let mut scale_ms = 0u64;
 
     for p in 0..channels {
         if cancel.load(Ordering::Relaxed) {
@@ -402,6 +420,7 @@ pub fn normalize_frame(
             path: frame.path.clone(),
             map: frame.map.clone(),
         };
+        let t = Instant::now();
         let src = RegisteredSource::open(
             &[registered],
             reference.width,
@@ -421,7 +440,9 @@ pub fn normalize_frame(
             })?;
         let mut target = vec![0f32; reference.width * reference.height];
         band.decode_frame_into(0, &mut target);
+        warp_ms += t.elapsed().as_millis() as u64;
 
+        let t = Instant::now();
         let target_bg = background_grid(&target, reference.width, reference.height, &target_params);
         let (expected_gw, expected_gh) =
             LnGrid::grid_dims(reference.width, reference.height, stride);
@@ -449,6 +470,7 @@ pub fn normalize_frame(
         // `median_of_finite`'s own doc for why a NaN-laden plane still needs
         // this even though `total_cmp`-based sorting never panics on NaN.
         let location_tgt = median_of_finite(&target);
+        background_ms += t.elapsed().as_millis() as u64;
 
         // Fix round 1, item 6: sanitize `target` IN PLACE for detection —
         // everything that needed the NaN-preserving version
@@ -476,6 +498,7 @@ pub fn normalize_frame(
         // match tree) was already prepared ONCE for the whole group by
         // `LnReferenceForDetection::build` — `relative_scale_against` only
         // re-detects/re-fits the TARGET, not the reference, on every call.
+        let t = Instant::now();
         let scale_result = scale::relative_scale_against(
             &reference_for_detection.prepared[p],
             &target,
@@ -486,6 +509,7 @@ pub fn normalize_frame(
             0.3,
             cfg.local_scale,
         )?;
+        scale_ms += t.elapsed().as_millis() as u64;
         matches_total += scale_result.matches;
         scales.push(scale_result.scale);
 
@@ -561,9 +585,11 @@ pub fn normalize_frame(
         });
     }
 
+    let t = Instant::now();
     LnFrameGrids { channels: grids }
         .write(sidecar)
         .map_err(|e| LnError::Other(format!("writing .athln sidecar: {e:#}")))?;
+    let write_ms = t.elapsed().as_millis() as u64;
 
     let scale = scales.iter().sum::<f64>() / scales.len().max(1) as f64;
 
@@ -572,6 +598,10 @@ pub fn normalize_frame(
         scale,
         matches: matches_total,
         cells_rejected: cells_rejected_total,
+        warp_ms,
+        background_ms,
+        scale_ms,
+        write_ms,
     })
 }
 

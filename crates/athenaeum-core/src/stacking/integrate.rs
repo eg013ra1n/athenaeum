@@ -1290,6 +1290,8 @@ pub fn integrate_group(
             plane = p,
             rejected_low = out.rejected_low,
             rejected_high = out.rejected_high,
+            read_ms = out.base.read_duration.as_millis() as u64,
+            combine_ms = out.base.combine_duration.as_millis() as u64,
             duration_ms = plane_duration_ms,
             "plane integrated"
         );

@@ -684,7 +684,7 @@ pub(crate) fn reference_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stacking::measure::NoiseSource;
+    use crate::stacking::measure::{MeasureTimings, NoiseSource};
 
     fn meas(psfsw: &[f64], fwhm: f64, ecc: f64, stars: usize, snrw: f64) -> FrameMeasurement {
         FrameMeasurement {
@@ -716,6 +716,7 @@ mod tests {
                     scale: 0.01,
                     psf_signal_weight: w,
                     psf_snr: w * 2.0,
+                    timings: MeasureTimings::default(),
                 })
                 .collect(),
         }

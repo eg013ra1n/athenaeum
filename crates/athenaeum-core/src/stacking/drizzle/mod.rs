@@ -485,6 +485,11 @@ pub fn drizzle_group(
         let mut i_buf = vec![0f32; plane_out_pixels];
         let mut w_buf = vec![0f32; plane_out_pixels];
         let mut plane_bytes_read = 0u64;
+        // Per-plane mirrors of `read_duration_total`/`deposit_duration_total`
+        // (perf tier 1 Task 0) — reset each iteration so the plane's own
+        // event can report its own split, not the group's running total.
+        let mut plane_read = std::time::Duration::ZERO;
+        let mut plane_deposit = std::time::Duration::ZERO;
 
         for frame in input.frames {
             // Cancel checked once per frame (perf shape) — the band loop
@@ -550,7 +555,9 @@ pub fn drizzle_group(
             let read_bytes = (src_width * src_height * 4) as u64;
             plane_bytes_read += read_bytes;
             bytes_read_total += read_bytes;
-            read_duration_total += read_start.elapsed();
+            let read_elapsed = read_start.elapsed();
+            read_duration_total += read_elapsed;
+            plane_read += read_elapsed;
 
             let rej_bitmap = if input.use_rejection {
                 match frame.rej {
@@ -630,7 +637,9 @@ pub fn drizzle_group(
                         deposit_band(ib, wb, band_idx, out_w, &ctx);
                     });
             });
-            deposit_duration_total += deposit_start.elapsed();
+            let deposit_elapsed = deposit_start.elapsed();
+            deposit_duration_total += deposit_elapsed;
+            plane_deposit += deposit_elapsed;
             // Ruling R-T4-6c: this frame's pixel work is done for this
             // plane, so its displacement grid goes back now. The plane
             // loop is the OUTER one, so a frame's next plane is separated
@@ -682,6 +691,8 @@ pub fn drizzle_group(
             frames = input.frames.len(),
             duration_ms = plane_start.elapsed().as_millis() as u64,
             bytes = plane_bytes_read,
+            read_ms = plane_read.as_millis() as u64,
+            deposit_ms = plane_deposit.as_millis() as u64,
             "drizzle plane deposited"
         );
     }

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use rusqlite::Connection;
 
@@ -491,13 +492,16 @@ pub fn execute_generation(
     hot_maps: &mut HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
     cancel: &AtomicBool,
 ) -> anyhow::Result<GeneratedLight> {
+    let t = Instant::now();
     let (mut frame, outcome) = calibrate_light_compute(&spec.inputs, cancel)?;
+    let compute_ms = t.elapsed().as_millis() as u64;
 
     // ── Cosmetic hot-pixel correction ───────────────────────────────────────
     // Only a master dark can say which pixels are defective, so a frame with
     // no dark applied is honestly skipped rather than guessed at.
     let mut hot_pixels_replaced = 0u64;
     let mut warnings = Vec::new();
+    let t = Instant::now();
     let corrected = match (opts.hot_pixel_correction, &spec.dark_path) {
         (true, Some(dark)) => {
             // `newly_measured` is what keeps the refusal warning to ONE line
@@ -553,6 +557,7 @@ pub fn execute_generation(
         }
         _ => false,
     };
+    let cosmetic_ms = t.elapsed().as_millis() as u64;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled.into());
@@ -588,6 +593,7 @@ pub fn execute_generation(
     // calibrated output at all, so the caller treats the frame as not
     // calibrated rather than as calibrated-without-a-mosaic.
     let mut mosaic_written = false;
+    let mut write_ms = 0u64;
     if opts.keep_mosaic {
         match (mosaic_path, spec.debayer) {
             (Some(path), true) => {
@@ -606,6 +612,7 @@ pub fn execute_generation(
                 // file we just wrote, per OSC frame. Always FITS (R7: the
                 // mosaic is a run-internal artifact, never the chosen
                 // export/send container).
+                let t = Instant::now();
                 write_fits_f32(
                     path,
                     frame.width,
@@ -615,6 +622,7 @@ pub fn execute_generation(
                     &mosaic_cards,
                 )
                 .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+                write_ms += t.elapsed().as_millis() as u64;
                 mosaic_written = true;
                 tracing::debug!(
                     src = %spec.inputs.light_path.display(),
@@ -641,6 +649,7 @@ pub fn execute_generation(
     // Full resolution: same width and height, three planes. `spec.debayer`
     // already implies a usable geometry; the fallback arm cannot fire, and if
     // it ever did it would leave the mosaic intact rather than guess a phase.
+    let t = Instant::now();
     let (data, channels) = match (spec.debayer, spec.cfa_geometry) {
         (true, Some(geom)) => (
             vng_debayer_f32(&frame.data, frame.width, frame.height, bayer_for(geom)),
@@ -649,6 +658,11 @@ pub fn execute_generation(
         _ => (frame.data, 1usize),
     };
     let debayered = channels == 3;
+    let debayer_ms = if debayered {
+        t.elapsed().as_millis() as u64
+    } else {
+        0
+    };
 
     // ── Final header ────────────────────────────────────────────────────────
     let mut cards = spec.cards.clone();
@@ -666,6 +680,7 @@ pub fn execute_generation(
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let t = Instant::now();
     let output_hash = write_calibrated_output(
         output_path,
         frame.width,
@@ -675,6 +690,7 @@ pub fn execute_generation(
         &cards,
         spec.format,
     )?;
+    write_ms += t.elapsed().as_millis() as u64;
     let byte_size = std::fs::metadata(output_path)?.len();
 
     tracing::debug!(
@@ -686,6 +702,10 @@ pub fn execute_generation(
         width = frame.width,
         height = frame.height,
         floored_flat_pixels = outcome.floored_flat_pixels,
+        compute_ms,
+        cosmetic_ms,
+        debayer_ms,
+        write_ms,
         "light calibrated"
     );
 

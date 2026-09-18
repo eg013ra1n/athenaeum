@@ -50,9 +50,19 @@ pub fn reference_stars(
     cfg: &RegistrationConfig,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ReferenceStars, IntegrationError> {
+    let t = Instant::now();
     let (lum, width, height) = read_luminance(path)?;
+    let read_ms = t.elapsed().as_millis() as u64;
+    let t = Instant::now();
     let stars = detect_stars(&lum, width, height, &cfg.detection, cfg.max_stars, pool);
-    debug!(path = %path.display(), detections = stars.len(), "reference stars detected");
+    let detect_ms = t.elapsed().as_millis() as u64;
+    debug!(
+        path = %path.display(),
+        detections = stars.len(),
+        read_ms,
+        detect_ms,
+        "reference stars detected"
+    );
     Ok(ReferenceStars {
         stars,
         width,
@@ -83,12 +93,17 @@ pub fn register_frame(
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled);
     }
+    let t = Instant::now();
     let (lum, width, height) = read_luminance(subject)?;
+    let read_ms = t.elapsed().as_millis() as u64;
+    let t = Instant::now();
     let stars = detect_stars(&lum, width, height, &cfg.detection, cfg.max_stars, pool);
+    let detect_ms = t.elapsed().as_millis() as u64;
     drop(lum);
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled);
     }
+    let t = Instant::now();
     let outcome = align(
         &stars,
         &reference.stars,
@@ -99,6 +114,7 @@ pub fn register_frame(
         policy,
         scale_gate,
     );
+    let align_ms = t.elapsed().as_millis() as u64;
     let duration_ms = start.elapsed().as_millis() as u64;
     match &outcome {
         Ok(a) => {
@@ -109,6 +125,9 @@ pub fn register_frame(
                 rms_px = a.rms_px,
                 model = %model_name(a.model, a.distortion, a.seed),
                 flipped = a.flipped,
+                read_ms,
+                detect_ms,
+                align_ms,
                 duration_ms,
                 "frame registered"
             );
@@ -117,7 +136,7 @@ pub fn register_frame(
             }
         }
         Err(e) => {
-            warn!(path = %subject.display(), detections = stars.len(), error = %e, duration_ms, "frame registration failed")
+            warn!(path = %subject.display(), detections = stars.len(), error = %e, read_ms, detect_ms, align_ms, duration_ms, "frame registration failed")
         }
     }
     Ok(FrameRegistration {
