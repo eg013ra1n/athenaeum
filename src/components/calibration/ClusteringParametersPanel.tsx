@@ -145,8 +145,12 @@ export default function ClusteringParametersPanel({
           Scoring Parameters
         </h4>
         <p className="text-xs text-content-muted mb-4">
-          When linking calibration sets to frames, candidates are scored based on date proximity, temperature match, and exposure time proximity.
-          These settings control how temperature and exposure time affect the scoring.
+          When Athenaeum links calibration sets automatically, every candidate gets a score from date proximity,
+          temperature match and exposure-time match, and the best-scoring compatible set wins. The same score is
+          shown as a percentage in the manual selection dialog. These settings control the temperature and
+          exposure terms; date proximity uses a fixed 30-day decay. Note: when a light is matched to a set of raw
+          flats (not a master flat), only Temperature Match Weight applies — raw flats are ranked by their own
+          time-grouping rule.
         </p>
         <div className="bg-surface-elevated/50 rounded-lg p-4 space-y-4">
           {/* Temperature Match Weight */}
