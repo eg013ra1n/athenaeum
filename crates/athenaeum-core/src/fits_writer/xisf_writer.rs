@@ -39,13 +39,16 @@
 //! bounds Image attribute, which is mandatory for a floating point real
 //! image", the v0.6.2 masters). The v0.6.2 writer left it off on the belief
 //! that `0:1` was the format's default; that was only OUR reader's
-//! default. The declared range is the pipeline's own convention — every
-//! master's samples are the u16 domain divided by 65535 (`ATH_CSCL`), so
-//! `0:1` names the black and white points the array was built against, and
-//! the reader this crate ships treats an explicit `0:1` as the identity
-//! mapping it already applied. The range is a REPRESENTABLE range, not a
-//! clip: a saturated star core above 1.0 is a sample beyond the white
-//! point, which the format allows. Declaring the array's true min/max
+//! default. The declared range is now the CALLER's own knowledge, passed
+//! in as [`super::XisfBounds`] rather than assumed here: a stacking master
+//! and a calibrated light are unit-scaled (`ATH_CSCL`, `XisfBounds::Unit`,
+//! `"0:1"`), while a built calibration master is raw ADU
+//! (`XisfBounds::Adu16`, `"0:65535"`) — the u16 domain the calibration
+//! engine and the scanner both expect back. Either way the reader this
+//! crate ships treats the declared bounds as the identity mapping the
+//! writer already applied. The range is a REPRESENTABLE range, not a
+//! clip: a saturated star core above the white point is a sample beyond
+//! it, which the format allows. Declaring the array's true min/max
 //! instead would oblige every honouring reader to rescale the data, which
 //! is worse.
 //!
@@ -101,6 +104,7 @@ use std::path::Path;
 
 use super::card::{fmt_real, format_card, sanitize_text, Card, CardValue, FitsWriteError};
 use super::writer::{rename_replace, validate};
+use super::XisfBounds;
 
 /// The format signature: "XISF" plus the version it declares, 1.0.0.
 const SIGNATURE: &[u8; 8] = b"XISF0100";
@@ -221,15 +225,15 @@ fn with_explicit_row_order(cards: &[Card]) -> Result<Cow<'_, [Card]>, FitsWriteE
     Ok(Cow::Owned(owned))
 }
 
-/// The representable range every master this writer serializes was built
-/// against: the u16 domain divided by 65535 (`ATH_CSCL`), i.e. `[0, 1]`.
-/// Mandatory on a Float32 `<Image>` (XISF 1.0 §11.5.1).
-const FLOAT_BOUNDS: &str = "0:1";
-
-/// The `imageType` literal (XISF 1.0 table 12) for the cards' `IMAGETYP`,
-/// when the two vocabularies coincide: the master light and the drizzle
-/// weight map have exact counterparts; everything else (the rejection maps
-/// are FITS-only anyway) gets no attribute rather than a guessed one.
+/// The `imageType` literal (XISF 1.0 table 12) for the cards' `IMAGETYP`.
+/// The external tool takes this attribute as authoritative for master
+/// calibration files — it overrides its own `IMAGETYP` guess — and treats a
+/// dark flat as a dark matched by exposure, so `Master Dark Flat` maps onto
+/// `MasterDark` rather than being left unmapped: its own `IMAGETYP` parser
+/// reads "Master Dark Flat" as unknown and then guesses FLAT from the file
+/// name, which is wrong for a dark flat. The `IMAGETYP` keyword itself keeps
+/// Athenaeum's own value either way — only this attribute changes what the
+/// external tool believes.
 fn image_type_for(cards: &[Card]) -> Option<&'static str> {
     let imagetyp = cards.iter().find(|c| c.keyword == "IMAGETYP")?;
     let Some(CardValue::Str(s)) = &imagetyp.value else {
@@ -238,6 +242,15 @@ fn image_type_for(cards: &[Card]) -> Option<&'static str> {
     match s.trim() {
         "Master Light" => Some("MasterLight"),
         "Drizzle Weight" => Some("WeightMap"),
+        "Master Dark" => Some("MasterDark"),
+        "Master Bias" => Some("MasterBias"),
+        "Master Flat" => Some("MasterFlat"),
+        // The consumer's own vocabulary has no dark-flat master; it matches a
+        // dark flat as a DARK by exposure, and its IMAGETYP parser reads
+        // "Master Dark Flat" as unknown and then guesses FLAT from the file
+        // name. The attribute overrides both — the keyword keeps our value.
+        "Master Dark Flat" => Some("MasterDark"),
+        "Light Frame" => Some("Light"),
         _ => None,
     }
 }
@@ -251,6 +264,7 @@ fn build_xml(
     data_bytes: usize,
     cards: &[Card],
     creation_time: &str,
+    bounds: XisfBounds,
 ) -> String {
     let color_space = if channels == 3 { "RGB" } else { "Gray" };
     let image_type_attr = image_type_for(cards)
@@ -264,12 +278,13 @@ fn build_xml(
          xsi:schemaLocation=\"{XSD_LOCATION}\">\n"
     ));
     // `bounds` is mandatory for a floating point real image (see the
-    // module docs) — the pipeline's `[0, 1]` convention, stated explicitly.
+    // module docs) — the CALLER's own domain, stated explicitly.
     xml.push_str(&format!(
         "  <Image geometry=\"{width}:{height}:{channels}\" sampleFormat=\"Float32\" \
          colorSpace=\"{color_space}\" pixelStorage=\"Planar\" \
-         bounds=\"{FLOAT_BOUNDS}\"{image_type_attr} \
-         location=\"attachment:{attachment_pos}:{data_bytes}\">\n"
+         bounds=\"{}\"{image_type_attr} \
+         location=\"attachment:{attachment_pos}:{data_bytes}\">\n",
+        bounds.attr()
     ));
     for card in cards {
         let (value, comment) = xisf_keyword_value(card);
@@ -311,6 +326,7 @@ fn header_prefix(
     data_bytes: usize,
     cards: &[Card],
     creation_time: &str,
+    bounds: XisfBounds,
 ) -> Result<Vec<u8>, FitsWriteError> {
     let mut pos = ATTACHMENT_ALIGN;
     for _ in 0..8 {
@@ -322,6 +338,7 @@ fn header_prefix(
             data_bytes,
             cards,
             creation_time,
+            bounds,
         );
         let need = align_up(SIGNATURE_BLOCK + xml.len(), ATTACHMENT_ALIGN);
         if need != pos {
@@ -344,11 +361,7 @@ fn header_prefix(
     ))
 }
 
-/// Write an XISF file at `path`, replacing any existing file only after the
-/// write fully succeeds — [`super::writer::write_fits_f32`]'s contract and
-/// mechanism exactly: validate first (so a bad call never touches `path`),
-/// write to a sibling temp file, `sync_all`, then atomically rename it into
-/// place, so a pre-existing good file is never truncated by a failed write.
+/// The stacking convention: unit-scaled samples (`ATH_CSCL`), `bounds="0:1"`.
 pub fn write_xisf_f32(
     path: &Path,
     width: usize,
@@ -356,6 +369,24 @@ pub fn write_xisf_f32(
     channels: usize,
     data: &[f32],
     cards: &[Card],
+) -> Result<(), FitsWriteError> {
+    write_xisf_f32_with(path, width, height, channels, data, cards, XisfBounds::Unit)
+}
+
+/// Write an XISF file at `path`, replacing any existing file only after the
+/// write fully succeeds — [`super::writer::write_fits_f32`]'s contract and
+/// mechanism exactly: validate first (so a bad call never touches `path`),
+/// write to a sibling temp file, `sync_all`, then atomically rename it into
+/// place, so a pre-existing good file is never truncated by a failed write.
+/// `bounds` is the CALLER's own knowledge — see the module docs.
+pub fn write_xisf_f32_with(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[Card],
+    bounds: XisfBounds,
 ) -> Result<(), FitsWriteError> {
     validate(width, height, channels, data.len())?;
 
@@ -368,7 +399,7 @@ pub fn write_xisf_f32(
     let write_result = (|| -> Result<(), FitsWriteError> {
         let f = std::fs::File::create(&tmp)?;
         let mut w = std::io::BufWriter::new(f);
-        write_xisf_f32_to(&mut w, width, height, channels, data, cards)?;
+        write_xisf_f32_to(&mut w, width, height, channels, data, cards, bounds)?;
         w.flush()?;
         // Power-loss durability: data must be on disk before the rename
         // makes the file visible under its final name.
@@ -388,7 +419,7 @@ pub fn write_xisf_f32(
     Ok(())
 }
 
-/// [`write_xisf_f32`]'s streaming body — the whole unit, header and
+/// [`write_xisf_f32_with`]'s streaming body — the whole unit, header and
 /// attachment, into one sink.
 pub fn write_xisf_f32_to<W: Write>(
     mut w: W,
@@ -397,6 +428,7 @@ pub fn write_xisf_f32_to<W: Write>(
     channels: usize,
     data: &[f32],
     cards: &[Card],
+    bounds: XisfBounds,
 ) -> Result<(), FitsWriteError> {
     validate(width, height, channels, data.len())?;
     // The stored array's row order, stated explicitly (ruling R-T2-1).
@@ -412,7 +444,15 @@ pub fn write_xisf_f32_to<W: Write>(
 
     let data_bytes = data.len() * std::mem::size_of::<f32>();
     let creation_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let prefix = header_prefix(width, height, channels, data_bytes, &cards, &creation_time)?;
+    let prefix = header_prefix(
+        width,
+        height,
+        channels,
+        data_bytes,
+        &cards,
+        &creation_time,
+        bounds,
+    )?;
     w.write_all(&prefix)?;
 
     let mut buf = Vec::with_capacity(8192 * 4);
@@ -470,7 +510,7 @@ mod tests {
         let (w, h, ch) = (5usize, 3usize, 3usize);
         let data = ramp(w, h, ch);
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, w, h, ch, &data, &sample_cards()).unwrap();
+        write_xisf_f32_to(&mut out, w, h, ch, &data, &sample_cards(), XisfBounds::Unit).unwrap();
 
         let (declared, xml) = split_header(&out);
         let attachment_pos = SIGNATURE_BLOCK + declared;
@@ -540,7 +580,7 @@ mod tests {
                 cards.push(Card::new("IMAGETYP", CardValue::Str(t.to_string())).unwrap());
             }
             let mut out: Vec<u8> = Vec::new();
-            write_xisf_f32_to(&mut out, w, h, ch, &data, &cards).unwrap();
+            write_xisf_f32_to(&mut out, w, h, ch, &data, &cards, XisfBounds::Unit).unwrap();
             split_header(&out).1
         };
         assert!(write(Some("Master Light")).contains("imageType=\"MasterLight\""));
@@ -549,6 +589,48 @@ mod tests {
         assert!(!write(None).contains("imageType="));
         // Every one of them still declares the mandatory range.
         assert!(write(None).contains("bounds=\"0:1\""));
+    }
+
+    /// The external tool takes the `<Image imageType>` attribute as
+    /// authoritative (it overrides its own IMAGETYP guess), and treats a
+    /// dark flat as a dark.
+    #[test]
+    fn image_type_names_every_master_kind_the_external_tool_reads() {
+        let cases = [
+            ("Master Dark", Some("MasterDark")),
+            ("Master Bias", Some("MasterBias")),
+            ("Master Flat", Some("MasterFlat")),
+            ("Master Dark Flat", Some("MasterDark")),
+            ("Light Frame", Some("Light")),
+            ("Master Light", Some("MasterLight")),
+            ("Drizzle Weight", Some("WeightMap")),
+            ("Dark Frame", None),
+        ];
+        for (imagetyp, want) in cases {
+            let cards = vec![Card::new("IMAGETYP", CardValue::Str(imagetyp.into())).unwrap()];
+            assert_eq!(image_type_for(&cards), want, "IMAGETYP {imagetyp:?}");
+        }
+    }
+
+    /// A calibration master is raw ADU. Written with bounds 0:65535, the
+    /// reader's `v/65535 * 65535` hands the same ADU back.
+    #[cfg(feature = "render")]
+    #[test]
+    fn adu_bounds_round_trip_through_the_reader_unscaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adu.xisf");
+        let data: Vec<f32> = vec![0.0, 1234.5, 40000.0, 65535.0];
+        write_xisf_f32_with(&path, 4, 1, 1, &data, &sample_cards(), XisfBounds::Adu16).unwrap();
+        let (_, header) = split_header(&std::fs::read(&path).unwrap());
+        assert!(header.contains("bounds=\"0:65535\""), "header: {header}");
+        let (_meta, pixels) = astroimage::ImageConverter::read_raw(&path).unwrap();
+        let samples = match pixels {
+            astroimage::PixelData::Float32(v) => v,
+            _ => panic!("expected Float32 samples"),
+        };
+        for (got, want) in samples.iter().zip(&data) {
+            assert!((got - want).abs() < 1e-2, "got {got}, want {want}");
+        }
     }
 
     /// Ruling R-T2-1: the keyword list always states the stored array's row
@@ -562,7 +644,7 @@ mod tests {
         )
         .unwrap()];
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &with).unwrap();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &with, XisfBounds::Unit).unwrap();
         let (_, xml) = split_header(&out);
         assert!(
             xml.contains("name=\"ROWORDER\" value=\"'TOP-DOWN'\""),
@@ -577,7 +659,16 @@ mod tests {
         // No ROWORDER card at all: the same astronomical default
         // `orientation::row_order_is_bottom_up` applies to a missing card.
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &sample_cards()).unwrap();
+        write_xisf_f32_to(
+            &mut out,
+            4,
+            2,
+            1,
+            &ramp(4, 2, 1),
+            &sample_cards(),
+            XisfBounds::Unit,
+        )
+        .unwrap();
         let (_, xml) = split_header(&out);
         assert!(
             xml.contains("name=\"ROWORDER\" value=\"'BOTTOM-UP'\""),
@@ -590,7 +681,7 @@ mod tests {
         // run's warning, which is a separate question).
         let odd = vec![Card::new("ROWORDER", CardValue::Str("sideways".into())).unwrap()];
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &odd).unwrap();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &odd, XisfBounds::Unit).unwrap();
         let (_, xml) = split_header(&out);
         assert!(
             xml.contains("name=\"ROWORDER\" value=\"'sideways'\""),
@@ -601,7 +692,7 @@ mod tests {
     #[test]
     fn one_channel_is_gray() {
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &[]).unwrap();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &[], XisfBounds::Unit).unwrap();
         let (_, xml) = split_header(&out);
         assert!(xml.contains("colorSpace=\"Gray\""), "{xml}");
         assert!(xml.contains("geometry=\"4:2:1\""), "{xml}");
@@ -698,7 +789,15 @@ mod tests {
     fn card_grammar_parity_with_the_fits_writer() {
         // A non-finite real: refused, same as on the FITS path.
         let nan = Card::new("ATH_BAD", CardValue::Real(f64::NAN)).unwrap();
-        let r = write_xisf_f32_to(std::io::sink(), 2, 2, 1, &[0.0; 4], &[nan]);
+        let r = write_xisf_f32_to(
+            std::io::sink(),
+            2,
+            2,
+            1,
+            &[0.0; 4],
+            &[nan],
+            XisfBounds::Unit,
+        );
         assert!(matches!(r, Err(FitsWriteError::NonFiniteReal(_))), "{r:?}");
 
         // A hand-built card claiming a structural keyword: refused, because
@@ -710,7 +809,15 @@ mod tests {
             text: None,
             structural: false,
         };
-        let r = write_xisf_f32_to(std::io::sink(), 2, 2, 1, &[0.0; 4], &[reserved]);
+        let r = write_xisf_f32_to(
+            std::io::sink(),
+            2,
+            2,
+            1,
+            &[0.0; 4],
+            &[reserved],
+            XisfBounds::Unit,
+        );
         assert!(
             matches!(r, Err(FitsWriteError::ReservedKeyword(_))),
             "{r:?}"
@@ -720,7 +827,15 @@ mod tests {
         let long = Card::new("GAIN", CardValue::Integer(100))
             .unwrap()
             .with_comment(&"c".repeat(100));
-        let r = write_xisf_f32_to(std::io::sink(), 2, 2, 1, &[0.0; 4], &[long]);
+        let r = write_xisf_f32_to(
+            std::io::sink(),
+            2,
+            2,
+            1,
+            &[0.0; 4],
+            &[long],
+            XisfBounds::Unit,
+        );
         assert!(matches!(r, Err(FitsWriteError::CommentTooLong(_))), "{r:?}");
     }
 
@@ -765,7 +880,7 @@ mod tests {
             })
             .collect();
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &cards).unwrap();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &cards, XisfBounds::Unit).unwrap();
         let (declared, xml) = split_header(&out);
         let attachment_pos = SIGNATURE_BLOCK + declared;
         assert!(
@@ -786,7 +901,7 @@ mod tests {
             .unwrap()
             .with_comment("1 < 2 & 3 > 2");
         let mut out: Vec<u8> = Vec::new();
-        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &[card]).unwrap();
+        write_xisf_f32_to(&mut out, 4, 2, 1, &ramp(4, 2, 1), &[card], XisfBounds::Unit).unwrap();
         let (_, xml) = split_header(&out);
         assert!(
             xml.contains("value=\"'a&lt;b&gt;c&amp;d&quot;e'\""),

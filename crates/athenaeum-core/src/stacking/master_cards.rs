@@ -15,7 +15,7 @@ use crate::archive::path_layout::sanitize_for_filename;
 use crate::calibration_library::paths::{fmt_num, resolve_collision};
 use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::wcs::wcs_cards;
-use crate::fits_writer::{write_fits_f32, write_xisf_f32, Card, CardValue, FitsWriteError};
+use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
 use crate::plate_solve::storage::PlateSolveRecord;
 use crate::stacking::config::OutputFormat;
 use crate::stacking::drizzle::{DrizzleKernel, DrizzleOutput};
@@ -425,10 +425,7 @@ pub fn drizzle_file_names(master_stem: &str, scale: u32) -> (String, String) {
 /// probes the exact candidate path, so `x.fits` never occupies `x.xisf`'s
 /// name and neither gets a `_2` suffix because of the other.
 pub fn output_extension(format: OutputFormat) -> &'static str {
-    match format {
-        OutputFormat::Fits => "fits",
-        OutputFormat::Xisf => "xisf",
-    }
+    format.extension()
 }
 
 /// Whether a master's own card list says its stored rows run bottom-up
@@ -465,10 +462,16 @@ fn write_output(
     cards: &[Card],
     format: OutputFormat,
 ) -> Result<(), FitsWriteError> {
-    match format {
-        OutputFormat::Fits => write_fits_f32(path, width, height, channels, data, cards),
-        OutputFormat::Xisf => write_xisf_f32(path, width, height, channels, data, cards),
-    }
+    crate::fits_writer::write_image_f32(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        format,
+        crate::fits_writer::XisfBounds::Unit,
+    )
 }
 
 pub struct WrittenMaster {
