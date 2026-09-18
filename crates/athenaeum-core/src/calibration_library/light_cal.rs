@@ -44,7 +44,7 @@ use crate::duplicates::compute_xxhash;
 use crate::fits_parser::parse_fits_with_header;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::Bayer;
-use crate::fits_writer::{write_fits_f32, Card};
+use crate::fits_writer::{write_image_f32, Card, OutputFormat, XisfBounds};
 use crate::integration::band_budget::MIN_BUDGET_BYTES;
 use crate::integration::banded::{BandPlanes, BandSource};
 use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
@@ -270,10 +270,12 @@ pub fn calibrate_light_compute(
 
 /// Write a calibrated plane to `path` and return the xxh3 of the written file.
 ///
-/// The write is atomic — [`write_fits_f32`] stages a sibling temp file and
+/// The write is atomic — the underlying writer stages a sibling temp file and
 /// renames it into place, so a failed write never truncates a good file already
 /// sitting at `path`. `channels` is a parameter rather than the constant `1`
-/// because a debayered frame goes out through this same door.
+/// because a debayered frame goes out through this same door. `format`
+/// chooses the container; a calibrated light is always `ATH_CSCL`-scaled, so
+/// the XISF bounds are unconditionally [`XisfBounds::Unit`].
 pub fn write_calibrated_output(
     path: &Path,
     width: usize,
@@ -281,8 +283,9 @@ pub fn write_calibrated_output(
     channels: usize,
     data: &[f32],
     cards: &[Card],
+    format: OutputFormat,
 ) -> Result<String, IntegrationError> {
-    write_fits_f32(path, width, height, channels, data, cards)
+    write_image_f32(path, width, height, channels, data, cards, format, XisfBounds::Unit)
         .map_err(|e| io_err(format!("writing {}: {e}", path.display())))?;
     compute_xxhash(path).map_err(|e| io_err(format!("hashing {}: {e:#}", path.display())))
 }
@@ -296,6 +299,9 @@ fn calibrate_light_inner(
     band_budget_bytes: usize,
 ) -> Result<LightCalOutcome, IntegrationError> {
     let (frame, mut outcome) = calibrate_light_compute_inner(inputs, cancel, band_budget_bytes)?;
+    // This legacy single-shot path (superseded by
+    // `export::calibrated_generator::execute_generation`, which every real
+    // caller uses) has no format option of its own — it stays FITS.
     outcome.output_hash = write_calibrated_output(
         &inputs.output_path,
         frame.width,
@@ -303,6 +309,7 @@ fn calibrate_light_inner(
         1,
         &frame.data,
         &inputs.cards,
+        OutputFormat::Fits,
     )?;
 
     tracing::debug!(
@@ -771,7 +778,7 @@ fn io_err(msg: String) -> IntegrationError {
 mod tests {
     use super::*;
     use crate::fits_writer::keywords::Bayer;
-    use crate::fits_writer::{Card, CardValue};
+    use crate::fits_writer::{write_fits_f32, Card, CardValue};
     use std::path::Path;
 
     fn write_plane(dir: &Path, name: &str, w: usize, h: usize, val: f32, cards: &[Card]) -> PathBuf {
@@ -1798,6 +1805,7 @@ mod tests {
             1,
             &frame.data,
             &cfg_b.cards,
+            OutputFormat::Fits,
         )
         .unwrap();
 

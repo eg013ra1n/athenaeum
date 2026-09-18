@@ -352,6 +352,11 @@ pub struct CalibratedLightOptions {
     /// serialized by this build round-trips to `false` too.
     #[serde(skip)]
     pub keep_mosaic: bool,
+    /// The container a calibrated light is written in on export and send.
+    /// The stacking run ignores it for its own intermediates (they stay
+    /// FITS — `PlaneReader` reads nothing else), and says so in stage 1.
+    #[serde(default)]
+    pub format: crate::fits_writer::OutputFormat,
 }
 
 impl Default for CalibratedLightOptions {
@@ -363,21 +368,23 @@ impl Default for CalibratedLightOptions {
             hot_pixel_correction: true,
             debayer_osc: true,
             keep_mosaic: false,
+            format: crate::fits_writer::OutputFormat::Fits,
         }
     }
 }
 
 impl CalibratedLightOptions {
-    /// Resolve the five per-field host arguments, each optional: an absent
+    /// Resolve the six per-field host arguments, each optional: an absent
     /// (or `null`) one takes this type's own default, so neither backend
     /// restates the defaults — the export commands and the summary preview on
-    /// both hosts resolve the same five fields through this one place.
+    /// both hosts resolve the same six fields through this one place.
     pub fn resolve(
         flat_norm: Option<bool>,
         flat_norm_mode: Option<FlatNormMode>,
         params: Option<LightCalParams>,
         hot_pixel: Option<bool>,
         debayer: Option<bool>,
+        format: Option<crate::fits_writer::OutputFormat>,
     ) -> Self {
         let d = Self::default();
         Self {
@@ -389,6 +396,7 @@ impl CalibratedLightOptions {
             // Not a host argument (see the field's own doc): the run that
             // wants the mosaic sets it on the resolved options itself.
             keep_mosaic: d.keep_mosaic,
+            format: format.unwrap_or(d.format),
         }
     }
 }
@@ -398,17 +406,22 @@ impl CalibratedLightOptions {
 /// pixels are generated and the generator names them at write time; a second
 /// implementation of this rule would let those two drift.
 ///
-/// The extension is always forced to `.fits`: an XISF source yields a FITS
-/// output.
-pub fn calibrated_output_filename(source_filename: &str, debayer: bool) -> String {
+/// The extension is the chosen container's, never the source's: an XISF
+/// source does not decide the output format.
+pub fn calibrated_output_filename(
+    source_filename: &str,
+    debayer: bool,
+    format: crate::fits_writer::OutputFormat,
+) -> String {
     let stem = std::path::Path::new(source_filename)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(source_filename);
+    let ext = format.extension();
     if debayer {
-        format!("c_{stem}_d.fits")
+        format!("c_{stem}_d.{ext}")
     } else {
-        format!("c_{stem}.fits")
+        format!("c_{stem}.{ext}")
     }
 }
 
@@ -987,5 +1000,33 @@ mod tests {
         let round: CalibratedLightOptions =
             serde_json::from_str(&serde_json::to_string(&partial).unwrap()).unwrap();
         assert_eq!(round, partial);
+    }
+
+    #[test]
+    fn calibrated_output_filename_takes_the_container() {
+        use crate::fits_writer::OutputFormat;
+        assert_eq!(
+            calibrated_output_filename("L_1.fits", false, OutputFormat::Fits),
+            "c_L_1.fits"
+        );
+        assert_eq!(
+            calibrated_output_filename("L_1.fits", true, OutputFormat::Xisf),
+            "c_L_1_d.xisf"
+        );
+        assert_eq!(
+            calibrated_output_filename("L_1.xisf", false, OutputFormat::Fits),
+            "c_L_1.fits",
+            "an XISF source still yields the chosen container, not its own"
+        );
+    }
+
+    #[test]
+    fn options_format_defaults_to_fits_and_decodes_old_documents() {
+        use crate::fits_writer::OutputFormat;
+        let old: CalibratedLightOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.format, OutputFormat::Fits);
+        let r =
+            CalibratedLightOptions::resolve(None, None, None, None, None, Some(OutputFormat::Xisf));
+        assert_eq!(r.format, OutputFormat::Xisf);
     }
 }

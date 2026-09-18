@@ -153,6 +153,7 @@ pub async fn enqueue_frame_set_send(
     params: Option<LightCalParams>,
     hot_pixel: Option<bool>,
     debayer: Option<bool>,
+    format: Option<athenaeum_core::fits_writer::OutputFormat>,
 ) -> Result<EnqueueSelectionResult, String> {
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
     let dest = api::resolve_dest_node(&state.ctx, &destination_device_id)
@@ -174,6 +175,7 @@ pub async fn enqueue_frame_set_send(
         // frontend that sends neither gets the recommended behavior.
         hot_pixel.unwrap_or(true),
         debayer.unwrap_or(true),
+        format.unwrap_or_default(),
         Some(emitter),
     )
     .await

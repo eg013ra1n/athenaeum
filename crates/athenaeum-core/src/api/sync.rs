@@ -3795,9 +3795,10 @@ pub async fn enqueue_frame_set_send(
     params: LightCalParams,
     hot_pixel_correction: bool,
     debayer_osc: bool,
+    format: crate::fits_writer::OutputFormat,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
-    // The send dialog reads the same five light-calibration preferences the
+    // The send dialog reads the same six light-calibration preferences the
     // Export tab does, so a send and an export of one frame set produce the
     // same files.
     let gen_opts = CalibratedLightOptions {
@@ -3809,6 +3810,7 @@ pub async fn enqueue_frame_set_send(
         // A send carries the calibrated light itself; the CFA mosaic is a
         // stacking-run artifact (M4d Task 1), never part of a payload.
         keep_mosaic: false,
+        format,
     };
     let entries =
         crate::api::frame_set_send::frame_set_entries(ctx, frame_set_id, mode, &gen_opts)?;

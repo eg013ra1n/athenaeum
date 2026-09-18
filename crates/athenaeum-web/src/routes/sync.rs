@@ -14,6 +14,7 @@ use athenaeum_core::api::sync::{
 };
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportMode;
+use athenaeum_core::fits_writer::OutputFormat;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 use serde::Deserialize;
 
@@ -211,6 +212,9 @@ pub struct EnqueueFrameSetSendArgs {
     /// Debayer a CFA light to planar RGB. Default ON; inert for mono frames.
     #[serde(default = "default_true")]
     pub debayer: bool,
+    /// The container the calibrated light is written in. Default FITS.
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 fn default_true() -> bool {
@@ -242,6 +246,7 @@ pub async fn enqueue_frame_set_send(
         args.params,
         args.hot_pixel,
         args.debayer,
+        args.format,
         Some(emitter),
     )
     .await

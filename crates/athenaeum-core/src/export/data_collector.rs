@@ -619,7 +619,7 @@ fn apply_calibrated_lights(
                     debayered += 1;
                 }
                 frame.debayer_calibrated = Some(debayer);
-                frame.filename = calibrated_output_filename(&frame.filename, debayer);
+                frame.filename = calibrated_output_filename(&frame.filename, debayer, opts.format);
             }
         }
     }
@@ -3092,10 +3092,11 @@ mod export_mode_tests {
     #[test]
     fn calibrated_light_options_resolve_fills_absent_fields() {
         assert_eq!(
-            CalibratedLightOptions::resolve(None, None, None, None, None),
+            CalibratedLightOptions::resolve(None, None, None, None, None, None),
             CalibratedLightOptions::default()
         );
-        let r = CalibratedLightOptions::resolve(Some(false), None, None, Some(false), Some(false));
+        let r =
+            CalibratedLightOptions::resolve(Some(false), None, None, Some(false), Some(false), None);
         assert!(!r.flat_norm && !r.hot_pixel_correction && !r.debayer_osc);
         assert_eq!(r.flat_norm_mode, CalibratedLightOptions::default().flat_norm_mode);
         assert_eq!(r.params, CalibratedLightOptions::default().params);

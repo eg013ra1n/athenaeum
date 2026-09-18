@@ -15,6 +15,7 @@ use athenaeum_core::export::models::{
 use athenaeum_core::export::{
     apply_export_mode, collect_export_data, collect_export_summary, resolve_export_mode,
 };
+use athenaeum_core::fits_writer::OutputFormat;
 use athenaeum_core::services::ExportHandle;
 use axum::{extract::State, http::StatusCode, Json};
 use std::path::PathBuf;
@@ -77,7 +78,7 @@ pub struct FrameSetIdArgs {
 }
 
 /// `get_export_summary` args — mirrors the Tauri command: the mode the tab has
-/// selected (`None` falls back to the persisted config) plus the five
+/// selected (`None` falls back to the persisted config) plus the six
 /// generation options, optional AND nullable like [`ExportToWbppArgs`]'s,
 /// defaulting through `CalibratedLightOptions::resolve`.
 #[derive(serde::Deserialize)]
@@ -96,6 +97,8 @@ pub struct GetExportSummaryArgs {
     pub hot_pixel: Option<bool>,
     #[serde(default)]
     pub debayer: Option<bool>,
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
 }
 
 #[derive(serde::Deserialize)]
@@ -132,6 +135,10 @@ pub struct ExportToWbppArgs {
     /// Debayer CFA lights to full-resolution planar RGB.
     #[serde(default)]
     pub debayer: Option<bool>,
+    /// The container the calibrated light is written in. `None`/`null` takes
+    /// [`CalibratedLightOptions::default`]'s value (FITS).
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
 }
 
 #[derive(serde::Deserialize)]
@@ -262,6 +269,7 @@ pub async fn get_export_summary(
         args.params,
         args.hot_pixel,
         args.debayer,
+        args.format,
     );
     let summary =
         collect_export_summary(&conn, args.frame_set_id, &config, mode, Some(&gen_opts))
@@ -392,6 +400,7 @@ pub async fn export_to_wbpp(
                 args.params,
                 args.hot_pixel,
                 args.debayer,
+                args.format,
             );
 
             // Validate output path is within the configured export directory.
@@ -875,6 +884,7 @@ mod export_cancel_while_queued_tests {
                     params: None,
                     hot_pixel: None,
                     debayer: None,
+                    format: None,
                 }),
             )
             .await

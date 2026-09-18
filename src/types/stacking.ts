@@ -174,7 +174,13 @@ hotPixelCorrection: boolean,
  * Debayer a CFA light to full-resolution planar RGB. Ignored for mono
  * frames and for a `BAYERPAT` the catalog cannot vouch for.
  */
-debayerOsc: boolean, };
+debayerOsc: boolean, 
+/**
+ * The container a calibrated light is written in on export and send.
+ * The stacking run ignores it for its own intermediates (they stay
+ * FITS — `PlaneReader` reads nothing else), and says so in stage 1.
+ */
+format: OutputFormat, };
 
 export type GroupingConfig = { 
 /**

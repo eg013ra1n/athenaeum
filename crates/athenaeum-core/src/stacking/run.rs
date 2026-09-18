@@ -1545,12 +1545,22 @@ fn calibrate_one_frame(
         }
     }
 
+    let mut calibration_opts = cfg.calibration.clone();
+    calibration_opts.keep_mosaic = want_mosaic;
+    // R6: the run's calibrated frames are read back by `PlaneReader`
+    // (Measure, Register, Integrate), which is FITS-only — the user-facing
+    // format choice applies to export and send, never to the working tree.
+    // Forced BEFORE `resolve_generation_cached` (not after): that call is
+    // what sets `spec.format` from these options, so the override has to
+    // land on the options it resolves from, not on a later copy.
+    calibration_opts.format = crate::fits_writer::OutputFormat::Fits;
+
     let spec = {
         let conn = db(&rc.ctx)?.conn();
         resolve_generation_cached(
             &conn,
             frame.frame_id,
-            &cfg.calibration,
+            &calibration_opts,
             scratch,
             rc.memo.divisors_mut(),
         )
@@ -1581,11 +1591,11 @@ fn calibrate_one_frame(
             .join(crate::export::calibrated_output_filename(
                 &format!("{stem}.fits"),
                 false,
+                // R7: the mosaic is a run-internal artifact, always FITS.
+                crate::fits_writer::OutputFormat::Fits,
             ))
     });
 
-    let mut calibration_opts = cfg.calibration.clone();
-    calibration_opts.keep_mosaic = want_mosaic;
     let generated = execute_generation(
         &spec,
         &out,

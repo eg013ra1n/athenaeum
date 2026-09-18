@@ -2376,7 +2376,11 @@ mod real_data_e2e {
             let out = dest.join(spec.output_filename(&source_filename));
             assert_eq!(
                 out.file_name().unwrap().to_string_lossy(),
-                calibrated_output_filename(&source_filename, false),
+                calibrated_output_filename(
+                    &source_filename,
+                    false,
+                    crate::fits_writer::OutputFormat::Fits
+                ),
                 "output naming must come from the one shared rule"
             );
             let generated =

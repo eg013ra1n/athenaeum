@@ -128,6 +128,9 @@ pub struct GenerationSpec {
     /// the output CONTENT can never disagree — Task 8 places the file by name
     /// long before the pixels exist.
     pub debayer: bool,
+    /// The container this frame's output is written in — the run's own
+    /// choice at resolve time, so the name and the write always agree.
+    pub format: crate::fits_writer::OutputFormat,
 }
 
 impl GenerationSpec {
@@ -135,7 +138,7 @@ impl GenerationSpec {
     /// reading it back off the plan so a caller placing a frame it already
     /// holds (the export's `ExportFrame`) uses one shared spelling.
     pub fn output_filename(&self, source_filename: &str) -> String {
-        calibrated_output_filename(source_filename, self.debayer)
+        calibrated_output_filename(source_filename, self.debayer, self.format)
     }
 }
 
@@ -410,6 +413,7 @@ pub fn resolve_generation_cached(
         dark_path: inputs.dark_path.clone(),
         cfa_geometry: resolved.cfa_geometry,
         debayer: opts.debayer_osc && resolved.cfa_geometry.is_some(),
+        format: opts.format,
         inputs,
         cards,
     })
@@ -599,7 +603,9 @@ pub fn execute_generation(
                 // no sampling xxh3 — nothing consumes a hash of the mosaic
                 // (it is a working artifact, never a payload or a catalog
                 // row), and computing one costs three 512 KB reads of the
-                // file we just wrote, per OSC frame.
+                // file we just wrote, per OSC frame. Always FITS (R7: the
+                // mosaic is a run-internal artifact, never the chosen
+                // export/send container).
                 write_fits_f32(
                     path,
                     frame.width,
@@ -667,6 +673,7 @@ pub fn execute_generation(
         channels,
         &data,
         &cards,
+        spec.format,
     )?;
     let byte_size = std::fs::metadata(output_path)?.len();
 
@@ -1189,6 +1196,47 @@ mod tests {
             data[5 * W + 5] > 600.0,
             "hot pixel not repaired: {}",
             data[5 * W + 5]
+        );
+    }
+
+    #[test]
+    fn mono_generation_writes_xisf_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = write_plane(&dir.path().join("light_a.fits"), |_, _| 1000.0);
+        let dark = write_plane(&dir.path().join("dark.fits"), spiky_dark);
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, None, None);
+        seed_master_set(&conn, 10, "Dark", &dark);
+        add_link(&conn, 1, 10, "Dark");
+
+        let opts = CalibratedLightOptions {
+            format: crate::fits_writer::OutputFormat::Xisf,
+            ..CalibratedLightOptions::default()
+        };
+        let spec = resolve_generation(&conn, 1, &opts, dir.path()).unwrap();
+        assert_eq!(spec.output_filename("light_a.fits"), "c_light_a.xisf");
+
+        let out = dir.path().join(spec.output_filename("light_a.fits"));
+        let mut hot_maps = HashMap::new();
+        execute_generation(
+            &spec,
+            &out,
+            None,
+            dir.path(),
+            &opts,
+            &mut hot_maps,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(out.to_string_lossy().ends_with(".xisf"));
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..8], b"XISF0100", "signature");
+        let declared = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let xml = String::from_utf8_lossy(&bytes[16..16 + declared]);
+        assert!(
+            xml.contains("bounds=\"0:1\""),
+            "calibrated lights are ATH_CSCL-scaled: {xml}"
         );
     }
 

@@ -180,14 +180,15 @@ pub async fn get_export_readiness(
 /// and could present it as `null`, so the mode is now passed explicitly rather
 /// than relying on a best-effort config sync.
 ///
-/// `flat_norm` / `flat_norm_mode` / `params` / `hot_pixel` / `debayer` are the
-/// calibrated-lights GENERATION options: in that mode this command calibrates
-/// every light from its linked masters as it places it. Each stays optional so
-/// a caller with no opinion keeps working — an omitted one takes
-/// [`CalibratedLightOptions::default`]'s value for that field; every other mode
-/// ignores them.
+/// `flat_norm` / `flat_norm_mode` / `params` / `hot_pixel` / `debayer` /
+/// `format` are the calibrated-lights GENERATION options: in that mode this
+/// command calibrates every light from its linked masters as it places it.
+/// Each stays optional so a caller with no opinion keeps working — an
+/// omitted one takes [`CalibratedLightOptions::default`]'s value for that
+/// field; every other mode ignores them.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn export_to_wbpp(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
@@ -200,6 +201,7 @@ pub async fn export_to_wbpp(
     params: Option<LightCalParams>,
     hot_pixel: Option<bool>,
     debayer: Option<bool>,
+    format: Option<athenaeum_core::fits_writer::OutputFormat>,
 ) -> Result<ExportResult, String> {
     // Create cancel flag and register export
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -264,8 +266,14 @@ pub async fn export_to_wbpp(
             // An absent (or `null`) option takes its value from the type that
             // owns the defaults — `resolve` is the one place, shared with the
             // Axum mirror and the summary preview.
-            let gen_opts =
-                CalibratedLightOptions::resolve(flat_norm, flat_norm_mode, params, hot_pixel, debayer);
+            let gen_opts = CalibratedLightOptions::resolve(
+                flat_norm,
+                flat_norm_mode,
+                params,
+                hot_pixel,
+                debayer,
+                format,
+            );
 
             // Strict gate (spec §12.2) + mode transform. `prepare` returns the
             // per-set omission warnings to fold into the final result, or an
@@ -439,11 +447,12 @@ pub async fn cancel_export(frame_set_id: i64, state: State<'_, AppState>) -> Res
 ///
 /// Drawn for the mode the tab has selected — the tree, file total and size
 /// estimate describe THAT export. `export_mode` `None` falls back to the
-/// persisted config like `export_to_wbpp`; the five generation options are
+/// persisted config like `export_to_wbpp`; the six generation options are
 /// read by `calibratedLights` only (the debayer flag decides the `c_*` names
 /// in the tree) and default the same way as the export's.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_export_summary(
     state: State<'_, AppState>,
     frame_set_id: i64,
@@ -453,13 +462,20 @@ pub async fn get_export_summary(
     params: Option<LightCalParams>,
     hot_pixel: Option<bool>,
     debayer: Option<bool>,
+    format: Option<athenaeum_core::fits_writer::OutputFormat>,
 ) -> Result<ExportSummary, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
     let config = load_wbpp_config(&conn).unwrap_or_default();
     let mode = resolve_export_mode(export_mode, &config);
-    let gen_opts =
-        CalibratedLightOptions::resolve(flat_norm, flat_norm_mode, params, hot_pixel, debayer);
+    let gen_opts = CalibratedLightOptions::resolve(
+        flat_norm,
+        flat_norm_mode,
+        params,
+        hot_pixel,
+        debayer,
+        format,
+    );
 
     collect_export_summary(&conn, frame_set_id, &config, mode, Some(&gen_opts))
         .map_err(|e| e.to_string())

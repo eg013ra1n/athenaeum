@@ -265,7 +265,8 @@ export's own destination tree. There is still no token-templating engine here
 - **Output naming**: `c_<original stem>.fits` for a mono light, or an OSC
   light with the VNG toggle off; `c_<original stem>_d.fits` for a debayered
   OSC light (3-plane; the Bayer cards are stripped since the mosaic is gone,
-  `ROWORDER` stays). An XISF source always yields a `.fits` output.
+  `ROWORDER` stays). The output container is the export's own choice (FITS
+  default, XISF optional); an XISF source does not decide it.
 - **Progress**: `export-progress` gains phase `"calibrating"` (per-frame
   `current`/`total`/`current_file`) alongside the existing `"copying"` phase
   used by the other modes; `cancel_export` and the existing progress/complete

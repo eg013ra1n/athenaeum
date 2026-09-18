@@ -369,6 +369,23 @@ pub struct GenerationBatch {
 #[cfg(not(feature = "render"))]
 pub enum GenerationBatch {}
 
+/// The container this batch's run is writing calibrated lights in — read
+/// once, before the placement loop, so `remove_stale_sibling` can name the
+/// opposite-toggle sibling in the SAME container the run itself is using.
+/// `None` (no batch: a copy-only export, or a `CalibrateLight` placement a
+/// headless build can never fulfil) has no run-chosen format to read, so it
+/// falls back to the type's own default (`Fits`) — harmless, since that path
+/// never writes a calibrated light in the first place.
+#[cfg(feature = "render")]
+fn generation_format(batch: Option<&GenerationBatch>) -> crate::fits_writer::OutputFormat {
+    batch.map(|b| b.opts.format).unwrap_or_default()
+}
+
+#[cfg(not(feature = "render"))]
+fn generation_format(_batch: Option<&GenerationBatch>) -> crate::fits_writer::OutputFormat {
+    crate::fits_writer::OutputFormat::Fits
+}
+
 #[cfg(feature = "render")]
 impl GenerationBatch {
     /// Resolve a plan for every light the calibrated-lights transform marked.
@@ -586,6 +603,11 @@ pub fn organize_files_wbpp(
     };
 
     let mut generation = generation;
+    // Read once, before any mutable borrow of `generation` below: the
+    // container this run's calibrated lights are written in, so a stale
+    // opposite-toggle sibling from an earlier run is named in the SAME
+    // container this run is using.
+    let format = generation_format(generation.as_deref());
     let mut claims = DestClaims::default();
     for placement in &placements {
         if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -630,6 +652,7 @@ pub fn organize_files_wbpp(
                             &placement.file_path,
                             &filename,
                             debayer,
+                            format,
                             |name| claims.is_claimed(&placement.rel_dir, name),
                             &mut warnings,
                         );
@@ -674,6 +697,7 @@ pub fn organize_files_wbpp(
                             &placement.file_path,
                             &filename,
                             debayer,
+                            format,
                             |name| claims.is_claimed(&placement.rel_dir, name),
                             &mut warnings,
                         );
@@ -720,16 +744,17 @@ fn remove_stale_sibling(
     source_path: &str,
     placed_filename: &str,
     debayer: bool,
+    format: crate::fits_writer::OutputFormat,
     already_placed: impl Fn(&str) -> bool,
     warnings: &mut Vec<String>,
 ) {
     let Some(source_name) = Path::new(source_path).file_name().and_then(|n| n.to_str()) else {
         return;
     };
-    if calibrated_output_filename(source_name, debayer) != placed_filename {
+    if calibrated_output_filename(source_name, debayer, format) != placed_filename {
         return;
     }
-    let sibling_name = calibrated_output_filename(source_name, !debayer);
+    let sibling_name = calibrated_output_filename(source_name, !debayer, format);
     if already_placed(&sibling_name) {
         return;
     }
