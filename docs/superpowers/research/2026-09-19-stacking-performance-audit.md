@@ -436,7 +436,7 @@ Effort in engineer-days on this codebase; "Δ" is the expected change on the
 50-min reference run (16 GB / 10 cores); "bytes" says whether the M1–M4d
 byte-identity pins survive.
 
-**Tier 1 — structural, output-identical (≈ 5–7 days, Δ ≈ −18 min)**
+**Tier 1 — structural, output-identical (≈ 5–7 days, Δ ≈ −15 min after the item-7 withdrawal below)**
 
 | # | Item | Stage | Δ (min) | bytes |
 | - | ---- | ----- | ------- | ----- |
@@ -446,7 +446,7 @@ byte-identity pins survive.
 | 4 | One pool: `install` around VNG / `noise_mrs` / LN detect+fit / band-worker `warp_rows`; admission clamped to the pool | all | −1 (and predictability) | identical |
 | 5 | LN: one `RegisteredSource` per frame via `set_plane`; pool into `detect_stars` | LN | −1 to −2 (−more with TPS) | identical |
 | 6 | Register: carry the dry pass's star lists into the persisting pass | Register | −0.5 | identical |
-| 7 | Drizzle: corner-sharing cache for `fwd.at()`; one read per frame across channels | Drizzle | −2 to −3 | identical |
+| ~~7~~ | ~~Drizzle: corner-sharing cache for `fwd.at()`~~ — **withdrawn while planning**: the four corners of the drop at `(x, y)` sit at `x ± drop_shrink/2`, so with the default `drop_shrink = 0.9` no corner is shared with a neighbouring drop; the cache exists only at `drop_shrink = 1.0`. The one-read-per-frame-across-channels item is worth ≈ 3 % of the stage and moves to tier 2 beside the phase table. | Drizzle | 0 | — |
 
 **Tier 2 — algorithmic, numeric change under the existing hash-bump
 mechanism (≈ 5–8 days, Δ ≈ −8 to −10 min more)**
