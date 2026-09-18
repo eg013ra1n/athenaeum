@@ -1,0 +1,102 @@
+// Settings redesign (spec 2026-09-18 §2) — Blink tab, "Blink viewer".
+// `blink.threads`'s range depends on `get_blink_threads_max` (CPU-count
+// dependent, not a fixed default) and its write rebuilds the blink
+// semaphore immediately, so it goes through `set_blink_threads` /
+// `get_blink_threads_max` rather than the default `get_setting`/
+// `set_setting` pair (plan Task C1 Step 3).
+import { useEffect, useState } from 'react';
+import { api } from '../../../api';
+import { SettingsSection } from '../SettingsSection';
+import { SettingSelect } from '../SettingSelect';
+import { SettingNumber } from '../SettingNumber';
+import { intCodec, enumCodec } from '../../../settings/codecs';
+
+const RESOLUTION_OPTIONS = [
+  { value: 'thumbnail', label: 'Thumbnail (4x downscale)' },
+  { value: 'preview', label: 'Preview (2x2 binning)' },
+  { value: 'full', label: 'Full Resolution' },
+] as const;
+
+const resolutionCodec = enumCodec(['thumbnail', 'preview', 'full'] as const);
+
+export function BlinkViewerSection() {
+  const [threadsMax, setThreadsMax] = useState(4);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.invoke<number>('get_blink_threads_max')
+      .then((max) => { if (!cancelled && typeof max === 'number') setThreadsMax(max); })
+      .catch((err) => console.error('[Settings] get_blink_threads_max failed:', err));
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <SettingsSection id="blink.viewer">
+      <div className="space-y-4">
+        <SettingSelect
+          section="blink.viewer"
+          field="resolution"
+          settingKey="blink.resolution"
+          codec={resolutionCodec}
+          options={RESOLUTION_OPTIONS}
+        />
+
+        <SettingNumber
+          section="blink.viewer"
+          field="qualityThumbnail"
+          settingKey="rustafits.quality.thumbnail"
+          codec={intCodec(10, 100)}
+          variant="slider"
+          min={10}
+          max={100}
+        />
+        <SettingNumber
+          section="blink.viewer"
+          field="qualityPreview"
+          settingKey="rustafits.quality.preview"
+          codec={intCodec(10, 100)}
+          variant="slider"
+          min={10}
+          max={100}
+        />
+        <SettingNumber
+          section="blink.viewer"
+          field="qualityFull"
+          settingKey="rustafits.quality.full"
+          codec={intCodec(10, 100)}
+          variant="slider"
+          min={10}
+          max={100}
+        />
+
+        <SettingNumber
+          section="blink.viewer"
+          field="threads"
+          settingKey="blink.threads"
+          codec={intCodec(0, threadsMax)}
+          write={(v) => api.invoke('set_blink_threads', { threads: v })}
+        />
+        <SettingNumber
+          section="blink.viewer"
+          field="cacheSize"
+          settingKey="blink.memory_cache_size"
+          codec={intCodec(10, 5000)}
+          step={10}
+        />
+        <SettingNumber
+          section="blink.viewer"
+          field="cacheMaxMb"
+          settingKey="blink.memory_cache_max_mb"
+          codec={intCodec(64, 16384)}
+          step={64}
+        />
+        <SettingNumber
+          section="blink.viewer"
+          field="retentionMinutes"
+          settingKey="blink.memory_retention_minutes"
+          codec={intCodec(1, 1440)}
+        />
+      </div>
+    </SettingsSection>
+  );
+}
