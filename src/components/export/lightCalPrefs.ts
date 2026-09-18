@@ -25,6 +25,11 @@ export const LIGHTCAL_HOT_PIXEL_KEY = 'athenaeum.lightcal.hotPixel';
 /** localStorage key for the OSC debayer toggle (default ON). */
 export const LIGHTCAL_DEBAYER_KEY = 'athenaeum.lightcal.debayer';
 
+/** localStorage key for the calibrated-light container (default 'fits'). */
+export const LIGHTCAL_FORMAT_KEY = 'athenaeum.lightcal.format';
+
+export type CalibratedLightFormat = 'fits' | 'xisf';
+
 /** Advanced-parameter defaults — these reproduce the engine's current behavior
  *  (see `LightCalParams::default` in `calibration_library/light_cal.rs`). */
 export const DEFAULT_LIGHTCAL_PARAMS: LightCalParams = {
@@ -112,6 +117,17 @@ export function readDebayerPref(): boolean {
   }
 }
 
+/** Read the persisted calibrated-light container (default 'fits' when
+ *  unset/corrupt — any value other than the exact 'xisf' token falls back). */
+export function readLightCalFormatPref(): CalibratedLightFormat {
+  try {
+    return localStorage.getItem(LIGHTCAL_FORMAT_KEY) === 'xisf' ? 'xisf' : 'fits';
+  } catch (err) {
+    console.warn('[lightCalPrefs] read format preference failed:', err);
+    return 'fits';
+  }
+}
+
 /** Persist the Advanced parameters. Best-effort: a storage failure loses the
  *  memory of the choice, never the choice itself (the caller already holds it). */
 export function writeLightCalParamsPref(params: LightCalParams): void {
@@ -155,5 +171,14 @@ export function writeDebayerPref(on: boolean): void {
     localStorage.setItem(LIGHTCAL_DEBAYER_KEY, String(on));
   } catch (err) {
     console.warn('[lightCalPrefs] write debayer preference failed:', err);
+  }
+}
+
+/** Persist the calibrated-light container. */
+export function writeLightCalFormatPref(format: CalibratedLightFormat): void {
+  try {
+    localStorage.setItem(LIGHTCAL_FORMAT_KEY, format);
+  } catch (err) {
+    console.warn('[lightCalPrefs] write format preference failed:', err);
   }
 }

@@ -56,6 +56,7 @@ export function useExportSummary(
               params: lightCal.params,
               hotPixel: lightCal.hotPixel,
               debayer: lightCal.debayer,
+              format: lightCal.format,
             }
           : {}),
       });

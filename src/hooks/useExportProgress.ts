@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom';
 import { api, type UnlistenFn } from '../api';
 import type { ExportProgressEvent, ExportCompleteEvent, ExportResult, ExportMode } from '../types/export';
 import type { FlatNormMode, LightCalParams } from '../types/models';
+import type { CalibratedLightFormat } from '../components/export/lightCalPrefs';
 import { useNotifications } from '../contexts/NotificationContext';
 
 /** Generation options forwarded to `export_to_wbpp`. In `calibratedLights` mode
@@ -17,6 +18,8 @@ export interface ExportLightCalPrefs {
   hotPixel: boolean;
   /** Debayer CFA lights to full-resolution RGB. */
   debayer: boolean;
+  /** Container the calibrated output is written in — FITS or XISF. */
+  format: CalibratedLightFormat;
 }
 
 export interface ActiveExport {
@@ -153,6 +156,7 @@ export function useExportProgress() {
                 params: lightCalPrefs.params,
                 hotPixel: lightCalPrefs.hotPixel,
                 debayer: lightCalPrefs.debayer,
+                format: lightCalPrefs.format,
               }
             : {}),
         });

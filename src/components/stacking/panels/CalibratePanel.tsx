@@ -109,6 +109,11 @@ export function CalibratePanel({ config, onChange, plan, disabled }: CalibratePa
           />
           <span className="text-sm text-content-secondary">Debayer OSC lights (VNG)</span>
         </label>
+
+        <p className="text-[11px] text-content-muted">
+          Intermediate calibrated frames in the working folder are always FITS. The export and send
+          format is chosen on the Export tab.
+        </p>
       </div>
     </div>
   );

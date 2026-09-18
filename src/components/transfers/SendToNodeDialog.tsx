@@ -17,6 +17,7 @@ import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useSyncSend, summarizeIneligible, errMsg } from '../../hooks/useSyncSend';
 import { formatTimestamp } from '../../utils/dateFormatting';
+import type { CalibratedLightFormat } from '../export/lightCalPrefs';
 import type { ExportMode } from '../../types/export';
 import type {
   AccountDevice,
@@ -42,6 +43,8 @@ export interface LightCalOptions {
   hotPixel: boolean;
   /** Debayer a CFA light to planar RGB (default ON; inert for mono). */
   debayer: boolean;
+  /** Container the calibrated output is written in — FITS or XISF. */
+  format: CalibratedLightFormat;
 }
 
 /** Compact display for a hub-assigned device id (opaque, can be long). Mirrors the

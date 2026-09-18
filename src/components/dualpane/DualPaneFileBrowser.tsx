@@ -60,6 +60,7 @@ import {
   readLightCalParamsPref,
   readHotPixelPref,
   readDebayerPref,
+  readLightCalFormatPref,
 } from '../export/lightCalPrefs';
 import CatalogSearch from './CatalogSearch';
 import MetadataPane from './MetadataPane';
@@ -380,6 +381,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     params: readLightCalParamsPref(),
     hotPixel: readHotPixelPref(),
     debayer: readDebayerPref(),
+    format: readLightCalFormatPref(),
   }));
   const refreshTokenRef = useRef(0);
   /** Per-pane generation counter for in-flight directory loads. Each call to
@@ -918,6 +920,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         params: readLightCalParamsPref(),
         hotPixel: readHotPixelPref(),
         debayer: readDebayerPref(),
+        format: readLightCalFormatPref(),
       });
       setSendOpen(true);
     } catch (e) {

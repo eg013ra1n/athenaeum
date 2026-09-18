@@ -26,11 +26,14 @@ import {
   readLightCalParamsPref,
   readHotPixelPref,
   readDebayerPref,
+  readLightCalFormatPref,
   writeFlatNormPref,
   writeFlatNormModePref,
   writeLightCalParamsPref,
   writeHotPixelPref,
   writeDebayerPref,
+  writeLightCalFormatPref,
+  type CalibratedLightFormat,
 } from './lightCalPrefs';
 import type { CalibrationDetail, ExportMode } from '../../types/export';
 import type {
@@ -160,6 +163,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [hotPixel, setHotPixel] = useState<boolean>(readHotPixelPref);
   const [debayer, setDebayer] = useState<boolean>(readDebayerPref);
+  const [format, setFormat] = useState<CalibratedLightFormat>(readLightCalFormatPref);
 
   // The two numeric Advanced fields keep their own string state so a partial
   // edit ("0.") survives until it parses; `params` stays the committed numeric
@@ -227,6 +231,10 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
     setDebayer(on);
     writeDebayerPref(on);
   }, []);
+  const handleFormatChange = useCallback((next: CalibratedLightFormat) => {
+    setFormat(next);
+    writeLightCalFormatPref(next);
+  }, []);
 
   // Readiness for the whole set — one fetch, mode-independent: it carries every
   // mode's file count plus the two blocker tallies. The gate here is UX; the
@@ -249,8 +257,8 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
   // only to calibrated lights (the debayer toggle decides the `c_*` names in
   // the tree), so the other modes don't re-fetch on a toggle.
   const summaryLightCal = useMemo<ExportLightCalPrefs | undefined>(
-    () => (exportMode === 'calibratedLights' ? { flatNorm, flatNormMode, params, hotPixel, debayer } : undefined),
-    [exportMode, flatNorm, flatNormMode, params, hotPixel, debayer],
+    () => (exportMode === 'calibratedLights' ? { flatNorm, flatNormMode, params, hotPixel, debayer, format } : undefined),
+    [exportMode, flatNorm, flatNormMode, params, hotPixel, debayer, format],
   );
   // Not before readiness has answered: only then is the mode above final, and
   // a blocked mode's summary is a refusal, not a tree.
@@ -457,12 +465,13 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
         params,
         hotPixel,
         debayer,
+        format,
       }, exportMode);
     } catch (err) {
       console.error('Failed to start export:', err);
       setExportError(typeof err === 'string' ? err : (err as Error)?.message ?? String(err));
     }
-  }, [frameSetId, outputDir, useSymlinks, exportMode, flatNorm, flatNormMode, params, hotPixel, debayer, wbppConfig, saveWbppConfig, startExport]);
+  }, [frameSetId, outputDir, useSymlinks, exportMode, flatNorm, flatNormMode, params, hotPixel, debayer, format, wbppConfig, saveWbppConfig, startExport]);
 
   const canExport = outputDir !== '' && !exporting && modeReady;
   // Sending needs no output folder — the payload is staged by the backend.
@@ -675,6 +684,20 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                     />
                     <span className="text-sm text-content-secondary">Debayer OSC lights (VNG)</span>
                   </label>
+                </div>
+
+                <div>
+                  <div className="text-xs font-medium text-content-secondary mb-1">Output format</div>
+                  <div className="flex gap-4">
+                    {(['fits', 'xisf'] as const).map((v) => (
+                      <label key={v} className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer">
+                        <input type="radio" name="lightcal-format" checked={format === v} onChange={() => handleFormatChange(v)}
+                               className="w-3.5 h-3.5 text-accent border-border focus:ring-accent" />
+                        {v === 'fits' ? 'FITS' : 'XISF'}
+                      </label>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-content-muted mt-1">Same header cards either way. XISF is the container WBPP reads natively.</p>
                 </div>
 
                 {/* Advanced parameters (spec §2) — collapsed and secondary by
@@ -941,7 +964,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
           // Same live state the export submits at handleExport above (D-1,
           // review fix) — never a localStorage re-read, so an unsaved edit in
           // the controls can't disagree with what Send actually ships.
-          lightCalOptions={{ flatNorm, flatNormMode, params, hotPixel, debayer }}
+          lightCalOptions={{ flatNorm, flatNormMode, params, hotPixel, debayer, format }}
         />
       )}
     </div>

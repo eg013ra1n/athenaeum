@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import type { ExportMode } from '../types/export';
+import type { CalibratedLightFormat } from '../components/export/lightCalPrefs';
 import type {
   EnqueueSelectionResult,
   FlatNormMode,
@@ -78,6 +79,8 @@ export interface FrameSetSendOptions {
   hotPixel: boolean;
   /** Debayer a CFA light to planar RGB (default ON; inert for mono). */
   debayer: boolean;
+  /** Container the calibrated output is written in — FITS or XISF. */
+  format: CalibratedLightFormat;
 }
 
 export interface UseSyncSend {
@@ -176,6 +179,7 @@ export function useSyncSend(): UseSyncSend {
                 params: opts.params,
                 hotPixel: opts.hotPixel,
                 debayer: opts.debayer,
+                format: opts.format,
               });
               return { deviceId, result };
             } catch (err) {
