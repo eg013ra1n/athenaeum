@@ -305,7 +305,7 @@ export function AnalysisSettingsPanel() {
         resetScopeLabel="This resets the whole Analysis configuration back to its default."
         actions={<SavedTick savedAt={savedAt} />}
       >
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           <DocNumberField
             section="analysis.detection"
             field="detectionSigma"
@@ -404,7 +404,7 @@ export function AnalysisSettingsPanel() {
 
       {/* PSF Fitting */}
       <SettingsSection id="analysis.psf" actions={<SavedTick savedAt={savedAt} />}>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           <DocNumberField
             section="analysis.psf"
             field="measureCap"

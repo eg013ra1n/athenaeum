@@ -488,7 +488,7 @@ export function PlateSolveSettingsPanel() {
 
       {/* Solver Parameters */}
       <SettingsSection id="plateSolving.solver" actions={<SavedTick savedAt={savedAt} />}>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           <DocNumberField
             section="plateSolving.solver"
             field="verificationTolerance"
@@ -501,7 +501,7 @@ export function PlateSolveSettingsPanel() {
             isDefault={isDefault('base_verification_tolerance_arcsec')}
             defaultValue={defaults?.plateSolve?.base_verification_tolerance_arcsec ?? config.base_verification_tolerance_arcsec}
             onReset={() => resetField('base_verification_tolerance_arcsec')}
-            help="Base angular tolerance for the persisted-solve confidence gate. The actual pixel tolerance adapts per frame: base / pixel_scale, clamped to [4, 20] px. Default 8.0″."
+            help="Base angular tolerance for the persisted-solve confidence gate. The actual pixel tolerance adapts per frame: base / pixel_scale, clamped to [4, 20] px."
           />
           <DocNumberField
             section="plateSolving.solver"
@@ -571,7 +571,7 @@ export function PlateSolveSettingsPanel() {
           those frames, so it rates many of them as round.
         </p>
         <div
-          className={`grid grid-cols-1 gap-4 sm:grid-cols-2 ${
+          className={`grid grid-cols-1 gap-4 md:grid-cols-2 ${
             config.input_gate_enabled ? '' : 'opacity-50'
           }`}
         >

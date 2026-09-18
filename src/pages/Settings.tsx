@@ -25,6 +25,11 @@ const VALID_TABS: readonly SettingsTabId[] = SETTINGS_TABS.map((t) => t.id);
 /** How long the `?section=` deep-link's highlight ring stays visible. */
 const SECTION_FLASH_MS = 1200;
 
+/** How often to poll for a deep-linked section's DOM node, and for how long
+ *  before giving up — see `useSectionDeepLink`. */
+const SECTION_POLL_INTERVAL_MS = 100;
+const SECTION_POLL_TIMEOUT_MS = 2000;
+
 function isSettingsTabId(v: string): v is SettingsTabId {
   return (VALID_TABS as readonly string[]).includes(v);
 }
@@ -40,19 +45,36 @@ function useSectionDeepLink(activeTab: SettingsTabId) {
   useEffect(() => {
     if (!section) return;
     // The target section only exists in the DOM once its owning tab is
-    // active — wait a tick for the tab body to mount/re-render before
-    // looking it up.
-    const raf = requestAnimationFrame(() => {
+    // active, and some panels (e.g. Calibration's) mount their sections
+    // asynchronously after their own data load — poll rather than assuming
+    // one frame is enough.
+    let cancelled = false;
+    let flashTimeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = Date.now() + SECTION_POLL_TIMEOUT_MS;
+
+    const tryScroll = () => {
+      if (cancelled) return;
       const el = document.getElementById(`settings-${section}`);
-      if (!el) return;
-      el.scrollIntoView({ block: 'start', behavior: 'smooth' });
-      el.classList.add('ring-2', 'ring-accent', 'transition-shadow');
-      const t = setTimeout(() => {
-        el.classList.remove('ring-2', 'ring-accent', 'transition-shadow');
-      }, SECTION_FLASH_MS);
-      return () => clearTimeout(t);
-    });
-    return () => cancelAnimationFrame(raf);
+      if (el) {
+        el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        el.classList.add('ring-2', 'ring-accent', 'transition-shadow');
+        flashTimeout = setTimeout(() => {
+          el.classList.remove('ring-2', 'ring-accent', 'transition-shadow');
+        }, SECTION_FLASH_MS);
+        return;
+      }
+      if (Date.now() < deadline) {
+        pollTimeout = setTimeout(tryScroll, SECTION_POLL_INTERVAL_MS);
+      }
+    };
+
+    let pollTimeout: ReturnType<typeof setTimeout> = setTimeout(tryScroll, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(pollTimeout);
+      clearTimeout(flashTimeout);
+    };
     // Re-run whenever the section id changes, or the active tab changes
     // (the same `?section=` can be visited again after switching away and
     // back — e.g. a repeated "→ Coverage"-style deep link).
@@ -77,6 +99,9 @@ function SettingsContent() {
       (prev) => {
         const next = new URLSearchParams(prev);
         next.set('tab', tab);
+        // A `?section=` deep link only applies to the tab it was opened
+        // for — picking a different tab by hand should not carry it along.
+        next.delete('section');
         return next;
       },
       { replace: true },
@@ -95,7 +120,7 @@ function SettingsContent() {
   useSectionDeepLink(activeTab);
 
   return (
-    <div className="p-6 max-w-4xl">
+    <div className="p-6 max-w-7xl">
       <div className="mb-6 flex items-center gap-2">
         <HistoryNav />
         <div>
@@ -117,7 +142,7 @@ function SettingsContent() {
           whichever tab was already selected (`activeTab` is untouched by
           search). */}
       <div
-        className={`flex gap-1 mb-6 mt-4 border-b border-border overflow-x-auto ${
+        className={`flex flex-wrap gap-1 mb-6 mt-4 border-b border-border ${
           isSearching ? 'opacity-50 pointer-events-none' : ''
         }`}
         aria-disabled={isSearching}
@@ -128,7 +153,7 @@ function SettingsContent() {
             onClick={() => setActiveTab(id)}
             disabled={isSearching}
             tabIndex={isSearching ? -1 : undefined}
-            className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors whitespace-nowrap ${
+            className={`flex items-center gap-2 px-3 py-2 rounded-t-lg transition-colors whitespace-nowrap ${
               activeTab === id
                 ? 'bg-surface-elevated text-white border-b-2 border-accent'
                 : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'

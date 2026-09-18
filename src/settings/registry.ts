@@ -110,7 +110,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'gapHours',
         label: 'Session gap threshold (hours)',
-        help: 'A gap longer than this between two lights starts a new night. Typical night sessions can span midnight (e.g. 19:00 Day 1 → 03:00 Day 2 = one night). Default is 6 hours.',
+        help: 'A gap longer than this between two lights starts a new night. Typical night sessions can span midnight (e.g. 19:00 Day 1 → 03:00 Day 2 = one night).',
         keywords: ['session_gap_threshold_hours', 'night', 'imaging night'],
       },
     ],
@@ -129,7 +129,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'intervalMinutes',
         label: 'Polling interval (minutes)',
-        help: 'How often to re-scan each monitor-enabled folder for new files. The scanner is idempotent, so short intervals are fine on local drives but may be costly for large NAS directories. Default is 10 minutes.',
+        help: 'How often to re-scan each monitor-enabled folder for new files. The scanner is idempotent, so short intervals are fine on local drives but may be costly for large NAS directories.',
         keywords: ['monitoring.interval_minutes'],
       },
     ],
@@ -248,19 +248,19 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'qualityThumbnail',
         label: 'Thumbnail JPEG Quality',
-        help: 'JPEG quality for thumbnail images. Default: 70.',
+        help: 'JPEG quality for thumbnail images.',
         keywords: ['rustafits.quality.thumbnail'],
       },
       {
         id: 'qualityPreview',
         label: 'Preview JPEG Quality',
-        help: 'JPEG quality for preview/blink viewer images. Default: 85.',
+        help: 'JPEG quality for preview/blink viewer images.',
         keywords: ['rustafits.quality.preview'],
       },
       {
         id: 'qualityFull',
         label: 'Full Resolution JPEG Quality',
-        help: 'JPEG quality for full resolution images. Default: 95.',
+        help: 'JPEG quality for full resolution images.',
         keywords: ['rustafits.quality.full'],
       },
       {
@@ -272,19 +272,19 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'cacheSize',
         label: 'Memory Cache Size (images)',
-        help: 'Maximum number of images kept in the memory cache. Default: 200.',
+        help: 'Maximum number of images kept in the memory cache.',
         keywords: ['blink.memory_cache_size'],
       },
       {
         id: 'cacheMaxMb',
         label: 'Memory Cache Limit (MB)',
-        help: 'Total memory the image cache may use, whichever limit is reached first. Default: 512 MB.',
+        help: 'Total memory the image cache may use, whichever limit is reached first.',
         keywords: ['blink.memory_cache_max_mb'],
       },
       {
         id: 'retentionMinutes',
         label: 'Memory Cache Retention (minutes)',
-        help: 'Cached images are automatically evicted after this many minutes of inactivity. Default: 30.',
+        help: 'Cached images are automatically evicted after this many minutes of inactivity.',
         keywords: ['blink.memory_retention_minutes'],
       },
     ],
@@ -431,7 +431,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'mrsLayers',
         label: 'MRS Wavelet Layers',
-        help: 'MRS wavelet noise estimation layers. Higher = more accurate noise on nebula-rich fields. Default: 0 (off, 0-10).',
+        help: 'MRS wavelet noise estimation layers. Higher = more accurate noise on nebula-rich fields. 0 = off (range 0-10).',
         keywords: ['mrs_layers'],
       },
     ],
@@ -444,25 +444,25 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'measureCap',
         label: 'Measure Cap',
-        help: 'Max stars to PSF-fit. 0 = measure all. Default: 2000.',
+        help: 'Max stars to PSF-fit. 0 = measure all.',
         keywords: ['measure_cap'],
       },
       {
         id: 'fitMaxIter',
         label: 'Fit Max Iterations',
-        help: 'LM max iterations. Increase for accuracy, decrease for speed. Default: 25.',
+        help: 'LM max iterations. Increase for accuracy, decrease for speed.',
         keywords: ['fit_max_iter'],
       },
       {
         id: 'fitTolerance',
         label: 'Fit Tolerance',
-        help: 'LM convergence tolerance. Lower = tighter convergence. Default: 0.0001.',
+        help: 'LM convergence tolerance. Lower = tighter convergence.',
         keywords: ['fit_tolerance'],
       },
       {
         id: 'fitMaxRejects',
         label: 'Fit Max Rejects',
-        help: 'LM consecutive reject bailout. Default: 5.',
+        help: 'LM consecutive reject bailout.',
         keywords: ['fit_max_rejects'],
       },
     ],
@@ -552,7 +552,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'verificationTolerance',
         label: 'Verification Tolerance (arcsec)',
-        help: 'Base angular tolerance for the persisted-solve confidence gate. Default 8.0".',
+        help: 'Base angular tolerance for the persisted-solve confidence gate.',
         keywords: ['base_verification_tolerance_arcsec'],
       },
       {
@@ -564,13 +564,13 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'autofindTolerance',
         label: 'Autofind Object Tolerance (°)',
-        help: 'Maximum great-circle distance between a frame\'s RA/Dec and a named DSO for the "Autofind Object" batch action to accept the match. Default 0.5°.',
+        help: 'Maximum great-circle distance between a frame\'s RA/Dec and a named DSO for the "Autofind Object" batch action to accept the match.',
         keywords: ['autofind_tolerance_deg'],
       },
       {
         id: 'batchConcurrency',
         label: 'Batch Concurrency',
-        help: 'Worker threads for batch solving. 0 means auto — cores / 3, clamped to 2–8. Default 0.',
+        help: 'Worker threads for batch solving. 0 means auto — cores / 3, clamped to 2–8.',
         keywords: ['batch_concurrency'],
       },
     ],
@@ -590,13 +590,13 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'maxEccentricity',
         label: 'Max Median Eccentricity',
-        help: 'How elongated the average star may be before the frame is a candidate for refusal. Default 0.85.',
+        help: 'How elongated the average star may be before the frame is a candidate for refusal.',
         keywords: ['input_max_eccentricity'],
       },
       {
         id: 'minTrailR2',
         label: 'Min Trail R²',
-        help: 'How well the elongation lines up along one direction — high means a tracking failure rather than soft seeing. Default 0.65.',
+        help: 'How well the elongation lines up along one direction — high means a tracking failure rather than soft seeing.',
         keywords: ['input_min_trail_r2'],
       },
     ],
@@ -821,7 +821,7 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       {
         id: 'concurrent',
         label: 'Simultaneous incoming transfers',
-        help: 'How many incoming transfers download at once. Others wait their turn — transfers from the same device always arrive in order. Default 2.',
+        help: 'How many incoming transfers download at once. Others wait their turn — transfers from the same device always arrive in order.',
         keywords: ['sync.max_concurrent_receives', 'set_sync_max_concurrent_receives'],
       },
     ],

@@ -114,7 +114,7 @@ export function StarAnnotationSection() {
         <div className="flex items-center justify-end -mb-2">
           <SavedTick savedAt={savedAt} />
         </div>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
             <label className="block text-xs text-content-secondary mb-1">Color Scheme</label>
             <select
@@ -147,7 +147,7 @@ export function StarAnnotationSection() {
           label="Show direction tick on elongated stars"
         />
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {numberField('ecc_good', 'Eccentricity Good (<)', 0, 1, 0.05)}
           {numberField('ecc_warn', 'Eccentricity Warn (>)', 0, 1, 0.05)}
           {numberField('fwhm_good', 'FWHM Good (ratio <)', 0.5, 5, 0.1)}

@@ -6,7 +6,7 @@ import { intCodec, floatCodec } from '../../../settings/codecs';
 export function FlatContourSection() {
   return (
     <SettingsSection id="blink.flatContour">
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         <SettingNumber
           section="blink.flatContour"
           field="resolutionPct"

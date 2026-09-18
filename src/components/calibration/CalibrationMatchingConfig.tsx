@@ -489,7 +489,7 @@ export default function CalibrationMatchingConfig() {
               <p className="text-sm text-content-muted mb-4">
                 Warn when calibration frames are older than these thresholds.
               </p>
-              <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
                 <DraftNumberField
                   label="Flat Date Warning (days)"
                   help="Warn if flat frames are older than this many days"
@@ -535,7 +535,7 @@ export default function CalibrationMatchingConfig() {
                 Choose whether to prefer Master calibration frames or frame sets
                 when both are available.
               </p>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
                 {["flat", "dark", "bias", "darkflat"].map((type) => (
                   <div key={type}>
                     <label className="block text-sm font-medium text-content-secondary mb-2 capitalize">

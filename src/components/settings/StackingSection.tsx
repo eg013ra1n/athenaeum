@@ -291,8 +291,8 @@ export default function StackingSection() {
             </div>
           )
         ) : (
-          <div className="flex flex-col md:flex-row gap-4">
-            <div className="md:w-56 shrink-0">
+          <div className="flex flex-col md:flex-row gap-4 xl:gap-6">
+            <div className="md:w-56 xl:w-64 shrink-0">
               <div className="flex flex-row md:flex-col gap-1 overflow-x-auto md:overflow-visible">
                 {STAGES.map((stage, i) => (
                   <button
