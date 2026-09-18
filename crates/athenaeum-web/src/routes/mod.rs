@@ -105,6 +105,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_setting", post(settings::get_setting))
         .route("/api/set_setting", post(settings::set_setting))
         .route("/api/delete_setting", post(settings::delete_setting))
+        .route("/api/get_settings_defaults", post(settings::get_settings_defaults))
         .route("/api/get_logging_config", post(settings::get_logging_config))
         .route("/api/set_logging_config", post(settings::set_logging_config))
         // Cache & blink (Category C — modified behavior in web mode)

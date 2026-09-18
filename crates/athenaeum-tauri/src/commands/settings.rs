@@ -20,7 +20,9 @@ pub async fn get_setting(
     let conn = db.conn();
 
     let default = default_value.unwrap_or_default();
-    state.ctx.settings
+    state
+        .ctx
+        .settings
         .get_with_precedence(&conn, &key, &default)
         .map_err(|e| e.to_string())
 }
@@ -36,7 +38,9 @@ pub async fn set_setting(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    state.ctx.settings
+    state
+        .ctx
+        .settings
         .persist_setting(&conn, &key, &value)
         .map_err(|e| e.to_string())?;
 
@@ -46,10 +50,20 @@ pub async fn set_setting(
         state.ctx.memory_cache.lock().unwrap().set_max_entries(size);
     } else if key == settings::keys::BLINK_MEMORY_CACHE_MAX_MB {
         let mb = settings::resolve_blink_memory_cache_max_mb(Some(&value));
-        state.ctx.memory_cache.lock().unwrap().set_max_bytes(mb * 1024 * 1024);
+        state
+            .ctx
+            .memory_cache
+            .lock()
+            .unwrap()
+            .set_max_bytes(mb * 1024 * 1024);
     } else if key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
         let minutes: u64 = value.parse().unwrap_or(30);
-        state.ctx.memory_cache.lock().unwrap().set_retention(minutes);
+        state
+            .ctx
+            .memory_cache
+            .lock()
+            .unwrap()
+            .set_retention(minutes);
     } else if key == settings::keys::MONITORING_INTERVAL_MINUTES
         || key == settings::keys::MONITORING_ENABLED_GLOBAL
     {
@@ -76,30 +90,39 @@ pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(
 /// and rebuilds the semaphore.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn set_blink_threads(
-    threads: u32,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn set_blink_threads(threads: u32, state: State<'_, AppState>) -> Result<(), String> {
     let max = state.max_blink_threads as u32;
     if threads > max {
-        return Err(format!("Blink threads must be between 0 and {} (0 = auto)", max));
+        return Err(format!(
+            "Blink threads must be between 0 and {} (0 = auto)",
+            max
+        ));
     }
 
     // Persist to DB
     {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        state.ctx.settings
+        state
+            .ctx
+            .settings
             .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
             .map_err(|e| e.to_string())?;
     }
 
     // Rebuild semaphore — 0 means auto (half of available cores)
-    let effective = if threads == 0 { ((max as usize) / 2).max(2) } else { threads as usize };
-    *state.image_semaphore.write().unwrap() =
-        Arc::new(tokio::sync::Semaphore::new(effective));
+    let effective = if threads == 0 {
+        ((max as usize) / 2).max(2)
+    } else {
+        threads as usize
+    };
+    *state.image_semaphore.write().unwrap() = Arc::new(tokio::sync::Semaphore::new(effective));
 
-    tracing::info!(permits = effective, requested = threads, "blink semaphore rebuilt");
+    tracing::info!(
+        permits = effective,
+        requested = threads,
+        "blink semaphore rebuilt"
+    );
     Ok(())
 }
 
@@ -122,18 +145,22 @@ pub async fn get_logging_config(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    let config = match db::get_setting(&conn, logging::config::SETTINGS_KEY).map_err(|e| e.to_string())? {
-        Some(raw) => serde_json::from_str::<logging::LoggingConfig>(&raw).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "invalid stored logging config; using default");
-            logging::LoggingConfig::default()
-        }),
-        None => logging::LoggingConfig::default(),
-    };
+    let config =
+        match db::get_setting(&conn, logging::config::SETTINGS_KEY).map_err(|e| e.to_string())? {
+            Some(raw) => serde_json::from_str::<logging::LoggingConfig>(&raw).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "invalid stored logging config; using default");
+                logging::LoggingConfig::default()
+            }),
+            None => logging::LoggingConfig::default(),
+        };
     let env_override_active = logging::global_handle()
         .map(|h| h.env_override_active())
         .unwrap_or(false);
 
-    Ok(logging::config::LoggingConfigResponse { config, env_override_active })
+    Ok(logging::config::LoggingConfigResponse {
+        config,
+        env_override_active,
+    })
 }
 
 /// Validates the config (rejects an out-of-range level or per-module level,
@@ -162,4 +189,16 @@ pub async fn set_logging_config(
     }
 
     Ok(())
+}
+
+// ── Settings page defaults (Settings redesign) ───────────────────────────────
+
+/// Every default the Settings page needs, in one round trip: every KV
+/// default plus the typed defaults of the four `reset_*`-backed configs.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_settings_defaults(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::api::settings::SettingsDefaults, String> {
+    athenaeum_core::api::settings::get_settings_defaults(&state.ctx).map_err(|e| e.to_string())
 }

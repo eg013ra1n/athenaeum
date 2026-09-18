@@ -74,6 +74,14 @@ pub mod collab;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod stacking;
 
+// The Settings page's one source of defaults (Settings redesign spec §6):
+// `SettingsDefaults` bundles every KV default with the typed defaults of
+// `analysis`/`plate_solve`/`stacking`, so it needs all three — gated the same
+// way `stacking`/`objects` are; `calibration`/`logging` are ungated but
+// already inside the same feature combo here.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod settings;
+
 // Slice-5 capstone: the three-instance collaboration E2E (publish → moderation →
 // swarm delivery → project WBPP export) exercised in one process over the
 // in-memory loopback transport. Test-only, and additionally render-gated because

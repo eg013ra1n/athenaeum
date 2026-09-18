@@ -1,6 +1,11 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+import type { AnalysisConfig } from './analysis-config';
+import type { PlateSolveConfig } from './plate-solve';
+import type { CalibrationMatchingConfig } from './calibration-config';
+import type { StackingConfig } from './stacking';
+
 export type FileFormat = "FITS" | "XISF";
 
 export type ImageType = "Light" | "Dark" | "Flat" | "Bias" | "DarkFlat" | "MasterLight" | "MasterDark" | "MasterFlat" | "MasterBias" | "MasterDarkFlat";
@@ -1691,4 +1696,6 @@ platformSupported: boolean, downloadPageUrl: string, blogUrl: string,
 dockerImage: string | null, };
 
 export type WhatsNew = { version: string, notes: string, blogUrl: string, };
+
+export type SettingsDefaults = { kv: { [key in string]: string }, analysis: AnalysisConfig, plateSolve: PlateSolveConfig, calibrationMatching: CalibrationMatchingConfig, logging: LoggingConfig, stacking: StackingConfig, };
 

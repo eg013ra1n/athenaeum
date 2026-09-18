@@ -27,6 +27,47 @@ pub mod defaults {
     /// one-shot-colour JPEG ~17 MB.
     pub const BLINK_MEMORY_CACHE_MAX_MB: &str = "512";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "30";
+    /// Preview quality Blink opens a frame at: `"thumbnail" | "preview" | "full"`.
+    pub const BLINK_RESOLUTION: &str = "preview";
+    /// The star-annotation overlay config, as JSON. Empty = the frontend's
+    /// built-in `DEFAULT_ANNOTATION_SETTINGS` (Settings redesign spec §6's one
+    /// documented exception to "defaults never restated in TypeScript").
+    pub const BLINK_ANNOTATION_CONFIG: &str = "";
+
+    // Rustafits JPEG render quality (0-100), one per resolution tier.
+    /// JPEG quality for `blink.resolution = "thumbnail"`.
+    pub const RUSTAFITS_QUALITY_THUMBNAIL: &str = "70";
+    /// JPEG quality for `blink.resolution = "preview"`.
+    pub const RUSTAFITS_QUALITY_PREVIEW: &str = "85";
+    /// JPEG quality for `blink.resolution = "full"`.
+    pub const RUSTAFITS_QUALITY_FULL: &str = "95";
+
+    // Blink flat-contour overlay (flat-frame QA).
+    /// Percent of native resolution the contour map is computed at.
+    pub const FLAT_CONTOUR_RESOLUTION_PCT: &str = "50";
+    /// Gaussian blur sigma (px) applied before contouring.
+    pub const FLAT_CONTOUR_SIGMA_PX: &str = "1.0";
+    /// Number of contour lines drawn.
+    pub const FLAT_CONTOUR_CONTOURS: &str = "15";
+    /// Percent threshold for the gradient/vignetting overlay.
+    pub const FLAT_CONTOUR_GRADIENT_PCT: &str = "50";
+
+    // In-app updates (Settings → General → Updates).
+    /// Check for a new release on startup.
+    pub const UPDATES_AUTO_CHECK: &str = "true";
+    /// Include beta releases when checking.
+    pub const UPDATES_CHECK_BETA: &str = "false";
+
+    // Frontend-only UI layout preferences, promoted to Rust keys so
+    // `get_settings_defaults` (Settings redesign) has one default for them too.
+    /// Frame-set tree grouping: `"by-night" | "by-camera"`. Shared by the
+    /// Coverage tab (`CalibrationHierarchyView`) and the Lights tab
+    /// (`LightsAnalysisView`), which today fall back to different per-component
+    /// defaults (`"by-night"` / `"by-camera"`) when this key is unset — this is
+    /// the older of the two call sites' own default.
+    pub const UI_TREE_VIEW_MODE: &str = "by-camera";
+    /// Blink sidebar width, px.
+    pub const UI_BLINK_SIDEBAR_PX: &str = "320";
 
     // Background scan monitoring
     pub const MONITORING_INTERVAL_MINUTES: &str = "1";
@@ -92,6 +133,109 @@ pub mod defaults {
     pub const ACCOUNT_HUB_URL: &str = "https://test-hub.artfrom.space";
     #[cfg(not(debug_assertions))]
     pub const ACCOUNT_HUB_URL: &str = "https://projects.artfrom.space";
+
+    /// Every key with a default, for `api::settings::get_settings_defaults`.
+    /// Adding a key to `keys` without listing it here fails
+    /// `every_key_with_a_default_is_listed`.
+    pub fn all() -> &'static [(&'static str, &'static str)] {
+        &[
+            (
+                super::keys::GROUPING_THRESHOLD_VALUE,
+                GROUPING_THRESHOLD_VALUE,
+            ),
+            (
+                super::keys::GROUPING_THRESHOLD_UNIT,
+                GROUPING_THRESHOLD_UNIT,
+            ),
+            (
+                super::keys::SESSION_GAP_THRESHOLD_HOURS,
+                SESSION_GAP_THRESHOLD_HOURS,
+            ),
+            (
+                super::keys::DUPLICATES_USE_CONTENT_HASH,
+                DUPLICATES_USE_CONTENT_HASH,
+            ),
+            (super::keys::BLINK_THREADS, BLINK_THREADS),
+            (
+                super::keys::BLINK_MEMORY_CACHE_SIZE,
+                BLINK_MEMORY_CACHE_SIZE,
+            ),
+            (
+                super::keys::BLINK_MEMORY_CACHE_MAX_MB,
+                BLINK_MEMORY_CACHE_MAX_MB,
+            ),
+            (
+                super::keys::BLINK_MEMORY_RETENTION_MINUTES,
+                BLINK_MEMORY_RETENTION_MINUTES,
+            ),
+            (
+                super::keys::MONITORING_INTERVAL_MINUTES,
+                MONITORING_INTERVAL_MINUTES,
+            ),
+            (
+                super::keys::MONITORING_ENABLED_GLOBAL,
+                MONITORING_ENABLED_GLOBAL,
+            ),
+            (
+                super::keys::AUTO_MERGE_ON_BUTTON_CLICK,
+                AUTO_MERGE_ON_BUTTON_CLICK,
+            ),
+            (
+                super::keys::AUTO_MERGE_ON_MONITOR_DETECT,
+                AUTO_MERGE_ON_MONITOR_DETECT,
+            ),
+            (super::keys::ARCHIVE_COMPRESSION, ARCHIVE_COMPRESSION),
+            (
+                super::keys::CALIBRATION_MASTER_FORMAT,
+                CALIBRATION_MASTER_FORMAT,
+            ),
+            (super::keys::COMPUTE_MAX_CONCURRENT, COMPUTE_MAX_CONCURRENT),
+            (
+                super::keys::INTEGRATION_BAND_BUDGET_MB,
+                INTEGRATION_BAND_BUDGET_MB,
+            ),
+            (
+                super::keys::INTEGRATION_READ_CONCURRENCY,
+                INTEGRATION_READ_CONCURRENCY,
+            ),
+            (
+                super::keys::SYNC_MAX_UPLOAD_BYTES_PER_SEC,
+                SYNC_MAX_UPLOAD_BYTES_PER_SEC,
+            ),
+            (
+                super::keys::SYNC_MAX_CONCURRENT_RECEIVES,
+                SYNC_MAX_CONCURRENT_RECEIVES,
+            ),
+            (super::keys::BLINK_RESOLUTION, BLINK_RESOLUTION),
+            (
+                super::keys::RUSTAFITS_QUALITY_THUMBNAIL,
+                RUSTAFITS_QUALITY_THUMBNAIL,
+            ),
+            (
+                super::keys::RUSTAFITS_QUALITY_PREVIEW,
+                RUSTAFITS_QUALITY_PREVIEW,
+            ),
+            (super::keys::RUSTAFITS_QUALITY_FULL, RUSTAFITS_QUALITY_FULL),
+            (
+                super::keys::FLAT_CONTOUR_RESOLUTION_PCT,
+                FLAT_CONTOUR_RESOLUTION_PCT,
+            ),
+            (super::keys::FLAT_CONTOUR_SIGMA_PX, FLAT_CONTOUR_SIGMA_PX),
+            (super::keys::FLAT_CONTOUR_CONTOURS, FLAT_CONTOUR_CONTOURS),
+            (
+                super::keys::FLAT_CONTOUR_GRADIENT_PCT,
+                FLAT_CONTOUR_GRADIENT_PCT,
+            ),
+            (super::keys::UPDATES_AUTO_CHECK, UPDATES_AUTO_CHECK),
+            (super::keys::UPDATES_CHECK_BETA, UPDATES_CHECK_BETA),
+            (
+                super::keys::BLINK_ANNOTATION_CONFIG,
+                BLINK_ANNOTATION_CONFIG,
+            ),
+            (super::keys::UI_TREE_VIEW_MODE, UI_TREE_VIEW_MODE),
+            (super::keys::UI_BLINK_SIDEBAR_PX, UI_BLINK_SIDEBAR_PX),
+        ]
+    }
 }
 
 /// Setting keys used throughout the application
@@ -109,6 +253,43 @@ pub mod keys {
     pub const BLINK_MEMORY_CACHE_SIZE: &str = "blink.memory_cache_size";
     pub const BLINK_MEMORY_CACHE_MAX_MB: &str = "blink.memory_cache_max_mb";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "blink.memory_retention_minutes";
+    /// Preview quality Blink opens a frame at: `"thumbnail" | "preview" | "full"`.
+    pub const BLINK_RESOLUTION: &str = "blink.resolution";
+    /// The star-annotation overlay config, as JSON. Empty = the frontend's
+    /// built-in default.
+    pub const BLINK_ANNOTATION_CONFIG: &str = "blink.annotation_config";
+
+    // Rustafits JPEG render quality (0-100), one per resolution tier.
+    /// JPEG quality for `blink.resolution = "thumbnail"`.
+    pub const RUSTAFITS_QUALITY_THUMBNAIL: &str = "rustafits.quality.thumbnail";
+    /// JPEG quality for `blink.resolution = "preview"`.
+    pub const RUSTAFITS_QUALITY_PREVIEW: &str = "rustafits.quality.preview";
+    /// JPEG quality for `blink.resolution = "full"`.
+    pub const RUSTAFITS_QUALITY_FULL: &str = "rustafits.quality.full";
+
+    // Blink flat-contour overlay (flat-frame QA).
+    /// Percent of native resolution the contour map is computed at.
+    pub const FLAT_CONTOUR_RESOLUTION_PCT: &str = "flat_contour.resolution_pct";
+    /// Gaussian blur sigma (px) applied before contouring.
+    pub const FLAT_CONTOUR_SIGMA_PX: &str = "flat_contour.sigma_px";
+    /// Number of contour lines drawn.
+    pub const FLAT_CONTOUR_CONTOURS: &str = "flat_contour.contours";
+    /// Percent threshold for the gradient/vignetting overlay.
+    pub const FLAT_CONTOUR_GRADIENT_PCT: &str = "flat_contour.gradient_pct";
+
+    // In-app updates (Settings → General → Updates).
+    /// Check for a new release on startup.
+    pub const UPDATES_AUTO_CHECK: &str = "updates.auto_check";
+    /// Include beta releases when checking.
+    pub const UPDATES_CHECK_BETA: &str = "updates.check_beta";
+
+    // Frontend-only UI layout preferences, promoted to Rust keys so
+    // `get_settings_defaults` (Settings redesign) has one default for them too.
+    /// Frame-set tree grouping: `"by-night" | "by-camera"` (`CalibrationHierarchyView`,
+    /// `LightsAnalysisView`).
+    pub const UI_TREE_VIEW_MODE: &str = "ui.tree_view_mode";
+    /// Blink sidebar width, px.
+    pub const UI_BLINK_SIDEBAR_PX: &str = "ui.blink_sidebar_px";
 
     // Background scan monitoring (see docs spec 2026-04-23 auto-scanning)
     pub const MONITORING_INTERVAL_MINUTES: &str = "monitoring.interval_minutes";
@@ -563,6 +744,36 @@ impl SettingsManager {
 mod tests {
     use super::*;
     use crate::db::schema::init_db;
+
+    #[test]
+    fn every_key_with_a_default_is_listed() {
+        let listed: std::collections::BTreeSet<&str> =
+            defaults::all().iter().map(|(k, _)| *k).collect();
+        for key in [
+            keys::GROUPING_THRESHOLD_VALUE,
+            keys::SESSION_GAP_THRESHOLD_HOURS,
+            keys::BLINK_THREADS,
+            keys::MONITORING_INTERVAL_MINUTES,
+            keys::ARCHIVE_COMPRESSION,
+            keys::CALIBRATION_MASTER_FORMAT,
+            keys::COMPUTE_MAX_CONCURRENT,
+            keys::INTEGRATION_BAND_BUDGET_MB,
+            keys::SYNC_MAX_CONCURRENT_RECEIVES,
+            keys::UPDATES_AUTO_CHECK,
+            keys::FLAT_CONTOUR_CONTOURS,
+            keys::BLINK_RESOLUTION,
+        ] {
+            assert!(
+                listed.contains(key),
+                "{key} has a default but is not in defaults::all()"
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            defaults::all().len(),
+            "duplicate key in defaults::all()"
+        );
+    }
 
     #[test]
     fn test_precedence_defaults() {

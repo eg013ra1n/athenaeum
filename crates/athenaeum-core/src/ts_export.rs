@@ -67,7 +67,12 @@ fn js_safe_ints(ts: String) -> String {
 
 pub fn generated_files() -> Vec<(&'static str, String)> {
     vec![
-        ("models.ts", js_safe_ints(format!("{HEADER}{}", decls![
+        ("models.ts", js_safe_ints(format!(
+            "{HEADER}import type {{ AnalysisConfig }} from './analysis-config';\n\
+             import type {{ PlateSolveConfig }} from './plate-solve';\n\
+             import type {{ CalibrationMatchingConfig }} from './calibration-config';\n\
+             import type {{ StackingConfig }} from './stacking';\n\n{}",
+            decls![
             crate::models::FileFormat,
             crate::models::ImageType,
             crate::models::File,
@@ -227,6 +232,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::updates::manifest::Channel,
             crate::updates::UpdateCheck,
             crate::updates::WhatsNew,
+            crate::api::settings::SettingsDefaults,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,

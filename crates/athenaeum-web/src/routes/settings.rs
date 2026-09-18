@@ -5,6 +5,7 @@ use athenaeum_core::logging;
 use athenaeum_core::settings;
 use axum::{extract::State, http::StatusCode, Json};
 
+use crate::routes::api_err;
 use crate::WebAppState;
 
 // ── Request structs ──────────────────────────────────────────────────────────
@@ -39,8 +40,10 @@ pub async fn get_setting(
     State(state): State<WebAppState>,
     Json(args): Json<GetSettingArgs>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
     let conn = db.conn();
 
     let default = args.default_value.unwrap_or_default();
@@ -62,8 +65,10 @@ pub async fn set_setting(
     State(state): State<WebAppState>,
     Json(args): Json<SetSettingArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
     let conn = db.conn();
 
     state
@@ -78,10 +83,20 @@ pub async fn set_setting(
         state.ctx.memory_cache.lock().unwrap().set_max_entries(size);
     } else if args.key == settings::keys::BLINK_MEMORY_CACHE_MAX_MB {
         let mb = settings::resolve_blink_memory_cache_max_mb(Some(&args.value));
-        state.ctx.memory_cache.lock().unwrap().set_max_bytes(mb * 1024 * 1024);
+        state
+            .ctx
+            .memory_cache
+            .lock()
+            .unwrap()
+            .set_max_bytes(mb * 1024 * 1024);
     } else if args.key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
         let minutes: u64 = args.value.parse().unwrap_or(30);
-        state.ctx.memory_cache.lock().unwrap().set_retention(minutes);
+        state
+            .ctx
+            .memory_cache
+            .lock()
+            .unwrap()
+            .set_retention(minutes);
     } else if args.key == settings::keys::MONITORING_INTERVAL_MINUTES
         || args.key == settings::keys::MONITORING_ENABLED_GLOBAL
     {
@@ -102,8 +117,10 @@ pub async fn delete_setting(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteSettingArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
     let conn = db.conn();
 
     db::delete_setting(&conn, &args.key)
@@ -166,10 +183,16 @@ pub async fn set_blink_threads(
     Json(args): Json<SetBlinkThreadsArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     let threads = args.threads.clamp(0, state.max_blink_threads);
-    let effective = if threads == 0 { (state.max_blink_threads / 2).max(2) } else { threads };
+    let effective = if threads == 0 {
+        (state.max_blink_threads / 2).max(2)
+    } else {
+        threads
+    };
 
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
     let conn = db.conn();
 
     state
@@ -182,7 +205,11 @@ pub async fn set_blink_threads(
     *state.image_semaphore.write().unwrap() =
         std::sync::Arc::new(tokio::sync::Semaphore::new(effective));
 
-    tracing::info!(permits = effective, requested = threads, "blink semaphore rebuilt");
+    tracing::info!(
+        permits = effective,
+        requested = threads,
+        "blink semaphore rebuilt"
+    );
     Ok(Json(()))
 }
 
@@ -197,8 +224,10 @@ pub async fn get_logging_config(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<logging::config::LoggingConfigResponse>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
     let conn = db.conn();
 
     let config = match db::get_setting(&conn, logging::config::SETTINGS_KEY)
@@ -214,7 +243,10 @@ pub async fn get_logging_config(
         .map(|h| h.env_override_active())
         .unwrap_or(false);
 
-    Ok(Json(logging::config::LoggingConfigResponse { config, env_override_active }))
+    Ok(Json(logging::config::LoggingConfigResponse {
+        config,
+        env_override_active,
+    }))
 }
 
 /// Request body for `set_logging_config`. The frontend calls
@@ -248,8 +280,10 @@ pub async fn set_logging_config(
         (StatusCode::BAD_REQUEST, e)
     })?;
 
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
     let conn = db.conn();
 
     let json = serde_json::to_string(&config)
@@ -264,14 +298,30 @@ pub async fn set_logging_config(
     Ok(Json(()))
 }
 
+// ── Settings page defaults (Settings redesign) ───────────────────────────────
+
+/// POST /api/get_settings_defaults
+///
+/// Every default the Settings page needs, in one round trip: every KV
+/// default plus the typed defaults of the four `reset_*`-backed configs.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_settings_defaults(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<athenaeum_core::api::settings::SettingsDefaults>, (StatusCode, String)> {
+    athenaeum_core::api::settings::get_settings_defaults(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
 #[cfg(test)]
 mod logging_config_tests {
     use super::*;
+    use crate::events::SseEvent;
     use athenaeum_core::cache::MemoryImageCache;
     use athenaeum_core::db::Database;
     use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
     use athenaeum_core::settings::SettingsManager;
-    use crate::events::SseEvent;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use tempfile::TempDir;
@@ -297,7 +347,12 @@ mod logging_config_tests {
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             active_stacks: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -349,11 +404,17 @@ mod logging_config_tests {
 
         let mut modules = std::collections::BTreeMap::new();
         modules.insert("scanner".to_string(), "debug".to_string());
-        let cfg = logging::LoggingConfig { level: "debug".to_string(), modules };
+        let cfg = logging::LoggingConfig {
+            level: "debug".to_string(),
+            modules,
+        };
 
-        let _ = set_logging_config(State(state.clone()), Json(SetLoggingConfigArgs { config: cfg }))
-            .await
-            .expect("valid config must be accepted");
+        let _ = set_logging_config(
+            State(state.clone()),
+            Json(SetLoggingConfigArgs { config: cfg }),
+        )
+        .await
+        .expect("valid config must be accepted");
 
         let resp = get_logging_config(State(state), Json(serde_json::json!({})))
             .await
@@ -372,10 +433,16 @@ mod logging_config_tests {
         let db = Database::new(tmp.path().join("catalog.db")).unwrap();
         let state = test_state(db);
 
-        let cfg = logging::LoggingConfig { level: "chatty".to_string(), modules: Default::default() };
-        let err = set_logging_config(State(state.clone()), Json(SetLoggingConfigArgs { config: cfg }))
-            .await
-            .unwrap_err();
+        let cfg = logging::LoggingConfig {
+            level: "chatty".to_string(),
+            modules: Default::default(),
+        };
+        let err = set_logging_config(
+            State(state.clone()),
+            Json(SetLoggingConfigArgs { config: cfg }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
 
         // Verify the DB was untouched on rejection: get_logging_config must still return default.
@@ -409,4 +476,3 @@ mod logging_config_tests {
         );
     }
 }
-
