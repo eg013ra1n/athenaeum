@@ -93,6 +93,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::SessionWithFrames,
             crate::models::ImagingNightWithSessions,
             crate::models::FrameSetDetail,
+            crate::api::frame_sets::ReconcileSummary,
             crate::models::CameraStats,
             crate::models::CalibrationSetDetail,
             crate::models::RelinkResult,

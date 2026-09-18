@@ -161,6 +161,21 @@ pub async fn recalculate_frame_set_nights(
     get_frame_set_detail(frames_set_id, state).await
 }
 
+/// Cheap, idempotent nights/sessions check meant to run whenever a frame
+/// set's page is opened — only rewrites the stored nights/sessions when
+/// they actually disagree with a fresh derivation; returns just the
+/// outcome, not the full detail (the caller reloads the page normally when
+/// `changed` is true).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn reconcile_frame_set_nights(
+    frames_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::api::frame_sets::ReconcileSummary, String> {
+    athenaeum_core::api::frame_sets::reconcile_frame_set_nights(&state.ctx, frames_set_id)
+        .map_err(|e| e.to_string())
+}
+
 /// Split selected items from a frame set into a new frame set
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

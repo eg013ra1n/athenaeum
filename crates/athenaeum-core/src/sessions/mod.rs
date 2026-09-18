@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::models::{File, Frame};
 
@@ -11,6 +11,46 @@ pub struct RederiveSummary {
     pub frames: usize,
     pub nights: usize,
     pub sessions: usize,
+}
+
+/// Stable span for the fallback night that holds members with no
+/// `DATE-OBS` (the gap rule can't place them). Anchored on the set's own
+/// dated members — the min/max `date_obs` across *every* dated member of
+/// the set, not just the leftover ones — so the span only moves when the
+/// set's actual observed time range moves, which is already a real change
+/// to the real nights. Previously this was stamped `Utc::now()`, which
+/// moved on every single run and made the fallback night look like drift
+/// to any comparison (see [`reconcile_for_frame_set`]).
+///
+/// `frames_set` carries no `created_at` column to fall back on, so a set
+/// with *no* dated member at all (nothing to anchor on) collapses onto a
+/// fixed epoch sentinel instead — harmless, since such a set never had
+/// real activity to anchor on either.
+///
+/// Truncated to whole seconds before it is returned: the DB round trip
+/// stores this night at `SecondsFormat::Secs` precision (unlike a real
+/// night's start/end, which keep `DATE-OBS`'s own precision verbatim), so a
+/// `DATE-OBS` with a fractional-second component would otherwise look like
+/// drift the instant it round-tripped through the database.
+fn fallback_night_span(frames: &[(i64, File, Frame)]) -> (DateTime<Utc>, DateTime<Utc>) {
+    let mut range: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+    for (_, _, frame) in frames {
+        if let Some(d) = frame.date_obs {
+            range = Some(match range {
+                Some((min, max)) => (min.min(d), max.max(d)),
+                None => (d, d),
+            });
+        }
+    }
+    let (start, end) = range.unwrap_or_else(|| {
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is representable");
+        (epoch, epoch + Duration::hours(1))
+    });
+    (truncate_to_secs(start), truncate_to_secs(end))
+}
+
+fn truncate_to_secs(dt: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(dt.timestamp(), 0).unwrap_or(dt)
 }
 
 /// Re-derive a frame set's imaging nights and sessions from the union of its
@@ -37,6 +77,7 @@ pub fn rederive_for_frame_set(
 
     let frames = crate::db::get_frames_with_files_by_ids(conn, &frame_ids)?;
     let known: Vec<i64> = frames.iter().filter_map(|(_, _, f)| f.id).collect();
+    let fallback_span = fallback_night_span(&frames);
     let detected = detect_sessions(frames, gap_threshold_hours)?;
 
     crate::db::delete_imaging_nights_for_frame_set(conn, frames_set_id)?;
@@ -76,9 +117,9 @@ pub fn rederive_for_frame_set(
             count = leftover.len(),
             "frames without date_obs kept on a fallback night"
         );
-        let now = Utc::now();
-        let start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let end = (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (fallback_start, fallback_end) = fallback_span;
+        let start = fallback_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let end = fallback_end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let night_id = crate::db::create_imaging_night(conn, frames_set_id, &start, &end)?;
         let session_id =
             crate::db::create_session(conn, night_id, "Unknown", leftover.len() as i32, None)?;
@@ -95,6 +136,160 @@ pub fn rederive_for_frame_set(
         "nights re-derived"
     );
     Ok(RederiveSummary { frames: known.len(), nights, sessions })
+}
+
+/// Outcome of [`reconcile_for_frame_set`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The stored nights/sessions already match what a re-derivation would
+    /// produce right now. Nothing was written — every `sessions.uuid` and
+    /// `created_at` is untouched.
+    Unchanged,
+    /// Something differed, so [`rederive_for_frame_set`] ran for real.
+    Rewritten(RederiveSummary),
+}
+
+/// One night's frame membership, comparable independent of session order
+/// or instant formatting (a session's `frame_ids` is a set, and start/end
+/// are parsed instants — never the raw RFC3339 text — so a stored
+/// `"…:00Z"` and a recomputed `"…:00.000Z"` for the same instant compare
+/// equal). `Ord` is derived so a list of nights can be sorted into a
+/// canonical order by full content, not just by `start`: the fallback
+/// night's span is anchored on *every* dated member of the set, so on a
+/// set with exactly one real night it frequently lands on the exact same
+/// instant as that night's own start/end — sorting by `start` alone would
+/// then leave the tie-break between the two nights up to whatever
+/// arbitrary order SQLite happened to return them in, which the freshly
+/// recomputed side has no way to match.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ComparableSession {
+    instrume: String,
+    frame_ids: BTreeSet<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ComparableNight {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    /// Sorted by `instrume` — order-independent, matching how
+    /// `rederive_for_frame_set` groups by instrument within a night.
+    sessions: Vec<ComparableSession>,
+}
+
+fn comparable_sessions(mut sessions: Vec<ComparableSession>) -> Vec<ComparableSession> {
+    sessions.sort_by(|a, b| a.instrume.cmp(&b.instrume));
+    sessions
+}
+
+/// What `rederive_for_frame_set` would write right now, in the same
+/// comparable shape as [`stored_nights`] — the detected nights plus the
+/// same stable fallback night for undated members, sorted by start
+/// instant (not insertion order: the fallback night's own start can sort
+/// anywhere once it is anchored on the set's dated range instead of
+/// `Utc::now()`).
+fn expected_nights(
+    frames: Vec<(i64, File, Frame)>,
+    gap_threshold_hours: f64,
+    fallback_span: (DateTime<Utc>, DateTime<Utc>),
+) -> Result<Vec<ComparableNight>> {
+    let known: Vec<i64> = frames.iter().filter_map(|(_, _, f)| f.id).collect();
+    let detected = detect_sessions(frames, gap_threshold_hours)?;
+
+    let mut placed: HashSet<i64> = HashSet::new();
+    let mut nights: Vec<ComparableNight> = Vec::new();
+    for night in &detected {
+        let start = DateTime::parse_from_rfc3339(&night.start_time)
+            .map_err(|e| anyhow!("bad detected start_time {:?}: {e}", night.start_time))?
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339(&night.end_time)
+            .map_err(|e| anyhow!("bad detected end_time {:?}: {e}", night.end_time))?
+            .with_timezone(&Utc);
+        let sessions = night
+            .sessions
+            .iter()
+            .map(|s| {
+                placed.extend(s.frame_ids.iter().copied());
+                ComparableSession {
+                    instrume: s.instrume.clone(),
+                    frame_ids: s.frame_ids.iter().copied().collect(),
+                }
+            })
+            .collect();
+        nights.push(ComparableNight { start, end, sessions: comparable_sessions(sessions) });
+    }
+
+    let leftover: BTreeSet<i64> = known.into_iter().filter(|id| !placed.contains(id)).collect();
+    if !leftover.is_empty() {
+        let (start, end) = fallback_span;
+        nights.push(ComparableNight {
+            start,
+            end,
+            sessions: vec![ComparableSession { instrume: "Unknown".to_string(), frame_ids: leftover }],
+        });
+    }
+
+    nights.sort();
+    Ok(nights)
+}
+
+/// The frame set's currently stored nights/sessions, in the same
+/// comparable shape as [`expected_nights`].
+fn stored_nights(conn: &Connection, frames_set_id: i64) -> Result<Vec<ComparableNight>> {
+    let mut nights = Vec::new();
+    for night in crate::db::get_imaging_nights_for_set(conn, frames_set_id)? {
+        let night_id = night.id.ok_or_else(|| anyhow!("stored night has no id"))?;
+        let start = DateTime::parse_from_rfc3339(&night.start_time)
+            .map_err(|e| anyhow!("bad stored start_time on night {night_id}: {e}"))?
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339(&night.end_time)
+            .map_err(|e| anyhow!("bad stored end_time on night {night_id}: {e}"))?
+            .with_timezone(&Utc);
+
+        let mut sessions = Vec::new();
+        for session in crate::db::get_sessions_for_night(conn, night_id)? {
+            let session_id = session.id.ok_or_else(|| anyhow!("stored session has no id"))?;
+            let frame_ids = crate::db::get_frame_ids_for_session(conn, session_id)?;
+            sessions.push(ComparableSession {
+                instrume: session.instrume,
+                frame_ids: frame_ids.into_iter().collect(),
+            });
+        }
+        nights.push(ComparableNight { start, end, sessions: comparable_sessions(sessions) });
+    }
+    nights.sort();
+    Ok(nights)
+}
+
+/// Cheap, idempotent check that only rewrites a frame set's nights and
+/// sessions when they actually differ from what a fresh derivation would
+/// produce.
+///
+/// `rederive_for_frame_set` (the force path behind the toolbar's
+/// "Recalculate nights" button) always deletes and re-inserts every night
+/// row, which mints a fresh `sessions.uuid` and `created_at` on every
+/// session because `sessions` is a UUID table
+/// ([`crate::db::schema::UUID_TABLES`]) — correct for an explicit user
+/// action, but ruinous if run on every frame-set page open. This computes
+/// the same detection the force path would and compares it against the
+/// stored rows; only on an actual mismatch does it fall through to
+/// [`rederive_for_frame_set`] to write.
+pub fn reconcile_for_frame_set(
+    conn: &Connection,
+    frames_set_id: i64,
+    gap_threshold_hours: f64,
+) -> Result<ReconcileOutcome> {
+    let frame_ids = crate::db::get_frame_ids_for_frame_set(conn, frames_set_id)?;
+    let frames = crate::db::get_frames_with_files_by_ids(conn, &frame_ids)?;
+    let fallback_span = fallback_night_span(&frames);
+    let expected = expected_nights(frames, gap_threshold_hours, fallback_span)?;
+    let actual = stored_nights(conn, frames_set_id)?;
+
+    if expected == actual {
+        return Ok(ReconcileOutcome::Unchanged);
+    }
+
+    let summary = rederive_for_frame_set(conn, frames_set_id, &[], gap_threshold_hours)?;
+    Ok(ReconcileOutcome::Rewritten(summary))
 }
 
 /// Detected imaging night structure
@@ -503,5 +698,158 @@ mod rederive_tests {
         let summary = rederive_for_frame_set(&conn, 1, &[], 6.0).unwrap();
         assert_eq!(summary.frames, 2);
         assert_eq!(night_rows(&conn, 1).iter().map(|r| r.2).sum::<i64>(), 2);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::{params, Connection};
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        init_db(&c).unwrap();
+        c
+    }
+
+    fn light(conn: &Connection, id: i64, date_obs: Option<&str>, instrume: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-01-01T00:00:00Z', 'FITS')",
+            params![id, format!("/t/{id}.fits"), format!("{id}.fits")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, date_obs)
+             VALUES (?1, ?1, 'Light', ?2, ?3)",
+            params![id, instrume, date_obs],
+        )
+        .unwrap();
+    }
+
+    /// A night row with one session holding `frame_ids`, inserted directly
+    /// (not through `rederive_for_frame_set`) — used to plant a stored
+    /// state a reconcile should compare against.
+    fn night(conn: &Connection, set_id: i64, start: &str, end: &str, instrume: &str, ids: &[i64]) {
+        let night_id = crate::db::create_imaging_night(conn, set_id, start, end).unwrap();
+        let session_id =
+            crate::db::create_session(conn, night_id, instrume, ids.len() as i32, None).unwrap();
+        crate::db::insert_session_members(conn, session_id, ids).unwrap();
+    }
+
+    /// Every `sessions.uuid` currently stored for a frame set, in a stable
+    /// order (`sessions` is a UUID table — see `db::schema::UUID_TABLES` —
+    /// so a spurious rewrite would mint fresh ones here).
+    fn session_uuids(conn: &Connection, set_id: i64) -> Vec<Option<String>> {
+        let mut st = conn
+            .prepare(
+                "SELECT s.uuid FROM sessions s
+                 JOIN imaging_nights n ON n.id = s.imaging_night_id
+                 WHERE n.frames_set_id = ?1
+                 ORDER BY s.id",
+            )
+            .unwrap();
+        st.query_map([set_id], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    fn night_count(conn: &Connection, set_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = ?1",
+            [set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// (a) Reconciling right after a fresh derivation finds nothing to do:
+    /// `Unchanged`, and every session's uuid — which a real rewrite would
+    /// mint fresh, `sessions` being a UUID table — is untouched.
+    #[test]
+    fn reconcile_on_a_fresh_derivation_is_unchanged_and_keeps_uuids() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        light(&conn, 10, Some("2025-10-17T22:04:00Z"), "CamA");
+        light(&conn, 11, Some("2025-10-17T22:14:00Z"), "CamA");
+        // `rederive_for_frame_set`'s `extra_frame_ids` is how a frame
+        // actually becomes a member — membership lives entirely in
+        // `session_members`, so a set with no night rows yet has no known
+        // members at all until something puts them there.
+        rederive_for_frame_set(&conn, 1, &[10, 11], 6.0).unwrap();
+
+        let before = session_uuids(&conn, 1);
+        assert!(!before.is_empty());
+
+        let outcome = reconcile_for_frame_set(&conn, 1, 6.0).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Unchanged);
+        assert_eq!(session_uuids(&conn, 1), before);
+    }
+
+    /// (b) A frame lands as a member of the set's one existing session
+    /// (the kind of membership drift `reconcile_for_frame_set` exists to
+    /// catch — e.g. two sets stitched by a merge) with a `DATE-OBS` a real
+    /// gap away from the rest. Reconcile must notice and rewrite, landing
+    /// on exactly what `detect_sessions` would produce from scratch.
+    #[test]
+    fn reconcile_rewrites_when_a_member_drifts_into_a_real_gap() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        light(&conn, 10, Some("2025-10-17T22:04:00Z"), "CamA");
+        light(&conn, 11, Some("2025-10-17T22:14:00Z"), "CamA");
+        rederive_for_frame_set(&conn, 1, &[10, 11], 6.0).unwrap();
+        assert_eq!(reconcile_for_frame_set(&conn, 1, 6.0).unwrap(), ReconcileOutcome::Unchanged);
+
+        light(&conn, 12, Some("2025-10-18T17:56:00Z"), "CamA"); // 19.7h later
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT s.id FROM sessions s JOIN imaging_nights n ON n.id = s.imaging_night_id
+                 WHERE n.frames_set_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, 12)",
+            params![session_id],
+        )
+        .unwrap();
+
+        let outcome = reconcile_for_frame_set(&conn, 1, 6.0).unwrap();
+        let summary = match outcome {
+            ReconcileOutcome::Rewritten(summary) => summary,
+            ReconcileOutcome::Unchanged => panic!("expected the drift to be detected"),
+        };
+        assert_eq!((summary.frames, summary.nights), (3, 2));
+        assert_eq!(night_count(&conn, 1), 2);
+
+        // Idempotent from here: the just-written state matches a fresh
+        // derivation exactly.
+        assert_eq!(reconcile_for_frame_set(&conn, 1, 6.0).unwrap(), ReconcileOutcome::Unchanged);
+    }
+
+    /// (c) A member with no `DATE-OBS` lands on the fallback night. The
+    /// stored fallback night here is deliberately stale — the kind of span
+    /// the OLD `Utc::now()`-stamped code would have left behind on a
+    /// previous run. The first reconcile must notice and rewrite it onto
+    /// the stable, dated-member-anchored span; the second reconcile must
+    /// then be `Unchanged` — proof the new span does not itself drift
+    /// between runs the way `Utc::now()` always did.
+    #[test]
+    fn reconcile_on_a_dateless_member_is_stable_across_runs() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        light(&conn, 10, Some("2025-10-17T22:04:00Z"), "CamA");
+        light(&conn, 11, None, "CamA");
+        // A real night for frame 10, matching what `detect_sessions` would
+        // produce, plus a fallback night for frame 11 stamped with a stale
+        // span unrelated to the set's own dated range.
+        night(&conn, 1, "2025-10-17T22:04:00Z", "2025-10-17T22:04:00Z", "CamA", &[10]);
+        night(&conn, 1, "1999-01-01T00:00:00Z", "1999-01-01T01:00:00Z", "Unknown", &[11]);
+
+        let first = reconcile_for_frame_set(&conn, 1, 6.0).unwrap();
+        assert!(matches!(first, ReconcileOutcome::Rewritten(_)), "{first:?}");
+
+        let second = reconcile_for_frame_set(&conn, 1, 6.0).unwrap();
+        assert_eq!(second, ReconcileOutcome::Unchanged);
     }
 }

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink } from '../types/models';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -380,9 +380,30 @@ export default function FrameSetDetail() {
     return out;
   }, [detail]);
 
-  // Load data on mount and when navigating back
+  // Load data on mount and when navigating back. Before that, a cheap
+  // idempotent nights/sessions check runs unconditionally — it only writes
+  // when the stored rows actually disagree with a fresh derivation (see
+  // CLAUDE.md "Database" — nights are derived data, never stitched). A
+  // failure here must never block the page: log and fall through to the
+  // normal load either way, and only bump the history tab's refresh key
+  // when something actually changed.
   useEffect(() => {
-    loadData();
+    (async () => {
+      if (id) {
+        try {
+          const result = await api.invoke<ReconcileSummary>('reconcile_frame_set_nights', {
+            framesSetId: parseInt(id),
+          });
+          if (result.changed) {
+            setHistoryRefreshKey((k) => k + 1);
+          }
+        } catch (e) {
+          console.error('[FrameSetDetail] reconcile_frame_set_nights failed:', e);
+        }
+      }
+      loadData();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, location.key]);
 
   // Refresh analysis data when analysis completes
@@ -811,7 +832,7 @@ export default function FrameSetDetail() {
                   type="button"
                   onClick={handleRecalculateNights}
                   disabled={recalcNightsBusy}
-                  title="Re-derive this set's nights and sessions from its frames (repairs a night stored as two)"
+                  title="Force a full re-derive of this set's nights and sessions from its frames (repairs a night stored as two); normally happens automatically on open"
                   className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <RotateCw size={14} className={recalcNightsBusy ? 'animate-spin' : ''} />

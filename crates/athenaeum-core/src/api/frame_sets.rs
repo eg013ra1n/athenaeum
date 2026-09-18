@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use crate::db::{self};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
-use crate::sessions::RederiveSummary;
+use crate::sessions::{RederiveSummary, ReconcileOutcome};
 use rusqlite::{Connection, OptionalExtension};
 
 /// `is_custom` of a frame set, or an error naming the id when there is no
@@ -64,6 +64,69 @@ pub fn recalculate_frame_set_nights(
     refresh_frame_set_metadata(&tx, frames_set_id, is_custom)?;
     tx.commit()?;
     Ok(summary)
+}
+
+/// Result of [`reconcile_frame_set_nights`]. `nights`/`sessions` are only
+/// meaningful when `changed` is `true` — an unchanged reconcile recomputed
+/// nothing worth reporting and leaves them at `0`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileSummary {
+    pub changed: bool,
+    pub nights: usize,
+    pub sessions: usize,
+}
+
+/// Cheap, idempotent nights/sessions check meant to run on every frame-set
+/// page open — unlike [`recalculate_frame_set_nights`], which always
+/// rewrites (and so always mints a fresh `sessions.uuid` per session, since
+/// `sessions` is a UUID table), this only writes when the stored rows
+/// actually disagree with a fresh derivation
+/// ([`crate::sessions::reconcile_for_frame_set`]).
+///
+/// Skips archived sets outright — an archived set's membership is frozen,
+/// so there is nothing to reconcile, and its members are never read.
+pub fn reconcile_frame_set_nights(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+) -> Result<ReconcileSummary> {
+    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let mut conn = db.conn();
+
+    let archived_at: Option<String> = conn
+        .query_row(
+            "SELECT archived_at FROM frames_set WHERE id = ?1",
+            [frames_set_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("frame set {frames_set_id} not found"))?;
+    if archived_at.is_some() {
+        tracing::debug!(frames_set_id, "nights unchanged");
+        return Ok(ReconcileSummary { changed: false, nights: 0, sessions: 0 });
+    }
+
+    let gap_hours = ctx.settings.get_session_gap_threshold_hours(&conn).unwrap_or(6.0);
+    let tx = conn.transaction()?;
+    let outcome = crate::sessions::reconcile_for_frame_set(&tx, frames_set_id, gap_hours)?;
+    let summary = match outcome {
+        ReconcileOutcome::Unchanged => {
+            tx.commit()?;
+            tracing::debug!(frames_set_id, "nights unchanged");
+            return Ok(ReconcileSummary { changed: false, nights: 0, sessions: 0 });
+        }
+        ReconcileOutcome::Rewritten(summary) => summary,
+    };
+    let is_custom = frame_set_is_custom(&tx, frames_set_id)?;
+    refresh_frame_set_metadata(&tx, frames_set_id, is_custom)?;
+    tx.commit()?;
+    tracing::info!(
+        frames_set_id,
+        nights = summary.nights,
+        sessions = summary.sessions,
+        "nights reconciled"
+    );
+    Ok(ReconcileSummary { changed: true, nights: summary.nights, sessions: summary.sessions })
 }
 
 /// Merge `source_id` into `target_id`: every source night moves over, the
@@ -352,6 +415,32 @@ mod tests {
         assert_eq!(count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"), 1);
         assert!(merge_frame_sets(&ctx, 1, 1).is_err(), "self-merge is refused");
         assert!(merge_frame_sets(&ctx, 99, 1).is_err(), "a missing source is refused");
+    }
+
+    /// (d) An archived set is skipped outright: `Unchanged`, and its
+    /// membership is never even read — no night row is created for a set
+    /// that has no stored nights to begin with.
+    #[test]
+    fn reconcile_frame_set_nights_skips_an_archived_set() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = ctx.db.get().unwrap().conn();
+            conn.execute(
+                "INSERT INTO frames_set (id, name, archived_at) VALUES (1, 'X', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            // Not wired into any session — an archived-set reconcile must
+            // never read this far.
+            seed_light_at(&conn, 10, "2025-10-17T22:04:00Z");
+        }
+
+        let summary = reconcile_frame_set_nights(&ctx, 1).unwrap();
+        assert!(!summary.changed);
+        assert_eq!((summary.nights, summary.sessions), (0, 0));
+
+        let conn = ctx.db.get().unwrap().conn();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"), 0);
     }
 
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
