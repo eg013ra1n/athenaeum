@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { addMonths, subMonths, addYears, subYears } from 'date-fns';
 import { Loader2, AlertCircle } from 'lucide-react';
@@ -9,16 +9,17 @@ import { CalendarMonthNav, type CalendarViewMode } from '../components/calendar/
 import { CalendarGrid } from '../components/calendar/CalendarGrid';
 import { CalendarYearList } from '../components/calendar/CalendarYearList';
 import { CalendarEventPanel } from '../components/calendar/CalendarEventPanel';
+import { useSessionState } from '../contexts/SessionStateContext';
 import type { CalendarDayEvent } from '../types/models';
 
 export default function ShootCalendar() {
   const navigate = useNavigate();
 
-  // View mode state
-  const [viewMode, setViewMode] = useState<CalendarViewMode>('month');
+  // View mode state — remembered across navigating away and back
+  const [viewMode, setViewMode] = useSessionState<CalendarViewMode>('calendar.viewMode', 'month');
 
-  // Current date state
-  const [currentDate, setCurrentDate] = useState(() => new Date());
+  // Current date state — remembered across navigating away and back
+  const [currentDate, setCurrentDate] = useSessionState<Date>('calendar.date', () => new Date());
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth() + 1; // 1-12
 
@@ -30,8 +31,8 @@ export default function ShootCalendar() {
   const loading = viewMode === 'month' ? monthData.loading : yearData.loading;
   const error = viewMode === 'month' ? monthData.error : yearData.error;
 
-  // Selected day state
-  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  // Selected day state — remembered across navigating away and back
+  const [selectedDate, setSelectedDate] = useSessionState<string | null>('calendar.selectedDate', null);
 
   // Get events for selected date
   const selectedEvents = useMemo(() => {

@@ -32,6 +32,9 @@ const backendDeps: Dependency[] = [
   { name: 'rayon', url: 'https://github.com/rayon-rs/rayon', license: 'MIT OR Apache-2.0', copyright: 'Niko Matsakis, Josh Stone' },
   { name: 'chrono', url: 'https://github.com/chronotope/chrono', license: 'MIT OR Apache-2.0', copyright: 'Kang Seonghoon' },
   { name: 'rustafits', url: 'https://github.com/eg013ra1n/rustafits', license: 'Apache-2.0', copyright: 'Vilen Sharifov' },
+  { name: 'solvemyastro', url: 'https://github.com/eg013ra1n/solvemyastro', license: 'Apache-2.0', copyright: 'Vilen Sharifov' },
+  { name: 'iroh', url: 'https://github.com/n0-computer/iroh', license: 'MIT OR Apache-2.0', copyright: 'N0, Inc.' },
+  { name: 'iroh-blobs', url: 'https://github.com/n0-computer/iroh-blobs', license: 'MIT OR Apache-2.0', copyright: 'N0, Inc.' },
   { name: 'xxhash-rust', url: 'https://github.com/DoumanAsh/xxhash-rust', license: 'BSL-1.0', copyright: 'Douman' },
   { name: 'walkdir', url: 'https://github.com/BurntSushi/walkdir', license: 'Unlicense OR MIT', copyright: 'Andrew Gallant' },
   { name: 'quick-xml', url: 'https://github.com/tafia/quick-xml', license: 'MIT', copyright: 'Johann Tuffe' },
@@ -220,6 +223,20 @@ export default function About() {
         <div className="flex gap-4 pt-1">
           <ExtLink href="https://github.com/fenriques/AstroDom">GitHub</ExtLink>
           <ExtLink href="https://app.astrobin.com/u/fenriques">AstroBin</ExtLink>
+        </div>
+
+        <p className="text-content-secondary leading-relaxed pt-2">
+          Device-to-device transfers in Athenaeum — sending frame sets, receiving
+          collaboration contributions, Perseus capture-agent sync — run on{' '}
+          <ExtLink href="https://iroh.computer">iroh</ExtLink> (QUIC connections with
+          hole punching and relay fallback) and iroh-blobs (content-addressed blob
+          transfer). Thanks to the{' '}
+          <ExtLink href="https://github.com/n0-computer">n0</ExtLink> team and the
+          wider iroh community for building and maintaining it.
+        </p>
+        <div className="flex gap-4 pt-1">
+          <ExtLink href="https://iroh.computer">iroh.computer</ExtLink>
+          <ExtLink href="https://github.com/n0-computer">GitHub (n0-computer)</ExtLink>
         </div>
 
         <div className="pt-4 space-y-2">

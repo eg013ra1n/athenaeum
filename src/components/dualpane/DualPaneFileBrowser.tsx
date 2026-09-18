@@ -1382,7 +1382,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           {activePaneListing && ` · ${activePaneListing.files.length} files`}
         </div>
         <div className="font-mono">
-          Tab switch · Enter open · {isMac ? '⌥↑' : 'Alt+↑'} up · ↑↓ navigate · Shift+click range · ⌘A select all
+          Tab switch · Enter open · Space blink · {isMac ? '⌥↑' : 'Alt+↑'} up · ↑↓ navigate · Shift+click range · ⌘A select all
         </div>
       </div>
 

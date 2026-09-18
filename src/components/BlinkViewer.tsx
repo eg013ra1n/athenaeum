@@ -625,11 +625,16 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       switch (e.key) {
         case " ":
           e.preventDefault();
-          toggleCurrentFrameSelection();
+          setIsPlaying((p) => !p);
           break;
         case "Enter":
           e.preventDefault();
           setIsPlaying((p) => !p);
+          break;
+        case "s":
+        case "S":
+          e.preventDefault();
+          toggleCurrentFrameSelection();
           break;
         case "ArrowUp":
           e.preventDefault();
@@ -1080,8 +1085,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               <div className="bg-surface/90 backdrop-blur-sm rounded-xl px-8 py-6 text-sm text-content space-y-2 shadow-2xl">
                 <h3 className="text-base font-semibold text-content mb-3">Keyboard Shortcuts</h3>
                 <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 text-xs">
-                  <span className="text-content-muted">Space</span><span>Select / Deselect</span>
-                  <span className="text-content-muted">Enter</span><span>Play / Pause</span>
+                  <span className="text-content-muted">Space / Enter</span><span>Play / Pause</span>
+                  <span className="text-content-muted">S</span><span>Select / Deselect</span>
                   <span className="text-content-muted">↑ ↓</span><span>Navigate frames</span>
                   <span className="text-content-muted">← →</span><span>Adjust speed</span>
                   <span className="text-content-muted">A</span><span>Toggle annotations</span>
