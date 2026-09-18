@@ -299,7 +299,12 @@ export function AnalysisSettingsPanel() {
           registry, which this task does not touch — the reset itself does
           reset the whole Analysis configuration (every section below),
           not just this one. */}
-      <SettingsSection id="analysis.detection" onResetAll={resetAll} actions={<SavedTick savedAt={savedAt} />}>
+      <SettingsSection
+        id="analysis.detection"
+        onResetAll={resetAll}
+        resetScopeLabel="This resets the whole Analysis configuration back to its default."
+        actions={<SavedTick savedAt={savedAt} />}
+      >
         <div className="grid grid-cols-2 gap-4">
           <DocNumberField
             section="analysis.detection"

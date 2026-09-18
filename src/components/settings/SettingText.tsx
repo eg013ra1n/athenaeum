@@ -6,6 +6,7 @@ import type { KeyboardEvent } from 'react';
 import { ResetButton, SavedTick } from './ResetButton';
 import { useSettingField, type UseSettingFieldOptions } from '../../hooks/useSettingField';
 import type { Codec } from '../../settings/codecs';
+import { useSearchHighlight, isFieldHighlighted } from './SearchHighlightContext';
 
 export interface SettingTextProps {
   section: string;
@@ -38,9 +39,11 @@ export function SettingText({ section, field, settingKey, codec, placeholder, di
     }
   };
 
+  const highlighted = isFieldHighlighted(useSearchHighlight(), section, field);
+
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className={`flex items-center justify-between gap-2 mb-1 ${highlighted ? 'ring-1 ring-accent/60 rounded' : ''}`}>
         <label className="text-sm text-content-secondary">{meta.label}</label>
         <div className="flex items-center gap-1 shrink-0">
           <SavedTick savedAt={savedAt} />

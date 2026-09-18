@@ -262,6 +262,7 @@ export default function StackingSection() {
       <SettingsSection
         id="stacking.pipeline"
         onResetAll={resetAll}
+        resetScopeLabel="This resets every stacking pipeline setting on this page back to the built-in default. Frame sets with their own override are unaffected. Folders are unaffected."
         actions={
           <select
             value=""

@@ -3,9 +3,11 @@
 // commits through `setValue` on change (debounced 300ms by the hook), never
 // a draft/blur cycle.
 
+import { useEffect, useRef } from 'react';
 import { ResetButton, SavedTick } from './ResetButton';
 import { useSettingField, type UseSettingFieldOptions } from '../../hooks/useSettingField';
 import type { Codec } from '../../settings/codecs';
+import { useSearchHighlight, isFieldHighlighted } from './SearchHighlightContext';
 
 export interface SettingSelectOption<T extends string> {
   value: T;
@@ -22,6 +24,10 @@ export interface SettingSelectProps<T extends string> {
   /** For a key with its own read/write command — forwarded to `useSettingField`. */
   write?: UseSettingFieldOptions<T>['write'];
   read?: UseSettingFieldOptions<T>['read'];
+  /** Fired on mount (once the initial value is known) and again on every
+   *  committed change — lets a sibling field in the same section mirror
+   *  this one's value into local state. */
+  onValueChange?: (value: T) => void;
 }
 
 export function SettingSelect<T extends string>({
@@ -33,6 +39,7 @@ export function SettingSelect<T extends string>({
   disabled,
   write,
   read,
+  onValueChange,
 }: SettingSelectProps<T>) {
   const { value, setValue, isDefault, reset, meta, savedAt, error, defaultValue } = useSettingField(
     section,
@@ -42,11 +49,19 @@ export function SettingSelect<T extends string>({
     { write, read },
   );
 
+  const onValueChangeRef = useRef(onValueChange);
+  onValueChangeRef.current = onValueChange;
+  useEffect(() => {
+    onValueChangeRef.current?.(value);
+  }, [value]);
+
+  const highlighted = isFieldHighlighted(useSearchHighlight(), section, field);
+
   const defaultLabel = options.find((o) => o.value === defaultValue)?.label ?? String(defaultValue);
 
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className={`flex items-center justify-between gap-2 mb-1 ${highlighted ? 'ring-1 ring-accent/60 rounded' : ''}`}>
         <label className="text-sm text-content-secondary">{meta.label}</label>
         <div className="flex items-center gap-1 shrink-0">
           <SavedTick savedAt={savedAt} />

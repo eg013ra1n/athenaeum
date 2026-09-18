@@ -9,13 +9,16 @@ import { HistoryNav } from '../components/HistoryNav';
 import { SettingsDefaultsProvider, useSettingsDefaults } from '../settings/SettingsDefaultsContext';
 import { SETTINGS_TABS, type SettingsTabId } from '../settings/registry';
 import { SettingsSearch } from '../components/settings/SettingsSearch';
-import { GeneralTab } from '../components/settings/tabs/GeneralTab';
-import { BlinkTab } from '../components/settings/tabs/BlinkTab';
-import { AnalysisTab } from '../components/settings/tabs/AnalysisTab';
-import { PlateSolvingTab } from '../components/settings/tabs/PlateSolvingTab';
-import { CalibrationTab } from '../components/settings/tabs/CalibrationTab';
-import { StackingTab } from '../components/settings/tabs/StackingTab';
-import { TransfersTab } from '../components/settings/tabs/TransfersTab';
+import { SearchResults } from '../components/settings/SearchResults';
+import {
+  GeneralTab,
+  BlinkTab,
+  AnalysisTab,
+  PlateSolvingTab,
+  CalibrationTab,
+  StackingTab,
+  TransfersTab,
+} from '../components/settings/tabs';
 
 const VALID_TABS: readonly SettingsTabId[] = SETTINGS_TABS.map((t) => t.id);
 
@@ -61,6 +64,7 @@ function SettingsContent() {
   const { error: defaultsError } = useSettingsDefaults();
   const [searchParams, setSearchParams] = useSearchParams();
   const [query, setQuery] = useState('');
+  const isSearching = query.trim().length > 0;
 
   const tabFromUrl = searchParams.get('tab') ?? '';
   const initialTab: SettingsTabId = isSettingsTabId(tabFromUrl) ? tabFromUrl : 'general';
@@ -107,11 +111,23 @@ function SettingsContent() {
         </p>
       )}
 
-      <div className="flex gap-1 mb-6 mt-4 border-b border-border overflow-x-auto">
+      {/* Spec §7: with a query active the tab bar stays visible but inert —
+          switching "tabs" would be meaningless while the body shows search
+          results gathered from every tab. Clearing the query returns to
+          whichever tab was already selected (`activeTab` is untouched by
+          search). */}
+      <div
+        className={`flex gap-1 mb-6 mt-4 border-b border-border overflow-x-auto ${
+          isSearching ? 'opacity-50 pointer-events-none' : ''
+        }`}
+        aria-disabled={isSearching}
+      >
         {SETTINGS_TABS.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             onClick={() => setActiveTab(id)}
+            disabled={isSearching}
+            tabIndex={isSearching ? -1 : undefined}
             className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors whitespace-nowrap ${
               activeTab === id
                 ? 'bg-surface-elevated text-white border-b-2 border-accent'
@@ -124,13 +140,19 @@ function SettingsContent() {
         ))}
       </div>
 
-      {activeTab === 'general' && <GeneralTab />}
-      {activeTab === 'blink' && <BlinkTab />}
-      {activeTab === 'analysis' && <AnalysisTab />}
-      {activeTab === 'plate_solving' && <PlateSolvingTab />}
-      {activeTab === 'calibration' && <CalibrationTab />}
-      {activeTab === 'stacking' && <StackingTab />}
-      {activeTab === 'transfers' && <TransfersTab />}
+      {isSearching ? (
+        <SearchResults query={query} />
+      ) : (
+        <>
+          {activeTab === 'general' && <GeneralTab />}
+          {activeTab === 'blink' && <BlinkTab />}
+          {activeTab === 'analysis' && <AnalysisTab />}
+          {activeTab === 'plate_solving' && <PlateSolvingTab />}
+          {activeTab === 'calibration' && <CalibrationTab />}
+          {activeTab === 'stacking' && <StackingTab />}
+          {activeTab === 'transfers' && <TransfersTab />}
+        </>
+      )}
     </div>
   );
 }

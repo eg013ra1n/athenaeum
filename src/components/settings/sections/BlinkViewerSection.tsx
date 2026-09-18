@@ -4,6 +4,14 @@
 // semaphore immediately, so it goes through `set_blink_threads` /
 // `get_blink_threads_max` rather than the default `get_setting`/
 // `set_setting` pair (plan Task C1 Step 3).
+//
+// Owner-visible regression fix round, Item 2: only the JPEG-quality slider
+// matching the SELECTED resolution shows (as the pre-redesign page did) —
+// the resolution `SettingSelect`'s `onValueChange` mirrors its committed
+// value into local state so this component can pick which slider to render;
+// `'full'` also restores the old "~10x slower" warning line under the
+// select (`git show 5c5922f0^:src/pages/Settings.tsx`, the Blink Viewer
+// block).
 import { useEffect, useState } from 'react';
 import { api } from '../../../api';
 import { SettingsSection } from '../SettingsSection';
@@ -17,10 +25,13 @@ const RESOLUTION_OPTIONS = [
   { value: 'full', label: 'Full Resolution' },
 ] as const;
 
+type BlinkResolution = (typeof RESOLUTION_OPTIONS)[number]['value'];
+
 const resolutionCodec = enumCodec(['thumbnail', 'preview', 'full'] as const);
 
 export function BlinkViewerSection() {
   const [threadsMax, setThreadsMax] = useState(4);
+  const [resolution, setResolution] = useState<BlinkResolution>('preview');
 
   useEffect(() => {
     let cancelled = false;
@@ -33,41 +44,59 @@ export function BlinkViewerSection() {
   return (
     <SettingsSection id="blink.viewer">
       <div className="space-y-4">
-        <SettingSelect
-          section="blink.viewer"
-          field="resolution"
-          settingKey="blink.resolution"
-          codec={resolutionCodec}
-          options={RESOLUTION_OPTIONS}
-        />
+        <div>
+          <SettingSelect
+            section="blink.viewer"
+            field="resolution"
+            settingKey="blink.resolution"
+            codec={resolutionCodec}
+            options={RESOLUTION_OPTIONS}
+            // `useSettingField`'s `value` is typed as the enum but can
+            // genuinely be `undefined` at runtime with no committed value
+            // AND no registry default yet — guard rather than let
+            // `resolution` leave its narrow union type.
+            onValueChange={(v) => { if (v) setResolution(v); }}
+          />
+          {resolution === 'full' && (
+            <p className="text-xs text-warning mt-1">
+              Full resolution is ~10x slower to load and uses significantly more memory. Use for detailed inspection only.
+            </p>
+          )}
+        </div>
 
-        <SettingNumber
-          section="blink.viewer"
-          field="qualityThumbnail"
-          settingKey="rustafits.quality.thumbnail"
-          codec={intCodec(10, 100)}
-          variant="slider"
-          min={10}
-          max={100}
-        />
-        <SettingNumber
-          section="blink.viewer"
-          field="qualityPreview"
-          settingKey="rustafits.quality.preview"
-          codec={intCodec(10, 100)}
-          variant="slider"
-          min={10}
-          max={100}
-        />
-        <SettingNumber
-          section="blink.viewer"
-          field="qualityFull"
-          settingKey="rustafits.quality.full"
-          codec={intCodec(10, 100)}
-          variant="slider"
-          min={10}
-          max={100}
-        />
+        {resolution === 'thumbnail' && (
+          <SettingNumber
+            section="blink.viewer"
+            field="qualityThumbnail"
+            settingKey="rustafits.quality.thumbnail"
+            codec={intCodec(10, 100)}
+            variant="slider"
+            min={10}
+            max={100}
+          />
+        )}
+        {resolution === 'preview' && (
+          <SettingNumber
+            section="blink.viewer"
+            field="qualityPreview"
+            settingKey="rustafits.quality.preview"
+            codec={intCodec(10, 100)}
+            variant="slider"
+            min={10}
+            max={100}
+          />
+        )}
+        {resolution === 'full' && (
+          <SettingNumber
+            section="blink.viewer"
+            field="qualityFull"
+            settingKey="rustafits.quality.full"
+            codec={intCodec(10, 100)}
+            variant="slider"
+            min={10}
+            max={100}
+          />
+        )}
 
         <SettingNumber
           section="blink.viewer"

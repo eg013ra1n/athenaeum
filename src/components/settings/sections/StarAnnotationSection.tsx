@@ -71,9 +71,16 @@ function NumberRow({ label, min, max, step, value, onChange, isDefault, defaultV
 }
 
 export function StarAnnotationSection() {
-  const { doc, patch, isDefault, resetField, savedAt } = useAutosaveDocument<AnnotationSettings>({
+  const { doc, patch, isDefault, resetField, resetAll, savedAt } = useAutosaveDocument<AnnotationSettings>({
     load: loadAnnotationConfig,
     save: saveAnnotationConfig,
+    // The document IS `blink.annotation_config`'s whole value — writing the
+    // built-in object directly (rather than `patch`ing local state) matches
+    // what `useAutosaveDocument.resetAll()` expects of `opts.resetAll`: it
+    // persists on its own, then the hook reloads (spec §6, "Every KV section
+    // ... gets onResetAll that resets each of its fields" — this section's
+    // ten fields share one key, so resetting the key resets all ten).
+    resetAll: () => saveAnnotationConfig(BUILT_IN_ANNOTATION_CONFIG),
     defaults: BUILT_IN_ANNOTATION_CONFIG,
     debounceMs: 300,
     label: 'Star annotation display',
@@ -102,7 +109,7 @@ export function StarAnnotationSection() {
   );
 
   return (
-    <SettingsSection id="blink.annotations">
+    <SettingsSection id="blink.annotations" onResetAll={resetAll}>
       <div className="space-y-4">
         <div className="flex items-center justify-end -mb-2">
           <SavedTick savedAt={savedAt} />

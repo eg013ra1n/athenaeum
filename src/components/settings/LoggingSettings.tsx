@@ -12,6 +12,7 @@ import { api } from '../../api';
 import { useAutosaveDocument } from '../../hooks/useAutosaveDocument';
 import { useSettingsDefaults } from '../../settings/SettingsDefaultsContext';
 import { LevelSelect, LEVEL_INHERIT } from './LevelSelect';
+import { SettingsSection } from './SettingsSection';
 import type { LoggingConfig, LoggingConfigResponse } from '../../types/models';
 import { AlertTriangle } from 'lucide-react';
 import { useState } from 'react';
@@ -52,13 +53,23 @@ export default function LoggingSettings() {
   const { defaults } = useSettingsDefaults();
   const [envOverrideActive, setEnvOverrideActive] = useState(false);
 
-  const { doc, patch, error } = useAutosaveDocument<LoggingConfig>({
+  const { doc, patch, error, resetAll } = useAutosaveDocument<LoggingConfig>({
     load: async () => {
       const resp = await api.invoke<LoggingConfigResponse>('get_logging_config');
       setEnvOverrideActive(resp.envOverrideActive);
       return resp.config;
     },
     save: (config) => api.invoke('set_logging_config', { config }),
+    // There is no `reset_logging_config` command — the default document IS
+    // the reset (spec §6: "for a typed config it calls the existing
+    // reset_* command and reloads"; here, writing the default achieves the
+    // same net effect since there is no dedicated command to call).
+    resetAll: async () => {
+      if (!defaults?.logging) {
+        throw new Error('defaults not loaded yet');
+      }
+      await api.invoke('set_logging_config', { config: defaults.logging });
+    },
     defaults: defaults?.logging ?? null,
     label: 'Logging settings',
   });
@@ -66,50 +77,58 @@ export default function LoggingSettings() {
   if (doc === null) {
     if (error) {
       return (
-        <div className="p-4 bg-error-muted border border-error/50 rounded-lg">
-          <p className="text-sm text-error">Failed to load logging settings: {error}</p>
-        </div>
+        <SettingsSection id="general.logging">
+          <div className="p-4 bg-error-muted border border-error/50 rounded-lg">
+            <p className="text-sm text-error">Failed to load logging settings: {error}</p>
+          </div>
+        </SettingsSection>
       );
     }
-    return <div className="text-sm text-content-muted">Loading logging settings…</div>;
+    return (
+      <SettingsSection id="general.logging">
+        <div className="text-sm text-content-muted">Loading logging settings…</div>
+      </SettingsSection>
+    );
   }
 
   return (
-    <div className="space-y-4">
-      {envOverrideActive && (
-        <div className="p-3 bg-warning-muted border border-warning/50 rounded-lg flex items-start gap-2">
-          <AlertTriangle size={16} className="text-warning flex-shrink-0 mt-0.5" />
-          <p className="text-sm text-warning/90">
-            Log level is overridden by ATHENAEUM_LOG on this server — UI changes are saved but inactive.
-          </p>
-        </div>
-      )}
+    <SettingsSection id="general.logging" onResetAll={resetAll}>
+      <div className="space-y-4">
+        {envOverrideActive && (
+          <div className="p-3 bg-warning-muted border border-warning/50 rounded-lg flex items-start gap-2">
+            <AlertTriangle size={16} className="text-warning flex-shrink-0 mt-0.5" />
+            <p className="text-sm text-warning/90">
+              Log level is overridden by ATHENAEUM_LOG on this server — UI changes are saved but inactive.
+            </p>
+          </div>
+        )}
 
-      <LevelSelect
-        label="Base log level"
-        value={doc.level}
-        onChange={(level) => patch({ level })}
-        className="w-full sm:w-64"
-      />
+        <LevelSelect
+          label="Base log level"
+          value={doc.level}
+          onChange={(level) => patch({ level })}
+          className="w-full sm:w-64"
+        />
 
-      <div>
-        <h4 className="text-sm font-medium text-content-secondary mb-2">Module overrides</h4>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {MODULES.map((m) => (
-            <div key={m.key}>
-              <LevelSelect
-                label={m.label}
-                value={toModuleValue(doc.modules, m.key)}
-                onChange={(value) =>
-                  patch((prev) => ({ ...prev, modules: fromModuleValue(prev.modules, m.key, value) }))
-                }
-                inherit={{ base: doc.level }}
-              />
-              {m.hint && <p className="text-xs text-content-muted mt-1">{m.hint}</p>}
-            </div>
-          ))}
+        <div>
+          <h4 className="text-sm font-medium text-content-secondary mb-2">Module overrides</h4>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {MODULES.map((m) => (
+              <div key={m.key}>
+                <LevelSelect
+                  label={m.label}
+                  value={toModuleValue(doc.modules, m.key)}
+                  onChange={(value) =>
+                    patch((prev) => ({ ...prev, modules: fromModuleValue(prev.modules, m.key, value) }))
+                  }
+                  inherit={{ base: doc.level }}
+                />
+                {m.hint && <p className="text-xs text-content-muted mt-1">{m.hint}</p>}
+              </div>
+            ))}
+          </div>
         </div>
       </div>
-    </div>
+    </SettingsSection>
   );
 }

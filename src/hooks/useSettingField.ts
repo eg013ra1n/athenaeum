@@ -19,6 +19,7 @@ import { useNotifications } from '../contexts/NotificationContext';
 import { useSettingsDefaults } from '../settings/SettingsDefaultsContext';
 import { fieldMeta, type SettingsFieldMeta } from '../settings/registry';
 import type { Codec } from '../settings/codecs';
+import { useRegisterFieldReset } from '../settings/ResetAllContext';
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -270,6 +271,13 @@ export function useSettingField<T>(
   // typed; `isDefault` below still correctly reports `false` in that case.
   const defaultValue: T = parsedDefault instanceof Error ? value : parsedDefault;
   const isDefault = committed !== null && !(parsedDefault instanceof Error) && committed === parsedDefault;
+
+  // Registers this field's own reset with the nearest `SettingsSection` (a
+  // KV section with no `onResetAll` of its own — spec §6/Task E1). A field
+  // with no real default (`parsedDefault instanceof Error`) never
+  // registers, so a section's "Reset all" can never silently do nothing to
+  // one of its fields.
+  useRegisterFieldReset(key, reset, !(parsedDefault instanceof Error));
 
   return {
     value,

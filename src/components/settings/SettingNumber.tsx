@@ -8,10 +8,11 @@
 // `onChange` commits through `setValue`, debounced 300ms by the hook, so a
 // drag ends as one write.
 
-import type { KeyboardEvent } from 'react';
+import { useEffect, useRef, type KeyboardEvent } from 'react';
 import { ResetButton, SavedTick } from './ResetButton';
 import { useSettingField, type UseSettingFieldOptions } from '../../hooks/useSettingField';
 import type { Codec } from '../../settings/codecs';
+import { useSearchHighlight, isFieldHighlighted } from './SearchHighlightContext';
 
 export interface SettingNumberProps {
   section: string;
@@ -31,6 +32,10 @@ export interface SettingNumberProps {
   /** For a key with its own read/write command — forwarded to `useSettingField`. */
   write?: UseSettingFieldOptions<number>['write'];
   read?: UseSettingFieldOptions<number>['read'];
+  /** Fired on mount (once the initial value is known) and again on every
+   *  committed change — lets a sibling field in the same section mirror
+   *  this one's value into local state. */
+  onValueChange?: (value: number) => void;
 }
 
 export function SettingNumber({
@@ -47,9 +52,18 @@ export function SettingNumber({
   disabled,
   write,
   read,
+  onValueChange,
 }: SettingNumberProps) {
   const { value, draft, setDraft, commit, setValue, escape, error, savedAt, isDefault, reset, meta, defaultValue } =
     useSettingField(section, field, settingKey, codec, { write, read });
+
+  const onValueChangeRef = useRef(onValueChange);
+  onValueChangeRef.current = onValueChange;
+  useEffect(() => {
+    onValueChangeRef.current?.(value);
+  }, [value]);
+
+  const highlighted = isFieldHighlighted(useSearchHighlight(), section, field);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
@@ -63,7 +77,7 @@ export function SettingNumber({
 
   return (
     <div>
-      <div className="flex items-center justify-between gap-2 mb-1">
+      <div className={`flex items-center justify-between gap-2 mb-1 ${highlighted ? 'ring-1 ring-accent/60 rounded' : ''}`}>
         <label className="text-sm text-content-secondary">
           {meta.label}
           {unit && <span className="text-content-muted"> ({unit})</span>}

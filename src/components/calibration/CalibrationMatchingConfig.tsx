@@ -326,6 +326,7 @@ export default function CalibrationMatchingConfig() {
     <SettingsSection
       id="calibration.matching"
       onResetAll={resetAll}
+      resetScopeLabel="This resets the whole Calibration Matching configuration back to its default."
       actions={
         <>
           <SavedTick savedAt={savedAt} />

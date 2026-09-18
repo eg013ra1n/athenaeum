@@ -313,7 +313,12 @@ export function PlateSolveSettingsPanel() {
           `AnalysisSettingsPanel.tsx`'s matching comment on why the first
           section's own registry title, not the whole config, is what
           `SettingsSection`'s confirm dialog names). */}
-      <SettingsSection id="plateSolving.catalog" onResetAll={resetAll} actions={<SavedTick savedAt={savedAt} />}>
+      <SettingsSection
+        id="plateSolving.catalog"
+        onResetAll={resetAll}
+        resetScopeLabel="This resets the whole Plate Solving configuration back to its default."
+        actions={<SavedTick savedAt={savedAt} />}
+      >
         {catalogsLoading ? (
           <div className="flex items-center gap-2 text-sm text-content-muted py-2">
             <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent" />

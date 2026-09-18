@@ -13,6 +13,7 @@
 // screen until the user happens to blur that particular field.
 
 import { useEffect, useRef, useState } from 'react';
+import { Checkbox } from '../settings/Checkbox';
 
 function clampNumber(n: number, min?: number, max?: number): number {
   let v = n;
@@ -153,16 +154,13 @@ export function NullableNumericField({
     <div>
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs text-content-secondary">{label}</span>
-        <label className="flex items-center gap-1.5 text-[11px] text-content-muted cursor-pointer">
-          <input
-            type="checkbox"
-            checked={on}
-            disabled={disabled}
-            onChange={(e) => handleToggle(e.target.checked)}
-            className="w-3.5 h-3.5 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          {on ? 'On' : 'Off'}
-        </label>
+        <Checkbox
+          size="sm"
+          checked={on}
+          disabled={disabled}
+          onChange={handleToggle}
+          label={<span className="text-[11px] text-content-muted">{on ? 'On' : 'Off'}</span>}
+        />
       </div>
       {on ? (
         <NumericField

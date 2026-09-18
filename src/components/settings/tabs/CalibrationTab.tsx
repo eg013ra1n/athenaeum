@@ -6,13 +6,14 @@
 import { CalibrationMatchingConfig } from '../../calibration';
 import { MasterBuildMemorySection } from '../sections/MasterBuildMemorySection';
 import { MasterFileFormatSection } from '../sections/MasterFileFormatSection';
+import { renderTabSections, type TabSectionEntry } from './tabSectionEntry';
+
+export const CALIBRATION_SECTIONS: TabSectionEntry[] = [
+  { sectionId: 'calibration.matching', element: <CalibrationMatchingConfig /> },
+  { sectionId: 'calibration.memory', element: <MasterBuildMemorySection /> },
+  { sectionId: 'calibration.masterFormat', element: <MasterFileFormatSection /> },
+];
 
 export function CalibrationTab() {
-  return (
-    <div className="space-y-6">
-      <CalibrationMatchingConfig />
-      <MasterBuildMemorySection />
-      <MasterFileFormatSection />
-    </div>
-  );
+  return <div className="space-y-6">{renderTabSections(CALIBRATION_SECTIONS)}</div>;
 }

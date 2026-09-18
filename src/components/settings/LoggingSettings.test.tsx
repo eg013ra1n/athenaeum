@@ -76,7 +76,12 @@ describe('LoggingSettings', () => {
       expect(s.value).toBe('inherit');
     }
 
-    expect(screen.queryAllByRole('button')).toHaveLength(0);
+    // No Save button — but a fix-round addition gives this section a
+    // "Reset all" (spec §6 KV-section discipline generalized to a typed
+    // document with no dedicated `reset_*` command — see `LoggingSettings`'s
+    // own `resetAll` comment).
+    expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reset all' })).toBeInTheDocument();
   });
 
   it('changing the base level writes the whole document, debounced', async () => {
