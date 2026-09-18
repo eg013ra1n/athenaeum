@@ -957,7 +957,16 @@ mod tests {
             },
             None,
         );
-        assert_ne!(plain, filtered, "the pre-filter must change something");
+        // Timings are wall-clock, not measurement output, so they're zeroed
+        // before the comparison (perf tier 1 Task 0) — otherwise two
+        // independent calls almost always differ in at least one phase
+        // timing and this pin would pass no matter what the measurement
+        // numbers say.
+        assert_ne!(
+            without_timings(plain.clone()),
+            without_timings(filtered.clone()),
+            "the pre-filter must change something"
+        );
         assert!(
             filtered.stars_fitted >= 100,
             "a well-sampled field survives the median: {} vs {}",
@@ -995,7 +1004,16 @@ mod tests {
             b.stars_fitted,
             b.stars_detected
         );
-        assert_ne!(a, b, "the two detectors are different measurements");
+        // Timings are wall-clock, not measurement output, so they're zeroed
+        // before the comparison (perf tier 1 Task 0) — otherwise two
+        // independent calls almost always differ in at least one phase
+        // timing and this pin would pass no matter what the measurement
+        // numbers say.
+        assert_ne!(
+            without_timings(a.clone()),
+            without_timings(b.clone()),
+            "the two detectors are different measurements"
+        );
         assert_eq!(b.noise, a.noise);
         assert_eq!((b.m_star, b.n_star), (a.m_star, a.n_star));
         assert_eq!((b.median, b.mad, b.location), (a.median, a.mad, a.location));
