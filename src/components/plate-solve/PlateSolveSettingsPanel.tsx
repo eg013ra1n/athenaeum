@@ -1,34 +1,23 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Save, RotateCw, CheckCircle, AlertCircle, Download, Info } from 'lucide-react';
+// Settings redesign (spec 2026-09-18 §4/§5/§6, plan Task D1): the
+// `PlateSolveConfig` fields commit through `useAutosaveDocument` — no Save
+// button, no "settings saved" banner. Three registered sections
+// (`plateSolving.catalog/solver/inputGate`); `onResetAll` on the first
+// (`plateSolving.catalog`) calls the document's whole-config `resetAll`.
+// The Star Catalog section's download UI is unchanged — it's an action,
+// not a setting (spec §5).
+import { useState, useEffect, useCallback, useRef, type KeyboardEvent } from 'react';
+import { CheckCircle, Download, Info } from 'lucide-react';
 import { api } from '../../api';
 import type { PlateSolveConfig, FovSummary } from '../../types/plate-solve';
 import type { CatalogStatusInfo, CatalogDownloadProgress } from '../../types/helpers';
 import { buildTierRows, recommendFromFov } from './cameraPresets';
-
-// Fallback default shown while loading, matching backend defaults (see
-// PlateSolveConfig::default() in athenaeum-core/src/plate_solve/config.rs).
-// The full config object is replaced by `get_plate_solve_config` on mount.
-// PlateSolveConfig is now the complete generated struct (previously a partial
-// hand-written mirror covering only the 3 settings-UI fields), so every field
-// must be present here too.
-const DEFAULT_CONFIG: PlateSolveConfig = {
-  sip_order: 3,
-  base_verification_tolerance_arcsec: 8.0,
-  autofind_tolerance_deg: 0.5,
-  batch_concurrency: 0,
-  blind_gate_enabled: true,
-  blind_rms_max_px_mult: 2.5,
-  blind_min_inlier_ratio: 0.04,
-  blind_inlier_floor: 6,
-  blind_scale_sanity_min: 0.05,
-  blind_scale_sanity_max: 60.0,
-  blind_scale_header_tol: 8.0,
-  input_gate_enabled: true,
-  input_max_eccentricity: 0.85,
-  input_min_trail_r2: 0.65,
-  camera_defaults: {},
-  bright_cache_path: null,
-};
+import { useAutosaveDocument } from '../../hooks/useAutosaveDocument';
+import { useSettingsDefaults } from '../../settings/SettingsDefaultsContext';
+import { fieldMeta } from '../../settings/registry';
+import { intCodec, floatCodec, type Codec } from '../../settings/codecs';
+import { SettingsSection } from '../settings/SettingsSection';
+import { Checkbox } from '../settings/Checkbox';
+import { ResetButton, SavedTick } from '../settings/ResetButton';
 
 function formatStarCount(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
@@ -78,14 +67,124 @@ function getDownloadStatusText(progress: CatalogDownloadProgress | null): string
   }
 }
 
-export function PlateSolveSettingsPanel() {
-  const [config, setConfig] = useState<PlateSolveConfig>(DEFAULT_CONFIG);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+/** Draft/blur/Enter/Escape discipline for one numeric input bound to a path
+ *  of the `useAutosaveDocument` doc — see `AnalysisSettingsPanel.tsx`'s own
+ *  copy of this helper for the full rationale (kept file-local in both
+ *  panels rather than shared, per this task's file scope). */
+function useNumberDraft(value: number, codec: Codec<number>, onCommit: (n: number) => void) {
+  const [draft, setDraft] = useState(String(value));
   const [error, setError] = useState<string | null>(null);
 
-  // Catalog state
+  useEffect(() => {
+    setDraft(String(value));
+    setError(null);
+  }, [value]);
+
+  const onCommitRef = useRef(onCommit);
+  onCommitRef.current = onCommit;
+
+  const commit = useCallback(() => {
+    const parsed = codec.parse(draft);
+    if (parsed instanceof Error) {
+      setError(parsed.message);
+      return;
+    }
+    const validationError = codec.validate?.(parsed);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+    setError(null);
+    if (parsed !== value) onCommitRef.current(parsed);
+  }, [codec, draft, value]);
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setDraft(String(value));
+      setError(null);
+    }
+  };
+
+  return { draft, setDraft, error, commit, handleKeyDown };
+}
+
+interface DocNumberFieldProps {
+  section: string;
+  field: string;
+  value: number;
+  codec: Codec<number>;
+  min?: number;
+  max?: number;
+  step?: number;
+  onCommit: (n: number) => void;
+  isDefault: boolean;
+  defaultValue: number;
+  onReset: () => void;
+  disabled?: boolean;
+  help?: string;
+}
+
+function DocNumberField({
+  section,
+  field,
+  value,
+  codec,
+  min,
+  max,
+  step,
+  onCommit,
+  isDefault,
+  defaultValue,
+  onReset,
+  disabled,
+  help,
+}: DocNumberFieldProps) {
+  const meta = fieldMeta(section, field);
+  const { draft, setDraft, error, commit, handleKeyDown } = useNumberDraft(value, codec, onCommit);
+
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <label className="block text-sm font-medium text-content-secondary">{meta.label}</label>
+        <ResetButton visible={!isDefault} defaultLabel={String(defaultValue)} onReset={onReset} disabled={disabled} />
+      </div>
+      <input
+        type="number"
+        value={draft}
+        min={min}
+        max={max}
+        step={step}
+        disabled={disabled}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={handleKeyDown}
+        className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed"
+      />
+      <p className="mt-1 text-xs text-content-muted">{help ?? meta.help}</p>
+      {error && <p className="text-xs text-error mt-1">{error}</p>}
+    </div>
+  );
+}
+
+export function PlateSolveSettingsPanel() {
+  const { defaults } = useSettingsDefaults();
+
+  const { doc: config, patch, error: docError, savedAt, isDefault, resetField, resetAll } = useAutosaveDocument<PlateSolveConfig>({
+    load: () => api.invoke<PlateSolveConfig>('get_plate_solve_config'),
+    save: (c) => api.invoke('set_plate_solve_config', { config: c }),
+    resetAll: async () => {
+      await api.invoke('reset_plate_solve_config');
+    },
+    defaults: defaults?.plateSolve ?? null,
+    label: 'Plate Solving settings',
+  });
+
+  // Catalog state — unchanged from before the redesign; independent of the
+  // typed-config document above.
   const [catalogs, setCatalogs] = useState<CatalogStatusInfo[]>([]);
   const [catalogsLoading, setCatalogsLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
@@ -98,25 +197,39 @@ export function PlateSolveSettingsPanel() {
   const [fovSummary, setFovSummary] = useState<FovSummary | null>(null);
 
   // Derived values (not state — recomputed on each render from inputs).
-  // Tier rows and the recommendation are both built from the LIVE catalog
-  // status (`get_catalog_status`, one row per manifest tier merged with
-  // on-disk install state) so the table only ever shows tiers the server
-  // actually publishes, and the recommendation can only ever name one of
-  // them. Falls back to the fixed TIER_POLICY (inside cameraPresets.ts) only
-  // when the status list is empty (manifest unreachable, nothing installed
-  // yet) so the panel still works offline on first run.
   const recommendation = recommendFromFov(fovSummary?.min_fov_deg, catalogs);
   const hasRecommendation = recommendation.isRecommendation;
   const recommended = recommendation.density;
   const tierRows = buildTierRows(catalogs);
-  // True iff the recommended tier (or its fallback) is not yet installed.
   const needsDownload = tierRows.some((t) => t.density <= recommended && !t.installed);
 
-  useEffect(() => {
-    loadConfig();
-    loadCatalogStatus();
-    loadFovSummary();
+  const loadCatalogStatus = useCallback(async () => {
+    try {
+      setCatalogsLoading(true);
+      const result = await api.invoke<CatalogStatusInfo[]>('get_catalog_status');
+      setCatalogs(result);
+    } catch (err) {
+      console.error('Failed to load catalog status:', err);
+      setCatalogs([]);
+    } finally {
+      setCatalogsLoading(false);
+    }
   }, []);
+
+  const loadFovSummary = useCallback(async () => {
+    try {
+      const s = await api.invoke<FovSummary>('get_frame_fov_summary');
+      setFovSummary(s);
+    } catch (err) {
+      console.error('[PlateSolveSettingsPanel] Failed to load FOV summary:', err);
+      setFovSummary(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadCatalogStatus();
+    void loadFovSummary();
+  }, [loadCatalogStatus, loadFovSummary]);
 
   // Tick once a second while a catalog download is active so the elapsed
   // timer keeps moving even during the long first wait (liveness).
@@ -127,10 +240,7 @@ export function PlateSolveSettingsPanel() {
   }, [downloading]);
 
   // Reflect ANY catalog download for the panel's whole lifetime — including one
-  // kicked off elsewhere (e.g. PlateSolveIndexMissingModal's "Download now",
-  // which fires download_catalog_layers then navigates here). A single
-  // persistent listener also gives us proper unmount cleanup. StrictMode-safe
-  // cancelled-flag form (see CLAUDE.md).
+  // kicked off elsewhere. StrictMode-safe cancelled-flag form (see CLAUDE.md).
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -141,7 +251,7 @@ export function PlateSolveSettingsPanel() {
           setDownloading(false);
           setDownloadProgress(null);
           setDownloadStartedAt(null);
-          loadCatalogStatus();
+          void loadCatalogStatus();
         } else if (payload.phase === 'error') {
           setDownloading(false);
           setDownloadProgress(null);
@@ -163,79 +273,8 @@ export function PlateSolveSettingsPanel() {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [loadCatalogStatus]);
 
-  const loadConfig = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const result = await api.invoke<PlateSolveConfig>('get_plate_solve_config');
-      setConfig(result);
-    } catch (err) {
-      setError(String(err));
-      console.error('Failed to load plate solve config:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSave = useCallback(async () => {
-    try {
-      setSaving(true);
-      setError(null);
-      setSaved(false);
-      await api.invoke('set_plate_solve_config', { config });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      setError(String(err));
-      console.error('Failed to save plate solve config:', err);
-    } finally {
-      setSaving(false);
-    }
-  }, [config]);
-
-  const handleReset = useCallback(async () => {
-    try {
-      setError(null);
-      const result = await api.invoke<PlateSolveConfig>('reset_plate_solve_config');
-      setConfig(result);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      setError(String(err));
-      console.error('Failed to reset plate solve config:', err);
-    }
-  }, []);
-
-  const loadCatalogStatus = async () => {
-    try {
-      setCatalogsLoading(true);
-      const result = await api.invoke<CatalogStatusInfo[]>('get_catalog_status');
-      setCatalogs(result);
-    } catch (err) {
-      console.error('Failed to load catalog status:', err);
-      // On error fall back to an empty list — the UI shows the download button.
-      setCatalogs([]);
-    } finally {
-      setCatalogsLoading(false);
-    }
-  };
-
-  const loadFovSummary = async () => {
-    try {
-      const s = await api.invoke<FovSummary>('get_frame_fov_summary');
-      setFovSummary(s);
-    } catch (err) {
-      console.error('[PlateSolveSettingsPanel] Failed to load FOV summary:', err);
-      setFovSummary(null);
-    }
-  };
-
-  // Kick off a tier download up to targetDensity. Live progress + terminal
-  // completion are handled by the persistent catalog-download-progress listener
-  // above; the awaited invoke is the authoritative "finished" signal and also
-  // covers the no-event case (e.g. every requested tier already installed).
   const downloadStarCatalog = useCallback(async (targetDensity: number) => {
     setDownloading(true);
     setDownloadError(null);
@@ -247,7 +286,7 @@ export function PlateSolveSettingsPanel() {
       setDownloading(false);
       setDownloadProgress(null);
       setDownloadStartedAt(null);
-      loadCatalogStatus();
+      void loadCatalogStatus();
     } catch (err) {
       console.error('Failed to start star catalog download:', err);
       setDownloadError(String(err));
@@ -255,13 +294,9 @@ export function PlateSolveSettingsPanel() {
       setDownloadProgress(null);
       setDownloadStartedAt(null);
     }
-  }, []);
+  }, [loadCatalogStatus]);
 
-  const setField = <K extends keyof PlateSolveConfig>(key: K, value: PlateSolveConfig[K]) => {
-    setConfig((prev) => ({ ...prev, [key]: value }));
-  };
-
-  if (loading) {
+  if (!config) {
     return (
       <div className="flex items-center justify-center py-12 text-content-muted">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-accent mr-3" />
@@ -272,30 +307,13 @@ export function PlateSolveSettingsPanel() {
 
   return (
     <div className="space-y-6">
-      {/* Error banner */}
-      {error && (
-        <div className="p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
-          <AlertCircle className="text-error flex-shrink-0 mt-0.5" size={20} />
-          <div>
-            <p className="font-medium text-error">Error</p>
-            <p className="text-sm text-error/80">{error}</p>
-          </div>
-        </div>
-      )}
+      {docError && <p className="text-xs text-error">{docError}</p>}
 
-      {/* Success banner */}
-      {saved && (
-        <div className="p-4 bg-success-muted border border-success/50 rounded-lg flex items-start gap-3">
-          <CheckCircle className="text-success flex-shrink-0 mt-0.5" size={20} />
-          <p className="font-medium text-success">Configuration saved</p>
-        </div>
-      )}
-
-      {/* Star Catalog */}
-      <section>
-        <h4 className="text-sm font-semibold uppercase tracking-wider text-content-muted mb-3">
-          Star Catalog
-        </h4>
+      {/* Star Catalog — carries the whole-panel reset (see
+          `AnalysisSettingsPanel.tsx`'s matching comment on why the first
+          section's own registry title, not the whole config, is what
+          `SettingsSection`'s confirm dialog names). */}
+      <SettingsSection id="plateSolving.catalog" onResetAll={resetAll} actions={<SavedTick savedAt={savedAt} />}>
         {catalogsLoading ? (
           <div className="flex items-center gap-2 text-sm text-content-muted py-2">
             <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent" />
@@ -303,12 +321,9 @@ export function PlateSolveSettingsPanel() {
           </div>
         ) : (
           <div className="rounded-lg border border-border bg-surface px-4 py-4 space-y-5">
-
-            {/* Auto recommendation banner — driven by scanned light-frame FOV data */}
             {fovSummary && fovSummary.computable_count > 0 ? (
               <div className="flex items-center gap-3 px-3 py-2.5 bg-accent/5 border border-accent/20 rounded-lg">
                 <div className="flex-1 min-w-0 flex items-baseline gap-1 text-xs text-content-secondary">
-                  {/* Lead-in truncates (long INSTRUME) so the whole banner stays one line… */}
                   <span className="min-w-0 truncate">
                     From your{' '}
                     <span className="font-medium text-content">{fovSummary.computable_count}</span>{' '}
@@ -318,7 +333,6 @@ export function PlateSolveSettingsPanel() {
                     </span>
                     {fovSummary.narrowest_instrume ? ` (${fovSummary.narrowest_instrume})` : ''}
                   </span>
-                  {/* …while the recommendation itself is always fully shown. */}
                   <span className="flex-shrink-0 whitespace-nowrap">
                     &rarr; recommended:{' '}
                     <span className="font-medium text-content">
@@ -350,9 +364,6 @@ export function PlateSolveSettingsPanel() {
               </p>
             )}
 
-            {/* Per-tier table — one row per tier the live catalog status reports
-                (manifest tiers merged with on-disk install state); falls back to
-                the fixed tier policy only when the status list is empty. */}
             <div>
               <div className="text-xs font-semibold uppercase tracking-wide text-content-muted mb-2">
                 Catalog Tiers
@@ -434,7 +445,6 @@ export function PlateSolveSettingsPanel() {
               )}
             </div>
 
-            {/* Download status — progress bar or all-good confirmation */}
             {downloadError && (
               <p className="text-xs text-error">{downloadError}</p>
             )}
@@ -467,120 +477,83 @@ export function PlateSolveSettingsPanel() {
                 Recommended catalog tiers installed and up to date.
               </p>
             ) : null}
-
           </div>
         )}
-      </section>
+      </SettingsSection>
 
       {/* Solver Parameters */}
-      <section>
-        <h4 className="text-sm font-semibold uppercase tracking-wider text-content-muted mb-3">
-          Solver Parameters
-        </h4>
+      <SettingsSection id="plateSolving.solver" actions={<SavedTick savedAt={savedAt} />}>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          {/* Base Verification Tolerance */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Verification Tolerance (arcsec)
-            </label>
-            <input
-              type="number"
-              min={2}
-              max={30}
-              step={0.5}
-              value={config.base_verification_tolerance_arcsec ?? 8.0}
-              onChange={(e) =>
-                setField('base_verification_tolerance_arcsec', parseFloat(e.target.value) || 0)
-              }
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Base angular tolerance for the persisted-solve confidence gate. The
-              actual pixel tolerance adapts per frame: <code>base / pixel_scale</code>,
-              clamped to [4, 20] px. Default 8.0&Prime;.
-            </p>
-          </div>
-
-          {/* SIP Order */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              SIP Distortion Order
-            </label>
-            <input
-              type="number"
-              min={2}
-              max={5}
-              value={config.sip_order}
-              onChange={(e) => setField('sip_order', parseInt(e.target.value, 10) || 2)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Polynomial order for the SIP distortion fit passed to the solver
-              (2&ndash;5). Higher orders fit more distortion but need more matched stars.
-            </p>
-          </div>
-
-          {/* Autofind Tolerance */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Autofind Object Tolerance (&deg;)
-            </label>
-            <input
-              type="number"
-              min={0.05}
-              max={5}
-              step={0.05}
-              value={config.autofind_tolerance_deg}
-              onChange={(e) => setField('autofind_tolerance_deg', parseFloat(e.target.value) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Maximum great-circle distance (in degrees) between a frame&apos;s
-              RA/Dec and a named DSO for the &quot;Autofind Object&quot; batch
-              action to accept the match as a label. Tighter values reject
-              more frames; looser values risk labelling unrelated fields with
-              distant objects. Default 0.5&deg;.
-            </p>
-          </div>
-
-          {/* Batch Concurrency */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Batch Concurrency
-            </label>
-            <input
-              type="number"
-              min={0}
-              max={16}
-              step={1}
-              value={config.batch_concurrency}
-              onChange={(e) => setField('batch_concurrency', parseInt(e.target.value, 10) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Worker threads for batch solving. Each worker solves one frame at a
-              time and shares the star-detection thread pool with the others.
-              <code>0</code> means auto &mdash; <code>cores / 3</code>, clamped to
-              2&ndash;8. Default 0.
-            </p>
-          </div>
+          <DocNumberField
+            section="plateSolving.solver"
+            field="verificationTolerance"
+            value={config.base_verification_tolerance_arcsec}
+            codec={floatCodec(2, 30)}
+            min={2}
+            max={30}
+            step={0.5}
+            onCommit={(n) => patch({ base_verification_tolerance_arcsec: n })}
+            isDefault={isDefault('base_verification_tolerance_arcsec')}
+            defaultValue={defaults?.plateSolve?.base_verification_tolerance_arcsec ?? config.base_verification_tolerance_arcsec}
+            onReset={() => resetField('base_verification_tolerance_arcsec')}
+            help="Base angular tolerance for the persisted-solve confidence gate. The actual pixel tolerance adapts per frame: base / pixel_scale, clamped to [4, 20] px. Default 8.0″."
+          />
+          <DocNumberField
+            section="plateSolving.solver"
+            field="sipOrder"
+            value={config.sip_order}
+            codec={intCodec(2, 5)}
+            min={2}
+            max={5}
+            step={1}
+            onCommit={(n) => patch({ sip_order: n })}
+            isDefault={isDefault('sip_order')}
+            defaultValue={defaults?.plateSolve?.sip_order ?? config.sip_order}
+            onReset={() => resetField('sip_order')}
+          />
+          <DocNumberField
+            section="plateSolving.solver"
+            field="autofindTolerance"
+            value={config.autofind_tolerance_deg}
+            codec={floatCodec(0.05, 5)}
+            min={0.05}
+            max={5}
+            step={0.05}
+            onCommit={(n) => patch({ autofind_tolerance_deg: n })}
+            isDefault={isDefault('autofind_tolerance_deg')}
+            defaultValue={defaults?.plateSolve?.autofind_tolerance_deg ?? config.autofind_tolerance_deg}
+            onReset={() => resetField('autofind_tolerance_deg')}
+          />
+          <DocNumberField
+            section="plateSolving.solver"
+            field="batchConcurrency"
+            value={config.batch_concurrency}
+            codec={intCodec(0, 16)}
+            min={0}
+            max={16}
+            step={1}
+            onCommit={(n) => patch({ batch_concurrency: n })}
+            isDefault={isDefault('batch_concurrency')}
+            defaultValue={defaults?.plateSolve?.batch_concurrency ?? config.batch_concurrency}
+            onReset={() => resetField('batch_concurrency')}
+          />
         </div>
-      </section>
+      </SettingsSection>
 
       {/* Input Gate */}
-      <section>
-        <h4 className="text-sm font-semibold uppercase tracking-wider text-content-muted mb-3">
-          Input Gate
-        </h4>
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
+      <SettingsSection id="plateSolving.inputGate" actions={<SavedTick savedAt={savedAt} />}>
+        <div className="flex items-start justify-between gap-2">
+          <Checkbox
             checked={config.input_gate_enabled}
-            onChange={(e) => setField('input_gate_enabled', e.target.checked)}
-            className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+            onChange={(checked) => patch({ input_gate_enabled: checked })}
+            label={fieldMeta('plateSolving.inputGate', 'inputGateEnabled').label}
           />
-          <span>Refuse trailed frames before solving</span>
-        </label>
+          <ResetButton
+            visible={!isDefault('input_gate_enabled')}
+            defaultLabel={(defaults?.plateSolve?.input_gate_enabled ?? config.input_gate_enabled) ? 'On' : 'Off'}
+            onReset={() => resetField('input_gate_enabled')}
+          />
+        </div>
         <p className="mt-2 mb-4 text-xs text-content-muted">
           A frame is refused when its own analysis reports a median star
           eccentricity of at least the first value <strong>and</strong> a trail-fit
@@ -597,71 +570,36 @@ export function PlateSolveSettingsPanel() {
             config.input_gate_enabled ? '' : 'opacity-50'
           }`}
         >
-          {/* Max median eccentricity */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Max Median Eccentricity
-            </label>
-            <input
-              type="number"
-              min={0}
-              max={1}
-              step={0.01}
-              disabled={!config.input_gate_enabled}
-              value={config.input_max_eccentricity}
-              onChange={(e) =>
-                setField('input_max_eccentricity', parseFloat(e.target.value) || 0)
-              }
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              How elongated the average star may be before the frame is a
-              candidate for refusal. Default 0.85.
-            </p>
-          </div>
-
-          {/* Min trail R-squared */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Min Trail R&sup2;
-            </label>
-            <input
-              type="number"
-              min={0}
-              max={1}
-              step={0.01}
-              disabled={!config.input_gate_enabled}
-              value={config.input_min_trail_r2}
-              onChange={(e) => setField('input_min_trail_r2', parseFloat(e.target.value) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              How well the elongation lines up along one direction &mdash; high
-              means a tracking failure rather than soft seeing. Default 0.65.
-            </p>
-          </div>
+          <DocNumberField
+            section="plateSolving.inputGate"
+            field="maxEccentricity"
+            value={config.input_max_eccentricity}
+            codec={floatCodec(0, 1)}
+            min={0}
+            max={1}
+            step={0.01}
+            disabled={!config.input_gate_enabled}
+            onCommit={(n) => patch({ input_max_eccentricity: n })}
+            isDefault={isDefault('input_max_eccentricity')}
+            defaultValue={defaults?.plateSolve?.input_max_eccentricity ?? config.input_max_eccentricity}
+            onReset={() => resetField('input_max_eccentricity')}
+          />
+          <DocNumberField
+            section="plateSolving.inputGate"
+            field="minTrailR2"
+            value={config.input_min_trail_r2}
+            codec={floatCodec(0, 1)}
+            min={0}
+            max={1}
+            step={0.01}
+            disabled={!config.input_gate_enabled}
+            onCommit={(n) => patch({ input_min_trail_r2: n })}
+            isDefault={isDefault('input_min_trail_r2')}
+            defaultValue={defaults?.plateSolve?.input_min_trail_r2 ?? config.input_min_trail_r2}
+            onReset={() => resetField('input_min_trail_r2')}
+          />
         </div>
-      </section>
-
-      {/* Action buttons */}
-      <div className="flex items-center gap-3 pt-2">
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded-lg text-sm font-medium transition-colors text-surface"
-        >
-          <Save size={16} />
-          {saving ? 'Saving...' : 'Save'}
-        </button>
-        <button
-          onClick={handleReset}
-          disabled={saving}
-          className="flex items-center gap-2 px-4 py-2 border border-border hover:bg-surface-hover disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
-        >
-          <RotateCw size={16} />
-          Reset to Defaults
-        </button>
-      </div>
+      </SettingsSection>
     </div>
   );
 }

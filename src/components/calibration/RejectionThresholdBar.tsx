@@ -1,4 +1,5 @@
 import { Minus, Plus, RotateCw } from 'lucide-react';
+import { Checkbox } from '../settings/Checkbox';
 
 export interface RejectionThresholds {
   fwhm: string;
@@ -150,14 +151,13 @@ export function RejectionThresholdBar({
         );
       })}
       <div className="flex flex-col items-center gap-0.5">
-        <label className="flex items-center justify-center h-7 cursor-pointer select-none">
-          <input
-            type="checkbox"
+        <div className="flex items-center justify-center h-7">
+          <Checkbox
             checked={thresholds.trail === 'true'}
-            onChange={e => handleChange('trail', e.target.checked ? 'true' : '')}
-            className="rounded border-border text-accent focus:ring-accent"
+            onChange={(checked) => handleChange('trail', checked ? 'true' : '')}
+            size="sm"
           />
-        </label>
+        </div>
         <span className="text-[10px] text-content-muted leading-tight">Trailed</span>
       </div>
       {onClear && (
