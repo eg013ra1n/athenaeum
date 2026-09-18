@@ -459,6 +459,23 @@ Two causes (`PlateSolveSettingsPanel.tsx`, `PlateSolveIndexMissingModal.tsx`,
 come from the manifest; the tooltip says "this tier and every lower one";
 `needsDownload` keys on the recommended tier being installed.
 
+## 4b. Web host: the account and sync routes can wedge the whole server — OPEN
+
+Found 2026-09-18 while clicking through the redesigned Settings in the web
+build (`athenaeum-web` release binary on a catalog copy, no keychain, no
+iroh peer): `account_status`, `get_sync_status` and
+`get_sync_pairing_ticket` never answered (8 s timeouts), and after the
+Transfers tab had fired them a few times even the static `/settings` and
+`get_settings_defaults` stopped answering — the whole server had to be
+killed. The shape points at blocking work (keychain / transport start-up)
+running on the async runtime's workers inside those three handlers, so a
+handful of pending calls starve every other route. Not this cycle's code:
+the Settings page only made the tab easier to reach. To do: reproduce with
+the web build alone (`curl -m 8 -X POST /api/account_status`), find the
+blocking call, move it to `spawn_blocking` or give it a timeout, and make
+the two Settings cards show a "not available in this build" state instead
+of "Loading…" forever.
+
 ## 5. Blink: Space starts the blink, then selects the file
 
 **What is known.** In the dual-pane browser Space opens the Blink viewer on the
