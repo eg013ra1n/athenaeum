@@ -71,7 +71,7 @@
   - `xisf_writer::write_xisf_f32_with(path, width, height, channels, data, cards, bounds: XisfBounds) -> Result<(), FitsWriteError>`; the existing `write_xisf_f32(…)` becomes `write_xisf_f32_with(…, XisfBounds::Unit)` so every current caller is unchanged.
   - `fits_writer::write_image_f32(path, width, height, channels, data, cards, format: OutputFormat, bounds: XisfBounds) -> Result<(), FitsWriteError>`.
 
-- [ ] **Step 1: Write the failing tests** (append to `xisf_writer.rs`'s `mod tests`, next to `image_type_follows_imagetyp_where_the_format_names_it`):
+- [x] **Step 1: Write the failing tests** (append to `xisf_writer.rs`'s `mod tests`, next to `image_type_follows_imagetyp_where_the_format_names_it`):
 
 ```rust
 #[test]
@@ -113,12 +113,12 @@ fn adu_bounds_round_trip_through_the_reader_unscaled() {
 
 (`read_raw`'s exact return shape: copy the call the existing `round_trips_through_the_reader` test makes at `xisf_writer.rs:617-640` and drop its `/ 65535.0`.)
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p athenaeum-core --lib fits_writer::xisf_writer::tests -- image_type_names adu_bounds`
 Expected: compile error — `write_xisf_f32_with` and `XisfBounds` do not exist.
 
-- [ ] **Step 3: Add the shared types to `fits_writer/mod.rs`**
+- [x] **Step 3: Add the shared types to `fits_writer/mod.rs`**
 
 ```rust
 /// The container an output image is written in. One enum for every writer
@@ -194,7 +194,7 @@ pub fn write_image_f32(
 
 Add `pub use` lines for `OutputFormat`, `XisfBounds`, `write_image_f32` beside the existing re-exports at `fits_writer/mod.rs:14`.
 
-- [ ] **Step 4: Thread `bounds` through the XISF writer**
+- [x] **Step 4: Thread `bounds` through the XISF writer**
 
 In `xisf_writer.rs`: delete `const FLOAT_BOUNDS`; give `build_xml` a `bounds: XisfBounds` parameter and write `bounds=\"{}\"` from `bounds.attr()`; give `write_xisf_f32_to` a trailing `bounds: XisfBounds` and pass it on; rename the body of `write_xisf_f32` to `write_xisf_f32_with(…, bounds)` and keep:
 
@@ -208,7 +208,7 @@ pub fn write_xisf_f32(path: &Path, width: usize, height: usize, channels: usize,
 
 Update the module doc comment paragraph that explains `bounds` (`xisf_writer.rs:35-50`) to say the range is the caller's and name the two callers' domains.
 
-- [ ] **Step 5: Grow `image_type_for`**
+- [x] **Step 5: Grow `image_type_for`**
 
 ```rust
 fn image_type_for(cards: &[Card]) -> Option<&'static str> {
@@ -231,7 +231,7 @@ fn image_type_for(cards: &[Card]) -> Option<&'static str> {
 }
 ```
 
-- [ ] **Step 6: Re-export from stacking and use the dispatcher there**
+- [x] **Step 6: Re-export from stacking and use the dispatcher there**
 
 `stacking/config.rs`: replace the `OutputFormat` enum definition with `pub use crate::fits_writer::OutputFormat;` (keep the doc comment about the rejection maps on `OutputConfig.format`). `stacking/master_cards.rs`: `output_extension(format)` becomes `format.extension()` (keep the function as a one-line wrapper if it is `pub` and used elsewhere — `grep -rn output_extension crates/`), and `write_output` becomes:
 
@@ -245,14 +245,14 @@ fn write_output(path: &Path, width: usize, height: usize, channels: usize,
 
 `ts_export.rs:332`: keep `crate::stacking::config::OutputFormat` (it resolves through the re-export); confirm the generated `src/types/stacking.ts` `OutputFormat` line is byte-identical after `TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract`.
 
-- [ ] **Step 7: Run the gates**
+- [x] **Step 7: Run the gates**
 
 Run: `cargo test -p athenaeum-core --lib fits_writer:: stacking::master_cards`
 Expected: all pass, the two new tests included; `image_type_follows_imagetyp_where_the_format_names_it` still passes (a `Dark Frame` still gets no attribute).
 Run: `cargo check -p athenaeum-core --all-targets && cargo check --workspace`
 Expected: clean.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/athenaeum-core/src/fits_writer crates/athenaeum-core/src/stacking/config.rs crates/athenaeum-core/src/stacking/master_cards.rs src/types/stacking.ts
@@ -273,7 +273,7 @@ git commit -m "fits_writer: one OutputFormat, caller-chosen XISF bounds, the mas
 - Consumes: `fits_writer::{OutputFormat, XisfBounds, write_image_f32}` (Task 1).
 - Produces: `keys::CALIBRATION_MASTER_FORMAT = "calibration.master_format"`, `defaults::CALIBRATION_MASTER_FORMAT = "fits"`, `SettingsManager::get_master_format(&self, conn) -> Result<OutputFormat>`; `MasterPathParams.format: OutputFormat`.
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 `paths.rs` tests (next to the existing `master_relative_path` tests — find them with `grep -n "fn .*relative_path" crates/athenaeum-core/src/calibration_library/paths.rs`):
 
@@ -305,12 +305,12 @@ fn master_format_defaults_to_fits_and_tolerates_garbage() {
 }
 ```
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p athenaeum-core --lib calibration_library::paths settings::`
 Expected: compile errors (`format` field, `get_master_format` missing).
 
-- [ ] **Step 3: The settings key and accessor**
+- [x] **Step 3: The settings key and accessor**
 
 `settings/mod.rs` — in `defaults`: `pub const CALIBRATION_MASTER_FORMAT: &str = "fits";` beside `INTEGRATION_BAND_BUDGET_MB`; in `keys`, right under `CALIBRATION_LIBRARY_DIR`:
 
@@ -340,7 +340,7 @@ On `SettingsManager`, beside `get_integration_band_budget_mb`:
     }
 ```
 
-- [ ] **Step 4: The path builder**
+- [x] **Step 4: The path builder**
 
 `paths.rs`: add `pub format: OutputFormat` to `MasterPathParams` and end `master_relative_path` with
 
@@ -352,7 +352,7 @@ On `SettingsManager`, beside `get_integration_band_budget_mb`:
 
 Update the layout doc comment at `paths.rs:8-10` (`…_<date>.fits` → `…_<date>.<fits|xisf>`). Every constructor of `MasterPathParams` (`grep -rn "MasterPathParams {" crates/`) gets a `format:`; tests use `OutputFormat::Fits`.
 
-- [ ] **Step 5: The write site**
+- [x] **Step 5: The write site**
 
 `api/masters.rs`, in `run_build`: resolve the format before the `match &target`:
 
@@ -373,11 +373,11 @@ Update the layout doc comment at `paths.rs:8-10` (`…_<date>.fits` → `…_<da
 
 Adjust the two comments around it that name `write_fits_f32` ("atomic rename inside `write_fits_f32`" → "inside the writer"). Add `format = ?format` to the `debug!`/`info!` event that already reports the target path of the build (find it with `grep -n "master written\|target_abs" crates/athenaeum-core/src/api/masters.rs`).
 
-- [ ] **Step 6: A rebuild test**
+- [x] **Step 6: A rebuild test**
 
 In `api/masters.rs` tests there is a rebuild test that writes a master then calls `rebuild_master` (find it: `grep -n "fn rebuild" crates/athenaeum-core/src/api/masters.rs`). Add a sibling that sets `calibration.master_format = xisf` in the settings AFTER the FITS master exists, rebuilds, and asserts the file at the catalog path is still FITS (`std::fs::read(&path)[..6] == b"SIMPLE"`) and that no `.xisf` sibling appeared.
 
-- [ ] **Step 7: Gates and commit**
+- [x] **Step 7: Gates and commit**
 
 Run: `cargo test -p athenaeum-core --lib calibration_library::paths settings:: api::masters`
 Expected: pass.
@@ -399,7 +399,7 @@ git commit -m "masters: the built master's container follows calibration.master_
 **Interfaces:**
 - Consumes: `fits_parser::{parse_fits_with_header, parse_xisf, extract_xisf_header}`; `fits_writer::write_xisf_f32_with(…, XisfBounds::Adu16)`.
 
-- [ ] **Step 1: Failing parity test for XISF**
+- [x] **Step 1: Failing parity test for XISF**
 
 In `register.rs` tests, make `write_master` take the format:
 
@@ -420,12 +420,12 @@ In `register.rs` tests, make `write_master` take the format:
 
 Turn `direct_registration_matches_scanner_ingestion` into a helper `parity_for(format: OutputFormat)` called by two `#[test]`s (`…_fits`, `…_xisf`); the scanner copy in path B keeps the same extension (`scan_dir.path().join(format!("master_dark.{}", format.extension()))`). Add to the compared columns the `files.format` value (`SELECT format FROM files WHERE id = …`) and assert it is `"XISF"` on both sides for the XISF case.
 
-- [ ] **Step 2: Run it to see it fail**
+- [x] **Step 2: Run it to see it fail**
 
 Run: `cargo test -p athenaeum-core --lib calibration_library::register::tests::direct_registration_matches_scanner_ingestion_xisf`
 Expected: FAIL at `register_master` — "freshly written master failed to parse" (the FITS parser refuses the XISF signature).
 
-- [ ] **Step 3: Dispatch the re-parse on the extension**
+- [x] **Step 3: Dispatch the re-parse on the extension**
 
 `register.rs:107-108` becomes:
 
@@ -451,11 +451,11 @@ Expected: FAIL at `register_master` — "freshly written master failed to parse"
 
 The `format` computed at `:133-136` is now redundant with `is_xisf` — derive it from the same boolean. The `unwrap_or("master.fits")` filename fallback at `:129` stays (it is unreachable for a real path).
 
-- [ ] **Step 4: Pin that light calibration reads an XISF master as ADU**
+- [x] **Step 4: Pin that light calibration reads an XISF master as ADU**
 
 Find the existing test that builds a master dark fixture and runs `calibrate_light` or `hot_pixel_map_from_dark` on it (`grep -n "master_dark" crates/athenaeum-core/src/calibration_library/light_cal.rs crates/athenaeum-core/src/calibration_library/cosmetic.rs | head`). Add a sibling that writes the SAME dark as XISF through `write_image_f32(…, Xisf, XisfBounds::Adu16)` and asserts the calibrated output (or the hot-pixel map's median) is identical to the FITS run within `1e-3` — this is the test that would have caught a 65535× inflation.
 
-- [ ] **Step 5: Gates and commit**
+- [x] **Step 5: Gates and commit**
 
 Run: `cargo test -p athenaeum-core --lib calibration_library::`
 Expected: pass, both parity tests included.
@@ -477,7 +477,7 @@ git commit -m "masters: an XISF master registers through the scanner's own XISF 
 **Interfaces:**
 - Consumes: generic `get_setting` / `set_setting` with key `calibration.master_format`.
 
-- [ ] **Step 1: State and load**
+- [x] **Step 1: State and load**
 
 Beside `budgetInfo` state: `const [masterFormat, setMasterFormat] = useState<'fits' | 'xisf'>('fits');`. In the mount effect that calls `loadIntegrationBudget()`:
 
@@ -487,7 +487,7 @@ Beside `budgetInfo` state: `const [masterFormat, setMasterFormat] = useState<'fi
       .catch((err) => console.error('[Settings] get_setting calibration.master_format failed:', err));
 ```
 
-- [ ] **Step 2: The control** — a new `border-t` block after "Master Build Memory", saved on change (no Save button, same as the Archive compression select at `Settings.tsx:1542-1550`):
+- [x] **Step 2: The control** — a new `border-t` block after "Master Build Memory", saved on change (no Save button, same as the Archive compression select at `Settings.tsx:1542-1550`):
 
 ```tsx
           <div className="mt-6 pt-6 border-t border-border">
@@ -517,9 +517,9 @@ Beside `budgetInfo` state: `const [masterFormat, setMasterFormat] = useState<'fi
           </div>
 ```
 
-- [ ] **Step 3: Docs** — `docs/calibration-reference.md`: in the library layout section, the filename template gains `.<fits|xisf>` and one sentence on the setting. `CLAUDE.md` "Master Calibration Library": change `…_<date>.fits` to `…_<date>.<fits|xisf>` and add "container from `calibration.master_format` (Settings → Calibration), XISF written with `bounds="0:65535"` and the WBPP-readable `imageType` attribute; a rebuild keeps the file's own container".
+- [x] **Step 3: Docs** — `docs/calibration-reference.md`: in the library layout section, the filename template gains `.<fits|xisf>` and one sentence on the setting. `CLAUDE.md` "Master Calibration Library": change `…_<date>.fits` to `…_<date>.<fits|xisf>` and add "container from `calibration.master_format` (Settings → Calibration), XISF written with `bounds="0:65535"` and the WBPP-readable `imageType` attribute; a rebuild keeps the file's own container".
 
-- [ ] **Step 4: Gate and commit**
+- [x] **Step 4: Gate and commit**
 
 Run: `npx tsc --noEmit`
 ```bash
@@ -543,7 +543,7 @@ git commit -m "settings: pick the container built masters are written in"
 - Consumes: `fits_writer::{OutputFormat, XisfBounds, write_image_f32}`.
 - Produces: `CalibratedLightOptions.format: OutputFormat` (`#[serde(default)]`), `CalibratedLightOptions::resolve(flat_norm, flat_norm_mode, params, hot_pixel, debayer, format: Option<OutputFormat>)`, `calibrated_output_filename(source_filename, debayer, format: OutputFormat)`, `write_calibrated_output(path, w, h, c, data, cards, format)`.
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 `export/models.rs` tests:
 
@@ -567,12 +567,12 @@ fn options_format_defaults_to_fits_and_decodes_old_documents() {
 
 `calibrated_generator.rs`: duplicate the mono generation test at `:1141-1160` as `…_writes_xisf_when_asked` with `opts.format = OutputFormat::Xisf`, asserting the output name ends in `.xisf`, the file starts with `b"XISF0100"`, and its header contains `bounds="0:1"` (calibrated lights are `ATH_CSCL`-scaled).
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p athenaeum-core --lib export::models export::calibrated_generator`
 Expected: compile errors on the new parameter and field.
 
-- [ ] **Step 3: The model**
+- [x] **Step 3: The model**
 
 In `CalibratedLightOptions` after `debayer_osc`:
 
@@ -586,11 +586,11 @@ In `CalibratedLightOptions` after `debayer_osc`:
 
 `Default` sets `format: OutputFormat::Fits`; `resolve` gains `format: Option<OutputFormat>` as its LAST parameter and `format: format.unwrap_or(d.format)`; `calibrated_output_filename(source_filename, debayer, format)` ends with `format!("c_{stem}_d.{}", format.extension())` / `format!("c_{stem}.{}", …)` and its doc comment's "always forced to `.fits`" sentence becomes "the extension is the chosen container's, never the source's". `GenerationSpec` gets a `format: OutputFormat` field set from the options in `resolve_generation`, and `output_filename` passes `self.format`.
 
-- [ ] **Step 4: The writer**
+- [x] **Step 4: The writer**
 
 `light_cal.rs::write_calibrated_output` gains `format: OutputFormat` and calls `write_image_f32(path, width, height, channels, data, cards, format, XisfBounds::Unit)`; `calibrated_generator.rs:664` passes `spec.format`. The mosaic write at `:603-610` stays `write_fits_f32` (R7) — add "(R7: the mosaic is a run-internal artifact, always FITS)" to its comment.
 
-- [ ] **Step 5: Every naming call site**
+- [x] **Step 5: Every naming call site**
 
 - `data_collector.rs:622`: `calibrated_output_filename(&frame.filename, debayer, opts.format)`.
 - `file_organizer.rs:729-732` (`remove_stale_sibling` or whatever the enclosing fn is called): it takes `debayer: bool` — give it `format: OutputFormat` too and pass it at its call site (`grep -n "calibrated_output_filename(source_name" crates/athenaeum-core/src/export/file_organizer.rs` finds both lines; the caller has the options in scope as `gen_opts`).
@@ -608,11 +608,11 @@ In `CalibratedLightOptions` after `debayer_osc`:
 
 and the two `format!("{stem}.fits")` names stay (`spec.output_filename` now yields `.fits` because the spec was resolved from these forced options — verify `resolve_generation` is called AFTER the override; if the spec is resolved earlier in `calibrate_frame`, move the override to the options it is resolved from).
 
-- [ ] **Step 6: Both hosts**
+- [x] **Step 6: Both hosts**
 
 Tauri `commands/export.rs`: the two commands that call `resolve` (`:267`, `:461`) gain `format: Option<athenaeum_core::fits_writer::OutputFormat>` as an argument and pass it sixth. Axum `routes/export.rs` (`:259`, `:389`): add `#[serde(default)] pub format: Option<OutputFormat>` to the two args structs and pass it. Then the frame-set send: `grep -rn "hot_pixel" crates/athenaeum-tauri/src/commands crates/athenaeum-web/src/routes` — every command that threads `hot_pixel`/`debayer` into `CalibratedLightOptions` (the frame-set send and the frame-selection send in `sync.rs`/`transfers.rs`) gets `format` the same way. `data_collector.rs:3095-3098` tests: add the sixth `None`/`Some(…)`.
 
-- [ ] **Step 7: Docs, TS, gates, commit**
+- [x] **Step 7: Docs, TS, gates, commit**
 
 `docs/export/README.md:266-268`: replace "An XISF source always yields a `.fits` output" with "The output container is the export's own choice (FITS default, XISF optional); an XISF source does not decide it." Regenerate TS: `TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract` (adds `format: OutputFormat` to `CalibratedLightOptions` in `src/types/stacking.ts`).
 
@@ -638,7 +638,7 @@ git commit -m "export: calibrated lights are written in the chosen container, on
 **Interfaces:**
 - Consumes: wire field `format: 'fits' | 'xisf'` on `export_to_wbpp`, `get_export_summary` and the send commands (Task 5).
 
-- [ ] **Step 1: The preference**
+- [x] **Step 1: The preference**
 
 `lightCalPrefs.ts`:
 
@@ -659,7 +659,7 @@ export function readLightCalFormatPref(): CalibratedLightFormat {
 
 `ExportLightCalPrefs` gains `format: CalibratedLightFormat;`. `useExportSummary` and `startExport` add `format: lightCal.format` next to `debayer` in their invoke args.
 
-- [ ] **Step 2: The Export tab**
+- [x] **Step 2: The Export tab**
 
 State `const [format, setFormat] = useState<CalibratedLightFormat>(readLightCalFormatPref)`, persisted in the same effect that writes the other prefs (`localStorage.setItem(LIGHTCAL_FORMAT_KEY, format)` in a try/catch). Add `format` to both literals (`:252`, `:944`). In the calibrated-lights section (`:588`), after the debayer toggle:
 
@@ -679,11 +679,11 @@ State `const [format, setFormat] = useState<CalibratedLightFormat>(readLightCalF
 </div>
 ```
 
-- [ ] **Step 3: The Send dialog and the browser send**
+- [x] **Step 3: The Send dialog and the browser send**
 
 `SendToNodeDialog.tsx`: its `lightCalOptions` prop type gains `format`, and the invoke that carries `hotPixel`/`debayer` carries `format` too. `DualPaneFileBrowser.tsx`: where it builds `lightCalOptions` from `readLightCalParamsPref()` and friends, add `format: readLightCalFormatPref()`.
 
-- [ ] **Step 4: The Calibrate panel line** — after the debayer checkbox in `CalibratePanel.tsx`:
+- [x] **Step 4: The Calibrate panel line** — after the debayer checkbox in `CalibratePanel.tsx`:
 
 ```tsx
         <p className="text-[11px] text-content-muted">
@@ -692,7 +692,7 @@ State `const [format, setFormat] = useState<CalibratedLightFormat>(readLightCalF
         </p>
 ```
 
-- [ ] **Step 5: Gate and commit**
+- [x] **Step 5: Gate and commit**
 
 Run: `npx tsc --noEmit`
 ```bash
@@ -707,18 +707,18 @@ git commit -m "export ui: choose FITS or XISF for calibrated lights; the run's i
 **Files:**
 - Modify: `docs/superpowers/open-items.md` (new subsection), `docs/backlog-v0.6.5.md` (items 1/1b → SHIPPED, the R6 follow-up listed)
 
-- [ ] **Step 1: Build one real master as XISF** on the dev catalog: set `calibration.master_format = xisf` in Settings, build a master dark from a real raw set (Coverage → Create master), then:
+- [x] **Step 1: Build one real master as XISF** on the dev catalog: set `calibration.master_format = xisf` in Settings, build a master dark from a real raw set (Coverage → Create master), then:
   - `sqlite3` the dev DB: `SELECT path, format FROM files WHERE id = (SELECT file_id FROM frames WHERE is_master = 1 ORDER BY id DESC LIMIT 1);` → `.xisf`, `XISF`.
   - `head -c 4096 <path> | strings | grep -o 'bounds="[^"]*"\|imageType="[^"]*"'` → `bounds="0:65535"`, `imageType="MasterDark"`.
   - Export the linked frame set in **Calibrated lights** mode with format FITS, then compare one output against the same export made before this plan (a saved copy): `integrate_probe`-free check — read both with `examples/measure_probe.rs` or `python`+`astropy` and assert median difference `< 1e-3` (an XISF master must calibrate identically to its FITS twin).
-- [ ] **Step 2: Rebuild that master** — the file keeps `.xisf`; flip the setting back to `fits`, rebuild again — still `.xisf` (R4).
-- [ ] **Step 3: Export calibrated lights as XISF** — the tree holds `c_*.xisf`, each starts with `XISF0100`, `bounds="0:1"`, `imageType="Light"`.
-- [ ] **Step 3b: A mixed-container stacking run (owner requirement 2026-09-18: the stacker takes FITS and XISF side by side at every stage).** On a small real set (20 best LDN 1272 mono frames): convert half of the lights to XISF through `fits_writer::write_image_f32(…, Xisf, XisfBounds::Adu16)` from a throwaway `examples/` probe (read with `astroimage::ImageConverter::read_raw`, write the same cards), place them in a scan root beside the FITS half, rescan, build the master dark as XISF (the setting from Task 4) and the flat as FITS, then run the Stacking tab end to end. Pass: every frame calibrates (`stacking_artifacts` has a `calibrated` row per light, none excluded for "calibration failed"), the master light's median and MAD match the all-FITS run of the same 20 frames within 0.1 %, and the run log shows no `warn!` about a frame's container. This is the first end-to-end proof; stage 1 is the only stage that ever reads a source, and it funnels every container into `c_*.fits`.
-- [ ] **Step 4: Record the owner smokes** in `docs/superpowers/open-items.md`:
+- [x] **Step 2: Rebuild that master** — the file keeps `.xisf`; flip the setting back to `fits`, rebuild again — still `.xisf` (R4).
+- [x] **Step 3: Export calibrated lights as XISF** — the tree holds `c_*.xisf`, each starts with `XISF0100`, `bounds="0:1"`, `imageType="Light"`.
+- [x] **Step 3b: A mixed-container stacking run (owner requirement 2026-09-18: the stacker takes FITS and XISF side by side at every stage).** On a small real set (20 best LDN 1272 mono frames): convert half of the lights to XISF through `fits_writer::write_image_f32(…, Xisf, XisfBounds::Adu16)` from a throwaway `examples/` probe (read with `astroimage::ImageConverter::read_raw`, write the same cards), place them in a scan root beside the FITS half, rescan, build the master dark as XISF (the setting from Task 4) and the flat as FITS, then run the Stacking tab end to end. Pass: every frame calibrates (`stacking_artifacts` has a `calibrated` row per light, none excluded for "calibration failed"), the master light's median and MAD match the all-FITS run of the same 20 frames within 0.1 %, and the run log shows no `warn!` about a frame's container. This is the first end-to-end proof; stage 1 is the only stage that ever reads a source, and it funnels every container into `c_*.fits`.
+- [x] **Step 4: Record the owner smokes** in `docs/superpowers/open-items.md`:
   - Open an Athenaeum XISF master dark, flat and dark flat in PixInsight; run WBPP with them added as masters: each must be listed as a master (no "must be in XISF format" refusal, the dark flat under DARK with the flat's exposure), and a light calibrated by WBPP with the Athenaeum master must match one calibrated by Athenaeum within noise.
   - Load a `c_*.xisf` calibrated light in PixInsight and in WBPP's calibrated-lights mode.
-- [ ] **Step 5: Backlog** — mark items 1 and 1b shipped with the commit range, add "XISF intermediates in the stacking run (`PlaneReader` XISF arm)" as the R6 follow-up.
-- [ ] **Step 6: Commit**
+- [x] **Step 5: Backlog** — mark items 1 and 1b shipped with the commit range, add "XISF intermediates in the stacking run (`PlaneReader` XISF arm)" as the R6 follow-up.
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/superpowers/open-items.md docs/backlog-v0.6.5.md

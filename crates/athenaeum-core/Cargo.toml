@@ -181,6 +181,10 @@ required-features = ["render", "solver"]
 name = "weight_audit"
 required-features = ["render", "solver"]
 
+[[example]]
+name = "xisf_convert_probe"
+required-features = ["render"]
+
 [dev-dependencies]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }

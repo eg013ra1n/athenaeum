@@ -21,7 +21,18 @@ Sizes are rough: **XS** an hour, **S** a session, **M** a plan with a few tasks,
    no problem with what is counted — no fix round; the two genuine defects
    (bias never warns, a set's span never widens) stay listed for a later call.
 
-## 1. Master calibration files as XISF
+## 1. Master calibration files as XISF — SHIPPED
+
+**Shipped 2026-09-18** (plan
+`docs/superpowers/plans/2026-09-18-xisf-output-masters-and-calibrated-lights.md`,
+acceptance `docs/superpowers/research/2026-09-18-xisf-acceptance-run.md`):
+`calibration.master_format` (Settings → Calibration), XISF masters written
+with `bounds="0:65535"` and the `imageType` attribute WBPP reads as
+authoritative (a dark flat as `MasterDark`), registered through the scanner's
+own XISF parser; a rebuild keeps the file's container. On real data the XISF
+master, the lights calibrated with it and a mixed FITS+XISF stack are
+bit-identical to their FITS twins. Owed: the PixInsight/WBPP open (open-items).
+
 
 **Owner's ask.** A setting in the Calibration settings that picks the container
 built masters are written in, FITS or XISF, "the way WBPP supports".
@@ -120,7 +131,16 @@ dispatches the re-parse on extension. The
 XISF case — it is the one test that proves the byte-identical registration
 invariant, and XISF is a new path through it. **M.**
 
-### 1b. Calibrated lights as XISF (the Stacking → Calibrate panel)
+### 1b. Calibrated lights as XISF — SHIPPED for export and send
+
+**Shipped 2026-09-18** (same plan, Tasks 5–6): `CalibratedLightOptions.format`,
+an Output format radio on the Export tab's calibrated-lights section, carried
+by export, summary and the frame-set send; `c_*.xisf` equals `c_*.fits` bit
+for bit. **Ruling R6:** the stacking run's own intermediates stay FITS
+(`PlaneReader` is FITS-only) and the Calibrate panel says so. Follow-up, not
+started: XISF intermediates in the run (a `PlaneReader` XISF arm), if the
+working folder's `calibrated/` tree is ever meant for WBPP directly.
+
 
 The owner's note "xisf calibration files save should be in the calibrate
 settings in stacking" reads as: the container for *calibrated lights* belongs

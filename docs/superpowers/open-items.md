@@ -193,6 +193,34 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### XISF masters and calibrated lights (2026-09-18)
+
+Plan `docs/superpowers/plans/2026-09-18-xisf-output-masters-and-calibrated-lights.md`,
+Tasks 1–7 on `main` (`b1c209bb` … the acceptance commit), acceptance
+`docs/superpowers/research/2026-09-18-xisf-acceptance-run.md` — the XISF
+master, the calibrated lights and a FITS+XISF mixed stack are all
+bit-identical to their FITS twins on real LDN 1272 data. What only the
+external tool can prove is owed to the owner (files kept in
+`/Volumes/BigMac/Users/astrobureau/acc-xisf/`, 5.4 GB, delete after):
+
+- **WBPP accepts the master.** Open
+  `acc-xisf/library/ATR2600M/MasterDark/master_dark_180s_-10C_g100_bin1x1_2025-04-12.xisf`
+  in PixInsight; add it to WBPP as a master dark — it must be listed as a
+  master (no "must be in XISF format" refusal), under DARK, 180 s. A light
+  WBPP calibrates with it should match Athenaeum's
+  `acc-xisf/export/C/ACC pure 20/camera_atr2600m/lights/c_*.xisf` of the
+  same frame within noise.
+- **A calibrated XISF light opens** — any `c_*.xisf` from that folder
+  (`bounds="0:1"`, `imageType="Light"`).
+- **The dark-flat case** (`imageType="MasterDark"` stamped on a
+  `'Master Dark Flat'` master) is pinned by a unit test only — no raw
+  dark-flat set with a linked flat was in the catalog copy. Build one when a
+  set exists (Settings → Calibration → Master File Format = XISF) and repeat
+  the WBPP check.
+- **Desktop click-through**: the Master File Format select on Settings →
+  Calibration, the Output format radio in the Export tab's calibrated-lights
+  section, the same choice reaching the Send dialog.
+
 ### v0.6.5 backlog quick wins + nights reconcile (2026-09-18)
 
 Six commits on `main` (`8726f045` … `938c9f58`, not pushed), from
