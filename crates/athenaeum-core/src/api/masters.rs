@@ -49,6 +49,11 @@ use crate::calibration_library::paths::{
 };
 use crate::calibration_library::register::{member_hash, register_master};
 use crate::events::{emit_event, ProgressEmitter};
+use crate::fits_writer::{write_image_f32, OutputFormat, XisfBounds};
+// Test-only: production code writes through `write_image_f32` (the format
+// dispatcher) exclusively now; fixture helpers below still write plain FITS
+// directly.
+#[cfg(test)]
 use crate::fits_writer::write_fits_f32;
 use crate::integration::combine::{IntegrationRecipe, Rejection};
 use crate::integration::engine::{
@@ -476,7 +481,11 @@ fn load_precal_pixels(choice: &PrecalChoice, scratch: &Path) -> Result<FlatPreca
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             let mut data = vec![0f32; w * h];
             planes.decode_frame_into(0, &mut data);
-            Ok(FlatPrecal::MasterFrame { data, width: w, height: h })
+            Ok(FlatPrecal::MasterFrame {
+                data,
+                width: w,
+                height: h,
+            })
         }
         PrecalChoice::Synthetic(b) => Ok(FlatPrecal::SyntheticBias(*b as f32)),
         PrecalChoice::None => Ok(FlatPrecal::None),
@@ -750,6 +759,9 @@ pub fn preview_master_build(
     };
 
     let inputs = load_header_inputs(&conn, set_id)?;
+    // The preview always describes a NEW build (there is no rebuild preview
+    // path) — same resolution `run_build`'s own `BuildTarget::New` arm uses.
+    let format = ctx.settings.get_master_format(&conn)?;
     let target_rel = master_relative_path(&MasterPathParams {
         instrume: inputs.instrume.as_deref(),
         master_kind: inputs.kind,
@@ -759,6 +771,7 @@ pub fn preview_master_build(
         gain: inputs.gain,
         binning: set.binning.as_deref(),
         date: &set.date,
+        format,
     });
     let target_path = resolve_collision_free(&library_dir.join(&target_rel), &|p| {
         crate::db::file_exists(&conn, p).unwrap_or(false)
@@ -897,14 +910,23 @@ fn log_build_started(
 /// `run_build`'s success path, once the master file is written AND
 /// registered in the catalog — never on a cancel or a write/register
 /// failure, both of which return before reaching this call.
-fn log_build_finished(set_id: i64, duration: std::time::Duration, bytes_read: u64, out: &IntegrationOutput) {
+fn log_build_finished(
+    set_id: i64,
+    duration: std::time::Duration,
+    bytes_read: u64,
+    out: &IntegrationOutput,
+) {
     let read_s = out.read_duration.as_secs_f64();
     tracing::info!(
         set_id,
         duration_ms = duration.as_millis() as u64,
         read_ms = out.read_duration.as_millis() as u64,
         combine_ms = out.combine_duration.as_millis() as u64,
-        read_mb_s = if read_s > 0.0 { (bytes_read as f64 / read_s / 1e6).round() as u64 } else { 0 },
+        read_mb_s = if read_s > 0.0 {
+            (bytes_read as f64 / read_s / 1e6).round() as u64
+        } else {
+            0
+        },
         band_rows = out.band_rows,
         bands = out.bands,
         "master build finished"
@@ -932,8 +954,16 @@ const READ_SHARE: f64 = 0.7;
 /// an unknown total (0, before the first tick of that phase) contributes
 /// nothing.
 fn build_percent(bytes_done: u64, bytes_total: u64, rows_done: usize, rows_total: usize) -> f64 {
-    let read = if bytes_total > 0 { (bytes_done as f64 / bytes_total as f64).min(1.0) } else { 0.0 };
-    let combine = if rows_total > 0 { (rows_done as f64 / rows_total as f64).min(1.0) } else { 0.0 };
+    let read = if bytes_total > 0 {
+        (bytes_done as f64 / bytes_total as f64).min(1.0)
+    } else {
+        0.0
+    };
+    let combine = if rows_total > 0 {
+        (rows_done as f64 / rows_total as f64).min(1.0)
+    } else {
+        0.0
+    };
     (read * READ_SHARE + combine * (1.0 - READ_SHARE)) * 100.0
 }
 
@@ -1097,7 +1127,12 @@ fn run_build(
     // Both I/O knobs, resolved from the machine AND from the storage the
     // frames actually live on — the same set may sit on a local disk today
     // and a NAS tomorrow.
-    let io = crate::integration::io_policy::resolve(&conn, &ctx.settings, &paths, ctx.image_pool.current_num_threads())?;
+    let io = crate::integration::io_policy::resolve(
+        &conn,
+        &ctx.settings,
+        &paths,
+        ctx.image_pool.current_num_threads(),
+    )?;
 
     // A multi-minute build that logs nothing is indistinguishable from a
     // hung one (research §8) — this is the one line an operator has to go on
@@ -1241,7 +1276,10 @@ fn run_build(
             },
         );
     };
-    let progress = EngineProgress { on_band: &on_band, on_combine: &on_combine };
+    let progress = EngineProgress {
+        on_band: &on_band,
+        on_combine: &on_combine,
+    };
 
     let out = if is_flat {
         // Pixel materialization of the selected precal happens HERE, on the
@@ -1374,6 +1412,14 @@ fn run_build(
         channel_norms,
     )?;
 
+    // The container this build writes: a NEW target reads the setting; a
+    // REBUILD keeps the container its own file already has — the catalog
+    // row's path is the contract, not whatever the setting says today.
+    let format = match &target {
+        BuildTarget::New => ctx.settings.get_master_format(&conn)?,
+        BuildTarget::Rebuild { target_path, .. } => OutputFormat::from_path(target_path),
+    };
+
     let (target_abs, mut claim) = match &target {
         BuildTarget::New => {
             let library_dir = library_dir_or_err(&conn)?;
@@ -1386,6 +1432,7 @@ fn run_build(
                 gain: inputs.gain,
                 binning: set.binning.as_deref(),
                 date: &set.date,
+                format,
             });
             let desired = library_dir.join(&target_rel);
             // create_dir_all runs BEFORE name resolution, not after: claiming
@@ -1421,7 +1468,7 @@ fn run_build(
     // much smaller one open between it and here (a DB connection,
     // `load_header_inputs`, `member_hash`, card building, directory creation
     // and the collision claim). Re-check right at the boundary of the
-    // irreversible action: once `write_fits_f32` returns, real bytes are on
+    // irreversible action: once the writer returns, real bytes are on
     // disk under a name `register_master` is about to make load-bearing.
     // `claim` (a `ClaimGuard`) is still armed here, so this early return
     // deletes the just-created placeholder via the same RAII path every
@@ -1430,9 +1477,18 @@ fn run_build(
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BuildStepError::Cancelled);
     }
-    write_fits_f32(&target_abs, out.width, out.height, 1, &out.data, &cards)?;
+    write_image_f32(
+        &target_abs,
+        out.width,
+        out.height,
+        1,
+        &out.data,
+        &cards,
+        format,
+        XisfBounds::Adu16,
+    )?;
     // The master's real bytes are on disk now (atomic rename inside
-    // `write_fits_f32` replaced the placeholder), so the name belongs to the
+    // the writer replaced the placeholder), so the name belongs to the
     // file, not to the claim: nothing below this line may delete it.
     claim.disarm();
 
@@ -1496,9 +1552,10 @@ fn run_build(
                 &target_abs,
                 &recipe_json,
                 &member_hash_str,
+                format,
             ) {
                 // METADATA-DRIFT WINDOW: the on-disk master file HAS already
-                // been replaced (atomic rename inside `write_fits_f32`), but
+                // been replaced (atomic rename inside the writer), but
                 // the catalog metadata was NOT refreshed — the
                 // master_provenance row (recipe/hash/created_at), the files
                 // row (size/modified_at) and the frames row + stored header
@@ -1577,6 +1634,7 @@ fn finalize_rebuild(
     target_abs: &Path,
     recipe_json: &str,
     member_hash_str: &str,
+    format: OutputFormat,
 ) -> Result<(), BuildStepError> {
     let tx = conn.unchecked_transaction()?;
     crate::db::master_provenance::update_rebuild(&tx, master_set_id, recipe_json, member_hash_str)?;
@@ -1589,6 +1647,7 @@ fn finalize_rebuild(
         master_set_id,
         master_file_id,
         path = %target_abs.display(),
+        format = ?format,
         "rebuild resynced catalog rows from disk"
     );
     Ok(())
@@ -4193,6 +4252,7 @@ mod tests {
             &master_path,
             r#"{"combine":"mean","rebuilt":true}"#,
             "hash-after-rebuild",
+            OutputFormat::Fits,
         )
         .unwrap();
 
@@ -4328,6 +4388,7 @@ mod tests {
                 &master_path,
                 r#"{"combine":"mean","rebuilt":true}"#,
                 "hash-after-rebuild",
+                OutputFormat::Fits,
             )
         });
         result.unwrap();
@@ -4402,6 +4463,7 @@ mod tests {
             &master_path,
             r#"{"combine":"mean","rebuilt":true}"#,
             "hash-that-must-not-land",
+            OutputFormat::Fits,
         )
         .expect_err("an unreadable master must fail the finalize, not pass silently");
         assert!(
@@ -4731,6 +4793,121 @@ mod tests {
             .unwrap();
         }
         set_id
+    }
+
+    /// R4 (design ruling): a rebuild keeps the container its OWN file
+    /// already has, whatever `calibration.master_format` says by the time
+    /// the rebuild runs — the catalog row's path is the contract, not
+    /// today's setting. Runs the real `run_build` write site end to end
+    /// (New, then Rebuild against the same source set), so this is the one
+    /// test that would catch a rebuild silently switching an established
+    /// master's container out from under it.
+    #[test]
+    fn rebuild_keeps_its_own_container_even_when_the_setting_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            seed_buildable_dark_set(&conn, &src, 3)
+        };
+
+        let ctx = build_test_ctx(database);
+        let recipe = MasterRecipe {
+            combine: Some(IntegrationRecipe::median(Rejection::None)),
+            synthetic_bias: None,
+            archive_after: false,
+        };
+        let (master_set_id, _warning) = run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::New,
+            Admission::Acquire,
+        )
+        .expect("the master dark must build");
+
+        let (master_file_id, target_path): (i64, PathBuf) = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            let (id, p): (i64, String) = conn
+                .query_row(
+                    "SELECT fi.id, fi.path FROM calibration_set_frames csf
+                     JOIN frames f ON f.id = csf.frame_id
+                     JOIN files fi ON fi.id = f.file_id
+                     WHERE csf.set_id = ?1",
+                    [master_set_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            (id, PathBuf::from(p))
+        };
+        assert_eq!(
+            target_path.extension().and_then(|e| e.to_str()),
+            Some("fits")
+        );
+        assert_eq!(
+            &std::fs::read(&target_path).unwrap()[..6],
+            b"SIMPLE",
+            "sanity: the initial build wrote FITS"
+        );
+
+        // Flip the setting AFTER the FITS master exists — a rebuild must
+        // still write FITS, not switch containers under an established file.
+        {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_MASTER_FORMAT,
+                "xisf",
+            )
+            .unwrap();
+        }
+
+        run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::Rebuild {
+                master_set_id,
+                master_file_id,
+                target_path: target_path.clone(),
+            },
+            Admission::Acquire,
+        )
+        .expect("the rebuild must succeed");
+
+        assert!(
+            target_path.exists(),
+            "the rebuild must replace the SAME path, not move it"
+        );
+        assert_eq!(
+            &std::fs::read(&target_path).unwrap()[..6],
+            b"SIMPLE",
+            "a rebuild must keep the file's own container (FITS) whatever the setting says today"
+        );
+        let sibling_xisf = target_path.with_extension("xisf");
+        assert!(
+            !sibling_xisf.exists(),
+            "no .xisf sibling must appear beside the FITS master"
+        );
     }
 
     /// The seam the Admission enum exists for: a `ComputeQueue` at
@@ -5064,15 +5241,24 @@ mod tests {
             );
         });
         assert!(
-            events.iter().any(|(lvl, m)| lvl == "INFO" && m == "master build started"),
+            events
+                .iter()
+                .any(|(lvl, m)| lvl == "INFO" && m == "master build started"),
             "no start line; got {events:?}"
         );
 
         let (_, events) = capture_events(|| {
-            log_build_finished(42, std::time::Duration::from_millis(44_400), 5_200_000_000, &nop_output());
+            log_build_finished(
+                42,
+                std::time::Duration::from_millis(44_400),
+                5_200_000_000,
+                &nop_output(),
+            );
         });
         assert!(
-            events.iter().any(|(lvl, m)| lvl == "INFO" && m == "master build finished"),
+            events
+                .iter()
+                .any(|(lvl, m)| lvl == "INFO" && m == "master build finished"),
             "no finish line; got {events:?}"
         );
     }
@@ -5114,7 +5300,11 @@ mod tests {
             "the terminal (100%) tick must bypass the throttle even mid-window, \
              or a 100% read can be swallowed right before the silent combine phase"
         );
-        assert_eq!(last, Some(t3), "the terminal tick still advances the window");
+        assert_eq!(
+            last,
+            Some(t3),
+            "the terminal tick still advances the window"
+        );
     }
 
     /// Review 2026-09-06 F1: the calibration row showed a bytes percent for
@@ -5126,26 +5316,43 @@ mod tests {
         // Two bands: read half → combine half → read the rest → combine the rest.
         let (bt, rt) = (1000u64, 100usize);
         let seq: [(u64, usize); 8] = [
-            (0, 0), (250, 0), (500, 0),      // band 1 read
-            (500, 25), (500, 50),            // band 1 combine
-            (750, 50), (1000, 50),           // band 2 read
-            (1000, 100),                     // band 2 combine
+            (0, 0),
+            (250, 0),
+            (500, 0), // band 1 read
+            (500, 25),
+            (500, 50), // band 1 combine
+            (750, 50),
+            (1000, 50),  // band 2 read
+            (1000, 100), // band 2 combine
         ];
         let mut last = -1.0f64;
         for (b, r) in seq {
             let p = build_percent(b, bt, r, rt);
-            assert!(p >= last, "percent went backwards: {last} -> {p} at bytes={b} rows={r}");
+            assert!(
+                p >= last,
+                "percent went backwards: {last} -> {p} at bytes={b} rows={r}"
+            );
             last = p;
         }
-        assert!((last - 100.0).abs() < 1e-9, "a finished build reads exactly 100, got {last}");
+        assert!(
+            (last - 100.0).abs() < 1e-9,
+            "a finished build reads exactly 100, got {last}"
+        );
         // Reading carries READ_SHARE of the bar: fully read, nothing combined.
         let read_only = build_percent(bt, bt, 0, rt);
-        assert!((read_only - READ_SHARE * 100.0).abs() < 1e-9, "got {read_only}");
+        assert!(
+            (read_only - READ_SHARE * 100.0).abs() < 1e-9,
+            "got {read_only}"
+        );
     }
 
     #[test]
     fn build_percent_tolerates_unknown_totals_and_overshoot() {
-        assert_eq!(build_percent(0, 0, 0, 0), 0.0, "nothing known yet is 0, not NaN");
+        assert_eq!(
+            build_percent(0, 0, 0, 0),
+            0.0,
+            "nothing known yet is 0, not NaN"
+        );
         // rows_total is unknown (0) until the first combine tick: only the read share counts.
         assert!((build_percent(500, 1000, 0, 0) - 35.0).abs() < 1e-9);
         // A tick that overshoots its total is capped at 100 — defensive against

@@ -46,6 +46,10 @@ pub mod defaults {
     // physical RAM, clamped) — see integration::band_budget.
     pub const INTEGRATION_BAND_BUDGET_MB: &str = "0";
 
+    // The container a NEW calibration master is written in. A rebuild
+    // ignores this — it keeps the container its file already has.
+    pub const CALIBRATION_MASTER_FORMAT: &str = "fits";
+
     // Reads kept in flight per integration. 0 = auto (from the storage class:
     // the CPU pool size locally, more on a network mount, which is
     // latency-bound). See integration::storage_class.
@@ -126,6 +130,11 @@ pub mod keys {
     // set" (legacy root fallback applies). See
     // `api::scan_roots::resolve_calibration_library_dir`.
     pub const CALIBRATION_LIBRARY_DIR: &str = "calibration.library_dir";
+
+    /// The container a built calibration master is written in: `fits`
+    /// (default) or `xisf`. Read once per build for a NEW target; a rebuild
+    /// keeps the container its file already has.
+    pub const CALIBRATION_MASTER_FORMAT: &str = "calibration.master_format";
 
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "compute.max_concurrent";
@@ -454,6 +463,33 @@ impl SettingsManager {
         }))
     }
 
+    /// The container a NEW calibration master is written in — `fits` or
+    /// `xisf`, read once per build (`api::masters::run_build`). A rebuild
+    /// never calls this: it keeps the container its own file already has
+    /// (`fits_writer::OutputFormat::from_path`), so the setting can change
+    /// underneath an existing master without touching it. An unrecognized
+    /// value falls back to FITS rather than failing the build outright.
+    pub fn get_master_format(&self, conn: &Connection) -> Result<crate::fits_writer::OutputFormat> {
+        use crate::fits_writer::OutputFormat;
+        let value = self.get_with_precedence(
+            conn,
+            keys::CALIBRATION_MASTER_FORMAT,
+            defaults::CALIBRATION_MASTER_FORMAT,
+        )?;
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "fits" => OutputFormat::Fits,
+            "xisf" => OutputFormat::Xisf,
+            _ => {
+                tracing::warn!(
+                    key = keys::CALIBRATION_MASTER_FORMAT,
+                    value = %value,
+                    "unknown master format — falling back to fits"
+                );
+                OutputFormat::Fits
+            }
+        })
+    }
+
     /// Configured reads-in-flight per integration. `0` is the auto sentinel;
     /// `storage_class::read_concurrency` applies the bounds. An unparseable
     /// value degrades to auto rather than failing a build — same stance as
@@ -777,10 +813,60 @@ mod tests {
     /// no error and no log. One resolver, used at all four apply sites.
     #[test]
     fn blink_cache_max_mb_resolves_default_and_clamps() {
-        assert_eq!(resolve_blink_memory_cache_max_mb(None), 512, "absent → default");
-        assert_eq!(resolve_blink_memory_cache_max_mb(Some("abc")), 512, "unparseable → default");
-        assert_eq!(resolve_blink_memory_cache_max_mb(Some("0")), BLINK_MEMORY_CACHE_MAX_MB_MIN, "0 must not mean one entry");
-        assert_eq!(resolve_blink_memory_cache_max_mb(Some("999999")), BLINK_MEMORY_CACHE_MAX_MB_MAX);
-        assert_eq!(resolve_blink_memory_cache_max_mb(Some(" 1024 ")), 1024, "whitespace tolerated");
+        assert_eq!(
+            resolve_blink_memory_cache_max_mb(None),
+            512,
+            "absent → default"
+        );
+        assert_eq!(
+            resolve_blink_memory_cache_max_mb(Some("abc")),
+            512,
+            "unparseable → default"
+        );
+        assert_eq!(
+            resolve_blink_memory_cache_max_mb(Some("0")),
+            BLINK_MEMORY_CACHE_MAX_MB_MIN,
+            "0 must not mean one entry"
+        );
+        assert_eq!(
+            resolve_blink_memory_cache_max_mb(Some("999999")),
+            BLINK_MEMORY_CACHE_MAX_MB_MAX
+        );
+        assert_eq!(
+            resolve_blink_memory_cache_max_mb(Some(" 1024 ")),
+            1024,
+            "whitespace tolerated"
+        );
+    }
+
+    #[test]
+    fn master_format_defaults_to_fits_and_tolerates_garbage() {
+        use crate::fits_writer::OutputFormat;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        assert_eq!(
+            manager.get_master_format(&conn).unwrap(),
+            OutputFormat::Fits
+        );
+
+        manager
+            .persist_setting(&conn, keys::CALIBRATION_MASTER_FORMAT, "xisf")
+            .unwrap();
+        assert_eq!(
+            manager.get_master_format(&conn).unwrap(),
+            OutputFormat::Xisf
+        );
+
+        manager
+            .persist_setting(&conn, keys::CALIBRATION_MASTER_FORMAT, "tiff")
+            .unwrap();
+        assert_eq!(
+            manager.get_master_format(&conn).unwrap(),
+            OutputFormat::Fits,
+            "unknown value falls back, with a warn!"
+        );
     }
 }

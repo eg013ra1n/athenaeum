@@ -3,10 +3,11 @@
 
 use crate::archive::path_layout::sanitize_for_filename;
 use crate::fits_writer::keywords::FrameKind;
+use crate::fits_writer::OutputFormat;
 use std::path::{Path, PathBuf};
 
 /// Relative path inside the library root, per the fixed v1 template:
-/// `<INSTRUME>/<MasterType>/master_dark_300s_-10C_g100_bin1_2026-06-28.fits`
+/// `<INSTRUME>/<MasterType>/master_dark_300s_-10C_g100_bin1_2026-06-28.<fits|xisf>`
 /// Flats insert the filter token after the type. Missing values collapse to
 /// nothing (no "NaN" junk in filenames).
 pub struct MasterPathParams<'a> {
@@ -18,6 +19,7 @@ pub struct MasterPathParams<'a> {
     pub gain: Option<f64>,
     pub binning: Option<&'a str>,
     pub date: &'a str, // YYYY-MM-DD (calibration_set.date)
+    pub format: OutputFormat,
 }
 
 fn kind_folder(kind: FrameKind) -> &'static str {
@@ -85,7 +87,7 @@ pub fn master_relative_path(p: &MasterPathParams) -> PathBuf {
     parts.push(p.date.to_string());
     PathBuf::from(camera)
         .join(kind_folder(p.master_kind))
-        .join(format!("{}.fits", parts.join("_")))
+        .join(format!("{}.{}", parts.join("_"), p.format.extension()))
 }
 
 /// First non-existing variant of `abs`: abs, then stem_2.fits, stem_3.fits…
@@ -205,6 +207,7 @@ mod tests {
             gain: Some(100.0),
             binning: Some("1x1"),
             date: "2026-06-28",
+            format: OutputFormat::Fits,
         });
         // sanitize_for_filename replaces whitespace with '_' (see
         // archive::path_layout::sanitize_for_filename), so the camera token
@@ -221,6 +224,31 @@ mod tests {
     }
 
     #[test]
+    fn master_relative_path_takes_the_chosen_container() {
+        let base = MasterPathParams {
+            instrume: Some("ASI2600MM"),
+            master_kind: FrameKind::MasterDark,
+            filter: None,
+            exptime: Some(300.0),
+            ccd_temp: Some(-10.0),
+            gain: Some(100.0),
+            binning: Some("1x1"),
+            date: "2026-09-18",
+            format: OutputFormat::Fits,
+        };
+        assert!(master_relative_path(&base)
+            .to_string_lossy()
+            .ends_with("_2026-09-18.fits"));
+        let xisf = MasterPathParams {
+            format: OutputFormat::Xisf,
+            ..base
+        };
+        assert!(master_relative_path(&xisf)
+            .to_string_lossy()
+            .ends_with("_2026-09-18.xisf"));
+    }
+
+    #[test]
     fn flat_includes_filter_and_missing_fields_collapse() {
         let p = master_relative_path(&MasterPathParams {
             instrume: Some("cam"),
@@ -231,6 +259,7 @@ mod tests {
             gain: None,
             binning: None,
             date: "2026-07-01",
+            format: OutputFormat::Fits,
         });
         assert_eq!(
             p,
@@ -251,6 +280,7 @@ mod tests {
             gain: None,
             binning: None,
             date: "2026-01-01",
+            format: OutputFormat::Fits,
         });
         assert!(p.starts_with("UnknownCamera/MasterBias/"), "{p:?}");
     }

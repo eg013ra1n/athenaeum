@@ -16,14 +16,16 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use athenaeum_core::api::masters::resolve_recipe;
-use athenaeum_core::integration::band_budget::MIN_BUDGET_BYTES;
-use athenaeum_core::integration::combine::{IntegrationRecipe, Rejection};
 use athenaeum_core::calibration_library::headers::{build_master_cards, load_header_inputs};
-use athenaeum_core::calibration_library::paths::{master_relative_path, resolve_collision, MasterPathParams};
+use athenaeum_core::calibration_library::paths::{
+    master_relative_path, resolve_collision, MasterPathParams,
+};
 use athenaeum_core::calibration_library::register::{member_hash, register_master};
 use athenaeum_core::fits_parser::FitsHeader;
 use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
-use athenaeum_core::fits_writer::write_fits_f32;
+use athenaeum_core::fits_writer::{write_fits_f32, OutputFormat};
+use athenaeum_core::integration::band_budget::MIN_BUDGET_BYTES;
+use athenaeum_core::integration::combine::{IntegrationRecipe, Rejection};
 use athenaeum_core::integration::engine::{integrate_bias_like, EngineProgress};
 use athenaeum_core::integration::io_policy::IoPolicy;
 use athenaeum_core::integration::storage_class::StorageClass;
@@ -35,7 +37,11 @@ use rusqlite::Connection;
 /// machine/storage-resolved one — concurrency and storage class are not
 /// under test here.
 fn fixed_io_policy() -> IoPolicy {
-    IoPolicy { band_budget_bytes: MIN_BUDGET_BYTES, read_concurrency: 1, storage: StorageClass::Local }
+    IoPolicy {
+        band_budget_bytes: MIN_BUDGET_BYTES,
+        read_concurrency: 1,
+        storage: StorageClass::Local,
+    }
 }
 
 /// Seeds a 3-frame raw Dark calibration set with real 8x8 FITS files on
@@ -52,20 +58,27 @@ fn seed_source_set(conn: &Connection, dir: &std::path::Path) -> i64 {
          VALUES ('Dark', 300.0, -10.0, 100.0, 50.0, '1x1', 'TestCam', '2026-06-28',
           '2026-06-28T20:00:00Z', '2026-06-28T22:00:00Z', -10.5, -9.5, 3)",
         [],
-    ).unwrap();
+    )
+    .unwrap();
     let set_id = conn.last_insert_rowid();
     for i in 0..3 {
         let p = dir.join(format!("raw{i}.fits"));
         let cards = HeaderBuilder::new(FrameKind::Dark)
-            .instrume("TestCam").exptime(300.0).gain(100).offset(50)
-            .binning(1, 1).ccd_temp(-10.0)
-            .build().unwrap();
+            .instrume("TestCam")
+            .exptime(300.0)
+            .gain(100)
+            .offset(50)
+            .binning(1, 1)
+            .ccd_temp(-10.0)
+            .build()
+            .unwrap();
         write_fits_f32(&p, 8, 8, 1, &vec![100.0; 64], &cards).unwrap();
         conn.execute(
             "INSERT INTO files (path, filename, size, modified_at, format)
              VALUES (?1, ?2, 100, '2026-06-28', 'FITS')",
             rusqlite::params![p.to_string_lossy(), format!("raw{i}.fits")],
-        ).unwrap();
+        )
+        .unwrap();
         let file_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO frames (file_id, imagetyp, instrume, exptime, gain, offset, binning, ccd_temp, date_obs)
@@ -76,7 +89,8 @@ fn seed_source_set(conn: &Connection, dir: &std::path::Path) -> i64 {
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![set_id, frame_id],
-        ).unwrap();
+        )
+        .unwrap();
     }
     set_id
 }
@@ -90,16 +104,22 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
 
     let set_id = seed_source_set(&conn, dir.path());
     let source_uuid: String = conn
-        .query_row("SELECT uuid FROM calibration_set WHERE id = ?1", [set_id], |r| r.get(0))
+        .query_row(
+            "SELECT uuid FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |r| r.get(0),
+        )
         .unwrap();
 
     // Load member paths — same query `api::masters::run_build` uses.
-    let mut stmt = conn.prepare(
-        "SELECT fi.path FROM calibration_set_frames csf
+    let mut stmt = conn
+        .prepare(
+            "SELECT fi.path FROM calibration_set_frames csf
          JOIN frames f ON f.id = csf.frame_id
          JOIN files fi ON fi.id = f.file_id
          WHERE csf.set_id = ?1 ORDER BY fi.path",
-    ).unwrap();
+        )
+        .unwrap();
     let paths: Vec<PathBuf> = stmt
         .query_map([set_id], |r| r.get::<_, String>(0))
         .unwrap()
@@ -113,19 +133,38 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
 
     // Resolve -> integrate (n=3 < 15 => plain Median for a non-flat type).
     let combine = resolve_recipe(None, "Dark", 3);
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
     let on_band = |_current: usize, _total: usize, _bytes_read_so_far: u64, _bytes_total: u64| {};
     let out = integrate_bias_like(
-        &paths, combine, &pool, scratch.path(), &AtomicBool::new(false),
-        EngineProgress { on_band: &on_band, on_combine: &on_band },
+        &paths,
+        combine,
+        &pool,
+        scratch.path(),
+        &AtomicBool::new(false),
+        EngineProgress {
+            on_band: &on_band,
+            on_combine: &on_band,
+        },
         fixed_io_policy(),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Write: consolidated header + fixed v1 naming into the temp library dir.
     let inputs = load_header_inputs(&conn, set_id).unwrap();
     let (hash, uuids) = member_hash(&conn, set_id).unwrap();
     assert_eq!(uuids.len(), 3);
-    let cards = build_master_cards(&inputs, "0.2.5-test", "median n=3", &hash, out.flat_norm, None).unwrap();
+    let cards = build_master_cards(
+        &inputs,
+        "0.2.5-test",
+        "median n=3",
+        &hash,
+        out.flat_norm,
+        None,
+    )
+    .unwrap();
 
     let target_rel = master_relative_path(&MasterPathParams {
         instrume: inputs.instrume.as_deref(),
@@ -136,6 +175,7 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
         gain: inputs.gain,
         binning: Some("1x1"),
         date: "2026-06-28",
+        format: OutputFormat::Fits,
     });
     let target_abs = resolve_collision(&library_dir.path().join(&target_rel));
     std::fs::create_dir_all(target_abs.parent().unwrap()).unwrap();
@@ -148,7 +188,10 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     // The load-bearing assertions: parse the just-written master back and
     // confirm its header actually reflects what was built.
     let header = FitsHeader::from_path(&target_abs).unwrap();
-    assert_eq!(header.get_str("ATH_SRC").as_deref(), Some(source_uuid.as_str()));
+    assert_eq!(
+        header.get_str("ATH_SRC").as_deref(),
+        Some(source_uuid.as_str())
+    );
     assert_eq!(header.get_i32("ATH_N"), Some(3));
     assert_eq!(header.get_str("IMAGETYP").as_deref(), Some("Master Dark"));
 }
@@ -188,7 +231,8 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
         "INSERT INTO files (path, filename, size, modified_at, format)
          VALUES ('/l/light.fits', 'light.fits', 100, '2026-06-28', 'FITS')",
         [],
-    ).unwrap();
+    )
+    .unwrap();
     let light_file_id = conn.last_insert_rowid();
     conn.execute(
         "INSERT INTO frames (file_id, imagetyp, instrume, exptime) VALUES (?1, 'Light', 'TestCam', 300.0)",
@@ -203,17 +247,26 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     ).unwrap();
 
     let member_paths = |conn: &Connection| -> Vec<PathBuf> {
-        let mut stmt = conn.prepare(
-            "SELECT fi.path FROM calibration_set_frames csf
+        let mut stmt = conn
+            .prepare(
+                "SELECT fi.path FROM calibration_set_frames csf
              JOIN frames f ON f.id = csf.frame_id
              JOIN files fi ON fi.id = f.file_id
              WHERE csf.set_id = ?1 ORDER BY fi.path",
-        ).unwrap();
-        stmt.query_map([set_id], |r| r.get::<_, String>(0)).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap()
-            .into_iter().map(PathBuf::from).collect()
+            )
+            .unwrap();
+        stmt.query_map([set_id], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
     };
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
     // Mean (not Median): the mutated raw frame below changes only ONE of
     // the 3 member frames, and a median of {100, 100, 400} is still 100 —
     // mean is what actually shifts, which is what "the rebuild re-read the
@@ -223,10 +276,16 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
         integrate_bias_like(
             paths,
             IntegrationRecipe::average(Rejection::None),
-            &pool, scratch.path(), &AtomicBool::new(false),
-            EngineProgress { on_band: &on_band, on_combine: &on_band },
+            &pool,
+            scratch.path(),
+            &AtomicBool::new(false),
+            EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
             fixed_io_policy(),
-        ).unwrap()
+        )
+        .unwrap()
     };
 
     // ── Build #1: same sequence as the New-path test above. ──
@@ -234,7 +293,15 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     let out1 = integrate(&paths);
     let inputs = load_header_inputs(&conn, set_id).unwrap();
     let (hash1, _uuids) = member_hash(&conn, set_id).unwrap();
-    let cards1 = build_master_cards(&inputs, "0.2.5-test", "mean n=3", &hash1, out1.flat_norm, None).unwrap();
+    let cards1 = build_master_cards(
+        &inputs,
+        "0.2.5-test",
+        "mean n=3",
+        &hash1,
+        out1.flat_norm,
+        None,
+    )
+    .unwrap();
     let target_rel = master_relative_path(&MasterPathParams {
         instrume: inputs.instrume.as_deref(),
         master_kind: inputs.kind,
@@ -244,6 +311,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
         gain: inputs.gain,
         binning: Some("1x1"),
         date: "2026-06-28",
+        format: OutputFormat::Fits,
     });
     let target_abs = resolve_collision(&library_dir.path().join(&target_rel));
     std::fs::create_dir_all(target_abs.parent().unwrap()).unwrap();
@@ -251,57 +319,108 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     let reg = register_master(&conn, set_id, &target_abs, r#"{"combine":"median"}"#).unwrap();
 
     // Capture "before" state for everything the rebuild must NOT touch.
-    let link_set_before: i64 = conn.query_row(
-        "SELECT calibration_set_id FROM calibration_set_to_frames
+    let link_set_before: i64 = conn
+        .query_row(
+            "SELECT calibration_set_id FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'frame'",
-        [light_frame_id], |r| r.get(0),
-    ).unwrap();
-    assert_eq!(link_set_before, reg.master_set_id, "sanity: registration relinked the light");
-    let frame_row_before: (String, i64) = conn.query_row(
-        "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
-        [reg.master_frame_id], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap();
-    let set_row_before: (i64, i64) = conn.query_row(
-        "SELECT frame_count, is_master_library FROM calibration_set WHERE id = ?1",
-        [reg.master_set_id], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap();
+            [light_frame_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        link_set_before, reg.master_set_id,
+        "sanity: registration relinked the light"
+    );
+    let frame_row_before: (String, i64) = conn
+        .query_row(
+            "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
+            [reg.master_frame_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let set_row_before: (i64, i64) = conn
+        .query_row(
+            "SELECT frame_count, is_master_library FROM calibration_set WHERE id = ?1",
+            [reg.master_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
 
     // Mutate ONE raw member frame's pixel data — the seed frames are all a
     // flat 100.0, so re-integrating the unmodified files would produce a
     // byte-identical result and "the rebuild actually re-read the source"
     // wouldn't be pinned by anything below.
     let cards_raw = HeaderBuilder::new(FrameKind::Dark)
-        .instrume("TestCam").exptime(300.0).gain(100).offset(50)
-        .binning(1, 1).ccd_temp(-10.0)
-        .build().unwrap();
-    write_fits_f32(&dir.path().join("raw0.fits"), 8, 8, 1, &vec![400.0; 64], &cards_raw).unwrap();
+        .instrume("TestCam")
+        .exptime(300.0)
+        .gain(100)
+        .offset(50)
+        .binning(1, 1)
+        .ccd_temp(-10.0)
+        .build()
+        .unwrap();
+    write_fits_f32(
+        &dir.path().join("raw0.fits"),
+        8,
+        8,
+        1,
+        &vec![400.0; 64],
+        &cards_raw,
+    )
+    .unwrap();
 
     // ── Rebuild: same source set, SAME target path, no register_master. ──
     let paths2 = member_paths(&conn);
     let out2 = integrate(&paths2);
-    assert_ne!(out1.data, out2.data, "rebuild must re-read the now-changed source frame");
+    assert_ne!(
+        out1.data, out2.data,
+        "rebuild must re-read the now-changed source frame"
+    );
 
     let (hash2, _uuids2) = member_hash(&conn, set_id).unwrap();
-    let cards2 = build_master_cards(&inputs, "0.2.5-test", "mean n=3", &hash2, out2.flat_norm, None).unwrap();
+    let cards2 = build_master_cards(
+        &inputs,
+        "0.2.5-test",
+        "mean n=3",
+        &hash2,
+        out2.flat_norm,
+        None,
+    )
+    .unwrap();
     write_fits_f32(&target_abs, out2.width, out2.height, 1, &out2.data, &cards2).unwrap();
 
     let recipe_json_2 = r#"{"combine":"median","rebuilt":true}"#;
-    athenaeum_core::db::master_provenance::update_rebuild(&conn, reg.master_set_id, recipe_json_2, &hash2).unwrap();
+    athenaeum_core::db::master_provenance::update_rebuild(
+        &conn,
+        reg.master_set_id,
+        recipe_json_2,
+        &hash2,
+    )
+    .unwrap();
     athenaeum_core::scanner::resync_catalog_rows_from_disk(&conn, reg.master_file_id, &target_abs)
         .unwrap();
 
     // ── Links / frames identity / calibration_set: untouched. ──
-    let link_set_after: i64 = conn.query_row(
-        "SELECT calibration_set_id FROM calibration_set_to_frames
+    let link_set_after: i64 = conn
+        .query_row(
+            "SELECT calibration_set_id FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'frame'",
-        [light_frame_id], |r| r.get(0),
-    ).unwrap();
-    assert_eq!(link_set_after, link_set_before, "rebuild must not touch existing consumer links");
+            [light_frame_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        link_set_after, link_set_before,
+        "rebuild must not touch existing consumer links"
+    );
 
-    let frame_row_after: (String, i64) = conn.query_row(
-        "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
-        [reg.master_frame_id], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap();
+    let frame_row_after: (String, i64) = conn
+        .query_row(
+            "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
+            [reg.master_frame_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(
         frame_row_after, frame_row_before,
         "rebuild must not change what the master IS (imagetyp/is_master) — only refresh its header-derived columns",
@@ -309,27 +428,49 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
 
     // The refresh is id-preserving: the frames row every junction table points
     // at is the same row, UPDATEd in place, never re-inserted.
-    let frame_id_after: i64 = conn.query_row(
-        "SELECT id FROM frames WHERE file_id = ?1", [reg.master_file_id], |r| r.get(0),
-    ).unwrap();
-    assert_eq!(frame_id_after, reg.master_frame_id, "rebuild must preserve frames.id");
+    let frame_id_after: i64 = conn
+        .query_row(
+            "SELECT id FROM frames WHERE file_id = ?1",
+            [reg.master_file_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        frame_id_after, reg.master_frame_id,
+        "rebuild must preserve frames.id"
+    );
 
-    let set_row_after: (i64, i64) = conn.query_row(
-        "SELECT frame_count, is_master_library FROM calibration_set WHERE id = ?1",
-        [reg.master_set_id], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap();
-    assert_eq!(set_row_after, set_row_before, "rebuild must not touch the master's calibration_set row");
+    let set_row_after: (i64, i64) = conn
+        .query_row(
+            "SELECT frame_count, is_master_library FROM calibration_set WHERE id = ?1",
+            [reg.master_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        set_row_after, set_row_before,
+        "rebuild must not touch the master's calibration_set row"
+    );
 
     // ── Provenance + files: refreshed, source_set_id preserved. ──
-    let prov = athenaeum_core::db::master_provenance::get(&conn, reg.master_set_id).unwrap().unwrap();
+    let prov = athenaeum_core::db::master_provenance::get(&conn, reg.master_set_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(prov.recipe_json, recipe_json_2);
     assert_eq!(prov.member_hash, hash2);
-    assert_eq!(prov.source_set_id, Some(set_id), "rebuild must not relink to a different source");
+    assert_eq!(
+        prov.source_set_id,
+        Some(set_id),
+        "rebuild must not relink to a different source"
+    );
 
     // ── The file on disk actually changed (same path, new pixels). ──
     let src = athenaeum_core::integration::banded::BandSource::open(
-        std::slice::from_ref(&target_abs), scratch.path(), 1,
-    ).unwrap();
+        std::slice::from_ref(&target_abs),
+        scratch.path(),
+        1,
+    )
+    .unwrap();
     let (w, h) = (src.width(), src.height());
     let mut planes = athenaeum_core::integration::banded::BandPlanes::new(&src);
     src.read_band(0, h, &mut planes, 1).unwrap();
