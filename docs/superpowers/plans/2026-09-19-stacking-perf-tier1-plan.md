@@ -686,7 +686,11 @@ Replace the inner `for frame in &group.frames` loop of `stage_calibrate` with:
         if jobs.is_empty() { continue; }
         prebuild_hot_maps(rc, &jobs, &scratch);
 
-        let (gw, gh) = (group.width as u64, group.height as u64); // the group's native geometry as the plan reports it
+        // Max over the group's members, exactly as Measure's `group_max_w`/
+        // `group_max_h` do — an M4b group may hold frames of different native
+        // size (a second camera, a bin-2 member), and admission must budget
+        // for the largest one.
+        let (gw, gh) = (group_max_w as u64, group_max_h as u64);
         let admission_n = admission(CALIBRATE_PLANES_RESIDENT * gw * gh * 4, rc.ctx.image_pool.current_num_threads());
         log_admission(rc, Stage::Calibrate, &group.key, CALIBRATE_PLANES_RESIDENT * gw * gh * 4, admission_n);
         let ticker = FanOutTicker::new(rc, Stage::Calibrate, Some(group.key.clone()), current, total);
@@ -727,7 +731,7 @@ Replace the inner `for frame in &group.frames` loop of `stage_calibrate` with:
 
 with `const CANCELLED_MARKER: &str = "__cancelled__";` next to the stage. `fan_out` returns results at their original index, so `commit_calibrated` runs in frame order — warnings and artifact rows land in the same order the sequential loop produced. Delete the old `calibrate_one_frame`; update the stage's doc comment (ruling 4's "sequentially" no longer holds — say the fan-out replaced it on 2026-09-19 and why the export path keeps its own loop).
 
-`GroupFrame`/`IntegrationGroup` carry the native geometry the plan resolved (`PlanGroup.width/height` — use whatever field `calibrate_bytes_total` reads for its per-frame byte estimate; if the group has none, fall back to the first job's `spec.inputs` header via the same probe `calibrate_bytes_total` uses).
+`group_max_w`/`group_max_h` are computed the same way `stage_measure` computes them at `run.rs:~2340` (the maximum native width/height over the group's included members, read from the same per-frame geometry `calibrate_bytes_total` uses) — copy that computation, do not invent a group-level field. A mixed-geometry group (M4b: a second camera or a bin-2 member beside the others) is budgeted for its largest member.
 
 - [ ] **Step 5: Gate**
 
