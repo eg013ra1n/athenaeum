@@ -59,6 +59,7 @@ export default function Settings() {
   const [budgetInfo, setBudgetInfo] = useState<IntegrationBudgetInfo | null>(null);
   const [budgetSaving, setBudgetSaving] = useState(false);
   const [budgetError, setBudgetError] = useState<string | null>(null);
+  const [masterFormat, setMasterFormat] = useState<'fits' | 'xisf'>('fits');
 
   // Flat Contour Plot defaults — drive the per-frame contour rendering in
   // Blink. Values match PixInsight FlatContourPlot v1.3.1 defaults.
@@ -128,6 +129,9 @@ export default function Settings() {
       api.invoke<string>('get_log_path').then(setLogDir).catch(console.error);
     }
     loadIntegrationBudget();
+    api.invoke<string>('get_setting', { key: 'calibration.master_format', defaultValue: 'fits' })
+      .then((v) => setMasterFormat(v === 'xisf' ? 'xisf' : 'fits'))
+      .catch((err) => console.error('[Settings] get_setting calibration.master_format failed:', err));
   }, []);
 
   const loadIntegrationBudget = async () => {
@@ -751,6 +755,32 @@ export default function Settings() {
                 {budgetSaving ? 'Saving...' : 'Save Memory Budget'}
               </button>
             </div>
+          </div>
+
+          <div className="mt-6 pt-6 border-t border-border">
+            <h3 className="text-xl font-semibold mb-4">Master File Format</h3>
+            <label className="block text-sm font-medium text-content-secondary mb-2">Container for masters built here</label>
+            <select
+              value={masterFormat}
+              onChange={async (e) => {
+                const next = e.target.value === 'xisf' ? 'xisf' : 'fits';
+                setMasterFormat(next);
+                try {
+                  await api.invoke('set_setting', { key: 'calibration.master_format', value: next });
+                } catch (err) {
+                  console.error('[Settings] set_setting calibration.master_format failed:', err);
+                  setError(`Failed to save master format: ${err}`);
+                }
+              }}
+              className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+            >
+              <option value="fits">FITS — float32, the format every tool reads</option>
+              <option value="xisf">XISF — what WBPP requires for master calibration files</option>
+            </select>
+            <p className="text-xs text-content-muted mt-2">
+              Applies to masters built from now on. A rebuild keeps the container the master already has.
+              XISF masters carry the same header cards, plus the image type WBPP reads.
+            </p>
           </div>
         </div>
       )}
