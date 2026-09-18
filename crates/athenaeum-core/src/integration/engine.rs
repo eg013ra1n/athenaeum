@@ -32,9 +32,14 @@ pub struct IntegrationOutput {
     /// Wall time spent inside `BandSource::read_band` across every band,
     /// including a flat's pass-1 reads. Separated from `combine_duration`
     /// because the two phases have completely different bottlenecks and only
-    /// the engine can tell them apart.
+    /// the engine can tell them apart. Since perf tier 1 Task 1, `band_loop`
+    /// prefetches band N+1's read while band N combines, so this and
+    /// `combine_duration` overlap in wall-clock time — `read_duration +
+    /// combine_duration` may exceed the run's own elapsed time. Pass 1's
+    /// central-third read (flats only) stays sequential and is unaffected.
     pub read_duration: std::time::Duration,
     /// Wall time spent in the parallel per-pixel combine across every band.
+    /// See `read_duration`'s doc for the overlap this now has with it.
     pub combine_duration: std::time::Duration,
     /// Rows per band and how many bands the run used — the two numbers the
     /// band budget actually decides, reported so the build's log line does not
@@ -153,6 +158,10 @@ struct BandJob<'a> {
 }
 
 struct BandStats {
+    /// Wall time spent in band reads. Since perf tier 1's prefetch (the next
+    /// band reads while the current one combines), this overlaps
+    /// `combine_duration` — `read_duration + combine_duration` may exceed
+    /// the loop's own elapsed time.
     read_duration: std::time::Duration,
     combine_duration: std::time::Duration,
     band_rows: usize,
@@ -177,7 +186,10 @@ fn band_loop<S: FrameSource + ?Sized>(
     combine: &(dyn Fn(BandJob<'_>, &(dyn Fn() + Sync)) -> Result<(), IntegrationError> + Sync),
 ) -> Result<BandStats, IntegrationError> {
     let (w, h) = (src.width(), src.height());
-    let band_rows = src.band_rows_for_budget(io.band_budget_bytes).min(h);
+    // Perf tier 1 Task 1: two band buffers, the next band's read overlapping
+    // this band's combine. Rows per band are computed against HALF the
+    // budget so the two resident bands together cost what one used to.
+    let band_rows = src.band_rows_for_budget(io.band_budget_bytes / 2).max(1).min(h);
     let bands_total = h.div_ceil(band_rows);
     // Computed once, next to `band_rows`, and referenced from every band's
     // progress call below — this run's own (pass 2) share of the work. See
@@ -185,14 +197,32 @@ fn band_loop<S: FrameSource + ?Sized>(
     // total than this once `integrate_flat_inner` wraps it with pass 1.
     let per_row_bytes = src.bytes_per_row();
     let bytes_total = (h * per_row_bytes) as u64;
-    let mut planes = BandPlanes::new(src);
-    let mut read_duration = std::time::Duration::ZERO;
+    let mut cur = BandPlanes::new(src);
+    let mut next = BandPlanes::new(src);
+    let read_duration = std::sync::Mutex::new(std::time::Duration::ZERO);
     let mut combine_duration = std::time::Duration::ZERO;
-    let mut bytes_read: u64 = 0;
-    // Fix wave item 2: rows combined ACROSS THE WHOLE RUN, not per band —
-    // see `EngineProgress::on_combine`'s doc for why a single global counter
-    // (rather than one reset per band) is what makes a single-band run
-    // report anything at all during combine.
+    // Bytes the READER has reported so far — the high-water mark both
+    // `on_band` and `on_combine` ticks quote, so a combine tick emitted
+    // while the next band is being read never reports fewer bytes than the
+    // reader already has (the "bytes never regress" contract, now across two
+    // threads).
+    //
+    // Fix round 3, Important 1 (this reasoning now spans the reader thread
+    // AND the main/combine thread, not just concurrent readers within one
+    // band): an `AtomicU64::fetch_max` high-water-mark guard here is NOT
+    // enough on its own — two workers can both pass the "am I a new
+    // maximum" check (each correctly, against the state at the moment they
+    // checked) and then still race each other into the actual callback
+    // afterward, since updating the atomic and invoking the callback are
+    // two separate, unsynchronized steps — the exact TOCTOU shape a
+    // fetch_max-then-emit pattern was trying to close, just moved one line
+    // later. A `Mutex` makes "add my bytes, then emit" ONE critical
+    // section: whichever thread holds the lock is the only one that can
+    // advance `bytes_reported` and call the progress callback, so
+    // emissions are ordered by lock-acquisition order, which is the same
+    // order the bytes were added in — monotonic by construction, not by
+    // discarding stale values after the fact.
+    let bytes_reported = std::sync::Mutex::new(0u64);
     let rows_combined = AtomicUsize::new(0);
     // A stride, not every row: `on_combine` is wall-clock-throttled by the
     // caller (`masters.rs`, same as `on_band`) behind a `Mutex`, so calling
@@ -202,101 +232,120 @@ fn band_loop<S: FrameSource + ?Sized>(
     // final tick is never skipped.
     const COMBINE_TICK_ROWS: usize = 64;
 
+    // One band's read, callable from either thread (the caller of
+    // `band_loop` itself for the very first band, or a scoped prefetch
+    // thread for every band after it). Returns the accounted bytes of the
+    // band it read.
+    let read_one = |band_idx: usize, y0: usize, rows: usize, into: &mut BandPlanes| -> Result<u64, IntegrationError> {
+        let t = std::time::Instant::now();
+        let on_bytes = |just_read: u64| {
+            let mut so_far = bytes_reported.lock().unwrap();
+            *so_far += just_read;
+            (progress.on_band)(band_idx + 1, bands_total, *so_far, bytes_total);
+        };
+        src.read_band_with_progress(y0, rows, into, io.read_concurrency, &on_bytes, cancel)?;
+        *read_duration.lock().unwrap() += t.elapsed();
+        Ok((rows * per_row_bytes) as u64)
+    };
+
+    let mut bytes_read: u64 = 0;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(IntegrationError::Cancelled);
+    }
+    bytes_read += read_one(0, 0, band_rows.min(h), &mut cur)?;
+
     for (band_idx, y0) in (0..h).step_by(band_rows).enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(IntegrationError::Cancelled);
         }
         let rows = band_rows.min(h - y0);
-        let t_read = std::time::Instant::now();
-        // Fix round 2, I2: a per-frame tick during the read itself, not just
-        // the end-of-band call below — see `EngineProgress::on_band`'s doc.
-        // `bytes_before_this_band` is a snapshot of `bytes_read` (the total
-        // from EARLIER bands only) taken before this band's read starts,
-        // since the outer variable itself isn't updated until the read
-        // returns; `band_bytes_so_far` (below) is a fresh `Mutex<u64>` per
-        // band — NOT an atomic — accumulating this band's own bytes across
-        // however many worker threads read it. See the Fix round 3 comment
-        // just below for why a `Mutex` and not an atomic is the point.
+        let next_y0 = y0 + rows;
+        let has_next = next_y0 < h;
+        let next_rows = band_rows.min(h.saturating_sub(next_y0));
+
+        // Fix wave item 1 (whole-branch review, CRITICAL — still holds):
+        // a cancel raised while a read was in flight must not fall through
+        // into the combine below; both checks that used to guard this are
+        // now the ones just above (before this band's own read, already
+        // done by the time this iteration starts) and the one right after
+        // `combine_result?` below.
         //
-        // Fix round 3, Important 1: an `AtomicU64::fetch_max` high-water-mark
-        // guard here (the reviewer's first-suggested shape: `fetch_add`,
-        // then check-and-maybe-emit) is NOT enough on its own — verified by
-        // writing it, then RE-FAILING the concurrency test below against it:
-        // two workers can both pass the "am I a new maximum" check (each
-        // correctly, against the state at the moment they checked) and then
-        // still race each other into the actual `on_band` call afterward,
-        // since updating the atomic and invoking the callback are two
-        // separate, unsynchronized steps — the exact TOCTOU shape the
-        // reviewer's snippet was trying to close, just moved one line later.
-        // A `Mutex` makes "add my bytes, then emit" ONE critical section:
-        // whichever thread holds the lock is the only one that can advance
-        // `band_bytes_so_far` and call `on_band`, so emissions are ordered
-        // by lock-acquisition order, which is the same order the bytes were
-        // added in — monotonic by construction, not by discarding stale
-        // values after the fact.
-        let bytes_before_this_band = bytes_read;
-        let band_bytes_so_far = std::sync::Mutex::new(0u64);
-        let on_bytes = |just_read: u64| {
-            let mut so_far_in_band = band_bytes_so_far.lock().unwrap();
-            *so_far_in_band += just_read;
-            (progress.on_band)(band_idx + 1, bands_total, bytes_before_this_band + *so_far_in_band, bytes_total);
-        };
-        src.read_band_with_progress(y0, rows, &mut planes, io.read_concurrency, &on_bytes, cancel)?;
-        read_duration += t_read.elapsed();
-        bytes_read += (rows * per_row_bytes) as u64;
-
-        // Fix wave item 1 (whole-branch review, CRITICAL): a cancel raised
-        // while this band's read was in flight must not fall through into
-        // the combine below. Task 6 can resolve a build to exactly ONE band
-        // (routine at >=32 GB visible RAM for a typical image), in which
-        // case the top-of-loop check above fires exactly once, before any
-        // work has happened — there is no "next band" iteration left to
-        // catch a cancel that lands here.
-        if cancel.load(Ordering::Relaxed) {
-            return Err(IntegrationError::Cancelled);
-        }
-
         // `y0` (the band's first global row) rides in `BandJob` for callers
-        // that need the global row index (e.g. the precal MasterFrame path's
-        // `gy = y0 + row_in_band`).
-        let t_combine = std::time::Instant::now();
-        let out_band = &mut out[y0 * w..(y0 + rows) * w];
-        // Fix wave item 2: the byte pair `tick` reports is frozen for this
-        // whole band's combine (see `EngineProgress::on_combine`'s doc) —
-        // captured as a plain `u64` copy here, not a reference to the outer
-        // `bytes_read`, so the tick closure below never observes a LATER
-        // band's value.
-        let bytes_read_for_tick = bytes_read;
-        let tick = || {
-            // Fix wave item 2: one relaxed increment per ROW — `combine`
-            // calls this once per row, matching the review's "one relaxed
-            // increment and nothing else" requirement. `done` can arrive
-            // slightly out of order under concurrency (two threads'
-            // `fetch_add`s can interleave with their two `on_combine`
-            // calls) — harmless here because bytes_done/bytes_total are
-            // frozen for this whole band's combine regardless, so the one
-            // hard monotonicity requirement (bytes, not rows) still holds
-            // by construction, not by luck.
-            let done = rows_combined.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % COMBINE_TICK_ROWS == 0 || done == h {
-                (progress.on_combine)(done, h, bytes_read_for_tick, bytes_total);
-            }
-        };
-        pool.install(|| combine(BandJob { planes: &planes, out_band, y0, rows, width: w }, &tick))?;
-        combine_duration += t_combine.elapsed();
-        // Fix wave item 1: same reasoning as the post-read check above, for
-        // the OTHER half of a band's work — the combine is the actually
-        // slow phase once a band is a meaningful fraction of the image, and
-        // on a single-band run there is no future loop iteration to catch a
-        // cancel raised during it.
+        // that need the global row index (e.g. the precal MasterFrame
+        // path's `gy = y0 + row_in_band`).
+        let combine_result: Result<(), IntegrationError>;
+        let prefetch_result: Option<Result<u64, IntegrationError>>;
+        {
+            let next_ref = &mut next;
+            let read_one = &read_one;
+            let (c, p) = std::thread::scope(|scope| {
+                let prefetch = has_next.then(|| {
+                    scope.spawn(move || read_one(band_idx + 1, next_y0, next_rows, next_ref))
+                });
+                let t_combine = std::time::Instant::now();
+                let out_band = &mut out[y0 * w..(y0 + rows) * w];
+                // Fix wave item 2 (still holds): the byte pair `tick`
+                // reports is frozen for this whole band's combine — a
+                // snapshot of `bytes_reported` taken inside the lock at
+                // tick time, never a later band's value, since the next
+                // band's prefetch reader updates `bytes_reported` through
+                // the SAME mutex this tick reads.
+                let tick = || {
+                    // Fix wave item 2: one relaxed increment per ROW —
+                    // `combine` calls this once per row, matching the
+                    // review's "one relaxed increment and nothing else"
+                    // requirement. `done` can arrive slightly out of order
+                    // under concurrency — harmless here because the byte
+                    // pair is read from the shared `bytes_reported` mutex
+                    // regardless, so the one hard monotonicity requirement
+                    // (bytes, not rows) still holds by construction.
+                    let done = rows_combined.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % COMBINE_TICK_ROWS == 0 || done == h {
+                        let so_far = *bytes_reported.lock().unwrap();
+                        (progress.on_combine)(done, h, so_far, bytes_total);
+                    }
+                };
+                let c = pool.install(|| combine(BandJob { planes: &cur, out_band, y0, rows, width: w }, &tick));
+                combine_duration += t_combine.elapsed();
+                let p = prefetch.map(|j| j.join().expect("band prefetch thread panicked"));
+                (c, p)
+            });
+            combine_result = c;
+            prefetch_result = p;
+        }
+        combine_result?;
+        // Fix wave item 1: same reasoning as before — the combine is the
+        // actually slow phase once a band is a meaningful fraction of the
+        // image, and on a single-band run there is no future loop
+        // iteration to catch a cancel raised during it.
         if cancel.load(Ordering::Relaxed) {
             return Err(IntegrationError::Cancelled);
         }
-        (progress.on_band)(band_idx + 1, bands_total, bytes_read, bytes_total);
+        // Perf tier 1 Task 1 fix: this end-of-band call must read the SAME
+        // `bytes_reported` high-water mark the in-flight prefetch's own
+        // ticks just wrote (already joined above, since `thread::scope`
+        // waits for it) — not the plain `bytes_read` accumulator, which is
+        // still one band behind at this point (it only gains the
+        // just-finished prefetch's bytes in the `if let Some(r) =
+        // prefetch_result` step below). Using the stale accumulator here
+        // regressed a real caller: a prefetch tick for band N+1 (reporting
+        // through `bytes_reported`, already including N+1's bytes) fires
+        // DURING band N's combine, chronologically before this "band N is
+        // done" call — which then reported FEWER bytes than the tick that
+        // just preceded it. Caught by
+        // `flat_progress_ticks_span_both_passes_with_one_shared_total`
+        // under `io(1)` (1-row bands, so almost every call is this
+        // interleaving).
+        let bytes_read_so_far = *bytes_reported.lock().unwrap();
+        (progress.on_band)(band_idx + 1, bands_total, bytes_read_so_far, bytes_total);
+        if let Some(r) = prefetch_result {
+            bytes_read += r?;
+            std::mem::swap(&mut cur, &mut next);
+        }
     }
 
     Ok(BandStats {
-        read_duration,
+        read_duration: read_duration.into_inner().unwrap(),
         combine_duration,
         band_rows,
         bands: bands_total,
@@ -1405,6 +1454,7 @@ mod tests {
     use super::*;
     use crate::fits_writer::write_fits_f32;
     use crate::integration::band_budget::MIN_BUDGET_BYTES;
+    use crate::integration::banded::PlaneKind;
     use crate::integration::combine::{IntegrationRecipe, Rejection};
     use crate::integration::storage_class::StorageClass;
     use std::sync::atomic::AtomicBool;
@@ -1794,6 +1844,10 @@ mod tests {
         // over every frame) + width*8 headroom = 3*32*4 + 32*8 = 384 + 256 =
         // 640; budget 12_800 -> band_rows = 12_800/640 = 20 exactly, so the
         // 48-row image runs as 20/20/8-row bands.
+        // Perf tier 1 Task 1: `band_loop` now sizes bands against HALF the
+        // budget (two resident bands cost what one used to), so the budget
+        // passed here is doubled to 25_600 to land on the same 20-row bands
+        // this test's comment and assertions describe.
         let out = integrate_bias_like(
             &paths,
             IntegrationRecipe::median(Rejection::None),
@@ -1801,7 +1855,7 @@ mod tests {
             dir.path(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &on_band, on_combine: &nop() },
-            io(12_800),
+            io(25_600),
         )
         .unwrap();
         assert_eq!(out.band_rows, 20, "budget math must give exactly 20-row bands here");
@@ -1829,6 +1883,12 @@ mod tests {
             write(dir.path(), "f3.fits", w, h, |_, _| 1000.0),
         ];
         let on_band = nop();
+        // Perf tier 1 Task 1: pass 2's `band_loop` halves the budget it
+        // sizes bands against; doubled here so this stays comfortably a
+        // single band, same as before the halving (48 rows is nowhere near
+        // even a halved 256 MiB budget, so this is a no-op on the actual
+        // band count — kept for consistency with the sibling geometry pin
+        // above).
         let out = integrate_flat_inner(
             &paths,
             &FlatPrecal::None,
@@ -1837,7 +1897,7 @@ mod tests {
             dir.path(),
             &AtomicBool::new(false),
             EngineProgress { on_band: &on_band, on_combine: &nop() },
-            io(MIN_BUDGET_BYTES),
+            io(MIN_BUDGET_BYTES * 2),
         )
         .unwrap();
         assert_eq!(
@@ -3013,5 +3073,136 @@ mod tests {
             Err(e) => panic!("expected a words-per-row refusal, got {e}"),
             Ok(_) => panic!("expected a words-per-row refusal, the run succeeded"),
         }
+    }
+
+    /// Perf tier 1 Task 1: with a budget that forces many bands, the loop's own
+    /// wall time must be less than read + combine (the two overlap), and the
+    /// output must equal the single-band run's bit for bit.
+    #[test]
+    fn band_prefetch_overlaps_read_and_combine_without_changing_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (64, 512);
+        let paths: Vec<_> = (0..6)
+            .map(|i| write(dir.path(), &format!("p{i}.fits"), w, h, move |x, y| (x * 3 + y * 7 + i * 11) as f32 * 0.01))
+            .collect();
+        let on_band = nop();
+        let run = |budget: usize| {
+            integrate_bias_like(
+                &paths,
+                IntegrationRecipe::median(Rejection::None),
+                &pool(),
+                dir.path(),
+                &AtomicBool::new(false),
+                EngineProgress { on_band: &on_band, on_combine: &nop() },
+                io(budget),
+            )
+            .unwrap()
+        };
+        let single = run(usize::MAX / 4);
+        // 2 rows of 6 f32 frames + headroom ≈ 2 * (6*64*4 + 8*64) B per band before halving.
+        let many = run(4 * (6 * w * 4 + 8 * w));
+        assert!(many.bands >= 64, "expected many bands, got {}", many.bands);
+        assert_eq!(single.data, many.data, "prefetch changed the output");
+        // Controller ruling on this task's brief: a wall-clock `elapsed <
+        // read_duration + combine_duration` assertion here is flaky — on a
+        // 64-band run of tiny (2-row) bands, per-band scoped-thread spawn
+        // overhead can swamp the microseconds of real read/combine work
+        // and swing the comparison either way run to run (measured on this
+        // machine: it failed under the OLD serial loop too, and it also
+        // failed under this task's correct, overlapping implementation —
+        // the margin is a few hundred microseconds either way, well inside
+        // this machine's scheduling noise). The actual
+        // overlap property — band N+1's read starts before band N's
+        // combine finishes — is pinned deterministically instead by
+        // `band_prefetch_starts_the_next_read_before_the_current_combine_finishes`
+        // below, via event ordering against a `FrameSource` double rather
+        // than a timer.
+    }
+
+    /// Perf tier 1 Task 1, deterministic companion to the pin above: band
+    /// N+1's read must START before band N's combine FINISHES. A
+    /// `FrameSource` double logs read start/end under its own mutex; the
+    /// combine closure sleeps a few ms (comfortably longer than the fake
+    /// read's own near-zero cost or any thread-spawn jitter) so the
+    /// ordering is decided by the overlap itself, not by scheduling luck.
+    /// Run against the PRE-task serial loop, this fails: the old code only
+    /// starts band N+1's read after band N's combine has already returned.
+    #[test]
+    fn band_prefetch_starts_the_next_read_before_the_current_combine_finishes() {
+        struct EventSource {
+            width: usize,
+            height: usize,
+            n: usize,
+            events: std::sync::Mutex<Vec<String>>,
+        }
+        impl EventSource {
+            fn note(&self, s: impl Into<String>) {
+                self.events.lock().unwrap().push(s.into());
+            }
+        }
+        impl FrameSource for EventSource {
+            fn width(&self) -> usize { self.width }
+            fn height(&self) -> usize { self.height }
+            fn frame_count(&self) -> usize { self.n }
+            fn plane_kinds(&self) -> Vec<PlaneKind> { vec![PlaneKind::F32Le; self.n] }
+            fn bytes_per_row(&self) -> usize { self.width * 4 * self.n }
+            fn band_rows_for_budget(&self, budget_bytes: usize) -> usize {
+                (budget_bytes / (self.width * 4 * self.n).max(1)).max(1)
+            }
+            fn read_band_with_progress(
+                &self,
+                y0: usize,
+                rows: usize,
+                out: &mut BandPlanes,
+                _concurrency: usize,
+                on_bytes: &(dyn Fn(u64) + Sync),
+                _cancel: &AtomicBool,
+            ) -> Result<(), IntegrationError> {
+                self.note(format!("read start {y0}"));
+                out.set_rows(rows);
+                on_bytes((rows * self.width * 4 * self.n) as u64);
+                self.note(format!("read end {y0}"));
+                Ok(())
+            }
+        }
+
+        let (w, h) = (8usize, 8usize);
+        let src = EventSource { width: w, height: h, n: 2, events: std::sync::Mutex::new(Vec::new()) };
+        // per-row cost = w*4*n = 64; `band_loop` halves the budget it sizes
+        // bands against, so 256/2 = 128 -> band_rows = 2, giving 4 bands
+        // (y0 = 0, 2, 4, 6) — enough for a middle band to prefetch while
+        // its predecessor combines.
+        let policy = IoPolicy { band_budget_bytes: 256, read_concurrency: 1, storage: StorageClass::Local };
+        let mut out = vec![0f32; w * h];
+        let combine = |job: BandJob<'_>, tick: &(dyn Fn() + Sync)| -> Result<(), IntegrationError> {
+            src.note(format!("combine start {}", job.y0));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for v in job.out_band.iter_mut() {
+                *v = 0.0;
+            }
+            tick();
+            src.note(format!("combine end {}", job.y0));
+            Ok(())
+        };
+        let stats = band_loop(
+            &src,
+            &pool(),
+            &AtomicBool::new(false),
+            &EngineProgress { on_band: &nop(), on_combine: &nop() },
+            policy,
+            &mut out,
+            &combine,
+        )
+        .unwrap();
+        assert!(stats.bands >= 3, "need at least 3 bands to exercise a middle overlap, got {}", stats.bands);
+        let events = src.events.into_inner().unwrap();
+        let pos = |needle: &str| events.iter().position(|e| e == needle).unwrap_or_else(|| panic!("missing event {needle:?} in {events:?}"));
+        let combine_end_0 = pos("combine end 0");
+        // Band index 1 starts at y0 = band_rows = 2.
+        let read_start_1 = pos("read start 2");
+        assert!(
+            read_start_1 < combine_end_0,
+            "band 1's read did not start before band 0's combine finished: {events:?}"
+        );
     }
 }
