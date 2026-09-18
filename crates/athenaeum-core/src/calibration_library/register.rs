@@ -13,7 +13,7 @@
 
 use crate::calibration::scan_integration::create_master_sets_from_frames;
 use crate::db::master_provenance::{self, MasterProvenance};
-use crate::fits_parser::parse_fits_with_header;
+use crate::fits_parser::{extract_xisf_header, parse_fits_with_header, parse_xisf};
 use crate::models::{File, FileFormat};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
@@ -104,8 +104,28 @@ pub fn register_master(
     // a missing/unparseable file or a header that doesn't actually carry a
     // Master IMAGETYP is caught before any DB write happens. file_id is
     // patched to the real value once the files row exists, below.
-    let (mut frame, header_text) = parse_fits_with_header(master_path, 0)
-        .with_context(|| format!("freshly written master failed to parse: {}", master_path.display()))?;
+    //
+    // The same parser pair the scanner uses for each container
+    // (scanner/mod.rs, the XISF branch), so a directly registered master and
+    // a scanned one go through identical parsing — the invariant
+    // `direct_registration_matches_scanner_ingestion_*` pins.
+    let is_xisf = master_path
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("xisf"))
+        .unwrap_or(false);
+    let (mut frame, header_text) = if is_xisf {
+        let frame = parse_xisf(master_path, 0).with_context(|| {
+            format!("freshly written master failed to parse: {}", master_path.display())
+        })?;
+        let header = extract_xisf_header(master_path).with_context(|| {
+            format!("freshly written master has no readable header: {}", master_path.display())
+        })?;
+        (frame, header)
+    } else {
+        parse_fits_with_header(master_path, 0).with_context(|| {
+            format!("freshly written master failed to parse: {}", master_path.display())
+        })?
+    };
 
     let is_master_type = frame.imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);
     if !is_master_type {
@@ -130,10 +150,7 @@ pub fn register_master(
         .and_then(|s| s.to_str())
         .unwrap_or("master.fits")
         .to_string();
-    let format = match master_path.extension().map(|e| e.to_string_lossy().to_lowercase()) {
-        Some(ext) if ext == "xisf" => FileFormat::XISF,
-        _ => FileFormat::FITS,
-    };
+    let format = if is_xisf { FileFormat::XISF } else { FileFormat::FITS };
     // member_hash reads calibration_set_frames/frames for the RAW set — read
     // before the transaction opens (no mutation involved), and before the
     // raw set's frames get relinked/superseded below.
@@ -231,7 +248,7 @@ pub fn register_master(
 mod tests {
     use super::*;
     use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
-    use crate::fits_writer::write_fits_f32;
+    use crate::fits_writer::{write_fits_f32, OutputFormat, XisfBounds};
     use rusqlite::Connection;
 
     /// Writes a parseable dark frame and registers it in files/frames like the
@@ -314,15 +331,31 @@ mod tests {
     /// Carries the Bayer geometry a consolidated master header now stamps
     /// (real phase + row order, not fabricated zeros) so the round-trip below
     /// pins that those cards survive write -> re-parse -> `frames` columns.
-    fn write_master(dir: &std::path::Path) -> std::path::PathBuf {
-        let p = dir.join("master_dark.fits");
+    /// `format` picks the container — a calibration master is raw ADU, so
+    /// `XisfBounds::Adu16` is the only bounds choice that makes sense here.
+    fn write_master_as(dir: &std::path::Path, format: OutputFormat) -> std::path::PathBuf {
+        let p = dir.join(format!("master_dark.{}", format.extension()));
         let cards = HeaderBuilder::new(FrameKind::MasterDark)
             .instrume("TestCam").exptime(300.0).gain(100).offset(50)
             .binning(1, 1).ccd_temp(-10.0)
             .bayer(Bayer::Rggb, 1, 0).roworder("BOTTOM-UP")
             .build().unwrap();
-        write_fits_f32(&p, 8, 8, 1, &vec![100.0; 64], &cards).unwrap();
+        crate::fits_writer::write_image_f32(
+            &p,
+            8,
+            8,
+            1,
+            &vec![100.0; 64],
+            &cards,
+            format,
+            XisfBounds::Adu16,
+        )
+        .unwrap();
         p
+    }
+
+    fn write_master(dir: &std::path::Path) -> std::path::PathBuf {
+        write_master_as(dir, OutputFormat::Fits)
     }
 
     #[test]
@@ -425,12 +458,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn direct_registration_matches_scanner_ingestion() {
-        // Spec §10 pinning test: register the SAME master file both ways and
-        // diff the rows column-by-column (ids/uuids/timestamps excluded).
+    /// Spec §10 pinning test, parameterized on container: register the SAME
+    /// master file both ways and diff the rows column-by-column (ids/uuids/
+    /// timestamps excluded). Run once for FITS and once for XISF so an XISF
+    /// master is pinned to go through identical parsing/DB rows as a scanned
+    /// one, not just a FITS one.
+    fn parity_for(format: OutputFormat) {
         let dir = tempfile::tempdir().unwrap();
-        let master = write_master(dir.path());
+        let master = write_master_as(dir.path(), format);
 
         // Path A: direct registration (fresh DB + fresh source set).
         let conn_a = Connection::open_in_memory().unwrap();
@@ -438,9 +473,12 @@ mod tests {
         let reg = register_master(&conn_a, raw_a, &master, "{}").unwrap();
 
         // Path B: scanner ingestion (fresh DB, scan the directory containing
-        // ONLY the master file — copy it to an isolated dir first).
+        // ONLY the master file — copy it to an isolated dir first). Same
+        // extension as path A, so the scanner takes the identical container
+        // branch (scanner/mod.rs's FITS/XISF split in `process_file`).
         let scan_dir = tempfile::tempdir().unwrap();
-        std::fs::copy(&master, scan_dir.path().join("master_dark.fits")).unwrap();
+        std::fs::copy(&master, scan_dir.path().join(format!("master_dark.{}", format.extension())))
+            .unwrap();
         let conn_b = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn_b).unwrap();
         conn_b.execute("INSERT INTO scan_roots (path) VALUES (?1)",
@@ -475,6 +513,33 @@ mod tests {
         let set_a = set_row(&conn_a, &format!("id = {}", reg.master_set_id));
         let set_b = set_row(&conn_b, "is_master_library = 1");
         assert_eq!(set_a, set_b, "direct-registration set row must equal scanner-ingested set row");
+
+        // The container itself must agree on both sides, and must be the
+        // one under test — this is what an XISF master registering through
+        // the FITS parser (the pre-Task-3 bug) would have gotten wrong.
+        let want_format = match format {
+            OutputFormat::Fits => "FITS",
+            OutputFormat::Xisf => "XISF",
+        };
+        let file_format = |conn: &Connection, file_id: i64| -> String {
+            conn.query_row("SELECT format FROM files WHERE id = ?1", [file_id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(file_format(&conn_a, reg.master_file_id), want_format);
+        let file_id_b: i64 = conn_b
+            .query_row("SELECT file_id FROM frames WHERE is_master = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(file_format(&conn_b, file_id_b), want_format);
+    }
+
+    #[test]
+    fn direct_registration_matches_scanner_ingestion_fits() {
+        parity_for(OutputFormat::Fits);
+    }
+
+    #[test]
+    fn direct_registration_matches_scanner_ingestion_xisf() {
+        parity_for(OutputFormat::Xisf);
     }
 
     #[test]

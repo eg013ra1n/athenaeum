@@ -898,6 +898,59 @@ mod tests {
         assert!(data.iter().all(|&v| v == expected), "got {}, want {expected}", data[0]);
     }
 
+    /// A calibration master's samples are raw ADU (`XisfBounds::Adu16`), the
+    /// same domain a FITS master's are. The SAME dark written in both
+    /// containers must calibrate a light identically — this is the test that
+    /// would have caught the dark being read back scaled by 65535x (or
+    /// divided by it) if the wrong bounds were ever wired to a master read.
+    #[test]
+    fn full_formula_matches_with_an_xisf_dark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 9usize);
+        let light = write_plane(dir.path(), "light.fits", w, h, 1100.0, &[]);
+        let flat = write_plane(dir.path(), "flat.fits", w, h, 2.0, &[fnrm_card(2.0)]);
+
+        // FITS dark — the same fixture full_formula_bdf uses.
+        let dark_fits = write_plane(dir.path(), "dark_fits.fits", w, h, 100.0, &[]);
+        let out_fits = dir.path().join("out_fits.fits");
+        let cfg_fits = inputs(
+            dir.path(), light.clone(), Some(dark_fits), None, Some(flat.clone()), true,
+            out_fits.clone(),
+        );
+        calibrate_light(&cfg_fits, &AtomicBool::new(false)).unwrap();
+        let (_, _, data_fits) = read_all(&out_fits, dir.path());
+
+        // The SAME dark value, written as an XISF master (raw ADU domain,
+        // XisfBounds::Adu16 — the bounds `register_master`'s written masters
+        // and `run_build`'s use).
+        let dark_xisf = dir.path().join("dark_xisf.xisf");
+        write_image_f32(
+            &dark_xisf,
+            w,
+            h,
+            1,
+            &vec![100.0f32; w * h],
+            &[],
+            OutputFormat::Xisf,
+            XisfBounds::Adu16,
+        )
+        .unwrap();
+        let out_xisf = dir.path().join("out_xisf.fits");
+        let cfg_xisf =
+            inputs(dir.path(), light, Some(dark_xisf), None, Some(flat), true, out_xisf.clone());
+        calibrate_light(&cfg_xisf, &AtomicBool::new(false)).unwrap();
+        let (_, _, data_xisf) = read_all(&out_xisf, dir.path());
+
+        assert_eq!(data_fits.len(), data_xisf.len());
+        for (a, b) in data_fits.iter().zip(&data_xisf) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "FITS-dark output {a} vs XISF-dark output {b} diverge by more than 1e-3 — \
+                 an XISF master must calibrate identically to its FITS twin"
+            );
+        }
+    }
+
     #[test]
     fn bias_fallback_bf() {
         let dir = tempfile::tempdir().unwrap();
