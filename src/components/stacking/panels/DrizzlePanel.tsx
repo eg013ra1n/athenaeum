@@ -1,10 +1,16 @@
 // Stage 8 (Drizzle) inspector panel (M3 Task 6 — live). Mirrors
 // `NormalizePanel.tsx`'s editing pattern: `patch` merges a partial
 // `DrizzleConfig` into `config.drizzle` and calls `onChange` with the whole
-// new `StackingConfig`. The stage's own on/off toggle lives on the
-// `PipelineBoard` row (`onToggleDrizzle`, wired through `StackingTab`) —
-// this panel edits the settings drizzle would run WITH, whether or not the
-// stage is currently enabled, same as every other panel here.
+// new `StackingConfig`. Per-set (`mode === 'perSet'`, the default), the
+// stage's own on/off toggle lives on the `PipelineBoard` row
+// (`onToggleDrizzle`, wired through `StackingTab`) — this panel edits the
+// settings drizzle would run WITH, whether or not the stage is currently
+// enabled, same as every other panel here. In `mode === 'global'`
+// (`StackingSection`, Settings → Stacking) there is no board row to hold
+// that toggle, so this panel renders its own "Enable drizzle by default"
+// checkbox at the top, bound to `config.drizzle.enabled` through the same
+// `patch` every other field here uses — otherwise a new frame set could
+// only ever start with drizzle on via the Maximum-quality preset.
 
 import { NumericField } from '../NumericField';
 import { drizzleEstimate, kernelLabel } from '../stageSummary';
@@ -23,9 +29,12 @@ export interface DrizzlePanelProps {
    *  plan against) — the estimate line degrades to a "no plan" line rather
    *  than reading `plan.groups` at all. */
   plan: StackingPlan | null;
+  /** `'global'` is `StackingSection`'s usage (Settings → Stacking) — see the
+   *  header comment. Defaults to `'perSet'`, unchanged behavior. */
+  mode?: 'perSet' | 'global';
 }
 
-export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: DrizzlePanelProps) {
+export function DrizzlePanel({ config, onChange, disabled, defaults, plan, mode = 'perSet' }: DrizzlePanelProps) {
   const d = config.drizzle;
   const lnOn = config.normalization.local.enabled;
 
@@ -41,6 +50,24 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan }: Dri
 
   return (
     <div className="space-y-3">
+      {mode === 'global' && (
+        <div className="pb-1 border-b border-border/60">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={d.enabled}
+              disabled={disabled}
+              onChange={(e) => patch({ enabled: e.target.checked })}
+              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+            />
+            <span className="text-sm text-content-secondary">Enable drizzle by default</span>
+          </label>
+          <p className="mt-1 ml-6 text-[11px] text-content-muted">
+            New frame sets start with drizzle on. Each set's Stacking tab can still turn it off.
+          </p>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="block text-xs text-content-secondary mb-1">Scale</label>

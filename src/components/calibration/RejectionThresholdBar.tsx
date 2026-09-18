@@ -24,7 +24,7 @@ export interface ThresholdFieldDef {
 
 export const THRESHOLD_FIELDS: ThresholdFieldDef[] = [
   { key: 'fwhm', label: 'FWHM (px) >', placeholder: 'px', step: 0.1, min: 0 },
-  { key: 'eccentricity', label: 'Ecc >', placeholder: '0.8', step: 0.01, min: 0, max: 1 },
+  { key: 'eccentricity', label: 'Ecc >', placeholder: '0.7', step: 0.01, min: 0, max: 1 },
   { key: 'frame_snr', label: 'Frame SNR (dB) <', placeholder: 'dB', step: 0.5, min: 0 },
   { key: 'snr_weight', label: 'SNR Wt <', placeholder: 'wt', step: 0.1, min: 0 },
 ];

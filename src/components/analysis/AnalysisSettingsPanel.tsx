@@ -109,7 +109,17 @@ export function AnalysisSettingsPanel() {
     try {
       setError(null);
       const result = await api.invoke<AnalysisConfig>('reset_analysis_config');
-      setConfig(result);
+      // `reset_analysis_config` persists and returns `AnalysisConfig::default()`,
+      // whose `batch_concurrency` is the computed core count, not 0 — the
+      // "Auto" checkbox here reads `batch_concurrency === 0`, and the backend
+      // already treats 0 as "auto, compute at run time" (`api/analysis.rs`).
+      // Show and persist 0 so Reset leaves Auto ticked instead of showing a
+      // manual value with nothing to explain it.
+      const withAuto: AnalysisConfig = { ...result, batch_concurrency: 0 };
+      setConfig(withAuto);
+      if (result.batch_concurrency !== 0) {
+        await api.invoke('set_analysis_config', { config: withAuto });
+      }
       setRejectionDefaults(EMPTY_THRESHOLDS);
       setFwhmUnit('px');
       await api.invoke('delete_setting', { key: 'analysis.rejection_defaults' });
@@ -232,7 +242,7 @@ export function AnalysisSettingsPanel() {
               min="0" max="10" step="1"
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
-            <p className="text-xs text-content-muted mt-1">MRS wavelet noise estimation layers. Higher = more accurate noise on nebula-rich fields. Default: 4 (0-10).</p>
+            <p className="text-xs text-content-muted mt-1">MRS wavelet noise estimation layers. Higher = more accurate noise on nebula-rich fields. Default: 0 (off, 0-10).</p>
           </div>
         </div>
       </div>
@@ -383,6 +393,23 @@ export function AnalysisSettingsPanel() {
               </div>
             );
           })}
+          {/* `trail` is a checkbox on the Analysis tab's own threshold bar
+           *  (`RejectionThresholdBar`'s hard-coded "Trailed" control) rather
+           *  than a `THRESHOLD_FIELDS` entry — matched here so its default can
+           *  actually be set from Settings (it was already persisted by
+           *  `handleSave` below, just never editable). */}
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Trailed</label>
+            <label className="flex items-center h-[38px] gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={rejectionDefaults.trail === 'true'}
+                onChange={e => setRejectionDefaults(prev => ({ ...prev, trail: e.target.checked ? 'true' : '' }))}
+                className="rounded border-border text-accent focus:ring-accent"
+              />
+              <span className="text-sm text-content">Reject trailed frames</span>
+            </label>
+          </div>
         </div>
         {(['fwhm', 'eccentricity', 'frame_snr', 'snr_weight', 'trail'] as const).some(k => rejectionDefaults[k] !== '') && (
           <button

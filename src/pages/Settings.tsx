@@ -760,7 +760,8 @@ export default function Settings() {
         <div className="bg-surface-elevated rounded-lg p-6">
           <h3 className="text-xl font-semibold mb-4">Star Analysis Configuration</h3>
           <p className="text-content-muted mb-6">
-            Configure star detection parameters and quality scoring weights for the Lights Analysis tab.
+            Configure star detection, PSF fitting and batch processing for the Lights Analysis tab, plus the
+            default rejection thresholds its threshold bar starts from.
             Changes here affect new analyses — existing results keep their original settings until re-analyzed.
           </p>
           <AnalysisSettingsPanel />
