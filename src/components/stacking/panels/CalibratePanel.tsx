@@ -4,6 +4,7 @@
 // exposes for the same underlying `CalibratedLightOptions` — same labels,
 // reused verbatim so the two surfaces never disagree.
 
+import { Checkbox } from '../../settings/Checkbox';
 import type { StackingConfig, StackingPlan } from '../../../types/stacking';
 
 export interface CalibratePanelProps {
@@ -49,16 +50,12 @@ export function CalibratePanel({ config, onChange, plan, disabled }: CalibratePa
 
       <div className="pt-3 border-t border-border/60 space-y-3">
         <div>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={cal.flatNorm}
-              disabled={disabled}
-              onChange={(e) => patchCalibration({ flatNorm: e.target.checked })}
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-            />
-            <span className="text-sm text-content-secondary">Normalize master flat (recommended)</span>
-          </label>
+          <Checkbox
+            checked={cal.flatNorm}
+            onChange={(checked) => patchCalibration({ flatNorm: checked })}
+            disabled={disabled}
+            label="Normalize master flat (recommended)"
+          />
 
           {cal.flatNorm && (
             <div className="mt-2 ml-6 space-y-1.5">
@@ -88,27 +85,19 @@ export function CalibratePanel({ config, onChange, plan, disabled }: CalibratePa
           )}
         </div>
 
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={cal.hotPixelCorrection}
-            disabled={disabled}
-            onChange={(e) => patchCalibration({ hotPixelCorrection: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Hot-pixel correction</span>
-        </label>
+        <Checkbox
+          checked={cal.hotPixelCorrection}
+          onChange={(checked) => patchCalibration({ hotPixelCorrection: checked })}
+          disabled={disabled}
+          label="Hot-pixel correction"
+        />
 
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={cal.debayerOsc}
-            disabled={disabled}
-            onChange={(e) => patchCalibration({ debayerOsc: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Debayer OSC lights (VNG)</span>
-        </label>
+        <Checkbox
+          checked={cal.debayerOsc}
+          onChange={(checked) => patchCalibration({ debayerOsc: checked })}
+          disabled={disabled}
+          label="Debayer OSC lights (VNG)"
+        />
 
         <p className="text-[11px] text-content-muted">
           Intermediate calibrated frames in the working folder are always FITS. The export and send

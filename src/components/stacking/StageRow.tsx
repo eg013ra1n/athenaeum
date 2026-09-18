@@ -2,6 +2,7 @@ import { Circle, CircleDot, CheckCircle2, XCircle, MinusCircle, AlertCircle } fr
 import type { BoardStage, RowState } from './stageSummary';
 import type { RunProgress } from '../../hooks/useStackingRuns';
 import { formatBytes } from './formatBytes';
+import { Checkbox } from '../settings/Checkbox';
 
 /** What a running row says beside its bar (v0.6.3). Every stage now ticks
  *  in its natural unit — Masters per build, Calibrate/Measure/Register/
@@ -96,12 +97,14 @@ function StateGlyph({ state }: { state: RowState }) {
 /** One row of the pipeline board (`PipelineBoard.tsx`). Presentational only —
  *  all state derives from `stageSummary.ts`'s pure `stageSummary`/`rowState`.
  *
- *  Markup note (fix round 1, Important #3): the optional toggle is a real
- *  `<label><input type="checkbox">` pair, which is invalid HTML nested
- *  inside a `<button>` (Firefox/Safari suppress the control). The row is a
- *  plain `<div>`; the row-select action is its own `<button>` covering only
- *  the glyph/index/label/summary — the toggle and the state chip are
- *  siblings outside it, not descendants. */
+ *  Markup note (fix round 1, Important #3): the optional toggle renders its
+ *  checkbox through `Checkbox` (Settings redesign, spec §4 — the one
+ *  checkbox in the codebase), which itself wraps the `<input>` in its own
+ *  `<label>`. That pair must not sit inside a `<button>` (Firefox/Safari
+ *  suppress the control), so the row is a plain `<div>`; the row-select
+ *  action is its own `<button>` covering only the glyph/index/label/summary
+ *  — the toggle and the state chip are siblings outside it, not
+ *  descendants. */
 export function StageRow({ index, stage, label, state, summary, progress, selected, onSelect, toggle }: StageRowProps) {
   return (
     <div
@@ -139,20 +142,14 @@ export function StageRow({ index, stage, label, state, summary, progress, select
       </button>
 
       {toggle && (
-        <label
+        <div
           className="flex items-center gap-1.5 text-xs text-content-muted shrink-0"
           title={toggle.note}
         >
           {toggle.label && <span>{toggle.label}</span>}
-          <input
-            type="checkbox"
-            checked={toggle.checked}
-            disabled={toggle.disabled}
-            onChange={(e) => toggle.onChange(e.target.checked)}
-            className="w-3.5 h-3.5 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
+          <Checkbox checked={toggle.checked} onChange={toggle.onChange} disabled={toggle.disabled} size="sm" />
           {toggle.note && <span className="italic">{toggle.note}</span>}
-        </label>
+        </div>
       )}
 
       <span className={`w-16 shrink-0 text-right text-xs font-medium ${STATE_CLASSES[state]}`}>

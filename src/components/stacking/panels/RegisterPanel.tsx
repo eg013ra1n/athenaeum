@@ -8,6 +8,7 @@ import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { NumericField } from '../NumericField';
 import { ParamPair } from '../ParamPair';
+import { Checkbox } from '../../settings/Checkbox';
 import { distortionLabel, interpolationLabel, modelLabel } from '../stageSummary';
 import type {
   DistortionChoice,
@@ -146,28 +147,15 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
       )}
 
       {/* M4c (ruling R-M4c-7): the loop refits the distortion, so with
-       *  none selected there is nothing for it to do. */}
-      <label
-        className={`flex items-center gap-2 ${
-          r.distortion === 'off' ? 'cursor-default' : 'cursor-pointer'
-        }`}
-      >
-        <input
-          type="checkbox"
-          checked={r.localDistortion}
-          disabled={disabled || r.distortion === 'off'}
-          onChange={(e) => patch({ localDistortion: e.target.checked })}
-          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-        />
-        <span
-          className={`text-sm ${
-            r.distortion === 'off' ? 'text-content-muted' : 'text-content-secondary'
-          }`}
-        >
-          Local distortion loop
-          {r.distortion === 'off' ? ' (needs a distortion model)' : ''}
-        </span>
-      </label>
+       *  none selected there is nothing for it to do — `disabled` (via
+       *  `Checkbox`'s own opacity-50/cursor-not-allowed styling) covers the
+       *  same "inert" affordance the old custom cursor/text classes did. */}
+      <Checkbox
+        checked={r.localDistortion}
+        onChange={(checked) => patch({ localDistortion: checked })}
+        disabled={disabled || r.distortion === 'off'}
+        label={`Local distortion loop${r.distortion === 'off' ? ' (needs a distortion model)' : ''}`}
+      />
 
       <div>
         <label className="block text-xs text-content-secondary mb-1">Interpolation</label>
@@ -237,27 +225,19 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
         help={`default ${defaults.registration.maxRmsPx}`}
       />
 
-      <label className="flex items-center gap-2 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={r.failOnMaxRms}
-          disabled={disabled}
-          onChange={(e) => patch({ failOnMaxRms: e.target.checked })}
-          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-        />
-        <span className="text-sm text-content-secondary">Fail the frame when max RMS is exceeded</span>
-      </label>
+      <Checkbox
+        checked={r.failOnMaxRms}
+        onChange={(checked) => patch({ failOnMaxRms: checked })}
+        disabled={disabled}
+        label="Fail the frame when max RMS is exceeded"
+      />
 
-      <label className="flex items-center gap-2 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={r.writeRegisteredFrames}
-          disabled={disabled}
-          onChange={(e) => patch({ writeRegisteredFrames: e.target.checked })}
-          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-        />
-        <span className="text-sm text-content-secondary">Write registered frames</span>
-      </label>
+      <Checkbox
+        checked={r.writeRegisteredFrames}
+        onChange={(checked) => patch({ writeRegisteredFrames: checked })}
+        disabled={disabled}
+        label="Write registered frames"
+      />
 
       <div className="pt-2 border-t border-border/60">
         <button

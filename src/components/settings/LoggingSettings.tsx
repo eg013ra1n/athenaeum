@@ -1,17 +1,20 @@
-import { useEffect, useState } from 'react';
-import { AlertTriangle, Save } from 'lucide-react';
-import { api } from '../../api';
-import { useNotifications } from '../../contexts/NotificationContext';
-import type { LoggingConfig, LoggingConfigResponse } from '../../types/models';
+// Settings redesign (spec 2026-09-18 §8): the base level and every module
+// row render through one `LevelSelect` each — no more five copies of the
+// same `<select>` markup — and the document autosaves through
+// `useAutosaveDocument`, so there is no Save button and no success toast
+// (the hook notifies on failure only). `general.logging`'s registry
+// description already states the `ATHENAEUM_LOG` override rule once; this
+// component only renders the LIVE banner when the override is actually
+// active right now (`envOverrideActive`, captured from the same
+// `get_logging_config` response the document's `load` reads).
 
-/** Levels selectable from the UI. `trace` is intentionally excluded — it is
- *  env-only (`ATHENAEUM_LOG`) so users can't accidentally melt their disk. */
-const LEVELS: Array<{ value: string; label: string }> = [
-  { value: 'error', label: 'Error' },
-  { value: 'warn', label: 'Warn' },
-  { value: 'info', label: 'Info' },
-  { value: 'debug', label: 'Debug' },
-];
+import { api } from '../../api';
+import { useAutosaveDocument } from '../../hooks/useAutosaveDocument';
+import { useSettingsDefaults } from '../../settings/SettingsDefaultsContext';
+import { LevelSelect, LEVEL_INHERIT } from './LevelSelect';
+import type { LoggingConfig, LoggingConfigResponse } from '../../types/models';
+import { AlertTriangle } from 'lucide-react';
+import { useState } from 'react';
 
 /** UI module keys — must match `MODULE_TARGETS` in
  *  `athenaeum-core/src/logging/config.rs`. */
@@ -27,102 +30,48 @@ const MODULES: Array<{ key: string; label: string; hint?: string }> = [
   },
 ];
 
-/** Sentinel select value meaning "key absent from `modules`" — falls back to
- *  the base level. */
-const INHERIT = 'inherit';
+/** A module row's current selection — its own override, or `LEVEL_INHERIT`
+ *  when the key is absent (falls back to the base level). */
+function toModuleValue(modules: LoggingConfig['modules'], key: string): string {
+  return modules[key] ?? LEVEL_INHERIT;
+}
+
+/** Writes a module row's selection back into `modules` — `LEVEL_INHERIT`
+ *  deletes the key (absent means inherit), any real level sets it. */
+function fromModuleValue(modules: LoggingConfig['modules'], key: string, value: string): LoggingConfig['modules'] {
+  const next = { ...modules };
+  if (value === LEVEL_INHERIT) {
+    delete next[key];
+  } else {
+    next[key] = value;
+  }
+  return next;
+}
 
 export default function LoggingSettings() {
-  const { notify } = useNotifications();
-
-  const [level, setLevel] = useState('info');
-  // Partial, not Record: LoggingConfig.modules is a HashMap-backed optional-
-  // index map on the generated type ({ [key in string]?: string }).
-  // Tracks the generated contract by reference rather than restating its shape:
-  // ts-rs 12 emits `modules` as an index signature (`{ [key in string]: string }`),
-  // where ts-rs 10 emitted the optional form. Keys are still genuinely absent at
-  // runtime for inherited modules, so the `?? INHERIT` read below stays load-bearing
-  // even though the index signature types the lookup as always-present.
-  const [modules, setModules] = useState<LoggingConfig['modules']>({});
+  const { defaults } = useSettingsDefaults();
   const [envOverrideActive, setEnvOverrideActive] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        setLoading(true);
-        setLoadError(null);
-        const resp = await api.invoke<LoggingConfigResponse>('get_logging_config');
-        if (cancelled) return;
-        setLevel(resp.config.level);
-        setModules(resp.config.modules ?? {});
-        setEnvOverrideActive(resp.envOverrideActive);
-      } catch (err) {
-        if (cancelled) return;
-        setLoadError(String(err));
-        console.error('Failed to load logging config:', err);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const { doc, patch, error } = useAutosaveDocument<LoggingConfig>({
+    load: async () => {
+      const resp = await api.invoke<LoggingConfigResponse>('get_logging_config');
+      setEnvOverrideActive(resp.envOverrideActive);
+      return resp.config;
+    },
+    save: (config) => api.invoke('set_logging_config', { config }),
+    defaults: defaults?.logging ?? null,
+    label: 'Logging settings',
+  });
 
-  const handleModuleChange = (key: string, value: string) => {
-    setModules((prev) => {
-      const next = { ...prev };
-      if (value === INHERIT) {
-        delete next[key];
-      } else {
-        next[key] = value;
-      }
-      return next;
-    });
-  };
-
-  const handleSave = async () => {
-    try {
-      setSaving(true);
-      const config: LoggingConfig = { level, modules };
-      await api.invoke('set_logging_config', { config });
-
-      const overrideCount = Object.keys(modules).length;
-      notify({
-        title: 'Logging settings saved',
-        detail: envOverrideActive
-          ? 'Saved, but ATHENAEUM_LOG on this server overrides the active level.'
-          : `Base level set to "${level}"${overrideCount ? ` with ${overrideCount} module override${overrideCount === 1 ? '' : 's'}` : ''}.`,
-        kind: 'generic',
-        tone: 'success',
-      });
-    } catch (err) {
-      console.error('Failed to save logging config:', err);
-      notify({
-        title: 'Failed to save logging settings',
-        detail: err instanceof Error ? err.message : String(err),
-        kind: 'generic',
-        tone: 'warning',
-        hasErrors: true,
-      });
-    } finally {
-      setSaving(false);
+  if (doc === null) {
+    if (error) {
+      return (
+        <div className="p-4 bg-error-muted border border-error/50 rounded-lg">
+          <p className="text-sm text-error">Failed to load logging settings: {error}</p>
+        </div>
+      );
     }
-  };
-
-  if (loading) {
     return <div className="text-sm text-content-muted">Loading logging settings…</div>;
-  }
-
-  if (loadError) {
-    return (
-      <div className="p-4 bg-error-muted border border-error/50 rounded-lg">
-        <p className="text-sm text-error">Failed to load logging settings: {loadError}</p>
-      </div>
-    );
   }
 
   return (
@@ -136,60 +85,30 @@ export default function LoggingSettings() {
         </div>
       )}
 
-      <div>
-        <label className="block text-sm font-medium text-content-secondary mb-2">
-          Base log level
-        </label>
-        <select
-          value={level}
-          onChange={(e) => setLevel(e.target.value)}
-          className="w-full sm:w-64 bg-surface-hover border border-border rounded-lg px-3 py-2 text-content focus:outline-none focus:border-accent"
-        >
-          {LEVELS.map((l) => (
-            <option key={l.value} value={l.value}>
-              {l.label}
-            </option>
-          ))}
-        </select>
-        <p className="text-xs text-content-muted mt-2">
-          Applies everywhere unless overridden per module below. Higher verbosity (Debug) writes
-          more to the JSONL log file in the folder above.
-        </p>
-      </div>
+      <LevelSelect
+        label="Base log level"
+        value={doc.level}
+        onChange={(level) => patch({ level })}
+        className="w-full sm:w-64"
+      />
 
       <div>
         <h4 className="text-sm font-medium text-content-secondary mb-2">Module overrides</h4>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {MODULES.map((m) => (
             <div key={m.key}>
-              <label className="block text-xs text-content-muted mb-1">{m.label}</label>
-              <select
-                value={modules[m.key] ?? INHERIT}
-                onChange={(e) => handleModuleChange(m.key, e.target.value)}
-                className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-              >
-                <option value={INHERIT}>Inherit ({level})</option>
-                {LEVELS.map((l) => (
-                  <option key={l.value} value={l.value}>
-                    {l.label}
-                  </option>
-                ))}
-              </select>
+              <LevelSelect
+                label={m.label}
+                value={toModuleValue(doc.modules, m.key)}
+                onChange={(value) =>
+                  patch((prev) => ({ ...prev, modules: fromModuleValue(prev.modules, m.key, value) }))
+                }
+                inherit={{ base: doc.level }}
+              />
               {m.hint && <p className="text-xs text-content-muted mt-1">{m.hint}</p>}
             </div>
           ))}
         </div>
-      </div>
-
-      <div className="pt-2">
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="flex items-center gap-2 px-6 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-surface rounded-lg transition-colors"
-        >
-          <Save size={18} />
-          {saving ? 'Saving...' : 'Save Logging Settings'}
-        </button>
       </div>
     </div>
   );

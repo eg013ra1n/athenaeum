@@ -13,6 +13,7 @@
 // only ever start with drizzle on via the Maximum-quality preset.
 
 import { NumericField } from '../NumericField';
+import { Checkbox } from '../../settings/Checkbox';
 import { drizzleEstimate, kernelLabel } from '../stageSummary';
 import { formatBytes } from '../formatBytes';
 import type { DrizzleKernel, StackingConfig, StackingPlan } from '../../../types/stacking';
@@ -52,16 +53,12 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan, mode 
     <div className="space-y-3">
       {mode === 'global' && (
         <div className="pb-1 border-b border-border/60">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={d.enabled}
-              disabled={disabled}
-              onChange={(e) => patch({ enabled: e.target.checked })}
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-            />
-            <span className="text-sm text-content-secondary">Enable drizzle by default</span>
-          </label>
+          <Checkbox
+            checked={d.enabled}
+            onChange={(checked) => patch({ enabled: checked })}
+            disabled={disabled}
+            label="Enable drizzle by default"
+          />
           <p className="mt-1 ml-6 text-[11px] text-content-muted">
             New frame sets start with drizzle on. Each set's Stacking tab can still turn it off.
           </p>
@@ -121,18 +118,12 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan, mode 
        *  is no plan to ask about OSC groups — the note carries the "OSC
        *  only" part, and a mono group ignores the flag silently. */}
       <div className="pt-1">
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={d.bayer}
-            disabled={disabled}
-            onChange={(e) => patch({ bayer: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">
-            Bayer drizzle (deposit each colour's own samples, OSC only)
-          </span>
-        </label>
+        <Checkbox
+          checked={d.bayer}
+          onChange={(checked) => patch({ bayer: checked })}
+          disabled={disabled}
+          label="Bayer drizzle (deposit each colour's own samples, OSC only)"
+        />
         <p className="mt-1 ml-6 text-[11px] text-content-muted">
           R and B cover a quarter of the pixels each — use drop shrink ≥ 0.9 or more frames.
           {noOscGroup ? ' This set has no OSC group, so it changes nothing.' : ''}
@@ -150,39 +141,27 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan, mode 
       </div>
 
       <div className="space-y-1.5 pt-1">
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={d.useRejection}
-            disabled={disabled}
-            onChange={(e) => patch({ useRejection: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Use rejection</span>
-        </label>
+        <Checkbox
+          checked={d.useRejection}
+          onChange={(checked) => patch({ useRejection: checked })}
+          disabled={disabled}
+          label="Use rejection"
+        />
 
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={d.useWeights}
-            disabled={disabled}
-            onChange={(e) => patch({ useWeights: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Use weights</span>
-        </label>
+        <Checkbox
+          checked={d.useWeights}
+          onChange={(checked) => patch({ useWeights: checked })}
+          disabled={disabled}
+          label="Use weights"
+        />
 
         <div>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={d.useLocalNormalization}
-              disabled={disabled || !lnOn}
-              onChange={(e) => patch({ useLocalNormalization: e.target.checked })}
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-            />
-            <span className="text-sm text-content-secondary">Use local normalization</span>
-          </label>
+          <Checkbox
+            checked={d.useLocalNormalization}
+            onChange={(checked) => patch({ useLocalNormalization: checked })}
+            disabled={disabled || !lnOn}
+            label="Use local normalization"
+          />
           {/* B8 (M3 final fix wave, M5 ruling): the toggle is kept as stored
            *  (never forced off) when LN itself is off for this set — the
            *  driver already falls back to each frame's own global
@@ -196,16 +175,12 @@ export function DrizzlePanel({ config, onChange, disabled, defaults, plan, mode 
           )}
         </div>
 
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={d.writeWeightMap}
-            disabled={disabled}
-            onChange={(e) => patch({ writeWeightMap: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Write weight map</span>
-        </label>
+        <Checkbox
+          checked={d.writeWeightMap}
+          onChange={(checked) => patch({ writeWeightMap: checked })}
+          disabled={disabled}
+          label="Write weight map"
+        />
 
         <p className="text-[11px] text-content-muted">
           defaults: {defaults.drizzle.scale}×, drop {defaults.drizzle.dropShrink.toFixed(2)},{' '}

@@ -5,6 +5,7 @@
 
 import { useNavigate } from 'react-router-dom';
 import { CheckCircle2, XCircle } from 'lucide-react';
+import { Checkbox } from '../../settings/Checkbox';
 import type { ReferenceMode, StackingConfig, StackingPlan } from '../../../types/stacking';
 
 export interface ReferencePanelProps {
@@ -54,24 +55,18 @@ export function ReferencePanel({ config, onChange, plan, disabled }: ReferencePa
 
         {/* Ruling R-M4a-5: the two-pass pick applies to Auto only — a manual
          *  pin never moves — so in Manual mode the checkbox stays visible
-         *  (the stored value is never hidden) but inert. */}
-        <label
-          className={`flex items-start gap-2 pt-1 ${
-            disabled || mode === 'manual' ? 'cursor-not-allowed' : 'cursor-pointer'
-          }`}
-          title={mode === 'manual' ? 'A manually pinned reference is never re-picked' : undefined}
-        >
-          <input
-            type="checkbox"
+         *  (the stored value is never hidden) but inert (greyed via
+         *  `disabled`, same as every other conditionally-disabled control
+         *  here). */}
+        <div className="pt-1">
+          <Checkbox
             checked={config.reference.twoPass}
+            onChange={setTwoPass}
             disabled={disabled || mode === 'manual'}
-            onChange={(e) => setTwoPass(e.target.checked)}
-            className="w-4 h-4 mt-0.5 shrink-0 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
+            label="Two-pass pick (re-choose the reference closest to the set's median transform; costs one extra registration pass of the reference's group)"
+            description={mode === 'manual' ? 'A manually pinned reference is never re-picked.' : undefined}
           />
-          <span className={`text-sm ${mode === 'manual' ? 'text-content-muted' : 'text-content-secondary'}`}>
-            Two-pass pick (re-choose the reference closest to the set&rsquo;s median transform; costs one extra registration pass of the reference&rsquo;s group)
-          </span>
-        </label>
+        </div>
       </div>
 
       {mode === 'auto' ? (

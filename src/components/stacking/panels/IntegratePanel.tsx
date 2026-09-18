@@ -4,6 +4,7 @@
 
 import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
 import { ParamPair } from '../ParamPair';
+import { Checkbox } from '../../settings/Checkbox';
 import { combinationLabel } from '../stageSummary';
 import type { Combination, RejectionChoice, StackingConfig } from '../../../types/stacking';
 
@@ -294,34 +295,24 @@ export function IntegratePanel({ config, onChange, disabled, defaults }: Integra
         help={nullableDefaultHelp(defaults.integration.rangeHigh, 'reject raw ≥ this value once turned on')}
       />
 
-      <label className="flex items-center gap-2 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={i.writeRejectionMaps}
-          disabled={disabled}
-          onChange={(e) => patch({ writeRejectionMaps: e.target.checked })}
-          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-        />
-        <span className="text-sm text-content-secondary">Write rejection maps</span>
-      </label>
+      <Checkbox
+        checked={i.writeRejectionMaps}
+        onChange={(checked) => patch({ writeRejectionMaps: checked })}
+        disabled={disabled}
+        label="Write rejection maps"
+      />
 
       {/* Large-scale rejection (M4c): a second integration pass that treats
           the filtered, grown per-pixel rejection map as forced rejections,
           so a satellite trail is removed as one object instead of as the
           speckle the per-pixel tests leave of it. */}
       <div className="pt-2 border-t border-border">
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={i.largeScale.enabled}
-            disabled={disabled}
-            onChange={(e) =>
-              patch({ largeScale: { ...i.largeScale, enabled: e.target.checked } })
-            }
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Large-scale rejection</span>
-        </label>
+        <Checkbox
+          checked={i.largeScale.enabled}
+          onChange={(checked) => patch({ largeScale: { ...i.largeScale, enabled: checked } })}
+          disabled={disabled}
+          label="Large-scale rejection"
+        />
         <p className="mt-1 text-[11px] text-content-muted">
           Keeps only the large rejected structures — trails, aircraft — grows them, and
           re-integrates with those samples forced out. Doubles the integration time.

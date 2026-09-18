@@ -11,6 +11,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { ParamPair } from '../ParamPair';
+import { Checkbox } from '../../settings/Checkbox';
 import { outputNormLabel, psfModelLabel, rejectionNormLabel } from '../stageSummary';
 import type { OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig } from '../../../types/stacking';
 
@@ -129,16 +130,12 @@ export function NormalizePanel({ config, onChange, disabled, defaults }: Normali
       <div className="pt-3 border-t border-border/60 space-y-2">
         <h4 className="text-xs font-medium text-content-secondary">Local normalization</h4>
 
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={n.local.enabled}
-            disabled={disabled}
-            onChange={(e) => handleLocalEnabledChange(e.target.checked)}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Enable local normalization</span>
-        </label>
+        <Checkbox
+          checked={n.local.enabled}
+          onChange={handleLocalEnabledChange}
+          disabled={disabled}
+          label="Enable local normalization"
+        />
 
         {resetNotice && (
           <p className="text-xs text-warning">
@@ -184,16 +181,12 @@ export function NormalizePanel({ config, onChange, disabled, defaults }: Normali
             </div>
 
             <div>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={n.local.localScale}
-                  disabled={disabled}
-                  onChange={(e) => patchLocal({ localScale: e.target.checked })}
-                  className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-                />
-                <span className="text-sm text-content-secondary">Local scale</span>
-              </label>
+              <Checkbox
+                checked={n.local.localScale}
+                onChange={(checked) => patchLocal({ localScale: checked })}
+                disabled={disabled}
+                label="Local scale"
+              />
               <p className="mt-1 text-[11px] text-content-muted">
                 Model the flux scale as a smooth surface (matched-star flux ratios, thin-plate spline)
               </p>

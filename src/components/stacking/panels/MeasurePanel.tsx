@@ -4,6 +4,7 @@
 
 import { RefreshCw } from 'lucide-react';
 import { NullableNumericField, NumericField, nullableDefaultHelp } from '../NumericField';
+import { Checkbox } from '../../settings/Checkbox';
 import { psfModelLabel, seedDetectorLabel, weightModeLabel } from '../stageSummary';
 import type {
   PsfModel,
@@ -316,16 +317,12 @@ export function MeasurePanel({
           disabled={disabled}
           help={nullableDefaultHelp(defaults.selection.minStars, 'every frame passes regardless of star count')}
         />
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={sel.excludeOnRegistrationFailure}
-            disabled={disabled}
-            onChange={(e) => patchSelection({ excludeOnRegistrationFailure: e.target.checked })}
-            className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-          />
-          <span className="text-sm text-content-secondary">Exclude frames whose registration failed</span>
-        </label>
+        <Checkbox
+          checked={sel.excludeOnRegistrationFailure}
+          onChange={(checked) => patchSelection({ excludeOnRegistrationFailure: checked })}
+          disabled={disabled}
+          label="Exclude frames whose registration failed"
+        />
       </div>
 
       {onRemeasure && (
