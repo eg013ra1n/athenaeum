@@ -12,13 +12,14 @@ Sizes are rough: **XS** an hour, **S** a session, **M** a plan with a few tasks,
 ## Proposed order
 
 1. Quick wins that need no decision — items 5, 6, 2, 4.12, 4.6 (the drizzle
-   toggle), 4.10 (the copy and the six mismatches). One frontend session.
+   toggle), 4.10's Analysis copy fixes (the scoring itself stays as it is).
 2. Item 3 (nights re-derived on open) — small Rust change, one decision below.
 3. Item 1 (XISF masters) — Rust, needs the WBPP verification first.
 4. Item 4 as ONE settings redesign cycle with a spec: tab order, the Blink tab,
    autosave, the shared checkbox, search, per-field reset. Frontend-only.
-5. Item 4.11 (date warnings) as a calibration fix round — the signedness
-   decision gates it.
+5. Item 4.11 (date warnings): the owner read the trace on 2026-09-18 and saw
+   no problem with what is counted — no fix round; the two genuine defects
+   (bias never warns, a set's span never widens) stay listed for a later call.
 
 ## 1. Master calibration files as XISF
 
@@ -64,21 +65,60 @@ built masters are written in, FITS or XISF, "the way WBPP supports".
   `output_extension` + `write_output` (`stacking/master_cards.rs:427-472`),
   `OutputPanel.tsx:19-22`.
 
-**The question.** What exactly WBPP keys on to accept a file as a master — the
-`IMAGETYP` value, the `master` filename prefix, an XISF `imageType` attribute,
-or some combination — and whether it reads `bounds`. Verify against WBPP's own
-script source (it ships in PixInsight as JavaScript) before deciding the
-`imageType`/`bounds` stamping; the v0.6.2 XISF masters were refused by the
-external tool for a missing `bounds`, so this is not a detail to guess.
+**What WBPP actually requires — read from its own source, 2026-09-18**
+(`/Applications/PixInsight/src/scripts/BatchPreprocessing/BPP-Helper.js`,
+`BPP-StackEngine.js`, the version installed on the owner's Mac):
+
+- **The container is not optional.** `BPP-StackEngine.js:724-728` rejects any
+  master whose extension is not `.xisf`: *"master calibration files must be
+  in XISF format"*. A FITS master is refused outright, whatever its header
+  says — this is why the FITS masters Athenaeum writes today cannot feed WBPP.
+- **Master detection** (`BPP-Helper.js:639-641`, `:734-741`): `isMaster` is
+  true when the `IMAGETYP` value contains the substring `master`
+  (case-insensitive); optionally also when the file PATH contains `master`
+  (`isMasterFromPath`, behind the "detect master including full path"
+  option). Our `Master Dark` / `Master Flat` / `Master Bias` pass.
+- **Frame type from `IMAGETYP`** (`imageTypeFromKeyword`, `:605-636`):
+  lower-cased with only the FIRST space removed, then matched against
+  `masterbias` / `masterdark` / `masterflat` / `flatdark` / `darkflat` … So
+  `Master Dark Flat` becomes `masterdark flat` → `Unknown` → smart naming
+  from the path takes the LAST of BIAS/DARK/FLAT/LIGHT in the file name —
+  for `master_darkflat_…` that is **FLAT**, i.e. a master dark flat would be
+  ingested as a master flat. Must be prevented (next point).
+- **XISF properties override the keywords** (`:866-877`): after the FITS
+  keywords, WBPP calls `getXISFProperty("PCL:Image:Type",
+  info[0].imageType)` — that is the `<Image imageType="…">` attribute as
+  PixInsight's reader exposes it (`pjsr/ImageType.jsh`: `MasterBias = 5`,
+  `MasterDark = 6`, `MasterFlat = 7`) — and it sets BOTH `imageType` and
+  `isMaster`. So the attribute is the authoritative channel: write
+  `imageType="MasterBias" | "MasterDark" | "MasterFlat"`, and for a dark flat
+  `imageType="MasterDark"` (WBPP treats dark flats as darks matched by
+  exposure) while `IMAGETYP` keeps our own `'Master Dark Flat'` for the
+  scanner.
+- **Matching keys it reads from the keywords**: `EXPTIME`/`EXPOSURE` (a
+  master dark is matched at `MIN_EXPOSURE_TOLERANCE = 0.01` s,
+  `BPP-Global.js:89`), `XBINNING`/`BINNING`/`CCDBINX`, `FILTER`/`INSFLNAM`
+  (flats), `BAYERPAT`, `DATE-OBS`, `XPIXSZ`, `FOCALLEN`; group matching adds
+  the image SIZE. `build_master_cards` already stamps `IMAGETYP`, `INSTRUME`,
+  `EXPTIME`, `CCD-TEMP`, `XBINNING`, `FILTER`, `GAIN`/`OFFSET` (its tests pin
+  them), so the keyword side needs no new card.
+- **`bounds`**: mandatory for float samples (the v0.6.2 lesson). Chosen
+  convention for calibration masters: samples stay raw ADU and the writer
+  stamps `bounds="0:65535"` — rustafits' reader then returns `v/65535·65535
+  = v`, exactly the ADU the light-calibration engine expects, and the file
+  states its true range instead of pretending to be unit-scaled. Owner smoke
+  owed: open one such master in PixInsight and run WBPP with it — the one
+  check that proves the whole contract.
 
 **Proposal.** New setting `calibration.master_format` (`settings/mod.rs` beside
 `CALIBRATION_LIBRARY_DIR`, default `fits`), a `get/set` pair on both hosts, a
 select in Settings → Calibration beside "Master Build Memory". In core:
-`xisf_writer` takes `bounds` and grows the three master `imageType` arms;
-`paths.rs` takes the extension; `register.rs` dispatches the re-parse on
-extension. The `direct_registration_matches_scanner_ingestion` pin must be
-extended to the XISF case — it is the one test that proves the byte-identical
-registration invariant, and XISF is a new path through it. **M.**
+`xisf_writer` takes `bounds` and an explicit `imageType` (the four master arms,
+dark flat → `MasterDark`); `paths.rs` takes the extension; `register.rs`
+dispatches the re-parse on extension. The
+`direct_registration_matches_scanner_ingestion` pin must be extended to the
+XISF case — it is the one test that proves the byte-identical registration
+invariant, and XISF is a new path through it. **M.**
 
 ### 1b. Calibrated lights as XISF (the Stacking → Calibrate panel)
 
@@ -151,6 +191,16 @@ counts when it wrote). Keep the toolbar button one more release as an explicit
 "force", then drop it. Skip archived sets. **S.** Decision for the owner: silent
 on drift, or a one-line notification ("nights recalculated — 3 nights, 4
 sessions")?
+
+**Standing decision (owner, 2026-09-18): nights and the calendar are UTC.**
+Session detection is gap-only (no sunset/sunrise assumption — a "night" is a
+run of frames with no gap above the threshold), the night label reads its
+dates in UTC, and the Shoot Calendar keys a day on `DATE(start, '-12 hours')`
+in UTC. So a night's label and calendar day are the same for every
+participant of a collaboration whatever their zone, at the cost of an
+observer far from UTC seeing a date shifted by one for early-evening starts
+(east of about UTC+6) or a label naming the morning date (west of about
+UTC−6). Accepted; do not re-flag or add local-zone logic unasked.
 
 ## 4. Settings — one redesign cycle
 
@@ -263,27 +313,60 @@ each typed config's default document; the frontend renders a `↺` beside any
 field whose value differs from its default. A section reset stays as "reset
 every field here".
 
-### 4.10 Analysis: the "scoring weights" that do not exist, and six mismatches
+### 4.10 Calibration scoring parameters — do the sliders reach the score?
 
-`Settings.tsx:763` promises "quality scoring weights"; there are none. The
-analyzer writes `quality_score: None` (`analysis/analyzer.rs:106`), nothing
-computes it, no UI reads it; the Analysis tab's ranking is a pass/fail threshold
-chain in `LightsAnalysisView.tsx:445-488` and the auto FWHM cut is a hard-coded
-`median + 3·max(MAD, 0.1·median)`. The only real weighted scores are stacking's
-`FormulaWeights` (Settings → Stacking → Measure) and calibration's
-`ScoringConfig`. Fix the copy.
+**Owner's question.** Whether the Scoring Parameters in Settings → Calibration →
+Clustering Parameters & Thresholds (Temperature Match Weight, Temperature
+Sensitivity, Exposure Match Weight, Exposure Sensitivity) correlate with the
+scoring that actually runs.
 
-Mismatches found on the way, all **XS**:
+**Answer.** Mostly yes, with one path that ignores three of them:
 
-- `measure_cap` has two Rust defaults — `#[serde(default)]` 500 vs
-  `Default` 2000 (`analysis/config.rs:5/65`); the UI says 2000.
-- `mrs_layers` help text says "Default: 4"; the default is 0 (off).
-- "Auto" concurrency is `0` in the UI, but `AnalysisConfig::default()` stores
-  the computed core count, so Reset unticks Auto.
-- `analysis.rejection_defaults` persists five keys including `trail`, but
-  `THRESHOLD_FIELDS` renders four — the trail default can never be set.
-- `EMPTY_THRESHOLDS` hard-codes `eccentricity: '0.7'` while the placeholder
-  says 0.8.
+- `score_match` (`calibration/configurable_matcher.rs:728-761`) reads all four
+  exactly as the panel describes — `temp_score = 1/(1 + |Δ|/scale)` is 0.5 at
+  `Δ = sensitivity`, blended by the weight; same for exposure. It is called at
+  `:537` for every candidate the configurable matcher enumerates — light→dark,
+  flat→darkflat/dark/bias, dark→bias, and master flats — and the candidates are
+  sorted by that score (`:563-567`), so the top pick follows the sliders. The
+  date term is a hard-coded 30-day decay (`:738`); the panel copy is honest
+  about that ("these settings control how temperature and exposure time affect
+  the scoring").
+- **Raw flats do not go through it.** The light→flat auto path is the grouping
+  matcher (`flat_matcher.rs:186-236`), which has its own formula:
+  `date_score = 1 − age/max_age` (linear, against the group midpoint),
+  `temp_score = 1 − |Δ|/10` (a hard-coded 10 °C scale), and
+  `match = date·(1−w) + temp·w` with `w` = Temperature Match Weight only.
+  Temperature Sensitivity, Exposure Match Weight and Exposure Sensitivity have
+  **no effect** on which raw flat a light gets — the very slot most users tune.
+- **Max Age** ("only consider frames within this many days") gates only the raw
+  flat search window (`flat_matcher.rs:140-145`) and the on-demand dark/bias
+  creation (`hierarchy.rs:845-847`, `:936-938`). The configurable matcher's
+  candidate query (`configurable_matcher.rs:421-430`) has **no date predicate**,
+  so a two-year-old dark set is a full candidate for darks/bias/darkflats; only
+  the warning threshold marks it. Time Cluster and Temp Threshold are applied
+  where the legend says (set creation in `scan_integration.rs:142-166`, the
+  grouping paths).
+
+**Owner ruling 2026-09-18 — no change.** Max Age and the date thresholds are
+WARNINGS, not gates for auto-link; auto-link must keep working exactly as it
+does, and the raw-flat path keeps its own formula (a unification was started,
+stopped and reverted the same day). What stands is the trace above: the four
+sliders reach every link except the raw-flat pick, which honours Temperature
+Match Weight only. If that ever becomes a complaint, the fix is a
+`score_match` call in `flat_matcher.rs` — a behaviour change to auto-link,
+so it needs the owner's explicit call first.
+
+**Found on the way, Settings → Analysis** (all XS): the tab copy at
+`Settings.tsx:763` promises "quality scoring weights" that do not exist
+(nothing computes `quality_score`; the Analysis tab ranks by a pass/fail
+threshold chain in `LightsAnalysisView.tsx:445-488`) — the eleven detection /
+PSF-fit fields ARE consumed by `build_analyzer`, only the sentence is wrong;
+`measure_cap` has two Rust defaults (`#[serde(default)]` 500 vs `Default`
+2000, `analysis/config.rs:5/65`); `mrs_layers` help says "Default: 4" for a
+default of 0; "Auto" concurrency is `0` in the UI while `Default` stores the
+core count so Reset unticks it; `analysis.rejection_defaults` persists a
+`trail` key the four-field bar never renders; `EMPTY_THRESHOLDS` hard-codes
+`eccentricity: '0.7'` beside a placeholder saying 0.8.
 
 ### 4.11 Date warnings — what is actually counted
 
