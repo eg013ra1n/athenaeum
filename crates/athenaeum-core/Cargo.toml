@@ -57,7 +57,11 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
     "query",
 ] }
-tokio = { version = "1", features = ["sync", "time", "macros", "rt", "fs", "io-util"] }
+# "rt-multi-thread" is needed for `tokio::task::block_in_place` (used by
+# `api::account::status` to keep the bounded keychain probe's blocking FFI off
+# an async worker without starving the runtime) and for `RuntimeFlavor::MultiThread`,
+# which gates that call to hosts actually running a multi-thread runtime.
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread", "fs", "io-util"] }
 # Trait-object async methods for the transport-agnostic SharingTransport (sync
 # feature). Sanctioned mechanism per the Stage I sync plan; ungated so the
 # headless build (`--no-default-features`) includes the sharing module.

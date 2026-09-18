@@ -270,9 +270,29 @@ pub async fn sign_in_verify(
 }
 
 /// This device's account state — resolvable offline from the keychain + settings.
+///
+/// `build_status` reads the OS keychain, which is blocking FFI
+/// (`SecKeychainFindGenericPassword` / the Windows Credential Manager call)
+/// and — on an unsigned release binary with nobody at the keyboard to answer
+/// a permission prompt — can block for a long time; [`TokenStore::load`]'s
+/// bounded probe caps that at a few seconds, but even a few seconds spent
+/// directly on an async worker thread starves every other request the
+/// runtime is serving concurrently (this is what wedged the whole web server,
+/// docs/backlog-v0.6.5.md item 4b). `block_in_place` moves the call off the
+/// worker for the duration of the (now-bounded) blocking read, but it only
+/// works — and only needs to run — inside a multi-thread runtime; a
+/// current-thread runtime (e.g. some embeddings/tests) has nowhere else to
+/// put the work, so it just calls `build_status` directly.
 pub async fn status(ctx: &ServiceContext) -> Result<AccountStatus, ApiError> {
     let cfg = resolve_config(ctx)?;
-    build_status(ctx, &cfg)
+    let is_multi_thread = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if is_multi_thread {
+        tokio::task::block_in_place(|| build_status(ctx, &cfg))
+    } else {
+        build_status(ctx, &cfg)
+    }
 }
 
 /// Assemble [`AccountStatus`] from local state (no network).
