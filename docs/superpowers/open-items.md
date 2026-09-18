@@ -164,6 +164,15 @@ contain forward slashes.
 
 ---
 
+## Known flaky test
+
+- `stacking::run::tests::local_normalization_sidecars_are_cached_on_the_second_run`
+  failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
+  (2026-09-18, 2431 passed alongside it) and passed twice in isolation and in
+  both CI jobs of the same commit. Not investigated; if it fails again, look
+  at what the two runs share on disk (the LN sidecar cache under a tempdir)
+  and at the parallel test load, not at the LN maths.
+
 ## Standing decisions — do not re-flag these
 
 Each of these has been raised by an audit or a review at least once and answered.

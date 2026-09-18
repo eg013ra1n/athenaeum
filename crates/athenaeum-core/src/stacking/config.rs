@@ -607,8 +607,19 @@ pub fn stage_hash(
 /// calibration options plus the grouping rule that decided which frames
 /// share a group.
 pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
+    // `calibration.format` (the XISF plan, 2026-09-18, ruling R6) is the
+    // container an EXPORT or a SEND writes; the run forces FITS for its own
+    // calibrated frames before the spec is resolved (`stacking::run`), so
+    // the field can never change a cached calibrated artifact and must not
+    // move this hash — otherwise every set would recalibrate once for a
+    // field it ignores. Pinned by `format_moves_the_run_fingerprint_but_no_stage_hash`.
+    let mut calibration = serde_json::to_value(&cfg.calibration)
+        .expect("CalibratedLightOptions serializes");
+    if let Some(obj) = calibration.as_object_mut() {
+        obj.remove("format");
+    }
     serde_json::json!({
-        "calibration": cfg.calibration,
+        "calibration": calibration,
         "grouping": cfg.grouping,
     })
 }
@@ -884,6 +895,28 @@ mod tests {
         assert_eq!(
             stage_hash(&normalization_subtree(&cfg), &[], &[]),
             stage_hash(&normalization_subtree(&other), &[], &[]),
+        );
+    }
+
+    #[test]
+    fn format_moves_the_run_fingerprint_but_no_stage_hash() {
+        // The XISF plan's `calibration.format` (2026-09-18, ruling R6): the
+        // run writes FITS intermediates whatever the field says, so a
+        // cached calibrated frame stays valid across the field's arrival
+        // AND across a user flipping it — only the whole-config fingerprint
+        // moves, exactly as `drizzle.bayer` above.
+        let cfg = StackingConfig::default();
+        let mut other = cfg.clone();
+        other.calibration.format = crate::fits_writer::OutputFormat::Xisf;
+        assert_ne!(config_hash(&cfg), config_hash(&other));
+        assert_eq!(
+            stage_hash(&calibration_subtree(&cfg), &[], &[]),
+            stage_hash(&calibration_subtree(&other), &[], &[]),
+            "calibration.format must not invalidate a calibrated frame"
+        );
+        assert!(
+            calibration_subtree(&cfg)["calibration"].get("format").is_none(),
+            "the subtree must not carry the field at all"
         );
     }
 
@@ -1440,6 +1473,16 @@ mod tests {
         // `bayer_moves_the_run_fingerprint_but_no_stage_hash`) — so not one
         // cached per-frame artifact goes stale over it; only this
         // whole-config fingerprint moves.
-        assert_eq!(default_hash, "fe75994518f16c4c");
+        //
+        // And here again (the XISF plan, 2026-09-18, ruling R6):
+        // `calibration.format` joins `CalibratedLightOptions`, shipping
+        // `fits`. It is an export/send choice the run overrides, so
+        // `calibration_subtree` strips it and no calibrated artifact goes
+        // stale (see `format_moves_the_run_fingerprint_but_no_stage_hash`);
+        // only this whole-config fingerprint moves. This pin was NOT run
+        // locally before the push that moved it — CI caught it — which is
+        // the reminder to run `stacking::config` whenever a config struct
+        // gains a field.
+        assert_eq!(default_hash, "648d0ead30d4e5b9");
     }
 }
