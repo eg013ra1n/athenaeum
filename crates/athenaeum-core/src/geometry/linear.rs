@@ -48,8 +48,61 @@ impl Linear {
         ]
     }
 
+    /// Byte-identical to the un-skipped `(numerator) / w` form for every
+    /// `(x, y)`, including non-finite ones — see `apply_general` (kept
+    /// under `#[cfg(test)]`) for the pin.
+    ///
+    /// A `Similarity`/`Affine` model's bottom row is exactly `[0, 0, 1]`
+    /// (every fitter/constructor in this module sets it that way, and
+    /// `compose`/deserialization only ever combine or copy rows that
+    /// already are). For a FINITE `x, y` that makes `w` IEEE-exactly
+    /// `1.0`: `0.0 * x` and `0.0 * y` are correctly-signed zeros for a
+    /// finite operand, and `±0.0 + ±0.0 + 1.0 == 1.0` in round-to-nearest.
+    /// Since `n / 1.0 == n` bit for bit for every finite `n` (division by
+    /// 1.0 is exact in IEEE 754), the numerator already IS the result — so
+    /// both the `w` multiply-adds and the division are redundant and can
+    /// be skipped.
+    ///
+    /// For a NON-finite `x` or `y` that argument breaks: `0.0 * Inf` (or
+    /// `0.0 * NaN`) is `NaN`, not `0.0`, so the un-skipped formula folds a
+    /// NaN into `w` — and hence, through the division, into the result —
+    /// in cases the skip's plain sum would not (e.g. `m01 * Inf` alone is
+    /// `±Inf`, not `NaN`). The finiteness check below keeps that case on
+    /// the divided path, where it is unchanged from before this method
+    /// existed, so `apply` returns the identical value in every case, not
+    /// only the finite ones.
+    ///
+    /// The check itself — the row compare plus the two finiteness tests —
+    /// is evaluated fresh on every call rather than cached on `Linear`
+    /// (both `kind` and `m` are public fields with no constructor
+    /// gateway, so a cached flag would need every one of the ~20
+    /// `Linear { .. }` struct literals across the crate, including ones
+    /// in test modules this task does not touch, to also set it; deriving
+    /// it from `m` is correct no matter how that instance was built,
+    /// mutated — nothing in this codebase mutates `.m` in place, grep-
+    /// verified — or decoded off the wire). It costs a handful of scalar
+    /// compares, still far cheaper than the division it replaces.
     #[inline]
     pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        let m = &self.m;
+        if x.is_finite() && y.is_finite() && m[2] == [0.0, 0.0, 1.0] {
+            let u = m[0][0] * x + m[0][1] * y + m[0][2];
+            let v = m[1][0] * x + m[1][1] * y + m[1][2];
+            (u, v)
+        } else {
+            let w = m[2][0] * x + m[2][1] * y + m[2][2];
+            let u = (m[0][0] * x + m[0][1] * y + m[0][2]) / w;
+            let v = (m[1][0] * x + m[1][1] * y + m[1][2]) / w;
+            (u, v)
+        }
+    }
+
+    /// Oracle for the `apply` pin: the pre-fast-path formula, dividing by
+    /// `w` unconditionally, byte-for-byte the method this replaced. Not
+    /// used outside tests — its only purpose is to diff against
+    /// [`Linear::apply`].
+    #[cfg(test)]
+    fn apply_general(&self, x: f64, y: f64) -> (f64, f64) {
         let m = &self.m;
         let w = m[2][0] * x + m[2][1] * y + m[2][2];
         let u = (m[0][0] * x + m[0][1] * y + m[0][2]) / w;
@@ -593,5 +646,125 @@ mod tests {
         let t = similarity(7.0, 1.2, 1.0, 2.0);
         let back = Linear::from_flat(LinearKind::Similarity, t.to_flat());
         assert_eq!(t, back);
+    }
+
+    /// PIN (Task 8, W4): `apply`'s no-division fast path for `w == 1`
+    /// (`Similarity`/`Affine`) must equal the un-skipped `apply_general`
+    /// bit for bit — not just "close" — for every finite coordinate,
+    /// negative, fractional and large. A genuine `Homography` (nonzero
+    /// perspective terms) never takes the fast path at all, so it is
+    /// included as the control: the two methods run the identical branch
+    /// for it and must obviously agree.
+    #[test]
+    fn apply_matches_the_general_oracle_bit_for_bit_over_a_grid() {
+        let coords: [f64; 11] = [
+            -1_000_000.25,
+            -12345.678,
+            -3000.5,
+            -0.75,
+            -0.0,
+            0.0,
+            0.75,
+            3000.5,
+            12345.678,
+            1_000_000.25,
+            6000.0, // a real frame's own width, for good measure
+        ];
+        let sim = similarity(23.4, 1.017, 812.3, -455.9);
+        let aff = Linear {
+            kind: LinearKind::Affine,
+            m: [
+                [1.002, 0.031, 273.2],
+                [-0.028, 0.995, -499.1],
+                [0.0, 0.0, 1.0],
+            ],
+        };
+        let hom = Linear {
+            kind: LinearKind::Homography,
+            m: [
+                [0.992, 0.0387, -23.54],
+                [-0.0383, 0.9922, 136.37],
+                [8.8e-8, -2.5e-8, 1.0],
+            ],
+        };
+        for t in [&sim, &aff, &hom] {
+            for &x in &coords {
+                for &y in &coords {
+                    let fast = t.apply(x, y);
+                    let general = t.apply_general(x, y);
+                    assert_eq!(
+                        fast.0.to_bits(),
+                        general.0.to_bits(),
+                        "u mismatch: kind={:?} x={x} y={y} fast={} general={}",
+                        t.kind,
+                        fast.0,
+                        general.0
+                    );
+                    assert_eq!(
+                        fast.1.to_bits(),
+                        general.1.to_bits(),
+                        "v mismatch: kind={:?} x={x} y={y} fast={} general={}",
+                        t.kind,
+                        fast.1,
+                        general.1
+                    );
+                }
+            }
+        }
+    }
+
+    /// PIN (Task 8, W4): the same equality for non-finite `x`/`y` — the
+    /// case the exactness argument singles out, since `0.0 * Inf` (or
+    /// `0.0 * NaN`) is `NaN`, not `0.0`, so an un-guarded fast path would
+    /// disagree with `apply_general` exactly here even though the bottom
+    /// row is `[0, 0, 1]`.
+    #[test]
+    fn apply_matches_the_general_oracle_for_non_finite_inputs() {
+        let sim = similarity(23.4, 1.017, 812.3, -455.9);
+        let aff = Linear {
+            kind: LinearKind::Affine,
+            m: [
+                [1.002, 0.031, 273.2],
+                [-0.028, 0.995, -499.1],
+                [0.0, 0.0, 1.0],
+            ],
+        };
+        let hom = Linear {
+            kind: LinearKind::Homography,
+            m: [
+                [0.992, 0.0387, -23.54],
+                [-0.0383, 0.9922, 136.37],
+                [8.8e-8, -2.5e-8, 1.0],
+            ],
+        };
+        let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        let finite = [0.0, 1234.5, -6789.0];
+        for t in [&sim, &aff, &hom] {
+            for &x in bad.iter().chain(finite.iter()) {
+                for &y in bad.iter().chain(finite.iter()) {
+                    if x.is_finite() && y.is_finite() {
+                        continue; // covered by the grid pin above
+                    }
+                    let fast = t.apply(x, y);
+                    let general = t.apply_general(x, y);
+                    assert_eq!(
+                        fast.0.to_bits(),
+                        general.0.to_bits(),
+                        "u mismatch: kind={:?} x={x} y={y} fast={} general={}",
+                        t.kind,
+                        fast.0,
+                        general.0
+                    );
+                    assert_eq!(
+                        fast.1.to_bits(),
+                        general.1.to_bits(),
+                        "v mismatch: kind={:?} x={x} y={y} fast={} general={}",
+                        t.kind,
+                        fast.1,
+                        general.1
+                    );
+                }
+            }
+        }
     }
 }
