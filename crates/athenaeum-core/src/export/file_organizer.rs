@@ -503,6 +503,10 @@ fn generate_one(
         scratch_dir,
         opts,
         hot_maps,
+        // No shared preload here: an export batch calibrates each frame's
+        // own resolved masters as it goes, never a whole group's worth up
+        // front — the preload cache belongs to the stacking run.
+        None,
         pool,
         cancel_flag,
     )?;

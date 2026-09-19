@@ -2397,6 +2397,7 @@ mod real_data_e2e {
                 &opts,
                 &mut hot_maps,
                 None,
+                None,
                 &cancel,
             )
             .unwrap();

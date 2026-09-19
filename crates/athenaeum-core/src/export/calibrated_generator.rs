@@ -28,7 +28,7 @@ use crate::calibration_library::cosmetic::{
     apply_hot_pixel_correction, hot_pixel_map_from_dark, HotPixelMapOutcome,
 };
 use crate::calibration_library::light_cal::{
-    calibrate_light_compute, resolve_flat_norm_divisor, scale_divisor_for_bitpix,
+    calibrate_light_compute_with, resolve_flat_norm_divisor, scale_divisor_for_bitpix,
     write_calibrated_output, BiasFallback, FlatNormDivisor, FlatNormMode, LightCalInputs,
 };
 use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalCardInputs};
@@ -483,6 +483,13 @@ pub fn resolved_master_paths(
 /// before the debayer, which is the most expensive stage and the one worth not
 /// entering. The error carries [`IntegrationError::Cancelled`], so a caller can
 /// tell a cancel from a failure by downcasting.
+///
+/// `preloaded` (perf tier 1 Task 5) is a group's shared master dark/bias and
+/// flat, already decoded once through the same `BandSource` path the engine
+/// would use itself — when an entry matches `spec.inputs.dark_path`/
+/// `bias_path`/`flat_path`, the engine reads it from RAM instead of opening
+/// a second `BandSource` over the file. `None` (every caller but the
+/// stacking run) is the original per-frame behavior, byte-for-byte.
 pub fn execute_generation(
     spec: &GenerationSpec,
     output_path: &Path,
@@ -490,11 +497,12 @@ pub fn execute_generation(
     scratch_dir: &Path,
     opts: &CalibratedLightOptions,
     hot_maps: &mut HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
+    preloaded: Option<&crate::calibration_library::light_cal::PreloadedMasters>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> anyhow::Result<GeneratedLight> {
     let t = Instant::now();
-    let (mut frame, outcome) = calibrate_light_compute(&spec.inputs, cancel)?;
+    let (mut frame, outcome) = calibrate_light_compute_with(&spec.inputs, preloaded, cancel)?;
     let compute_ms = t.elapsed().as_millis() as u64;
 
     // ── Cosmetic hot-pixel correction ───────────────────────────────────────
@@ -997,6 +1005,7 @@ mod tests {
             &opts,
             &mut HashMap::new(),
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1190,6 +1199,7 @@ mod tests {
             &opts,
             &mut hot_maps,
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1255,6 +1265,7 @@ mod tests {
             &opts,
             &mut hot_maps,
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1289,6 +1300,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut hot_maps,
+            None,
             None,
             &AtomicBool::new(false),
         )
@@ -1340,6 +1352,7 @@ mod tests {
             &opts,
             &mut hot_maps,
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1381,6 +1394,7 @@ mod tests {
                 dir.path(),
                 &opts,
                 &mut hot_maps,
+                None,
                 None,
                 &AtomicBool::new(false),
             )
@@ -1434,6 +1448,7 @@ mod tests {
                 dir.path(),
                 &opts,
                 &mut hot_maps,
+                None,
                 None,
                 &AtomicBool::new(false),
             )
@@ -1508,6 +1523,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut HashMap::new(),
+            None,
             None,
             &AtomicBool::new(false),
         )
@@ -1660,6 +1676,7 @@ mod tests {
             &plain_opts,
             &mut HashMap::new(),
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1681,6 +1698,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut HashMap::new(),
+            None,
             None,
             &AtomicBool::new(false),
         )
@@ -1747,6 +1765,7 @@ mod tests {
             &opts,
             &mut HashMap::new(),
             None,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1775,6 +1794,7 @@ mod tests {
             dir.path(),
             &mono_opts,
             &mut HashMap::new(),
+            None,
             None,
             &AtomicBool::new(false),
         )

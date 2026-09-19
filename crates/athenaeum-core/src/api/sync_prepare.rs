@@ -839,6 +839,10 @@ fn generate_payload(
         &gen.scratch_dir,
         &gen.opts,
         &mut gen.hot_maps,
+        // No shared preload here: a send calibrates one frame at a time from
+        // whatever master a light resolves to, never a whole group's worth
+        // in one call — the preload cache belongs to the stacking run.
+        None,
         Some(&gen.pool),
         flag,
     )

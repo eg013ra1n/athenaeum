@@ -32,6 +32,7 @@ use serde::Serialize;
 use crate::api::stacking::MasterLightKind;
 use crate::api::{db, ApiError, PathPolicy};
 use crate::calibration_library::cosmetic::{hot_pixel_map_from_dark, HotPixelMapOutcome};
+use crate::calibration_library::light_cal::{preload_master_plane, PreloadedMasters};
 use crate::db::stacking::{
     finish_run, get_run, insert_group, insert_master_light, insert_run,
     set_frame_rejected_fraction, set_run_reference, set_run_status, update_group, upsert_artifact,
@@ -1433,14 +1434,12 @@ enum CalibrateResolved {
 
 /// One frame's fully-resolved stage-1 pixel work (perf tier 1 Task 4):
 /// everything [`resolve_calibrate_job`] read from the catalog, handed to a
-/// fan-out worker so it never touches `rc`/the DB. `idx` is the frame's
-/// position in the group's own frame list — set by the caller right after
-/// `resolve_calibrate_job` returns (`resolve_calibrate_job` itself has no
-/// use for it), so [`commit_calibrated`]'s callers can always recover
-/// frame order from `jobs[pos]` without a second pass.
+/// fan-out worker so it never touches `rc`/the DB. Frame order is already
+/// recoverable from `jobs[pos]` (the resolve loop below pushes jobs in group
+/// order and the results loop walks `jobs` the same way), so there is no
+/// `idx` field here (Task 4 fix round — the original field was set but never
+/// read).
 struct CalibrateJob {
-    #[allow(dead_code)] // set by stage_calibrate's resolve loop; read only by a future caller
-    idx: usize,
     frame_id: i64,
     group_key: String,
     hash: String,
@@ -1627,7 +1626,6 @@ fn resolve_calibrate_job(
     });
 
     Ok(CalibrateResolved::Job(Box::new(CalibrateJob {
-        idx: 0,
         frame_id: frame.frame_id,
         group_key: group_key.to_string(),
         hash,
@@ -1652,8 +1650,13 @@ fn resolve_calibrate_job(
 /// names it first — `jobs` is built by `stage_calibrate`'s resolve loop in
 /// group-frame order, so that "first" is deterministic and matches what the
 /// old sequential stage would have reported).
+///
+/// Task 4 fix round: the `seen_this_call` set this loop used to keep beside
+/// `rc.hot_maps` was redundant — `rc.hot_maps.insert` below runs in the same
+/// iteration that measures a dark, so `rc.hot_maps.contains_key` already
+/// short-circuits every later job naming the same dark, within this call and
+/// across calls alike.
 fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path) {
-    let mut seen_this_call: HashSet<PathBuf> = HashSet::new();
     for job in jobs {
         if !job.opts.hot_pixel_correction {
             continue;
@@ -1661,7 +1664,7 @@ fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path)
         let Some(dark) = &job.spec.dark_path else {
             continue;
         };
-        if rc.hot_maps.contains_key(dark) || !seen_this_call.insert(dark.clone()) {
+        if rc.hot_maps.contains_key(dark) {
             continue;
         }
         let measured = match hot_pixel_map_from_dark(dark, scratch) {
@@ -1683,6 +1686,45 @@ fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path)
         }
         rc.hot_maps.insert(dark.clone(), Arc::new(measured));
     }
+}
+
+/// Stage 1's per-group PRELOAD phase (perf tier 1 Task 5): decode every
+/// distinct master dark/bias and flat `jobs` will need exactly ONCE, on the
+/// run thread, before the fan-out — so instead of every included frame
+/// re-opening and re-band-reading its group's shared masters,
+/// `execute_generation`'s engine call reads them straight from RAM. Decoded
+/// through [`preload_master_plane`], the SAME `BandSource` decode path the
+/// engine runs itself, so the samples are bit-identical to the old
+/// per-frame reads (pinned by
+/// `light_cal::tests::preloaded_masters_calibrate_bit_identically`).
+///
+/// A preload failure never fails the group: it is logged and the path is
+/// simply absent from the returned map, so every worker's own
+/// `execute_generation` call falls back to reading that one file itself —
+/// exactly the pre-Task-5 behavior for that path alone.
+fn build_preloaded_masters(jobs: &[CalibrateJob], scratch: &Path) -> PreloadedMasters {
+    let mut distinct: HashSet<PathBuf> = HashSet::new();
+    for job in jobs {
+        distinct.extend(job.spec.inputs.dark_path.clone());
+        distinct.extend(job.spec.inputs.bias_path.clone());
+        distinct.extend(job.spec.inputs.flat_path.clone());
+    }
+    let mut planes = HashMap::new();
+    for path in distinct {
+        match preload_master_plane(&path, scratch) {
+            Ok(plane) => {
+                planes.insert(path, plane);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "master preload failed; the engine reads it per frame"
+                );
+            }
+        }
+    }
+    PreloadedMasters { planes }
 }
 
 /// Stage 1's per-frame COMMIT phase (perf tier 1 Task 4): everything
@@ -1905,7 +1947,7 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
             .unwrap_or(0);
 
         let mut jobs: Vec<CalibrateJob> = Vec::new();
-        for (idx, frame) in group.frames.iter().enumerate() {
+        for frame in &group.frames {
             if excluded_set.contains(&frame.frame_id) {
                 continue;
             }
@@ -1936,11 +1978,22 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
                     );
                     rc.runtime_exclusions.push((frame.frame_id, reason));
                     current += 1;
+                    // Task 4 fix round: the same progress tick `Reused`
+                    // emits above — an all-`Excluded` group used to emit
+                    // nothing here and leave the bar short of `total`.
+                    rc.progress(
+                        Stage::Calibrate,
+                        Some(group.key.clone()),
+                        current,
+                        total,
+                        bytes_done,
+                        bytes_total,
+                        Some(frame.frame_id),
+                        None,
+                    );
                 }
                 CalibrateResolved::Job(job) => {
-                    let mut j = *job;
-                    j.idx = idx;
-                    jobs.push(j);
+                    jobs.push(*job);
                 }
             }
         }
@@ -1948,22 +2001,38 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         }
         prebuild_hot_maps(rc, &jobs, &scratch);
+        // Perf tier 1 Task 5: decode this group's shared master dark/bias
+        // and flat once, on the run thread, before the fan-out — every
+        // worker's `execute_generation` call below then reads them from RAM
+        // instead of re-opening and re-band-reading them per frame.
+        let preloaded = build_preloaded_masters(&jobs, &scratch);
 
-        let admission_n = admission(
-            CALIBRATE_PLANES_RESIDENT * group_max_w * group_max_h * 4,
-            rc.ctx.image_pool.current_num_threads(),
-        );
+        // Perf tier 1 Task 5: the two preloaded master planes (dark/bias and
+        // flat, each up to `group_max_w * group_max_h * 4` bytes) are
+        // resident for the whole group's fan-out, on top of each worker's
+        // own `CALIBRATE_PLANES_RESIDENT` footprint — added to the working
+        // set so the admission budget accounts for them.
+        let working_set_bytes = CALIBRATE_PLANES_RESIDENT * group_max_w * group_max_h * 4
+            + 2 * group_max_w * group_max_h * 4;
+        let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
         log_admission(
             rc,
             Stage::Calibrate,
             &group.key,
-            CALIBRATE_PLANES_RESIDENT * group_max_w * group_max_h * 4,
+            working_set_bytes,
             admission_n,
         );
-        let ticker = FanOutTicker::new(rc, Stage::Calibrate, Some(group.key.clone()), current, total);
+        let ticker = FanOutTicker::new(
+            rc,
+            Stage::Calibrate,
+            Some(group.key.clone()),
+            current,
+            total,
+        );
         let ticker_ref = &ticker;
         let cancel_ref: &AtomicBool = &rc.cancel;
         let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+        let preloaded_ref: &PreloadedMasters = &preloaded;
         // Arcs only — cheap. Every job's own dark was already prebuilt into
         // `rc.hot_maps` above, so each worker's own clone is a cache HIT for
         // every lookup `execute_generation` makes; it never inserts into its
@@ -1971,31 +2040,37 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         let hot_maps_snapshot: HashMap<PathBuf, Arc<HotPixelMapOutcome>> = rc.hot_maps.clone();
         let scratch_ref: &Path = &scratch;
         let job_refs: Vec<&CalibrateJob> = jobs.iter().collect();
-        let results = fan_out(job_refs, admission_n, cancel_ref, move |job: &CalibrateJob| {
-            let mut local_maps = hot_maps_snapshot.clone();
-            let out = execute_generation(
-                &job.spec,
-                &job.out,
-                job.mosaic_out.as_deref(),
-                scratch_ref,
-                &job.opts,
-                &mut local_maps,
-                Some(pool_ref),
-                cancel_ref,
-            )
-            .map_err(|e| {
-                if matches!(
-                    e.downcast_ref::<IntegrationError>(),
-                    Some(IntegrationError::Cancelled)
-                ) {
-                    CANCELLED_MARKER.to_string()
-                } else {
-                    format!("calibration failed: {e:#}")
-                }
-            });
-            ticker_ref.tick(Some(job.frame_id));
-            out
-        });
+        let results = fan_out(
+            job_refs,
+            admission_n,
+            cancel_ref,
+            move |job: &CalibrateJob| {
+                let mut local_maps = hot_maps_snapshot.clone();
+                let out = execute_generation(
+                    &job.spec,
+                    &job.out,
+                    job.mosaic_out.as_deref(),
+                    scratch_ref,
+                    &job.opts,
+                    &mut local_maps,
+                    Some(preloaded_ref),
+                    Some(pool_ref),
+                    cancel_ref,
+                )
+                .map_err(|e| {
+                    if matches!(
+                        e.downcast_ref::<IntegrationError>(),
+                        Some(IntegrationError::Cancelled)
+                    ) {
+                        CANCELLED_MARKER.to_string()
+                    } else {
+                        format!("calibration failed: {e:#}")
+                    }
+                });
+                ticker_ref.tick(Some(job.frame_id));
+                out
+            },
+        );
 
         rc.check_cancel()?;
         current = ticker.done();
@@ -2004,6 +2079,15 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         // completion order — `commit_calibrated`'s artifact-row writes and
         // `rc.warnings` must land exactly where the old sequential stage
         // put them.
+        //
+        // Task 4 fix round: the `?` below is a DB failure inside
+        // `commit_calibrated`, not a calibration failure — if it fires at
+        // frame k, the run fails and frames k+1.. in this group are already
+        // written to disk with no `stacking_artifacts` row. That is not a
+        // leak: the next run's freshness check finds no row, regenerates
+        // those frames, and the write is the same atomic temp-file +
+        // rename `execute_generation` always uses, so the stale file is
+        // simply overwritten in place.
         for (pos, res) in results.into_iter().enumerate() {
             let job = &jobs[pos];
             match res {
@@ -8466,6 +8550,14 @@ mod tests {
                 .unwrap(),
         );
         let ctx_par = Arc::new(ctx2);
+        // Task 4 fix round: assert this fixture's working set still admits
+        // more than one worker on the 4-thread pool before running, so a
+        // future admission-math change cannot silently degrade this pin to
+        // comparing sequential against sequential.
+        assert!(
+            admission(CALIBRATE_PLANES_RESIDENT * 64 * 48 * 4, 4) > 1,
+            "fixture working set must admit more than one worker for this pin to test the fan-out"
+        );
         let working_par = tempfile::tempdir().unwrap();
         let output_par = tempfile::tempdir().unwrap();
         let layout_par = WorkingLayout::new(working_par.path(), &set_slug(SET_NAME));
