@@ -31,14 +31,17 @@ use serde::Serialize;
 
 use crate::api::stacking::MasterLightKind;
 use crate::api::{db, ApiError, PathPolicy};
-use crate::calibration_library::cosmetic::HotPixelMapOutcome;
+use crate::calibration_library::cosmetic::{hot_pixel_map_from_dark, HotPixelMapOutcome};
 use crate::db::stacking::{
     finish_run, get_run, insert_group, insert_master_light, insert_run,
     set_frame_rejected_fraction, set_run_reference, set_run_status, update_group, upsert_artifact,
     upsert_frame_row, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewMasterLight, NewRun,
 };
 use crate::events::{emit_event, ProgressEmitter};
-use crate::export::{execute_generation, resolve_generation_cached};
+use crate::export::{
+    execute_generation, resolve_generation_cached, CalibratedLightOptions, GeneratedLight,
+    GenerationSpec,
+};
 use crate::fits_parser::FitsHeader;
 use crate::fits_writer::wcs::scale_plate_solve;
 use crate::fits_writer::{Card, CardValue};
@@ -255,7 +258,7 @@ pub(crate) struct RunContext {
     /// `frame_id -> whether stage 1 REUSED an existing `calibrated` artifact
     /// for it` (Task 8's own addition — the brief's `SummaryFrame.cached_calibrated`
     /// has no field on [`MeasuredFrame`] to read it from otherwise, since
-    /// `CalibrateOutcome` is transient and stage 3 builds `MeasuredFrame`
+    /// `CalibrateResolved` is transient and stage 3 builds `MeasuredFrame`
     /// fresh from the DB, blind to which run wrote the artifact it found).
     /// Populated once per frame by [`stage_calibrate`]; read by
     /// [`stage_measure`] when it builds each frame's [`MeasuredFrame`].
@@ -1410,17 +1413,41 @@ fn calibrate_bytes_total(groups: &[IntegrationGroup], excluded: &HashSet<i64>) -
     total
 }
 
-/// One frame's stage-1 outcome (private to [`stage_calibrate`]).
-enum CalibrateOutcome {
+/// One frame's stage-1 RESOLVE outcome (private to [`stage_calibrate`],
+/// perf tier 1 Task 4). Replaces the old `CalibrateOutcome`: `Reused`/
+/// `Excluded` are terminal (nothing more to do for this frame), `Job` is a
+/// fully-resolved unit of pixel work the fan-out below runs in parallel and
+/// [`commit_calibrated`] then writes back.
+enum CalibrateResolved {
     /// An existing `calibrated` artifact was fresh; nothing was written.
     /// `bytes` is the reused file's own recorded size (fix round 1, item 5:
     /// a fully-reused stage must report `N/N` progress bytes, not `0/N`).
     Reused { bytes: u64 },
-    /// A fresh `calibrated` file was written; `bytes` is its size.
-    Generated { bytes: u64 },
     /// Calibration failed for this frame; `reason` is
     /// [`RunContext::runtime_exclusions`]'s text.
     Excluded { reason: String },
+    /// Everything a worker needs to calibrate this frame's pixels, with no
+    /// further catalog access — see [`CalibrateJob`].
+    Job(Box<CalibrateJob>),
+}
+
+/// One frame's fully-resolved stage-1 pixel work (perf tier 1 Task 4):
+/// everything [`resolve_calibrate_job`] read from the catalog, handed to a
+/// fan-out worker so it never touches `rc`/the DB. `idx` is the frame's
+/// position in the group's own frame list — set by the caller right after
+/// `resolve_calibrate_job` returns (`resolve_calibrate_job` itself has no
+/// use for it), so [`commit_calibrated`]'s callers can always recover
+/// frame order from `jobs[pos]` without a second pass.
+struct CalibrateJob {
+    #[allow(dead_code)] // set by stage_calibrate's resolve loop; read only by a future caller
+    idx: usize,
+    frame_id: i64,
+    group_key: String,
+    hash: String,
+    spec: GenerationSpec,
+    out: PathBuf,
+    mosaic_out: Option<PathBuf>,
+    opts: CalibratedLightOptions,
 }
 
 /// The collision-safe calibrated-file STEM for one frame of a group (fix
@@ -1467,32 +1494,35 @@ pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame)
     }
 }
 
-/// Stage 1 (calibrate) for one frame (spec §9.3, decision 4).
-///
-/// Three DB connections, each opened, used and dropped in its own scope: one
-/// for the stage-1 hash (through `rc.memo`, which internally resolves the
-/// frame's calibration plan the same way the second, generation-time
-/// resolution below does — see [`HashMemo::calibration_hash_checked`]'s doc
-/// for why that is not wasted work), one for the freshness lookup, one more
-/// (opened AFTER the pixel work) to record the fresh artifact row. Never
-/// held across [`resolve_generation_cached`]'s master-flat read or
-/// [`execute_generation`]'s pixel work, matching this codebase's
-/// never-hold-a-connection-across-slow-I/O convention (decision 4: "open a
-/// conn, …, DROP the conn, then execute_generation").
-fn calibrate_one_frame(
+/// Stage 1's per-frame RESOLVE phase (perf tier 1 Task 4, spec §9.3): every
+/// catalog read `calibrate_one_frame` used to do before handing off to
+/// `execute_generation` — the stage-1 hash (through `rc.memo`, which
+/// internally resolves the frame's calibration plan the same way the
+/// second, generation-time resolution below does — see
+/// [`HashMemo::calibration_hash_checked`]'s doc for why that is not wasted
+/// work), the freshness lookup, and (on a miss) `resolve_generation_cached`
+/// — all still on the run thread, one frame at a time, exactly as before.
+/// Never held across [`resolve_generation_cached`]'s master-flat read
+/// (matching this codebase's never-hold-a-connection-across-slow-I/O
+/// convention), and no longer holds anything at all across
+/// [`execute_generation`]'s pixel work — that now happens in a worker,
+/// after this function has returned. Returns [`CalibrateResolved::Job`]
+/// with everything a worker needs and nothing it does not (no `rc`, no
+/// `Connection`); the caller (`stage_calibrate`) fills in `idx`.
+fn resolve_calibrate_job(
     rc: &mut RunContext,
     cfg: &StackingConfig,
     group: &IntegrationGroup,
     frame: &GroupFrame,
     scratch: &Path,
-) -> Result<CalibrateOutcome, RunError> {
+) -> Result<CalibrateResolved, RunError> {
     let group_key: &str = group.key.as_str();
     let hash = {
         let conn = db(&rc.ctx)?.conn();
         match rc.memo.calibration_hash_checked(&conn, cfg, frame) {
             Ok(hash) => hash,
             Err(e) => {
-                return Ok(CalibrateOutcome::Excluded {
+                return Ok(CalibrateResolved::Excluded {
                     reason: format!("calibration failed: {e}"),
                 })
             }
@@ -1538,7 +1568,7 @@ fn calibrate_one_frame(
             let mosaic_fresh =
                 !want_mosaic || mosaic_row.as_ref().is_some_and(|row| is_fresh(row, &hash));
             if is_fresh(row, &hash) && mosaic_fresh {
-                return Ok(CalibrateOutcome::Reused {
+                return Ok(CalibrateResolved::Reused {
                     bytes: row.size.unwrap_or(0) as u64,
                 });
             }
@@ -1568,7 +1598,7 @@ fn calibrate_one_frame(
     let spec = match spec {
         Ok(s) => s,
         Err(e) => {
-            return Ok(CalibrateOutcome::Excluded {
+            return Ok(CalibrateResolved::Excluded {
                 reason: format!("calibration failed: {e:#}"),
             })
         }
@@ -1596,37 +1626,88 @@ fn calibrate_one_frame(
             ))
     });
 
-    let generated = execute_generation(
-        &spec,
-        &out,
-        mosaic_out.as_deref(),
-        scratch,
-        &calibration_opts,
-        &mut rc.hot_maps,
-        Some(&rc.ctx.image_pool),
-        &rc.cancel,
-    );
-    let generated = match generated {
-        Ok(g) => g,
-        Err(e) => {
-            if matches!(
-                e.downcast_ref::<IntegrationError>(),
-                Some(IntegrationError::Cancelled)
-            ) {
-                return Err(RunError::Cancelled);
-            }
-            return Ok(CalibrateOutcome::Excluded {
-                reason: format!("calibration failed: {e:#}"),
-            });
+    Ok(CalibrateResolved::Job(Box::new(CalibrateJob {
+        idx: 0,
+        frame_id: frame.frame_id,
+        group_key: group_key.to_string(),
+        hash,
+        spec,
+        out,
+        mosaic_out,
+        opts: calibration_opts,
+    })))
+}
+
+/// Stage 1's per-dark PREBUILD phase (perf tier 1 Task 4): builds every
+/// distinct master dark's hot-pixel map that `jobs` will need, on the run
+/// thread, BEFORE the fan-out — so no two workers ever race to measure the
+/// same dark, and every worker's own `execute_generation` call sees a cache
+/// hit (`newly_measured == false`) whatever order the fan-out finishes in.
+/// Mirrors `execute_generation`'s own cache-miss branch
+/// (`calibrated_generator.rs:511-533`) exactly — same call, same `Refused`
+/// mapping, same `warn!` — with ONE difference: because every worker's own
+/// call is now guaranteed a cache hit, `execute_generation` can never be the
+/// one to push the operator-facing refusal line, so THIS function pushes it
+/// instead, still exactly once per distinct dark (whichever job in `jobs`
+/// names it first — `jobs` is built by `stage_calibrate`'s resolve loop in
+/// group-frame order, so that "first" is deterministic and matches what the
+/// old sequential stage would have reported).
+fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path) {
+    let mut seen_this_call: HashSet<PathBuf> = HashSet::new();
+    for job in jobs {
+        if !job.opts.hot_pixel_correction {
+            continue;
         }
-    };
+        let Some(dark) = &job.spec.dark_path else {
+            continue;
+        };
+        if rc.hot_maps.contains_key(dark) || !seen_this_call.insert(dark.clone()) {
+            continue;
+        }
+        let measured = match hot_pixel_map_from_dark(dark, scratch) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dark.display(),
+                    error = %format!("{e:#}"),
+                    "measuring the master dark failed — hot-pixel correction refused"
+                );
+                HotPixelMapOutcome::Refused(format!("measuring it failed: {e:#}"))
+            }
+        };
+        if let HotPixelMapOutcome::Refused(reason) = &measured {
+            rc.warnings.push(format!(
+                "Hot-pixel correction skipped for {}: {reason}",
+                dark.display()
+            ));
+        }
+        rc.hot_maps.insert(dark.clone(), Arc::new(measured));
+    }
+}
+
+/// Stage 1's per-frame COMMIT phase (perf tier 1 Task 4): everything
+/// `calibrate_one_frame` used to do AFTER `execute_generation` returned —
+/// file identities, the missing-mosaic warning, and the one-transaction
+/// artifact-row pair — back on the run thread. Called from the fan-out's
+/// results loop in the group's own frame order (never fan-out completion
+/// order), so the artifact rows and `rc.warnings` this pushes land in
+/// exactly the order the old sequential stage produced them in. Returns the
+/// debayered artifact's own byte size (`bytes_total` for this stage is the
+/// debayered footprint — `calibrate_bytes_total` — so counting the mosaic
+/// too would push a complete stage past 100%).
+fn commit_calibrated(
+    rc: &mut RunContext,
+    job: &CalibrateJob,
+    generated: GeneratedLight,
+) -> Result<u64, RunError> {
     rc.warnings.extend(generated.warnings);
 
-    let (size, modified_at) = file_identity(&out).map_err(|e| RunError::Other(format!("{e:#}")))?;
+    let (size, modified_at) =
+        file_identity(&job.out).map_err(|e| RunError::Other(format!("{e:#}")))?;
     // M4d Task 1: recorded only when the generator says it actually wrote one
     // (`mosaic_written`), never by stat-ing the path — a leftover file from an
     // earlier run must not be adopted as this generation's output.
-    let mosaic_identity = match (&mosaic_out, generated.mosaic_written) {
+    let mosaic_identity = match (&job.mosaic_out, generated.mosaic_written) {
         (Some(path), true) => Some((
             path.clone(),
             file_identity(path).map_err(|e| RunError::Other(format!("{e:#}")))?,
@@ -1639,10 +1720,10 @@ fn calibrate_one_frame(
     // mosaic exists to keep. That frame's `calibrated_mosaic` row will be
     // missing on the next run too, which means it recalibrates every run:
     // cheap on one broken frame, but never silent.
-    if mosaic_out.is_some() && !generated.mosaic_written {
+    if job.mosaic_out.is_some() && !generated.mosaic_written {
         tracing::warn!(
             run_id = rc.run_id,
-            frame_id = frame.frame_id,
+            frame_id = job.frame_id,
             "no cfa mosaic could be kept for this frame; it will be recalibrated on every run"
         );
     }
@@ -1661,11 +1742,11 @@ fn calibrate_one_frame(
             &tx,
             &NewArtifact {
                 frames_set_id: rc.set_id,
-                frame_id: Some(frame.frame_id),
-                group_key,
+                frame_id: Some(job.frame_id),
+                group_key: &job.group_key,
                 kind: "calibrated",
-                path: out.to_str(),
-                config_hash: &hash,
+                path: job.out.to_str(),
+                config_hash: &job.hash,
                 size: Some(size),
                 modified_at: Some(&modified_at),
                 payload_json: None,
@@ -1676,11 +1757,11 @@ fn calibrate_one_frame(
                 &tx,
                 &NewArtifact {
                     frames_set_id: rc.set_id,
-                    frame_id: Some(frame.frame_id),
-                    group_key,
+                    frame_id: Some(job.frame_id),
+                    group_key: &job.group_key,
                     kind: "calibrated_mosaic",
                     path: path.to_str(),
-                    config_hash: &hash,
+                    config_hash: &job.hash,
                     size: Some(*mosaic_size),
                     modified_at: Some(mosaic_modified),
                     payload_json: None,
@@ -1691,18 +1772,52 @@ fn calibrate_one_frame(
             .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
     }
 
-    // Only the debayered artifact's bytes are reported: `bytes_total` for this
-    // stage is the debayered footprint (`calibrate_bytes_total`), so counting
-    // the mosaic here would push a complete stage past 100%.
-    Ok(CalibrateOutcome::Generated { bytes: size as u64 })
+    Ok(size as u64)
 }
 
-/// Stage 1: calibrate every non-manually-excluded LIGHT frame, sequentially
-/// (ruling 4 — exactly as the calibrated-lights export does today), reusing
-/// a fresh `calibrated` artifact when one exists. A per-frame failure
-/// excludes that frame (`runtime_exclusions` + a `warn!`) rather than
-/// failing the run; only `IntegrationError::Cancelled` propagates as
-/// [`RunError::Cancelled`].
+/// Planes of one w×h channel resident while a fan-out worker calibrates one
+/// frame (perf tier 1 Task 4): the light band, the `out` plane, a 3-plane
+/// VNG debayer output and the calibration formula's own band scratch — one
+/// frame at a time per worker, never a whole group. Unlike
+/// `MEASURE_PLANES_RESIDENT`/`LN_PLANES_RESIDENT` above, not measured with
+/// `/usr/bin/time -l` this cycle: Task 10's acceptance run reads the
+/// "fan-out admitted" line this stage now logs (`log_admission`) against
+/// real RSS instead.
+pub(crate) const CALIBRATE_PLANES_RESIDENT: u64 = 8;
+
+/// Stage-1-worker cancellation marker (perf tier 1 Task 4): a fan-out
+/// worker cannot return `RunError` (the closure's error type is `String`,
+/// same as every other fan-out in this file), so `execute_generation`
+/// reporting `IntegrationError::Cancelled` is encoded as this sentinel
+/// string instead of the ordinary "calibration failed: …" text; the
+/// results loop right after `fan_out` returns maps it (and a plain
+/// `rc.check_cancel()` failure) back to [`RunError::Cancelled`]. Never
+/// shown to a user — a cancelled run's `last_error`/summary never reaches
+/// this string, since [`RunError::Cancelled`] is handled before it would be
+/// formatted.
+const CANCELLED_MARKER: &str = "__cancelled__";
+
+/// Stage 1: calibrate every non-manually-excluded LIGHT frame, reusing a
+/// fresh `calibrated` artifact when one exists. Ruling 4's "sequentially,
+/// exactly as the calibrated-lights export does today" is retired as of
+/// 2026-09-19 (perf tier 1 Task 4): the per-frame DB lookups and freshness
+/// check ([`resolve_calibrate_job`]) still run one at a time, on the run
+/// thread, in the group's own frame order — but the pixel work
+/// ([`execute_generation`]) now fans out across `rc.ctx.image_pool`'s width
+/// via [`fan_out`], with every distinct dark's hot-pixel map measured once
+/// up front ([`prebuild_hot_maps`]) so no worker ever races another to
+/// build it. Results are written back ([`commit_calibrated`]: artifact
+/// rows, `rc.warnings`) on the run thread, in the fan-out's ORIGINAL
+/// (frame) order rather than completion order — so the output (files,
+/// artifact rows, warning order) is byte-identical to the old sequential
+/// stage's, which is what
+/// `calibrate_fan_out_matches_the_sequential_stage_byte_for_byte` pins. The
+/// calibrated-lights EXPORT path (`export::file_organizer::GenerationBatch`)
+/// is untouched and keeps its own sequential loop — this fan-out is stage 1
+/// of the stacking run only. A per-frame failure excludes that frame
+/// (`runtime_exclusions` + a `warn!`) rather than failing the run; only
+/// `IntegrationError::Cancelled` (surfaced by a worker as
+/// [`CANCELLED_MARKER`]) propagates as [`RunError::Cancelled`].
 fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
     let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
@@ -1771,22 +1886,48 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         std::fs::create_dir_all(rc.layout.calibrated_dir(&group.key))
             .map_err(|e| RunError::Other(format!("failed to create calibrated dir: {e}")))?;
 
-        for frame in &group.frames {
+        // Owner decision 2026-09-10 (same rule `stage_measure` uses): a
+        // group's members can carry different native geometry (M4b — a
+        // second camera, a bin-2 member), so admission sizing below budgets
+        // for the LARGEST frame in the group rather than a single
+        // group-wide width/height.
+        let group_max_w = group
+            .frames
+            .iter()
+            .map(|f| f.width.max(0) as u64)
+            .max()
+            .unwrap_or(0);
+        let group_max_h = group
+            .frames
+            .iter()
+            .map(|f| f.height.max(0) as u64)
+            .max()
+            .unwrap_or(0);
+
+        let mut jobs: Vec<CalibrateJob> = Vec::new();
+        for (idx, frame) in group.frames.iter().enumerate() {
             if excluded_set.contains(&frame.frame_id) {
                 continue;
             }
             rc.check_cancel()?;
 
-            match calibrate_one_frame(rc, &cfg, group, frame, &scratch)? {
-                CalibrateOutcome::Reused { bytes } => {
+            match resolve_calibrate_job(rc, &cfg, group, frame, &scratch)? {
+                CalibrateResolved::Reused { bytes } => {
                     bytes_done += bytes;
                     rc.cached_calibrated.insert(frame.frame_id, true);
+                    current += 1;
+                    rc.progress(
+                        Stage::Calibrate,
+                        Some(group.key.clone()),
+                        current,
+                        total,
+                        bytes_done,
+                        bytes_total,
+                        Some(frame.frame_id),
+                        None,
+                    );
                 }
-                CalibrateOutcome::Generated { bytes } => {
-                    bytes_done += bytes;
-                    rc.cached_calibrated.insert(frame.frame_id, false);
-                }
-                CalibrateOutcome::Excluded { reason } => {
+                CalibrateResolved::Excluded { reason } => {
                     tracing::warn!(
                         run_id = rc.run_id,
                         frame_id = frame.frame_id,
@@ -1794,21 +1935,113 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
                         "calibration failed; frame excluded"
                     );
                     rc.runtime_exclusions.push((frame.frame_id, reason));
+                    current += 1;
+                }
+                CalibrateResolved::Job(job) => {
+                    let mut j = *job;
+                    j.idx = idx;
+                    jobs.push(j);
                 }
             }
-
-            current += 1;
-            rc.progress(
-                Stage::Calibrate,
-                Some(group.key.clone()),
-                current,
-                total,
-                bytes_done,
-                bytes_total,
-                Some(frame.frame_id),
-                None,
-            );
         }
+        if jobs.is_empty() {
+            continue;
+        }
+        prebuild_hot_maps(rc, &jobs, &scratch);
+
+        let admission_n = admission(
+            CALIBRATE_PLANES_RESIDENT * group_max_w * group_max_h * 4,
+            rc.ctx.image_pool.current_num_threads(),
+        );
+        log_admission(
+            rc,
+            Stage::Calibrate,
+            &group.key,
+            CALIBRATE_PLANES_RESIDENT * group_max_w * group_max_h * 4,
+            admission_n,
+        );
+        let ticker = FanOutTicker::new(rc, Stage::Calibrate, Some(group.key.clone()), current, total);
+        let ticker_ref = &ticker;
+        let cancel_ref: &AtomicBool = &rc.cancel;
+        let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+        // Arcs only — cheap. Every job's own dark was already prebuilt into
+        // `rc.hot_maps` above, so each worker's own clone is a cache HIT for
+        // every lookup `execute_generation` makes; it never inserts into its
+        // clone, so the clones never need to be merged back.
+        let hot_maps_snapshot: HashMap<PathBuf, Arc<HotPixelMapOutcome>> = rc.hot_maps.clone();
+        let scratch_ref: &Path = &scratch;
+        let job_refs: Vec<&CalibrateJob> = jobs.iter().collect();
+        let results = fan_out(job_refs, admission_n, cancel_ref, move |job: &CalibrateJob| {
+            let mut local_maps = hot_maps_snapshot.clone();
+            let out = execute_generation(
+                &job.spec,
+                &job.out,
+                job.mosaic_out.as_deref(),
+                scratch_ref,
+                &job.opts,
+                &mut local_maps,
+                Some(pool_ref),
+                cancel_ref,
+            )
+            .map_err(|e| {
+                if matches!(
+                    e.downcast_ref::<IntegrationError>(),
+                    Some(IntegrationError::Cancelled)
+                ) {
+                    CANCELLED_MARKER.to_string()
+                } else {
+                    format!("calibration failed: {e:#}")
+                }
+            });
+            ticker_ref.tick(Some(job.frame_id));
+            out
+        });
+
+        rc.check_cancel()?;
+        current = ticker.done();
+
+        // Committed in the fan-out's ORIGINAL (frame) order, never
+        // completion order — `commit_calibrated`'s artifact-row writes and
+        // `rc.warnings` must land exactly where the old sequential stage
+        // put them.
+        for (pos, res) in results.into_iter().enumerate() {
+            let job = &jobs[pos];
+            match res {
+                None => return Err(RunError::Cancelled),
+                Some(Err(msg)) if msg == CANCELLED_MARKER => return Err(RunError::Cancelled),
+                Some(Err(msg)) => {
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        frame_id = job.frame_id,
+                        error = %msg,
+                        "calibration failed; frame excluded"
+                    );
+                    rc.runtime_exclusions.push((job.frame_id, msg));
+                }
+                Some(Ok(generated)) => {
+                    bytes_done += commit_calibrated(rc, job, generated)?;
+                    rc.cached_calibrated.insert(job.frame_id, false);
+                }
+            }
+        }
+
+        // Perf tier 1 Task 4, ruling 7: `bytes_done` for a GENERATED frame
+        // is only known once `commit_calibrated` returns its file's real
+        // size, which happens after the whole fan-out — so, unlike the old
+        // per-frame loop, the byte count does not advance mid-fan-out; only
+        // the ticker's `current`/count does (via `FanOutTicker::tick`
+        // above). This one final `progress` call is what carries the
+        // group's true `bytes_done` forward once the fan-out has committed.
+        rc.progress(
+            Stage::Calibrate,
+            Some(group.key.clone()),
+            current,
+            total,
+            bytes_done,
+            bytes_total,
+            None,
+            None,
+        );
     }
 
     rc.timings.push(crate::stacking::provenance::StageTiming {
@@ -8137,6 +8370,174 @@ mod tests {
     }
 
     // ── stage_calibrate ──────────────────────────────────────────────────
+
+    /// Perf tier 1 Task 4: the fan-out must produce the same calibrated
+    /// PIXELS, the same header CARDS and the same warning ORDER as the
+    /// sequential stage did. `seed_ready`'s master dark is a constant-value
+    /// plane (MAD = 0, see `hot_pixel_map_from_dark`'s "zero mad" branch),
+    /// so `prebuild_hot_maps` refuses its hot-pixel map and pushes exactly
+    /// one "Hot-pixel correction skipped for …" warning — the one thing a
+    /// reordering bug in this task would show up as.
+    ///
+    /// NOT a raw-byte comparison, despite the brief's own framing (a
+    /// discovery made while writing this pin, unrelated to the fan-out):
+    /// `light_resolve::source_cards_for_file` rebuilds a light's header
+    /// cards from `parse_stored_header_keys`'s `HashMap<String, String>`
+    /// (`fits_parser/stored_header.rs`), so the card ORDER in a calibrated
+    /// output already varies from one generation to the next — proven by
+    /// running this fixture's admission-1 path twice and diffing the raw
+    /// bytes, which disagree starting at the SAME byte offset (560, right
+    /// after `SIMPLE`/`BITPIX`/`NAXIS*`) whether or not a fan-out is
+    /// involved. That is a pre-existing property of the header-rebuild path
+    /// (harmless: nothing downstream keys freshness on byte-identical
+    /// headers), not a regression this task introduces, and fixing it is
+    /// out of this task's scope. So this pin compares what "the same
+    /// calibrated bytes" actually needs to mean here: the header's CARD SET
+    /// (sorted, so ordering cannot fail it) and the PIXEL DATA (which the
+    /// header-order shuffle cannot touch — same card COUNT on both sides
+    /// keeps the header block count, and therefore the data offset,
+    /// identical) read back bit-for-bit via `PlaneReader`.
+    ///
+    /// Controller ruling (2026-09-19): no env var or static forces
+    /// admission — two SEPARATE `ServiceContext`s give the two runs two
+    /// different `image_pool` widths instead. `ServiceContext::new_for_tests`'s
+    /// stock 1-thread pool clamps `admission` to 1 (sequential, one job at a
+    /// time) whatever the working-set math says; a second context built
+    /// here with a 4-thread pool clamps `admission` up to 4 instead —
+    /// `admission`'s RAM-budget term is astronomically larger than this
+    /// fixture's `CALIBRATE_PLANES_RESIDENT * 64 * 48 * 4` (~96 KB) working
+    /// set on any machine with a few GB of RAM, so the pool WIDTH is the
+    /// clamp that actually binds. Two separate working folders + run ids;
+    /// the parallel run also sets `rerun_from = Some(Stage::Calibrate)` (the
+    /// SAME escape hatch `calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones`'s
+    /// own rc4 uses below) because both runs share ONE on-disk catalog —
+    /// without it, the parallel run's freshness check would find the
+    /// sequential run's OWN `stacking_artifacts` rows fresh (identical
+    /// config hash) and reuse them instead of regenerating, which would
+    /// make this pin compare a file against itself.
+    #[test]
+    fn calibrate_fan_out_matches_the_sequential_stage_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let (fixture, _light_ids, _working, _output) = seed_ready(&db_path, SET_NAME);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
+        let group_key = plan_groups[0].key.clone();
+
+        // Sequential reference: the stock 1-thread `image_pool` clamps
+        // `admission` to 1.
+        let ctx_seq = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let working_seq = tempfile::tempdir().unwrap();
+        let output_seq = tempfile::tempdir().unwrap();
+        let layout_seq = WorkingLayout::new(working_seq.path(), &set_slug(SET_NAME));
+        let mut rc_seq = test_context(
+            ctx_seq,
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            fixture.set_id,
+            SET_NAME,
+            cfg.clone(),
+            plan_groups.clone(),
+            layout_seq.clone(),
+            output_seq.path().to_path_buf(),
+            HashMap::new(),
+        );
+        stage_calibrate(&mut rc_seq).unwrap();
+
+        let seq_dir = layout_seq.calibrated_dir(&group_key);
+        let mut seq_files: Vec<PathBuf> = std::fs::read_dir(&seq_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        seq_files.sort();
+        assert_eq!(seq_files.len(), 3, "{seq_files:?}");
+        let seq_warnings = rc_seq.warnings.clone();
+
+        // Parallel: a second `ServiceContext` whose `image_pool` is 4 wide —
+        // `admission` clamps to the pool width, not to 1. A fresh working
+        // folder and `rerun_from` so this run always regenerates through
+        // the fan-out rather than reusing the sequential run's own rows.
+        let mut ctx2 = ServiceContext::new_for_tests(db_path.clone());
+        ctx2.image_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        );
+        let ctx_par = Arc::new(ctx2);
+        let working_par = tempfile::tempdir().unwrap();
+        let output_par = tempfile::tempdir().unwrap();
+        let layout_par = WorkingLayout::new(working_par.path(), &set_slug(SET_NAME));
+        let mut rc_par = test_context(
+            ctx_par,
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            2,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout_par.clone(),
+            output_par.path().to_path_buf(),
+            HashMap::new(),
+        );
+        rc_par.rerun_from = Some(Stage::Calibrate);
+        stage_calibrate(&mut rc_par).unwrap();
+
+        let par_dir = layout_par.calibrated_dir(&group_key);
+        let mut par_files: Vec<PathBuf> = std::fs::read_dir(&par_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        par_files.sort();
+        assert_eq!(par_files.len(), 3, "{par_files:?}");
+
+        // Sorted header card lines: order-independent (see the doc comment
+        // above), still catches a genuinely different card set.
+        fn header_lines_sorted(path: &Path) -> Vec<String> {
+            let mut lines: Vec<String> = FitsHeader::from_path(path)
+                .unwrap()
+                .to_header_text()
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+            lines.sort();
+            lines
+        }
+        // Every plane's pixel data, read back through the SAME reader the
+        // pipeline itself uses — the header shuffle cannot touch this: equal
+        // card COUNTS (both sides carry the same cards) keep the header's
+        // 2880-byte block count, and therefore the data offset, identical.
+        fn planes(path: &Path) -> Vec<Vec<f32>> {
+            let reader = PlaneReader::open(path).unwrap();
+            (0..reader.channels())
+                .map(|p| reader.read_plane(p).unwrap())
+                .collect()
+        }
+
+        for (i, (sp, pp)) in seq_files.iter().zip(par_files.iter()).enumerate() {
+            assert_eq!(
+                header_lines_sorted(sp),
+                header_lines_sorted(pp),
+                "file {i}: header card SET must match the sequential stage (order is not \
+                 pinned — see the doc comment above)"
+            );
+            assert_eq!(
+                planes(sp),
+                planes(pp),
+                "file {i}: calibrated pixel data must match the sequential stage bit for bit"
+            );
+        }
+        assert_eq!(
+            seq_warnings, rc_par.warnings,
+            "warning order (the one hot-pixel refusal) must match the sequential stage"
+        );
+        assert_eq!(
+            seq_warnings.len(),
+            1,
+            "the fixture's dark has MAD = 0: exactly one refusal warning is expected: {seq_warnings:?}"
+        );
+    }
 
     #[test]
     fn calibrate_stage_reuses_fresh_artifacts_and_regenerates_stale_ones() {
