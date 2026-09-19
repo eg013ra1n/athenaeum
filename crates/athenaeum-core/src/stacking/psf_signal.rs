@@ -203,23 +203,69 @@ fn moment_ellipse(px: &[PixelSample], b0: f64) -> Option<(f64, f64, f64)> {
     Some((l1.sqrt(), l2.sqrt(), theta))
 }
 
+/// Pushes the finite pixels of row `y`, columns `xs`, onto `scratch`.
+/// `xs` is a plain range (inclusive or not) so both a full-width row and a
+/// side-strip's narrow one share this loop.
+fn push_finite_row(
+    data: &[f32],
+    w: usize,
+    y: i64,
+    xs: impl Iterator<Item = i64>,
+    scratch: &mut Vec<f32>,
+) {
+    let row = y as usize * w;
+    for x in xs {
+        let v = data[row + x as usize];
+        if v.is_finite() {
+            scratch.push(v);
+        }
+    }
+}
+
 /// Median of the `(2r+1)²` square centred on `(cx, cy)`, non-finite pixels
 /// skipped. `None` when the square holds no finite pixel.
+///
+/// `scratch` is the running multiset the caller (`sampling_radius`) grows
+/// as it grows `r`: when `prev_r` is `Some`, `scratch` already holds the
+/// finite pixels of the smaller `(2*prev_r+1)²` square and only the RING
+/// newly exposed between `prev_r` and `r` is appended — the two squares
+/// share a centre and `sampling_radius` only ever grows `r`, so that ring
+/// is the exact set difference of the two squares, each pixel entering the
+/// multiset exactly once. `prev_r = None` rebuilds the square from
+/// scratch (the growth loop's first radius). Either way the resulting
+/// multiset is identical to a full rebuild at `r` — a median does not
+/// depend on insertion order.
 fn region_median(
     data: &[f32],
     w: usize,
     cx: i64,
     cy: i64,
+    prev_r: Option<i64>,
     r: i64,
     scratch: &mut Vec<f32>,
 ) -> Option<f64> {
-    scratch.clear();
-    for y in cy - r..=cy + r {
-        let row = y as usize * w;
-        for x in cx - r..=cx + r {
-            let v = data[row + x as usize];
-            if v.is_finite() {
-                scratch.push(v);
+    match prev_r {
+        None => {
+            scratch.clear();
+            for y in cy - r..=cy + r {
+                push_finite_row(data, w, y, cx - r..=cx + r, scratch);
+            }
+        }
+        Some(pr) => {
+            debug_assert!(r > pr, "sampling_radius only ever grows r");
+            // Top and bottom strips: full new width, the rows the smaller
+            // square did not cover at all.
+            for y in cy - r..cy - pr {
+                push_finite_row(data, w, y, cx - r..=cx + r, scratch);
+            }
+            for y in (cy + pr + 1)..=(cy + r) {
+                push_finite_row(data, w, y, cx - r..=cx + r, scratch);
+            }
+            // Left and right strips: the smaller square's own row range,
+            // the new columns only.
+            for y in cy - pr..=cy + pr {
+                push_finite_row(data, w, y, cx - r..cx - pr, scratch);
+                push_finite_row(data, w, y, (cx + pr + 1)..=(cx + r), scratch);
             }
         }
     }
@@ -250,16 +296,18 @@ fn sampling_radius(
     r_start: i64,
     r_max: i64,
     p: &FitParams,
+    scratch: &mut Vec<f32>,
 ) -> i64 {
     let step = p.region_growth_step_px.max(1) as i64;
-    let mut scratch: Vec<f32> = Vec::new();
     let mut r = r_start;
-    let Some(mut prev) = region_median(data, w, cx, cy, r, &mut scratch) else {
+    let Some(mut prev) = region_median(data, w, cx, cy, None, r, scratch) else {
         return r;
     };
     while r + step <= r_max {
         let next = r + step;
-        let Some(m) = region_median(data, w, cx, cy, next, &mut scratch) else {
+        // `scratch` currently holds exactly the square at `r` (the last
+        // radius region_median built or grew it to) — that IS `prev_r`.
+        let Some(m) = region_median(data, w, cx, cy, Some(r), next, scratch) else {
             return r;
         };
         r = next;
@@ -269,6 +317,23 @@ fn sampling_radius(
         prev = m;
     }
     r
+}
+
+/// Per-worker scratch [`fit_one`] reuses across seeds instead of
+/// allocating fresh buffers every call: the region-median growth's running
+/// multiset (`region`) and the stamp's pixel/value buffers (`px`/`vals`).
+/// `fit_all` hands one instance to each rayon worker via `map_init` (a
+/// thread-local, one instance per worker for the whole `fit_all` call, not
+/// per seed) instead of `fit_one` allocating two fresh `Vec`s — three,
+/// counting `region` — on every seed. Every buffer is `clear()`ed at the
+/// point it starts being rebuilt for a new seed, so a worker's retained
+/// capacity is invisible to the numbers: the content is always exactly
+/// what a fresh, empty `Vec` would have accumulated.
+#[derive(Default)]
+struct FitScratch {
+    region: Vec<f32>,
+    px: Vec<PixelSample>,
+    vals: Vec<f32>,
 }
 
 /// Fit one seed with a fixed β, seeded from the field σ (size) and the
@@ -283,6 +348,7 @@ fn fit_one(
     sigma0: f64,
     beta: f64,
     p: &FitParams,
+    scratch: &mut FitScratch,
 ) -> Option<StarFit> {
     // Admission: the seed must have room for the NOMINAL stamp. The
     // adaptive region below starts at half of it and may grow to twice it,
@@ -297,10 +363,12 @@ fn fit_one(
     let to_border = cx.min(cy).min(w as i64 - 1 - cx).min(h as i64 - 1 - cy);
     let r_max = (2 * nominal).min(48).min(to_border);
     let r_start = (nominal / 2).max(3).min(r_max);
-    let r = sampling_radius(data, w, cx, cy, r_start, r_max, p);
+    let r = sampling_radius(data, w, cx, cy, r_start, r_max, p, &mut scratch.region);
     let cap = ((2 * r + 1) * (2 * r + 1)) as usize;
-    let mut px = Vec::with_capacity(cap);
-    let mut vals = Vec::with_capacity(cap);
+    scratch.px.clear();
+    scratch.px.reserve(cap);
+    scratch.vals.clear();
+    scratch.vals.reserve(cap);
     let mut peak = f64::NEG_INFINITY;
     for y in cy - r..=cy + r {
         for x in cx - r..=cx + r {
@@ -309,23 +377,23 @@ fn fit_one(
                 continue;
             }
             peak = peak.max(v as f64);
-            vals.push(v);
-            px.push(PixelSample {
+            scratch.vals.push(v);
+            scratch.px.push(PixelSample {
                 x: x as f64,
                 y: y as f64,
                 value: v as f64,
             });
         }
     }
-    if px.len() < 10 {
+    if scratch.px.len() < 10 {
         return None;
     }
-    let b0 = median_in_place(&mut vals) as f64;
+    let b0 = median_in_place(&mut scratch.vals) as f64;
     let a0 = (peak - b0).max(1e-9);
     // Size from the field σ (flux/peak), orientation and axis ratio from the
     // stamp's moments: a circular θ = 0 seed leaves an elongated star in an
     // axis-aligned local minimum, and Moffat wings inflate the moments' size.
-    let (sx0, sy0, th0) = match moment_ellipse(&px, b0) {
+    let (sx0, sy0, th0) = match moment_ellipse(&scratch.px, b0) {
         Some((major, minor, theta)) => {
             let q = (major / minor).clamp(1.0, 4.0).sqrt();
             (sigma0 * q, sigma0 / q, theta)
@@ -333,7 +401,7 @@ fn fit_one(
         None => (sigma0, sigma0, 0.0),
     };
     let fit = fit_moffat_2d_fixed_beta(
-        &px,
+        &scratch.px,
         b0,
         a0,
         seed.x,
@@ -500,7 +568,14 @@ fn fit_all(
     let body = || {
         seeds
             .par_iter()
-            .filter_map(|s| fit_one(data, w, h, s, sigma0, beta, p))
+            // `map_init` calls `FitScratch::default` once per worker (not
+            // per seed) and hands that same instance to every seed the
+            // worker processes — `fit_one` clears each buffer itself, so
+            // this is only the allocation that disappears, never the data.
+            .map_init(FitScratch::default, |scratch, s| {
+                fit_one(data, w, h, s, sigma0, beta, p, scratch)
+            })
+            .filter_map(|f| f)
             .collect()
     };
     match pool {
@@ -1125,6 +1200,207 @@ mod tests {
             accept(&fit, &seed, cx, cy, r, &off).is_some(),
             "with the rule off the same fit is accepted"
         );
+    }
+
+    // --- Task 5 pin: sampling_radius's incremental ring-append multiset ---
+
+    /// An INDEPENDENT re-implementation of the pre-Task-5 rescan-every-step
+    /// algorithm — full `(2r+1)²` square rebuild at every radius, never
+    /// calling `region_median`/`push_finite_row` — so the pin tests below
+    /// check the incremental code against a real oracle, not against a copy
+    /// of itself.
+    fn pin_rescan_region_median(data: &[f32], w: usize, cx: i64, cy: i64, r: i64) -> Option<f64> {
+        let mut v: Vec<f32> = Vec::new();
+        for y in cy - r..=cy + r {
+            let row = y as usize * w;
+            for x in cx - r..=cx + r {
+                let p = data[row + x as usize];
+                if p.is_finite() {
+                    v.push(p);
+                }
+            }
+        }
+        if v.is_empty() {
+            return None;
+        }
+        Some(median_in_place(&mut v) as f64)
+    }
+
+    /// The pre-Task-5 growth loop over [`pin_rescan_region_median`], byte-
+    /// for-byte the same control flow `sampling_radius` has (same stop
+    /// rule), returning the stopping radius AND every median it visited.
+    fn pin_rescan_sampling_radius(
+        data: &[f32],
+        w: usize,
+        cx: i64,
+        cy: i64,
+        r_start: i64,
+        r_max: i64,
+        p: &FitParams,
+    ) -> (i64, Vec<f64>) {
+        let step = p.region_growth_step_px.max(1) as i64;
+        let mut seq = Vec::new();
+        let mut r = r_start;
+        let Some(mut prev) = pin_rescan_region_median(data, w, cx, cy, r) else {
+            return (r, seq);
+        };
+        seq.push(prev);
+        while r + step <= r_max {
+            let next = r + step;
+            let Some(m) = pin_rescan_region_median(data, w, cx, cy, next) else {
+                return (r, seq);
+            };
+            r = next;
+            seq.push(m);
+            if !(m < (1.0 - p.region_growth_min_drop) * prev) {
+                break;
+            }
+            prev = m;
+        }
+        (r, seq)
+    }
+
+    /// Mirrors `sampling_radius`'s own loop exactly, but through the real
+    /// (incremental) `region_median`, collecting every intermediate median
+    /// — `sampling_radius` itself only returns the final radius.
+    fn incremental_sampling_radius_with_seq(
+        data: &[f32],
+        w: usize,
+        cx: i64,
+        cy: i64,
+        r_start: i64,
+        r_max: i64,
+        p: &FitParams,
+    ) -> (i64, Vec<f64>) {
+        let step = p.region_growth_step_px.max(1) as i64;
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut seq = Vec::new();
+        let mut r = r_start;
+        let Some(mut prev) = region_median(data, w, cx, cy, None, r, &mut scratch) else {
+            return (r, seq);
+        };
+        seq.push(prev);
+        while r + step <= r_max {
+            let next = r + step;
+            let Some(m) = region_median(data, w, cx, cy, Some(r), next, &mut scratch) else {
+                return (r, seq);
+            };
+            r = next;
+            seq.push(m);
+            if !(m < (1.0 - p.region_growth_min_drop) * prev) {
+                break;
+            }
+            prev = m;
+        }
+        (r, seq)
+    }
+
+    /// A fixture star well inside the field, growth walking several steps.
+    #[test]
+    fn sampling_radius_incremental_matches_rescan_on_a_normal_star() {
+        let stars = [round(100.4, 100.6, 0.6)];
+        let mut data = moffat_field(200, 200, &stars, 4.0, 0.05);
+        add_noise(&mut data, 0.01, 41);
+        let p = FitParams::default();
+        let (cx, cy) = (100i64, 100i64);
+        let (r_start, r_max) = (5i64, 25i64);
+
+        let (r_ref, seq_ref) = pin_rescan_sampling_radius(&data, 200, cx, cy, r_start, r_max, &p);
+        let (r_seq, seq_new) =
+            incremental_sampling_radius_with_seq(&data, 200, cx, cy, r_start, r_max, &p);
+        let mut scratch: Vec<f32> = Vec::new();
+        let r_prod = sampling_radius(&data, 200, cx, cy, r_start, r_max, &p, &mut scratch);
+
+        assert_eq!(
+            r_prod, r_seq,
+            "production sampling_radius vs the sequence wrapper"
+        );
+        assert_eq!(r_ref, r_seq, "growth stopped at a different radius");
+        assert_eq!(seq_ref.len(), seq_new.len(), "different number of steps");
+        for (a, b) in seq_ref.iter().zip(&seq_new) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "median sequence: {seq_ref:?} vs {seq_new:?}"
+            );
+        }
+
+        // Recorded literals (Task 5, pinned before the incremental change
+        // shipped, cross-checked against `pin_rescan_sampling_radius` above
+        // on every run — this assertion additionally survives a future
+        // change that broke both the oracle and the incremental code the
+        // same way).
+        assert_eq!(r_prod, 15);
+        let expected: [f64; 11] = [
+            0.11737800389528275,
+            0.07933449000120163,
+            0.06783409416675568,
+            0.06370921432971954,
+            0.05825279280543327,
+            0.05651697516441345,
+            0.05566517263650894,
+            0.055028729140758514,
+            0.054084811359643936,
+            0.05354057624936104,
+            0.053332407027482986,
+        ];
+        assert_eq!(seq_new.len(), expected.len());
+        for (got, want) in seq_new.iter().zip(&expected) {
+            assert_eq!(got.to_bits(), want.to_bits(), "{seq_new:?} vs {expected:?}");
+        }
+    }
+
+    /// A fixture star near the image border, so `r_max` is tight and the
+    /// growth loop exercises a shorter, boundary-constrained walk.
+    #[test]
+    fn sampling_radius_incremental_matches_rescan_near_the_border() {
+        let stars = [round(15.3, 12.7, 0.5)];
+        let mut data = moffat_field(120, 120, &stars, 3.0, 0.04);
+        add_noise(&mut data, 0.008, 43);
+        let p = FitParams::default();
+        let (cx, cy) = (15i64, 13i64);
+        let to_border = cx.min(cy).min(120 - 1 - cx).min(120 - 1 - cy);
+        let (r_start, r_max) = (3i64, to_border);
+        assert!(r_max >= r_start, "fixture must leave room to grow");
+
+        let (r_ref, seq_ref) = pin_rescan_sampling_radius(&data, 120, cx, cy, r_start, r_max, &p);
+        let (r_seq, seq_new) =
+            incremental_sampling_radius_with_seq(&data, 120, cx, cy, r_start, r_max, &p);
+        let mut scratch: Vec<f32> = Vec::new();
+        let r_prod = sampling_radius(&data, 120, cx, cy, r_start, r_max, &p, &mut scratch);
+
+        assert_eq!(
+            r_prod, r_seq,
+            "production sampling_radius vs the sequence wrapper"
+        );
+        assert_eq!(r_ref, r_seq, "growth stopped at a different radius");
+        assert_eq!(seq_ref.len(), seq_new.len(), "different number of steps");
+        for (a, b) in seq_ref.iter().zip(&seq_new) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "median sequence: {seq_ref:?} vs {seq_new:?}"
+            );
+        }
+
+        assert_eq!(r_prod, 13);
+        let expected: [f64; 11] = [
+            0.255771666765213,
+            0.1849888265132904,
+            0.12626828253269196,
+            0.09833625704050064,
+            0.07689442485570908,
+            0.06416510790586472,
+            0.05707979202270508,
+            0.051649294793605804,
+            0.048868581652641296,
+            0.04728369787335396,
+            0.04579973965883255,
+        ];
+        assert_eq!(seq_new.len(), expected.len());
+        for (got, want) in seq_new.iter().zip(&expected) {
+            assert_eq!(got.to_bits(), want.to_bits(), "{seq_new:?} vs {expected:?}");
+        }
     }
 
     #[test]
