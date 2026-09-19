@@ -20,6 +20,7 @@
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::Context;
 use tracing::info;
@@ -112,7 +113,10 @@ pub fn build_reference(
     input: &GroupInput<'_>,
     included: &[usize],
     n: usize,
-    pool: &rayon::ThreadPool,
+    // An owned `Arc`, not a bare `&rayon::ThreadPool` (perf tier 1 Task 2):
+    // forwarded straight into `integrate_planes`, which needs a clonable
+    // handle for its own `RegisteredSource::with_pool`.
+    pool: &Arc<rayon::ThreadPool>,
     cancel: &AtomicBool,
     io: IoPolicy,
     on_progress: &(dyn Fn(usize, usize) + Sync),
@@ -328,11 +332,13 @@ mod tests {
     use crate::test_support::add_noise;
     use std::sync::Mutex;
 
-    fn pool() -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap()
+    fn pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        )
     }
 
     /// Same shape as `stacking::integrate::tests`'s own `io()` helper — a

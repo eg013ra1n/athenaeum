@@ -1603,6 +1603,7 @@ fn calibrate_one_frame(
         scratch,
         &calibration_opts,
         &mut rc.hot_maps,
+        Some(&rc.ctx.image_pool),
         &rc.cancel,
     );
     let generated = match generated {
@@ -1910,20 +1911,21 @@ fn stage_forces_fresh(rerun_from: Option<Stage>, stage: Stage) -> bool {
 }
 
 /// Memory-budgeted worker count for a fan-out stage (decision 3):
-/// `clamp(budget / working_set, 1, cores)`. `budget = total_ram_bytes() / 4`;
-/// when the total is unknown, the budget is treated as exhausted (admission
-/// 1 — the conservative, single-frame-at-a-time fallback) rather than
-/// guessed. `cores` falls back to 1 when `available_parallelism` fails.
-fn admission(working_set_bytes: u64) -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+/// `clamp(budget / working_set, 1, max_workers)`. `budget =
+/// total_ram_bytes() / 4`; when the total is unknown, the budget is treated
+/// as exhausted (admission 1 — the conservative, single-frame-at-a-time
+/// fallback) rather than guessed. `max_workers` is the app pool's width — a
+/// frame worker that outnumbers the pixel pool only queues behind it (perf
+/// tier 1 Task 2: every fan-out's own worker threads now hand their pixel
+/// work to `image_pool`, so admitting more frame workers than the pool has
+/// threads cannot buy any more parallelism, only more RAM held at once).
+fn admission(working_set_bytes: u64, max_workers: usize) -> usize {
     let working_set = working_set_bytes.max(1);
     let n = match total_ram_bytes() {
         Some(total) => (total / 4) / working_set,
         None => 1,
     };
-    n.clamp(1, cores as u64) as usize
+    n.clamp(1, max_workers.max(1) as u64) as usize
 }
 
 /// One line per fan-out stating what `admission` decided and from what —
@@ -2380,7 +2382,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 
         if !needing_measure.is_empty() {
             let working_set_bytes = 8 * max_planes as u64 * group_max_w * group_max_h * 4;
-            let admission_n = admission(working_set_bytes);
+            let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
             log_admission(
                 rc,
                 Stage::Measure,
@@ -3304,7 +3306,7 @@ fn register_group_pass(
         (geometry.width, geometry.height)
     };
     let working_set_bytes = 4 * ref_w as u64 * ref_h as u64 * 4;
-    let admission_n = admission(working_set_bytes);
+    let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     log_admission(
         rc,
         Stage::Register,
@@ -5743,7 +5745,7 @@ fn process_group_output(
 
     let integrate_start = Instant::now();
     let cancel: &AtomicBool = &rc.cancel;
-    let pool: &rayon::ThreadPool = rc.ctx.image_pool.as_ref();
+    let pool: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
     let output = match integrate_group(&input, measure_opts, pool, cancel, &progress, io) {
         Ok(o) => o,
         Err(IntegrationError::Cancelled) => return Err(RunError::Cancelled),
@@ -7050,7 +7052,7 @@ fn run_group_normalization(
 
     let working_set_bytes =
         input.channels as u64 * input.width as u64 * input.height as u64 * 4 * 2;
-    let admission_n = admission(working_set_bytes);
+    let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     log_admission(
         rc,
         Stage::Normalize,
@@ -7061,6 +7063,7 @@ fn run_group_normalization(
     let interpolation = input.interpolation;
     let clamping = input.clamping;
     let cancel_ref: &AtomicBool = &rc.cancel;
+    let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
     let stack_frames_ref: &[StackFrame] = input.frames;
     let ref_backgrounds_ref: &[BackgroundGrid] = &ref_backgrounds;
     let ln_reference_ref: &LnReference = &ln_reference;
@@ -7094,6 +7097,7 @@ fn run_group_normalization(
                 interpolation,
                 clamping,
                 &sidecar_paths_ref[i],
+                Some(pool_ref),
                 cancel_ref,
             )
             .map_err(|e| e.to_string());
@@ -7316,7 +7320,7 @@ fn build_and_write_ln_reference(
         );
     };
     let cancel: &AtomicBool = &rc.cancel;
-    let pool: &rayon::ThreadPool = rc.ctx.image_pool.as_ref();
+    let pool: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
 
     let built = build_ln_reference(input, included, n, pool, cancel, io, &on_build_progress)
         .map_err(|e| {

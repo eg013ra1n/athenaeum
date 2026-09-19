@@ -490,6 +490,7 @@ pub fn execute_generation(
     scratch_dir: &Path,
     opts: &CalibratedLightOptions,
     hot_maps: &mut HashMap<PathBuf, Arc<HotPixelMapOutcome>>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> anyhow::Result<GeneratedLight> {
     let t = Instant::now();
@@ -651,10 +652,16 @@ pub fn execute_generation(
     // it ever did it would leave the mosaic intact rather than guess a phase.
     let t = Instant::now();
     let (data, channels) = match (spec.debayer, spec.cfa_geometry) {
-        (true, Some(geom)) => (
-            vng_debayer_f32(&frame.data, frame.width, frame.height, bayer_for(geom)),
-            3usize,
-        ),
+        (true, Some(geom)) => {
+            let pattern = bayer_for(geom);
+            let rgb = match pool {
+                Some(p) => {
+                    p.install(|| vng_debayer_f32(&frame.data, frame.width, frame.height, pattern))
+                }
+                None => vng_debayer_f32(&frame.data, frame.width, frame.height, pattern),
+            };
+            (rgb, 3usize)
+        }
         _ => (frame.data, 1usize),
     };
     let debayered = channels == 3;
@@ -989,6 +996,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut HashMap::new(),
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1181,6 +1189,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut hot_maps,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1245,6 +1254,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut hot_maps,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1279,6 +1289,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut hot_maps,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1328,6 +1339,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut hot_maps,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1369,6 +1381,7 @@ mod tests {
                 dir.path(),
                 &opts,
                 &mut hot_maps,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -1421,6 +1434,7 @@ mod tests {
                 dir.path(),
                 &opts,
                 &mut hot_maps,
+                None,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -1494,6 +1508,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut HashMap::new(),
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1644,6 +1659,7 @@ mod tests {
             dir.path(),
             &plain_opts,
             &mut HashMap::new(),
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1665,6 +1681,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut HashMap::new(),
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1729,6 +1746,7 @@ mod tests {
             dir.path(),
             &opts,
             &mut HashMap::new(),
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -1757,6 +1775,7 @@ mod tests {
             dir.path(),
             &mono_opts,
             &mut HashMap::new(),
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();

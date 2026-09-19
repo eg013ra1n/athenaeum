@@ -107,6 +107,7 @@ pub fn run_export_organize(
         frame_set_id,
         cancel_flag.as_ref(),
         generation.as_mut(),
+        Some(&ctx.image_pool),
     )
     .map_err(|e| ApiError::Internal(format!("Failed to organize files: {e:#}")))?;
     Ok(ExportRunOutcome::Organized(result))

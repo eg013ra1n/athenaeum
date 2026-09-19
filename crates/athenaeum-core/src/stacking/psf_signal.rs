@@ -5,6 +5,7 @@
 //! PSF SNR formulas. Coordinates are 0-based pixel centres.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use astroimage::analysis::fitting::{fit_moffat_2d_fixed_beta, Moffat2DResult, PixelSample};
 use rayon::prelude::*;
@@ -479,6 +480,13 @@ fn dedupe(mut fits: Vec<StarFit>) -> Vec<StarFit> {
     out
 }
 
+/// `seeds.par_iter()`'s work runs on `pool` when given one (perf tier 1
+/// Task 2) — without it, the fit lands on rayon's GLOBAL pool, sized by
+/// `available_parallelism` and invisible to `image_pool`/the admission
+/// budget. A caller that has already entered a `pool.install` (`measure.rs`
+/// wraps the whole `fit_stars` call) passes `None` here — nesting an
+/// `install` inside another is legal but pointless, since the outer one
+/// already runs every parallel iterator inside it on that same pool.
 fn fit_all(
     data: &[f32],
     w: usize,
@@ -487,11 +495,18 @@ fn fit_all(
     sigma0: f64,
     beta: f64,
     p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Vec<StarFit> {
-    seeds
-        .par_iter()
-        .filter_map(|s| fit_one(data, w, h, s, sigma0, beta, p))
-        .collect()
+    let body = || {
+        seeds
+            .par_iter()
+            .filter_map(|s| fit_one(data, w, h, s, sigma0, beta, p))
+            .collect()
+    };
+    match pool {
+        Some(pl) => pl.install(body),
+        None => body(),
+    }
 }
 
 /// Fit every seed with the chosen model. `Auto` fits the brightest
@@ -507,6 +522,7 @@ pub fn fit_stars(
     seeds: &[Seed],
     model: PsfModel,
     p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
     let sigma0 = initial_sigma(seeds);
     let beta = match model {
@@ -515,7 +531,7 @@ pub fn fit_stars(
             let sample = &seeds[..seeds.len().min(AUTO_SAMPLE)];
             let mut best: Option<(f64, f64)> = None; // (median residual, β)
             for &b in &AUTO_BETAS {
-                let mut res: Vec<f64> = fit_all(data, w, h, sample, sigma0, b, p)
+                let mut res: Vec<f64> = fit_all(data, w, h, sample, sigma0, b, p, pool)
                     .iter()
                     .map(|f| f.residual)
                     .collect();
@@ -531,7 +547,7 @@ pub fn fit_stars(
             best.map_or(4.0, |(_, b)| b)
         }
     };
-    fit_stars_with_beta(data, w, h, seeds, beta, p)
+    fit_stars_with_beta(data, w, h, seeds, beta, p, pool)
 }
 
 /// Fit every seed at a caller-chosen, already-concrete β — the tail
@@ -555,9 +571,10 @@ pub fn fit_stars_with_beta(
     seeds: &[Seed],
     beta: f64,
     p: &FitParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> FitOutcome {
     let sigma0 = initial_sigma(seeds);
-    let fits = dedupe(fit_all(data, w, h, seeds, sigma0, beta, p));
+    let fits = dedupe(fit_all(data, w, h, seeds, sigma0, beta, p, pool));
     FitOutcome {
         fits,
         beta,
@@ -779,6 +796,7 @@ mod tests {
             &seeds_from(&stars, 4.0),
             PsfModel::Moffat4,
             &FitParams::default(),
+            None,
         );
         assert_eq!(out.beta, 4.0);
         assert_eq!(out.seeds, 3);
@@ -833,6 +851,7 @@ mod tests {
             &seeds_from(&stars, 4.0),
             PsfModel::Auto,
             &FitParams::default(),
+            None,
         );
         assert_eq!(out.beta, 4.0);
         assert!(out.fits.len() >= 60, "{}", out.fits.len());
@@ -848,7 +867,15 @@ mod tests {
                 flux: 2.0 * std::f64::consts::PI * 4.0 * s.amp,
             })
             .collect();
-        let out = fit_stars(&g, 420, 320, &seeds, PsfModel::Auto, &FitParams::default());
+        let out = fit_stars(
+            &g,
+            420,
+            320,
+            &seeds,
+            PsfModel::Auto,
+            &FitParams::default(),
+            None,
+        );
         assert_eq!(
             out.beta, 10.0,
             "a Gaussian field is closest to the largest β"
@@ -899,6 +926,7 @@ mod tests {
             &seeds,
             PsfModel::Auto,
             &FitParams::default(),
+            None,
         );
         let explicit_out = fit_stars_with_beta(
             &data,
@@ -907,6 +935,7 @@ mod tests {
             &seeds,
             auto_out.beta,
             &FitParams::default(),
+            None,
         );
 
         assert_eq!(auto_out.beta, explicit_out.beta);
@@ -949,6 +978,7 @@ mod tests {
             &seeds,
             PsfModel::Moffat4,
             &FitParams::default(),
+            None,
         );
         assert_eq!(out.fits.len(), 1);
         let f = &out.fits[0];
@@ -994,14 +1024,21 @@ mod tests {
             &[good, off, dup, border],
             PsfModel::Moffat4,
             &FitParams::default(),
+            None,
         );
         assert_eq!(out.fits.len(), 1, "{:?}", out.fits);
         assert!((out.fits[0].x - 60.0).abs() < 0.05);
-        assert!(
-            fit_stars(&data, 160, 160, &[], PsfModel::Auto, &FitParams::default())
-                .fits
-                .is_empty()
-        );
+        assert!(fit_stars(
+            &data,
+            160,
+            160,
+            &[],
+            PsfModel::Auto,
+            &FitParams::default(),
+            None
+        )
+        .fits
+        .is_empty());
     }
 
     /// The inner-region rule (math reference §1.4): a fit that settled

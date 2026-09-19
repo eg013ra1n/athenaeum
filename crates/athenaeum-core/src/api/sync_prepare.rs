@@ -653,6 +653,11 @@ struct Generation {
         PathBuf,
         Arc<crate::calibration_library::cosmetic::HotPixelMapOutcome>,
     >,
+    /// The app's own pixel pool (perf tier 1 Task 2) — captured once here
+    /// (where `ctx` is in scope) so `generate_payload`, which only ever
+    /// sees `&mut Generation`, can hand it to `execute_generation` without
+    /// threading `ctx` through on every call.
+    pool: Arc<rayon::ThreadPool>,
 }
 
 /// A build with no pixel pipeline can never generate anything, so the type is
@@ -786,6 +791,7 @@ fn open_generation(
         opts,
         scratch_dir,
         hot_maps: std::collections::HashMap::new(),
+        pool: Arc::clone(&ctx.image_pool),
     })
 }
 
@@ -833,6 +839,7 @@ fn generate_payload(
         &gen.scratch_dir,
         &gen.opts,
         &mut gen.hot_maps,
+        Some(&gen.pool),
         flag,
     )
     .map_err(|e| {

@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use athenaeum_core::db::stacking::{find_artifact, list_frame_rows, list_runs};
 use athenaeum_core::db::Database;
@@ -427,10 +428,12 @@ registration row for each — run stacking through Register first); found {}",
     };
 
     let n = (args.frames as usize).min(stack_frames.len());
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .expect("build a thread pool");
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build a thread pool"),
+    );
     let io = IoPolicy {
         band_budget_bytes: 1 << 30,
         read_concurrency: 4,
@@ -507,6 +510,7 @@ registration row for each — run stacking through Register first); found {}",
         interpolation,
         clamping,
         &sidecar_path,
+        None,
         &cancel,
     )
     .unwrap_or_else(|e| {

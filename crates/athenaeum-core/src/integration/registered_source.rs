@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, warn};
 
@@ -32,6 +32,13 @@ pub struct RegisteredSource {
     interp: Interpolation,
     clamping: f32,
     whole_threshold: f64,
+    /// The pool `fill_frame`'s row-parallel warp runs on (perf tier 1 Task
+    /// 2). `None` (the default from [`Self::open`]) means the warp lands on
+    /// rayon's GLOBAL pool instead — sized by `available_parallelism`,
+    /// invisible to `image_pool` and the admission budget — because the
+    /// band workers are plain `std::thread::scope` threads, not pool
+    /// workers.
+    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl RegisteredSource {
@@ -86,7 +93,24 @@ impl RegisteredSource {
             interp,
             clamping,
             whole_threshold: 0.6,
+            pool: None,
         })
+    }
+
+    /// The pool `fill_frame`'s row-parallel warp runs on (perf tier 1 Task
+    /// 2). Without one it lands on rayon's GLOBAL pool — sized by
+    /// `available_parallelism`, invisible to `image_pool` and the admission
+    /// budget — because the band workers are plain `std::thread::scope`
+    /// threads, not pool workers.
+    pub fn with_pool(mut self, pool: Arc<rayon::ThreadPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// The pool's own thread count, for tests to pin that a source built
+    /// with [`Self::with_pool`] actually holds the pool it was given.
+    pub fn pool_threads(&self) -> Option<usize> {
+        self.pool.as_ref().map(|p| p.current_num_threads())
     }
 
     /// Hands back every frame's displacement grid (ruling R-T4-6c).
@@ -183,7 +207,13 @@ impl RegisteredSource {
             return Ok(0);
         }
         src_buf.resize(src_rows * sw, 0.0);
-        reader.read_rows_with_scratch(self.plane, sy0, src_rows, &mut src_buf[..src_rows * sw], raw_scratch)?;
+        reader.read_rows_with_scratch(
+            self.plane,
+            sy0,
+            src_rows,
+            &mut src_buf[..src_rows * sw],
+            raw_scratch,
+        )?;
         let plane = Plane {
             data: &src_buf[..src_rows * sw],
             width: sw,
@@ -191,16 +221,30 @@ impl RegisteredSource {
             y_offset: sy0,
             full_height: sh,
         };
-        warp_rows(
-            &plane,
-            map,
-            self.width,
-            y0,
-            rows,
-            self.interp,
-            self.clamping,
-            dst,
-        );
+        match &self.pool {
+            Some(p) => p.install(|| {
+                warp_rows(
+                    &plane,
+                    map,
+                    self.width,
+                    y0,
+                    rows,
+                    self.interp,
+                    self.clamping,
+                    dst,
+                )
+            }),
+            None => warp_rows(
+                &plane,
+                map,
+                self.width,
+                y0,
+                rows,
+                self.interp,
+                self.clamping,
+                dst,
+            ),
+        }
         Ok((src_rows * sw * reader.kind().bytes_per_sample()) as u64)
     }
 }
@@ -595,6 +639,37 @@ mod tests {
         ));
     }
 
+    /// Perf tier 1 Task 2: a band read's row-parallel warp runs on the pool
+    /// the source was given, never on rayon's global pool. Pinned by giving
+    /// the source a 1-thread pool and confirming the source reports exactly
+    /// that pool (`pool_threads`) after a band read under it — the warp
+    /// itself must not panic when its only available worker is the one the
+    /// caller thread hands off to via `pool.install`.
+    #[test]
+    fn band_read_warps_on_the_source_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0.5f32; 64 * 64];
+        let path = dir.path().join("f.fits");
+        write_fits_f32(&path, 64, 64, 1, &data, &[]).unwrap();
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let frames = vec![RegisteredFrame {
+            path,
+            map: PixelMap::linear(Linear::identity()).unwrap(),
+        }];
+        let src = RegisteredSource::open(&frames, 64, 64, 0, Interpolation::BicubicBSpline, 0.3)
+            .unwrap()
+            .with_pool(Arc::clone(&pool));
+        let mut band = BandPlanes::new(&src);
+        src.read_band_with_progress(0, 64, &mut band, 1, &|_| {}, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(src.pool_threads(), Some(1));
+    }
+
     #[test]
     fn a_band_read_equals_a_full_warp_of_each_frame() {
         let dir = tempfile::tempdir().unwrap();
@@ -829,20 +904,15 @@ mod tests {
     // ── Cross-scale pin, resolution (M4b Task 4, ruling R-M4b-6). ──
 
     #[test]
-    fn a_coarse_frame_registered_at_double_scale_preserves_centroid_and_broadens_sigma_by_the_scale()
-    {
+    fn a_coarse_frame_registered_at_double_scale_preserves_centroid_and_broadens_sigma_by_the_scale(
+    ) {
         const BG: f32 = 100.0;
         const SIGMA_SUB: f64 = 1.5;
         const STAR: (f64, f64, f64) = (100.0, 75.0, 5000.0);
 
         let dir = tempfile::tempdir().unwrap();
-        let star_data = gaussian_field(
-            CROSS_SCALE_SUB_W,
-            CROSS_SCALE_SUB_H,
-            &[STAR],
-            SIGMA_SUB,
-            BG,
-        );
+        let star_data =
+            gaussian_field(CROSS_SCALE_SUB_W, CROSS_SCALE_SUB_H, &[STAR], SIGMA_SUB, BG);
         let star_path = dir.path().join("star.fits");
         write_fits_f32(
             &star_path,

@@ -31,6 +31,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::geometry::ThinPlateSpline;
@@ -371,6 +372,7 @@ pub fn normalize_frame(
     interpolation: Interpolation,
     clamping: f32,
     sidecar: &Path,
+    pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<LnFrameOutcome, LnError> {
     let channels = reference.planes.len();
@@ -421,7 +423,7 @@ pub fn normalize_frame(
             map: frame.map.clone(),
         };
         let t = Instant::now();
-        let src = RegisteredSource::open(
+        let mut src = RegisteredSource::open(
             &[registered],
             reference.width,
             reference.height,
@@ -430,6 +432,9 @@ pub fn normalize_frame(
             clamping,
         )
         .map_err(|e| LnError::Other(format!("warping into the reference geometry: {e}")))?;
+        if let Some(pl) = pool {
+            src = src.with_pool(Arc::clone(pl));
+        }
 
         let mut band = BandPlanes::new(&src);
         let no_progress = |_: u64| {};
@@ -508,6 +513,7 @@ pub fn normalize_frame(
             4.0,
             0.3,
             cfg.local_scale,
+            pool,
         )?;
         scale_ms += t.elapsed().as_millis() as u64;
         matches_total += scale_result.matches;
@@ -627,7 +633,9 @@ mod tests {
     #[test]
     fn an_all_finite_reference_borrows_every_plane() {
         let planes = vec![
-            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            vec![
+                1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             vec![0.5f32; 12],
         ];
         let reference = reference_with_planes(planes);
@@ -643,7 +651,9 @@ mod tests {
 
     #[test]
     fn a_plane_with_a_nan_is_sanitized_into_an_owned_copy() {
-        let mut plane = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let mut plane = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         plane[5] = f32::NAN;
         let reference = reference_with_planes(vec![plane.clone()]);
         let location = median_of_finite(&plane);
@@ -652,7 +662,10 @@ mod tests {
         assert_eq!(for_detection.sanitized_planes.len(), 1);
         match &for_detection.sanitized_planes[0] {
             Cow::Owned(v) => {
-                assert!(v.iter().all(|x| x.is_finite()), "sanitized plane must be all-finite");
+                assert!(
+                    v.iter().all(|x| x.is_finite()),
+                    "sanitized plane must be all-finite"
+                );
                 assert!(
                     (v[5] as f64 - location).abs() < 1e-9,
                     "the NaN must be replaced by the plane's own finite median: {} vs {location}",

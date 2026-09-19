@@ -297,7 +297,11 @@ pub fn measure_plane_with_seeds(
         }
     };
     let t = Instant::now();
-    let (noise_adu, noise_source) = match psf_signal::noise_mrs(&scaled, w, h) {
+    let mrs = match pool {
+        Some(p) => p.install(|| psf_signal::noise_mrs(&scaled, w, h)),
+        None => psf_signal::noise_mrs(&scaled, w, h),
+    };
+    let (noise_adu, noise_source) = match mrs {
         Some(n) => (n as f64, NoiseSource::Mrs),
         None => {
             warn!(
@@ -445,10 +449,13 @@ pub fn measure_plane_with_seeds(
     let params = FitParams::default();
     let t = Instant::now();
     let outcome = match pool {
-        Some(p) => {
-            p.install(|| psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params))
-        }
-        None => psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params),
+        // Already inside this `install` — `fit_stars`'s own pool param gets
+        // `None` so it does not nest a second, pointless `install` inside
+        // this one (perf tier 1 Task 2).
+        Some(p) => p.install(|| {
+            psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params, None)
+        }),
+        None => psf_signal::fit_stars(&scaled, w, h, &seeds, opts.psf_model, &params, None),
     };
     let fit_ms = t.elapsed().as_millis() as u64;
     let totals = psf_signal::signal_totals(&outcome.fits);

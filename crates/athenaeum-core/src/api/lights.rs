@@ -161,9 +161,9 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
     let nothing_linked = r.total > 0 && r.unlinked_lights == r.total;
     match mode {
         ExportMode::LightsOnly => Ok(()),
-        ExportMode::RawWithCalibrationSets | ExportMode::RawWithMasters if nothing_linked => Err(
-            "No calibration is linked to this set — only the lights would land".to_string(),
-        ),
+        ExportMode::RawWithCalibrationSets | ExportMode::RawWithMasters if nothing_linked => {
+            Err("No calibration is linked to this set — only the lights would land".to_string())
+        }
         // The sets mode lands the raw originals behind every built master; an
         // original that is not on disk (archived after the build, or moved)
         // is refused here, up front, with the transform's own sentence.
@@ -1091,9 +1091,15 @@ mod tests {
         };
         assert!(check_mode_ready(&nothing, ExportMode::LightsOnly).is_ok());
         let msg = check_mode_ready(&nothing, ExportMode::RawWithCalibrationSets).unwrap_err();
-        assert_eq!(msg, "No calibration is linked to this set — only the lights would land");
+        assert_eq!(
+            msg,
+            "No calibration is linked to this set — only the lights would land"
+        );
         let msg = check_mode_ready(&nothing, ExportMode::RawWithMasters).unwrap_err();
-        assert_eq!(msg, "No calibration is linked to this set — only the lights would land");
+        assert_eq!(
+            msg,
+            "No calibration is linked to this set — only the lights would land"
+        );
         let msg = check_mode_ready(&nothing, ExportMode::CalibratedLights).unwrap_err();
         assert_eq!(msg, "4 lights have no calibration links");
         // A set with no lights is empty, not "nothing linked".
@@ -2383,9 +2389,17 @@ mod real_data_e2e {
                 ),
                 "output naming must come from the one shared rule"
             );
-            let generated =
-                execute_generation(&spec, &out, None, &scratch, &opts, &mut hot_maps, &cancel)
-                    .unwrap();
+            let generated = execute_generation(
+                &spec,
+                &out,
+                None,
+                &scratch,
+                &opts,
+                &mut hot_maps,
+                None,
+                &cancel,
+            )
+            .unwrap();
 
             assert_eq!(generated.calstat, "BDF", "frame {fid} calstat");
             assert!(!generated.debayered);

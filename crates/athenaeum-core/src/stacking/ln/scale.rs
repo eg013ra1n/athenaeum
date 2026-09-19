@@ -32,6 +32,7 @@
 
 use std::collections::HashSet;
 use std::f64::consts::{PI, SQRT_2};
+use std::sync::Arc;
 
 use tracing::{debug, warn};
 
@@ -110,9 +111,15 @@ pub struct ScaleResult {
 /// preserved through `to_seed` and by `fit_stars`/`fit_stars_with_beta`.
 /// Shared by the reference's own-model fit and the target's
 /// reference-β fit in [`relative_scale`].
-fn detect_seeds(data: &[f32], width: usize, height: usize, max_stars: usize) -> Vec<Seed> {
+fn detect_seeds(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    max_stars: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<Seed> {
     let cfg = DetectionConfig::default();
-    let stars = detect_stars(data, width, height, &cfg, max_stars, None);
+    let stars = detect_stars(data, width, height, &cfg, max_stars, pool);
     stars.iter().map(to_seed).collect()
 }
 
@@ -453,8 +460,12 @@ impl PreparedReferenceChannel {
         max_stars: usize,
     ) -> PreparedReferenceChannel {
         let fit_params = FitParams::default();
-        let ref_seeds = detect_seeds(reference, width, height, max_stars);
-        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params);
+        // No pool here — `PreparedReferenceChannel` has no `ServiceContext`/
+        // `RunContext` in scope (perf tier 1 Task 2's own listed call sites
+        // stop at `detect_seeds`/`relative_scale_against`); this runs on
+        // rayon's global pool, unchanged from before this task.
+        let ref_seeds = detect_seeds(reference, width, height, max_stars, None);
+        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, None);
         let fit_positions: Vec<Option<(f64, f64)>> =
             outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
         let (tree, fit_of_point) = tree_over(&fit_positions);
@@ -510,9 +521,10 @@ pub fn relative_scale_against(
     match_radius_px: f64,
     rcr_limit: f64,
     local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ScaleResult, LnError> {
     let fit_params = FitParams::default();
-    let tgt_seeds = detect_seeds(target, width, height, max_stars);
+    let tgt_seeds = detect_seeds(target, width, height, max_stars, pool);
     let tgt_outcome = fit_stars_with_beta(
         target,
         width,
@@ -520,6 +532,7 @@ pub fn relative_scale_against(
         &tgt_seeds,
         prepared.outcome.beta,
         &fit_params,
+        pool,
     );
 
     // Pass 1 on the PSF-fit centroids; pass 2 (ruling R-M4c-9) on the
@@ -600,6 +613,7 @@ pub fn relative_scale(
         match_radius_px,
         rcr_limit,
         local_scale,
+        None,
     )
 }
 
@@ -697,9 +711,10 @@ mod tests {
 
         let prepared =
             PreparedReferenceChannel::build(&reference, WIDTH, HEIGHT, PsfModel::Moffat4, 200);
-        let via_prepared =
-            relative_scale_against(&prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false)
-                .expect("the same prepared reference must match the same target");
+        let via_prepared = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("the same prepared reference must match the same target");
 
         assert_eq!(via_wrapper, via_prepared);
     }
@@ -876,7 +891,7 @@ mod tests {
         // Independently resolve what `Auto` picks for the REFERENCE alone,
         // the exact same way `relative_scale` does internally — the
         // target must have been fitted at this same β, not its own.
-        let ref_seeds = detect_seeds(&reference, WIDTH, HEIGHT, 200);
+        let ref_seeds = detect_seeds(&reference, WIDTH, HEIGHT, 200, None);
         let ref_out = fit_stars(
             &reference,
             WIDTH,
@@ -884,6 +899,7 @@ mod tests {
             &ref_seeds,
             PsfModel::Auto,
             &FitParams::default(),
+            None,
         );
 
         assert_eq!(r.beta, ref_out.beta);

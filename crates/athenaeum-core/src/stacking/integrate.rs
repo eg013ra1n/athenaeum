@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -562,7 +563,11 @@ pub(crate) fn integrate_planes<'g>(
     forced: Option<&RejForcedSource>,
     recipe: IntegrationRecipe,
     write_maps: bool,
-    pool: &rayon::ThreadPool,
+    // An owned `Arc`, not a bare `&rayon::ThreadPool` (perf tier 1 Task 2):
+    // this is the one place a `RegisteredSource` gets built for group
+    // integration, and `RegisteredSource::with_pool` needs a clonable
+    // handle to outlive the call the pool reference alone cannot provide.
+    pool: &Arc<rayon::ThreadPool>,
     cancel: &AtomicBool,
     progress: &GroupProgress<'_>,
     io: IoPolicy,
@@ -640,7 +645,8 @@ pub(crate) fn integrate_planes<'g>(
         0,
         input.interpolation,
         input.clamping,
-    )?;
+    )?
+    .with_pool(Arc::clone(pool));
 
     for p in 0..input.channels {
         if cancel.load(Ordering::Relaxed) {
@@ -822,8 +828,7 @@ fn build_forced_source(
     let paths: Vec<PathBuf> = (0..included_count)
         .map(|k| rej_set.processed_path(k))
         .collect();
-    RejForcedSource::load(&paths, w, h, c)
-        .map_err(|e| IntegrationError::Decode(format!("{e:#}")))
+    RejForcedSource::load(&paths, w, h, c).map_err(|e| IntegrationError::Decode(format!("{e:#}")))
 }
 
 /// Integrates one group, plane by plane (spec §6.1–6.3): resolves the Auto
@@ -835,7 +840,7 @@ fn build_forced_source(
 pub fn integrate_group(
     input: &GroupInput<'_>,
     measure: &MeasureOptions,
-    pool: &rayon::ThreadPool,
+    pool: &Arc<rayon::ThreadPool>,
     cancel: &AtomicBool,
     progress: &GroupProgress<'_>,
     io: IoPolicy,
@@ -926,7 +931,9 @@ pub fn integrate_group(
         // much later when `RejBitmap::read` reports a length/geometry
         // mismatch — after the group's whole integration has already been
         // paid for. Refused here instead, before any pixel work runs.
-        if rej_set.width() != input.width || rej_set.height() != input.height || rej_set.channels() != input.channels
+        if rej_set.width() != input.width
+            || rej_set.height() != input.height
+            || rej_set.channels() != input.channels
         {
             return Err(IntegrationError::BadInput(format!(
                 "rejection bitmap set geometry {}x{}x{} != group geometry {}x{}x{}",
@@ -1387,11 +1394,13 @@ mod tests {
     use crate::stacking::rej::RejBitmap;
     use crate::test_support::{add_noise, centroid, gaussian_field};
 
-    fn pool() -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap()
+    fn pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        )
     }
 
     fn io(band_budget_bytes: usize) -> IoPolicy {
@@ -2237,7 +2246,8 @@ mod tests {
     /// included frame, the reference frame's own pair `(scale 1, offset 0)`
     /// under the default `AdditiveWithScaling` output mode.
     #[test]
-    fn integrate_group_writes_rejection_bitmaps_matching_the_engines_rejected_count_and_output_pairs() {
+    fn integrate_group_writes_rejection_bitmaps_matching_the_engines_rejected_count_and_output_pairs(
+    ) {
         const W: usize = 32;
         const H: usize = 24;
         let dir = tempfile::tempdir().unwrap();
@@ -2275,14 +2285,20 @@ mod tests {
             .collect();
 
         let mut integration = IntegrationConfig::default();
-        integration.rejection = RejectionChoice::SigmaClip { sigma_low: 3.0, sigma_high: 1.0 };
+        integration.rejection = RejectionChoice::SigmaClip {
+            sigma_low: 3.0,
+            sigma_high: 1.0,
+        };
         let normalization = NormalizationConfig::default();
         let pool = pool();
         let on_plane = nop_plane();
         let on_band = nop_band();
         let progress = GroupProgress {
             on_plane: &on_plane,
-            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
         };
 
         let input_plain = GroupInput {
@@ -2338,7 +2354,10 @@ mod tests {
         let stems: Vec<String> = (0..4).map(|i| format!("f{i}")).collect();
         let set = RejBitmapSet::create(&rej_dir, &stems, W, H, 1).unwrap();
 
-        let input = GroupInput { rej: Some(&set), ..input_plain };
+        let input = GroupInput {
+            rej: Some(&set),
+            ..input_plain
+        };
         let out = integrate_group(
             &input,
             &MeasureOptions::default(),
@@ -2353,7 +2372,11 @@ mod tests {
         // (h) output_pairs shape + the reference frame's own identity pair.
         assert_eq!(out.output_pairs.len(), 1, "one entry per channel");
         assert_eq!(out.output_pairs[0].len(), out.included.len());
-        let ref_pos = out.included.iter().position(|&i| i == input.reference).unwrap();
+        let ref_pos = out
+            .included
+            .iter()
+            .position(|&i| i == input.reference)
+            .unwrap();
         let ref_pair = out.output_pairs[0][ref_pos];
         assert_eq!(
             ref_pair.scale, 1.0,
@@ -2439,7 +2462,10 @@ mod tests {
         let on_band = nop_band();
         let progress = GroupProgress {
             on_plane: &on_plane,
-            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
         };
         let err = integrate_group(
             &input,
@@ -2463,7 +2489,10 @@ mod tests {
         let geom_dir = dir.path().join("rej-geom");
         let stems4: Vec<String> = (0..4).map(|i| format!("g{i}")).collect();
         let wrong_geom_set = RejBitmapSet::create(&geom_dir, &stems4, W / 2, H, 1).unwrap();
-        let geom_input = GroupInput { rej: Some(&wrong_geom_set), ..input };
+        let geom_input = GroupInput {
+            rej: Some(&wrong_geom_set),
+            ..input
+        };
         let err = integrate_group(
             &geom_input,
             &MeasureOptions::default(),
@@ -2575,14 +2604,20 @@ mod tests {
         let mut integration = IntegrationConfig::default();
         // 50 % high threshold: the 0.6 core (500 %) is rejected, the 0.12
         // shoulder (20 %) is not.
-        integration.rejection = RejectionChoice::PercentileClip { low: 0.2, high: 0.5 };
+        integration.rejection = RejectionChoice::PercentileClip {
+            low: 0.2,
+            high: 0.5,
+        };
         let normalization = NormalizationConfig::default();
         let pool = pool();
         let on_plane = nop_plane();
         let on_band = nop_band();
         let progress = GroupProgress {
             on_plane: &on_plane,
-            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
         };
         let input_off = GroupInput {
             frames: &frames,
@@ -2649,9 +2684,15 @@ mod tests {
             let bm = RejBitmap::read(&path, W, H, 1).unwrap();
             let bits = bm.count();
             if k == trail_idx {
-                assert!(bits > 0, "the trail frame's processed bitmap must carry bits");
+                assert!(
+                    bits > 0,
+                    "the trail frame's processed bitmap must carry bits"
+                );
             } else {
-                assert_eq!(bits, 0, "frame {k}'s speckle must be erased, got {bits} bits");
+                assert_eq!(
+                    bits, 0,
+                    "frame {k}'s speckle must be erased, got {bits} bits"
+                );
             }
         }
 
@@ -2704,7 +2745,8 @@ mod tests {
             // `rejected_fraction_per_frame` is that frame's rejected
             // samples over its own samples; every sample here is finite
             // (identity maps, one plane), so the denominator is `W · H`.
-            let reported = (on.stats.rejected_fraction_per_frame[k] * (W * H) as f64).round() as u64;
+            let reported =
+                (on.stats.rejected_fraction_per_frame[k] * (W * H) as f64).round() as u64;
             assert_eq!(
                 second.count(),
                 reported,
@@ -2721,7 +2763,11 @@ mod tests {
         );
 
         let row_mean = |data: &[f32], y: usize| -> f64 {
-            data[y * W..(y + 1) * W].iter().map(|&v| v as f64).sum::<f64>() / W as f64
+            data[y * W..(y + 1) * W]
+                .iter()
+                .map(|&v| v as f64)
+                .sum::<f64>()
+                / W as f64
         };
         let control = row_mean(&off.data, 5);
         for y in SHOULDER_LOW.chain(SHOULDER_HIGH) {

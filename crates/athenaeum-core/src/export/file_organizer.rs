@@ -21,6 +21,7 @@
 //!
 //! Missing calibration levels are simply omitted (collapsed).
 
+use crate::events::{emit_event, ProgressEmitter};
 use crate::export::models::{
     calibrated_output_filename, sanitize_display_folder_name, sanitize_folder_name,
     CalibrationSetInfo, CalibrationSubgroup, ExportData, ExportProgressEvent, WbppExportConfig,
@@ -29,8 +30,8 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
-use crate::events::{ProgressEmitter, emit_event};
 
 /// Result of organizing files for export
 #[derive(Debug, Clone)]
@@ -465,6 +466,7 @@ fn generate_one(
     debayer: bool,
     dest: &Path,
     cancel_flag: &std::sync::atomic::AtomicBool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<Vec<String>> {
     // Field-level destructuring: `specs` is read while `hot_maps` is written,
     // which a whole-struct borrow would not allow.
@@ -501,6 +503,7 @@ fn generate_one(
         scratch_dir,
         opts,
         hot_maps,
+        pool,
         cancel_flag,
     )?;
     tracing::debug!(
@@ -523,6 +526,7 @@ fn generate_one(
     _debayer: bool,
     _dest: &Path,
     _cancel_flag: &std::sync::atomic::AtomicBool,
+    _pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<Vec<String>> {
     match *batch {}
 }
@@ -548,6 +552,7 @@ pub fn organize_files_wbpp(
     frame_set_id: i64,
     cancel_flag: &std::sync::atomic::AtomicBool,
     generation: Option<&mut GenerationBatch>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<OrganizeResult> {
     let span = tracing::info_span!("export", frame_set_id);
     let _g = span.enter();
@@ -636,9 +641,14 @@ pub fn organize_files_wbpp(
                 // one light takes seconds to minutes, and a bar that only moves
                 // on completion looks frozen for the whole of it. The count is
                 // still what has actually landed.
-                emit_progress(files_organized as usize, Some(&filename), "calibrating", true);
+                emit_progress(
+                    files_organized as usize,
+                    Some(&filename),
+                    "calibrating",
+                    true,
+                );
                 let outcome = match generation.as_deref_mut() {
-                    Some(batch) => generate_one(batch, frame_id, debayer, &dest, cancel_flag),
+                    Some(batch) => generate_one(batch, frame_id, debayer, &dest, cancel_flag, pool),
                     None => Err(anyhow::anyhow!(
                         "this export was not prepared to calibrate lights"
                     )),
@@ -916,7 +926,14 @@ mod tests {
     /// the frame-set name is NOT part of `rel_dir`.
     #[test]
     fn wbpp_placements_full_hierarchy() {
-        let bias_of_dark = set_info(30, "Bias", vec![frame(300, "bias1.fits", "ASI")], None, None, None);
+        let bias_of_dark = set_info(
+            30,
+            "Bias",
+            vec![frame(300, "bias1.fits", "ASI")],
+            None,
+            None,
+            None,
+        );
         let dark = set_info(
             20,
             "Dark",
@@ -1089,8 +1106,18 @@ mod tests {
 
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let config = WbppExportConfig::default();
-        let result =
-            organize_files_wbpp(out.path(), &data, false, &config, None, 1, &cancel, None).unwrap();
+        let result = organize_files_wbpp(
+            out.path(),
+            &data,
+            false,
+            &config,
+            None,
+            1,
+            &cancel,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.files_organized, 3);
         assert!(result.warnings.is_empty());
 
@@ -1313,6 +1340,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 1, "warnings: {:?}", result.warnings);
@@ -1394,6 +1422,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
         )
         .expect("one unusable frame must not fail the export");
 
@@ -1475,6 +1504,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
         )
         .expect("a cancel is not an export failure");
 
@@ -1523,6 +1553,7 @@ mod tests {
                 1,
                 &cancel,
                 Some(&mut batch),
+                None,
             )
             .unwrap();
             assert_eq!(result.files_organized, 1, "{:?}", result.warnings);
@@ -1566,6 +1597,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 1, "{:?}", result.warnings);
@@ -1589,6 +1621,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 0, "the only frame failed");
@@ -1647,6 +1680,7 @@ mod tests {
             1,
             &cancel,
             Some(&mut batch),
+            None,
         )
         .unwrap();
         assert_eq!(result.files_organized, 2, "{:?}", result.warnings);
