@@ -2,7 +2,7 @@
 //! `PlaneReader`, detect on its luminance, align onto the reference's stars,
 //! and turn the outcome into a `registration_results` row.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +49,14 @@ impl From<&DetectedStars> for ReferenceStars {
 /// `FrameRegistration::duration_ms` reporting the whole frame's cost).
 /// [`register_detected`] does not read them: see its own doc comment for
 /// why its own logged `read_ms`/`detect_ms` are unconditionally `0`.
+///
+/// `path` (fix round 1, Important finding 1) is the subject's own path —
+/// carried for the same reason: [`register_detected`] has no `Path`
+/// parameter of its own (its 6-argument signature is unchanged from the
+/// brief), so without this field its `"frame registered"`/`"registration
+/// warning"`/`"frame registration failed"` events would carry no
+/// identifying field at all when fired from inside the Register fan-out's
+/// scoped worker threads, which have no span context either.
 #[derive(Debug, Clone)]
 pub struct DetectedStars {
     pub stars: Vec<Star>,
@@ -56,6 +64,7 @@ pub struct DetectedStars {
     pub height: usize,
     pub read_ms: u64,
     pub detect_ms: u64,
+    pub path: PathBuf,
 }
 
 /// Test-only call log (perf tier 1 Task 9): every real call to
@@ -170,6 +179,7 @@ pub fn detect_frame_stars(
         height,
         read_ms,
         detect_ms,
+        path: path.to_path_buf(),
     })
 }
 
@@ -191,6 +201,14 @@ pub fn detect_frame_stars(
 /// passed straight through to [`align`]: an optional plate-solve seed,
 /// which seed leads (ruling R-T6-9), and the scale window this particular
 /// frame is judged against.
+///
+/// Fix round 1, Important finding 1: `path` on all three logged events
+/// (`"frame registered"`, `"registration warning"`, `"frame registration
+/// failed"`) comes from `detected.path` — this function has no `Path`
+/// parameter of its own, so without it these events, fired from inside
+/// the Register fan-out's scoped worker threads (no span context), would
+/// carry no identifying field at all. The logging spec's registration
+/// entry has always said these events "reuse `path`".
 pub fn register_detected(
     reference: &ReferenceStars,
     detected: &DetectedStars,
@@ -215,6 +233,7 @@ pub fn register_detected(
     match &outcome {
         Ok(a) => {
             debug!(
+                path = %detected.path.display(),
                 detections = detected.stars.len(),
                 inliers = a.inliers,
                 rms_px = a.rms_px,
@@ -227,11 +246,16 @@ pub fn register_detected(
                 "frame registered"
             );
             for note in &a.warnings {
-                warn!(note = %note, "registration warning");
+                warn!(
+                    path = %detected.path.display(),
+                    note = %note,
+                    "registration warning"
+                );
             }
         }
         Err(e) => {
             warn!(
+                path = %detected.path.display(),
                 detections = detected.stars.len(),
                 error = %e,
                 read_ms = 0,

@@ -3837,28 +3837,57 @@ fn register_group_pass(
             // detection, already known — skip `detect_frame_stars`
             // entirely on a cache hit, exactly as `register_frame` (its
             // composition, kept intact for every OTHER caller) would do
-            // for a cache miss.
+            // for a cache miss. `was_miss` (fix round 1, Minor 2) has to
+            // be read before the `match` below moves `item.pre`.
+            let was_miss = item.pre.is_none();
             let detected: Result<Arc<DetectedStars>, IntegrationError> = match item.pre {
                 Some(d) => Ok(d),
                 None => detect_frame_stars(&item.path, reg_cfg, Some(pool_ref)).map(Arc::new),
             };
-            detected
-                .map(|d| {
-                    let reg = register_detected(
-                        ref_stars_ref,
-                        &d,
-                        reg_cfg,
-                        item.hint.as_ref(),
-                        item.policy,
-                        item.scale_gate,
-                    );
-                    // Returned only for a dry pass (`!persist`) — the
-                    // persisting pass consumed its cache entry building
-                    // this very item (or never had one), so it has
-                    // nothing new to cache.
-                    (reg, (!persist).then_some(d))
-                })
-                .map_err(|e| format!("registration failed: {e}"))
+            match detected {
+                Err(e) => Err(format!("registration failed: {e}")),
+                Ok(d) => {
+                    // Fix round 1, Minor 3: `register_detected` itself has
+                    // no cancel awareness (it is pure CPU, by design) —
+                    // `register_frame`'s own two checks (before the read,
+                    // after the detect) covered this before the split.
+                    // Checked between the detect and the align so a cancel
+                    // raised mid-fan-out short-circuits before the
+                    // (possibly expensive) RANSAC/distortion work starts;
+                    // `rc.check_cancel()?` right after `fan_out` returns
+                    // below is what actually stops the run either way, so
+                    // this string is never shown to a user.
+                    if cancel_ref.load(Ordering::Relaxed) {
+                        Err("registration cancelled".to_string())
+                    } else {
+                        let mut reg = register_detected(
+                            ref_stars_ref,
+                            &d,
+                            reg_cfg,
+                            item.hint.as_ref(),
+                            item.policy,
+                            item.scale_gate,
+                        );
+                        // Fix round 1, Minor 2: `register_detected`'s own
+                        // `duration_ms` is align-only (Task 9) — restore
+                        // the miss arm's read+detect time onto what gets
+                        // PERSISTED as `registration_results.compute_
+                        // time_ms`, exactly as `register_frame` (every
+                        // OTHER caller) still reports for a fresh
+                        // detection. A cache hit (`!was_miss`) stays
+                        // align-only (ruling 3) — the persisting pass paid
+                        // no read/detect for it at all.
+                        if was_miss {
+                            reg.duration_ms += d.read_ms + d.detect_ms;
+                        }
+                        // Returned only for a dry pass (`!persist`) — the
+                        // persisting pass consumed its cache entry
+                        // building this very item (or never had one), so
+                        // it has nothing new to cache.
+                        Ok((reg, (!persist).then_some(d)))
+                    }
+                }
+            }
         };
         ticker_ref.tick(Some(item.frame_id));
         out
@@ -9650,14 +9679,15 @@ mod tests {
 
         stage_register(&mut rc).unwrap();
 
-        let detect_calls = {
+        let detect_calls: Vec<PathBuf> = {
             let log = crate::stacking::register::frame::DETECT_FRAME_STARS_LOG
                 .lock()
                 .unwrap();
             log[detect_log_before..]
                 .iter()
                 .filter(|p| p.starts_with(working.path()))
-                .count()
+                .cloned()
+                .collect()
         };
         // The fixture's own two-pass switch (asserted below) means every
         // one of the group's 6 included frames is detected EXACTLY once
@@ -9667,12 +9697,28 @@ mod tests {
         // reference's own `ReferenceStars` — see `two_pass_refine`), and
         // the persisting pass detects exactly the 1 remaining frame (the
         // ORIGINAL reference, now a plain subject) that the dry pass never
-        // touched. Before this task, the persisting pass re-detected the
-        // whole group unconditionally, so this would have read 11.
+        // touched. Before this task, `two_pass_refine`'s switch resolution
+        // always re-read+re-detected the winning candidate too, and the
+        // persisting pass always re-registered the whole group regardless
+        // of the dry pass — 5 (dry) + 5 (persisting, the group minus
+        // `chosen`) = 10 through `detect_frame_stars`'s own predecessor
+        // logic (what this counter observes), or 12 counting the stage's
+        // two separate `reference_stars` reads (the initial reference and
+        // the switch's own re-detection of `chosen`, neither of which
+        // this counter — scoped to `detect_frame_stars` — sees).
         assert_eq!(
-            detect_calls,
+            detect_calls.len(),
             light_ids.len(),
-            "every included frame is read and detected exactly once across the two passes"
+            "every included frame is read and detected exactly once across the two passes: {detect_calls:?}"
+        );
+        // Fix round 1, Minor 5: a bare count could hide a frame detected
+        // twice offsetting one never detected at all — assert the paths
+        // are DISTINCT so "each frame exactly once" is what is actually
+        // pinned, not just "six detections happened somewhere".
+        assert_eq!(
+            detect_calls.iter().collect::<HashSet<_>>().len(),
+            light_ids.len(),
+            "each frame must be detected on its own distinct path, no repeats: {detect_calls:?}"
         );
         assert!(
             rc.dry_pass_stars.is_empty(),
