@@ -1097,4 +1097,41 @@ mod tests {
         assert_eq!(c.stars_fitted, 3);
         assert_eq!(c.noise_source, NoiseSource::Mrs);
     }
+
+    /// Tier A task-3b pin (controller ruling R-TA-2): `measure_plane_with_seeds`
+    /// must return the identical `ChannelMeasurement` (timings excluded, per
+    /// `without_timings`) before and after the `estimate_noise_mrs`
+    /// residency rewrite (rustafits ping-pong buffers + bit-packed
+    /// `sig_mask`) and this module's own scope-narrowing pass. The Debug
+    /// string is the pin — captured verbatim from the CURRENT (pre-task-3b)
+    /// code, so any drift in any field (not just the ones this task
+    /// deliberately touches) fails loudly.
+    #[test]
+    fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
+        let (data, w, h) = field(2026_09_19, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let m = without_timings(measure_plane_with_seeds(
+            &data,
+            w,
+            h,
+            &opts,
+            None,
+            SeedSource::Fast,
+        ));
+        assert_eq!(
+            format!("{m:?}"),
+            "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
+beta: 10.0, fwhm_px: 4.1218061822248675, eccentricity: 0.09524602087103572, \
+tflux: 569.0781285580445, tmean_flux: 11.823163448679521, \
+mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
+n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
+noise_source: Mrs, median: 0.08010764420032501, \
+mad: 0.001409422606229782, median_mean_dev: 0.003131831530481577, \
+snr_weight: 2.471863255689976, noise_scale_low: 0.0010744471801444888, \
+noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
+scale: 0.0020880382508039474, psf_signal_weight: 0.0014687684228686841, \
+psf_snr: 0.0021537136857493117, timings: MeasureTimings { read_ms: 0, \
+background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
+        );
+    }
 }
