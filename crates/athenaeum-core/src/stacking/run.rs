@@ -1910,6 +1910,52 @@ fn stage_forces_fresh(rerun_from: Option<Stage>, stage: Stage) -> bool {
     rerun_from.is_some_and(|from| stage as u8 >= from as u8)
 }
 
+/// Planes of ONE channel resident while a frame is measured (perf tier 1
+/// Task 3, measured 2026-09-19 with `measure_probe` under `/usr/bin/time
+/// -l` on the real OSC calibrated frame `c_2025-09-14_00-55-28__-10.00_
+/// 180.00s_0000_d.fits` (6248×4176, 3 planes, 313 MB) —
+/// `cargo build --release --example measure_probe -p athenaeum-core` then
+/// `/usr/bin/time -l ./target/release/examples/measure_probe <file>`, run
+/// twice: peak RSS ("maximum resident set size") 742,899,712 B and
+/// 741,212,160 B, larger kept; baseline (`measure_probe` with no args, its
+/// own usage-and-exit path) 6,176,768 B, measured twice, stable, and
+/// subtracted first. `(742,899,712 − 6,176,768) / (6248 × 4176 × 4) =
+/// 7.06`, rounded up: 8. Higher than the audit's 4–6 guess but at the
+/// task's own stop threshold ("more than 8" blocks; 8 does not), and
+/// plausible against `measure_plane_with_seeds`: the plane read from disk,
+/// its ADU-scaled copy, `background_residual`'s own scratch, `noise_mrs`'s
+/// à-trous layers and the detector's copy of the (possibly pre-filtered)
+/// plane all coexist. `measure_frame_with_seeds` reads and measures one
+/// plane at a time, so the frame's own channel count (3 for this OSC
+/// frame) does not multiply in.
+pub(crate) const MEASURE_PLANES_RESIDENT: u64 = 8;
+/// Planes of one channel resident while `normalize_frame` runs: the warped
+/// target, `clean_plane`'s copy, the detector's scaled copy and the warp
+/// scratch. Kept analytic (perf tier 1 Task 3) — `ln_probe` builds the
+/// group's LN reference through the banded integration engine before it
+/// ever calls `normalize_frame`, and that reference build dominates the
+/// probe's own peak RSS, so the probe cannot isolate one frame's normalize
+/// working set. As an UPPER bound only: `ln_probe --db <copy of the dev
+/// catalog> --set 109 --group osc__NoFilter__bin1__180s --frames 3 --frame
+/// c_2025-09-14_00-55-28__-10.00_180.00s_0000_d` under `/usr/bin/time -l`,
+/// 2026-09-19, peak RSS ("maximum resident set size") 2,112,798,720 B —
+/// consistent with a 3-frame reference build (3 × 6248×4176×3-plane frames
+/// plus the banded engine's own scratch) dominating, not with a single
+/// channel's normalize.
+pub(crate) const LN_PLANES_RESIDENT: u64 = 4;
+
+/// `MEASURE_PLANES_RESIDENT` planes of one w×h channel, in bytes — Measure's
+/// fan-out working set (perf tier 1 Task 3).
+pub(crate) fn measure_working_set_bytes(w: u64, h: u64) -> u64 {
+    MEASURE_PLANES_RESIDENT * w * h * 4
+}
+
+/// `LN_PLANES_RESIDENT` planes of one w×h channel, in bytes — Normalize's
+/// fan-out working set (perf tier 1 Task 3).
+pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
+    LN_PLANES_RESIDENT * w * h * 4
+}
+
 /// Memory-budgeted worker count for a fan-out stage (decision 3):
 /// `clamp(budget / working_set, 1, max_workers)`. `budget =
 /// total_ram_bytes() / 4`; when the total is unknown, the budget is treated
@@ -2381,7 +2427,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         }
 
         if !needing_measure.is_empty() {
-            let working_set_bytes = 8 * max_planes as u64 * group_max_w * group_max_h * 4;
+            let working_set_bytes = measure_working_set_bytes(group_max_w, group_max_h);
             let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
             log_admission(
                 rc,
@@ -7055,8 +7101,7 @@ fn run_group_normalization(
         None,
     );
 
-    let working_set_bytes =
-        input.channels as u64 * input.width as u64 * input.height as u64 * 4 * 2;
+    let working_set_bytes = ln_working_set_bytes(input.width as u64, input.height as u64);
     let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     log_admission(
         rc,
@@ -16090,5 +16135,21 @@ mod tests {
             "{:?}",
             summary.warnings
         );
+    }
+
+    // Perf tier 1 Task 3: Measure's and Normalize's working-set formulas
+    // moved from an all-planes guess to a measured one-channel-resident
+    // factor (`MEASURE_PLANES_RESIDENT`/`LN_PLANES_RESIDENT`) — both stages
+    // read and process one channel at a time, so the frame's own plane
+    // count (3 for OSC) must not multiply into the admitted worker count.
+    #[test]
+    fn measure_working_set_is_one_channel_deep() {
+        // A 3-plane 26 Mpx frame: one channel resident at a time, so the
+        // planes count does not multiply in.
+        let one_channel = measure_working_set_bytes(6248, 4176);
+        assert_eq!(one_channel, MEASURE_PLANES_RESIDENT * 6248 * 4176 * 4);
+        // 16 GB, 10-worker pool: at least 3 OSC frames in flight.
+        let n = (16u64 << 30) / 4 / one_channel;
+        assert!(n >= 3, "admission would be {n}");
     }
 }
