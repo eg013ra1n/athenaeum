@@ -1898,12 +1898,17 @@ const CANCELLED_MARKER: &str = "__cancelled__";
 /// up front ([`prebuild_hot_maps`]) so no worker ever races another to
 /// build it. Results are written back ([`commit_calibrated`]: artifact
 /// rows, `rc.warnings`) on the run thread, in the fan-out's ORIGINAL
-/// (frame) order rather than completion order — so the output (files,
-/// artifact rows, warning order) is byte-identical to the old sequential
-/// stage's, which is what
-/// `calibrate_fan_out_matches_the_sequential_stage_byte_for_byte` pins. The
-/// calibrated-lights EXPORT path (`export::file_organizer::GenerationBatch`)
-/// is untouched and keeps its own sequential loop — this fan-out is stage 1
+/// (frame) order rather than completion order — so the FILES and artifact
+/// rows are byte-identical to the old sequential stage's, which is what
+/// `calibrate_fan_out_matches_the_sequential_stage_byte_for_byte` pins.
+/// Warning ORDER is not: [`prebuild_hot_maps`] pushes every hot-pixel-map
+/// refusal for a group up front, before that group's fan-out even starts,
+/// where the old sequential stage would have interleaved the same warning
+/// at whichever frame first triggered that dark's measurement — the SET of
+/// warnings is unchanged, only their position relative to the per-frame
+/// calibration warnings that follow. The calibrated-lights EXPORT path
+/// (`export::file_organizer::GenerationBatch`) is untouched and keeps its
+/// own sequential loop — this fan-out is stage 1
 /// of the stacking run only. A per-frame failure excludes that frame
 /// (`runtime_exclusions` + a `warn!`) rather than failing the run; only
 /// `IntegrationError::Cancelled` (surfaced by a worker as
@@ -2089,6 +2094,8 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
             Some(group.key.clone()),
             current,
             total,
+            bytes_done,
+            bytes_total,
         );
         let ticker_ref = &ticker;
         let cancel_ref: &AtomicBool = &rc.cancel;
@@ -2173,10 +2180,15 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         // Perf tier 1 Task 4, ruling 7: `bytes_done` for a GENERATED frame
         // is only known once `commit_calibrated` returns its file's real
         // size, which happens after the whole fan-out — so, unlike the old
-        // per-frame loop, the byte count does not advance mid-fan-out; only
-        // the ticker's `current`/count does (via `FanOutTicker::tick`
-        // above). This one final `progress` call is what carries the
-        // group's true `bytes_done` forward once the fan-out has committed.
+        // per-frame loop, the byte count does not advance mid-fan-out. Fix
+        // wave item 3: the ticker's own per-frame ticks (`FanOutTicker::
+        // tick` above) DO carry a byte pair now, but it is frozen at this
+        // group's start (the `bytes_done`/`bytes_total` passed into
+        // `FanOutTicker::new` above) — only the `current`/count climbs
+        // during the fan-out itself. This one final `progress` call is
+        // what actually advances `bytes_done`, at the group boundary, once
+        // the fan-out has committed and the group's real generated sizes
+        // are known.
         rc.progress(
             Stage::Calibrate,
             Some(group.key.clone()),
@@ -2485,15 +2497,27 @@ pub(crate) struct FanOutTicker {
     total: usize,
     done: AtomicUsize,
     gate: Mutex<(Instant, usize)>,
+    /// Fix wave item 3: a byte pair FROZEN at construction — most callers
+    /// (Measure/Register/Normalize) pass `(0, 0)`, since their per-frame
+    /// ticks have no byte figure of their own to report. Calibrate passes
+    /// the group's real `(bytes_done, bytes_total)` as they stood the
+    /// instant this group's fan-out started, so its per-frame ticks keep
+    /// showing a non-zero byte readout through the fan-out instead of
+    /// reporting `0, 0` for the whole thing.
+    bytes_done: u64,
+    bytes_total: u64,
 }
 
 impl FanOutTicker {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         rc: &RunContext,
         stage: Stage,
         group_key: Option<String>,
         done_so_far: usize,
         total: usize,
+        bytes_done: u64,
+        bytes_total: u64,
     ) -> Self {
         Self::from_parts(
             rc.emitter.clone(),
@@ -2503,9 +2527,12 @@ impl FanOutTicker {
             group_key,
             done_so_far,
             total,
+            bytes_done,
+            bytes_total,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         emitter: Arc<dyn ProgressEmitter>,
         run_id: i64,
@@ -2514,6 +2541,8 @@ impl FanOutTicker {
         group_key: Option<String>,
         done_so_far: usize,
         total: usize,
+        bytes_done: u64,
+        bytes_total: u64,
     ) -> Self {
         Self {
             emitter,
@@ -2529,6 +2558,8 @@ impl FanOutTicker {
                 Instant::now() - Duration::from_millis(PROGRESS_THROTTLE_MS),
                 0,
             )),
+            bytes_done,
+            bytes_total,
         }
     }
 
@@ -2563,8 +2594,8 @@ impl FanOutTicker {
                 current,
                 total: self.total,
                 percent,
-                bytes_done: 0,
-                bytes_total: 0,
+                bytes_done: self.bytes_done,
+                bytes_total: self.bytes_total,
                 frame_id,
                 message: None,
             },
@@ -2614,7 +2645,6 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 
         let mut entries: Vec<MeasuredFrame> = Vec::with_capacity(group.frames.len());
         let mut to_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
-        let mut max_planes = 1usize;
         // Owner decision 2026-09-10: a group's members can carry different
         // native geometry now, so admission sizing below uses the LARGEST
         // frame in the group rather than a (now nonexistent) single
@@ -2754,7 +2784,6 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     continue;
                 }
             };
-            max_planes = max_planes.max(planes);
 
             let cached_calibrated = rc
                 .cached_calibrated
@@ -2872,6 +2901,8 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 Some(group.key.clone()),
                 current + reused_in_group,
                 total,
+                0,
+                0,
             );
             let cancel_ref: &AtomicBool = &rc.cancel;
             let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
@@ -3829,6 +3860,8 @@ fn register_group_pass(
         Some(group.key.clone()),
         progress.0,
         progress.1,
+        0,
+        0,
     );
     let ticker_ref = &ticker;
     let cancel_ref: &AtomicBool = &rc.cancel;
@@ -4250,12 +4283,16 @@ fn two_pass_refine(
                 // SAME `cfg.detection`/`cfg.max_stars` a fresh
                 // `reference_stars` read below would use — reuse rather
                 // than pay for a second read+detect of the frame the pick
-                // just chose. Left in the cache rather than removed here:
-                // the persisting pass's own item for this frame (now the
-                // reference) never consults `RegisterItem.pre` at all
-                // (`identity_registration` takes no detections), so the
-                // entry just sits until `stage_register`'s final
-                // `rc.dry_pass_stars.clear()`.
+                // just chose. Read here, not removed: the persisting
+                // registration pass that follows builds a `RegisterItem`
+                // for EVERY frame it registers (`rc.dry_pass_stars.remove`,
+                // this function's caller a few frames up the stack) — the
+                // reference's own item included, whether or not its dry-pass
+                // pick changed here — so the entry is still removed, just
+                // not by this lookup; `identity_registration` then ignores
+                // the `RegisterItem.pre` it carries (it takes no
+                // detections), so the removal costs nothing, it just isn't
+                // this line's job.
                 let stars = match rc.dry_pass_stars.get(&new_frame_id) {
                     Some(cached) => Ok(ReferenceStars::from(cached.as_ref())),
                     None => {
@@ -7653,6 +7690,8 @@ fn run_group_normalization(
         Some(group.key.clone()),
         total - needs_normalize.len(),
         total,
+        0,
+        0,
     );
     let ticker_ref = &ticker;
     let member_ids: Vec<i64> = members.iter().map(|m| m.frame_id).collect();
@@ -11477,6 +11516,8 @@ mod tests {
             Some("g".to_string()),
             DONE_SO_FAR,
             TOTAL,
+            0,
+            0,
         );
         let counter = AtomicUsize::new(0);
         let worker = || loop {
