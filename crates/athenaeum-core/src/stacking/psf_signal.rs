@@ -689,6 +689,9 @@ pub fn background_residual(data: &[f32], w: usize, h: usize) -> Option<(f64, f64
         w,
         h,
         BACKGROUND_MODEL_CELL_PX,
+        // Only `background_map` is read below — the per-pixel noise map
+        // would cost a second bicubic interpolation pass for nothing.
+        false,
     );
     let model = bg.background_map?;
     let mut r: Vec<f32> = Vec::with_capacity(data.len() / 32);

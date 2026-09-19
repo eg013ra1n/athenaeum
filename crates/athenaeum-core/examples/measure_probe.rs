@@ -63,6 +63,20 @@ fn read_planes_any(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), String>
 }
 
 fn main() {
+    // Task 2 (Tier A): the per-plane sub-stage events (`background_ms`,
+    // `noise_ms`, `detect_ms`, `fit_ms` on "frame plane measured", emitted
+    // by `stacking::measure`) are silent without a subscriber — examples
+    // carry none by default (library code must not install one). Installed
+    // only when `RUST_LOG` is actually set, so a plain run stays quiet and
+    // the probe's JSON keeps going to stdout unmixed; the subscriber writes
+    // to stderr.
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let mut args = std::env::args().skip(1);
     let path = match args.next() {
         Some(p) => p,
