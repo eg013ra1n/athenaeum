@@ -418,37 +418,52 @@ pub fn normalize_frame(
     let mut background_ms = 0u64;
     let mut scale_ms = 0u64;
 
+    // Perf tier 1 Task 8: one `RegisteredSource` per FRAME, re-pointed at
+    // each channel with `set_plane` (ruling R-T4-7's own reasoning, applied
+    // here) instead of a fresh `RegisteredSource::open` — one
+    // `PlaneReader::open` and, under a TPS map, one displacement-grid build
+    // per frame rather than one per channel (3x on an OSC frame). `band`
+    // and `target` are likewise allocated once and reused across channels:
+    // `target` is fully overwritten by `decode_frame_into` on every
+    // iteration, so the in-place NaN sanitizing below (which mutates
+    // `target` for detection, after `background_grid`/`median_of_finite`
+    // have already read the NaN-preserving version) never leaks into the
+    // next channel's warp.
+    let t = Instant::now();
+    let registered = RegisteredFrame {
+        path: frame.path.clone(),
+        map: frame.map.clone(),
+    };
+    let mut src = RegisteredSource::open(
+        &[registered],
+        reference.width,
+        reference.height,
+        0,
+        interpolation,
+        clamping,
+    )
+    .map_err(|e| LnError::Other(format!("warping into the reference geometry: {e}")))?;
+    if let Some(pl) = pool {
+        src = src.with_pool(Arc::clone(pl));
+    }
+    let mut band = BandPlanes::new(&src);
+    let mut target = vec![0f32; reference.width * reference.height];
+    warp_ms += t.elapsed().as_millis() as u64;
+
     for p in 0..channels {
         if cancel.load(Ordering::Relaxed) {
             return Err(LnError::Other("cancelled".to_string()));
         }
 
-        let registered = RegisteredFrame {
-            path: frame.path.clone(),
-            map: frame.map.clone(),
-        };
         let t = Instant::now();
-        let mut src = RegisteredSource::open(
-            &[registered],
-            reference.width,
-            reference.height,
-            p,
-            interpolation,
-            clamping,
-        )
-        .map_err(|e| LnError::Other(format!("warping into the reference geometry: {e}")))?;
-        if let Some(pl) = pool {
-            src = src.with_pool(Arc::clone(pl));
-        }
-
-        let mut band = BandPlanes::new(&src);
+        src.set_plane(p)
+            .map_err(|e| LnError::Other(e.to_string()))?;
         let no_progress = |_: u64| {};
         src.read_band_with_progress(0, reference.height, &mut band, 1, &no_progress, cancel)
             .map_err(|e| match e {
                 IntegrationError::Cancelled => LnError::Other("cancelled".to_string()),
                 other => LnError::Other(format!("warping into the reference geometry: {other}")),
             })?;
-        let mut target = vec![0f32; reference.width * reference.height];
         band.decode_frame_into(0, &mut target);
         warp_ms += t.elapsed().as_millis() as u64;
 
@@ -595,6 +610,11 @@ pub fn normalize_frame(
             location_tgt,
         });
     }
+
+    // The one source's warping work for this frame is done — release its
+    // displacement grid now rather than letting it ride to the end of the
+    // function (the sidecar write below is pure I/O and touches no grid).
+    drop(src);
 
     let t = Instant::now();
     LnFrameGrids { channels: grids }
@@ -791,5 +811,97 @@ mod tests {
             a.iter().all(|&v| v == TEST_SCALE as f32),
             "the fallback must be the constant global scale, not a clamp"
         );
+    }
+
+    // ---- Perf tier 1 Task 8: one `RegisteredSource` per frame ----------
+
+    /// Guards the restructure of [`normalize_frame`]'s warp step: reading a
+    /// 3-channel (OSC-shaped) frame's planes by re-pointing ONE
+    /// `RegisteredSource` with `set_plane` must warp each channel
+    /// bit-for-bit identically to the old per-channel shape (a fresh
+    /// `RegisteredSource::open` per channel). Everything `normalize_frame`
+    /// does past the warp (`background_grid`, `relative_scale_against`, the
+    /// `.athln` grid it writes) is a pure function of the warped `target`
+    /// buffer, so comparing `target` directly — rather than the sidecar
+    /// bytes `normalize_frame` itself produces, which would need a second
+    /// code path through the whole function to get an "old shape" oracle —
+    /// is the whole pin. This passes unchanged before and after the
+    /// restructure below: it guards the invariant the restructure relies
+    /// on (that `set_plane` reads the same bytes a fresh open would), not a
+    /// behaviour the restructure introduces.
+    #[test]
+    fn one_source_per_frame_warps_each_channel_identically() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::resample::Interpolation;
+        use crate::test_support::gaussian_field;
+
+        let w = 24;
+        let h = 20;
+        let stars = [(6.3, 5.7, 900.0), (17.0, 13.4, 600.0)];
+        let mut data = vec![0f32; w * h * 3];
+        for (c, plane) in data.chunks_exact_mut(w * h).enumerate() {
+            plane.copy_from_slice(&gaussian_field(w, h, &stars, 1.6, 100.0 + c as f32 * 25.0));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("osc.fits");
+        write_fits_f32(&path, w, h, 3, &data, &[]).unwrap();
+        let map = PixelMap::linear(Linear::identity()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let no_progress = |_: u64| {};
+
+        // Old shape: a fresh `RegisteredSource` per channel.
+        let mut old_targets = Vec::new();
+        for p in 0..3 {
+            let src = RegisteredSource::open(
+                &[RegisteredFrame {
+                    path: path.clone(),
+                    map: map.clone(),
+                }],
+                w,
+                h,
+                p,
+                Interpolation::BicubicBSpline,
+                0.3,
+            )
+            .unwrap();
+            let mut band = BandPlanes::new(&src);
+            src.read_band_with_progress(0, h, &mut band, 1, &no_progress, &cancel)
+                .unwrap();
+            let mut target = vec![0f32; w * h];
+            band.decode_frame_into(0, &mut target);
+            old_targets.push(target);
+        }
+
+        // New shape: one source, re-pointed at each channel with `set_plane`.
+        let mut new_targets = Vec::new();
+        let mut src = RegisteredSource::open(
+            &[RegisteredFrame {
+                path: path.clone(),
+                map: map.clone(),
+            }],
+            w,
+            h,
+            0,
+            Interpolation::BicubicBSpline,
+            0.3,
+        )
+        .unwrap();
+        let mut band = BandPlanes::new(&src);
+        for p in 0..3 {
+            src.set_plane(p).unwrap();
+            src.read_band_with_progress(0, h, &mut band, 1, &no_progress, &cancel)
+                .unwrap();
+            let mut target = vec![0f32; w * h];
+            band.decode_frame_into(0, &mut target);
+            new_targets.push(target);
+        }
+
+        for p in 0..3 {
+            assert_eq!(
+                old_targets[p], new_targets[p],
+                "channel {p}: warped target differs between the per-channel-reopen shape and set_plane"
+            );
+        }
     }
 }
