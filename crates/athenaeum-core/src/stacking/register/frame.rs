@@ -101,15 +101,21 @@ pub struct FrameRegistration {
     pub duration_ms: u64,
 }
 
-/// All planes of a calibrated frame collapsed to one luminance plane.
-pub(crate) fn read_luminance(path: &Path) -> Result<(Vec<f32>, usize, usize), IntegrationError> {
+/// Every plane of a calibrated frame, read from disk but not yet combined
+/// to luminance (perf tier A Task 3). Kept separate — rather than folded
+/// straight into an owned `Vec<f32>` the way this used to work — so a
+/// caller can build the [`luminance`] slice itself and keep `planes` alive
+/// across its own [`detect_stars`] call: `luminance`'s single-plane case
+/// now borrows instead of copying (see its doc comment), and that borrow's
+/// lifetime is tied to `planes`, which would otherwise be dropped at the
+/// end of a `read_luminance`-shaped helper before `detect_stars` ever ran.
+fn read_planes(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), IntegrationError> {
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
     let planes: Vec<Vec<f32>> = (0..reader.channels())
         .map(|p| reader.read_plane(p))
         .collect::<Result<_, _>>()?;
-    let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-    Ok((luminance(&refs), w, h))
+    Ok((planes, w, h))
 }
 
 pub fn reference_stars(
@@ -118,7 +124,9 @@ pub fn reference_stars(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ReferenceStars, IntegrationError> {
     let t = Instant::now();
-    let (lum, width, height) = read_luminance(path)?;
+    let (planes, width, height) = read_planes(path)?;
+    let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+    let lum = luminance(&refs);
     let read_ms = t.elapsed().as_millis() as u64;
     let t = Instant::now();
     let stars = detect_stars(&lum, width, height, &cfg.detection, cfg.max_stars, pool);
@@ -161,7 +169,9 @@ pub fn detect_frame_stars(
         .unwrap()
         .push(path.to_path_buf());
     let t = Instant::now();
-    let (lum, width, height) = read_luminance(path)?;
+    let (planes, width, height) = read_planes(path)?;
+    let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+    let lum = luminance(&refs);
     let read_ms = t.elapsed().as_millis() as u64;
     let t = Instant::now();
     let stars = detect_stars(&lum, width, height, &cfg.detection, cfg.max_stars, pool);

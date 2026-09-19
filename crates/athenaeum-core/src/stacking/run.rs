@@ -2325,6 +2325,71 @@ fn stage_forces_fresh(rerun_from: Option<Stage>, stage: Stage) -> bool {
 /// plane all coexist. `measure_frame_with_seeds` reads and measures one
 /// plane at a time, so the frame's own channel count (3 for this OSC
 /// frame) does not multiply in.
+///
+/// Re-measured (perf tier A Task 3, 2026-09-19) after the detect.rs copy-
+/// chain change (`luminance` borrows a single plane, `detect_stars` fuses
+/// its max-fold into the ADU-scale pass) — **unchanged, 8, on both a mono
+/// and an OSC frame.** `measure_plane_with_seeds`/`measure_frame_with_seeds`
+/// never call `register::detect::{luminance, detect_stars}` at all (Measure
+/// seeds through `ImageAnalyzer::detect_fast_data` directly), so this
+/// constant was never going to move from that change; the re-measurement
+/// exists to confirm it and to localize the peak with per-sub-stage
+/// `getrusage` checkpoints the way Task 2 (tier 1) asked Task 3 to.
+/// Frames: OSC `c_2025-10-18_22-53-18__-10.00_180.00s_0144_d.fits`
+/// (6248×4176, 3 planes), mono `c_2025-10-18_22-18-12__-10.00_180.00s_
+/// 0058.fits` (6224×4168, 1 plane), both from the LDN1272-test acceptance
+/// catalog. `/usr/bin/time -l` on `measure_probe`, 3 runs per frame, larger
+/// kept; baseline (no-arg usage-and-exit) 6,406,144 B, stable across 2
+/// runs. OSC peak 741,392,384 B: `(741,392,384 − 6,406,144) / (6248 × 4176
+/// × 4) = 7.04`, rounds up to 8 — matches the original measurement almost
+/// exactly. Mono peak 708,378,624 B: `(708,378,624 − 6,406,144) / (6224 ×
+/// 4168 × 4) = 6.77`, rounds up to 7 — the max across both measured frames
+/// is kept (8), the same conservative rule the original measurement used,
+/// since under-provisioning risks the swap-thrash regression
+/// `LN_PLANES_RESIDENT`'s own comment below describes.
+///
+/// Per-sub-stage `getrusage(RUSAGE_SELF).ru_maxrss` checkpoints (a
+/// temporary, uncommitted instrumentation of `measure_plane_with_seeds` and
+/// its caller's per-plane loop — `ru_maxrss` is a HIGH-WATER MARK, so every
+/// reading is the max reached so far in the whole process, never a
+/// snapshot of the currently-live set) found the SAME pattern on both
+/// frames, dominated by plane 1 of the run (subsequent planes barely move
+/// the mark, confirming the "does not multiply in" claim above): reading
+/// one plane sets the mark to ≈ 208 MB (the decode scratch buffer and the
+/// decoded `Vec<f32>` transiently coexist inside `PlaneReader::read_plane`,
+/// each ≈ one plane); the ADU-scale copy (`scaled`) adds nothing NEW to
+/// the mark (the allocator reuses the read scratch's just-freed space);
+/// `background_residual` (`astroimage::analysis::background::
+/// estimate_background_mesh` plus this crate's own residual pass) pushes it
+/// up by ≈ 113 MB; **`noise_mrs` (rustafits' `estimate_noise_mrs`, 4 à-trous
+/// layers: `smoothed`, `w1` — held live to the end for the final
+/// re-estimation loop — then a `prev_smooth`/`next_smooth` pair per layer)
+/// is the single largest jump, ≈ 345 MB**, dwarfing every other stage
+/// combined and setting the mark to within ~5 % of the run's eventual
+/// peak; detection then adds next to nothing (≈ 0.3 MB — the D5 rustafits
+/// change landed exactly here, `run_fast_detection`'s single-channel
+/// `Cow::Borrowed` no longer copying `scaled` a second time); the PSF fit
+/// adds ≈ 3 MB; the tail (`stratified_sample`/`clip_sample`/
+/// `location_scale`/`noise_scale_factors`, all far-sub-plane-sized samples)
+/// still shows a further ≈ 33 MB of watermark creep, attributed to
+/// allocator fragmentation (freed pages not exactly reused by a
+/// differently-sized next allocation) rather than a live buffer, since
+/// nothing in that tail is plane-sized. **This explains Task 2's own
+/// finding that D4 (skip the dead noise map in `background_residual`) left
+/// the overall peak flat**: `noise_mrs` runs AFTER `background_residual`
+/// and sets a higher mark regardless of whether `background_residual`'s own
+/// noise-map buffer existed, so D4's ~104 MB saving there is masked by a
+/// downstream allocation nothing in Tier A touches. `noise_mrs`'s three
+/// buffers are entirely inside the `rustafits` submodule (off limits to
+/// this task — pinned at `872ae0f` on `perf/stacking-kernels`), and every
+/// buffer under this crate's own control (`scaled`, and the caller's
+/// `data`) is genuinely read at both the start AND the end of
+/// `measure_plane_with_seeds` (`data` again at the final
+/// `stratified_sample` call), so neither can be scope-narrowed without
+/// either reordering a read (harmless) or restructuring the read/scale
+/// split across the `measure_frame_with_seeds`/`measure_plane_with_seeds`
+/// boundary (a materially bigger change than a bit-identical drop). No
+/// dead-at-peak buffer was found on the core side; the constant stays 8.
 pub(crate) const MEASURE_PLANES_RESIDENT: u64 = 8;
 /// Planes of one channel resident while `normalize_frame` runs: since Task
 /// 8 it keeps the `RegisteredSource` (its raw read scratch plus f32
@@ -4276,9 +4341,10 @@ fn two_pass_refine(
     // sibling no-op paths above.
     //
     // No test forces this branch: the dry pass read THIS SAME calibrated
-    // file through the same `read_luminance` moments earlier, so the only
-    // window is a genuine race (the working folder swept, a volume
-    // unmounted, an SMB hiccup) that no in-process fixture can open
+    // file through the same `detect_frame_stars` read+detect path moments
+    // earlier, so the only window is a genuine race (the working folder
+    // swept, a volume unmounted, an SMB hiccup) that no in-process fixture
+    // can open
     // without a fault-injection hook. It is guarded, logged and non-fatal
     // by construction instead.
     let prepared: Result<(ReferenceStars, String), String> =

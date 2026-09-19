@@ -202,7 +202,7 @@ fn read_luminance_any(path: &Path) -> Result<(Vec<f32>, usize, usize), String> {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-        return Ok((luminance(&refs), r.width(), r.height()));
+        return Ok((luminance(&refs).into_owned(), r.width(), r.height()));
     }
     let (meta, pixels) = astroimage::ImageConverter::read_raw(path).map_err(|e| e.to_string())?;
     let data: Vec<f32> = match pixels {
@@ -213,7 +213,7 @@ fn read_luminance_any(path: &Path) -> Result<(Vec<f32>, usize, usize), String> {
     let planes: Vec<&[f32]> = (0..meta.channels)
         .map(|c| &data[c * n..(c + 1) * n])
         .collect();
-    Ok((luminance(&planes), meta.width, meta.height))
+    Ok((luminance(&planes).into_owned(), meta.width, meta.height))
 }
 
 /// As `read_luminance_any`, but keeps every plane separate (for `--compare`,

@@ -189,7 +189,7 @@ fn read_luminance_any(path: &Path) -> Result<(Vec<f32>, usize, usize), String> {
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
         let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-        return Ok((luminance(&refs), r.width(), r.height()));
+        return Ok((luminance(&refs).into_owned(), r.width(), r.height()));
     }
     let (meta, pixels) = astroimage::ImageConverter::read_raw(path).map_err(|e| e.to_string())?;
     let data: Vec<f32> = match pixels {
@@ -200,10 +200,23 @@ fn read_luminance_any(path: &Path) -> Result<(Vec<f32>, usize, usize), String> {
     let planes: Vec<&[f32]> = (0..meta.channels)
         .map(|c| &data[c * n..(c + 1) * n])
         .collect();
-    Ok((luminance(&planes), meta.width, meta.height))
+    Ok((luminance(&planes).into_owned(), meta.width, meta.height))
 }
 
 fn main() {
+    // Perf tier A Task 3: `reference_stars`/`detect_frame_stars` log their
+    // own `read_ms`/`detect_ms` split on a debug event (`"reference stars
+    // detected"` / `"frame stars detected"`) — silent without a subscriber,
+    // same reasoning as `measure_probe.rs`'s Task 2 addition: installed only
+    // when `RUST_LOG` is actually set, writing to stderr so the probe's own
+    // JSON on stdout stays unmixed.
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let args = parse_args();
     let reference = reference_stars(&args.reference, &args.cfg, None).unwrap_or_else(|e| {
         eprintln!("reference: {e}");
