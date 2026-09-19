@@ -317,12 +317,14 @@ duplicate fits. Not in this cycle.
 
 **Tier A — bit-identical (≈ 1 week).** Instrumentation first: split LN's `scale_ms` into
 detect/refine/fit/match (the same `MeasureTimings` shape), add `combine_cpu_ms` and the I/E
-histograms (I11). Then D3, D4, D5, D7, D8, D11, W1, W3, W4, I1–I6, Z1, Z2, Z5, L1, L2; gate the
+histograms (I11). Then D3, D4, D5, D7, D8, D11, W1, W3, W4, I1–I6, Z1, Z5, L1, L2; gate the
 tier-1 prefetch and pool routing on `StorageClass::Network`. Every pin stays green.
 Expected: **−8 to −10 wall min** (Measure/LN admission 4 → 6–7, Integrate 10.7 → ≈ 7, drizzle −2,
 warp −3), i.e. ≈ 49 → 39–41.
 
-**Tier B — same math, bits move (≈ 1 week + one acceptance run).** D6, D10, W2, I7–I9 (+ D9).
+**Tier B — same math, bits move (≈ 1 week + one acceptance run).** D6, D10, W2, I7–I9 (+ D9), Z2
+(§3.4 — its hoisted corner arithmetic rounds differently from the per-pixel version, so it needs
+the hash-bump + acceptance re-run every other Tier B item does).
 Expected another **−7 to −9 min** → ≈ 30–33.
 
 **Tier C — reuse and algorithm (≈ 2 weeks + acceptance).** D1 (LN takes Measure's fits, with D2

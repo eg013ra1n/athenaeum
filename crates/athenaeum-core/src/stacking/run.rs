@@ -323,13 +323,20 @@ pub(crate) struct RunContext {
     /// (`frame_id -> Arc<DetectedStars>`), kept only long enough for the
     /// persisting pass right after it to reuse them instead of re-reading
     /// and re-detecting the same frame. [`register_group_pass`] inserts
-    /// into this when it runs `persist = false` and removes from it as it
-    /// consumes each entry building a `persist = true` pass's items, so it
-    /// drains itself as the persisting pass runs; [`stage_register`] clears
-    /// whatever is left once the whole stage is done (belt and braces —
-    /// the reference's own identity row never consumes its entry, and a
-    /// group that never reaches a persisting pass — cancelled mid-stage —
-    /// would otherwise leak whatever the dry pass cached for it).
+    /// into this when it runs `persist = false`, and removes an entry as
+    /// the PERSISTING pass builds its `RegisterItem`s: every frame it adds
+    /// to `to_register` consumes its own entry there, the reference's
+    /// included (whether or not the two-pass pick switched to it), so it
+    /// drains itself as the persisting pass runs. [`stage_register`]
+    /// clears whatever is left once the whole stage is done (belt and
+    /// braces) — two real cases leave something behind: a frame whose
+    /// stored registration row is already fresh skips `to_register`
+    /// entirely and is REUSED instead of rebuilt, so nothing ever consumes
+    /// its dry-pass entry (including a reused reference row — the frame
+    /// the two-pass pick just switched to may already carry a fresh row
+    /// from an earlier run); and a group that never reaches a persisting
+    /// pass at all — cancelled mid-stage — would otherwise leak whatever
+    /// the dry pass cached for it.
     pub(crate) dry_pass_stars: HashMap<i64, Arc<DetectedStars>>,
     /// Test-only fault injection: [`run_pipeline`] panics right after the
     /// named stage completes, so [`run_thread`]'s catch-unwind/single-exit-path
