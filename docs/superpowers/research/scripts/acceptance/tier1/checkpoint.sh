@@ -59,6 +59,14 @@ cp -R "$TEMPLATE" "$COPY"
 # other settings value embeds the template's own folder name).
 sqlite3 "$COPY/athenaeum.db" \
   "UPDATE settings SET value = replace(value, 'tierA-template', 'tierA-$NAME') WHERE value LIKE '%tierA-template%';"
+# A per-set `paths` override would send the run's working tree and masters
+# to whatever absolute path it names (the baseline attempt wrote 51 GB into
+# the owner's Pictures folder). prepare-catalog.sh strips it at template
+# creation; refuse here if it ever came back.
+if [ "$(sqlite3 "$COPY/athenaeum.db" "SELECT COUNT(*) FROM stacking_set_config WHERE frames_set_id = 204 AND json_extract(config_json, '\$.paths') IS NOT NULL;")" != "0" ]; then
+  echo "refusing: set 204's config in $COPY carries a paths override" >&2
+  exit 1
+fi
 
 PORT=8950
 while lsof -i ":$PORT" >/dev/null 2>&1; do
@@ -66,7 +74,7 @@ while lsof -i ":$PORT" >/dev/null 2>&1; do
 done
 echo "using port $PORT"
 
-export ATH_ACC_EXTRA_PATHS="/Volumes/BigMac/Users/astrobureau/Pictures"
+export ATH_ACC_EXTRA_PATHS="${ATH_ACC_EXTRA_PATHS:-$HOME/Pictures}"
 zsh "$SCRIPTS/tier1/tier1-run.sh" "$REPO" "$COPY" "$PORT" 204
 
 python3 "$SCRIPTS/tier1/tier1-extract.py" "$COPY" > "$COPY/extract.txt"
