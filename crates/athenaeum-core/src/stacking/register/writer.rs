@@ -5,8 +5,12 @@
 //! bearing: Normalize and Integrate both read it verbatim in place of
 //! re-warping the calibrated frame on every band
 //! (`RegisteredSource::open_materialized`) — see `write_registered_frame`'s
-//! own doc for the write side and `stacking::run::ensure_registered_artifact`
-//! for how a cached registration re-run still gets one.
+//! own doc for the write side. Fix round 1 (ruling R-TA-5) moved the write
+//! itself INTO the register fan-out's own worker closures — both the
+//! align-and-write one and the cache-hit rewrite-only one
+//! (`stacking::run::write_one_registered_frame`,
+//! `stacking::run::registered_artifact_is_fresh`) — since a full-frame warp
+//! is exactly the CPU cost the fan-out's admission exists to parallelize.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -127,8 +131,9 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
 /// `par_chunks_mut`) same as every other warp in the pipeline — without a
 /// pool it lands on rayon's GLOBAL pool, invisible to `image_pool`/the
 /// admission budget. `Some(&rc.ctx.image_pool)` from the run's own call
-/// chain (`write_registered_artifact`); every other caller (tests, the
-/// probe) passes `None`.
+/// chain (`stacking::run::write_one_registered_frame`, called from both
+/// register fan-out closures — perf tier A Task 6a fix round 1); every
+/// other caller (tests, the probe) passes `None`.
 pub fn write_registered_frame(
     subject: &Path,
     map: &PixelMap,

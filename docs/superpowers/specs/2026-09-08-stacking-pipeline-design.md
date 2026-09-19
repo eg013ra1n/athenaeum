@@ -354,6 +354,21 @@ construction (the writer and the on-the-fly path share the exact same
 `warp_rows` call). Drizzle is unaffected — it always read the calibrated
 frame through the forward map, never this artifact.
 
+**Fix round 1 (ruling R-TA-5)**: the write itself runs INSIDE the register
+fan-out's own per-frame worker closures — both the frames being freshly
+registered (the same closure that runs `register_detected` and builds the
+`registration_results` row) and, in a separate fan-out batch admitted the
+same way, a cached registration whose artifact turned out to be missing or
+stale. Only the DB writes (`upsert_registration`, the `registered` artifact
+row) stay on the run thread, sequentially — `rusqlite` connections are not
+`Send` across the fan-out's plain threads. This matters because the warp is
+a full-frame cost (measured ≈ 0.4-1.3 s wall / 1.6-5.1 s CPU per frame on an
+otherwise-idle 10-core Mac, mono vs OSC, uncontended — see
+`REGISTER_PLANES_RESIDENT_OSC`'s own doc for the admission-budget
+measurement): running it one frame at a time on the run thread after the
+fan-out returned would have added minutes to the Register stage, cancelling
+most of the task's own savings.
+
 ### 3.8 Mixed pixel scales (M4b)
 
 One frame set may hold groups — or members of one group — shot at different

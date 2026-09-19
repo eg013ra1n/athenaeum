@@ -58,6 +58,7 @@ use crate::registration::db::{
     get_frame_set_reference, get_registration_for_frame_set, upsert_registration,
     RegistrationRecord,
 };
+use crate::resample::Interpolation;
 use crate::services::compute_queue::ComputeJobKind;
 use crate::services::{ServiceContext, StackHandle};
 #[cfg(test)]
@@ -1489,11 +1490,10 @@ struct CalibrateJob {
 /// Callers append the generator's own `_d` debayer marker via
 /// `GenerationSpec::output_filename` — never insert it here, so the marker
 /// always stays LAST in the filename (`c_<stem>_f<id>_d.fits`, never
-/// `c_<stem>_d_f<id>.fits`). Task 7's registered-frame writer
-/// ([`write_registered_artifact`]/[`registered_file_name`]) calls this SAME
-/// function for its own `r_<stem>[_d].fits` naming, so the two stay
-/// consistent by construction rather than by one parsing the other's
-/// output.
+/// `c_<stem>_d_f<id>.fits`). Task 7's registered-frame writer (both register
+/// fan-out closures, and [`registered_file_name`]) calls this SAME function
+/// for its own `r_<stem>[_d].fits` naming, so the two stay consistent by
+/// construction rather than by one parsing the other's output.
 pub(crate) fn calibrated_file_stem(group: &IntegrationGroup, frame: &GroupFrame) -> String {
     fn stem_of(f: &GroupFrame) -> &str {
         Path::new(&f.filename)
@@ -2435,6 +2435,71 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 /// shared master and under-charged a native-mode group with several.
 pub(crate) fn calibrate_working_set_bytes(w: u64, h: u64) -> u64 {
     CALIBRATE_PLANES_RESIDENT * w * h * 4
+}
+
+/// Planes of ONE channel (ref geometry `w × h`) resident while a register
+/// fan-out worker registers a MONO frame (perf tier A Task 6a fix round 1,
+/// ruling R-TA-5): the pre-existing detect+align working set, unchanged.
+///
+/// Measured 2026-09-19 with `/usr/bin/time -l` on `register_probe`
+/// extended (temporarily, never committed) to also call
+/// `write_registered_frame`, over 3 runs each against two real
+/// LDN1272-test calibrated frames (mono 6224×4168 detect-only vs
+/// detect+write):
+///
+/// | | detect+align only | detect+align+write |
+/// | ---- | ---- | ---- |
+/// | mono, avg of 3 | 276.1 MB ≈ 2.66 planes | 380.5 MB ≈ 3.67 planes |
+///
+/// The write's own delta (≈ 1.01 planes) matches `write_registered_frame`'s
+/// output buffer exactly — ONE plane for a mono (1-channel) subject. The
+/// MEASURED TOTAL (detect+align+write, 3.67) is used directly, rounded up,
+/// rather than a baseline-plus-delta estimate (see
+/// [`REGISTER_PLANES_RESIDENT_OSC`]'s own doc for why that split
+/// undercounts OSC) — it stays at the pre-task flat value, so mono
+/// admission is UNCHANGED by this task.
+pub(crate) const REGISTER_PLANES_RESIDENT: u64 = 4;
+
+/// OSC (3-channel) register+write planes — see [`REGISTER_PLANES_RESIDENT`]'s
+/// own doc for the measurement method; same date, same probe, against two
+/// real LDN1272-test debayered OSC frames (6248×4176, 3 planes), 2 runs
+/// each:
+///
+/// | | detect+align only | detect+align+write |
+/// | ---- | ---- | ---- |
+/// | OSC, avg of 2 | 588.2 MB ≈ 5.64 planes | 906.7 MB ≈ 8.69 planes |
+///
+/// The write's own delta (≈ 3.05 planes) matches `write_registered_frame`'s
+/// output buffer exactly — ONE plane PER CHANNEL, resident together for the
+/// whole write (`all = vec![f32::NAN; plane_len * channels]`), not a flat
+/// add. The pre-existing detect+align baseline itself already runs closer
+/// to 6 planes than the OLD flat constant's 4 (a PRE-EXISTING gap this task
+/// does not attempt to fix — luminance/detection buffers for a 3-channel
+/// subject were never flat-4 either); using a baseline-plus-delta estimate
+/// (4 + 3 = 7) would have undercounted the measured total by ≈ 1.7 planes.
+/// This constant is instead the MEASURED TOTAL, rounded up: 9.
+///
+/// If a real run's admission ever needs re-deriving from RAM instead of
+/// this measurement, `total_ram_bytes() / 4 / (9 · w · h · 4)` is the
+/// worker count an OSC group's register stage gets — on a 16 GB machine at
+/// LDN1272-test's 6248×4176 OSC geometry that is 1 worker (down from 2 at
+/// the pre-task flat 4); see the fix round's own report for what this did
+/// to the logged `log_admission` line.
+pub(crate) const REGISTER_PLANES_RESIDENT_OSC: u64 = 9;
+
+/// Register's fan-out working set (perf tier A Task 6a fix round 1) —
+/// [`REGISTER_PLANES_RESIDENT`] or [`REGISTER_PLANES_RESIDENT_OSC`] planes
+/// of one reference-geometry channel, in bytes, depending on the group's
+/// own color mode (an OSC subject's registered-artifact write holds one
+/// output plane PER CHANNEL, not a flat add — see the OSC constant's own
+/// doc).
+pub(crate) fn register_working_set_bytes(w: u64, h: u64, color_mode: ColorMode) -> u64 {
+    let planes = if color_mode == ColorMode::Osc {
+        REGISTER_PLANES_RESIDENT_OSC
+    } else {
+        REGISTER_PLANES_RESIDENT
+    };
+    planes * w * h * 4
 }
 
 /// Memory-budgeted worker count for a fan-out stage (decision 3):
@@ -3599,12 +3664,23 @@ struct PendingRegistration {
     scale_gate: (f64, f64),
     hint: Option<Linear>,
     policy: SeedPolicy,
+    /// Perf tier A Task 6a fix round 1 (ruling R-TA-5): this frame's own
+    /// calibrated plane count, already known from stage 3
+    /// (`MeasuredFrame::planes`) — threaded through so the fan-out worker
+    /// that now writes the registered artifact never needs `rc` to learn
+    /// whether the output filename gets the `_d` (debayered) marker.
+    planes: usize,
 }
 
 /// What one fan-out worker needs — the pixel-side half of a
 /// [`PendingRegistration`]. The bookkeeping half stays on the run thread.
 struct RegisterItem {
     frame_id: i64,
+    /// Perf tier A Task 6a fix round 1: kept whole (not just `frame_id`) —
+    /// the worker's own registered-artifact write needs it for
+    /// `calibrated_file_stem` (which checks stem collisions against every
+    /// OTHER member of the group).
+    frame: GroupFrame,
     path: PathBuf,
     is_reference: bool,
     scale_gate: (f64, f64),
@@ -3617,6 +3693,46 @@ struct RegisterItem {
     /// item the dry pass never saw — the reference's own identity row, or
     /// a frame the dry pass excluded).
     pre: Option<Arc<DetectedStars>>,
+    /// Perf tier A Task 6a fix round 1: this item's `registration_results`
+    /// config hash — the worker needs it to build the `RegistrationRecord`
+    /// (`to_record`) itself now, so the write's provenance cards and the
+    /// sequential loop's `upsert_registration` agree on ONE record instead
+    /// of two independently-built ones.
+    expected_hash: String,
+    planes: usize,
+}
+
+/// Perf tier A Task 6a fix round 1 (ruling R-TA-5): a register fan-out
+/// worker's own registered-artifact outcome for a PERSISTING item whose
+/// alignment succeeded — built and (attempted to be) written right here,
+/// since the warp is the CPU cost the fan-out's admission exists to
+/// parallelize (~3.3 s/plane), not something to redo one frame at a time
+/// on the run thread afterward. `None` (the whole `Option`, at the call
+/// site) covers the dry pass and an alignment failure — neither builds a
+/// record or attempts a write here; the sequential loop's existing
+/// handling for both is unchanged.
+struct RegisteredWrite {
+    /// Already-resolved (`to_record`) — the sequential loop's
+    /// `upsert_registration` uses this SAME record, never rebuilding it.
+    rec: RegistrationRecord,
+    /// `Some(out_path)` iff the write succeeded; `None` on a write failure
+    /// (logged here, non-fatal — the sequential loop then records no
+    /// artifact row, and every downstream reader falls back to the
+    /// on-the-fly warp for this frame).
+    written: Option<PathBuf>,
+}
+
+/// Perf tier A Task 6a fix round 1 (ruling R-TA-5): a CACHED registration
+/// (`register_group_pass`'s reused branch) whose artifact turned out to be
+/// missing or stale — everything the SEPARATE rewrite fan-out needs to redo
+/// just the pixel work; no re-alignment, the map/record are already known.
+struct ArtifactRewriteItem {
+    frame_id: i64,
+    calibrated: PathBuf,
+    frame: GroupFrame,
+    map: PixelMap,
+    rec: RegistrationRecord,
+    planes: usize,
 }
 
 /// [`SeedPolicy`] as the `seed_policy` log field's value.
@@ -3784,6 +3900,10 @@ fn register_group_pass(
         .and_then(|f| f.pixel_scale_arcsec);
 
     let mut to_register: Vec<PendingRegistration> = Vec::new();
+    // Perf tier A Task 6a fix round 1 (ruling R-TA-5): cache-hit
+    // registrations whose artifact needs (re)writing — see the `reused`
+    // branch below.
+    let mut needs_artifact_rewrite: Vec<ArtifactRewriteItem> = Vec::new();
     for (idx, frame, path, is_reference) in snapshot {
         let frame_hash = {
             let conn = db(&rc.ctx)?.conn();
@@ -3818,15 +3938,46 @@ fn register_group_pass(
         }
 
         if let Some(outcome) = reused {
-            // Perf tier A Task 6a: a cached `registration_results` row can
-            // still be missing its OWN materialized artifact — never
-            // written before this became required (an existing catalog's
-            // first run under this cycle), or removed by a cleanup — so a
-            // reused frame gets the same freshness-checked (re)write a
-            // freshly-registered one gets below (in the fan-out results
-            // loop), just without redoing the registration itself.
+            // Perf tier A Task 6a fix round 1 (ruling R-TA-5): a cached
+            // `registration_results` row can still be missing its OWN
+            // materialized artifact — never written before this became
+            // required (an existing catalog's first run under this cycle),
+            // or removed by a cleanup. The CHECK stays here (a cheap
+            // `find_artifact` SELECT + a disk `stat`, no pixel I/O); the
+            // WARP+WRITE, when one is needed, is queued into
+            // `needs_artifact_rewrite` and runs in its own fan-out below —
+            // never one frame at a time on the run thread, which is exactly
+            // what the previous round's `ensure_registered_artifact` did
+            // and what made a from-scratch backfill add minutes to this
+            // stage.
             if let RegisteredFrameOutcome::Aligned { map, record, .. } = &outcome {
-                ensure_registered_artifact(rc, group, &frame, map, record, &cfg);
+                let hash = record.config_hash.as_deref().unwrap_or_default();
+                let fresh = registered_artifact_is_fresh(rc, &group.key, frame.frame_id, hash)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            run_id = rc.run_id,
+                            frame_id = frame.frame_id,
+                            error = ?e,
+                            "failed to check the registered artifact's freshness; rewriting it"
+                        );
+                        false
+                    });
+                if !fresh {
+                    let planes = rc
+                        .measured
+                        .get(&group.key)
+                        .and_then(|v| v.get(idx))
+                        .map(|e| e.planes)
+                        .unwrap_or(1);
+                    needs_artifact_rewrite.push(ArtifactRewriteItem {
+                        frame_id: frame.frame_id,
+                        calibrated: path.clone(),
+                        frame: frame.clone(),
+                        map: map.clone(),
+                        rec: record.clone(),
+                        planes,
+                    });
+                }
             }
             if let Some(entries) = rc.measured.get_mut(&group.key) {
                 entries[idx].registration = Some(outcome);
@@ -3866,6 +4017,16 @@ fn register_group_pass(
                 seed_policy = seed_policy_field(policy),
                 "registration gate"
             );
+            // Perf tier A Task 6a fix round 1: this frame's own plane count
+            // (stage 3's `MeasuredFrame::planes`), threaded through so the
+            // fan-out worker that writes the registered artifact never
+            // needs `rc` to name the `_d` (debayered) output file.
+            let planes = rc
+                .measured
+                .get(&group.key)
+                .and_then(|v| v.get(idx))
+                .map(|e| e.planes)
+                .unwrap_or(1);
             to_register.push(PendingRegistration {
                 idx,
                 frame,
@@ -3875,11 +4036,12 @@ fn register_group_pass(
                 scale_gate,
                 hint,
                 policy,
+                planes,
             });
         }
     }
 
-    if to_register.is_empty() {
+    if to_register.is_empty() && needs_artifact_rewrite.is_empty() {
         return Ok(pass);
     }
 
@@ -3887,12 +4049,29 @@ fn register_group_pass(
     // (already resolved by the caller — the run-wide one in co-registered
     // mode, the group's own in native) — the OUTPUT buffer size, and a
     // more accurate admission bound than any per-frame native geometry
-    // would be.
-    let (ref_w, ref_h) = {
+    // would be. `reference_name` is the registered artifact's own
+    // `ATH_REGR` card value (perf tier A Task 6a fix round 1: hoisted here,
+    // once per group, instead of once per frame inside the old
+    // `write_registered_artifact`).
+    let (ref_w, ref_h, reference_name) = {
         let geometry = rc.geometry_of(&group.key);
-        (geometry.width, geometry.height)
+        (
+            geometry.width,
+            geometry.height,
+            geometry
+                .calibrated
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("reference")
+                .to_string(),
+        )
     };
-    let working_set_bytes = 4 * ref_w as u64 * ref_h as u64 * 4;
+    // Perf tier A Task 6a fix round 1 (ruling R-TA-5): the register
+    // fan-out's worker now also warps and writes the registered artifact
+    // (`REGISTER_PLANES_RESIDENT`'s own doc has the measurement) —
+    // `register_working_set_bytes` folds that cost in, channel-aware.
+    let working_set_bytes =
+        register_working_set_bytes(ref_w as u64, ref_h as u64, group.color_mode);
     let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     log_admission(
         rc,
@@ -3902,6 +4081,89 @@ fn register_group_pass(
         0,
         admission_n,
     );
+    // Perf tier A Task 6a fix round 1: both fan-outs below write into the
+    // SAME per-group directory — created once here rather than once per
+    // frame inside the old `write_registered_artifact`.
+    let out_dir = rc.layout.registered_dir(&group.key);
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| RunError::Other(format!("creating {}: {e}", out_dir.display())))?;
+    let interp = cfg.registration.interpolation;
+    let clamping = cfg.registration.clamping_threshold;
+    let run_id = rc.run_id;
+    let set_id = rc.set_id;
+
+    // ── Cache-hit rewrite batch (ruling R-TA-5): parallel, admitted the
+    // SAME way as the main fan-out below — no per-frame `rc` access, so it
+    // never fights the main batch over `&mut RunContext`. Registration
+    // itself is already known (`map`/`rec`); only the pixel work runs
+    // here. ──
+    if !needs_artifact_rewrite.is_empty() {
+        let pool_ref = &rc.ctx.image_pool;
+        let out_dir_ref = &out_dir;
+        let reference_name_ref = &reference_name;
+        let group_ref = group;
+        let cancel_ref: &AtomicBool = &rc.cancel;
+        let rewrite_results = fan_out(
+            needs_artifact_rewrite,
+            admission_n,
+            cancel_ref,
+            move |item: ArtifactRewriteItem| -> Result<(i64, RegistrationRecord, Option<PathBuf>), String> {
+                let stem = calibrated_file_stem(group_ref, &item.frame);
+                let out = out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
+                let written = write_one_registered_frame(
+                    &item.calibrated,
+                    &item.map,
+                    ref_w,
+                    ref_h,
+                    interp,
+                    clamping,
+                    reference_name_ref,
+                    &item.rec,
+                    Some(pool_ref),
+                    &out,
+                );
+                match written {
+                    Ok(()) => Ok((item.frame_id, item.rec, Some(out))),
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id,
+                            frame_id = item.frame_id,
+                            error = ?e,
+                            "failed to write registered frame"
+                        );
+                        Ok((item.frame_id, item.rec, None))
+                    }
+                }
+            },
+        );
+        rc.check_cancel()?;
+        for res in rewrite_results {
+            match res {
+                None => return Err(RunError::Cancelled),
+                Some(Ok((frame_id, rec, Some(out_path)))) => {
+                    if let Err(e) =
+                        record_registered_artifact(rc, &group.key, frame_id, &rec, &out_path)
+                    {
+                        tracing::warn!(
+                            run_id = rc.run_id,
+                            frame_id,
+                            error = ?e,
+                            "failed to record registered artifact"
+                        );
+                    }
+                }
+                // Write failed (already warned above) or a hard error the
+                // closure never actually constructs — either way, nothing
+                // to record; the frame falls back to the on-the-fly warp.
+                Some(Ok((_, _, None))) | Some(Err(_)) => {}
+            }
+        }
+    }
+
+    if to_register.is_empty() {
+        return Ok(pass);
+    }
+
     let meta: Vec<(usize, GroupFrame, String, SeedPolicy)> = to_register
         .iter()
         .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone(), p.policy))
@@ -3921,12 +4183,15 @@ fn register_group_pass(
             };
             RegisterItem {
                 frame_id: p.frame.frame_id,
+                frame: p.frame,
                 path: p.path,
                 is_reference: p.is_reference,
                 scale_gate: p.scale_gate,
                 hint: p.hint,
                 policy: p.policy,
                 pre,
+                expected_hash: p.expected_hash,
+                planes: p.planes,
             }
         })
         .collect();
@@ -3950,6 +4215,11 @@ fn register_group_pass(
     let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
     let reg_cfg = &cfg.registration;
     let ref_stars_ref = ref_stars;
+    // Perf tier A Task 6a fix round 1 (ruling R-TA-5): the registered
+    // artifact's write now happens INSIDE this closure, right after a
+    // successful alignment — see `RegisteredWrite`'s own doc.
+    let out_dir_ref = &out_dir;
+    let reference_name_ref = &reference_name;
 
     let results = fan_out(items, admission_n, cancel_ref, move |item: RegisterItem| {
         let out = if item.is_reference {
@@ -4011,6 +4281,65 @@ fn register_group_pass(
                 }
             }
         };
+        // Perf tier A Task 6a fix round 1 (ruling R-TA-5): for a
+        // PERSISTING item whose alignment just succeeded, build the
+        // registration record AND write the registered artifact right
+        // here — the full-frame warp this used to defer to the sequential
+        // results loop is exactly the CPU cost `admission_n` exists to
+        // parallelize. A dry pass, or an alignment failure, builds nothing
+        // (`None`) — the sequential loop's existing handling for both is
+        // unchanged.
+        let out = out.map(|(reg, dry_stars)| {
+            let persisted = if persist {
+                match &reg.outcome {
+                    Ok(alignment) => {
+                        let now =
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                        let is_reference_row = item.frame_id == reference_frame_id;
+                        let rec = to_record(
+                            set_id,
+                            item.frame_id,
+                            reference_frame_id,
+                            is_reference_row,
+                            &reg,
+                            &item.expected_hash,
+                            &now,
+                        );
+                        let stem = calibrated_file_stem(group, &item.frame);
+                        let out_path =
+                            out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
+                        let written = match write_one_registered_frame(
+                            &item.path,
+                            &alignment.map,
+                            ref_w,
+                            ref_h,
+                            interp,
+                            clamping,
+                            reference_name_ref,
+                            &rec,
+                            Some(pool_ref),
+                            &out_path,
+                        ) {
+                            Ok(()) => Some(out_path),
+                            Err(e) => {
+                                tracing::warn!(
+                                    run_id,
+                                    frame_id = item.frame_id,
+                                    error = ?e,
+                                    "failed to write registered frame"
+                                );
+                                None
+                            }
+                        };
+                        Some(RegisteredWrite { rec, written })
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            (reg, dry_stars, persisted)
+        });
         ticker_ref.tick(Some(item.frame_id));
         out
     });
@@ -4048,7 +4377,7 @@ fn register_group_pass(
                     return Err(RunError::Other(msg.clone()));
                 }
             }
-            Some(Ok((reg, dry_stars))) => {
+            Some(Ok((reg, dry_stars, persisted))) => {
                 // Perf tier 1 Task 9: a dry pass's own successful
                 // detections are cached for the persisting pass right
                 // after it — regardless of whether THIS pass's alignment
@@ -4096,42 +4425,41 @@ fn register_group_pass(
                                 rc.warnings
                                     .push(format!("frame {}: {note}", frame.frame_id));
                             }
-                            let now = chrono::Utc::now()
-                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                            let is_reference_row = frame.frame_id == reference_frame_id;
-                            let rec = to_record(
-                                rc.set_id,
-                                frame.frame_id,
-                                reference_frame_id,
-                                is_reference_row,
-                                &reg,
-                                hash,
-                                &now,
+                            // Perf tier A Task 6a fix round 1 (ruling
+                            // R-TA-5): the record AND the registered
+                            // artifact's pixel work were both already done
+                            // inside the fan-out worker above — `persisted`
+                            // is `Some` for every successfully-aligned,
+                            // persisting item (the worker builds it
+                            // unconditionally in that case; see the
+                            // closure). Only the DB writes — this record's
+                            // `registration_results` row and, when the
+                            // write succeeded, the `registered` artifact
+                            // row — stay here: `rusqlite` connections are
+                            // not `Send` across `fan_out`'s plain threads.
+                            let RegisteredWrite { rec, written } = persisted.expect(
+                                "a persisting, successfully-aligned item always carries a RegisteredWrite",
                             );
                             let map = alignment.map.clone();
                             {
                                 let conn = db(&rc.ctx)?.conn();
                                 upsert_registration(&conn, &rec)?;
                             }
-                            // Perf tier A Task 6a: the registered artifact
-                            // is now the run's REQUIRED per-frame artifact
-                            // (Normalize/Integrate always read it) — no
-                            // longer gated on `write_registered_frames`
-                            // (which stays in the config/UI as a vestigial
-                            // toggle, see its own doc). A write failure is
-                            // still non-fatal: this frame's `GroupMember`
-                            // snapshot later just finds no fresh artifact
-                            // and every reader falls back to the on-the-fly
-                            // warp.
-                            if let Err(e) =
-                                write_registered_artifact(rc, group, frame, &map, &rec, &cfg)
-                            {
-                                tracing::warn!(
-                                    run_id = rc.run_id,
-                                    frame_id = frame.frame_id,
-                                    error = ?e,
-                                    "failed to write registered frame"
-                                );
+                            if let Some(out_path) = &written {
+                                if let Err(e) = record_registered_artifact(
+                                    rc,
+                                    &group.key,
+                                    frame.frame_id,
+                                    &rec,
+                                    out_path,
+                                ) {
+                                    tracing::warn!(
+                                        run_id = rc.run_id,
+                                        frame_id = frame.frame_id,
+                                        error = ?e,
+                                        "failed to record registered artifact"
+                                    );
+                                }
                             }
                             if let Some(entries) = rc.measured.get_mut(&group.key) {
                                 entries[idx].registration = Some(RegisteredFrameOutcome::Aligned {
@@ -4878,113 +5206,78 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Perf tier A Task 6a: the registered artifact is a REQUIRED per-frame
-/// output now — Normalize and Integrate both read it in place of re-warping
-/// the calibrated frame on every band (`RegisteredSource::open_materialized`)
-/// — resamples `calibrated` into the reference geometry through the SAME
-/// `warp_rows` call the on-the-fly path uses and writes it under
-/// `layout.registered_dir(group_key)`, plus a `registered` artifact row
-/// keyed on `rec.config_hash` (the registration config hash, already folded
-/// with the frame's own calibration hash by `registration_hash_for` — a
-/// re-registration or a re-calibration invalidates it exactly like the LN
-/// `.athln` sidecars). Runs on the run thread, sequentially, right after
-/// each frame's registration DB write rather than inside the fan-out
-/// worker — this predates the write becoming required (Task 2's era, when
-/// it really was optional debug output); a future tier could move it into
-/// the fan-out for more parallelism, not attempted here. A write failure is
-/// logged and never fails the run — [`GroupMember`]'s own freshness check
-/// (`stacking::run`'s snapshot before Normalize/Integrate) simply finds
-/// nothing fresh and every reader falls back to the on-the-fly warp.
+/// Perf tier A Task 6a fix round 1 (ruling R-TA-5): the registered
+/// artifact's PIXEL work ONLY — source cards, the warp, the tmp+atomic-
+/// rename write — with no `RunContext`/DB access at all, so BOTH register
+/// fan-out closures (the main align-and-write one, and the cache-hit
+/// rewrite-only one) can call it directly from a worker thread. `rec`'s
+/// `model`/`transform_json`/`rms_residual_px` (already resolved by
+/// [`to_record`]) feed the `ATH_REG*` provenance cards — see
+/// [`RegisteredCards`]'s own doc for what each one means. The registered
+/// artifact is a REQUIRED per-frame output since this task — Normalize and
+/// Integrate both read it in place of re-warping the calibrated frame on
+/// every band (`RegisteredSource::open_materialized`).
 ///
 /// The config field `registration.write_registered_frames` (Settings →
 /// Stacking, `RegisterPanel`'s "Write registered frames" toggle) no longer
-/// gates this call — see [`ensure_registered_artifact`] below, this
-/// function's other caller — and is kept only because removing it would be
-/// a command-surface change out of this task's scope; it is otherwise
-/// inert now that the write always happens.
-fn write_registered_artifact(
-    rc: &mut RunContext,
-    group: &IntegrationGroup,
-    frame: &GroupFrame,
+/// gates this write — kept only because removing it would be a
+/// command-surface change out of this task's scope; it is otherwise inert.
+#[allow(clippy::too_many_arguments)]
+fn write_one_registered_frame(
+    calibrated: &Path,
     map: &PixelMap,
+    ref_w: usize,
+    ref_h: usize,
+    interp: Interpolation,
+    clamping: f32,
+    reference_name: &str,
     rec: &RegistrationRecord,
-    cfg: &StackingConfig,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    out: &Path,
 ) -> anyhow::Result<()> {
-    let group_key: &str = group.key.as_str();
-    let (calibrated, planes) = rc
-        .measured
-        .get(group_key)
-        .and_then(|v| v.iter().find(|e| e.frame.frame_id == frame.frame_id))
-        .and_then(|e| e.calibrated.clone().map(|c| (c, e.planes)))
-        .ok_or_else(|| {
-            anyhow::anyhow!("no calibrated path recorded for frame {}", frame.frame_id)
-        })?;
-
-    let out_dir = rc.layout.registered_dir(group_key);
-    std::fs::create_dir_all(&out_dir)?;
-    // Fix round 1: route the registered name through the SAME
-    // `calibrated_file_stem` stage 1 used, rather than recovering it by
-    // trimming a leading "c_" off the calibrated file's own name — the two
-    // stay consistent by construction, not by one parsing the other. The
-    // debayer marker is likewise explicit (`planes == 3`, already known
-    // from this same frame's own measured entry) rather than inferred by
-    // checking whether the calibrated file's OWN name ends in "_d" — a
-    // source light whose own filename happens to end in "_d" (e.g.
-    // "vega_d.fits", mono) made that heuristic misfire.
-    let stem = calibrated_file_stem(group, frame);
-    let out = out_dir.join(registered_file_name(&stem, planes == 3));
-
-    // M4b ruling R-M4b-5: the registered artifact is written in — and
-    // names — its GROUP's reference, which in co-registered mode is the
-    // run-wide one and in native mode the group's own.
-    let (reference_name, ref_width, ref_height) = {
-        let geometry = rc.geometry_of(group_key);
-        (
-            geometry
-                .calibrated
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("reference")
-                .to_string(),
-            geometry.width,
-            geometry.height,
-        )
-    };
-    let transform_json = map.to_json();
-    let model = rec.model.clone().unwrap_or_default();
-
-    let source = source_cards_from_file(&calibrated)?;
+    let source = source_cards_from_file(calibrated)?;
     let cards = build_registered_cards(
         &source,
         &RegisteredCards {
-            reference_name: &reference_name,
-            model: &model,
-            transform_json: &transform_json,
-            interpolation: cfg.registration.interpolation,
-            clamping: cfg.registration.clamping_threshold,
+            reference_name,
+            model: rec.model.as_deref().unwrap_or_default(),
+            transform_json: rec.transform_json.as_deref().unwrap_or_default(),
+            interpolation: interp,
+            clamping,
             rms_px: rec.rms_residual_px,
             reference_roworder: None,
         },
     )?;
     write_registered_frame(
-        &calibrated,
-        map,
-        ref_width,
-        ref_height,
-        cfg.registration.interpolation,
-        cfg.registration.clamping_threshold,
-        &cards,
-        Some(&rc.ctx.image_pool),
-        &out,
+        calibrated, map, ref_w, ref_h, interp, clamping, &cards, pool, out,
     )?;
+    Ok(())
+}
 
-    let (size, modified_at) = file_identity(&out)?;
+/// Perf tier A Task 6a fix round 1: the registered artifact's DB
+/// bookkeeping ONLY — `file_identity` + the `registered` artifact row,
+/// keyed on `rec.config_hash` (the registration config hash, already
+/// folded with the frame's own calibration hash by `registration_hash_for`
+/// — a re-registration or a re-calibration invalidates it exactly like the
+/// LN `.athln` sidecars). Split from the pixel work
+/// ([`write_one_registered_frame`]) because `rusqlite` connections are not
+/// `Send` across `fan_out`'s plain `thread::scope` workers — this runs on
+/// the run thread, in the sequential results loop, right after the write
+/// a worker already finished.
+fn record_registered_artifact(
+    rc: &mut RunContext,
+    group_key: &str,
+    frame_id: i64,
+    rec: &RegistrationRecord,
+    out: &Path,
+) -> anyhow::Result<()> {
+    let (size, modified_at) = file_identity(out)?;
     let conn = db(&rc.ctx)?.conn();
     upsert_artifact(
         &conn,
         &NewArtifact {
             frames_set_id: rc.set_id,
-            frame_id: Some(frame.frame_id),
+            frame_id: Some(frame_id),
             group_key,
             kind: "registered",
             path: out.to_str(),
@@ -4997,58 +5290,27 @@ fn write_registered_artifact(
     Ok(())
 }
 
-/// Perf tier A Task 6a: called on the register-pass CACHE-HIT branch (a
-/// `registration_results` row reused from a prior run) — the registration
-/// itself needs no rework, but its materialized artifact might: never
-/// written before this became required, or removed since (a cleanup, a
-/// foreign edit). Looks up the `registered` artifact row for `frame` and
-/// (re)writes it via [`write_registered_artifact`] only when [`is_fresh`]
-/// says the existing one is stale or missing — the ordinary case is a fresh
-/// hit, so this costs one `find_artifact` SELECT per reused frame and
-/// nothing else. Failures (either the lookup or the write) are logged and
-/// swallowed here exactly as they are in [`write_registered_artifact`]'s
-/// own caller: a frame whose registration is a cache hit but whose artifact
-/// stays missing simply falls back to the on-the-fly warp downstream.
-fn ensure_registered_artifact(
-    rc: &mut RunContext,
-    group: &IntegrationGroup,
-    frame: &GroupFrame,
-    map: &PixelMap,
-    rec: &RegistrationRecord,
-    cfg: &StackingConfig,
-) {
-    let hash = rec.config_hash.as_deref().unwrap_or_default();
-    let fresh = (|| -> anyhow::Result<bool> {
-        let conn = db(&rc.ctx)?.conn();
-        Ok(crate::db::stacking::find_artifact(
-            &conn,
-            rc.set_id,
-            &group.key,
-            "registered",
-            Some(frame.frame_id),
-        )?
-        .is_some_and(|row| is_fresh(&row, hash)))
-    })()
-    .unwrap_or_else(|e| {
-        tracing::warn!(
-            run_id = rc.run_id,
-            frame_id = frame.frame_id,
-            error = ?e,
-            "failed to check the registered artifact's freshness; rewriting it"
-        );
-        false
-    });
-    if fresh {
-        return;
-    }
-    if let Err(e) = write_registered_artifact(rc, group, frame, map, rec, cfg) {
-        tracing::warn!(
-            run_id = rc.run_id,
-            frame_id = frame.frame_id,
-            error = ?e,
-            "failed to write registered frame"
-        );
-    }
+/// Perf tier A Task 6a fix round 1: the CHEAP half of what used to be
+/// `ensure_registered_artifact` — a `find_artifact` SELECT + [`is_fresh`]
+/// (a disk `stat`, no pixel I/O) — called from `register_group_pass`'s
+/// cache-hit branch to decide whether a frame needs queuing into
+/// `needs_artifact_rewrite`. The expensive half (warp + write) now runs in
+/// that batch's own fan-out, not here.
+fn registered_artifact_is_fresh(
+    rc: &RunContext,
+    group_key: &str,
+    frame_id: i64,
+    hash: &str,
+) -> anyhow::Result<bool> {
+    let conn = db(&rc.ctx)?.conn();
+    Ok(crate::db::stacking::find_artifact(
+        &conn,
+        rc.set_id,
+        group_key,
+        "registered",
+        Some(frame_id),
+    )?
+    .is_some_and(|row| is_fresh(&row, hash)))
 }
 
 /// `r_<stem>[_d].fits` for the SAME collision-safe `stem`
@@ -5899,18 +6161,19 @@ fn process_group_output(
                 normalized_mean: 0.0,
                 missing: None,
             });
-            // Perf tier A Task 6a: this snapshot is taken AFTER stage 5 has
-            // already written (or refreshed) every included, aligned
-            // member's registered artifact — see `ensure_registered_artifact`
-            // and the fan-out results loop in `register_group_pass` — so a
-            // fresh row here is the ordinary case; `None` (the write
-            // failed, or a config predating this task never ran stage 5
-            // again) just means every reader below falls back to the
-            // on-the-fly warp for this one frame, silently (nothing was
-            // ever expected on disk).
+            // Perf tier A Task 6a (fix round 1: both register fan-out
+            // closures — the align-and-write one and the cache-hit
+            // rewrite-only one, see `register_group_pass`): this snapshot is
+            // taken AFTER stage 5 has already written (or refreshed) every
+            // included, aligned member's registered artifact, so a fresh
+            // row here is the ordinary case; `None` (the write failed, or a
+            // config predating this task never ran stage 5 again) just
+            // means every reader below falls back to the on-the-fly warp
+            // for this one frame, silently (nothing was ever expected on
+            // disk).
             //
             // Deliberately HASH-ONLY, not the full [`is_fresh`] disk check
-            // stage 5's own [`ensure_registered_artifact`] uses to decide
+            // stage 5's own [`registered_artifact_is_fresh`] uses to decide
             // whether a REWRITE is needed: the actual "is the file usable
             // right now" question belongs to
             // `RegisteredSource::open_materialized`'s own `PlaneReader::open`
