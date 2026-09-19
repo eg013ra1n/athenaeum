@@ -21,7 +21,12 @@ fn push(records: &mut Vec<[u8; CARD_SIZE]>, c: Card) -> Result<(), FitsWriteErro
 /// M4d Task 2: `pub(super)` — the sibling XISF writer validates the same
 /// geometry contract (1 or 3 channels, non-zero dimensions, matching data
 /// length) through this one function rather than a second copy of it.
-pub(super) fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Result<(), FitsWriteError> {
+pub(super) fn validate(
+    width: usize,
+    height: usize,
+    channels: usize,
+    data_len: usize,
+) -> Result<(), FitsWriteError> {
     if channels != 1 && channels != 3 {
         return Err(FitsWriteError::BadChannels(channels));
     }
@@ -31,9 +36,14 @@ pub(super) fn validate(width: usize, height: usize, channels: usize, data_len: u
     let expected = width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(channels))
-        .ok_or_else(|| FitsWriteError::BadDimensions(format!("{width}x{height}x{channels} overflows")))?;
+        .ok_or_else(|| {
+            FitsWriteError::BadDimensions(format!("{width}x{height}x{channels} overflows"))
+        })?;
     if data_len != expected {
-        return Err(FitsWriteError::DataSizeMismatch { expected, got: data_len });
+        return Err(FitsWriteError::DataSizeMismatch {
+            expected,
+            got: data_len,
+        });
     }
     Ok(())
 }
@@ -91,7 +101,15 @@ pub fn write_fits_f32(
     data: &[f32],
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
-    write_fits_f32_with(path, width, height, channels, data, cards, Durability::Durable)
+    write_fits_f32_with(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        Durability::Durable,
+    )
 }
 
 /// [`write_fits_f32`] with the durability as a parameter (perf tier 1 Task
@@ -144,25 +162,53 @@ pub fn write_fits_f32_with(
     Ok(())
 }
 
-pub fn write_fits_f32_to<W: Write>(
-    mut w: W,
+/// Header records + the terminating 2880-byte pad — shared by
+/// [`write_fits_f32_to`] (which then writes the whole `data` slice in one
+/// go) and [`write_fits_f32_streaming_to`] (fix round 2, ruling R-TA-6,
+/// required item: one shared header writer so the two data-writing shapes
+/// can never drift apart on what the header itself says).
+fn write_header<W: Write>(
+    w: &mut W,
     width: usize,
     height: usize,
     channels: usize,
-    data: &[f32],
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
-    validate(width, height, channels, data.len())?;
-
     let mut records: Vec<[u8; CARD_SIZE]> = Vec::new();
-    push(&mut records, Card::structural("SIMPLE", CardValue::Logical(true), "conforms to FITS standard"))?;
-    push(&mut records, Card::structural("BITPIX", CardValue::Integer(-32), "IEEE single precision floating point"))?;
+    push(
+        &mut records,
+        Card::structural(
+            "SIMPLE",
+            CardValue::Logical(true),
+            "conforms to FITS standard",
+        ),
+    )?;
+    push(
+        &mut records,
+        Card::structural(
+            "BITPIX",
+            CardValue::Integer(-32),
+            "IEEE single precision floating point",
+        ),
+    )?;
     let naxis: i64 = if channels == 3 { 3 } else { 2 };
-    push(&mut records, Card::structural("NAXIS", CardValue::Integer(naxis), "number of data axes"))?;
-    push(&mut records, Card::structural("NAXIS1", CardValue::Integer(width as i64), "width"))?;
-    push(&mut records, Card::structural("NAXIS2", CardValue::Integer(height as i64), "height"))?;
+    push(
+        &mut records,
+        Card::structural("NAXIS", CardValue::Integer(naxis), "number of data axes"),
+    )?;
+    push(
+        &mut records,
+        Card::structural("NAXIS1", CardValue::Integer(width as i64), "width"),
+    )?;
+    push(
+        &mut records,
+        Card::structural("NAXIS2", CardValue::Integer(height as i64), "height"),
+    )?;
     if channels == 3 {
-        push(&mut records, Card::structural("NAXIS3", CardValue::Integer(3), "color planes"))?;
+        push(
+            &mut records,
+            Card::structural("NAXIS3", CardValue::Integer(3), "color planes"),
+        )?;
     }
     for c in cards {
         records.extend(format_card(c)?);
@@ -179,8 +225,22 @@ pub fn write_fits_f32_to<W: Write>(
     let header_bytes = records.len() * CARD_SIZE;
     let pad = (BLOCK_SIZE - header_bytes % BLOCK_SIZE) % BLOCK_SIZE;
     w.write_all(&vec![b' '; pad])?;
+    Ok(())
+}
 
-    // data: big-endian f32, plane-major
+/// Writes `data` (one big-endian f32 chunk at a time) and the trailing
+/// 2880-byte pad. Shared by [`write_fits_f32_to`] and
+/// [`write_fits_f32_streaming_to`] (one plane at a time) — the SAME
+/// chunking loop either way, so neither shape can byte-drift from the
+/// other. `data_bytes` is the TOTAL image size (`width*height*channels*4`)
+/// even when this call only wrote one plane's worth — the pad is written
+/// once, by the LAST caller, via `is_last_chunk`.
+fn write_data_chunk<W: Write>(
+    w: &mut W,
+    data: &[f32],
+    total_data_bytes: usize,
+    is_last_chunk: bool,
+) -> Result<(), FitsWriteError> {
     let mut buf = Vec::with_capacity(8192 * 4);
     for v in data {
         buf.extend_from_slice(&v.to_be_bytes());
@@ -190,9 +250,125 @@ pub fn write_fits_f32_to<W: Write>(
         }
     }
     w.write_all(&buf)?;
-    let data_bytes = data.len() * 4;
-    let dpad = (BLOCK_SIZE - data_bytes % BLOCK_SIZE) % BLOCK_SIZE;
-    w.write_all(&vec![0u8; dpad])?;
+    if is_last_chunk {
+        let dpad = (BLOCK_SIZE - total_data_bytes % BLOCK_SIZE) % BLOCK_SIZE;
+        w.write_all(&vec![0u8; dpad])?;
+    }
+    Ok(())
+}
+
+/// [`write_fits_f32_streaming_to`] wrapped in the SAME tmp-file + atomic-
+/// rename shell [`write_fits_f32_with`] uses (fix round 2, ruling R-TA-6,
+/// required item) — validates first, writes to a sibling temp file one
+/// plane at a time, flushes, optionally `sync_all`s per `durability`, then
+/// renames into place; a failed write never touches an existing good file
+/// at `path`. `plane`'s error type is [`FitsWriteError`] so this module
+/// stays free of a caller's own error type — `stacking::register::writer`
+/// maps its `anyhow::Error` (a `PlaneReader` read failure) into
+/// `FitsWriteError::Io` at the boundary.
+pub fn write_fits_f32_streaming_with(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    cards: &[Card],
+    durability: Durability,
+    mut plane: impl FnMut(usize) -> Result<Vec<f32>, FitsWriteError>,
+) -> Result<(), FitsWriteError> {
+    let tmp = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        path.with_extension(format!("fits.tmp.{}.{}", std::process::id(), seq))
+    };
+    let write_result = (|| -> Result<(), FitsWriteError> {
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(f);
+        write_fits_f32_streaming_to(&mut w, width, height, channels, cards, &mut plane)?;
+        w.flush()?;
+        if durability == Durability::Durable {
+            w.get_ref().sync_all()?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = rename_replace(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+pub fn write_fits_f32_to<W: Write>(
+    mut w: W,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[Card],
+) -> Result<(), FitsWriteError> {
+    validate(width, height, channels, data.len())?;
+    write_header(&mut w, width, height, channels, cards)?;
+    write_data_chunk(&mut w, data, data.len() * 4, true)
+}
+
+/// Streaming per-plane counterpart of [`write_fits_f32_to`] (fix round 2,
+/// ruling R-TA-6, required item — the plane-at-a-time registered-frame
+/// write): the header is IDENTICAL (`write_header`, shared), but instead
+/// of one `data: &[f32]` slice already holding every plane, `plane` is
+/// called once per channel (`0..channels`, the SAME FITS plane-major order
+/// — R, then G, then B for a 3-channel image — `write_fits_f32_to` writes
+/// a pre-assembled buffer in) and must return exactly `width * height`
+/// values for THAT plane. Nothing here holds more than one plane's bytes
+/// resident at once, so a caller that also PRODUCES its plane data lazily
+/// (warp one plane, write it, drop it, warp the next) never has to
+/// assemble the whole image in memory first — the reason this exists.
+/// Because it calls the exact same `write_header`/`write_data_chunk` a
+/// pre-assembled write does, over the exact same per-plane byte ranges,
+/// the resulting file is byte-identical to what [`write_fits_f32_to`]
+/// would write given the same planes concatenated into one slice —
+/// pinned by `stacking::register::writer`'s own tests via `cmp`, not
+/// re-proven here.
+pub fn write_fits_f32_streaming_to<W: Write>(
+    mut w: W,
+    width: usize,
+    height: usize,
+    channels: usize,
+    cards: &[Card],
+    mut plane: impl FnMut(usize) -> Result<Vec<f32>, FitsWriteError>,
+) -> Result<(), FitsWriteError> {
+    if channels != 1 && channels != 3 {
+        return Err(FitsWriteError::BadChannels(channels));
+    }
+    if width == 0 || height == 0 {
+        return Err(FitsWriteError::BadDimensions(format!("{width}x{height}")));
+    }
+    let plane_len = width
+        .checked_mul(height)
+        .ok_or_else(|| FitsWriteError::BadDimensions(format!("{width}x{height} overflows")))?;
+    let total_data_bytes = plane_len
+        .checked_mul(channels)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            FitsWriteError::BadDimensions(format!("{width}x{height}x{channels} overflows"))
+        })?;
+
+    write_header(&mut w, width, height, channels, cards)?;
+    for p in 0..channels {
+        let data = plane(p)?;
+        if data.len() != plane_len {
+            return Err(FitsWriteError::DataSizeMismatch {
+                expected: plane_len,
+                got: data.len(),
+            });
+        }
+        write_data_chunk(&mut w, &data, total_data_bytes, p + 1 == channels)?;
+    }
     Ok(())
 }
 
@@ -241,29 +417,62 @@ mod tests {
     #[test]
     fn bypassed_card_constructor_still_validated_at_format_time() {
         // Card fields are pub — a caller can build an invalid keyword directly.
-        let evil = Card { keyword: "BAD KEY!".into(), value: Some(CardValue::Integer(1)), comment: None, text: None, structural: false };
+        let evil = Card {
+            keyword: "BAD KEY!".into(),
+            value: Some(CardValue::Integer(1)),
+            comment: None,
+            text: None,
+            structural: false,
+        };
         let r = crate::fits_writer::card::format_card(&evil);
         assert!(r.is_err(), "format_card must re-validate keywords: {r:?}");
-        let reserved = Card { keyword: "NAXIS1".into(), value: Some(CardValue::Integer(1)), comment: None, text: None, structural: false };
+        let reserved = Card {
+            keyword: "NAXIS1".into(),
+            value: Some(CardValue::Integer(1)),
+            comment: None,
+            text: None,
+            structural: false,
+        };
         assert!(crate::fits_writer::card::format_card(&reserved).is_err());
         // Reserved keywords must fail closed even when hand-built to mimic the
         // writer's own structural cards — only the crate-private `structural`
         // capability flag (Card::structural) exempts a card, never its name.
         for kw in ["SIMPLE", "BITPIX", "END"] {
-            let fake = Card { keyword: kw.into(), value: Some(CardValue::Integer(1)), comment: None, text: None, structural: false };
+            let fake = Card {
+                keyword: kw.into(),
+                value: Some(CardValue::Integer(1)),
+                comment: None,
+                text: None,
+                structural: false,
+            };
             let r = crate::fits_writer::card::format_card(&fake);
             assert!(r.is_err(), "hand-built {kw} card must be rejected: {r:?}");
         }
         // A comment is caller-settable and must not act as a trust signal.
-        let fake_naxis = Card { keyword: "NAXIS1".into(), value: Some(CardValue::Integer(1)), comment: Some("x".into()), text: None, structural: false };
+        let fake_naxis = Card {
+            keyword: "NAXIS1".into(),
+            value: Some(CardValue::Integer(1)),
+            comment: Some("x".into()),
+            text: None,
+            structural: false,
+        };
         let r = crate::fits_writer::card::format_card(&fake_naxis);
-        assert!(r.is_err(), "NAXIS1 with a comment must still be rejected: {r:?}");
+        assert!(
+            r.is_err(),
+            "NAXIS1 with a comment must still be rejected: {r:?}"
+        );
     }
 
     #[test]
     fn text_card_with_no_value_is_error_not_panic() {
         // value: None + text: None used to hit `expect("value card")`.
-        let broken = Card { keyword: "GAIN".into(), value: None, comment: None, text: None, structural: false };
+        let broken = Card {
+            keyword: "GAIN".into(),
+            value: None,
+            comment: None,
+            text: None,
+            structural: false,
+        };
         assert!(crate::fits_writer::card::format_card(&broken).is_err());
     }
 
@@ -277,7 +486,61 @@ mod tests {
         write_fits_f32_with(&b, 64, 48, 1, &data, &[], Durability::Volatile).unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
         // No tmp file left behind either way.
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp.")).collect();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+            })
+            .collect();
         assert!(leftovers.is_empty());
+    }
+
+    /// Fix round 2, ruling R-TA-6, required item: the plane-at-a-time
+    /// streaming writer must produce BYTE-IDENTICAL output to the
+    /// all-at-once writer, for a 1-channel and a 3-channel image, over
+    /// both durability modes. `stacking::register::writer`'s own tests
+    /// re-verify this at the `write_registered_frame` level (a synthetic
+    /// fixture AND a real OSC frame, via `cmp`) — this is the foundational
+    /// pin at the primitive level, mono and OSC alike.
+    #[test]
+    fn streaming_write_matches_the_all_at_once_writer_byte_for_byte() {
+        for channels in [1usize, 3usize] {
+            let (w, h) = (37usize, 29usize); // an odd size: no accidental block alignment
+            let plane_len = w * h;
+            let planes: Vec<Vec<f32>> = (0..channels)
+                .map(|c| {
+                    (0..plane_len)
+                        .map(|i| (c * 1000 + i) as f32 * 0.125 - 3.0)
+                        .collect()
+                })
+                .collect();
+            let all: Vec<f32> = planes.iter().flatten().copied().collect();
+            let cards = vec![Card::new("EXPTIME", CardValue::Real(30.0)).unwrap()];
+
+            let dir = tempfile::tempdir().unwrap();
+            for durability in [Durability::Durable, Durability::Volatile] {
+                let whole = dir
+                    .path()
+                    .join(format!("whole_{channels}_{durability:?}.fits"));
+                let streamed = dir
+                    .path()
+                    .join(format!("streamed_{channels}_{durability:?}.fits"));
+                write_fits_f32_with(&whole, w, h, channels, &all, &cards, durability).unwrap();
+                write_fits_f32_streaming_with(&streamed, w, h, channels, &cards, durability, |p| {
+                    Ok(planes[p].clone())
+                })
+                .unwrap();
+                assert_eq!(
+                    std::fs::read(&whole).unwrap(),
+                    std::fs::read(&streamed).unwrap(),
+                    "channels={channels} durability={durability:?}: streaming and \
+                     all-at-once writers disagree"
+                );
+            }
+        }
     }
 }

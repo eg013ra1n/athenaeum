@@ -455,6 +455,7 @@ pub fn normalize_frame(
     // warp otherwise — see `RegisteredSource::open_materialized`'s own doc.
     let registered = MaterializedFrame {
         registered_path: frame.registered_path.clone(),
+        frame_id: Some(frame.frame_id),
         fallback: RegisteredFrame {
             path: frame.path.clone(),
             map: frame.map.clone(),

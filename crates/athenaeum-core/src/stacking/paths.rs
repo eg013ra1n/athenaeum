@@ -532,16 +532,21 @@ pub struct EstimateInputs<'a> {
 
 /// Rough byte estimate for a run's working+output footprint: every group
 /// contributes its calibrated frames (one float32 plane per frame, three
-/// planes for OSC), the same again if registered frames are also kept, and
-/// one master plus (when maps are written) two rejection maps. The master/
-/// maps term uses the group's LARGEST member's native geometry (owner
-/// decision 2026-09-10: a group's members can carry different native
-/// geometry now that camera/geometry are not grouping keys — there is no
-/// single group-wide `W x H` any more; every registered frame actually
-/// lands on the ONE run-wide reference geometry, but that is not known this
-/// early, before any run has even started). This is a footprint estimate,
-/// not an exact accounting: it ignores compression, FITS header overhead,
-/// and the ln/intermediates M2 adds.
+/// planes for OSC, each frame at its OWN native geometry), one master plus
+/// (when maps are written) two rejection maps, and — when registered frames
+/// are also kept — one registered artifact per frame. The registered term
+/// (fix round 2, ruling R-TA-6 M5) and the master/maps term both use the
+/// group's LARGEST member's native geometry as a stand-in for the reference
+/// geometry (owner decision 2026-09-10: a group's members can carry
+/// different native geometry now that camera/geometry are not grouping keys
+/// — there is no single group-wide `W x H` any more; every registered frame
+/// actually lands on the ONE run-wide reference geometry, but that is not
+/// known this early, before any run has even started) — NOT each frame's
+/// own native size, which the registered term used before this fix and
+/// which drifts from the true count in exactly the mixed-pixel-scale (M4b)
+/// and native-geometry-mode groups this owner decision introduced. This is
+/// a footprint estimate, not an exact accounting: it ignores compression,
+/// FITS header overhead, and the ln/intermediates M2 adds.
 ///
 /// M3 Task 5 (spec §7): when `i.drizzle` is `Some`, two more per-group terms
 /// use the SAME largest-member geometry the master term above does —
@@ -568,8 +573,27 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
             .map(|f| planes * f.width.max(0) as u64 * f.height.max(0) as u64 * 4)
             .sum();
         total += calibrated_bytes;
+
+        // Fix round 2 (ruling R-TA-6 M5): `max_w`/`max_h` — the group's
+        // largest member's native geometry, the SAME approximation the
+        // master/maps term below already makes for "the reference
+        // geometry, not known this early" — hoisted above the
+        // `write_registered` term so that term can use it too, instead of
+        // `calibrated_bytes` (each frame's OWN native size). A registered
+        // artifact never lands at its source frame's native size — Task 6a's
+        // writer always warps into the REFERENCE geometry — so doubling
+        // `calibrated_bytes` under-or-over-counts by exactly the gap
+        // between a frame's native size and the reference whenever they
+        // differ, which M4b's mixed-pixel-scale and native-geometry groups
+        // make an ordinary case, not an edge one.
+        let (max_w, max_h) = g
+            .frames
+            .iter()
+            .map(|f| (f.width.max(0) as u64, f.height.max(0) as u64))
+            .max_by_key(|&(w, h)| w * h)
+            .unwrap_or((0, 0));
         if i.write_registered {
-            total += calibrated_bytes;
+            total += g.frames.len() as u64 * planes * max_w * max_h * 4;
         }
         // M4d Task 1: Bayer drizzle keeps the single-plane CFA mosaic beside
         // each debayered OSC frame — one plane where the calibrated frame
@@ -582,12 +606,6 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
                 .sum::<u64>();
         }
 
-        let (max_w, max_h) = g
-            .frames
-            .iter()
-            .map(|f| (f.width.max(0) as u64, f.height.max(0) as u64))
-            .max_by_key(|&(w, h)| w * h)
-            .unwrap_or((0, 0));
         let master_per_frame_bytes = planes * max_w * max_h * 4;
         let master_multiplier: u64 = if i.write_maps { 1 + 2 } else { 1 };
         total += master_per_frame_bytes * master_multiplier;
@@ -1246,6 +1264,44 @@ mod tests {
             on,
             off + 3 * 400,
             "registered adds one more calibrated-sized copy per frame"
+        );
+    }
+
+    /// Fix round 2, ruling R-TA-6 M5: a group whose members carry DIFFERENT
+    /// native geometry (M4b mixed-pixel-scale, or a native-mode group) must
+    /// have its registered-artifact term counted at the group's largest
+    /// member's geometry — the same stand-in the master/maps term already
+    /// uses for "the reference geometry, not known this early" — not at
+    /// each frame's OWN native size. Two frames, 10x10 and 20x10: before
+    /// this fix the registered term summed each frame's own native bytes
+    /// (`400 + 800 = 1200`); after, it is `frame_count * largest = 2 * 800
+    /// = 1600`, exactly what the master term already charges per frame.
+    #[test]
+    fn estimate_registered_copy_uses_the_largest_members_geometry_not_each_frames_own() {
+        let mut g = group(ColorMode::Mono, 1, 10, 10);
+        g.frames.push(frame(2, 20, 10));
+        let groups = vec![g];
+        let off = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: false,
+            drizzle: None,
+            large_scale: false,
+            drizzle_bayer: false,
+        });
+        let on = estimate_bytes(&EstimateInputs {
+            groups: &groups,
+            write_registered: true,
+            write_maps: false,
+            drizzle: None,
+            large_scale: false,
+            drizzle_bayer: false,
+        });
+        assert_eq!(
+            on,
+            off + 2 * 800,
+            "the registered term must use the largest member's geometry per frame, \
+             not the sum of each frame's own native bytes"
         );
     }
 

@@ -2441,60 +2441,76 @@ pub(crate) fn calibrate_working_set_bytes(w: u64, h: u64) -> u64 {
 /// fan-out worker registers a MONO frame (perf tier A Task 6a fix round 1,
 /// ruling R-TA-5): the pre-existing detect+align working set, unchanged.
 ///
-/// Measured 2026-09-19 with `/usr/bin/time -l` on `register_probe`
-/// extended (temporarily, never committed) to also call
-/// `write_registered_frame`, over 3 runs each against two real
-/// LDN1272-test calibrated frames (mono 6224×4168 detect-only vs
-/// detect+write):
+/// Measured 2026-09-19 with `/usr/bin/time -l` on `register_probe --write`
+/// (a real, committed flag — see its own doc), over 3 runs against two real
+/// LDN1272-test calibrated frames (mono 6224×4168):
 ///
-/// | | detect+align only | detect+align+write |
-/// | ---- | ---- | ---- |
-/// | mono, avg of 3 | 276.1 MB ≈ 2.66 planes | 380.5 MB ≈ 3.67 planes |
+/// | | detect+align+write |
+/// | ---- | ---- |
+/// | mono, avg of 3 | 274.6 MB ≈ 2.65 planes |
 ///
-/// The write's own delta (≈ 1.01 planes) matches `write_registered_frame`'s
-/// output buffer exactly — ONE plane for a mono (1-channel) subject. The
-/// MEASURED TOTAL (detect+align+write, 3.67) is used directly, rounded up,
-/// rather than a baseline-plus-delta estimate (see
-/// [`REGISTER_PLANES_RESIDENT_OSC`]'s own doc for why that split
-/// undercounts OSC) — it stays at the pre-task flat value, so mono
-/// admission is UNCHANGED by this task.
+/// Re-measured after fix round 2's plane-at-a-time write (ruling R-TA-6):
+/// for a MONO (1-channel) subject the old all-at-once writer and the new
+/// streaming one hold the exact same ONE plane's worth of output buffer
+/// either way, so no drop was expected here — and none of consequence
+/// showed up: 2.65 planes is close to the OLD design's own detect+align-
+/// ONLY baseline (2.66, fix round 1's measurement), i.e. the write's
+/// marginal cost over detect+align's own peak is now negligible for mono
+/// too (detect+align's peak already exceeds the one-plane write cost by
+/// itself). Left at 4 — comfortably above the fresh measurement, so mono
+/// admission is UNCHANGED by this fix round.
 pub(crate) const REGISTER_PLANES_RESIDENT: u64 = 4;
 
 /// OSC (3-channel) register+write planes — see [`REGISTER_PLANES_RESIDENT`]'s
 /// own doc for the measurement method; same date, same probe, against two
-/// real LDN1272-test debayered OSC frames (6248×4176, 3 planes), 2 runs
-/// each:
+/// real LDN1272-test debayered OSC frames (6248×4176, 3 planes).
 ///
-/// | | detect+align only | detect+align+write |
-/// | ---- | ---- | ---- |
-/// | OSC, avg of 2 | 588.2 MB ≈ 5.64 planes | 906.7 MB ≈ 8.69 planes |
+/// **Fix round 1** (all-at-once writer, `all = vec![NAN; plane_len *
+/// channels]`, one buffer holding EVERY channel's output together for the
+/// whole write), 2 runs: detect+align only 588.2 MB ≈ 5.64 planes,
+/// detect+align+write 906.7 MB ≈ 8.69 planes — the write's own delta
+/// (≈ 3.05 planes) was ONE plane PER CHANNEL, resident together, which is
+/// what made the OSC register admission the fan-out's tightest budget.
 ///
-/// The write's own delta (≈ 3.05 planes) matches `write_registered_frame`'s
-/// output buffer exactly — ONE plane PER CHANNEL, resident together for the
-/// whole write (`all = vec![f32::NAN; plane_len * channels]`), not a flat
-/// add. The pre-existing detect+align baseline itself already runs closer
-/// to 6 planes than the OLD flat constant's 4 (a PRE-EXISTING gap this task
-/// does not attempt to fix — luminance/detection buffers for a 3-channel
-/// subject were never flat-4 either); using a baseline-plus-delta estimate
-/// (4 + 3 = 7) would have undercounted the measured total by ≈ 1.7 planes.
-/// This constant is instead the MEASURED TOTAL, rounded up: 9.
+/// **Fix round 2** (ruling R-TA-6, required item — plane-at-a-time write:
+/// warp plane → write plane → drop its buffer → next plane, via
+/// `fits_writer::write_fits_f32_streaming_with`), 3 runs: detect+align+write
+/// 592.3 MB (range 588.2–598.1 MB) ≈ 5.68 planes (range 5.64–5.73) — the
+/// write's own marginal cost is now negligible, same reasoning as the mono
+/// re-measurement above: only ONE plane's buffer is ever resident during
+/// the write, and detect+align's own peak (5.64 planes, fix round 1's own
+/// baseline) already exceeds it, so the write no longer sets the peak at
+/// all — close to the senior review's own rough guess of "≈5 planes
+/// total" for this constant.
+/// The measured total, rounded up with the same margin fix round 1's own 9
+/// carried (≈0.3 planes of headroom above the average): **6**, down from 9.
 ///
 /// If a real run's admission ever needs re-deriving from RAM instead of
-/// this measurement, `total_ram_bytes() / 4 / (9 · w · h · 4)` is the
-/// worker count an OSC group's register stage gets — on a 16 GB machine at
-/// LDN1272-test's 6248×4176 OSC geometry that is 1 worker (down from 2 at
-/// the pre-task flat 4); see the fix round's own report for what this did
-/// to the logged `log_admission` line.
-pub(crate) const REGISTER_PLANES_RESIDENT_OSC: u64 = 9;
+/// this measurement, `total_ram_bytes() / 4 / (6 · w · h · 4)` is the
+/// worker count an OSC group's register stage gets — on this dev Mac (16
+/// GiB RAM, 10 cores) at LDN1272-test's 6248×4176 OSC geometry that is
+/// `admission(626_199_552, 10) = 6` (up from `admission(939_299_328, 10) =
+/// 4` at the old constant of 9 — both computed against this same machine's
+/// real `total_ram_bytes()`, not the illustrative "16 GB machine" figure
+/// fix round 1's own doc cited, which this fix round did not attempt to
+/// reproduce exactly); see the fix round's own report for the full
+/// before/after admission line.
+pub(crate) const REGISTER_PLANES_RESIDENT_OSC: u64 = 6;
 
 /// Register's fan-out working set (perf tier A Task 6a fix round 1) —
 /// [`REGISTER_PLANES_RESIDENT`] or [`REGISTER_PLANES_RESIDENT_OSC`] planes
-/// of one reference-geometry channel, in bytes, depending on the group's
-/// own color mode (an OSC subject's registered-artifact write holds one
-/// output plane PER CHANNEL, not a flat add — see the OSC constant's own
-/// doc).
-pub(crate) fn register_working_set_bytes(w: u64, h: u64, color_mode: ColorMode) -> u64 {
-    let planes = if color_mode == ColorMode::Osc {
+/// of one reference-geometry channel, in bytes, depending on the GROUP'S
+/// OWN MEASURED PLANE COUNT (fix round 2, ruling R-TA-6 M3) — the caller's
+/// `PendingRegistration`/`ArtifactRewriteItem::planes`, stage 3's own
+/// `MeasuredFrame::planes`, not `group.color_mode`. Keying on color mode
+/// charged 9 planes for an OSC group whose debayering is off and therefore
+/// produces 1-plane frames (`calibration.debayer_osc = false`) — the
+/// subject the writer actually opens never carries 3 channels in that
+/// case, so the working set it needs never does either. `frame_planes < 3`
+/// (i.e. 1) takes the mono constant, `>= 3` takes the OSC one; there is no
+/// 2-channel case in this pipeline.
+pub(crate) fn register_working_set_bytes(w: u64, h: u64, frame_planes: usize) -> u64 {
+    let planes = if frame_planes >= 3 {
         REGISTER_PLANES_RESIDENT_OSC
     } else {
         REGISTER_PLANES_RESIDENT
@@ -4070,8 +4086,21 @@ fn register_group_pass(
     // fan-out's worker now also warps and writes the registered artifact
     // (`REGISTER_PLANES_RESIDENT`'s own doc has the measurement) —
     // `register_working_set_bytes` folds that cost in, channel-aware.
-    let working_set_bytes =
-        register_working_set_bytes(ref_w as u64, ref_h as u64, group.color_mode);
+    //
+    // Fix round 2 (ruling R-TA-6 M3): keyed on this batch's own MEASURED
+    // plane count, not `group.color_mode` — an OSC group whose debayering
+    // is off produces 1-plane frames, and charging it for 9 resident
+    // planes it never actually holds would under-admit it for no reason.
+    // Both batches share one geometry and one group, so one MAX over
+    // whichever items exist covers them; `unwrap_or(1)` is unreachable in
+    // practice (the caller already returned above when both are empty).
+    let batch_planes = to_register
+        .iter()
+        .map(|p| p.planes)
+        .chain(needs_artifact_rewrite.iter().map(|p| p.planes))
+        .max()
+        .unwrap_or(1);
+    let working_set_bytes = register_working_set_bytes(ref_w as u64, ref_h as u64, batch_planes);
     let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     log_admission(
         rc,
@@ -9812,6 +9841,12 @@ mod tests {
     fn a_registered_frame_deleted_mid_run_falls_back_and_the_master_is_unchanged() {
         use crate::integration::registered_source::fallback_counters;
 
+        // Fix round 2, ruling R-TA-6 M7: the counter is process-global and
+        // the harness runs tests in parallel — without this guard another
+        // test's own fault injection could land between this test's
+        // `reset()` and `snapshot()` and inflate its count.
+        let _fallback_guard = fallback_counters::exclusive();
+
         let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
         let noise = [5.0f32; 4];
 
@@ -9916,6 +9951,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Fix round 2, ruling R-TA-6 I2: a `registered` artifact deleted AFTER
+    /// a finished run (the same `registered/<group>` directory Pin 3 above
+    /// faults mid-run) must make the NEXT plan call Register stale, not
+    /// falsely report it cached. Before this fix `compute_register_stale`
+    /// only checked the `registration_results` row (the alignment itself),
+    /// never the on-disk artifact Task 6a's writer keeps beside it — so an
+    /// existing catalog whose registered files went missing (a cleanup, or
+    /// simply an upgrade to a build that writes them for the first time)
+    /// reported Register as cached while a run would actually warp and
+    /// write every included frame.
+    #[test]
+    fn register_stale_reacts_to_a_deleted_registered_artifact() {
+        use crate::stacking::plan::build_plan;
+
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg.clone()),
+            None,
+        )
+        .expect("start should succeed");
+        wait_for_run(&ctx, started.run_id);
+        let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+
+        let plan_before = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg.clone()),
+        )
+        .expect("the plan should build");
+        assert!(
+            !plan_before.stale_stages.contains(&Stage::Register),
+            "a finished run's own registered artifacts must read fresh: {:?}",
+            plan_before.stale_stages
+        );
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        for g in &plan_before.groups {
+            let dir = layout.registered_dir(&g.key);
+            assert!(
+                dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
+                "the run must have written at least one registered file at {}",
+                dir.display()
+            );
+            std::fs::remove_dir_all(&dir)
+                .expect("remove registered/<group> for the fault injection");
+        }
+
+        let plan_after = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg),
+        )
+        .expect("the plan should build");
+        assert!(
+            plan_after.stale_stages.contains(&Stage::Register),
+            "a registered artifact deleted after the run must make Register stale, not \
+             falsely cached: {:?}",
+            plan_after.stale_stages
+        );
     }
 
     #[test]
@@ -15665,9 +15789,9 @@ mod tests {
         // the releases are pinned by is `peak` below and the three
         // per-stage tests (`writer`, `registered_source`, `drizzle`).
         // Where the peak comes from — traced build by build (v0.6.3 CI
-        // fix, `GRID_TRACE` instrumentation on `grid_counters`): the
-        // registration writer and drizzle each hold ONE grid at a time
-        // (build, warp, release, next frame). Before perf tier A Task 6a,
+        // fix, `GRID_TRACE` instrumentation on `grid_counters`): drizzle
+        // still processes one frame at a time on the run thread (build,
+        // warp, release, next frame). Before perf tier A Task 6a,
         // `integrate_planes` opened ONE `RegisteredSource` per group
         // (ruling R-T4-7) and every band read every included frame through
         // its inverse grid, so the group's spline frames' inverse grids
@@ -15681,20 +15805,36 @@ mod tests {
         // nothing deletes the artifact) neither stage touches a
         // `PixelMap`'s grid at all, so the writer's own builds are what
         // remain: re-measured post-Task-6a at 22 builds (33 minus the 11
-        // integration used to add) and a peak of 1 (only the writer or
-        // drizzle ever holds one at a time now) — independent of the rayon
-        // pool either way, and still bounded by `tps_frames` since 1 <= 11.
+        // integration used to add) and a peak of 1.
+        //
+        // Fix round 2 (ruling R-TA-6 M8): fix round 1 moved the write from
+        // a sequential post-fan-out loop into the register fan-out's own
+        // worker closures, so it is NO LONGER true by construction that
+        // "the writer holds one grid at a time" — up to `admission_n`
+        // workers can each be mid-warp, each holding its own grid, at
+        // once. Re-measured after that change (this run): still 22 builds,
+        // peak 1 — a property of THIS fixture, not a guarantee the design
+        // makes. On a 192x144 canvas with only 56 stars, one worker's
+        // detection + RANSAC + distortion fit dominates its own per-frame
+        // wall time far more than its brief warp-then-release window, so
+        // two workers rarely land inside their OWN grid-holding moment at
+        // the same instant even though nothing serializes them; a larger
+        // real frame, where the warp itself is a much bigger share of a
+        // worker's time, would be expected to show a peak closer to
+        // `admission_n`. The actual bound the design guarantees is `peak
+        // <= admission_n <= tps_frames` (never more resident grids than
+        // in-flight register workers, and never more workers than there
+        // are frames to register) — this assertion checks the frame-count
+        // half of that, which is what R-T4-6 cares about (the 2x shape:
+        // inverse grids surviving into drizzle's forward grids, what
+        // thrashed acceptance run 27), not the sequential-writer claim
+        // this comment used to make.
         //
         // The assertion this replaces read `peak <= threads + 4` — the
         // hypothesis that a per-frame release bounds residency by the POOL.
         // It held on the 10-worker dev Mac only because 11 <= 14, and
         // failed on every 4-worker GitHub runner (11 > 8) from v0.6.1 to
         // v0.6.2 — a wrong model of the integration source, not a leak.
-        // The shape R-T4-6 actually refuses is the 2x one: inverse grids
-        // surviving integration into drizzle's forward grids (what
-        // thrashed acceptance run 27), so the bound is the frame count
-        // itself: every spline frame contributes at most ONE resident
-        // grid at any instant, and no stage's grids overlap another's.
         let threads = rayon::current_num_threads().max(1);
         eprintln!(
             "R-T4-6d measured: builds {builds} peak_alive {peak} threads {threads} \

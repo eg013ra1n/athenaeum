@@ -20,7 +20,9 @@ use anyhow::Context;
 use crate::calibration_library::light_resolve::card_from_kv;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_parser::FitsHeader;
-use crate::fits_writer::{write_fits_f32, Card, CardValue};
+use crate::fits_writer::{
+    write_fits_f32_streaming_with, Card, CardValue, Durability, FitsWriteError,
+};
 use crate::geometry::PixelMap;
 use crate::integration::plane_reader::PlaneReader;
 use crate::models::FileFormat;
@@ -134,6 +136,35 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
 /// chain (`stacking::run::write_one_registered_frame`, called from both
 /// register fan-out closures — perf tier A Task 6a fix round 1); every
 /// other caller (tests, the probe) passes `None`.
+///
+/// PLANE AT A TIME (fix round 2, ruling R-TA-6, required item): warps
+/// plane `p` into a fresh `plane_len`-element buffer, hands it to
+/// [`write_fits_f32_streaming_with`], and drops it before plane `p+1`
+/// starts — the OLD shape allocated `all = vec![NAN; plane_len *
+/// channels]` and warped every plane into it before writing anything,
+/// which held every channel resident together and was the OSC register
+/// admission's own dominant cost (see `stacking::run::
+/// REGISTER_PLANES_RESIDENT_OSC`'s own doc for the re-measurement this
+/// enabled). The bytes on disk are unaffected by this reshuffle —
+/// `write_fits_f32_streaming_with` writes the identical header and the
+/// identical per-plane byte ranges `write_fits_f32` would for the same
+/// planes concatenated (`fits_writer::writer`'s own
+/// `streaming_write_matches_the_all_at_once_writer_byte_for_byte` pins the
+/// primitive; this module's own Pin 1 and
+/// `the_plane_at_a_time_write_matches_the_all_at_once_write_byte_for_byte`
+/// below pin it at this level, synthetic AND real-frame).
+///
+/// [`Durability::Volatile`] (M2): a lost or truncated registered artifact
+/// is not silent corruption — `RegisteredSource::open_materialized` (its
+/// own doc) falls back to warping the calibrated intermediate on the fly
+/// and logs it once, exactly the same contract perf tier 1 Task 6 already
+/// gave the calibrated intermediate itself (`Durability::Volatile`'s own
+/// doc: "a cache miss, not a wrong answer"). A registered artifact carries
+/// the identical guarantee — the Register-stage freshness check
+/// (`stacking::run::registered_artifact_is_fresh`) heals a torn or missing
+/// file the same way a stale calibrated artifact heals, by rewriting it —
+/// so it does not need the `fsync`-before-rename cost every master/export
+/// write still pays.
 pub fn write_registered_frame(
     subject: &Path,
     map: &PixelMap,
@@ -158,22 +189,33 @@ pub fn write_registered_frame(
     let reader = PlaneReader::open(subject)?;
     let (w, h, channels) = (reader.width(), reader.height(), reader.channels());
     let plane_len = ref_w * ref_h;
-    let mut all = vec![f32::NAN; plane_len * channels];
-    for plane in 0..channels {
-        let data = reader.read_plane(plane)?;
-        let src = Plane::full(&data, w, h);
-        let dst = &mut all[plane * plane_len..(plane + 1) * plane_len];
-        match pool {
-            Some(p) => p.install(|| warp_rows(&src, map, ref_w, 0, ref_h, interp, clamping, dst)),
-            None => warp_rows(&src, map, ref_w, 0, ref_h, interp, clamping, dst),
-        }
-    }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    write_fits_f32(out, ref_w, ref_h, channels, &all, cards)
-        .with_context(|| format!("writing {}", out.display()))?;
+    write_fits_f32_streaming_with(
+        out,
+        ref_w,
+        ref_h,
+        channels,
+        cards,
+        Durability::Volatile,
+        |plane| {
+            let data = reader
+                .read_plane(plane)
+                .map_err(|e| FitsWriteError::Io(std::io::Error::other(e.to_string())))?;
+            let src = Plane::full(&data, w, h);
+            let mut dst = vec![f32::NAN; plane_len];
+            match pool {
+                Some(p) => {
+                    p.install(|| warp_rows(&src, map, ref_w, 0, ref_h, interp, clamping, &mut dst))
+                }
+                None => warp_rows(&src, map, ref_w, 0, ref_h, interp, clamping, &mut dst),
+            }
+            Ok(dst)
+        },
+    )
+    .with_context(|| format!("writing {}", out.display()))?;
     Ok(channels)
 }
 
@@ -181,8 +223,8 @@ pub fn write_registered_frame(
 mod tests {
     use super::*;
     use crate::fits_parser::FitsHeader;
-    use crate::fits_writer::CardValue;
-    use crate::geometry::{Linear, LinearKind};
+    use crate::fits_writer::{write_fits_f32, CardValue};
+    use crate::geometry::{DistortionModel, Linear, LinearKind, ThinPlateSpline};
     use crate::integration::banded::BandPlanes;
     use crate::integration::plane_reader::PlaneReader;
     use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
@@ -201,14 +243,20 @@ mod tests {
     /// so this test's job is to PROVE that a windowed, per-band read is
     /// bit-for-bit (`to_bits`, so even a NaN's payload bits must match) the
     /// same as the one-shot full-plane read the writer does — never assume
-    /// it — across a similarity AND a homography map (the pipeline's two
-    /// families of registration model), at BicubicBSpline and Lanczos3 (the
-    /// default kernel plus the other one the pipeline exposes), and across
-    /// several band heights, including one (`37`) that does not evenly
-    /// divide the fixture's 384-row height, so the LAST band of that sweep
-    /// is short. If any of these ever disagree, [`write_registered_frame`]
-    /// must be changed to call the exact routine `RegisteredSource` uses —
-    /// this test would then be the regression guard for that fix.
+    /// it — across a similarity, a homography, AND (fix round 2, ruling
+    /// R-TA-6 M1) a thin-plate-spline map (the pipeline's registration
+    /// model families, linear and distorted alike), at BicubicBSpline and
+    /// Lanczos3 (the default kernel plus the other one the pipeline
+    /// exposes), and across several band heights, including one (`37`)
+    /// that does not evenly divide the fixture's 384-row height, so the
+    /// LAST band of that sweep is short. If any of these ever disagree,
+    /// [`write_registered_frame`] must be changed to call the exact
+    /// routine `RegisteredSource` uses — this test would then be the
+    /// regression guard for that fix, UNLESS the disagreement is specific
+    /// to the `tps` arm, in which case it means the per-band reader's own
+    /// `source_window` margin is too tight for a spline's displacement —
+    /// the fix then belongs there (widen the margin honestly), never in
+    /// the writer.
     #[test]
     fn writer_output_matches_the_registered_source_band_by_band_bit_for_bit() {
         const W: usize = 512;
@@ -252,11 +300,55 @@ mod tests {
         ))
         .unwrap();
 
+        // M1 (fix round 2, ruling R-TA-6): a genuine thin-plate-spline
+        // distortion map, on top of the same similarity linear part above —
+        // the writer's ONE-SHOT full-plane warp must agree with the
+        // on-the-fly PER-BAND reader through a grid-backed displacement
+        // too, not only the two purely-linear models above. A spline's
+        // inverse grid is sampled through `source_window`'s own margin on
+        // every band; if this arm ever disagrees, the fix belongs in
+        // `source_window` (widen the margin honestly), never here — see
+        // this test's own doc.
+        let tps_nodes: Vec<(f64, f64)> = (0..48)
+            .map(|i| {
+                let (col, row) = ((i % 8) as f64, (i / 8) as f64);
+                (32.0 + col * 64.0, 24.0 + row * 64.0)
+            })
+            .collect();
+        let tps_dx: Vec<f64> = tps_nodes
+            .iter()
+            .map(|(x, _)| 3.0 * (x / 80.0).sin())
+            .collect();
+        let tps_dy: Vec<f64> = tps_nodes
+            .iter()
+            .map(|(_, y)| 2.5 * (y / 70.0).cos())
+            .collect();
+        let tps_ndx: Vec<f64> = tps_dx.iter().map(|v| -v).collect();
+        let tps_ndy: Vec<f64> = tps_dy.iter().map(|v| -v).collect();
+        let tps_forward =
+            ThinPlateSpline::fit(&tps_nodes, &tps_dx, &tps_dy, 0.0).expect("tps forward fit");
+        let tps_inverse =
+            ThinPlateSpline::fit(&tps_nodes, &tps_ndx, &tps_ndy, 0.0).expect("tps inverse fit");
+        let tps_model =
+            DistortionModel::tps(tps_forward, tps_inverse, [0.0, 0.0, W as f64, H as f64]);
+        let tps = PixelMap::with_distortion_model(
+            Linear::from_flat(
+                LinearKind::Similarity,
+                [1.017, -0.0712, 6.3, 0.0712, 1.017, -4.1, 0.0, 0.0, 1.0],
+            ),
+            tps_model,
+        )
+        .unwrap();
+
         // The pipeline's default `clamping_threshold` (`RegistrationConfig::default`).
         const CLAMPING: f32 = 0.30;
         let band_heights = [1usize, 7, 37, 64, 128, H];
 
-        for (map_name, map) in [("similarity", &similarity), ("homography", &homography)] {
+        for (map_name, map) in [
+            ("similarity", &similarity),
+            ("homography", &homography),
+            ("tps", &tps),
+        ] {
             for interp in [Interpolation::BicubicBSpline, Interpolation::Lanczos3] {
                 let out = dir.path().join(format!("r_{map_name}_{interp:?}.fits"));
                 write_registered_frame(&subject, map, W, H, interp, CLAMPING, &[], None, &out)

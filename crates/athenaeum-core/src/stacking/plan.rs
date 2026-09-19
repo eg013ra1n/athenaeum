@@ -1055,6 +1055,28 @@ fn compute_register_stale(
         if !registration_row_is_fresh(row, reference_frame_id, &expected) {
             return Ok(true);
         }
+        // Fix round 2, ruling R-TA-6 I2: a fresh REGISTRATION row only
+        // means the alignment itself does not need to be redone — perf
+        // tier A Task 6a's materialized `registered` artifact is a
+        // separate on-disk file the run rewrites per frame whenever it is
+        // missing or stale (`registered_artifact_is_fresh` in `run.rs`;
+        // same rule, mirrored here so the plan and the run can never
+        // disagree about what "cached" means). Without this, an existing
+        // catalog's first run after Task 6a — real registration rows, zero
+        // `registered` artifacts yet — reported Register as cached while
+        // the run actually warped and wrote every included frame; the
+        // same was true after any cleanup that deletes the `registered/`
+        // directory (`CleanupPolicy::DeleteRegistered`/`DeleteIntermediates`).
+        let artifact = find_artifact(
+            conn,
+            frames_set_id,
+            &group.key,
+            "registered",
+            Some(frame_id),
+        )?;
+        if !artifact.is_some_and(|row| is_fresh(&row, &expected)) {
+            return Ok(true);
+        }
     }
 
     Ok(false)
@@ -3833,6 +3855,40 @@ mod tests {
         run_id
     }
 
+    /// Fix round 2, ruling R-TA-6 I2: writes a fresh `registered` artifact
+    /// row for one frame — a real file on disk whose size matches the row,
+    /// so `find_artifact` + [`is_fresh`] (now folded into
+    /// [`compute_register_stale`]) reads it as usable. `hash` is the SAME
+    /// registration hash the caller already computed for this frame
+    /// (`registration_hash_for`) — the registered artifact's freshness
+    /// rides the registration row's own hash, exactly as `run.rs`'s
+    /// `registered_artifact_is_fresh` call site does.
+    fn seed_registered_artifact(
+        f: &test_fixtures::Fixture,
+        group_key: &str,
+        frame_id: i64,
+        hash: &str,
+    ) {
+        let path = f.dir.path().join(format!("registered_{frame_id}.fits"));
+        std::fs::write(&path, [0u8]).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        crate::db::stacking::upsert_artifact(
+            &f.conn,
+            &crate::db::stacking::NewArtifact {
+                frames_set_id: f.set_id,
+                frame_id: Some(frame_id),
+                group_key,
+                kind: "registered",
+                path: Some(path.to_str().unwrap()),
+                config_hash: hash,
+                size: Some(size),
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+    }
+
     /// The fresh path, end to end: every frame gets a matching `calibrated`
     /// artifact (real file, recorded size), a matching `metrics` artifact,
     /// a previous run whose `stacking_run_frames` rows include all three
@@ -3949,6 +4005,12 @@ mod tests {
                 source_kind: Some("calibrated".to_string()),
                 ..RegistrationRecord::default()
             };
+            seed_registered_artifact(
+                &f,
+                &group_key,
+                gf.frame_id,
+                rec.config_hash.as_deref().unwrap(),
+            );
             crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
         }
 
@@ -4796,6 +4858,12 @@ mod tests {
                 source_kind: Some("calibrated".to_string()),
                 ..RegistrationRecord::default()
             };
+            seed_registered_artifact(
+                &f,
+                &groups[0].key,
+                frame_id,
+                rec.config_hash.as_deref().unwrap(),
+            );
             crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
         }
 
@@ -4869,6 +4937,12 @@ mod tests {
                 source_kind: Some("calibrated".to_string()),
                 ..RegistrationRecord::default()
             };
+            seed_registered_artifact(
+                &f,
+                &groups[0].key,
+                frame_id,
+                rec.config_hash.as_deref().unwrap(),
+            );
             crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
         }
 
@@ -4960,6 +5034,12 @@ mod tests {
                 source_kind: Some("calibrated".to_string()),
                 ..RegistrationRecord::default()
             };
+            seed_registered_artifact(
+                &f,
+                &group_key,
+                frame_id,
+                rec.config_hash.as_deref().unwrap(),
+            );
             crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
         }
 
@@ -5066,6 +5146,12 @@ mod tests {
                 source_kind: Some("calibrated".to_string()),
                 ..RegistrationRecord::default()
             };
+            seed_registered_artifact(
+                &f,
+                &groups[0].key,
+                frame_id,
+                rec.config_hash.as_deref().unwrap(),
+            );
             crate::registration::db::upsert_registration(&f.conn, &rec).unwrap();
         }
 

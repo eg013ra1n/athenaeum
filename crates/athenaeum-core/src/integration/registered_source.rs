@@ -38,12 +38,22 @@ pub struct RegisteredFrame {
 /// `fallback`: the calibrated frame in its OWN native geometry, warped
 /// through `map` exactly as [`RegisteredFrame`] always has, and the
 /// fallback is logged ONCE, here, at
-/// [`RegisteredSource::open_materialized`] time — never per band read.
+/// [`RegisteredSource::open_materialized`] time — never per band read —
+/// naming `frame_id` (fix round 2, ruling R-TA-6 I1) so the warning is
+/// actionable from the log alone, without a path round-trip back to the
+/// catalog.
 /// `registered_path: None` falls back the SAME way but silently: no
 /// artifact was ever expected for this frame (the caller's own freshness
-/// check found none), which is not itself a fault to warn about.
+/// check found none), which is not itself a fault to warn about. A file
+/// that opens with a valid header but fails partway through a later plane
+/// read is NOT this fallback's job — that fails the whole group, same as
+/// any other corrupt input; the Register stage's own freshness check is
+/// what keeps a truncated artifact from reaching this source at all.
 pub struct MaterializedFrame {
     pub registered_path: Option<PathBuf>,
+    /// The frame's catalog id, carried only for the fallback `warn!`
+    /// below — never used to key the read itself.
+    pub frame_id: Option<i64>,
     pub fallback: RegisteredFrame,
 }
 
@@ -81,15 +91,28 @@ pub struct RegisteredSource {
 /// executed, since asserting the paired `warn!` line would need a global
 /// tracing subscriber shared with the whole (parallel) test binary, which
 /// `docs/logging/README.md` documents as impractical per-test. Process-
-/// global like [`crate::geometry::pixel_map::grid_counters`]; nothing else
-/// in this codebase deliberately breaks a registered artifact mid-run, so
-/// the contention risk a shared counter would otherwise carry is not
-/// exercised in practice.
+/// global like [`crate::geometry::pixel_map::grid_counters`], and (fix
+/// round 2, ruling R-TA-6 M7) guarded by the same `exclusive()` pattern:
+/// the counter is process-wide and the harness runs tests in parallel, so
+/// without the lock another test's own fault injection could inflate a
+/// concurrently-measuring Pin 3's count. Nothing else in this codebase
+/// deliberately breaks a registered artifact mid-run, so the contention
+/// risk the lock adds is not exercised in practice.
 #[cfg(test)]
 pub(crate) mod fallback_counters {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     pub static FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held by every test that measures the fallback counter — see the
+    /// module doc above; mirrors
+    /// [`crate::geometry::pixel_map::grid_counters::exclusive`].
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+    pub fn exclusive() -> MutexGuard<'static, ()> {
+        EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     pub(super) fn on_fallback() {
         FALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -206,8 +229,9 @@ impl RegisteredSource {
                     // at the wrong size) is the Task 6a fallback proper.
                     if let Some(p) = &f.registered_path {
                         warn!(
+                            frame_id = f.frame_id,
                             path = %p.display(),
-                            fallback_path = %f.fallback.path.display(),
+                            src = %f.fallback.path.display(),
                             "registered frame unavailable; warping on the fly"
                         );
                         #[cfg(test)]

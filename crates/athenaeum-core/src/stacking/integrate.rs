@@ -297,9 +297,11 @@ pub struct StackFrame {
     /// `DATE-OBS` as stored (ISO-8601 text), for the header's earliest/latest.
     pub date_obs: Option<String>,
     /// The catalog frame id, for the Task 6a fallback warning only — no
-    /// other field on this type carries identity, so this exists purely so
-    /// [`integrate_planes`]'s materialized-frame fallback can name the
-    /// frame it warped instead of reading verbatim.
+    /// other field on this type carries identity. [`integrate_planes`]
+    /// carries it into the `frame_id` [`MaterializedFrame`] builds, so
+    /// `RegisteredSource::open_materialized`'s fallback `warn!` (fix round
+    /// 2, ruling R-TA-6 I1) can name the frame it warped instead of
+    /// reading it verbatim.
     pub frame_id: i64,
     /// The materialized registered artifact (Task 6a, spec §3.7) — already
     /// warped into the group's reference geometry, read verbatim by
@@ -656,6 +658,7 @@ pub(crate) fn integrate_planes<'g>(
         .iter()
         .map(|&i| MaterializedFrame {
             registered_path: frames[i].registered_path.clone(),
+            frame_id: Some(frames[i].frame_id),
             fallback: RegisteredFrame {
                 path: frames[i].path.clone(),
                 map: frames[i].map.clone(),

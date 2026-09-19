@@ -10,7 +10,10 @@ pub mod xisf_writer;
 pub mod wcs;
 pub use card::{Card, CardValue, FitsWriteError};
 pub use stamp::stamp_extra_card;
-pub use writer::{write_fits_f32, write_fits_f32_to, write_fits_f32_with};
+pub use writer::{
+    write_fits_f32, write_fits_f32_streaming_to, write_fits_f32_streaming_with, write_fits_f32_to,
+    write_fits_f32_with,
+};
 pub use xisf_writer::{write_xisf_f32, write_xisf_f32_to, xisf_keyword_value};
 
 /// Whether a write must survive power loss before its rename makes it
@@ -96,7 +99,17 @@ pub fn write_image_f32(
     format: OutputFormat,
     bounds: XisfBounds,
 ) -> Result<(), card::FitsWriteError> {
-    write_image_f32_with(path, width, height, channels, data, cards, format, bounds, Durability::Durable)
+    write_image_f32_with(
+        path,
+        width,
+        height,
+        channels,
+        data,
+        cards,
+        format,
+        bounds,
+        Durability::Durable,
+    )
 }
 
 /// [`write_image_f32`] with the durability as a parameter (perf tier 1 Task
