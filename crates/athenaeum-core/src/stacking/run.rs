@@ -21,7 +21,7 @@
 //! see each item's doc comment for exactly what is provisioned now and
 //! consumed later.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1689,32 +1689,61 @@ fn prebuild_hot_maps(rc: &mut RunContext, jobs: &[CalibrateJob], scratch: &Path)
 }
 
 /// Stage 1's per-group PRELOAD phase (perf tier 1 Task 5): decode every
-/// distinct master dark/bias and flat `jobs` will need exactly ONCE, on the
+/// distinct master subtrahend/flat `jobs` will need exactly ONCE, on the
 /// run thread, before the fan-out — so instead of every included frame
 /// re-opening and re-band-reading its group's shared masters,
 /// `execute_generation`'s engine call reads them straight from RAM. Decoded
 /// through [`preload_master_plane`], the SAME `BandSource` decode path the
 /// engine runs itself, so the samples are bit-identical to the old
 /// per-frame reads (pinned by
-/// `light_cal::tests::preloaded_masters_calibrate_bit_identically`).
+/// `light_cal::tests::preloaded_masters_calibrate_bit_identically` and
+/// `light_cal::tests::preloaded_masters_match_across_multiple_bands`).
+///
+/// Fix round 1, Important finding 1: the subtrahend collected here mirrors
+/// the engine's own dark-OR-bias rule (`light_cal.rs::
+/// calibrate_light_compute_inner`'s `subtrahend` — dark preferred, bias
+/// only when there is no dark) — `job.spec.inputs.dark_path.or(bias_path)`,
+/// never both. Collecting the bias unconditionally alongside a present dark
+/// used to decode and hold a plane the engine would never query.
 ///
 /// A preload failure never fails the group: it is logged and the path is
 /// simply absent from the returned map, so every worker's own
 /// `execute_generation` call falls back to reading that one file itself —
-/// exactly the pre-Task-5 behavior for that path alone.
-fn build_preloaded_masters(jobs: &[CalibrateJob], scratch: &Path) -> PreloadedMasters {
-    let mut distinct: HashSet<PathBuf> = HashSet::new();
+/// exactly the pre-Task-5 behavior for that path alone. A CANCEL is
+/// different (ruled-in item 5): `cancel` is checked before each file (so a
+/// run cancelled mid-group does not decode every remaining distinct master
+/// first) and `preload_master_plane` itself is cancel-aware
+/// (`BandSource::open_with_cancel` + `read_band_with_progress`), so a
+/// cancel raised mid-file is `RunError::Cancelled` too, not a logged
+/// failure. Paths are visited in SORTED order (ruled-in item 6, a
+/// `BTreeSet` rather than a `HashSet`) so preload order — and therefore
+/// warn order — is deterministic run to run.
+fn build_preloaded_masters(
+    cancel: &AtomicBool,
+    jobs: &[CalibrateJob],
+    scratch: &Path,
+) -> Result<PreloadedMasters, RunError> {
+    let mut distinct: BTreeSet<PathBuf> = BTreeSet::new();
     for job in jobs {
-        distinct.extend(job.spec.inputs.dark_path.clone());
-        distinct.extend(job.spec.inputs.bias_path.clone());
+        let subtrahend = job
+            .spec
+            .inputs
+            .dark_path
+            .clone()
+            .or_else(|| job.spec.inputs.bias_path.clone());
+        distinct.extend(subtrahend);
         distinct.extend(job.spec.inputs.flat_path.clone());
     }
     let mut planes = HashMap::new();
     for path in distinct {
-        match preload_master_plane(&path, scratch) {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(RunError::Cancelled);
+        }
+        match preload_master_plane(&path, scratch, cancel) {
             Ok(plane) => {
                 planes.insert(path, plane);
             }
+            Err(IntegrationError::Cancelled) => return Err(RunError::Cancelled),
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -1724,7 +1753,7 @@ fn build_preloaded_masters(jobs: &[CalibrateJob], scratch: &Path) -> PreloadedMa
             }
         }
     }
-    PreloadedMasters { planes }
+    Ok(PreloadedMasters { planes })
 }
 
 /// Stage 1's per-frame COMMIT phase (perf tier 1 Task 4): everything
@@ -2001,25 +2030,37 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         }
         prebuild_hot_maps(rc, &jobs, &scratch);
-        // Perf tier 1 Task 5: decode this group's shared master dark/bias
-        // and flat once, on the run thread, before the fan-out — every
-        // worker's `execute_generation` call below then reads them from RAM
-        // instead of re-opening and re-band-reading them per frame.
-        let preloaded = build_preloaded_masters(&jobs, &scratch);
+        // Perf tier 1 Task 5: decode this group's shared master subtrahend
+        // (dark, or bias when there is no dark — mirroring the engine's own
+        // rule, fix round 1 Important finding 1) and flat once, on the run
+        // thread, before the fan-out — every worker's `execute_generation`
+        // call below then reads them from RAM instead of re-opening and
+        // re-band-reading them per frame.
+        let preloaded = build_preloaded_masters(&rc.cancel, &jobs, &scratch)?;
 
-        // Perf tier 1 Task 5: the two preloaded master planes (dark/bias and
-        // flat, each up to `group_max_w * group_max_h * 4` bytes) are
-        // resident for the whole group's fan-out, on top of each worker's
-        // own `CALIBRATE_PLANES_RESIDENT` footprint — added to the working
-        // set so the admission budget accounts for them.
-        let working_set_bytes = CALIBRATE_PLANES_RESIDENT * group_max_w * group_max_h * 4
-            + 2 * group_max_w * group_max_h * 4;
-        let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
+        // Perf tier 1 Task 5 fix round 1, Important finding 2: the preloaded
+        // planes are resident ONCE per group, not once per worker, so they
+        // are charged separately from the per-worker working set —
+        // `shared_bytes` is the REAL count of planes this group actually
+        // preloaded (0-2: subtrahend and/or flat, never both a dark and a
+        // bias), not a hard-coded 2, so a group missing a link (or a
+        // preload failure) doesn't over-charge the budget, and native-mode
+        // grouping's several distinct masters per group don't under-charge
+        // it either. `admission_with_shared` subtracts this from the RAM
+        // budget BEFORE dividing by the per-worker working set.
+        let shared_bytes = preloaded.planes.len() as u64 * group_max_w * group_max_h * 4;
+        let working_set_bytes = calibrate_working_set_bytes(group_max_w, group_max_h);
+        let admission_n = admission_with_shared(
+            shared_bytes,
+            working_set_bytes,
+            rc.ctx.image_pool.current_num_threads(),
+        );
         log_admission(
             rc,
             Stage::Calibrate,
             &group.key,
             working_set_bytes,
+            shared_bytes,
             admission_n,
         );
         let ticker = FanOutTicker::new(
@@ -2273,6 +2314,18 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
     LN_PLANES_RESIDENT * w * h * 4
 }
 
+/// `CALIBRATE_PLANES_RESIDENT` planes of one w×h channel, in bytes — ONE
+/// worker's own Calibrate fan-out footprint (perf tier 1 Task 5 fix round
+/// 1, Important finding 2). The group's shared preloaded master planes are
+/// NOT folded in here — they are resident once per group, not once per
+/// worker, so they are charged through `admission_with_shared`'s
+/// `shared_bytes` instead; folding a fixed `+2 planes` into this per-worker
+/// number over-charged every worker's own budget on a group with one
+/// shared master and under-charged a native-mode group with several.
+pub(crate) fn calibrate_working_set_bytes(w: u64, h: u64) -> u64 {
+    CALIBRATE_PLANES_RESIDENT * w * h * 4
+}
+
 /// Memory-budgeted worker count for a fan-out stage (decision 3):
 /// `clamp(budget / working_set, 1, max_workers)`. `budget =
 /// total_ram_bytes() / 4`; when the total is unknown, the budget is treated
@@ -2291,14 +2344,36 @@ fn admission(working_set_bytes: u64, max_workers: usize) -> usize {
     n.clamp(1, max_workers.max(1) as u64) as usize
 }
 
+/// `admission` for a fan-out whose working set also carries bytes resident
+/// ONCE per group rather than once per worker (perf tier 1 Task 5 fix
+/// round 1, Important finding 2) — Calibrate's preloaded master
+/// subtrahend/flat planes. `shared_bytes` is subtracted from the RAM
+/// budget BEFORE the per-worker division (`saturating_sub`, so a shared
+/// cost that exceeds the whole budget clamps to admission 1 rather than
+/// underflowing), then the remainder is divided by `working_set_bytes`
+/// exactly as [`admission`] does. Same `total_ram_bytes()` semantics as
+/// `admission`: an unknown total is a budget treated as exhausted
+/// (admission 1), never guessed.
+fn admission_with_shared(shared_bytes: u64, working_set_bytes: u64, max_workers: usize) -> usize {
+    let working_set = working_set_bytes.max(1);
+    let n = match total_ram_bytes() {
+        Some(total) => (total / 4).saturating_sub(shared_bytes) / working_set,
+        None => 1,
+    };
+    n.clamp(1, max_workers.max(1) as u64) as usize
+}
+
 /// One line per fan-out stating what `admission` decided and from what —
 /// the number the audit's Δ estimates are measured against (perf tier 1
-/// Task 0).
+/// Task 0). `shared_bytes` (perf tier 1 Task 5 fix round 1) is `0` for
+/// every stage but Calibrate, which passes the REAL bytes its group's
+/// preloaded master planes hold (see [`admission_with_shared`]).
 fn log_admission(
     rc: &RunContext,
     stage: Stage,
     group_key: &str,
     working_set_bytes: u64,
+    shared_bytes: u64,
     admission: usize,
 ) {
     tracing::info!(
@@ -2306,6 +2381,7 @@ fn log_admission(
         stage = stage.as_str(),
         group_key,
         working_set_bytes,
+        shared_bytes,
         admission,
         pool_threads = rc.ctx.image_pool.current_num_threads(),
         "fan-out admitted"
@@ -2751,6 +2827,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 Stage::Measure,
                 &group.key,
                 working_set_bytes,
+                0,
                 admission_n,
             );
             let meta: Vec<(usize, GroupFrame)> = needing_measure
@@ -3675,6 +3752,7 @@ fn register_group_pass(
         Stage::Register,
         &group.key,
         working_set_bytes,
+        0,
         admission_n,
     );
     let meta: Vec<(usize, GroupFrame, String, SeedPolicy)> = to_register
@@ -7425,6 +7503,7 @@ fn run_group_normalization(
         Stage::Normalize,
         &group.key,
         working_set_bytes,
+        0,
         admission_n,
     );
     let interpolation = input.interpolation;
@@ -8509,6 +8588,17 @@ mod tests {
         assert_eq!(plan_groups.len(), 1, "one group expected for this fixture");
         let group_key = plan_groups[0].key.clone();
 
+        // Fix round 1: `admission_with_shared` (like `admission`) treats an
+        // unknown RAM total as an exhausted budget — admission 1 always,
+        // whatever `shared_bytes`/`working_set_bytes` say. On a machine (or
+        // sandbox) with no RAM probe the parallel run below could never
+        // actually admit more than one worker, so this pin would compare
+        // sequential against sequential for a reason that has nothing to do
+        // with the fan-out under test. Skip it rather than fail it.
+        if total_ram_bytes().is_none() {
+            return;
+        }
+
         // Sequential reference: the stock 1-thread `image_pool` clamps
         // `admission` to 1.
         let ctx_seq = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
@@ -8553,9 +8643,13 @@ mod tests {
         // Task 4 fix round: assert this fixture's working set still admits
         // more than one worker on the 4-thread pool before running, so a
         // future admission-math change cannot silently degrade this pin to
-        // comparing sequential against sequential.
+        // comparing sequential against sequential. Fix round 1 (Important
+        // finding 2): `admission_with_shared` with `shared_bytes` for the
+        // fixture's own two preloaded planes (its dark and flat — see the
+        // doc comment above), `calibrate_working_set_bytes` for the
+        // per-worker term.
         assert!(
-            admission(CALIBRATE_PLANES_RESIDENT * 64 * 48 * 4, 4) > 1,
+            admission_with_shared(2 * 64 * 48 * 4, calibrate_working_set_bytes(64, 48), 4) > 1,
             "fixture working set must admit more than one worker for this pin to test the fan-out"
         );
         let working_par = tempfile::tempdir().unwrap();

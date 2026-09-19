@@ -237,13 +237,26 @@ pub struct CalibratedFrame {
     pub data: Vec<f32>,
 }
 
+/// One master's plane preloaded through `BandSource`, with the geometry it
+/// was decoded at (fix round 1, ruled-in item 4). Carrying `width`/`height`
+/// alongside `data` restores the strictness `BandSource::open` has on a
+/// direct read — a transposed master (same total sample count, wrong shape)
+/// now fails the geometry check below instead of passing a length-only
+/// comparison.
+pub struct PreloadedPlane {
+    pub data: Arc<Vec<f32>>,
+    pub width: usize,
+    pub height: usize,
+}
+
 /// Master planes already decoded through `BandSource` — the same decode the
 /// engine would run itself, so the samples are bit-identical (perf tier 1
 /// Task 5). Keyed by the master's path; the engine uses an entry only when
-/// the path matches its own `dark_path`/`bias_path`/`flat_path` AND the
-/// length matches `w * h`, and reads the file itself otherwise.
+/// the path matches its own `dark_path`/`bias_path`/`flat_path` AND its
+/// `(width, height)` matches the light's own, and reads the file itself
+/// otherwise.
 pub struct PreloadedMasters {
-    pub planes: HashMap<PathBuf, Arc<Vec<f32>>>,
+    pub planes: HashMap<PathBuf, PreloadedPlane>,
 }
 
 /// Decode one master file's single plane through the same `BandSource` /
@@ -252,8 +265,19 @@ pub struct PreloadedMasters {
 /// flat once produces bit-identical samples to the engine reading them itself
 /// per frame. Always the floor budget ([`MIN_BUDGET_BYTES`]): a single master
 /// plane is 1-2 bands regardless, same reasoning as [`calibrate_light`].
-pub fn preload_master_plane(path: &Path, scratch_dir: &Path) -> Result<Arc<Vec<f32>>, IntegrationError> {
-    let src = BandSource::open(&[path.to_path_buf()], scratch_dir, 1)?;
+///
+/// Cancellable (fix round 1, ruled-in item 5): `cancel` reaches both
+/// `BandSource::open_with_cancel` (a probe abandoned mid-file) and
+/// `read_band_with_progress` (a read abandoned mid-band, progress itself a
+/// no-op — nothing in this path drives a progress bar), so a run cancelled
+/// while preloading a large master's planes stops within one file rather
+/// than running every remaining band to completion first.
+pub fn preload_master_plane(
+    path: &Path,
+    scratch_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreloadedPlane, IntegrationError> {
+    let src = BandSource::open_with_cancel(&[path.to_path_buf()], scratch_dir, 1, cancel)?;
     let (w, h) = (src.width(), src.height());
     let mut planes = BandPlanes::new(&src);
     let mut out = vec![0f32; w * h];
@@ -261,11 +285,11 @@ pub fn preload_master_plane(path: &Path, scratch_dir: &Path) -> Result<Arc<Vec<f
     let mut y = 0;
     while y < h {
         let rows = band_rows.min(h - y);
-        src.read_band(y, rows, &mut planes, 1)?;
+        src.read_band_with_progress(y, rows, &mut planes, 1, &|_| {}, cancel)?;
         planes.decode_frame_into(0, &mut out[y * w..(y + rows) * w]);
         y += rows;
     }
-    Ok(Arc::new(out))
+    Ok(PreloadedPlane { data: Arc::new(out), width: w, height: h })
 }
 
 /// Calibrate one LIGHT frame and write the result to `inputs.output_path`.
@@ -434,9 +458,9 @@ fn calibrate_light_compute_inner(
     // samples from RAM instead of opening a second `BandSource` over the
     // file. Resolved BEFORE `paths` below, so a preloaded path is never
     // pushed onto the light's own `BandSource` read.
-    let pre_sub: Option<&Arc<Vec<f32>>> =
+    let pre_sub: Option<&PreloadedPlane> =
         subtrahend.and_then(|p| preloaded.and_then(|m| m.planes.get(p)));
-    let pre_flat: Option<&Arc<Vec<f32>>> =
+    let pre_flat: Option<&PreloadedPlane> =
         inputs.flat_path.as_ref().and_then(|p| preloaded.and_then(|m| m.planes.get(p)));
 
     // One BandSource over the light plus whichever of subtrahend/flat is NOT
@@ -471,17 +495,18 @@ fn calibrate_light_compute_inner(
 
     // A preloaded plane must match the light's own geometry — the same
     // failure class `BandSource::open` raises for a mixed-dimension read,
-    // just checked against RAM instead of a second file open.
-    for (path, plane) in [
-        (subtrahend, pre_sub),
-        (inputs.flat_path.as_ref(), pre_flat),
-    ] {
+    // just checked against RAM instead of a second file open. Comparing
+    // `(width, height)` rather than just the sample count (fix round 1,
+    // ruled-in item 4) catches a transposed master too — same total
+    // samples, wrong shape.
+    for (path, plane) in [(subtrahend, pre_sub), (inputs.flat_path.as_ref(), pre_flat)] {
         if let (Some(path), Some(plane)) = (path, plane) {
-            if plane.len() != w * h {
+            if (plane.width, plane.height) != (w, h) {
                 return Err(IntegrationError::BadInput(format!(
-                    "preloaded master geometry mismatch: {} has {} samples, the light is {w}x{h}",
+                    "preloaded master geometry mismatch: {} is {}x{}, the light is {w}x{h}",
                     path.display(),
-                    plane.len()
+                    plane.width,
+                    plane.height
                 )));
             }
         }
@@ -513,12 +538,12 @@ fn calibrate_light_compute_inner(
             // first band.
             let full = y * w + idx;
             match (pre_sub, sub_idx) {
-                (Some(sub), _) => v -= sub[full] as f64,
+                (Some(sub), _) => v -= sub.data[full] as f64,
                 (None, Some(si)) => v -= planes.sample(si, idx) as f64,
                 (None, None) => {}
             }
             let flat_sample = match (pre_flat, flat_idx) {
-                (Some(f), _) => Some(f[full] as f64),
+                (Some(f), _) => Some(f.data[full] as f64),
                 (None, Some(fi)) => Some(planes.sample(fi, idx) as f64),
                 (None, None) => None,
             };
@@ -1002,9 +1027,14 @@ mod tests {
 
     /// Fixture for the perf tier 1 Task 5 preload pins: a light calibrated
     /// against a dark and a flat, mirroring `full_formula_bdf`'s setup but
-    /// with per-pixel VARYING values (not uniform planes) — a band-local vs.
-    /// frame-global indexing bug in the preload path would otherwise be
-    /// masked by every pixel already being equal.
+    /// with per-pixel VARYING values (not uniform planes) — a preload path
+    /// that reads the wrong SAMPLE shows up as a numeric mismatch rather
+    /// than being masked by every pixel already being equal. At the default
+    /// `MIN_BUDGET_BYTES` this 8x9 fixture is a SINGLE band, so `full ==
+    /// idx` for every pixel here and this fixture alone cannot catch a
+    /// band-local-vs-frame-global indexing bug (fix round 1, Important
+    /// finding 3) — `preloaded_masters_match_across_multiple_bands` below
+    /// forces several bands on a taller fixture for that case.
     fn fixture_light_dark_flat() -> (tempfile::TempDir, LightCalInputs) {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (8usize, 9usize);
@@ -1034,28 +1064,68 @@ mod tests {
     /// bit-identical to one calibrated from the files.
     #[test]
     fn preloaded_masters_calibrate_bit_identically() {
-        let (dir, inputs) = fixture_light_dark_flat(); // the module's existing fixture helper
+        let (dir, inputs) = fixture_light_dark_flat();
         let cancel = AtomicBool::new(false);
         let (from_files, _) = calibrate_light_compute(&inputs, &cancel).unwrap();
         let mut planes = HashMap::new();
         for p in [inputs.dark_path.clone(), inputs.flat_path.clone()].into_iter().flatten() {
-            planes.insert(p.clone(), preload_master_plane(&p, dir.path()).unwrap());
+            planes.insert(p.clone(), preload_master_plane(&p, dir.path(), &cancel).unwrap());
         }
         let pre = PreloadedMasters { planes };
         let (from_ram, _) = calibrate_light_compute_with(&inputs, Some(&pre), &cancel).unwrap();
         assert_eq!(from_files.data, from_ram.data);
     }
 
-    /// A preloaded plane whose length doesn't match the light's own geometry
-    /// is refused loudly (ruling 4) rather than read out of bounds or
-    /// silently ignored.
+    /// Fix round 1, Important finding 3: `preloaded_masters_calibrate_
+    /// bit_identically` runs its 8x9 fixture at `MIN_BUDGET_BYTES`, which is
+    /// a SINGLE band — `full == idx` for every pixel there, so writing
+    /// `sub[idx]`/`f[idx]` instead of `sub[full]`/`f[full]` would still pass
+    /// it. This pin forces several bands (a 300-byte budget, the same
+    /// technique `multi_band_run_keeps_the_global_cfa_row_phase` uses below)
+    /// on a taller fixture and calls the PRIVATE, budget-parameterized
+    /// `calibrate_light_compute_inner` directly, so a band-local vs.
+    /// frame-global indexing bug in the preload path is something this test
+    /// can actually catch.
+    #[test]
+    fn preloaded_masters_match_across_multiple_bands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 12usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, |x, y| 1000.0 + (x + y * w) as f32, &[]);
+        let dark = write_fill(dir.path(), "dark.fits", w, h, |x, _y| 50.0 + x as f32, &[]);
+        let flat = write_fill(dir.path(), "flat.fits", w, h, |_x, y| 1.5 + y as f32 * 0.1, &[fnrm_card(2.0)]);
+        let out = dir.path().join("out.fits");
+        let cfg = inputs(dir.path(), light.clone(), Some(dark.clone()), None, Some(flat.clone()), true, out);
+
+        // Confirm the fixture actually forces multiple bands at this budget
+        // — a passing pin on a single-band fixture would prove nothing.
+        let probe = BandSource::open(&[light, dark.clone(), flat.clone()], dir.path(), 1).unwrap();
+        let band_rows = probe.band_rows_for_budget(300);
+        assert!(band_rows < h, "fixture must force multiple bands at this budget, got {band_rows} rows of {h}");
+
+        let cancel = AtomicBool::new(false);
+        let mut planes = HashMap::new();
+        for p in [dark, flat] {
+            planes.insert(p.clone(), preload_master_plane(&p, dir.path(), &cancel).unwrap());
+        }
+        let pre = PreloadedMasters { planes };
+
+        let (from_files, _) = calibrate_light_compute_inner(&cfg, None, &cancel, 300).unwrap();
+        let (from_ram, _) = calibrate_light_compute_inner(&cfg, Some(&pre), &cancel, 300).unwrap();
+        assert_eq!(from_files.data, from_ram.data);
+    }
+
+    /// A preloaded plane whose geometry doesn't match the light's own is
+    /// refused loudly (ruling 4) rather than read out of bounds or silently
+    /// ignored. Transposed relative to the light's 8x9 — same total sample
+    /// count (72) as a length-only check would miss, but the wrong shape
+    /// (fix round 1, ruled-in item 4: `PreloadedPlane` carries `(width,
+    /// height)`, not just a sample count).
     #[test]
     fn preloaded_master_geometry_mismatch_is_refused() {
         let (dir, inputs) = fixture_light_dark_flat();
         let dark_path = inputs.dark_path.clone().unwrap();
         let mut planes = HashMap::new();
-        // One sample short of the light's 8x9 = 72.
-        planes.insert(dark_path, Arc::new(vec![0f32; 71]));
+        planes.insert(dark_path, PreloadedPlane { data: Arc::new(vec![0f32; 9 * 8]), width: 9, height: 8 });
         let pre = PreloadedMasters { planes };
         let cancel = AtomicBool::new(false);
         match calibrate_light_compute_with(&inputs, Some(&pre), &cancel) {
