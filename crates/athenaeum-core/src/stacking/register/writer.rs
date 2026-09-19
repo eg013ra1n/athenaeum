@@ -1,7 +1,12 @@
-//! Optional registered frames (spec §3.7): the subject resampled once into
-//! the reference geometry, NaN outside its coverage, with the source's
+//! Registered frames (spec §3.7): the subject resampled once into the
+//! reference geometry, NaN outside its coverage, with the source's
 //! acquisition cards and the `ATH_REG*` provenance. Artifacts, never
-//! cataloged; nothing downstream reads them.
+//! cataloged. Perf tier A Task 6a made this write REQUIRED and load-
+//! bearing: Normalize and Integrate both read it verbatim in place of
+//! re-warping the calibrated frame on every band
+//! (`RegisteredSource::open_materialized`) — see `write_registered_frame`'s
+//! own doc for the write side and `stacking::run::ensure_registered_artifact`
+//! for how a cached registration re-run still gets one.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -173,8 +178,127 @@ mod tests {
     use crate::fits_parser::FitsHeader;
     use crate::fits_writer::CardValue;
     use crate::geometry::{Linear, LinearKind};
+    use crate::integration::banded::BandPlanes;
     use crate::integration::plane_reader::PlaneReader;
+    use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
+    use crate::integration::source::FrameSource;
     use crate::test_support::{centroid, gaussian_field};
+    use std::sync::atomic::AtomicBool;
+
+    /// Perf tier A Task 6a, Pin 1 — the identity the whole task rests on.
+    /// [`write_registered_frame`] warps the WHOLE plane in one `warp_rows`
+    /// call over a source read in one `PlaneReader::read_plane`;
+    /// `RegisteredSource` (the pre-Task-6a on-the-fly reader every band read
+    /// downstream used, and still the fallback path after this task) warps
+    /// the SAME frame band by band, each band's source read windowed
+    /// through `source_window`. Both already call the exact same
+    /// `warp_rows`/`sample_at` code with the same `Interpolation`/clamping,
+    /// so this test's job is to PROVE that a windowed, per-band read is
+    /// bit-for-bit (`to_bits`, so even a NaN's payload bits must match) the
+    /// same as the one-shot full-plane read the writer does — never assume
+    /// it — across a similarity AND a homography map (the pipeline's two
+    /// families of registration model), at BicubicBSpline and Lanczos3 (the
+    /// default kernel plus the other one the pipeline exposes), and across
+    /// several band heights, including one (`37`) that does not evenly
+    /// divide the fixture's 384-row height, so the LAST band of that sweep
+    /// is short. If any of these ever disagree, [`write_registered_frame`]
+    /// must be changed to call the exact routine `RegisteredSource` uses —
+    /// this test would then be the regression guard for that fix.
+    #[test]
+    fn writer_output_matches_the_registered_source_band_by_band_bit_for_bit() {
+        const W: usize = 512;
+        const H: usize = 384;
+
+        // Deterministic synthetic stars (not evenly spaced, not on a
+        // lattice) plus a linear gradient — a flat field cannot distinguish
+        // "sampled the wrong row" from "sampled the right one", the
+        // gradient's slope can.
+        let stars: Vec<(f64, f64, f64)> = (0..24)
+            .map(|i| {
+                let fi = i as f64;
+                (
+                    20.0 + (fi * 47.0) % (W as f64 - 40.0),
+                    15.0 + (fi * 83.0) % (H as f64 - 30.0),
+                    800.0 + (fi * 137.0) % 4000.0,
+                )
+            })
+            .collect();
+        let mut data = gaussian_field(W, H, &stars, 1.7, 200.0);
+        for y in 0..H {
+            for x in 0..W {
+                data[y * W + x] += x as f32 * 0.03 + y as f32 * 0.05;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let subject = dir.path().join("c_sub.fits");
+        write_fits_f32(&subject, W, H, 1, &data, &[]).unwrap();
+
+        // A genuine similarity (scale ~1.02, rotate ~4deg, shift) and a
+        // genuine homography (a real perspective term in the bottom row,
+        // not just an affine written through the homography arm).
+        let similarity = PixelMap::linear(Linear::from_flat(
+            LinearKind::Similarity,
+            [1.017, -0.0712, 6.3, 0.0712, 1.017, -4.1, 0.0, 0.0, 1.0],
+        ))
+        .unwrap();
+        let homography = PixelMap::linear(Linear::from_flat(
+            LinearKind::Homography,
+            [1.01, 0.02, 5.0, -0.015, 0.995, 3.0, 0.00012, -0.00009, 1.0],
+        ))
+        .unwrap();
+
+        // The pipeline's default `clamping_threshold` (`RegistrationConfig::default`).
+        const CLAMPING: f32 = 0.30;
+        let band_heights = [1usize, 7, 37, 64, 128, H];
+
+        for (map_name, map) in [("similarity", &similarity), ("homography", &homography)] {
+            for interp in [Interpolation::BicubicBSpline, Interpolation::Lanczos3] {
+                let out = dir.path().join(format!("r_{map_name}_{interp:?}.fits"));
+                write_registered_frame(&subject, map, W, H, interp, CLAMPING, &[], None, &out)
+                    .unwrap();
+                let writer_plane = PlaneReader::open(&out).unwrap().read_plane(0).unwrap();
+
+                for &band_h in &band_heights {
+                    let frames = vec![RegisteredFrame {
+                        path: subject.clone(),
+                        map: map.clone(),
+                    }];
+                    let src = RegisteredSource::open(&frames, W, H, 0, interp, CLAMPING).unwrap();
+                    let mut planes = BandPlanes::new(&src);
+                    let mut got = vec![0f32; H * W];
+                    let mut y0 = 0usize;
+                    while y0 < H {
+                        let rows = band_h.min(H - y0);
+                        src.read_band_with_progress(
+                            y0,
+                            rows,
+                            &mut planes,
+                            1,
+                            &|_| {},
+                            &AtomicBool::new(false),
+                        )
+                        .unwrap();
+                        let mut band_buf = vec![0f32; rows * W];
+                        planes.decode_frame_into(0, &mut band_buf);
+                        got[y0 * W..(y0 + rows) * W].copy_from_slice(&band_buf);
+                        y0 += rows;
+                    }
+
+                    for (i, (&w, &g)) in writer_plane.iter().zip(got.iter()).enumerate() {
+                        let (wb, gb) = (w.to_bits(), g.to_bits());
+                        assert!(
+                            wb == gb,
+                            "{map_name} {interp:?} band_h={band_h} sample {i} \
+                             (row {}, col {}): writer {w} (0x{wb:08x}) vs \
+                             RegisteredSource {g} (0x{gb:08x})",
+                            i / W,
+                            i % W
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn writes_the_subject_into_reference_geometry_with_provenance_cards() {

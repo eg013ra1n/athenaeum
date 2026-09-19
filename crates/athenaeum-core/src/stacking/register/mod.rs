@@ -103,19 +103,24 @@ pub enum DistortionChoice {
     ///
     /// | stage | grids per frame |
     /// | ---- | ---- |
-    /// | registration writer (when `writeRegisteredFrames`) | 1 |
-    /// | local normalization | 1 per PLANE (it opens a source per plane) |
-    /// | integration | 1 (one source per group since ruling R-T4-7) |
-    /// | drizzle | 1 per PLANE (the plane loop is the outer one) |
+    /// | registration writer | 1 (unconditional since perf tier A Task 6a — see below) |
+    /// | local normalization | 0 (reads the materialized registered artifact — no warp); 1 per PLANE on the Task 6a fallback (the artifact is missing/stale for this frame) |
+    /// | integration | 0 (same materialized read; one source per group when it falls back, ruling R-T4-7) |
+    /// | drizzle | 1 per PLANE (the plane loop is the outer one; drizzle still reads the calibrated frame through the forward map, untouched by Task 6a) |
     ///
-    /// Adding the table up, a mono run pays 4 builds per frame (3 by
-    /// default — `writeRegisteredFrames` is off) and a three-plane colour
-    /// run 8 (7 by default) — on the 160-frame OSC acceptance group,
-    /// ≈ 19 minutes of grid building at the default toggles. In exchange
-    /// it never holds more than a few grids at
-    /// once: the resident figure is one inverse grid per frame for the
-    /// length of a group's integration (≈ 208 × 4.5 MB ≈ 0.9 GB at that
-    /// set's size) and a handful anywhere else.
+    /// The table above (and the "3 by default"/"7 by default"/"≈ 19
+    /// minutes" totals a v0.6.3 acceptance run measured from it) predates
+    /// perf tier A Task 6a, which made the registered artifact a REQUIRED
+    /// output — Normalize and Integrate now read it verbatim instead of
+    /// re-warping the calibrated frame, so in the ordinary case (the
+    /// artifact is fresh) they build NO grid at all; only the registration
+    /// writer's own build and drizzle's still apply. A frame whose
+    /// materialized artifact is missing or stale falls back to warping on
+    /// the fly for that one stage, at which point its grid cost reverts to
+    /// this table's original count. The resident-grid ceiling this doc goes
+    /// on to describe (one inverse grid per frame for the length of a
+    /// group's integration) still holds — Task 6a changes how many grids
+    /// get BUILT, not how many are held at once.
     ///
     /// Registration itself pays nothing extra: its residual statistics,
     /// its star re-pairing and the local distortion loop all evaluate the
@@ -231,6 +236,13 @@ pub struct RegistrationConfig {
     pub max_rms_px: f64,
     pub fail_on_max_rms: bool,
     pub detection: DetectionConfig,
+    /// Vestigial since perf tier A Task 6a: the registered artifact became
+    /// the run's REQUIRED per-frame output (Normalize/Integrate read it in
+    /// place of re-warping) and is now written unconditionally — this
+    /// field no longer gates that write. Kept in the schema/UI (the
+    /// `RegisterPanel` "Write registered frames" toggle) only because
+    /// removing it is a command-surface change out of that task's scope; it
+    /// has no observable effect any more.
     pub write_registered_frames: bool,
 }
 
@@ -276,7 +288,10 @@ mod tests {
         assert_eq!(scale_gate_for(Some(1.56), Some(0.78)), (1.6, 2.5));
         // … and the other way round.
         let (lo, hi) = scale_gate_for(Some(0.78), Some(1.56));
-        assert!((lo - 0.4).abs() < 1e-12 && (hi - 0.625).abs() < 1e-12, "{lo} {hi}");
+        assert!(
+            (lo - 0.4).abs() < 1e-12 && (hi - 0.625).abs() < 1e-12,
+            "{lo} {hi}"
+        );
 
         // Nonsense scales fall back to the fixed window rather than
         // producing a gate nothing can satisfy.

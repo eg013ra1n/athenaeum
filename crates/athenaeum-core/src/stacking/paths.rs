@@ -506,6 +506,13 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
 /// master, and — M3 Task 5 — whether drizzle runs at all).
 pub struct EstimateInputs<'a> {
     pub groups: &'a [IntegrationGroup],
+    /// Perf tier A Task 6a: `build_plan` always passes `true` now — the
+    /// registered artifact is the run's REQUIRED per-frame output (Normalize
+    /// and Integrate both read it), not the `registration.write_registered_frames`
+    /// toggle's optional QC dump the field used to mirror. Left as a plain
+    /// `bool` (not hardcoded `true` inside [`estimate_bytes`]) so the
+    /// function itself stays a general-purpose estimator its own unit tests
+    /// can still exercise both ways.
     pub write_registered: bool,
     pub write_maps: bool,
     /// `Some((scale, write_weight_map, use_rejection))` when

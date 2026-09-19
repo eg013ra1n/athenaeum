@@ -1,8 +1,12 @@
-//! A `FrameSource` that resamples calibrated frames through their
-//! registration transforms as bands are requested — the hybrid
-//! materialization of spec §0/§6.1: transforms persist, pixels do not.
-//! Each band: map the band boundary back into every frame, read only that
-//! row window, warp it into the band, hand the engine native f32.
+//! A `FrameSource` over registered frames, two ways. [`RegisteredSource::open`]
+//! is the hybrid materialization of spec §0/§6.1 (transforms persist, pixels
+//! do not): each band maps its boundary back into every calibrated frame,
+//! reads only that row window, and warps it into the band. Perf tier A Task
+//! 6a added [`RegisteredSource::open_materialized`], which skips the warp
+//! entirely for a frame whose registered artifact is already on disk in the
+//! reference geometry (`register::writer::write_registered_frame` wrote it)
+//! — a plain positional read — falling back per frame to the warp above
+//! when that artifact is missing, unreadable, or the wrong size.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,8 +27,37 @@ pub struct RegisteredFrame {
     pub map: PixelMap,
 }
 
+/// One frame for [`RegisteredSource::open_materialized`] (Task 6a, spec
+/// §3.7/§6.1): `registered_path`, when `Some`, is a materialized registered
+/// artifact — already warped into the source's reference geometry by the
+/// SAME `warp_rows` call the on-the-fly path below uses (`register::writer::
+/// write_registered_frame`) — read verbatim, no warp, when it opens and its
+/// own `(width, height)` match the geometry this source was built with.
+/// When it does not (missing, unreadable, or the wrong size — deleted
+/// mid-run, a cleanup, a foreign file), this frame falls back to
+/// `fallback`: the calibrated frame in its OWN native geometry, warped
+/// through `map` exactly as [`RegisteredFrame`] always has, and the
+/// fallback is logged ONCE, here, at
+/// [`RegisteredSource::open_materialized`] time — never per band read.
+/// `registered_path: None` falls back the SAME way but silently: no
+/// artifact was ever expected for this frame (the caller's own freshness
+/// check found none), which is not itself a fault to warn about.
+pub struct MaterializedFrame {
+    pub registered_path: Option<PathBuf>,
+    pub fallback: RegisteredFrame,
+}
+
+/// One opened frame's read strategy: [`FrameKind::Materialized`] is a plain
+/// positional read at the source's own reference geometry (no resample —
+/// the file already IS the reference geometry); [`FrameKind::Warped`] warps
+/// through the map exactly as every pre-Task-6a `RegisteredSource` did.
+enum FrameKind {
+    Materialized,
+    Warped(PixelMap),
+}
+
 pub struct RegisteredSource {
-    frames: Vec<(PlaneReader, PixelMap)>,
+    frames: Vec<(PlaneReader, FrameKind)>,
     width: usize,
     height: usize,
     channels: usize,
@@ -41,10 +74,73 @@ pub struct RegisteredSource {
     pool: Option<Arc<rayon::ThreadPool>>,
 }
 
+/// Test-only counter (Task 6a Pin 3): how many times
+/// [`RegisteredSource::open_materialized`]'s per-frame fallback actually
+/// fired (a `registered_path` that was `Some` but failed to open at the
+/// right geometry) — the run pin's way to confirm the fallback path itself
+/// executed, since asserting the paired `warn!` line would need a global
+/// tracing subscriber shared with the whole (parallel) test binary, which
+/// `docs/logging/README.md` documents as impractical per-test. Process-
+/// global like [`crate::geometry::pixel_map::grid_counters`]; nothing else
+/// in this codebase deliberately breaks a registered artifact mid-run, so
+/// the contention risk a shared counter would otherwise carry is not
+/// exercised in practice.
+#[cfg(test)]
+pub(crate) mod fallback_counters {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn on_fallback() {
+        FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        FALLBACKS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn snapshot() -> usize {
+        FALLBACKS.load(Ordering::Relaxed)
+    }
+}
+
+fn check_ref_geometry(ref_width: usize, ref_height: usize) -> Result<(), IntegrationError> {
+    if ref_width == 0 || ref_height == 0 {
+        return Err(IntegrationError::BadInput(
+            "reference geometry must be non-zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Folds one more frame's channel count into the running consistency check,
+/// naming `path` in the error the moment two frames disagree — kept as a
+/// free function (rather than inline in each opener's loop) so both
+/// [`RegisteredSource::open`] and [`RegisteredSource::open_materialized`]
+/// report the exact same error shape.
+fn check_channels(
+    channels: &mut Option<usize>,
+    this: usize,
+    path: &std::path::Path,
+) -> Result<(), IntegrationError> {
+    match *channels {
+        None => *channels = Some(this),
+        Some(c) if c != this => {
+            return Err(IntegrationError::BadInput(format!(
+                "{}: {this} planes, the set has {c}",
+                path.display()
+            )))
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl RegisteredSource {
     /// Opens every frame; all must share one channel count and `plane`
     /// must exist in it. `ref_width × ref_height` is the output geometry
-    /// (the reference frame's).
+    /// (the reference frame's). Every frame warps — the pre-Task-6a path,
+    /// unchanged.
     pub fn open(
         frames: &[RegisteredFrame],
         ref_width: usize,
@@ -56,28 +152,91 @@ impl RegisteredSource {
         if frames.is_empty() {
             return Err(IntegrationError::BadInput("empty frame list".into()));
         }
-        if ref_width == 0 || ref_height == 0 {
-            return Err(IntegrationError::BadInput(
-                "reference geometry must be non-zero".into(),
-            ));
-        }
+        check_ref_geometry(ref_width, ref_height)?;
         let mut opened = Vec::with_capacity(frames.len());
         let mut channels = None;
         for f in frames {
             let r = PlaneReader::open(&f.path)?;
-            match channels {
-                None => channels = Some(r.channels()),
-                Some(c) if c != r.channels() => {
-                    return Err(IntegrationError::BadInput(format!(
-                        "{}: {} planes, the set has {c}",
-                        f.path.display(),
-                        r.channels()
-                    )))
-                }
-                _ => {}
-            }
-            opened.push((r, f.map.clone()));
+            check_channels(&mut channels, r.channels(), &f.path)?;
+            opened.push((r, FrameKind::Warped(f.map.clone())));
         }
+        Self::from_opened(
+            opened, channels, ref_width, ref_height, plane, interp, clamping,
+        )
+    }
+
+    /// Task 6a: opens every frame at the group's materialized registered
+    /// artifact when it is usable, falling back per frame (with ONE
+    /// `warn!`) to the on-the-fly warp otherwise — see
+    /// [`MaterializedFrame`]'s own doc for exactly which failures trigger
+    /// the fallback. Same contract as [`Self::open`] otherwise (empty list,
+    /// zero geometry, channel-count/`plane` validation).
+    pub fn open_materialized(
+        frames: &[MaterializedFrame],
+        ref_width: usize,
+        ref_height: usize,
+        plane: usize,
+        interp: Interpolation,
+        clamping: f32,
+    ) -> Result<RegisteredSource, IntegrationError> {
+        if frames.is_empty() {
+            return Err(IntegrationError::BadInput("empty frame list".into()));
+        }
+        check_ref_geometry(ref_width, ref_height)?;
+        let mut opened = Vec::with_capacity(frames.len());
+        let mut channels = None;
+        for f in frames {
+            let materialized = f.registered_path.as_ref().and_then(|p| {
+                PlaneReader::open(p)
+                    .ok()
+                    .filter(|r| r.width() == ref_width && r.height() == ref_height)
+            });
+            match materialized {
+                Some(r) => {
+                    // `f.registered_path` is `Some` in this arm (that is
+                    // what `materialized` being `Some` required above).
+                    let p = f.registered_path.as_ref().unwrap();
+                    check_channels(&mut channels, r.channels(), p)?;
+                    opened.push((r, FrameKind::Materialized));
+                }
+                None => {
+                    // A `None` `registered_path` is the ordinary "no
+                    // artifact was ever expected" case — nothing to warn
+                    // about. Only a `Some` that failed to open (or opened
+                    // at the wrong size) is the Task 6a fallback proper.
+                    if let Some(p) = &f.registered_path {
+                        warn!(
+                            path = %p.display(),
+                            fallback_path = %f.fallback.path.display(),
+                            "registered frame unavailable; warping on the fly"
+                        );
+                        #[cfg(test)]
+                        fallback_counters::on_fallback();
+                    }
+                    let r = PlaneReader::open(&f.fallback.path)?;
+                    check_channels(&mut channels, r.channels(), &f.fallback.path)?;
+                    opened.push((r, FrameKind::Warped(f.fallback.map.clone())));
+                }
+            }
+        }
+        Self::from_opened(
+            opened, channels, ref_width, ref_height, plane, interp, clamping,
+        )
+    }
+
+    /// Shared tail of [`Self::open`]/[`Self::open_materialized`]: `plane`
+    /// range and the struct itself. `channels` is already validated
+    /// consistent by the caller's own [`check_channels`] loop (which still
+    /// has each frame's own path in scope for the error text).
+    fn from_opened(
+        opened: Vec<(PlaneReader, FrameKind)>,
+        channels: Option<usize>,
+        ref_width: usize,
+        ref_height: usize,
+        plane: usize,
+        interp: Interpolation,
+        clamping: f32,
+    ) -> Result<RegisteredSource, IntegrationError> {
         let channels = channels.unwrap_or(1);
         if plane >= channels {
             return Err(IntegrationError::BadInput(format!(
@@ -137,9 +296,17 @@ impl RegisteredSource {
     /// how 208 frames' inverse grids survived integration and met
     /// drizzle's forward grids on the acceptance run.
     ///
-    /// A no-op for linear and polynomial maps, which have no grids.
+    /// A no-op for linear and polynomial maps, which have no grids, and for
+    /// a [`FrameKind::Materialized`] entry, which has no map to release at
+    /// all (it never warps).
     pub fn release_grids(&self) -> usize {
-        self.frames.iter().map(|(_, m)| m.release_grids()).sum()
+        self.frames
+            .iter()
+            .filter_map(|(_, k)| match k {
+                FrameKind::Warped(m) => Some(m.release_grids()),
+                FrameKind::Materialized => None,
+            })
+            .sum()
     }
 
     pub fn channels(&self) -> usize {
@@ -185,7 +352,19 @@ impl RegisteredSource {
         raw_scratch: &mut Vec<u8>,
         src_buf: &mut Vec<f32>,
     ) -> Result<u64, IntegrationError> {
-        let (reader, map) = &self.frames[i];
+        let (reader, kind) = &self.frames[i];
+        let map = match kind {
+            // Task 6a: the materialized registered artifact is already at
+            // THIS source's own reference geometry (validated at open time)
+            // — a positional read of `[y0, y0+rows)` at `self.width`
+            // reproduces exactly the bytes the writer warped, no resample.
+            FrameKind::Materialized => {
+                reader.read_rows_with_scratch(self.plane, y0, rows, dst, raw_scratch)?;
+                let bpp = reader.kind().bytes_per_sample();
+                return Ok((rows * self.width * bpp) as u64);
+            }
+            FrameKind::Warped(map) => map,
+        };
         let (sw, sh) = (reader.width(), reader.height());
         let window = source_window(
             map,

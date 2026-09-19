@@ -373,6 +373,8 @@ registration row for each — run stacking through Register first); found {}",
             },
             exposure_s: c.frame.exposure_s.unwrap_or(0.0),
             date_obs: c.frame.date_obs.clone(),
+            frame_id: c.frame.frame_id,
+            registered_path: None,
         })
         .collect();
 

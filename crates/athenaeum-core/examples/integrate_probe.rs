@@ -895,6 +895,8 @@ fn main() {
             weight: w,
             exposure_s: f.exposure_s,
             date_obs: f.date_obs.clone(),
+            frame_id: 900001,
+            registered_path: None,
         })
         .collect();
 

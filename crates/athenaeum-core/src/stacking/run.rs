@@ -3818,6 +3818,16 @@ fn register_group_pass(
         }
 
         if let Some(outcome) = reused {
+            // Perf tier A Task 6a: a cached `registration_results` row can
+            // still be missing its OWN materialized artifact — never
+            // written before this became required (an existing catalog's
+            // first run under this cycle), or removed by a cleanup — so a
+            // reused frame gets the same freshness-checked (re)write a
+            // freshly-registered one gets below (in the fan-out results
+            // loop), just without redoing the registration itself.
+            if let RegisteredFrameOutcome::Aligned { map, record, .. } = &outcome {
+                ensure_registered_artifact(rc, group, &frame, map, record, &cfg);
+            }
             if let Some(entries) = rc.measured.get_mut(&group.key) {
                 entries[idx].registration = Some(outcome);
             }
@@ -4103,17 +4113,25 @@ fn register_group_pass(
                                 let conn = db(&rc.ctx)?.conn();
                                 upsert_registration(&conn, &rec)?;
                             }
-                            if cfg.registration.write_registered_frames {
-                                if let Err(e) =
-                                    write_registered_artifact(rc, group, frame, &map, &rec, &cfg)
-                                {
-                                    tracing::warn!(
-                                        run_id = rc.run_id,
-                                        frame_id = frame.frame_id,
-                                        error = ?e,
-                                        "failed to write registered frame"
-                                    );
-                                }
+                            // Perf tier A Task 6a: the registered artifact
+                            // is now the run's REQUIRED per-frame artifact
+                            // (Normalize/Integrate always read it) — no
+                            // longer gated on `write_registered_frames`
+                            // (which stays in the config/UI as a vestigial
+                            // toggle, see its own doc). A write failure is
+                            // still non-fatal: this frame's `GroupMember`
+                            // snapshot later just finds no fresh artifact
+                            // and every reader falls back to the on-the-fly
+                            // warp.
+                            if let Err(e) =
+                                write_registered_artifact(rc, group, frame, &map, &rec, &cfg)
+                            {
+                                tracing::warn!(
+                                    run_id = rc.run_id,
+                                    frame_id = frame.frame_id,
+                                    error = ?e,
+                                    "failed to write registered frame"
+                                );
                             }
                             if let Some(entries) = rc.measured.get_mut(&group.key) {
                                 entries[idx].registration = Some(RegisteredFrameOutcome::Aligned {
@@ -4860,14 +4878,30 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Optional debug/QC output (`cfg.registration.write_registered_frames`,
-/// default off, not exercised by any required test): resample `calibrated`
-/// into the reference geometry and write it under
-/// `layout.registered_dir(group_key)`, plus a `registered` artifact row.
-/// Runs on the run thread, sequentially, right after each frame's
-/// registration DB write rather than inside the fan-out worker — simpler,
-/// and this optional output is not on the pipeline's timing-critical path
-/// (`write_registered_frames` defaults off).
+/// Perf tier A Task 6a: the registered artifact is a REQUIRED per-frame
+/// output now — Normalize and Integrate both read it in place of re-warping
+/// the calibrated frame on every band (`RegisteredSource::open_materialized`)
+/// — resamples `calibrated` into the reference geometry through the SAME
+/// `warp_rows` call the on-the-fly path uses and writes it under
+/// `layout.registered_dir(group_key)`, plus a `registered` artifact row
+/// keyed on `rec.config_hash` (the registration config hash, already folded
+/// with the frame's own calibration hash by `registration_hash_for` — a
+/// re-registration or a re-calibration invalidates it exactly like the LN
+/// `.athln` sidecars). Runs on the run thread, sequentially, right after
+/// each frame's registration DB write rather than inside the fan-out
+/// worker — this predates the write becoming required (Task 2's era, when
+/// it really was optional debug output); a future tier could move it into
+/// the fan-out for more parallelism, not attempted here. A write failure is
+/// logged and never fails the run — [`GroupMember`]'s own freshness check
+/// (`stacking::run`'s snapshot before Normalize/Integrate) simply finds
+/// nothing fresh and every reader falls back to the on-the-fly warp.
+///
+/// The config field `registration.write_registered_frames` (Settings →
+/// Stacking, `RegisterPanel`'s "Write registered frames" toggle) no longer
+/// gates this call — see [`ensure_registered_artifact`] below, this
+/// function's other caller — and is kept only because removing it would be
+/// a command-surface change out of this task's scope; it is otherwise
+/// inert now that the write always happens.
 fn write_registered_artifact(
     rc: &mut RunContext,
     group: &IntegrationGroup,
@@ -4961,6 +4995,60 @@ fn write_registered_artifact(
         },
     )?;
     Ok(())
+}
+
+/// Perf tier A Task 6a: called on the register-pass CACHE-HIT branch (a
+/// `registration_results` row reused from a prior run) — the registration
+/// itself needs no rework, but its materialized artifact might: never
+/// written before this became required, or removed since (a cleanup, a
+/// foreign edit). Looks up the `registered` artifact row for `frame` and
+/// (re)writes it via [`write_registered_artifact`] only when [`is_fresh`]
+/// says the existing one is stale or missing — the ordinary case is a fresh
+/// hit, so this costs one `find_artifact` SELECT per reused frame and
+/// nothing else. Failures (either the lookup or the write) are logged and
+/// swallowed here exactly as they are in [`write_registered_artifact`]'s
+/// own caller: a frame whose registration is a cache hit but whose artifact
+/// stays missing simply falls back to the on-the-fly warp downstream.
+fn ensure_registered_artifact(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+    frame: &GroupFrame,
+    map: &PixelMap,
+    rec: &RegistrationRecord,
+    cfg: &StackingConfig,
+) {
+    let hash = rec.config_hash.as_deref().unwrap_or_default();
+    let fresh = (|| -> anyhow::Result<bool> {
+        let conn = db(&rc.ctx)?.conn();
+        Ok(crate::db::stacking::find_artifact(
+            &conn,
+            rc.set_id,
+            &group.key,
+            "registered",
+            Some(frame.frame_id),
+        )?
+        .is_some_and(|row| is_fresh(&row, hash)))
+    })()
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            run_id = rc.run_id,
+            frame_id = frame.frame_id,
+            error = ?e,
+            "failed to check the registered artifact's freshness; rewriting it"
+        );
+        false
+    });
+    if fresh {
+        return;
+    }
+    if let Err(e) = write_registered_artifact(rc, group, frame, map, rec, cfg) {
+        tracing::warn!(
+            run_id = rc.run_id,
+            frame_id = frame.frame_id,
+            error = ?e,
+            "failed to write registered frame"
+        );
+    }
 }
 
 /// `r_<stem>[_d].fits` for the SAME collision-safe `stem`
@@ -5124,7 +5212,9 @@ static OUTPUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// One included member of a group, snapshotted out of `rc.measured` before
 /// the (possibly slow) integration call so nothing below needs a borrow of
 /// `rc` to survive it — the fields [`crate::stacking::integrate::StackFrame`]
-/// needs, plus `frame_id` (`StackFrame` itself has no identity field).
+/// needs, plus `frame_id` (`StackFrame` also carries `frame_id` now, purely
+/// for the Task 6a fallback warning — this struct's own copy stays, since a
+/// lot of code here reads `member.frame_id` before any `StackFrame` exists).
 struct GroupMember {
     frame_id: i64,
     /// The catalog `files.filename` (fix round 1, item 3) — `ATH_STKF`
@@ -5144,6 +5234,18 @@ struct GroupMember {
     /// Stage 6's own [`normalization_hash_for`] keys a frame's `ln` artifact
     /// on this, so a re-registered frame's sidecar is recomputed too.
     registration_hash: String,
+    /// Perf tier A Task 6a: this frame's materialized registered artifact —
+    /// `Some` when a `stacking_artifacts` row of `kind = "registered"`
+    /// exists for it with `config_hash == registration_hash` (a HASH-only
+    /// check, deliberately not the disk-`stat`ing [`plan::is_fresh`] — see
+    /// the field's own build site); `None` when no such row exists at all,
+    /// which falls back SILENTLY (nothing was ever expected here). Every
+    /// reader ([`crate::stacking::integrate::integrate_planes`],
+    /// `ln::normalize_frame`) then tries `Some` paths for real and falls
+    /// back LOUDLY (one `warn!`) only if the file turns out to be missing,
+    /// unreadable, or the wrong size at that point — never a run failure
+    /// either way.
+    registered_path: Option<PathBuf>,
 }
 
 /// What became of one group at Output time.
@@ -5797,6 +5899,38 @@ fn process_group_output(
                 normalized_mean: 0.0,
                 missing: None,
             });
+            // Perf tier A Task 6a: this snapshot is taken AFTER stage 5 has
+            // already written (or refreshed) every included, aligned
+            // member's registered artifact — see `ensure_registered_artifact`
+            // and the fan-out results loop in `register_group_pass` — so a
+            // fresh row here is the ordinary case; `None` (the write
+            // failed, or a config predating this task never ran stage 5
+            // again) just means every reader below falls back to the
+            // on-the-fly warp for this one frame, silently (nothing was
+            // ever expected on disk).
+            //
+            // Deliberately HASH-ONLY, not the full [`is_fresh`] disk check
+            // stage 5's own [`ensure_registered_artifact`] uses to decide
+            // whether a REWRITE is needed: the actual "is the file usable
+            // right now" question belongs to
+            // `RegisteredSource::open_materialized`'s own `PlaneReader::open`
+            // attempt at read time, which is what turns a file that
+            // vanished AFTER this snapshot (deleted mid-run, a cleanup, a
+            // foreign edit) into the loud, warned fallback rather than a
+            // silent one — re-`stat`-ing here would only race that same
+            // check and answer it twice.
+            let registered_path = {
+                let conn = db(&rc.ctx)?.conn();
+                crate::db::stacking::find_artifact(
+                    &conn,
+                    rc.set_id,
+                    &group.key,
+                    "registered",
+                    Some(e.frame.frame_id),
+                )?
+                .filter(|row| row.config_hash == registration_hash)
+                .and_then(|row| row.path.map(PathBuf::from))
+            };
             members.push(GroupMember {
                 frame_id: e.frame.frame_id,
                 filename: e.frame.filename.clone(),
@@ -5806,6 +5940,7 @@ fn process_group_output(
                 weight,
                 exposure_s: e.frame.exposure_s,
                 date_obs: e.frame.date_obs.clone(),
+                registered_path,
                 registration_hash,
             });
         }
@@ -5953,6 +6088,8 @@ fn process_group_output(
                 weight: m.weight.clone(),
                 exposure_s: m.exposure_s.unwrap_or(0.0),
                 date_obs: m.date_obs.clone(),
+                frame_id: m.frame_id,
+                registered_path: m.registered_path.clone(),
             })
             .collect()
     };
@@ -9396,6 +9533,128 @@ mod tests {
         assert_eq!(registered_file_name("vega_d", true), "r_vega_d_d.fits");
     }
 
+    /// Perf tier A Task 6a, Pin 3: a registered artifact deleted strictly
+    /// BETWEEN stage 5 (Register, which just wrote it) and stage 7
+    /// (Integrate, which reads it) must not fail the run — every affected
+    /// frame falls back to the on-the-fly warp (counted via
+    /// `RegisteredSource`'s test-only `fallback_counters`, since asserting
+    /// the paired `warn!` line would need a tracing subscriber this test
+    /// binary cannot own exclusively, see `open_materialized`'s own doc),
+    /// and the resulting master is bit-for-bit identical to a baseline
+    /// run's own — the master is unchanged either way, by construction (Pin
+    /// 1 already proved the writer and the on-the-fly warp agree pixel for
+    /// pixel; this pin proves the RUN actually reaches that fallback path
+    /// and does not fail or diverge when it does).
+    #[test]
+    fn a_registered_frame_deleted_mid_run_falls_back_and_the_master_is_unchanged() {
+        use crate::integration::registered_source::fallback_counters;
+
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+
+        // `delete_registered`: when true, every included frame's `registered/`
+        // artifact is removed right after stage 5 (Register) finishes and
+        // before `stage_output` (stages 6-9) runs — the exact "between
+        // stage 5 and 6" window this pin is about.
+        let run_once = |delete_registered: bool| -> (usize, Vec<Vec<f32>>, usize) {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let (fixture, light_ids, working, output) =
+                seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            let cfg = StackingConfig::default();
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups.clone(),
+                layout,
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            run_stages_for_test(&mut rc, Stage::Register).unwrap();
+
+            if delete_registered {
+                let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+                for g in &plan_groups {
+                    let dir = layout.registered_dir(&g.key);
+                    assert!(
+                        dir.exists() && std::fs::read_dir(&dir).unwrap().next().is_some(),
+                        "stage 5 must have written at least one registered file at {}",
+                        dir.display()
+                    );
+                    std::fs::remove_dir_all(&dir)
+                        .expect("remove registered/<group> for the fault injection");
+                }
+            }
+
+            fallback_counters::reset();
+            stage_output(&mut rc).unwrap();
+            let fallbacks = fallback_counters::snapshot();
+
+            let master = rc
+                .summary
+                .groups
+                .iter()
+                .find(|g| g.key == plan_groups[0].key)
+                .and_then(|g| g.master_path.clone())
+                .expect("master path");
+            // Read the master's pixel data back NOW, while `working`/`output`
+            // (this closure's own `TempDir`s) are still alive — both are
+            // dropped (deleting everything under them, master included) the
+            // moment this closure returns, so a caller comparing by PATH
+            // after the fact would be reading a file that no longer exists.
+            let reader = PlaneReader::open(Path::new(&master)).unwrap();
+            let channels = reader.channels();
+            let planes: Vec<Vec<f32>> = (0..channels)
+                .map(|p| reader.read_plane(p).unwrap())
+                .collect();
+            (channels, planes, fallbacks)
+        };
+
+        let (channels_baseline, planes_baseline, _fallbacks_baseline) = run_once(false);
+        let (channels_faulted, planes_faulted, fallbacks_faulted) = run_once(true);
+
+        assert!(
+            fallbacks_faulted > 0,
+            "deleting every registered artifact must make Integrate fall back \
+             at least once (mono group, one plane, four included frames)"
+        );
+
+        assert_eq!(channels_baseline, channels_faulted);
+        for p in 0..channels_baseline {
+            let plane_a = &planes_baseline[p];
+            let plane_b = &planes_faulted[p];
+            assert_eq!(plane_a.len(), plane_b.len());
+            for (i, (a, b)) in plane_a.iter().zip(plane_b.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "plane {p} pixel {i}: baseline {a} vs registered-file-deleted-mid-run {b}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn measure_reuses_metrics_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12177,12 +12436,11 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.output.cleanup = CleanupPolicy::DeleteIntermediates;
-        // Fix round 1, item 8: without this, `registered_root()` never has
-        // any content to begin with (`write_registered_frames` defaults
-        // off), so the assertion that cleanup emptied it would pass
-        // trivially even if `CleanupWhat::Intermediates` never touched that
-        // subtree at all.
-        cfg.registration.write_registered_frames = true;
+        // Perf tier A Task 6a: the registered artifact is now written
+        // unconditionally (`registration.write_registered_frames` no
+        // longer gates it — see the field's own doc), so `registered_root()`
+        // always has content before cleanup runs; the assertion below is no
+        // longer at risk of passing trivially over an empty directory.
 
         let started = start_stacking(
             ctx.clone(),
@@ -12229,7 +12487,6 @@ mod tests {
         // make every kept row a miss while the kind list still passed.
         let mut cfg2 = StackingConfig::default();
         cfg2.output.cleanup = CleanupPolicy::DeleteIntermediates;
-        cfg2.registration.write_registered_frames = true;
         let second = start_stacking(
             ctx.clone(),
             Arc::new(NullEmitter),
@@ -15083,7 +15340,11 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
         cfg.registration.local_distortion = true;
-        cfg.registration.write_registered_frames = true;
+        // Perf tier A Task 6a: the registered artifact is written
+        // unconditionally now, so `write_registered_frames` no longer needs
+        // setting here for the writer stage's own grid build/release below
+        // to run.
+        //
         // LN stays OFF here: its PSF-flux scale needs 20 matched stars per
         // frame and this 192x144 canvas cannot carry that many resolvable
         // ones (measured: 3–6 matched, every frame excluded). Nothing is
@@ -15143,17 +15404,23 @@ mod tests {
         // Where the peak comes from — traced build by build (v0.6.3 CI
         // fix, `GRID_TRACE` instrumentation on `grid_counters`): the
         // registration writer and drizzle each hold ONE grid at a time
-        // (build, warp, release, next frame), while `integrate_planes`
-        // opens ONE `RegisteredSource` per group (ruling R-T4-7) and every
-        // band reads every included frame through its inverse grid, so
-        // the group's spline frames' inverse grids are all resident for
-        // the whole integration — one per frame, by design (rebuilding
-        // 600-node splines per band would cost far more than the ~3 MB a
-        // grid holds), and independent of the rayon pool. Measured: 33
-        // grids built over the run (registration releases, drizzle
-        // rebuilds — the documented cost of the spline arm) and a peak of
-        // exactly `tps_frames` (11), on a 10-worker Mac AND on a 4-worker
-        // CI runner alike.
+        // (build, warp, release, next frame). Before perf tier A Task 6a,
+        // `integrate_planes` opened ONE `RegisteredSource` per group
+        // (ruling R-T4-7) and every band read every included frame through
+        // its inverse grid, so the group's spline frames' inverse grids
+        // were all resident for the whole integration — one per frame, by
+        // design (rebuilding 600-node splines per band would cost far more
+        // than the ~3 MB a grid holds) — measured then: 33 grids built over
+        // the run and a peak of exactly `tps_frames` (11), on a 10-worker
+        // Mac AND on a 4-worker CI runner alike. Task 6a made Integrate (and
+        // Normalize) read the materialized registered artifact instead —
+        // when it is fresh (this test's ordinary case: LN is off and
+        // nothing deletes the artifact) neither stage touches a
+        // `PixelMap`'s grid at all, so the writer's own builds are what
+        // remain: re-measured post-Task-6a at 22 builds (33 minus the 11
+        // integration used to add) and a peak of 1 (only the writer or
+        // drizzle ever holds one at a time now) — independent of the rayon
+        // pool either way, and still bounded by `tps_frames` since 1 <= 11.
         //
         // The assertion this replaces read `peak <= threads + 4` — the
         // hypothesis that a per-frame release bounds residency by the POOL.

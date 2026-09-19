@@ -406,6 +406,8 @@ mod tests {
                 weight: weight(w),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900100 + i as i64,
+                registered_path: None,
             });
         }
         (frames, raw)

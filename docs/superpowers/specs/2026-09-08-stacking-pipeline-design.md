@@ -328,14 +328,31 @@ with `failOnMaxRms` on (default off: warn, keep). A failed frame is excluded
 from the run with reason `registration failed: …` when
 `excludeOnRegistrationFailure` is on (default on), else the run fails.
 
-### 3.7 Optional registered frames
+### 3.7 Registered frames
 
-`writeRegisteredFrames` (default off) writes `registered/<group>/r_<stem>.fits`
+Every registered frame is written to `registered/<group>/r_<stem>.fits`
 (float32, its group's reference geometry — §3.8, the run-wide one in
 co-registered mode — NaN coverage, copy-through cards + `ATH_REG`
 cards with the transform) after registration, resampling once with the
-configured kernel. They are artifacts (§9.3), never cataloged, and are not
-read by later stages — the lazy source stays the single code path.
+configured kernel. They are artifacts (§9.3), never cataloged, keyed on the
+registration config hash folded with the frame's own calibration hash
+(§9.3, the same rule the `.athln` sidecars follow).
+
+**Task 6a (perf tier A) made this write REQUIRED and load-bearing**: the
+warp used to happen twice per frame — once (optionally) here, and again on
+every band Normalize and Integrate each opened through their own
+`RegisteredSource`. Both stages now read the materialized file verbatim
+instead (`RegisteredSource::open_materialized`) — no resample, since the
+file already IS the reference geometry the warp produced. `writeRegisteredFrames`
+(Settings → Stacking) no longer gates the write; it is vestigial, kept only
+because removing the config field/UI toggle is a command-surface change out
+of scope for that task. A frame whose materialized artifact is missing,
+unreadable, or the wrong size at read time (deleted mid-run, a cleanup, a
+foreign file) falls back to the pre-Task-6a on-the-fly warp for that one
+frame, logged once — the master is bit-identical either way, by
+construction (the writer and the on-the-fly path share the exact same
+`warp_rows` call). Drizzle is unaffected — it always read the calibrated
+frame through the forward map, never this artifact.
 
 ### 3.8 Mixed pixel scales (M4b)
 

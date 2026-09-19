@@ -21,7 +21,7 @@ use crate::integration::engine::{
     integrate_stack, EngineProgress, LocalNormRow, LocalNormRowFactory, StackOutput, StackParams,
 };
 use crate::integration::io_policy::IoPolicy;
-use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
+use crate::integration::registered_source::{MaterializedFrame, RegisteredFrame, RegisteredSource};
 use crate::integration::source::{RejectionBitSink, RejectionBitSource};
 use crate::integration::stats::{
     output_pair, rejection_pair, NormalizationPair, OutputNormalization, RejectionNormalization,
@@ -296,6 +296,20 @@ pub struct StackFrame {
     pub exposure_s: f64,
     /// `DATE-OBS` as stored (ISO-8601 text), for the header's earliest/latest.
     pub date_obs: Option<String>,
+    /// The catalog frame id, for the Task 6a fallback warning only — no
+    /// other field on this type carries identity, so this exists purely so
+    /// [`integrate_planes`]'s materialized-frame fallback can name the
+    /// frame it warped instead of reading verbatim.
+    pub frame_id: i64,
+    /// The materialized registered artifact (Task 6a, spec §3.7) — already
+    /// warped into the group's reference geometry, read verbatim by
+    /// [`integrate_planes`]/`normalize_frame` in place of re-warping `path`
+    /// through `map`. `None` when no fresh artifact was on disk at snapshot
+    /// time (`stacking::run::GroupMember` resolves this once, the same
+    /// `is_fresh` rule every other cached stage uses) — every reader then
+    /// falls back to the on-the-fly warp, exactly as before this field
+    /// existed.
+    pub registered_path: Option<PathBuf>,
 }
 
 pub struct GroupInput<'a> {
@@ -631,14 +645,24 @@ pub(crate) fn integrate_planes<'g>(
     // re-opened every reader and, since M4c, rebuilt every frame's
     // displacement grid twice over for nothing. `set_plane` existed for
     // exactly this and had no production caller until now.
-    let registered_frames: Vec<RegisteredFrame> = frame_indices
+    //
+    // Perf tier A Task 6a: read each frame's MATERIALIZED registered
+    // artifact when `stacking::run` found one fresh at snapshot time
+    // (`StackFrame::registered_path`), falling back per frame to the
+    // on-the-fly warp otherwise — `RegisteredSource::open_materialized`
+    // owns the readiness check and the ONE fallback `warn!`, see its own
+    // doc.
+    let registered_frames: Vec<MaterializedFrame> = frame_indices
         .iter()
-        .map(|&i| RegisteredFrame {
-            path: frames[i].path.clone(),
-            map: frames[i].map.clone(),
+        .map(|&i| MaterializedFrame {
+            registered_path: frames[i].registered_path.clone(),
+            fallback: RegisteredFrame {
+                path: frames[i].path.clone(),
+                map: frames[i].map.clone(),
+            },
         })
         .collect();
-    let mut src = RegisteredSource::open(
+    let mut src = RegisteredSource::open_materialized(
         &registered_frames,
         input.width,
         input.height,
@@ -1709,6 +1733,8 @@ mod tests {
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900002,
+                registered_path: None,
             })
             .collect();
 
@@ -1785,6 +1811,8 @@ mod tests {
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900003,
+                registered_path: None,
             },
             StackFrame {
                 path: PathBuf::from("b.fits"),
@@ -1793,6 +1821,8 @@ mod tests {
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900004,
+                registered_path: None,
             },
         ];
         let integration = IntegrationConfig::default();
@@ -1902,6 +1932,8 @@ mod tests {
                     weight: weight(w, 1),
                     exposure_s: 60.0,
                     date_obs: None,
+                    frame_id: 900005,
+                    registered_path: None,
                 })
                 .collect()
         };
@@ -2032,6 +2064,8 @@ mod tests {
                 weight: weight(weights[0], 1),
                 exposure_s: exposures[0],
                 date_obs: None,
+                frame_id: 900006,
+                registered_path: None,
             },
             StackFrame {
                 path: p1,
@@ -2040,6 +2074,8 @@ mod tests {
                 weight: weight(weights[1], 1),
                 exposure_s: exposures[1],
                 date_obs: None,
+                frame_id: 900007,
+                registered_path: None,
             },
             StackFrame {
                 path: p2,
@@ -2048,6 +2084,8 @@ mod tests {
                 weight: weight(weights[2], 1),
                 exposure_s: exposures[2],
                 date_obs: None,
+                frame_id: 900008,
+                registered_path: None,
             },
         ];
 
@@ -2192,6 +2230,8 @@ mod tests {
                 weight: weight(1.0, 3),
                 exposure_s: 30.0,
                 date_obs: None,
+                frame_id: 900009,
+                registered_path: None,
             });
         }
 
@@ -2289,6 +2329,8 @@ mod tests {
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900010,
+                registered_path: None,
             })
             .collect();
 
@@ -2441,6 +2483,8 @@ mod tests {
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900011,
+                registered_path: None,
             })
             .collect();
         let integration = IntegrationConfig::default();
@@ -2606,6 +2650,8 @@ mod tests {
                 weight: weight(1.0, 1),
                 exposure_s: 60.0,
                 date_obs: None,
+                frame_id: 900012,
+                registered_path: None,
             })
             .collect();
 

@@ -1585,7 +1585,12 @@ pub fn build_plan(
         .collect();
     let estimate_bytes = paths::estimate_bytes(&EstimateInputs {
         groups: &estimate_groups,
-        write_registered: cfg.registration.write_registered_frames,
+        // Perf tier A Task 6a: the registered artifact is now the run's
+        // REQUIRED per-frame artifact (Normalize/Integrate always read it),
+        // not the optional QC dump `write_registered_frames` used to gate —
+        // the footprint estimate must count it unconditionally, the same
+        // way the run itself now writes it unconditionally.
+        write_registered: true,
         write_maps: cfg.integration.write_rejection_maps,
         drizzle: cfg.drizzle.enabled.then_some((
             cfg.drizzle.scale,

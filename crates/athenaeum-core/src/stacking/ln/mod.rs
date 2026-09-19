@@ -36,7 +36,7 @@ use std::time::Instant;
 
 use crate::geometry::ThinPlateSpline;
 use crate::integration::banded::BandPlanes;
-use crate::integration::registered_source::{RegisteredFrame, RegisteredSource};
+use crate::integration::registered_source::{MaterializedFrame, RegisteredFrame, RegisteredSource};
 use crate::integration::source::FrameSource;
 use crate::integration::stats::median_of;
 use crate::integration::IntegrationError;
@@ -449,11 +449,18 @@ pub fn normalize_frame(
     // have already read the NaN-preserving version) never leaks into the
     // next channel's warp.
     let t = Instant::now();
-    let registered = RegisteredFrame {
-        path: frame.path.clone(),
-        map: frame.map.clone(),
+    // Perf tier A Task 6a: reads the frame's materialized registered
+    // artifact (`frame.registered_path`, resolved once by `stacking::run`)
+    // verbatim when it is fresh and usable, falling back to the on-the-fly
+    // warp otherwise — see `RegisteredSource::open_materialized`'s own doc.
+    let registered = MaterializedFrame {
+        registered_path: frame.registered_path.clone(),
+        fallback: RegisteredFrame {
+            path: frame.path.clone(),
+            map: frame.map.clone(),
+        },
     };
-    let mut src = RegisteredSource::open(
+    let mut src = RegisteredSource::open_materialized(
         &[registered],
         reference.width,
         reference.height,
