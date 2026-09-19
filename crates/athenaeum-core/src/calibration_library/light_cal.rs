@@ -1083,15 +1083,19 @@ mod tests {
     /// it. This pin forces several bands (a 300-byte budget, the same
     /// technique `multi_band_run_keeps_the_global_cfa_row_phase` uses below)
     /// on a taller fixture and calls the PRIVATE, budget-parameterized
-    /// `calibrate_light_compute_inner` directly, so a band-local vs.
-    /// frame-global indexing bug in the preload path is something this test
-    /// can actually catch.
+    /// `calibrate_light_compute_inner` directly, covering BOTH arms: the
+    /// flat varies in y (`1.5 + y*0.1`), and the dark varies in y TOO (fix
+    /// round 2, Important finding 3 residue — `idx % w == full % w` always,
+    /// so an x-only-varying dark made `sub.data[idx]` and `sub.data[full]`
+    /// read equal VALUES from different rows and this pin could not have
+    /// caught `sub.data[full]` regressing to `sub.data[idx]` in the
+    /// subtrahend arm; `50.0 + x + y*0.25` closes that gap).
     #[test]
     fn preloaded_masters_match_across_multiple_bands() {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (8usize, 12usize);
         let light = write_fill(dir.path(), "light.fits", w, h, |x, y| 1000.0 + (x + y * w) as f32, &[]);
-        let dark = write_fill(dir.path(), "dark.fits", w, h, |x, _y| 50.0 + x as f32, &[]);
+        let dark = write_fill(dir.path(), "dark.fits", w, h, |x, y| 50.0 + x as f32 + y as f32 * 0.25, &[]);
         let flat = write_fill(dir.path(), "flat.fits", w, h, |_x, y| 1.5 + y as f32 * 0.1, &[fnrm_card(2.0)]);
         let out = dir.path().join("out.fits");
         let cfg = inputs(dir.path(), light.clone(), Some(dark.clone()), None, Some(flat.clone()), true, out);

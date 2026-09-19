@@ -2042,12 +2042,13 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
         // planes are resident ONCE per group, not once per worker, so they
         // are charged separately from the per-worker working set —
         // `shared_bytes` is the REAL count of planes this group actually
-        // preloaded (0-2: subtrahend and/or flat, never both a dark and a
-        // bias), not a hard-coded 2, so a group missing a link (or a
-        // preload failure) doesn't over-charge the budget, and native-mode
-        // grouping's several distinct masters per group don't under-charge
-        // it either. `admission_with_shared` subtracts this from the RAM
-        // budget BEFORE dividing by the per-worker working set.
+        // preloaded: one subtrahend (dark or bias, never both) and one flat
+        // PER DISTINCT MASTER the group's jobs resolve to, not a hard-coded
+        // 2, so a group missing a link (or a preload failure) doesn't
+        // over-charge the budget, and native-mode grouping's several
+        // distinct masters per group don't under-charge it either.
+        // `admission_with_shared` subtracts this from the RAM budget BEFORE
+        // dividing by the per-worker working set.
         let shared_bytes = preloaded.planes.len() as u64 * group_max_w * group_max_h * 4;
         let working_set_bytes = calibrate_working_set_bytes(group_max_w, group_max_h);
         let admission_n = admission_with_shared(
