@@ -283,11 +283,15 @@ impl<'a> LnReferenceForDetection<'a> {
     /// `psf`/`max_stars` are the group's own LN config — the SAME values
     /// [`normalize_frame`]'s own `relative_scale_against` calls use, so the
     /// prepared reference channel matches what a direct (unhoisted)
-    /// `relative_scale` call on this reference would have produced.
+    /// `relative_scale` call on this reference would have produced. `pool`
+    /// (perf tier 1 Task 2 fix round 1, item 3) is threaded straight to
+    /// [`scale::PreparedReferenceChannel::build`] — this runs once per
+    /// group, not once per frame, but it is still real detect+fit work.
     pub fn build(
         reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
         max_stars: usize,
+        pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
@@ -315,6 +319,7 @@ impl<'a> LnReferenceForDetection<'a> {
                     reference.height,
                     psf,
                     max_stars,
+                    pool,
                 )
             })
             .collect();
@@ -639,7 +644,8 @@ mod tests {
             vec![0.5f32; 12],
         ];
         let reference = reference_with_planes(planes);
-        let for_detection = LnReferenceForDetection::build(&reference, PsfModel::default(), 50);
+        let for_detection =
+            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
         assert_eq!(for_detection.sanitized_planes.len(), 2);
         for (p, plane) in for_detection.sanitized_planes.iter().enumerate() {
             assert!(
@@ -658,7 +664,8 @@ mod tests {
         let reference = reference_with_planes(vec![plane.clone()]);
         let location = median_of_finite(&plane);
 
-        let for_detection = LnReferenceForDetection::build(&reference, PsfModel::default(), 50);
+        let for_detection =
+            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
         assert_eq!(for_detection.sanitized_planes.len(), 1);
         match &for_detection.sanitized_planes[0] {
             Cow::Owned(v) => {

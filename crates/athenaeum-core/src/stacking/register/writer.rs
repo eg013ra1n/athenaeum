@@ -4,6 +4,7 @@
 //! cataloged; nothing downstream reads them.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 
@@ -115,6 +116,14 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
 /// Resample every plane of `subject` into the reference geometry through
 /// `map` (subject → reference; the resampler gathers through its inverse)
 /// and write the float32 FITS. Returns the plane count.
+///
+/// `pool`, perf tier 1 Task 2 fix round 1 (Finding 2): the per-plane
+/// `warp_rows` call is row-parallel (`resample::warp_rows` →
+/// `par_chunks_mut`) same as every other warp in the pipeline — without a
+/// pool it lands on rayon's GLOBAL pool, invisible to `image_pool`/the
+/// admission budget. `Some(&rc.ctx.image_pool)` from the run's own call
+/// chain (`write_registered_artifact`); every other caller (tests, the
+/// probe) passes `None`.
 pub fn write_registered_frame(
     subject: &Path,
     map: &PixelMap,
@@ -123,6 +132,7 @@ pub fn write_registered_frame(
     interp: Interpolation,
     clamping: f32,
     cards: &[Card],
+    pool: Option<&Arc<rayon::ThreadPool>>,
     out: &Path,
 ) -> anyhow::Result<usize> {
     // Ruling R-T4-6c, made exit-path-proof in fix round 3: this frame's
@@ -142,16 +152,11 @@ pub fn write_registered_frame(
     for plane in 0..channels {
         let data = reader.read_plane(plane)?;
         let src = Plane::full(&data, w, h);
-        warp_rows(
-            &src,
-            map,
-            ref_w,
-            0,
-            ref_h,
-            interp,
-            clamping,
-            &mut all[plane * plane_len..(plane + 1) * plane_len],
-        );
+        let dst = &mut all[plane * plane_len..(plane + 1) * plane_len];
+        match pool {
+            Some(p) => p.install(|| warp_rows(&src, map, ref_w, 0, ref_h, interp, clamping, dst)),
+            None => warp_rows(&src, map, ref_w, 0, ref_h, interp, clamping, dst),
+        }
     }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
@@ -223,6 +228,7 @@ mod tests {
             Interpolation::BicubicBSpline,
             0.3,
             &cards,
+            None,
             &out,
         )
         .unwrap();
@@ -332,6 +338,7 @@ mod tests {
             Interpolation::BicubicBSpline,
             0.3,
             &[],
+            None,
             &out,
         )
         .unwrap();
@@ -365,6 +372,7 @@ mod tests {
                 Interpolation::Bilinear,
                 0.3,
                 &[],
+                None,
                 &out
             )
             .unwrap(),

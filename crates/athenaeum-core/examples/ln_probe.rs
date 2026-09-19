@@ -456,8 +456,12 @@ registration row for each — run stacking through Register first); found {}",
         reference.height
     );
 
-    let ref_for_detection =
-        LnReferenceForDetection::build(&reference, local_cfg.psf_model, measure_opts.max_stars);
+    let ref_for_detection = LnReferenceForDetection::build(
+        &reference,
+        local_cfg.psf_model,
+        measure_opts.max_stars,
+        None,
+    );
     let ref_params = BackgroundParams {
         scale: args.scale,
         ..DEFAULT_PARAMS

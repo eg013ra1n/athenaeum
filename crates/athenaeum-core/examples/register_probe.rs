@@ -329,6 +329,7 @@ fn main() {
                 args.cfg.interpolation,
                 args.cfg.clamping_threshold,
                 &cards,
+                None,
                 &target,
             )
         });

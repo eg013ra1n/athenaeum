@@ -451,21 +451,22 @@ impl PreparedReferenceChannel {
     /// `reference` is one channel's row-major `width × height` plane
     /// (already in the reference geometry); `psf`/`max_stars` are the
     /// SAME values a direct [`relative_scale`] call on this reference would
-    /// use.
+    /// use. `pool` (perf tier 1 Task 2 fix round 1, item 3): the
+    /// reference-side detect+fit this hoists once per group is real
+    /// parallel work — routed to `image_pool` when the caller has one
+    /// (`LnReferenceForDetection::build`, itself called from `run.rs` with
+    /// `rc.ctx.image_pool` in scope), `None` from the probe/tests.
     pub fn build(
         reference: &[f32],
         width: usize,
         height: usize,
         psf: PsfModel,
         max_stars: usize,
+        pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> PreparedReferenceChannel {
         let fit_params = FitParams::default();
-        // No pool here — `PreparedReferenceChannel` has no `ServiceContext`/
-        // `RunContext` in scope (perf tier 1 Task 2's own listed call sites
-        // stop at `detect_seeds`/`relative_scale_against`); this runs on
-        // rayon's global pool, unchanged from before this task.
-        let ref_seeds = detect_seeds(reference, width, height, max_stars, None);
-        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, None);
+        let ref_seeds = detect_seeds(reference, width, height, max_stars, pool);
+        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, pool);
         let fit_positions: Vec<Option<(f64, f64)>> =
             outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
         let (tree, fit_of_point) = tree_over(&fit_positions);
@@ -603,7 +604,7 @@ pub fn relative_scale(
     rcr_limit: f64,
     local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
-    let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars);
+    let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars, None);
     relative_scale_against(
         &prepared,
         target,
@@ -709,8 +710,14 @@ mod tests {
         )
         .expect("a clean uniformly-scaled field must match");
 
-        let prepared =
-            PreparedReferenceChannel::build(&reference, WIDTH, HEIGHT, PsfModel::Moffat4, 200);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
         let via_prepared = relative_scale_against(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
         )

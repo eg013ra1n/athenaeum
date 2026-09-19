@@ -639,35 +639,70 @@ mod tests {
         ));
     }
 
-    /// Perf tier 1 Task 2: a band read's row-parallel warp runs on the pool
-    /// the source was given, never on rayon's global pool. Pinned by giving
-    /// the source a 1-thread pool and confirming the source reports exactly
-    /// that pool (`pool_threads`) after a band read under it — the warp
-    /// itself must not panic when its only available worker is the one the
-    /// caller thread hands off to via `pool.install`.
+    /// Perf tier 1 Task 2 fix round 1 (Finding 1): pins exactly three things
+    /// about `RegisteredSource::with_pool`, no more —
+    ///
+    /// 1. **The builder round-trip.** A source that never called
+    ///    `with_pool` reports `pool_threads() == None` (the negative
+    ///    control); one that did reports the pool's own `current_num_threads`.
+    /// 2. **The routed `pool.install(..)` path is safe on the degenerate
+    ///    case.** A 1-thread pool is exactly what a real single-core
+    ///    admission budget can hand `with_pool` — this must neither
+    ///    deadlock (the caller thread IS that one worker) nor panic.
+    /// 3. **Routing through the pool changes nothing about the warp's
+    ///    output.** A band read through a `with_pool` source is
+    ///    bit-for-bit (`to_bits()`, so a NaN's payload counts too — the
+    ///    fixture's shifted frames warp with a genuine NaN margin) identical
+    ///    to the same read through a plain, unpooled source — the "output
+    ///    bytes unchanged" constraint this whole task runs under.
+    ///
+    /// This does NOT prove the warp actually executed on the given pool's
+    /// OWN worker thread rather than the caller's — `fill_frame`'s
+    /// `on_bytes` callback fires from the caller's thread, not from inside
+    /// the warp, so there is nothing here to observe that from without
+    /// instrumenting `warp_rows` itself (out of scope: routing safety and
+    /// output invariance are what this pins).
     #[test]
     fn band_read_warps_on_the_source_pool() {
         let dir = tempfile::tempdir().unwrap();
-        let data = vec![0.5f32; 64 * 64];
-        let path = dir.path().join("f.fits");
-        write_fits_f32(&path, 64, 64, 1, &data, &[]).unwrap();
+        let fr = frames(dir.path());
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .unwrap(),
         );
-        let frames = vec![RegisteredFrame {
-            path,
-            map: PixelMap::linear(Linear::identity()).unwrap(),
-        }];
-        let src = RegisteredSource::open(&frames, 64, 64, 0, Interpolation::BicubicBSpline, 0.3)
+
+        let plain =
+            RegisteredSource::open(&fr, W, H, 0, Interpolation::BicubicBSpline, 0.3).unwrap();
+        assert_eq!(plain.pool_threads(), None, "no with_pool call ⇒ no pool");
+        let mut plain_band = BandPlanes::new(&plain);
+        plain
+            .read_band_with_progress(0, H, &mut plain_band, 1, &|_| {}, &AtomicBool::new(false))
+            .unwrap();
+
+        let pooled = RegisteredSource::open(&fr, W, H, 0, Interpolation::BicubicBSpline, 0.3)
             .unwrap()
             .with_pool(Arc::clone(&pool));
-        let mut band = BandPlanes::new(&src);
-        src.read_band_with_progress(0, 64, &mut band, 1, &|_| {}, &AtomicBool::new(false))
+        assert_eq!(pooled.pool_threads(), Some(1));
+        let mut pooled_band = BandPlanes::new(&pooled);
+        pooled
+            .read_band_with_progress(0, H, &mut pooled_band, 1, &|_| {}, &AtomicBool::new(false))
             .unwrap();
-        assert_eq!(src.pool_threads(), Some(1));
+
+        for i in 0..fr.len() {
+            let mut plain_out = vec![0f32; H * W];
+            let mut pooled_out = vec![0f32; H * W];
+            plain_band.decode_frame_into(i, &mut plain_out);
+            pooled_band.decode_frame_into(i, &mut pooled_out);
+            for (k, (a, b)) in plain_out.iter().zip(pooled_out.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "frame {i} sample {k}: pooled warp must be bit-identical to the unpooled one ({a} vs {b})"
+                );
+            }
+        }
     }
 
     #[test]

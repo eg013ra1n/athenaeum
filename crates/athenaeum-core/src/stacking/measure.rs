@@ -329,7 +329,15 @@ pub fn measure_plane_with_seeds(
             // sample statistics) stays on the untouched plane.
             let detect_on = match opts.seed_prefilter {
                 SeedPrefilter::None => None,
-                SeedPrefilter::Median3 => Some(prefilter::median3(&scaled, w, h)),
+                // Perf tier 1 Task 2 fix round 1, item 4: `median3` is
+                // itself `par_chunks_mut`-parallel — the one unwrapped
+                // parallel call left in this function, routed like its
+                // three siblings (`background_residual`, `noise_mrs`,
+                // `fit_stars`) above/below.
+                SeedPrefilter::Median3 => Some(match pool {
+                    Some(p) => p.install(|| prefilter::median3(&scaled, w, h)),
+                    None => prefilter::median3(&scaled, w, h),
+                }),
             };
             let detect_data: &[f32] = detect_on.as_deref().unwrap_or(&scaled);
             // Noise-relative levels, not the detector's default rank budget:

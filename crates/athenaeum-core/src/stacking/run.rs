@@ -4260,6 +4260,7 @@ fn write_registered_artifact(
         cfg.registration.interpolation,
         cfg.registration.clamping_threshold,
         &cards,
+        Some(&rc.ctx.image_pool),
         &out,
     )?;
 
@@ -6913,8 +6914,12 @@ fn run_group_normalization(
     // PSF fit + match tree (`prepared`), so `normalize_frame`'s
     // `relative_scale_against` call never re-detects/re-fits the
     // reference plane on every frame either.
-    let reference_for_detection =
-        LnReferenceForDetection::build(&ln_reference, ln_cfg.psf_model, measure_opts.max_stars);
+    let reference_for_detection = LnReferenceForDetection::build(
+        &ln_reference,
+        ln_cfg.psf_model,
+        measure_opts.max_stars,
+        Some(&rc.ctx.image_pool),
+    );
 
     let group_frames_by_id: HashMap<i64, &GroupFrame> =
         group.frames.iter().map(|f| (f.frame_id, f)).collect();
