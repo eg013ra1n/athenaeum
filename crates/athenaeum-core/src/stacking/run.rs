@@ -92,7 +92,8 @@ use crate::stacking::provenance::{
 };
 use crate::stacking::register::align::{SeedKind, SeedPolicy};
 use crate::stacking::register::frame::{
-    identity_registration, reference_stars, register_frame, to_record, ReferenceStars,
+    detect_frame_stars, identity_registration, reference_stars, register_detected, to_record,
+    DetectedStars, ReferenceStars,
 };
 use crate::stacking::register::wcs_seed::{ratio_wants_seed, seed_from_solves};
 use crate::stacking::register::writer::{
@@ -318,6 +319,18 @@ pub(crate) struct RunContext {
     /// failed to create would push a `0 ms` `Drizzle` timing under that
     /// proxy despite `drizzle_group` never having run at all).
     pub(crate) drizzle_attempted: usize,
+    /// Perf tier 1 Task 9: the two-pass dry pass's own detections
+    /// (`frame_id -> Arc<DetectedStars>`), kept only long enough for the
+    /// persisting pass right after it to reuse them instead of re-reading
+    /// and re-detecting the same frame. [`register_group_pass`] inserts
+    /// into this when it runs `persist = false` and removes from it as it
+    /// consumes each entry building a `persist = true` pass's items, so it
+    /// drains itself as the persisting pass runs; [`stage_register`] clears
+    /// whatever is left once the whole stage is done (belt and braces —
+    /// the reference's own identity row never consumes its entry, and a
+    /// group that never reaches a persisting pass — cancelled mid-stage —
+    /// would otherwise leak whatever the dry pass cached for it).
+    pub(crate) dry_pass_stars: HashMap<i64, Arc<DetectedStars>>,
     /// Test-only fault injection: [`run_pipeline`] panics right after the
     /// named stage completes, so [`run_thread`]'s catch-unwind/single-exit-path
     /// contract can be exercised without a real failure anywhere in the
@@ -883,6 +896,7 @@ pub fn start_stacking(
         reference_height: 0,
         group_geometry: HashMap::new(),
         drizzle_attempted: 0,
+        dry_pass_stars: HashMap::new(),
         #[cfg(test)]
         fail_after_stage: None,
     };
@@ -3486,6 +3500,13 @@ struct RegisterItem {
     scale_gate: (f64, f64),
     hint: Option<Linear>,
     policy: SeedPolicy,
+    /// Perf tier 1 Task 9: this frame's detections, already known from the
+    /// two-pass dry pass over the SAME group — `Some` skips
+    /// [`detect_frame_stars`] entirely in the fan-out closure below. `None`
+    /// for a genuine cache miss (every dry-pass item, and any persisting
+    /// item the dry pass never saw — the reference's own identity row, or
+    /// a frame the dry pass excluded).
+    pre: Option<Arc<DetectedStars>>,
 }
 
 /// [`SeedPolicy`] as the `seed_policy` log field's value.
@@ -3765,15 +3786,28 @@ fn register_group_pass(
         .iter()
         .map(|p| (p.idx, p.frame.clone(), p.expected_hash.clone(), p.policy))
         .collect();
+    // Perf tier 1 Task 9: a `persist` item consumes (and frees) its dry-pass
+    // cache entry here, on the run thread, before the fan-out spawns — the
+    // dry pass (`persist = false`) never consults the cache itself (a fresh
+    // pass always registers afresh, per this function's own doc comment),
+    // so `pre` is always `None` there.
     let items: Vec<RegisterItem> = to_register
         .into_iter()
-        .map(|p| RegisterItem {
-            frame_id: p.frame.frame_id,
-            path: p.path,
-            is_reference: p.is_reference,
-            scale_gate: p.scale_gate,
-            hint: p.hint,
-            policy: p.policy,
+        .map(|p| {
+            let pre = if persist {
+                rc.dry_pass_stars.remove(&p.frame.frame_id)
+            } else {
+                None
+            };
+            RegisterItem {
+                frame_id: p.frame.frame_id,
+                path: p.path,
+                is_reference: p.is_reference,
+                scale_gate: p.scale_gate,
+                hint: p.hint,
+                policy: p.policy,
+                pre,
+            }
         })
         .collect();
 
@@ -3797,19 +3831,34 @@ fn register_group_pass(
 
     let results = fan_out(items, admission_n, cancel_ref, move |item: RegisterItem| {
         let out = if item.is_reference {
-            Ok(identity_registration(ref_stars_ref))
+            Ok((identity_registration(ref_stars_ref), None))
         } else {
-            register_frame(
-                ref_stars_ref,
-                &item.path,
-                reg_cfg,
-                Some(pool_ref),
-                cancel_ref,
-                item.hint.as_ref(),
-                item.policy,
-                item.scale_gate,
-            )
-            .map_err(|e| format!("registration failed: {e}"))
+            // Perf tier 1 Task 9: `item.pre` is this frame's dry-pass
+            // detection, already known — skip `detect_frame_stars`
+            // entirely on a cache hit, exactly as `register_frame` (its
+            // composition, kept intact for every OTHER caller) would do
+            // for a cache miss.
+            let detected: Result<Arc<DetectedStars>, IntegrationError> = match item.pre {
+                Some(d) => Ok(d),
+                None => detect_frame_stars(&item.path, reg_cfg, Some(pool_ref)).map(Arc::new),
+            };
+            detected
+                .map(|d| {
+                    let reg = register_detected(
+                        ref_stars_ref,
+                        &d,
+                        reg_cfg,
+                        item.hint.as_ref(),
+                        item.policy,
+                        item.scale_gate,
+                    );
+                    // Returned only for a dry pass (`!persist`) — the
+                    // persisting pass consumed its cache entry building
+                    // this very item (or never had one), so it has
+                    // nothing new to cache.
+                    (reg, (!persist).then_some(d))
+                })
+                .map_err(|e| format!("registration failed: {e}"))
         };
         ticker_ref.tick(Some(item.frame_id));
         out
@@ -3848,126 +3897,137 @@ fn register_group_pass(
                     return Err(RunError::Other(msg.clone()));
                 }
             }
-            Some(Ok(reg)) => match &reg.outcome {
-                Ok(alignment) => {
-                    if !persist {
-                        pass.push(PassResult {
-                            idx,
-                            frame_id: frame.frame_id,
-                            outcome: Ok((alignment.rotation_deg, alignment.translation)),
-                        });
-                    } else {
-                        tracing::debug!(
-                            run_id = rc.run_id,
-                            frame_id = frame.frame_id,
-                            inliers = alignment.inliers,
-                            rms_px = alignment.rms_px,
-                            "frame registered"
-                        );
-                        // Ruling R-T6-9: the quad matcher dropped this
-                        // frame and the plate-solve seed picked it up. Its
-                        // own note is in `warnings` below, but a distinct
-                        // event is what makes the pattern countable — on
-                        // real data it clusters by filter, not by frame.
-                        if alignment.seed == SeedKind::Wcs && policy == SeedPolicy::QuadFirst {
-                            tracing::warn!(
+            Some(Ok((reg, dry_stars))) => {
+                // Perf tier 1 Task 9: a dry pass's own successful
+                // detections are cached for the persisting pass right
+                // after it — regardless of whether THIS pass's alignment
+                // succeeded (a fresh detection is exactly what the
+                // persisting pass needs even when the dry pass's own
+                // probe against the OLD reference failed to align).
+                if let Some(d) = dry_stars {
+                    rc.dry_pass_stars.insert(frame.frame_id, d);
+                }
+                match &reg.outcome {
+                    Ok(alignment) => {
+                        if !persist {
+                            pass.push(PassResult {
+                                idx,
+                                frame_id: frame.frame_id,
+                                outcome: Ok((alignment.rotation_deg, alignment.translation)),
+                            });
+                        } else {
+                            tracing::debug!(
                                 run_id = rc.run_id,
                                 frame_id = frame.frame_id,
-                                "quad seed failed; the plate-solve seed carried this frame"
+                                inliers = alignment.inliers,
+                                rms_px = alignment.rms_px,
+                                "frame registered"
                             );
-                        }
-                        for note in &alignment.warnings {
-                            tracing::warn!(
-                                run_id = rc.run_id,
-                                frame_id = frame.frame_id,
-                                note = %note,
-                                "registration warning"
-                            );
-                            rc.warnings
-                                .push(format!("frame {}: {note}", frame.frame_id));
-                        }
-                        let now =
-                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                        let is_reference_row = frame.frame_id == reference_frame_id;
-                        let rec = to_record(
-                            rc.set_id,
-                            frame.frame_id,
-                            reference_frame_id,
-                            is_reference_row,
-                            &reg,
-                            hash,
-                            &now,
-                        );
-                        let map = alignment.map.clone();
-                        {
-                            let conn = db(&rc.ctx)?.conn();
-                            upsert_registration(&conn, &rec)?;
-                        }
-                        if cfg.registration.write_registered_frames {
-                            if let Err(e) =
-                                write_registered_artifact(rc, group, frame, &map, &rec, &cfg)
-                            {
+                            // Ruling R-T6-9: the quad matcher dropped this
+                            // frame and the plate-solve seed picked it up. Its
+                            // own note is in `warnings` below, but a distinct
+                            // event is what makes the pattern countable — on
+                            // real data it clusters by filter, not by frame.
+                            if alignment.seed == SeedKind::Wcs && policy == SeedPolicy::QuadFirst {
                                 tracing::warn!(
                                     run_id = rc.run_id,
                                     frame_id = frame.frame_id,
-                                    error = ?e,
-                                    "failed to write registered frame"
+                                    "quad seed failed; the plate-solve seed carried this frame"
                                 );
                             }
-                        }
-                        if let Some(entries) = rc.measured.get_mut(&group.key) {
-                            entries[idx].registration = Some(RegisteredFrameOutcome::Aligned {
-                                map,
-                                record: rec,
-                                cached: false,
-                            });
-                        }
-                    }
-                }
-                Err(align_err) => {
-                    let reason = format!("registration failed: {align_err}");
-                    if !persist {
-                        pass.push(PassResult {
-                            idx,
-                            frame_id: frame.frame_id,
-                            outcome: Err(reason),
-                        });
-                    } else {
-                        let now =
-                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                        let rec = to_record(
-                            rc.set_id,
-                            frame.frame_id,
-                            reference_frame_id,
-                            false,
-                            &reg,
-                            hash,
-                            &now,
-                        );
-                        {
-                            let conn = db(&rc.ctx)?.conn();
-                            upsert_registration(&conn, &rec)?;
-                        }
-                        if cfg.selection.exclude_on_registration_failure {
-                            rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
-                            if let Some(entries) = rc.measured.get_mut(&group.key) {
-                                entries[idx].included = false;
-                                entries[idx].reason = Some(reason.clone());
-                                entries[idx].registration =
-                                    Some(RegisteredFrameOutcome::Failed(reason.clone()));
+                            for note in &alignment.warnings {
+                                tracing::warn!(
+                                    run_id = rc.run_id,
+                                    frame_id = frame.frame_id,
+                                    note = %note,
+                                    "registration warning"
+                                );
+                                rc.warnings
+                                    .push(format!("frame {}: {note}", frame.frame_id));
                             }
-                            tracing::warn!(
-                                run_id = rc.run_id,
-                                frame_id = frame.frame_id,
-                                reason = %reason,
-                                "frame excluded"
+                            let now = chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                            let is_reference_row = frame.frame_id == reference_frame_id;
+                            let rec = to_record(
+                                rc.set_id,
+                                frame.frame_id,
+                                reference_frame_id,
+                                is_reference_row,
+                                &reg,
+                                hash,
+                                &now,
                             );
+                            let map = alignment.map.clone();
+                            {
+                                let conn = db(&rc.ctx)?.conn();
+                                upsert_registration(&conn, &rec)?;
+                            }
+                            if cfg.registration.write_registered_frames {
+                                if let Err(e) =
+                                    write_registered_artifact(rc, group, frame, &map, &rec, &cfg)
+                                {
+                                    tracing::warn!(
+                                        run_id = rc.run_id,
+                                        frame_id = frame.frame_id,
+                                        error = ?e,
+                                        "failed to write registered frame"
+                                    );
+                                }
+                            }
+                            if let Some(entries) = rc.measured.get_mut(&group.key) {
+                                entries[idx].registration = Some(RegisteredFrameOutcome::Aligned {
+                                    map,
+                                    record: rec,
+                                    cached: false,
+                                });
+                            }
+                        }
+                    }
+                    Err(align_err) => {
+                        let reason = format!("registration failed: {align_err}");
+                        if !persist {
+                            pass.push(PassResult {
+                                idx,
+                                frame_id: frame.frame_id,
+                                outcome: Err(reason),
+                            });
                         } else {
-                            return Err(RunError::Other(reason));
+                            let now = chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                            let rec = to_record(
+                                rc.set_id,
+                                frame.frame_id,
+                                reference_frame_id,
+                                false,
+                                &reg,
+                                hash,
+                                &now,
+                            );
+                            {
+                                let conn = db(&rc.ctx)?.conn();
+                                upsert_registration(&conn, &rec)?;
+                            }
+                            if cfg.selection.exclude_on_registration_failure {
+                                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                                if let Some(entries) = rc.measured.get_mut(&group.key) {
+                                    entries[idx].included = false;
+                                    entries[idx].reason = Some(reason.clone());
+                                    entries[idx].registration =
+                                        Some(RegisteredFrameOutcome::Failed(reason.clone()));
+                                }
+                                tracing::warn!(
+                                    run_id = rc.run_id,
+                                    frame_id = frame.frame_id,
+                                    reason = %reason,
+                                    "frame excluded"
+                                );
+                            } else {
+                                return Err(RunError::Other(reason));
+                            }
                         }
                     }
                 }
-            },
+            }
         }
     }
     // One settled tick after the bookkeeping, so the last throttled
@@ -4149,10 +4209,24 @@ fn two_pass_refine(
         match find_frame_in_groups(&rc.plan_groups, new_frame_id) {
             None => Err("it is not in any plan group".to_string()),
             Some(new_group_frame) => {
-                let stars = {
-                    let pool_ref = &rc.ctx.image_pool;
-                    reference_stars(&new_calibrated, &cfg.registration, Some(pool_ref))
-                        .map_err(|e| format!("its star detection failed: {e}"))
+                // Perf tier 1 Task 9: the dry pass already detected this
+                // frame's stars moments ago, as a regular candidate, the
+                // SAME `cfg.detection`/`cfg.max_stars` a fresh
+                // `reference_stars` read below would use — reuse rather
+                // than pay for a second read+detect of the frame the pick
+                // just chose. Left in the cache rather than removed here:
+                // the persisting pass's own item for this frame (now the
+                // reference) never consults `RegisterItem.pre` at all
+                // (`identity_registration` takes no detections), so the
+                // entry just sits until `stage_register`'s final
+                // `rc.dry_pass_stars.clear()`.
+                let stars = match rc.dry_pass_stars.get(&new_frame_id) {
+                    Some(cached) => Ok(ReferenceStars::from(cached.as_ref())),
+                    None => {
+                        let pool_ref = &rc.ctx.image_pool;
+                        reference_stars(&new_calibrated, &cfg.registration, Some(pool_ref))
+                            .map_err(|e| format!("its star detection failed: {e}"))
+                    }
                 };
                 match stars {
                     Err(e) => Err(e),
@@ -4468,6 +4542,14 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
             stage: Stage::Register,
             duration_ms: stage_start.elapsed().as_millis() as u64,
         });
+        // Perf tier 1 Task 9, belt and braces: `register_group_pass`
+        // already drains its own dry-pass entries as the persisting pass
+        // consumes them (per group, since native mode runs its dry pass
+        // through the SAME function once per group), but a group that
+        // never reaches a persisting pass — cancelled mid-stage, or with
+        // fewer than 3 included frames after the dry pass excluded one —
+        // would otherwise leave its entries stranded until the run ends.
+        rc.dry_pass_stars.clear();
         return Ok(());
     }
 
@@ -4623,6 +4705,11 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         stage: Stage::Register,
         duration_ms: stage_start.elapsed().as_millis() as u64,
     });
+
+    // Perf tier 1 Task 9, belt and braces (see the native-mode return
+    // above for why this can't rely solely on the per-item drain in
+    // `register_group_pass`).
+    rc.dry_pass_stars.clear();
 
     Ok(())
 }
@@ -8106,6 +8193,7 @@ pub(crate) fn test_context(
         reference_height: 0,
         group_geometry: HashMap::new(),
         drizzle_attempted: 0,
+        dry_pass_stars: HashMap::new(),
         fail_after_stage: None,
     }
 }
@@ -9524,7 +9612,7 @@ mod tests {
     #[test]
     fn two_pass_moves_the_reference_off_a_deviating_top_weight_frame() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_ctx, fixture, light_ids, mut rc, _working, _output) =
+        let (_ctx, fixture, light_ids, mut rc, working, _output) =
             two_pass_context(&tmp, StackingConfig::default());
         assert!(rc.config.reference.two_pass, "the default must be on");
         assert_eq!(
@@ -9533,7 +9621,64 @@ mod tests {
             "fixture premise: stage 4 picks the deviating frame A on weight"
         );
 
+        // Perf tier 1 Task 9: pinned structurally rather than through a
+        // captured "frame stars detected"/"frame registered" log line —
+        // `fan_out`'s workers run on their own `std::thread::scope`
+        // threads, which start with no thread-local `tracing` dispatcher
+        // of their own, so a `set_default`-scoped capture layer (the
+        // pattern `sync::engine_tests`/`sharing::iroh::tests` use
+        // elsewhere in this crate) would silently observe nothing from
+        // inside a fan-out; only a `set_global_default` would reach it,
+        // and that can be installed at most once per test binary — not
+        // usable per-test.
+        //
+        // `DETECT_FRAME_STARS_LOG` logs every real call's path
+        // process-wide, so under `cargo test`'s default parallelism other
+        // `stacking::run`/`stacking::register` tests' own calls land in
+        // the same log while this one runs (confirmed empirically: a bare
+        // `AtomicUsize` delta read 7 instead of 6 under
+        // `--test-threads=8`, matching single-threaded exactly at 6) —
+        // filtering the new entries down to paths under THIS test's own
+        // `working` tempdir (every fixture writes its calibrated frames
+        // under its own unique dir) isolates the count correctly
+        // regardless of how many sibling tests are registering frames of
+        // their own at the same moment.
+        let detect_log_before = crate::stacking::register::frame::DETECT_FRAME_STARS_LOG
+            .lock()
+            .unwrap()
+            .len();
+
         stage_register(&mut rc).unwrap();
+
+        let detect_calls = {
+            let log = crate::stacking::register::frame::DETECT_FRAME_STARS_LOG
+                .lock()
+                .unwrap();
+            log[detect_log_before..]
+                .iter()
+                .filter(|p| p.starts_with(working.path()))
+                .count()
+        };
+        // The fixture's own two-pass switch (asserted below) means every
+        // one of the group's 6 included frames is detected EXACTLY once
+        // across the whole stage: the dry pass detects the 5 non-original-
+        // reference candidates (including the eventual `chosen` one, whose
+        // detections the persisting pass then reuses for the switched
+        // reference's own `ReferenceStars` — see `two_pass_refine`), and
+        // the persisting pass detects exactly the 1 remaining frame (the
+        // ORIGINAL reference, now a plain subject) that the dry pass never
+        // touched. Before this task, the persisting pass re-detected the
+        // whole group unconditionally, so this would have read 11.
+        assert_eq!(
+            detect_calls,
+            light_ids.len(),
+            "every included frame is read and detected exactly once across the two passes"
+        );
+        assert!(
+            rc.dry_pass_stars.is_empty(),
+            "the dry-pass cache must be drained/cleared by the end of the stage: {:?}",
+            rc.dry_pass_stars.keys().collect::<Vec<_>>()
+        );
 
         let chosen = rc.reference_frame_id.expect("a reference after stage 5");
         assert_ne!(chosen, light_ids[0], "the deviating frame must not stay");

@@ -24,6 +24,64 @@ pub struct ReferenceStars {
     pub height: usize,
 }
 
+impl From<&DetectedStars> for ReferenceStars {
+    fn from(d: &DetectedStars) -> Self {
+        ReferenceStars {
+            stars: d.stars.clone(),
+            width: d.width,
+            height: d.height,
+        }
+    }
+}
+
+/// One frame's star detections off its own pixels (perf tier 1 Task 9,
+/// `register_frame`'s split half). Detection depends only on the frame's
+/// own plane(s) and `cfg.registration` — never on a reference — so this
+/// value is reusable verbatim for as many registration attempts as a
+/// caller likes; [`crate::stacking::run`]'s two-pass dry pass caches one
+/// of these per frame instead of re-reading and re-detecting the same
+/// pixels for the persisting pass that follows it.
+///
+/// `read_ms`/`detect_ms` are the read+detect cost [`detect_frame_stars`]
+/// measured to PRODUCE this value — carried here (rather than threaded as
+/// extra parameters) so a caller holding an `Arc<DetectedStars>` from
+/// earlier can still recover them (`register_frame` uses them to keep
+/// `FrameRegistration::duration_ms` reporting the whole frame's cost).
+/// [`register_detected`] does not read them: see its own doc comment for
+/// why its own logged `read_ms`/`detect_ms` are unconditionally `0`.
+#[derive(Debug, Clone)]
+pub struct DetectedStars {
+    pub stars: Vec<Star>,
+    pub width: usize,
+    pub height: usize,
+    pub read_ms: u64,
+    pub detect_ms: u64,
+}
+
+/// Test-only call log (perf tier 1 Task 9): every real call to
+/// [`detect_frame_stars`] appends the path it was called with. A run-level
+/// test can snapshot its length before and after a pipeline stage and
+/// filter the new entries by path prefix (every test fixture writes its
+/// calibrated frames under its own unique `tempfile::TempDir`) to prove a
+/// frame's pixels are read and detected AT MOST ONCE across a run — a
+/// cache hit in [`crate::stacking::run`]'s two-pass dry-pass cache reuses a
+/// previously detected `Arc<DetectedStars>` and never reaches this
+/// function at all.
+///
+/// A plain `AtomicUsize` was tried first and rejected: `cargo test`'s
+/// default parallelism runs many OTHER `stacking::register`/`stacking::run`
+/// tests' own `detect_frame_stars` calls concurrently with any one test's
+/// measurement window, so a bare process-wide count is not that test's own
+/// count — confirmed empirically (a raw counter delta read 7 where a
+/// single-threaded run of the same test read 6, `--test-threads=8` over
+/// just `stacking::run::` reproduced it every time). Logging the PATH
+/// instead of just counting lets a test filter down to calls that are
+/// provably its own, immune to how many other tests happen to be
+/// registering frames at the same wall-clock moment.
+#[cfg(test)]
+pub(crate) static DETECT_FRAME_STARS_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 #[derive(Debug, Clone)]
 pub struct FrameRegistration {
     pub width: usize,
@@ -70,14 +128,133 @@ pub fn reference_stars(
     })
 }
 
-/// Register one subject onto the reference. I/O errors and cancellation
-/// are `Err`; an alignment failure is a successful measurement of a frame
-/// that cannot be registered (`outcome: Err(AlignError)`).
+/// Read one subject's plane(s) and detect its stars — the I/O+CPU half of
+/// [`register_frame`], split out (perf tier 1 Task 9) so a caller that
+/// already knows the frame will be registered more than once (the two-pass
+/// dry pass, then the persisting pass) can detect it exactly ONCE and reuse
+/// the result. Depends only on `path` and `cfg` — never on a reference —
+/// which is exactly what makes that reuse safe: the reference the caller
+/// eventually aligns against has no bearing on what stars this frame has.
+///
+/// Logs its own `"frame stars detected"` debug (path, detections, and the
+/// read/detect split) — the ONE place that timing is captured now, whether
+/// this is called directly by a caller wanting fresh detections, or once
+/// per frame from inside a caching pass. [`register_detected`]'s own log
+/// line no longer repeats it (see that function's doc comment).
+pub fn detect_frame_stars(
+    path: &Path,
+    cfg: &RegistrationConfig,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<DetectedStars, IntegrationError> {
+    #[cfg(test)]
+    DETECT_FRAME_STARS_LOG
+        .lock()
+        .unwrap()
+        .push(path.to_path_buf());
+    let t = Instant::now();
+    let (lum, width, height) = read_luminance(path)?;
+    let read_ms = t.elapsed().as_millis() as u64;
+    let t = Instant::now();
+    let stars = detect_stars(&lum, width, height, &cfg.detection, cfg.max_stars, pool);
+    let detect_ms = t.elapsed().as_millis() as u64;
+    debug!(
+        path = %path.display(),
+        detections = stars.len(),
+        read_ms,
+        detect_ms,
+        "frame stars detected"
+    );
+    Ok(DetectedStars {
+        stars,
+        width,
+        height,
+        read_ms,
+        detect_ms,
+    })
+}
+
+/// Align one frame's already-detected stars onto the reference — the
+/// pixel-CPU half of [`register_frame`] (perf tier 1 Task 9): no I/O, no
+/// star detection, just [`align`]. `read_ms`/`detect_ms` on its own
+/// `"frame registered"`/`"frame registration failed"` event are therefore
+/// UNCONDITIONALLY `0` — this function never reads or detects, whether
+/// `detected` was produced moments ago (a fresh [`register_frame`] call)
+/// or reused from an earlier detection (a cache hit in
+/// [`crate::stacking::run`]'s two-pass dry pass); that cost is captured
+/// once, on [`detect_frame_stars`]'s own `"frame stars detected"` event,
+/// wherever it was actually paid. `FrameRegistration::duration_ms` here is
+/// align time only — [`register_frame`] adds the detect+read time back on
+/// top of it so a caller reading `duration_ms` alone still sees the whole
+/// frame's cost.
 ///
 /// `hint`, `policy` and `scale_gate` are M4b's three per-frame inputs,
 /// passed straight through to [`align`]: an optional plate-solve seed,
 /// which seed leads (ruling R-T6-9), and the scale window this particular
 /// frame is judged against.
+pub fn register_detected(
+    reference: &ReferenceStars,
+    detected: &DetectedStars,
+    cfg: &RegistrationConfig,
+    hint: Option<&Linear>,
+    policy: SeedPolicy,
+    scale_gate: (f64, f64),
+) -> FrameRegistration {
+    let start = Instant::now();
+    let outcome = align(
+        &detected.stars,
+        &reference.stars,
+        (reference.width, reference.height),
+        (detected.width, detected.height),
+        cfg,
+        hint,
+        policy,
+        scale_gate,
+    );
+    let align_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = align_ms;
+    match &outcome {
+        Ok(a) => {
+            debug!(
+                detections = detected.stars.len(),
+                inliers = a.inliers,
+                rms_px = a.rms_px,
+                model = %model_name(a.model, a.distortion, a.seed),
+                flipped = a.flipped,
+                read_ms = 0,
+                detect_ms = 0,
+                align_ms,
+                duration_ms,
+                "frame registered"
+            );
+            for note in &a.warnings {
+                warn!(note = %note, "registration warning");
+            }
+        }
+        Err(e) => {
+            warn!(
+                detections = detected.stars.len(),
+                error = %e,
+                read_ms = 0,
+                detect_ms = 0,
+                align_ms,
+                duration_ms,
+                "frame registration failed"
+            )
+        }
+    }
+    FrameRegistration {
+        width: detected.width,
+        height: detected.height,
+        detections: detected.stars.len(),
+        outcome,
+        duration_ms,
+    }
+}
+
+/// Register one subject onto the reference: [`detect_frame_stars`] then
+/// [`register_detected`]. I/O errors and cancellation are `Err`; an
+/// alignment failure is a successful measurement of a frame that cannot be
+/// registered (`outcome: Err(AlignError)`).
 #[allow(clippy::too_many_arguments)]
 pub fn register_frame(
     reference: &ReferenceStars,
@@ -89,63 +266,21 @@ pub fn register_frame(
     policy: SeedPolicy,
     scale_gate: (f64, f64),
 ) -> Result<FrameRegistration, IntegrationError> {
-    let start = Instant::now();
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled);
     }
-    let t = Instant::now();
-    let (lum, width, height) = read_luminance(subject)?;
-    let read_ms = t.elapsed().as_millis() as u64;
-    let t = Instant::now();
-    let stars = detect_stars(&lum, width, height, &cfg.detection, cfg.max_stars, pool);
-    let detect_ms = t.elapsed().as_millis() as u64;
-    drop(lum);
+    let detected = detect_frame_stars(subject, cfg, pool)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled);
     }
-    let t = Instant::now();
-    let outcome = align(
-        &stars,
-        &reference.stars,
-        (reference.width, reference.height),
-        (width, height),
-        cfg,
-        hint,
-        policy,
-        scale_gate,
-    );
-    let align_ms = t.elapsed().as_millis() as u64;
-    let duration_ms = start.elapsed().as_millis() as u64;
-    match &outcome {
-        Ok(a) => {
-            debug!(
-                path = %subject.display(),
-                detections = stars.len(),
-                inliers = a.inliers,
-                rms_px = a.rms_px,
-                model = %model_name(a.model, a.distortion, a.seed),
-                flipped = a.flipped,
-                read_ms,
-                detect_ms,
-                align_ms,
-                duration_ms,
-                "frame registered"
-            );
-            for note in &a.warnings {
-                warn!(path = %subject.display(), note = %note, "registration warning");
-            }
-        }
-        Err(e) => {
-            warn!(path = %subject.display(), detections = stars.len(), error = %e, read_ms, detect_ms, align_ms, duration_ms, "frame registration failed")
-        }
-    }
-    Ok(FrameRegistration {
-        width,
-        height,
-        detections: stars.len(),
-        outcome,
-        duration_ms,
-    })
+    let mut reg = register_detected(reference, &detected, cfg, hint, policy, scale_gate);
+    // `register_detected`'s own `duration_ms` is align-only; add back the
+    // detect+read time `detect_frame_stars` already spent (and already
+    // logged on its own "frame stars detected" event) so this function's
+    // `FrameRegistration.duration_ms` still reports the whole frame's
+    // cost, exactly as before this split.
+    reg.duration_ms += detected.read_ms + detected.detect_ms;
+    Ok(reg)
 }
 
 /// The reference frame's own row: an identity map over its stars.
@@ -367,6 +502,46 @@ mod tests {
         let (bx, by) = back.forward(sx, sy);
         assert!((bx - fx).abs() < 1e-9 && (by - fy).abs() < 1e-9);
         assert!(rec.crpix1.is_none() && rec.error.is_none());
+    }
+
+    /// Perf tier 1 Task 9: `register_frame` = `detect_frame_stars` +
+    /// `register_detected`, byte-for-byte — the split must not change what
+    /// gets detected or how it aligns, only how many times a caller who
+    /// already has the detections can skip redoing them.
+    #[test]
+    fn register_detected_equals_register_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, s, _) = pair(dir.path(), 25, 5.0, -3.0, 1.0, 1);
+        let cfg = RegistrationConfig::default();
+        let reference = reference_stars(&r, &cfg, None).unwrap();
+        let cancel = AtomicBool::new(false);
+        let direct = register_frame(
+            &reference,
+            &s,
+            &cfg,
+            None,
+            &cancel,
+            None,
+            SeedPolicy::QuadFirst,
+            SCALE_RANGE,
+        )
+        .unwrap();
+        let detected = detect_frame_stars(&s, &cfg, None).unwrap();
+        let split = register_detected(
+            &reference,
+            &detected,
+            &cfg,
+            None,
+            SeedPolicy::QuadFirst,
+            SCALE_RANGE,
+        );
+        let (a, b) = (direct.outcome.unwrap(), split.outcome.unwrap());
+        assert_eq!(a.map.to_json(), b.map.to_json());
+        assert_eq!(a.inliers, b.inliers);
+        assert_eq!(a.rms_px, b.rms_px);
+        assert_eq!(direct.detections, split.detections);
+        assert_eq!(direct.width, split.width);
+        assert_eq!(direct.height, split.height);
     }
 
     #[test]
