@@ -198,6 +198,18 @@ fn median_abs(values: &[f32]) -> f64 {
 }
 
 fn main() {
+    // Perf tier A Task 12: the same RUST_LOG-gated subscriber pattern the
+    // other probes carry (`measure_probe`/`register_probe`/
+    // `integrate_probe`) — off by default so a plain run's JSON stays
+    // unmixed on stdout, installed only when RUST_LOG is actually set,
+    // writing to stderr.
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let args = parse_args();
 
     // `Database::new` creates a fresh (empty, schema-initialised) catalog
@@ -468,10 +480,23 @@ registration row for each — run stacking through Register first); found {}",
         scale: args.scale,
         ..DEFAULT_PARAMS
     };
+    // Perf tier A Task 12: pass the probe's own pool through so the probe
+    // exercises the SAME parallel path production (`stacking::run`) does —
+    // with `pool = None` throughout, this probe would only ever measure
+    // the allocation-reduction half of the task, understating the real
+    // improvement.
     let ref_backgrounds: Vec<_> = reference
         .planes
         .iter()
-        .map(|p| background_grid(p, reference.width, reference.height, &ref_params))
+        .map(|p| {
+            background_grid(
+                p,
+                reference.width,
+                reference.height,
+                &ref_params,
+                Some(&pool),
+            )
+        })
         .collect();
 
     // The target frame: the named stem, or the first candidate (index 0 of
@@ -516,7 +541,9 @@ registration row for each — run stacking through Register first); found {}",
         interpolation,
         clamping,
         &sidecar_path,
-        None,
+        // Perf tier A Task 12: the probe's own pool, not `None` — see the
+        // `ref_backgrounds` comment above for why.
+        Some(&pool),
         &cancel,
     )
     .unwrap_or_else(|e| {
@@ -570,6 +597,7 @@ registration row for each — run stacking through Register first); found {}",
             reference.width,
             reference.height,
             &target_params,
+            Some(&pool),
         );
         let ref_bg = &ref_backgrounds[p];
 
@@ -644,6 +672,21 @@ registration row for each — run stacking through Register first); found {}",
             "matches": outcome.matches,
             "cellsRejected": outcome.cells_rejected,
             "path": outcome.sidecar.display().to_string(),
+        },
+        // Perf tier A Task 12: `normalize_frame`'s own per-phase timing —
+        // `run.rs` logs these via `tracing::debug!` on every real run, but
+        // this probe calls `normalize_frame` directly and prints its own
+        // JSON, so they need to be surfaced here too for the task's own
+        // before/after measurement (`background_ms` is the target of this
+        // task; the rest ride along for context).
+        "timingMs": {
+            "warp": outcome.warp_ms,
+            "background": outcome.background_ms,
+            "scale": outcome.scale_ms,
+            "detect": outcome.detect_ms,
+            "fit": outcome.fit_ms,
+            "match": outcome.match_ms,
+            "write": outcome.write_ms,
         },
         "perChannel": per_channel,
     });

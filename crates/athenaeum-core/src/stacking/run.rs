@@ -7980,10 +7980,24 @@ fn run_group_normalization(
         scale: ln_cfg.scale,
         ..DEFAULT_PARAMS
     };
+    // Perf tier A Task 12: the group's own pool, so `background_grid`'s
+    // per-cell loop (and `clean_plane`'s two passes) fan out across
+    // workers instead of running one cell at a time on this thread — this
+    // reference-background computation happens once per group (a handful
+    // of channels), not once per frame.
+    let bg_pool = Some(&rc.ctx.image_pool);
     let ref_backgrounds: Vec<BackgroundGrid> = ln_reference
         .planes
         .iter()
-        .map(|plane| background_grid(plane, ln_reference.width, ln_reference.height, &ref_params))
+        .map(|plane| {
+            background_grid(
+                plane,
+                ln_reference.width,
+                ln_reference.height,
+                &ref_params,
+                bg_pool,
+            )
+        })
         .collect();
 
     // Fix round 1, item 3: `BackgroundGrid`'s own documented contract — a

@@ -29,8 +29,12 @@
 //! `invalid_cells` is a per-frame count for the caller (Task 5) to log as
 //! `ln_cells_rejected` — this module does not log it itself.
 
+use std::sync::Arc;
+
+use rayon::prelude::*;
+
 use super::grid::LnGrid;
-use crate::integration::stats::{mad_about, median_in_place, median_of, MAD_TO_SIGMA};
+use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
 
 /// Deviation multiple (in MAD-sigma) a pixel must exceed its local window
 /// median by before the hot-pixel pass replaces it.
@@ -91,16 +95,53 @@ pub struct BackgroundGrid {
     pub invalid_cells: usize,
 }
 
+/// Per-worker scratch [`background_grid`]'s cell loop hands to
+/// [`gather_cell`]/[`robust_cell_level`] via `rayon`'s `map_init` — one
+/// instance per worker thread for the WHOLE plane, reused cell to cell
+/// instead of each cell allocating its own `Vec`s (perf tier A Task 12,
+/// audit's own accounting: ≈ 1,700 cells per plane, `gather_cell` growing a
+/// `Vec` from empty for every one of them, up to [`MAX_SIGMA_CLIP_ROUNDS`]
+/// rounds each allocating more). `samples` is the cell's working set —
+/// filled by `gather_cell` (cleared first), filtered in place by
+/// `robust_cell_level`'s `retain`; `dev` is `robust_cell_level`'s own
+/// `|x - med|` scratch for the MAD computation, likewise cleared and
+/// refilled every round rather than allocated. Neither ever leaks between
+/// cells: `gather_cell` always clears `samples` before filling it, so a
+/// cell never sees a previous cell's leftover data, and `map_init` hands
+/// each rayon worker its own instance — no two cells running concurrently
+/// ever share one.
+#[derive(Default)]
+struct CellScratch {
+    samples: Vec<f32>,
+    dev: Vec<f32>,
+}
+
 /// One plane → its large-scale background on the stride grid (node `(i,
 /// j)` = the robust level of the stride×stride cell centred on `(i·stride,
 /// j·stride)`, clipped to the plane — the trailing node on either axis is
 /// clamped to the plane's last pixel first, see the module doc). See the
 /// module doc for the clipping thresholds' meaning and algorithm steps.
+///
+/// `pool` (perf tier A Task 12) runs `clean_plane`'s two passes and this
+/// function's own per-cell loop on the caller's pool when given one — see
+/// each site's own doc for why every one of those loops is exact under
+/// parallel order: `clean_plane`'s two passes are elementwise (each pixel's
+/// output depends only on the read-only input plane and constants, never on
+/// another pixel's output), and a cell's statistics are a pure function of
+/// that cell's own gathered samples, read by no other cell. `None` does NOT
+/// mean serial: a rayon parallel iterator called outside an explicit
+/// `ThreadPool::install` still runs on rayon's own lazily-initialized
+/// GLOBAL pool (sized by `available_parallelism`, invisible to the
+/// caller's `image_pool`/admission budget) — the same convention
+/// `psf_signal::fit_all`'s own doc states. Either way the RESULT is
+/// bit-identical (the module's own pin proves it) — `pool` only changes
+/// whose workers do the work, never what they compute.
 pub fn background_grid(
     plane: &[f32],
     width: usize,
     height: usize,
     p: &BackgroundParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> BackgroundGrid {
     let stride = (p.scale / 8).max(2) as usize;
     let (gw, gh) = LnGrid::grid_dims(width, height, stride);
@@ -118,35 +159,64 @@ pub fn background_grid(
     // Every pass below reads only `plane[..width * height]` — a longer
     // input's tail is ignored everywhere, not just here.
     let plane = &plane[..width * height];
-    let cleaned = clean_plane(plane, width, height, p);
+    let cleaned = clean_plane(plane, width, height, p, pool);
 
-    let mut cells = vec![0f32; cell_count];
-    let mut invalid = vec![false; cell_count];
     let half = stride / 2;
     let half_hi = stride - half; // symmetric for even stride; keeps total width == stride for odd stride too
-    for j in 0..gh {
-        // The trailing node overshoots the plane by design (`node_count`
-        // guarantees the mesh reaches the last pixel for the spline) —
-        // clamp it into the plane before windowing, so its cell is the
-        // last stride×stride (clipped) region rather than landing at or
-        // past `height`/`width` and gathering nothing.
-        let node_y = (j * stride).min(height - 1);
-        let y0 = node_y.saturating_sub(half);
-        let y1 = (node_y + half_hi).min(height);
-        for i in 0..gw {
-            let node_x = (i * stride).min(width - 1);
-            let x0 = node_x.saturating_sub(half);
-            let x1 = (node_x + half_hi).min(width);
 
-            let samples = gather_cell(&cleaned, width, x0, x1, y0, y1);
-            let (level, ok) = robust_cell_level(samples, p);
-            let idx = j * gw + i;
-            cells[idx] = level;
-            invalid[idx] = !ok;
+    // The cell loop, flattened to `0..cell_count` (row-major, `idx = j*gw +
+    // i` — the same layout the nested `for j { for i { ... } }` loop it
+    // replaces used) so it can run as one indexed parallel iterator: each
+    // cell's window bounds (`node_x`/`node_y`/`x0`/`x1`/`y0`/`y1`) are pure
+    // functions of `idx`/the constants above, and `gather_cell` +
+    // `robust_cell_level` read only `cleaned` (read-only, shared) and the
+    // cell's own `CellScratch` (never another cell's) — no cell's
+    // computation can observe another's result, so the order they run in
+    // cannot change any cell's `(level, ok)`. `collect()` on an
+    // `IndexedParallelIterator` preserves index order regardless of which
+    // worker finished which cell first, so `results[idx]` is cell `idx`'s
+    // own outcome exactly as the serial loop would have produced.
+    let body = || {
+        (0..cell_count)
+            .into_par_iter()
+            .map_init(CellScratch::default, |scratch, idx| {
+                let j = idx / gw;
+                let i = idx % gw;
+                // The trailing node overshoots the plane by design
+                // (`node_count` guarantees the mesh reaches the last pixel
+                // for the spline) — clamp it into the plane before
+                // windowing, so its cell is the last stride×stride
+                // (clipped) region rather than landing at or past
+                // `height`/`width` and gathering nothing.
+                let node_y = (j * stride).min(height - 1);
+                let y0 = node_y.saturating_sub(half);
+                let y1 = (node_y + half_hi).min(height);
+                let node_x = (i * stride).min(width - 1);
+                let x0 = node_x.saturating_sub(half);
+                let x1 = (node_x + half_hi).min(width);
+
+                gather_cell(&cleaned, width, x0, x1, y0, y1, &mut scratch.samples);
+                robust_cell_level(&mut scratch.samples, &mut scratch.dev, p)
+            })
+            .collect::<Vec<(f32, bool)>>()
+    };
+    let results: Vec<(f32, bool)> = match pool {
+        Some(pl) => pl.install(body),
+        None => body(),
+    };
+
+    let mut cells = Vec::with_capacity(cell_count);
+    let mut invalid = Vec::with_capacity(cell_count);
+    let mut invalid_cells = 0usize;
+    for (level, ok) in results {
+        cells.push(level);
+        let inv = !ok;
+        if inv {
+            invalid_cells += 1;
         }
+        invalid.push(inv);
     }
 
-    let invalid_cells = invalid.iter().filter(|&&v| v).count();
     fill_invalid_cells(&mut cells, &invalid, gw, gh);
 
     BackgroundGrid {
@@ -174,46 +244,76 @@ fn high_clip_threshold(p: &BackgroundParams) -> f32 {
 /// replacement. The only transient full-plane allocation beyond the
 /// returned copy is the small per-candidate hot-pixel window (at most
 /// `(2·hot_radius+1)²` samples), built only for pixels past the high clip.
-fn clean_plane(plane: &[f32], width: usize, height: usize, p: &BackgroundParams) -> Vec<f32> {
+///
+/// Both passes run on `pool` (perf tier A Task 12) when given one, in ONE
+/// `install` call. Pass 1 (hot-pixel correction) is exact under any row
+/// split: pixel `(x, y)`'s candidacy test and its replacement window both
+/// read ONLY `plane` (read-only, shared, never mutated by this function)
+/// and constants (`p`, `high_thresh`) — never `cleaned`'s own OUTPUT at any
+/// other position — and write only `cleaned[y*width + x]`, so no row's
+/// computation can observe or be observed by another row's write; splitting
+/// `cleaned` into per-row chunks (`par_chunks_mut(width)`) therefore
+/// produces the identical `cleaned` a serial row-by-row pass would, for any
+/// row order. Pass 2 (the low/high clip) is a pure elementwise threshold
+/// against the two constants `p.low_clip`/`high_thresh` — again no pixel
+/// reads another's value — so parallelizing it (`par_iter_mut`) is exact
+/// for the same reason.
+fn clean_plane(
+    plane: &[f32],
+    width: usize,
+    height: usize,
+    p: &BackgroundParams,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<f32> {
     let high_thresh = high_clip_threshold(p);
 
     let mut cleaned = plane.to_vec();
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let v = plane[idx];
-            if !(v.is_finite() && v > high_thresh) {
-                continue;
-            }
-            let x0 = x.saturating_sub(p.hot_radius);
-            let x1 = (x + p.hot_radius).min(width - 1);
-            let y0 = y.saturating_sub(p.hot_radius);
-            let y1 = (y + p.hot_radius).min(height - 1);
-            let mut window: Vec<f32> = Vec::with_capacity((x1 - x0 + 1) * (y1 - y0 + 1));
-            for wy in y0..=y1 {
-                for wx in x0..=x1 {
-                    let wv = plane[wy * width + wx];
-                    if wv.is_finite() {
-                        window.push(wv);
+
+    let mut body = || {
+        cleaned
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let base = y * width;
+                for (x, o) in row.iter_mut().enumerate() {
+                    let v = plane[base + x];
+                    if !(v.is_finite() && v > high_thresh) {
+                        continue;
+                    }
+                    let x0 = x.saturating_sub(p.hot_radius);
+                    let x1 = (x + p.hot_radius).min(width - 1);
+                    let y0 = y.saturating_sub(p.hot_radius);
+                    let y1 = (y + p.hot_radius).min(height - 1);
+                    let mut window: Vec<f32> = Vec::with_capacity((x1 - x0 + 1) * (y1 - y0 + 1));
+                    for wy in y0..=y1 {
+                        for wx in x0..=x1 {
+                            let wv = plane[wy * width + wx];
+                            if wv.is_finite() {
+                                window.push(wv);
+                            }
+                        }
+                    }
+                    if window.is_empty() {
+                        continue;
+                    }
+                    let med = median_in_place(&mut window);
+                    let mad = mad_about(&window, med);
+                    let thresh = med + HOT_PIXEL_SIGMA * MAD_TO_SIGMA * mad;
+                    if v > thresh {
+                        *o = med;
                     }
                 }
-            }
-            if window.is_empty() {
-                continue;
-            }
-            let med = median_in_place(&mut window);
-            let mad = mad_about(&window, med);
-            let thresh = med + HOT_PIXEL_SIGMA * MAD_TO_SIGMA * mad;
-            if v > thresh {
-                cleaned[idx] = med;
-            }
-        }
-    }
+            });
 
-    for v in cleaned.iter_mut() {
-        if !v.is_finite() || *v < p.low_clip || *v > high_thresh {
-            *v = f32::NAN;
-        }
+        cleaned.par_iter_mut().for_each(|v| {
+            if !v.is_finite() || *v < p.low_clip || *v > high_thresh {
+                *v = f32::NAN;
+            }
+        });
+    };
+    match pool {
+        Some(pl) => pl.install(body),
+        None => body(),
     }
 
     cleaned
@@ -221,7 +321,13 @@ fn clean_plane(plane: &[f32], width: usize, height: usize, p: &BackgroundParams)
 
 /// The window's finite pixels, stride-2 subsampled (both axes) when the
 /// window itself (before filtering to finite) holds more than
-/// [`CELL_SUBSAMPLE_THRESHOLD`] pixels.
+/// [`CELL_SUBSAMPLE_THRESHOLD`] pixels — written into `out` (perf tier A
+/// Task 12: cleared, then filled, in place) instead of returning a fresh
+/// `Vec`. `out` is the caller's per-cell [`CellScratch::samples`] — the
+/// push sequence (same row-major stride-stepped order as before) is
+/// unchanged, so `out`'s content after this call is byte-identical to what
+/// the old `Vec::new()` + push return used to hold, not merely
+/// value-equal.
 fn gather_cell(
     cleaned: &[f32],
     width: usize,
@@ -229,7 +335,9 @@ fn gather_cell(
     x1: usize,
     y0: usize,
     y1: usize,
-) -> Vec<f32> {
+    out: &mut Vec<f32>,
+) {
+    out.clear();
     let total = x1.saturating_sub(x0) * y1.saturating_sub(y0);
     let step = if total > CELL_SUBSAMPLE_THRESHOLD {
         2
@@ -237,40 +345,69 @@ fn gather_cell(
         1
     };
 
-    let mut samples = Vec::new();
     let mut y = y0;
     while y < y1 {
         let mut x = x0;
         while x < x1 {
             let v = cleaned[y * width + x];
             if v.is_finite() {
-                samples.push(v);
+                out.push(v);
             }
             x += step;
         }
         y += step;
     }
-    samples
 }
 
 /// Algorithm step 3: iterative median±`deviation_sigma`·MAD clipping over
-/// a cell's already-clipped finite samples. Returns `(level, true)` when
-/// the kept set holds after clipping stabilizes (or hits the round cap)
-/// with no more than `rejection_limit` of the finite samples thrown out;
-/// `(0.0, false)` — invalid — when there is nothing finite to start from,
-/// or the iterative clip rejects too much of what there was.
-fn robust_cell_level(samples: Vec<f32>, p: &BackgroundParams) -> (f32, bool) {
-    if samples.is_empty() {
+/// a cell's already-clipped finite samples, in place on the caller's
+/// per-worker scratch (perf tier A Task 12) instead of `median_of`/
+/// `mad_about`'s own fresh-`Vec` calls and a `filter().collect()` per
+/// round. `kept` arrives already filled by [`gather_cell`] — this function
+/// only ever shrinks it (`retain`) or reorders it (`median_in_place`'s own
+/// partial sort), never grows it, and the caller's NEXT cell starts from a
+/// fresh `gather_cell` fill (which clears it first), so no cell can
+/// observe a previous cell's leftover data. `dev` is scratch for the MAD
+/// step's `|x - med|` values, cleared and rebuilt every round.
+///
+/// Exactness: `median_in_place`/[`mad_about`] compute a SELECTION (the
+/// k-th order statistic of a multiset) — deterministic for a given
+/// multiset regardless of the array's arrangement when the call is made,
+/// because `select_nth_unstable_by` always partitions to place the correct
+/// order-statistic VALUE at the pivot position, whatever permutation it
+/// starts from. `median_in_place(kept)` therefore returns exactly what
+/// `median_of(&kept)` used to (same multiset, same value) while also
+/// reordering `kept` in place — harmless, since every later read of `kept`
+/// (the `dev` fill, the `retain` predicate, the final `median_in_place`)
+/// only cares about VALUES, never position. `dev`'s own median is the same
+/// argument one level down: `dev.extend(kept.iter().map(|&x| (x -
+/// med).abs()))` builds the identical multiset `mad_about(&kept, med)`
+/// would have (same `kept` contents, same `med`), just in whatever order
+/// `kept` happens to be in at that moment — irrelevant to the median it
+/// computes. `retain` vs the old `filter().collect()`: both keep exactly
+/// the elements passing the same predicate and drop the rest — `retain`
+/// preserves the relative order of survivors (a stable filter), which
+/// `filter().collect()` also did, so the two are the same permutation of
+/// the same surviving multiset, not just the same set.
+///
+/// Returns `(level, true)` when the kept set holds after clipping
+/// stabilizes (or hits the round cap) with no more than `rejection_limit`
+/// of the finite samples thrown out; `(0.0, false)` — invalid — when there
+/// is nothing finite to start from, or the iterative clip rejects too much
+/// of what there was.
+fn robust_cell_level(kept: &mut Vec<f32>, dev: &mut Vec<f32>, p: &BackgroundParams) -> (f32, bool) {
+    if kept.is_empty() {
         return (0.0, false);
     }
-    let total = samples.len();
-    let mut kept = samples;
+    let total = kept.len();
     for _ in 0..MAX_SIGMA_CLIP_ROUNDS {
         if kept.is_empty() {
             break;
         }
-        let med = median_of(&kept);
-        let mad = mad_about(&kept, med);
+        let med = median_in_place(kept);
+        dev.clear();
+        dev.extend(kept.iter().map(|&x| (x - med).abs()));
+        let mad = median_in_place(dev);
         if mad <= 0.0 {
             // Every kept sample already agrees with the median at MAD's
             // resolution — a zero deviation bound would otherwise reject
@@ -279,16 +416,11 @@ fn robust_cell_level(samples: Vec<f32>, p: &BackgroundParams) -> (f32, bool) {
             break;
         }
         let bound = p.deviation_sigma * MAD_TO_SIGMA * mad;
-        let next: Vec<f32> = kept
-            .iter()
-            .copied()
-            .filter(|&v| (v - med).abs() <= bound)
-            .collect();
-        if next.len() == kept.len() {
-            kept = next;
+        let before = kept.len();
+        kept.retain(|&v| (v - med).abs() <= bound);
+        if kept.len() == before {
             break;
         }
-        kept = next;
     }
 
     let rejected = total.saturating_sub(kept.len());
@@ -296,7 +428,7 @@ fn robust_cell_level(samples: Vec<f32>, p: &BackgroundParams) -> (f32, bool) {
     if kept.is_empty() || fraction > p.rejection_limit {
         return (0.0, false);
     }
-    (median_of(&kept), true)
+    (median_in_place(kept), true)
 }
 
 /// Algorithm step 4: repeatedly fill invalid cells from the mean of their
@@ -382,6 +514,7 @@ mod tests {
                 deviation_sigma: 3.0,
                 rejection_limit: 0.3,
             },
+            None,
         );
         assert_eq!((g.gw, g.gh), (17, 13)); // stride 32
         assert!(
@@ -405,6 +538,7 @@ mod tests {
                 scale: 256,
                 ..DEFAULT_PARAMS
             },
+            None,
         );
         let top = g.cells[0];
         let bottom = g.cells[(g.gh - 1) * g.gw];
@@ -431,6 +565,7 @@ mod tests {
                 scale: 256,
                 ..DEFAULT_PARAMS
             },
+            None,
         );
         assert_eq!(g.invalid_cells, 1);
         assert!((g.cells[0] - 0.10).abs() < 1e-3);
@@ -464,6 +599,7 @@ mod tests {
                 scale: 256,
                 ..DEFAULT_PARAMS
             },
+            None,
         );
         assert_eq!(g.invalid_cells, 0, "cells: {:?}", g.cells);
         assert!(g.cells.iter().all(|c| (c - 0.10).abs() < 1e-4));
@@ -480,12 +616,90 @@ mod tests {
     fn robust_cell_level_over_rejected_by_the_iterative_clip_is_invalid() {
         let mut samples = vec![0.098f32, 0.099, 0.100, 0.101, 0.102, 0.103];
         samples.extend([0.50f32; 4]);
-        let (level, ok) = robust_cell_level(samples, &DEFAULT_PARAMS);
+        let mut dev = Vec::new();
+        let (level, ok) = robust_cell_level(&mut samples, &mut dev, &DEFAULT_PARAMS);
         assert!(
             !ok,
             "40% of the cell is a systematic outlier block, above the 30% \
              rejection limit: must be flagged invalid, got level {level}"
         );
+    }
+
+    /// Perf tier A Task 12 pin: `robust_cell_level` on caller-owned scratch
+    /// (perf tier A) must return the identical `(level, ok)` a fresh `Vec`
+    /// per round used to — the exactness argument is that `median_in_place`/
+    /// `mad_about` are order-independent SELECTIONS over the same multiset
+    /// (see the function's own doc), so reusing/reordering the scratch
+    /// buffers changes nothing. A clean 20-sample set with one dominant
+    /// outlier cluster exercises more than one clip round (unlike the
+    /// over-rejected test above, which stabilizes/fails on round 1).
+    #[test]
+    fn robust_cell_level_on_scratch_matches_a_fresh_allocation_every_round() {
+        let base: Vec<f32> = vec![
+            0.200, 0.201, 0.199, 0.202, 0.198, 0.2005, 0.1995, 0.2015, 0.1985, 0.2, 0.2001, 0.1999,
+            0.2008, 0.1992, 0.2003, 0.1997, 0.2006, 0.1994, 0.2002, 0.1998,
+        ];
+        // A reference computed with a brand-new `Vec` per call (the
+        // pre-Task-12 shape), reimplemented locally so this pin does not
+        // depend on the very code path it is checking.
+        fn reference_robust_cell_level(samples: &[f32], p: &BackgroundParams) -> (f32, bool) {
+            if samples.is_empty() {
+                return (0.0, false);
+            }
+            let total = samples.len();
+            let mut kept = samples.to_vec();
+            for _ in 0..MAX_SIGMA_CLIP_ROUNDS {
+                if kept.is_empty() {
+                    break;
+                }
+                let m = crate::integration::stats::median_of(&kept);
+                let mad = mad_about(&kept, m);
+                if mad <= 0.0 {
+                    break;
+                }
+                let bound = p.deviation_sigma * MAD_TO_SIGMA * mad;
+                let next: Vec<f32> = kept
+                    .iter()
+                    .copied()
+                    .filter(|&v| (v - m).abs() <= bound)
+                    .collect();
+                if next.len() == kept.len() {
+                    kept = next;
+                    break;
+                }
+                kept = next;
+            }
+            let rejected = total.saturating_sub(kept.len());
+            let fraction = rejected as f32 / total as f32;
+            if kept.is_empty() || fraction > p.rejection_limit {
+                return (0.0, false);
+            }
+            (crate::integration::stats::median_of(&kept), true)
+        }
+
+        for outliers in [0usize, 1, 3, 7] {
+            let mut samples = base.clone();
+            samples.extend(std::iter::repeat(0.9f32).take(outliers));
+            let expected = reference_robust_cell_level(&samples, &DEFAULT_PARAMS);
+
+            let mut scratch = samples.clone();
+            let mut dev = Vec::new();
+            let got = robust_cell_level(&mut scratch, &mut dev, &DEFAULT_PARAMS);
+
+            assert_eq!(
+                got.1, expected.1,
+                "outliers={outliers}: validity flag diverged"
+            );
+            if expected.1 {
+                assert_eq!(
+                    got.0.to_bits(),
+                    expected.0.to_bits(),
+                    "outliers={outliers}: level diverged ({} vs {})",
+                    got.0,
+                    expected.0
+                );
+            }
+        }
     }
 
     /// M8 (final fix wave): `fill_invalid_cells`'s terminal branch — "no cell
@@ -507,8 +721,68 @@ mod tests {
                 scale: 256,
                 ..DEFAULT_PARAMS
             },
+            None,
         );
         assert_eq!(g.invalid_cells, g.gw * g.gh, "{:?}", g.cells);
         assert!(g.cells.iter().all(|&v| v == 0.0), "{:?}", g.cells);
+    }
+
+    fn pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Perf tier A Task 12's primary pin: `background_grid` on the shared
+    /// `pool` (`clean_plane`'s two passes AND the cell loop now run in
+    /// parallel) returns bit-identical `cells`/`invalid_cells` to the
+    /// serial (`pool = None`) path — the module's own doc argues why: both
+    /// of `clean_plane`'s passes are elementwise (no pixel reads another's
+    /// OUTPUT), and a cell's `(level, ok)` is a pure function of that
+    /// cell's own gathered samples, read by no other cell — so no cell's
+    /// result can depend on which worker computed it or in what order. A
+    /// star field (some pixels blown past the high clip, to exercise the
+    /// hot-pixel pass) plus a NaN and an Inf pixel (exercising the low/high
+    /// clip and `gather_cell`'s finite filter) over a plane large enough
+    /// (25×19 cells at stride 32) that the parallel path actually spans
+    /// several workers.
+    #[test]
+    fn background_grid_is_bit_identical_with_and_without_a_pool() {
+        let (w, h) = (800usize, 600usize);
+        let mut plane: Vec<f32> = (0..w * h)
+            .map(|idx| {
+                let x = idx % w;
+                let y = idx / w;
+                0.08 + 0.00002 * (x as f32) + 0.00001 * (y as f32)
+            })
+            .collect();
+        for k in 0..400 {
+            let (x, y) = ((k * 53) % w, (k * 97) % h);
+            plane[y * w + x] = 0.92; // past the 0.85 high clip: hot-pixel candidates
+        }
+        plane[5 * w + 5] = f32::NAN;
+        plane[9 * w + 9] = f32::INFINITY;
+
+        let p = BackgroundParams {
+            scale: 256,
+            ..DEFAULT_PARAMS
+        };
+        let serial = background_grid(&plane, w, h, &p, None);
+        let parallel = background_grid(&plane, w, h, &p, Some(&pool()));
+
+        assert_eq!(serial.gw, parallel.gw);
+        assert_eq!(serial.gh, parallel.gh);
+        assert_eq!(serial.invalid_cells, parallel.invalid_cells);
+        assert_eq!(serial.cells.len(), parallel.cells.len());
+        for (idx, (&s, &pa)) in serial.cells.iter().zip(parallel.cells.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                pa.to_bits(),
+                "cell {idx}: serial {s} vs parallel {pa}"
+            );
+        }
     }
 }

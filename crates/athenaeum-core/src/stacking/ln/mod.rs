@@ -38,7 +38,7 @@ use crate::geometry::ThinPlateSpline;
 use crate::integration::banded::BandPlanes;
 use crate::integration::registered_source::{MaterializedFrame, RegisteredFrame, RegisteredSource};
 use crate::integration::source::FrameSource;
-use crate::integration::stats::median_of;
+use crate::integration::stats::median_in_place;
 use crate::integration::IntegrationError;
 use crate::resample::Interpolation;
 use crate::stacking::integrate::{LocalNormalizationConfig, StackFrame};
@@ -184,11 +184,19 @@ fn target_background_params(scale: u32) -> BackgroundParams {
 /// refusal upstream (fix round 1, item 3) means this is never the only
 /// signal of that case reaching a caller.
 fn median_of_finite(plane: &[f32]) -> f64 {
-    let finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
+    let mut finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {
         return f64::NAN;
     }
-    median_of(&finite) as f64
+    // Perf tier A Task 12: `median_in_place` directly on the owned `finite`
+    // buffer instead of `median_of`, which itself clones its argument
+    // before calling `median_in_place` — this function used to pay for
+    // TWO copies of the finite pixels (the `filter().collect()` above, then
+    // `median_of`'s own internal `.to_vec()`) for one median. Selection is
+    // order-independent (the k-th order statistic of a multiset does not
+    // depend on the array's arrangement), so mutating `finite`'s order in
+    // place changes nothing here — nothing reads `finite` again afterward.
+    median_in_place(&mut finite) as f64
 }
 
 /// One channel's `A` grid (ruling R-M4c-8): the global `scale` at every
@@ -495,7 +503,16 @@ pub fn normalize_frame(
         warp_ms += t.elapsed().as_millis() as u64;
 
         let t = Instant::now();
-        let target_bg = background_grid(&target, reference.width, reference.height, &target_params);
+        // Perf tier A Task 12: `pool` fans `background_grid`'s per-cell
+        // loop (and `clean_plane`'s two passes) out across workers instead
+        // of running one cell at a time on this fan-out thread.
+        let target_bg = background_grid(
+            &target,
+            reference.width,
+            reference.height,
+            &target_params,
+            pool,
+        );
         let (expected_gw, expected_gh) =
             LnGrid::grid_dims(reference.width, reference.height, stride);
         debug_assert_eq!(
@@ -735,6 +752,67 @@ mod tests {
                 );
             }
             Cow::Borrowed(_) => panic!("a plane with a NaN must not be borrowed as-is"),
+        }
+    }
+
+    /// Perf tier A Task 12 pin: `median_of_finite` (now `median_in_place`
+    /// on the owned `finite` buffer, no second copy) must still return
+    /// exactly what a from-scratch sort-based median does, on a plane
+    /// carrying NaNs, `±Inf`, and ties — the finite-filtering and the
+    /// even/odd averaging are the parts a refactor could get wrong, not
+    /// the allocation count. The naive reference is written in `f32`
+    /// arithmetic for the even-count average (`0.5f32 * (lo + hi)`, cast
+    /// to `f64` only at the end) to match `median_in_place`'s own
+    /// arithmetic bit for bit — comparing against an `f64`-arithmetic
+    /// average would fail on rounding alone, which is not what this pin is
+    /// checking.
+    #[test]
+    fn median_of_finite_matches_a_naive_sort_based_median() {
+        fn naive_median_of_finite(plane: &[f32]) -> f64 {
+            let mut finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
+            if finite.is_empty() {
+                return f64::NAN;
+            }
+            finite.sort_by(|a, b| a.total_cmp(b));
+            let n = finite.len();
+            let mid = n / 2;
+            let result: f32 = if n % 2 == 1 {
+                finite[mid]
+            } else {
+                0.5f32 * (finite[mid - 1] + finite[mid])
+            };
+            result as f64
+        }
+
+        let cases: Vec<Vec<f32>> = vec![
+            vec![3.0, 1.0, 2.0],                       // odd count
+            vec![1.0, 2.0, 2.0, 2.0, 3.0, 4.0],         // even count, ties at the median
+            vec![
+                1.0,
+                f32::NAN,
+                2.0,
+                f32::INFINITY,
+                3.0,
+                f32::NEG_INFINITY,
+                4.0,
+            ], // NaN/+-Inf mixed in among finite values
+            vec![5.0, 5.0, 5.0, 5.0],                   // all ties
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY], // nothing finite
+            vec![],                                     // empty plane
+        ];
+
+        for plane in cases {
+            let got = median_of_finite(&plane);
+            let want = naive_median_of_finite(&plane);
+            if want.is_nan() {
+                assert!(got.is_nan(), "plane {plane:?}: expected NaN, got {got}");
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "plane {plane:?}: {got} vs {want}"
+                );
+            }
         }
     }
 
