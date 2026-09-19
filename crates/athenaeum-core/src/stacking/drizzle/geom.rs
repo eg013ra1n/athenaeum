@@ -14,7 +14,7 @@
 
 use astroimage::BayerPattern;
 
-use crate::geometry::pixel_map::ForwardEval;
+use crate::geometry::pixel_map::{ForwardEval, PixelMap};
 use crate::stacking::config::DrizzleKernel;
 
 /// A convex quadrilateral in output-grid coordinates, vertex order matching
@@ -139,71 +139,184 @@ pub fn map_drop(
 }
 
 /// Safety margin (output pixels) [`drop_bound_half_diag`] adds on top of
-/// its own measured half-diagonal (Tier A task 11, Z1). For a Linear-only
-/// map (`PixelMap::distortion.is_none()` — every fixture this stage's
-/// tests use, and the whole M1–M4b registration model before a `Tps`/
-/// `Polynomial` layer is chosen) the measured value is already an EXACT
-/// bound (see that function's doc), so this margin is pure unused
-/// headroom there. It exists for the map WITH a distortion layer, whose
-/// local Jacobian can in principle vary across the frame — its documented
-/// deviations are sub-pixel over windows far larger than one
-/// `drop_shrink`-sized drop (registration's own `tpsSmoothing`
-/// acceptance measured 0.1–0.2 px hold-out rms at the 8-px grid step), so
-/// one whole output pixel of pad is generous, not a measured requirement.
+/// its own sampled-max half-diagonal (Tier A task 11, Z1; controller
+/// ruling R-TA-10, fix round 1). For a Similarity/Affine map (no
+/// projective row, no distortion layer) the sampled max is already an
+/// EXACT bound (see that function's doc), so this margin is pure unused
+/// headroom there. It exists for a Homography map's projective term and
+/// for a `Tps`/`Polynomial` distortion layer, both of which can vary the
+/// LOCAL drop shape between the 29 sample points — not with a proven
+/// analytic bound, but because real registrations measure that variation
+/// small: M4c's own `tpsSmoothing` acceptance found hold-out rms
+/// 0.1–0.2 px on real 26 Mpx frames (`docs/superpowers/research/
+/// 2026-09-12-m4c-acceptance-run.md`), and a homography's own projective
+/// row on the LDN 1272 checkpoint's real fits stays around 1e-8..1e-7 —
+/// both orders of magnitude below what would make one whole output pixel
+/// insufficient. The exhaustive skip-safety test below stress-cases this
+/// directly with a homography two orders of magnitude past any real fit
+/// and a TPS map with several-pixel node displacement, both still
+/// passing with zero wrongly-skipped pixels at this same margin.
 const DEPOSIT_SKIP_MARGIN_PX: f64 = 1.0;
 
+/// The number of fractional grid positions [`drop_bound_half_diag`]
+/// samples along each axis (fix round 1, ruling R-TA-10) — `FRACS.len()²`
+/// interior points plus the four exact frame corners.
+const HALF_DIAG_SAMPLE_FRACS: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+
+/// The half-diagonal, in OUTPUT pixels, of the drop centred at subject
+/// pixel `(x, y)`, mapped through `eval` — the same corner-mapping +
+/// centroid + max-corner-distance math [`map_drop`] performs for the
+/// real per-pixel deposit, generalized over the evaluator so
+/// [`drop_bound_half_diag`]'s sampling can drive it through
+/// [`PixelMap::forward_exact`] (the O(nodes) exact path, ruling R-T4-3a)
+/// instead of a grid-cached [`ForwardEval`]. Orientation (CW vs CCW) is
+/// irrelevant here — unlike [`map_drop`], which needs it for
+/// [`clip_area`]'s half-plane clipping, a centroid and a max corner
+/// distance are the same regardless of vertex order, so this skips that
+/// step entirely. Returns `None` when any corner maps to a non-finite
+/// output coordinate (mirrors [`map_drop`]'s own fallback).
+fn drop_half_diag_at(
+    eval: impl Fn(f64, f64) -> (f64, f64),
+    x: usize,
+    y: usize,
+    drop_shrink: f64,
+    scale: u32,
+) -> Option<f64> {
+    let corners = drop_corners(x, y, drop_shrink);
+    let mut quad: Quad = [(0.0, 0.0); 4];
+    for (i, &(sx, sy)) in corners.iter().enumerate() {
+        let (u, v) = eval(sx, sy);
+        let ox = to_output(u, scale);
+        let oy = to_output(v, scale);
+        if !ox.is_finite() || !oy.is_finite() {
+            return None;
+        }
+        quad[i] = (ox, oy);
+    }
+    let cx = (quad[0].0 + quad[1].0 + quad[2].0 + quad[3].0) / 4.0;
+    let cy = (quad[0].1 + quad[1].1 + quad[2].1 + quad[3].1) / 4.0;
+    let mut half_diag = 0.0_f64;
+    for &(qx, qy) in &quad {
+        let d = ((qx - cx).powi(2) + (qy - cy).powi(2)).sqrt();
+        if d > half_diag {
+            half_diag = d;
+        }
+    }
+    Some(half_diag)
+}
+
 /// The half-diagonal, in OUTPUT pixels, of ONE source pixel's mapped
-/// drop under `fwd` — a PER-FRAME constant (the drop's mapped SHAPE, not
+/// drop under `map` — a PER-FRAME constant (the drop's mapped SHAPE, not
 /// its position) [`crate::stacking::drizzle::deposit_band`]'s early skip
 /// (Tier A task 11, Z1) uses to reject a source pixel whose mapped drop
 /// cannot possibly touch the current output band, before doing any of
 /// the per-pixel work that follows (the rejection-bitmap lookup, the LN
 /// grid, or either kernel's dispatch).
 ///
-/// Evaluated once, at [`drop_corners`]`(0, 0, drop_shrink)` — the "origin
-/// drop" — as the maximum distance from that drop's own mapped quad's
-/// centroid to any of its four mapped corners.
+/// **Controller ruling R-TA-10 (fix round 1) — the single-origin-drop
+/// version this function shipped as first was WRONG.** It argued the
+/// bound was exact for "every Similarity/Affine/Homography map with no
+/// distortion layer" — true for Similarity/Affine (a linear map's
+/// Jacobian is position-independent), but FALSE for `LinearKind::
+/// Homography`: a projective map's Jacobian depends on position through
+/// `1/w(x, y)` where `w = m[2][0]·x + m[2][1]·y + m[2][2]`, and nothing
+/// in `fit_homography` (or a hand-built matrix) bounds `m[2][0]`/
+/// `m[2][1]`. Homography with no distortion is also the pipeline's
+/// DEFAULT registration output (`ModelChoice::Auto` picks it at ≥ 30
+/// correspondences), so this was not an edge case.
 ///
-/// **Why the origin is enough for every map this crate registers today.**
-/// `fwd.at(x, y) = linear.apply(x, y) + displacement(...)` — for a
-/// Linear-only map (`layer == EvalLayer::None`, i.e. no TPS/polynomial
-/// distortion) the `displacement` term is absent and `linear.apply` is
-/// an AFFINE function of `(x, y)`. An affine map's Jacobian does not
-/// depend on position, so a drop's shape RELATIVE TO ITS OWN MAPPED
-/// CENTRE — a rotation, an anisotropic scale, a shear — is identical
-/// wherever in the frame it is measured; only the translation differs
-/// between locations, and this function only measures shape (corner
-/// distance from centre), never position. The value returned here is
-/// therefore an EXACT bound for every Similarity/Affine/Homography map
-/// with no distortion layer, not merely a conservative one — which is
-/// every fixture this stage's exhaustive skip-safety test pins (rotation
-/// at 1/5/30 degrees) and every M1–M4b registration result before a
-/// distortion model is chosen.
+/// This now SAMPLES the drop's mapped half-diagonal at 29 points spread
+/// across the frame's own `[0, width) x [0, height)` extent — a 5x5 grid
+/// at [`HALF_DIAG_SAMPLE_FRACS`]'s fractional positions of
+/// `(width - 1, height - 1)` (25 points, deliberately INSIDE the exact
+/// edges) plus the four EXACT corners (4 points) — through
+/// [`PixelMap::forward_exact`] (never the grid-cached [`ForwardEval`]
+/// this same drop math still uses for the real per-pixel deposit — this
+/// runs once per frame, not once per pixel, so the O(nodes) exact path
+/// costs nothing measurable; see the task report for the measured µs),
+/// and takes the MAX over all 29, padded by [`DEPOSIT_SKIP_MARGIN_PX`].
 ///
-/// A distortion layer (`Tps`/`Polynomial`) breaks the position-invariance
-/// argument above in principle, so [`DEPOSIT_SKIP_MARGIN_PX`] pads the
-/// result there — see its own doc for why that pad is believed
-/// sufficient without being a proven bound in the distorted case.
+/// **Exact for Similarity/Affine.** `map.forward_exact(x, y) =
+/// linear.apply(x, y) + displacement(...)`; with no distortion layer and
+/// `linear.kind` a Similarity or Affine (bottom row exactly `[0, 0, 1]`),
+/// `linear.apply` is an AFFINE function of `(x, y)` whose Jacobian does
+/// not depend on position — a drop's shape RELATIVE TO ITS OWN MAPPED
+/// CENTRE is identical wherever in the frame it is measured, so every
+/// one of the 29 samples returns the SAME value. The sampling is
+/// redundant there, not wrong — this is the exactness argument the
+/// shipped version had, now correctly SCOPED to the maps it actually
+/// holds for (every fixture the exhaustive skip-safety test pins at
+/// 1/5/30 degree rotation).
 ///
-/// Returns `f64::INFINITY` (skip disabled, never wrong, only slower) when
-/// the origin drop's own corners cannot even be mapped ([`map_drop`]
-/// returns `None`) — the same degenerate non-finite case every other
-/// caller of `map_drop` already falls back on.
-pub fn drop_bound_half_diag(fwd: &ForwardEval<'_>, drop_shrink: f64, scale: u32) -> f64 {
-    let corners = drop_corners(0, 0, drop_shrink);
-    let Some((quad, _)) = map_drop(fwd, &corners, scale) else {
-        return f64::INFINITY;
-    };
-    let cx = (quad[0].0 + quad[1].0 + quad[2].0 + quad[3].0) / 4.0;
-    let cy = (quad[0].1 + quad[1].1 + quad[2].1 + quad[3].1) / 4.0;
+/// **A measured bound, not a proven one, for Homography or any
+/// distortion layer.** The drop's mapped shape can vary smoothly between
+/// the 29 sample points, so the TRUE max over the whole frame could in
+/// principle exceed the sampled max by an amount related to the map's
+/// second derivative between samples. [`DEPOSIT_SKIP_MARGIN_PX`] covers
+/// that gap for every real registration this crate has measured — see
+/// its own doc for the numbers, and the exhaustive skip-safety test for
+/// two stress cases (a homography with a projective row two orders of
+/// magnitude past any real fit, and a TPS map with several-pixel node
+/// displacement) that still pass at zero wrongly-skipped pixels.
+///
+/// Returns `f64::INFINITY` (skip disabled, never wrong, only slower) the
+/// moment any ONE of the 29 samples maps to a non-finite output
+/// coordinate — the same degenerate non-finite case every other caller
+/// of [`map_drop`] already falls back on.
+pub fn drop_bound_half_diag(
+    map: &PixelMap,
+    width: usize,
+    height: usize,
+    drop_shrink: f64,
+    scale: u32,
+) -> f64 {
+    let w1 = width.saturating_sub(1) as f64;
+    let h1 = height.saturating_sub(1) as f64;
+
+    let mut points = [(0usize, 0usize); 29];
+    let mut i = 0;
+    for &fx in &HALF_DIAG_SAMPLE_FRACS {
+        for &fy in &HALF_DIAG_SAMPLE_FRACS {
+            points[i] = ((fx * w1).round() as usize, (fy * h1).round() as usize);
+            i += 1;
+        }
+    }
+    debug_assert_eq!(i, 25);
+    points[25] = (0, 0);
+    points[26] = (width.saturating_sub(1), 0);
+    points[27] = (0, height.saturating_sub(1));
+    points[28] = (width.saturating_sub(1), height.saturating_sub(1));
+
     let mut half_diag = 0.0_f64;
-    for &(x, y) in &quad {
-        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
-        if d > half_diag {
-            half_diag = d;
+    for &(x, y) in &points {
+        match drop_half_diag_at(|sx, sy| map.forward_exact(sx, sy), x, y, drop_shrink, scale) {
+            Some(d) => {
+                if d > half_diag {
+                    half_diag = d;
+                }
+            }
+            None => return f64::INFINITY,
         }
     }
     half_diag + DEPOSIT_SKIP_MARGIN_PX
+}
+
+/// The Tier A task 11 (Z1) band-skip predicate
+/// [`crate::stacking::drizzle::deposit_band`] uses: true when a drop
+/// whose mapped centroid is at output row `oy` and whose half-diagonal
+/// is `half_diag` CANNOT touch the band's own continuous row extent
+/// `[band_y_lo, band_y_hi]` at all — see `deposit_band`'s own comment at
+/// the call site for the derivation (from `map_drop`'s `strict_ceil`/
+/// `strict_floor` inclusion rule) of why these two comparisons are a
+/// SUFFICIENT condition for the clipped intersection to be empty.
+///
+/// Pulled out as its own function (fix round 1, ruling R-TA-10) so the
+/// exhaustive skip-safety test calls the SAME code `deposit_band` runs,
+/// not a hand-copied restatement of the formula that could silently
+/// drift from it.
+#[inline]
+pub fn band_skip(oy: f64, half_diag: f64, band_y_lo: f64, band_y_hi: f64) -> bool {
+    oy + half_diag < band_y_lo || oy - half_diag > band_y_hi
 }
 
 /// Signed polygon area by the shoelace formula — positive for the vertex

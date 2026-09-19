@@ -318,8 +318,8 @@ struct FrameDepositCtx<'a> {
     /// per source pixel plus four times per drop corner, so a cache lock
     /// in there would be six locks per pixel.
     fwd: ForwardEval<'a>,
-    /// Tier A task 11 (Z1): [`geom::drop_bound_half_diag`] of `fwd`,
-    /// computed once when this ctx is built — the per-frame constant
+    /// Tier A task 11 (Z1): [`geom::drop_bound_half_diag`] of the frame's
+    /// map, sampled once when this ctx is built — the per-frame constant
     /// `deposit_band`'s early band skip compares a mapped pixel centre
     /// against, before any per-pixel side effect.
     half_diag: f64,
@@ -644,10 +644,19 @@ pub fn drizzle_group(
             let pair = frame.output_pair[c];
 
             let fwd = frame.map.forward_eval();
-            // Tier A task 11 (Z1): a per-frame constant — see
-            // `geom::drop_bound_half_diag`'s doc for why the origin drop
-            // alone is enough for every map this crate registers.
-            let half_diag = geom::drop_bound_half_diag(&fwd, input.drop_shrink, input.scale);
+            // Tier A task 11 (Z1), fix round 1 (ruling R-TA-10): a
+            // per-frame constant, sampled across this frame's own native
+            // geometry (NOT the reference geometry — the samples must
+            // land inside the domain `deposit_band` actually indexes) —
+            // see `geom::drop_bound_half_diag`'s doc for the exactness
+            // argument and why it needed correcting.
+            let half_diag = geom::drop_bound_half_diag(
+                frame.map,
+                src_width,
+                src_height,
+                input.drop_shrink,
+                input.scale,
+            );
             let ctx = FrameDepositCtx {
                 src: &src,
                 src_width,
@@ -965,21 +974,25 @@ fn deposit_band(
             if !u.is_finite() || !v.is_finite() {
                 continue;
             }
-            // Tier A task 11 (Z1): this pixel's mapped drop cannot possibly
-            // touch this band's row range at all — skip before any
-            // per-pixel side effect below (the rejection-bitmap lookup, the
-            // LN grid, either kernel's dispatch). `oy` is the mapped pixel
-            // CENTRE, i.e. the drop's own mapped centroid (exactly, for a
-            // Linear-only map — `geom::drop_bound_half_diag`'s doc); the
-            // quad's continuous y-extent is therefore contained in
-            // `[oy - ctx.half_diag, oy + ctx.half_diag]`, and that interval
-            // has no overlap with `[band_y_lo, band_y_hi]` exactly when one
-            // of the two comparisons below holds — the same "entirely
-            // above" / "entirely below" split `band_source_window`'s own
-            // `None` case uses, just on the tight per-pixel interval
-            // instead of the coarse per-band probe.
+            // Tier A task 11 (Z1), fix round 1 (ruling R-TA-10): this
+            // pixel's mapped drop cannot possibly touch this band's row
+            // range at all — skip before any per-pixel side effect below
+            // (the rejection-bitmap lookup, the LN grid, either kernel's
+            // dispatch). `oy` is the mapped pixel CENTRE, i.e. the drop's
+            // own mapped centroid (exactly, for a Similarity/Affine map —
+            // `geom::drop_bound_half_diag`'s doc; a measured bound for
+            // Homography/distortion); the quad's continuous y-extent is
+            // therefore contained in `[oy - ctx.half_diag, oy +
+            // ctx.half_diag]`, and that interval has no overlap with
+            // `[band_y_lo, band_y_hi]` exactly when `geom::band_skip`
+            // (below) says so — the same "entirely above" / "entirely
+            // below" split `band_source_window`'s own `None` case uses,
+            // just on the tight per-pixel interval instead of the coarse
+            // per-band probe. `band_skip` is its own function (not
+            // inlined) so the exhaustive skip-safety test calls this
+            // EXACT code, not a hand-copied restatement of it.
             let oy = geom::to_output(v, ctx.scale);
-            if oy + ctx.half_diag < band_y_lo || oy - ctx.half_diag > band_y_hi {
+            if geom::band_skip(oy, ctx.half_diag, band_y_lo, band_y_hi) {
                 continue;
             }
             // Minor 10 (fix round 1): `floor(v + 0.5)`, not `f64::round`
@@ -1135,6 +1148,69 @@ mod tests {
             m: [[c, -s, tx], [s, c, ty], [0.0, 0.0, 1.0]],
         })
         .unwrap()
+    }
+
+    /// Fix round 1 (controller ruling R-TA-10): a pure projective warp —
+    /// `u = x / w(x, y)`, `v = y / w(x, y)`, `w = m20*x + m21*y + 1` — with
+    /// no rotation/translation, isolating exactly the property the
+    /// single-origin-drop version got wrong: `w`'s dependence on position
+    /// makes the LOCAL Jacobian (and hence the drop's mapped shape) vary
+    /// across the frame, unlike any Similarity/Affine map. `m20`/`m21`
+    /// here are two orders of magnitude past the LDN 1272 checkpoint's own
+    /// real homography fits (`m[2][0]`/`m[2][1]` around 1e-8..1e-7 at
+    /// 6000-px scale), scaled up for this 64x48 fixture so `w` swings by
+    /// several percent across it: at the far corner `(W-1, H-1) = (63,
+    /// 47)`, `w = 5e-4*63 + 5e-4*47 + 1 = 1.055` — a 5.5% variation, far
+    /// beyond anything a real fit produces.
+    fn homography_with_projective_row(m20: f64, m21: f64) -> PixelMap {
+        PixelMap::linear(Linear {
+            kind: LinearKind::Homography,
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [m20, m21, 1.0]],
+        })
+        .unwrap()
+    }
+
+    /// Fix round 1 (controller ruling R-TA-10): a thin-plate-spline
+    /// distortion layer with AGGRESSIVE node displacement (several pixels
+    /// across this 64x48 fixture — the node amplitudes below reach ~4.5 px
+    /// in x and ~4.0 px in y) on top of the identity linear part, so the
+    /// distortion's own local Jacobian genuinely varies node to node —
+    /// exactly the property `drop_bound_half_diag`'s sampled-max must
+    /// survive via its margin. The "inverse" spline is fit on the
+    /// negated displacements (an approximation, not an exact inverse —
+    /// fine here since the skip predicate and this test only ever drive
+    /// the FORWARD direction), the same pattern
+    /// `dropping_a_source_hands_back_its_frames_displacement_grids`
+    /// (`integration/registered_source.rs`) uses for its own spline
+    /// fixture.
+    fn tps_map_with_aggressive_distortion() -> PixelMap {
+        use crate::geometry::{DistortionModel, ThinPlateSpline};
+
+        let nodes: Vec<(f64, f64)> = vec![
+            (8.0, 8.0),
+            (32.0, 8.0),
+            (56.0, 8.0),
+            (8.0, 24.0),
+            (32.0, 24.0),
+            (56.0, 24.0),
+            (8.0, 40.0),
+            (32.0, 40.0),
+            (56.0, 40.0),
+        ];
+        let dx: Vec<f64> = nodes
+            .iter()
+            .map(|&(x, y)| 4.0 * (x / 20.0).sin() + 0.5 * (y / 15.0).cos())
+            .collect();
+        let dy: Vec<f64> = nodes
+            .iter()
+            .map(|&(x, y)| 3.5 * (y / 18.0).cos() - 0.5 * (x / 25.0).sin())
+            .collect();
+        let ndx: Vec<f64> = dx.iter().map(|v| -v).collect();
+        let ndy: Vec<f64> = dy.iter().map(|v| -v).collect();
+        let forward = ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0).expect("9-node fit");
+        let inverse = ThinPlateSpline::fit(&nodes, &ndx, &ndy, 0.0).expect("9-node fit");
+        let model = DistortionModel::tps(forward, inverse, [0.0, 0.0, W as f64, H as f64]);
+        PixelMap::with_distortion_model(Linear::identity(), model).unwrap()
     }
 
     fn write_mono(dir: &std::path::Path, name: &str, w: usize, h: usize, data: &[f32]) -> PathBuf {
@@ -1777,13 +1853,18 @@ mod tests {
     }
 
     // ── Tier A task 11 (Z1): exhaustive skip-predicate safety. For every
-    // source pixel of the fixture, under a rotated (Linear-only, no
-    // distortion) map, `deposit_band`'s early skip must never reject a
-    // pixel whose drop's clipped area with the band is actually nonzero —
-    // checked by replaying the SAME Square-kernel clip path
-    // (`geom::drop_corners` → `geom::map_drop` → `geom::clip_area`) the
-    // driver itself uses, over a band narrower than the frame so both
-    // "clearly touches" and "clearly misses" pixels exist. ──
+    // source pixel of the fixture, under each of five maps (fix round 1,
+    // ruling R-TA-10: the three original rotations plus a homography with
+    // a stress-case projective row and a TPS with aggressive node
+    // displacement — the two arms the single-origin-drop version got
+    // wrong), `deposit_band`'s early skip must never reject a pixel whose
+    // drop's clipped area with the band is actually nonzero — checked by
+    // replaying the SAME Square-kernel clip path (`geom::drop_corners` →
+    // `geom::map_drop` → `geom::clip_area`) the driver itself uses, over a
+    // band narrower than the frame so both "clearly touches" and "clearly
+    // misses" pixels exist. Calls `geom::drop_bound_half_diag` and
+    // `geom::band_skip` — the REAL functions `deposit_band` runs, not a
+    // hand-copied restatement of either. ──
 
     #[test]
     fn deposit_skip_predicate_never_rejects_a_pixel_with_nonzero_clipped_area() {
@@ -1792,18 +1873,37 @@ mod tests {
         let out_w = W * SCALE as usize;
         let out_h = H * SCALE as usize;
         // A sub-band, not the whole frame's output extent: at least one of
-        // the three rotations must leave some source pixels whose drop
-        // maps entirely outside it, or the predicate is never exercised.
+        // the five maps must leave some source pixels whose drop maps
+        // entirely outside it, or the predicate is never exercised.
         let y0 = 0usize;
         let rows = out_h / 3;
         let y1 = y0 + rows;
         let band_y_lo = y0 as f64 - 0.5;
         let band_y_hi = y1 as f64 - 0.5;
 
-        for deg in [1.0_f64, 5.0, 30.0] {
-            let map = rotation_about_centre(deg, W as f64 / 2.0, H as f64 / 2.0);
+        let cx = W as f64 / 2.0;
+        let cy = H as f64 / 2.0;
+        let cases: [(&str, PixelMap); 5] = [
+            ("1deg", rotation_about_centre(1.0, cx, cy)),
+            ("5deg", rotation_about_centre(5.0, cx, cy)),
+            ("30deg", rotation_about_centre(30.0, cx, cy)),
+            (
+                "homography_stress",
+                homography_with_projective_row(5e-4, 5e-4),
+            ),
+            ("tps_stress", tps_map_with_aggressive_distortion()),
+        ];
+
+        for (name, map) in &cases {
+            // The per-frame bound the real driver computes once — sampled
+            // across THIS frame's own native geometry, matching
+            // `drizzle_group`'s own call (`src_width`/`src_height`, not
+            // the reference geometry).
+            let half_diag = geom::drop_bound_half_diag(map, W, H, DROP_SHRINK, SCALE);
+            // The grid-cached evaluator `deposit_band` actually calls per
+            // pixel (`ctx.fwd.at`) — NOT `forward_exact`, which only
+            // `drop_bound_half_diag`'s sampling uses.
             let fwd = map.forward_eval();
-            let half_diag = geom::drop_bound_half_diag(&fwd, DROP_SHRINK, SCALE);
 
             let mut examined = 0usize;
             let mut skipped = 0usize;
@@ -1813,9 +1913,9 @@ mod tests {
                 for x in 0..W {
                     examined += 1;
                     let (u, v) = fwd.at(x as f64, y as f64);
-                    assert!(u.is_finite() && v.is_finite(), "{deg}deg x={x} y={y}");
+                    assert!(u.is_finite() && v.is_finite(), "{name}: x={x} y={y}");
                     let oy = geom::to_output(v, SCALE);
-                    let would_skip = oy + half_diag < band_y_lo || oy - half_diag > band_y_hi;
+                    let would_skip = geom::band_skip(oy, half_diag, band_y_lo, band_y_hi);
 
                     // The actual clipped area this pixel's drop contributes
                     // to the band, via the exact same path `deposit_band`'s
@@ -1846,12 +1946,12 @@ mod tests {
 
             assert_eq!(
                 wrongly_skipped, 0,
-                "{deg}deg: {wrongly_skipped} of {examined} examined pixels wrongly skipped \
+                "{name}: {wrongly_skipped} of {examined} examined pixels wrongly skipped \
                  ({skipped} skipped in total)"
             );
             assert!(
                 skipped > 0,
-                "{deg}deg: expected some skips over a {rows}-row sub-band of {out_h}, got 0 \
+                "{name}: expected some skips over a {rows}-row sub-band of {out_h}, got 0 \
                  (the predicate is not being exercised)"
             );
         }
@@ -2132,7 +2232,7 @@ mod tests {
             ref_height: height,
             map: &map,
             fwd: map.forward_eval(),
-            half_diag: geom::drop_bound_half_diag(&map.forward_eval(), drop_shrink, scale),
+            half_diag: geom::drop_bound_half_diag(&map, width, height, drop_shrink, scale),
             scale,
             drop_shrink,
             kernel: DrizzleKernel::Square,
@@ -2158,7 +2258,7 @@ mod tests {
             ref_height: height,
             map: &map,
             fwd: map.forward_eval(),
-            half_diag: geom::drop_bound_half_diag(&map.forward_eval(), drop_shrink, scale),
+            half_diag: geom::drop_bound_half_diag(&map, width, height, drop_shrink, scale),
             scale,
             drop_shrink,
             kernel: DrizzleKernel::Circle,
