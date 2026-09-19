@@ -138,6 +138,74 @@ pub fn map_drop(
     Some((quad, bbox))
 }
 
+/// Safety margin (output pixels) [`drop_bound_half_diag`] adds on top of
+/// its own measured half-diagonal (Tier A task 11, Z1). For a Linear-only
+/// map (`PixelMap::distortion.is_none()` — every fixture this stage's
+/// tests use, and the whole M1–M4b registration model before a `Tps`/
+/// `Polynomial` layer is chosen) the measured value is already an EXACT
+/// bound (see that function's doc), so this margin is pure unused
+/// headroom there. It exists for the map WITH a distortion layer, whose
+/// local Jacobian can in principle vary across the frame — its documented
+/// deviations are sub-pixel over windows far larger than one
+/// `drop_shrink`-sized drop (registration's own `tpsSmoothing`
+/// acceptance measured 0.1–0.2 px hold-out rms at the 8-px grid step), so
+/// one whole output pixel of pad is generous, not a measured requirement.
+const DEPOSIT_SKIP_MARGIN_PX: f64 = 1.0;
+
+/// The half-diagonal, in OUTPUT pixels, of ONE source pixel's mapped
+/// drop under `fwd` — a PER-FRAME constant (the drop's mapped SHAPE, not
+/// its position) [`crate::stacking::drizzle::deposit_band`]'s early skip
+/// (Tier A task 11, Z1) uses to reject a source pixel whose mapped drop
+/// cannot possibly touch the current output band, before doing any of
+/// the per-pixel work that follows (the rejection-bitmap lookup, the LN
+/// grid, or either kernel's dispatch).
+///
+/// Evaluated once, at [`drop_corners`]`(0, 0, drop_shrink)` — the "origin
+/// drop" — as the maximum distance from that drop's own mapped quad's
+/// centroid to any of its four mapped corners.
+///
+/// **Why the origin is enough for every map this crate registers today.**
+/// `fwd.at(x, y) = linear.apply(x, y) + displacement(...)` — for a
+/// Linear-only map (`layer == EvalLayer::None`, i.e. no TPS/polynomial
+/// distortion) the `displacement` term is absent and `linear.apply` is
+/// an AFFINE function of `(x, y)`. An affine map's Jacobian does not
+/// depend on position, so a drop's shape RELATIVE TO ITS OWN MAPPED
+/// CENTRE — a rotation, an anisotropic scale, a shear — is identical
+/// wherever in the frame it is measured; only the translation differs
+/// between locations, and this function only measures shape (corner
+/// distance from centre), never position. The value returned here is
+/// therefore an EXACT bound for every Similarity/Affine/Homography map
+/// with no distortion layer, not merely a conservative one — which is
+/// every fixture this stage's exhaustive skip-safety test pins (rotation
+/// at 1/5/30 degrees) and every M1–M4b registration result before a
+/// distortion model is chosen.
+///
+/// A distortion layer (`Tps`/`Polynomial`) breaks the position-invariance
+/// argument above in principle, so [`DEPOSIT_SKIP_MARGIN_PX`] pads the
+/// result there — see its own doc for why that pad is believed
+/// sufficient without being a proven bound in the distorted case.
+///
+/// Returns `f64::INFINITY` (skip disabled, never wrong, only slower) when
+/// the origin drop's own corners cannot even be mapped ([`map_drop`]
+/// returns `None`) — the same degenerate non-finite case every other
+/// caller of `map_drop` already falls back on.
+pub fn drop_bound_half_diag(fwd: &ForwardEval<'_>, drop_shrink: f64, scale: u32) -> f64 {
+    let corners = drop_corners(0, 0, drop_shrink);
+    let Some((quad, _)) = map_drop(fwd, &corners, scale) else {
+        return f64::INFINITY;
+    };
+    let cx = (quad[0].0 + quad[1].0 + quad[2].0 + quad[3].0) / 4.0;
+    let cy = (quad[0].1 + quad[1].1 + quad[2].1 + quad[3].1) / 4.0;
+    let mut half_diag = 0.0_f64;
+    for &(x, y) in &quad {
+        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        if d > half_diag {
+            half_diag = d;
+        }
+    }
+    half_diag + DEPOSIT_SKIP_MARGIN_PX
+}
+
 /// Signed polygon area by the shoelace formula — positive for the vertex
 /// order [`drop_corners`] produces (see the identity-map pin in the tests
 /// below), which this module treats as "counter-clockwise" throughout.

@@ -318,6 +318,11 @@ struct FrameDepositCtx<'a> {
     /// per source pixel plus four times per drop corner, so a cache lock
     /// in there would be six locks per pixel.
     fwd: ForwardEval<'a>,
+    /// Tier A task 11 (Z1): [`geom::drop_bound_half_diag`] of `fwd`,
+    /// computed once when this ctx is built — the per-frame constant
+    /// `deposit_band`'s early band skip compares a mapped pixel centre
+    /// against, before any per-pixel side effect.
+    half_diag: f64,
     scale: u32,
     drop_shrink: f64,
     kernel: DrizzleKernel,
@@ -517,6 +522,37 @@ pub fn drizzle_group(
             // EVERY plane is the one single-plane mosaic — `plane 0` of it,
             // three times over (once per output plane), each pass keeping
             // only the pixels of that plane's own colour.
+            //
+            // Tier A task 11 (Z5, considered and NOT landed): this reads
+            // the SAME mosaic file up to three times per frame (once per
+            // `c` in `0..input.channels`) because the loop nest above is
+            // `for c in 0..channels { for frame in frames { ... } }` — the
+            // PLANE loop is outer, the frame loop inner, on purpose (this
+            // is what keeps only ONE `(i_buf, w_buf)` accumulator pair
+            // alive at a time — `estimate_memory_bytes`'s R-M3-7/16 doc
+            // above states the formula's whole premise as "the channels
+            // output-data planes plus the ONE `I`/`W` accumulator pair
+            // alive at a time", not `channels` pairs). Caching a frame's
+            // decoded mosaic across its three plane passes only pays off
+            // if the SAME frame is visited for `c=1` right after `c=0`,
+            // which this loop order never does — every OTHER frame in the
+            // group is read for `c=0` in between. The only cache that
+            // could still help is "every frame's mosaic held for the whole
+            // group", which costs `frame_count × mosaic_bytes` ON TOP of
+            // the existing per-plane terms `estimate_memory_bytes` already
+            // budgets (104 MB per frame at 6248×4176 f32, so a 50-frame
+            // OSC group would add ≈5.2 GB) — for any group past a handful
+            // of frames this blows well past the R-M3-7 refusal ceiling
+            // (half of probed total RAM, or the 4 GiB floor when unknown),
+            // which the estimate above is checked against BEFORE any
+            // output allocation happens. Restructuring the loop so frame
+            // is outer and all `channels` accumulators are held live
+            // instead trades that same memory pressure for a different
+            // fixed cost (3 output planes × 4× area at 2× scale ≈ 3 × 417
+            // MB ≈ 1.25 GB plus the weight-map planes on a real OSC
+            // group's geometry) and is a materially bigger, riskier change
+            // than this task's scope — so the re-read stays, and only the
+            // per-pixel Z1 skip above lands this task.
             let src_path = match frame.cfa {
                 Some(cfa) => cfa.path,
                 None => frame.path,
@@ -607,6 +643,11 @@ pub fn drizzle_group(
             // that `frame.output_pair.len() == input.channels`.
             let pair = frame.output_pair[c];
 
+            let fwd = frame.map.forward_eval();
+            // Tier A task 11 (Z1): a per-frame constant — see
+            // `geom::drop_bound_half_diag`'s doc for why the origin drop
+            // alone is enough for every map this crate registers.
+            let half_diag = geom::drop_bound_half_diag(&fwd, input.drop_shrink, input.scale);
             let ctx = FrameDepositCtx {
                 src: &src,
                 src_width,
@@ -614,7 +655,8 @@ pub fn drizzle_group(
                 ref_width: input.width,
                 ref_height: input.height,
                 map: frame.map,
-                fwd: frame.map.forward_eval(),
+                fwd,
+                half_diag,
                 scale: input.scale,
                 drop_shrink: input.drop_shrink,
                 kernel: input.kernel,
@@ -866,6 +908,14 @@ fn deposit_band(
         return;
     }
     let y1 = y0 + rows;
+    // Tier A task 11 (Z1): the band's own continuous row extent in output
+    // coordinates — pixel row `y0` covers `[y0 - 0.5, y0 + 0.5]` and the
+    // band's last row is `y1 - 1` (this `y1` is one PAST the last row),
+    // whose upper edge is `(y1 - 1) + 0.5 = y1 - 0.5`. A pixel's mapped
+    // drop is skipped only when it PROVABLY cannot reach this span at all
+    // — see the derivation on the skip check below.
+    let band_y_lo = y0 as f64 - 0.5;
+    let band_y_hi = y1 as f64 - 0.5;
 
     let Some((sx0, sy0, sx1, sy1)) = band_source_window(
         ctx.map,
@@ -913,6 +963,23 @@ fn deposit_band(
             }
             let (u, v) = ctx.fwd.at(x as f64, y as f64);
             if !u.is_finite() || !v.is_finite() {
+                continue;
+            }
+            // Tier A task 11 (Z1): this pixel's mapped drop cannot possibly
+            // touch this band's row range at all — skip before any
+            // per-pixel side effect below (the rejection-bitmap lookup, the
+            // LN grid, either kernel's dispatch). `oy` is the mapped pixel
+            // CENTRE, i.e. the drop's own mapped centroid (exactly, for a
+            // Linear-only map — `geom::drop_bound_half_diag`'s doc); the
+            // quad's continuous y-extent is therefore contained in
+            // `[oy - ctx.half_diag, oy + ctx.half_diag]`, and that interval
+            // has no overlap with `[band_y_lo, band_y_hi]` exactly when one
+            // of the two comparisons below holds — the same "entirely
+            // above" / "entirely below" split `band_source_window`'s own
+            // `None` case uses, just on the tight per-pixel interval
+            // instead of the coarse per-band probe.
+            let oy = geom::to_output(v, ctx.scale);
+            if oy + ctx.half_diag < band_y_lo || oy - ctx.half_diag > band_y_hi {
                 continue;
             }
             // Minor 10 (fix round 1): `floor(v + 0.5)`, not `f64::round`
@@ -1647,6 +1714,149 @@ mod tests {
         assert!(checked > 500, "checked={checked}");
     }
 
+    // ── Tier A task 11 (Z1 band skip, Z5 one-read-per-frame): a
+    // bit-identity pin recorded against the unmodified driver
+    // (`b55cd3a3`/`65619f0c`, before this task's changes) — see the task
+    // report for how the expected checksums were captured. A FNV-1a-style
+    // fold of every output f32's `to_bits()` so a single flipped bit
+    // anywhere in `data`/`weight` changes the number, without needing a
+    // golden file on disk.
+    fn checksum_f32(data: &[f32]) -> u64 {
+        data.iter().fold(0xcbf29ce484222325u64, |acc, v| {
+            (acc ^ v.to_bits() as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    #[test]
+    fn drizzle_group_output_is_bit_identical_across_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let stars = [
+            (10.0, 12.0, 0.6),
+            (40.0, 8.0, 0.35),
+            (55.0, 40.0, 0.5),
+            (5.0, 44.0, 0.2),
+            (30.0, 24.0, 0.8),
+        ];
+        let data0 = gaussian_field(W, H, &stars, 1.4, 0.02);
+        let data1 = gaussian_field(W, H, &stars, 1.1, 0.015);
+        let p0 = write_mono(dir.path(), "f0.fits", W, H, &data0);
+        let p1 = write_mono(dir.path(), "f1.fits", W, H, &data1);
+        let cx = (W as f64 - 1.0) / 2.0;
+        let cy = (H as f64 - 1.0) / 2.0;
+        let w0 = [1.0f64];
+        let w1 = [0.8f64];
+        let pair = identity_pair();
+
+        // Recorded against the unmodified driver; re-run after Z1/Z5 to
+        // confirm the checksums do not move (task 11 report has the run
+        // log for both sides).
+        let expected: [(u64, u64); 3] = [
+            (0x8cb227895e93f504, 0xcf5743015bcedb75), // 1 deg
+            (0x9427361e0439f161, 0x82f2ad1c84dd72c6), // 5 deg
+            (0x502542b82e474955, 0x2a811e20249d5d31), // 30 deg
+        ];
+
+        for (deg, (want_data, want_weight)) in [1.0_f64, 5.0, 30.0].into_iter().zip(expected) {
+            let map0 = rotation_about_centre(deg, cx, cy);
+            let map1 = rotation_about_centre(deg + 2.0, cx, cy);
+            let f0 = frame(&p0, &map0, &w0, &pair);
+            let f1 = frame(&p1, &map1, &w1, &pair);
+            let frames = [f0, f1];
+            let measure = MeasureOptions::default();
+            let mut input = base_input(&frames, &measure);
+            input.scale = 2;
+            input.drop_shrink = 0.7;
+
+            let out =
+                drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+            let got_data = checksum_f32(&out.data);
+            let got_weight = checksum_f32(out.weight.as_ref().unwrap());
+            assert_eq!(got_data, want_data, "{deg}deg data checksum");
+            assert_eq!(got_weight, want_weight, "{deg}deg weight checksum");
+        }
+    }
+
+    // ── Tier A task 11 (Z1): exhaustive skip-predicate safety. For every
+    // source pixel of the fixture, under a rotated (Linear-only, no
+    // distortion) map, `deposit_band`'s early skip must never reject a
+    // pixel whose drop's clipped area with the band is actually nonzero —
+    // checked by replaying the SAME Square-kernel clip path
+    // (`geom::drop_corners` → `geom::map_drop` → `geom::clip_area`) the
+    // driver itself uses, over a band narrower than the frame so both
+    // "clearly touches" and "clearly misses" pixels exist. ──
+
+    #[test]
+    fn deposit_skip_predicate_never_rejects_a_pixel_with_nonzero_clipped_area() {
+        const DROP_SHRINK: f64 = 0.9;
+        const SCALE: u32 = 2;
+        let out_w = W * SCALE as usize;
+        let out_h = H * SCALE as usize;
+        // A sub-band, not the whole frame's output extent: at least one of
+        // the three rotations must leave some source pixels whose drop
+        // maps entirely outside it, or the predicate is never exercised.
+        let y0 = 0usize;
+        let rows = out_h / 3;
+        let y1 = y0 + rows;
+        let band_y_lo = y0 as f64 - 0.5;
+        let band_y_hi = y1 as f64 - 0.5;
+
+        for deg in [1.0_f64, 5.0, 30.0] {
+            let map = rotation_about_centre(deg, W as f64 / 2.0, H as f64 / 2.0);
+            let fwd = map.forward_eval();
+            let half_diag = geom::drop_bound_half_diag(&fwd, DROP_SHRINK, SCALE);
+
+            let mut examined = 0usize;
+            let mut skipped = 0usize;
+            let mut wrongly_skipped = 0usize;
+
+            for y in 0..H {
+                for x in 0..W {
+                    examined += 1;
+                    let (u, v) = fwd.at(x as f64, y as f64);
+                    assert!(u.is_finite() && v.is_finite(), "{deg}deg x={x} y={y}");
+                    let oy = geom::to_output(v, SCALE);
+                    let would_skip = oy + half_diag < band_y_lo || oy - half_diag > band_y_hi;
+
+                    // The actual clipped area this pixel's drop contributes
+                    // to the band, via the exact same path `deposit_band`'s
+                    // Square-kernel arm uses.
+                    let corners = geom::drop_corners(x, y, DROP_SHRINK);
+                    let mut total_area = 0.0_f64;
+                    if let Some((quad, bbox)) = geom::map_drop(&fwd, &corners, SCALE) {
+                        let (bx0, by0, bx1, by1) = bbox;
+                        let px0 = bx0.max(0);
+                        let px1 = bx1.min(out_w as i64 - 1);
+                        let py0 = by0.max(y0 as i64);
+                        let py1 = by1.min(y1 as i64 - 1);
+                        for py in py0..=py1 {
+                            for px in px0..=px1 {
+                                total_area += geom::clip_area(&quad, px, py);
+                            }
+                        }
+                    }
+
+                    if would_skip {
+                        skipped += 1;
+                        if total_area > 0.0 {
+                            wrongly_skipped += 1;
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                wrongly_skipped, 0,
+                "{deg}deg: {wrongly_skipped} of {examined} examined pixels wrongly skipped \
+                 ({skipped} skipped in total)"
+            );
+            assert!(
+                skipped > 0,
+                "{deg}deg: expected some skips over a {rows}-row sub-band of {out_h}, got 0 \
+                 (the predicate is not being exercised)"
+            );
+        }
+    }
+
     // ── (h) cancel ──
 
     #[test]
@@ -1922,6 +2132,7 @@ mod tests {
             ref_height: height,
             map: &map,
             fwd: map.forward_eval(),
+            half_diag: geom::drop_bound_half_diag(&map.forward_eval(), drop_shrink, scale),
             scale,
             drop_shrink,
             kernel: DrizzleKernel::Square,
@@ -1947,6 +2158,7 @@ mod tests {
             ref_height: height,
             map: &map,
             fwd: map.forward_eval(),
+            half_diag: geom::drop_bound_half_diag(&map.forward_eval(), drop_shrink, scale),
             scale,
             drop_shrink,
             kernel: DrizzleKernel::Circle,
