@@ -221,10 +221,32 @@ fn stddev<T: Sample>(v: &[T], m: f64) -> f64 {
     var.sqrt()
 }
 
+/// Stable by contract: the weighted path's summation order follows this
+/// ordering; `sort_unstable_by` would permute tied (value, index) pairs and
+/// change the f64 summation order.
+///
+/// Perf tier A Task 9 (I4, audit §3.3): BUILT and MEASURED as
+/// `sort_unstable_by` with an explicit `(value, tie_key)` comparator
+/// (`Sample::tie_key`, still on the trait — see its doc) reproducing this
+/// same stable order, on the audit's own reasoning that it both avoids the
+/// stable sort's ~1.6 KB `driftsort` allocation and is asymptotically an
+/// unstable (pdqsort-family) sort. REVERTED: isolated microbenchmarks
+/// (`diag_sort_asc_cost` in this module's history) on `(f32, u16)` data at
+/// `n` = 20 and 208, 200 000 iterations, comparing `sort_by` (this
+/// function) against `sort_unstable_by` with and without the tie_key
+/// comparator: at `n` = 208 the unstable sort alone (no tie_key, same
+/// comparator cost as this function) was already 1.18× SLOWER than this
+/// stable sort despite never allocating, and the tie_key comparator adds
+/// another ~1.15× on top (1.36× total) even though ties are rare in that
+/// fixture and `Ordering::then_with` short-circuits the tie_key extraction
+/// on every non-tied pair. On this machine's toolchain the standard
+/// library's stable sort (`driftsort`) is simply faster than
+/// `sort_unstable_by`'s pattern-defeating quicksort for a `(f32, u16)`
+/// stack at the sizes this rejection loop actually sees — the audit's
+/// "unstable never allocates, so it must be faster" premise does not hold
+/// here. Kept as the reasoning a future attempt at this item should read
+/// before re-trying the same shape.
 fn sort_asc<T: Sample>(v: &mut [T]) {
-    // Stable by contract: the weighted path's summation order follows this
-    // ordering; sort_unstable_by would permute tied (value, index) pairs and
-    // change the f64 summation order.
     v.sort_by(|a, b| a.value().partial_cmp(&b.value()).unwrap_or(std::cmp::Ordering::Equal));
 }
 
@@ -318,6 +340,19 @@ pub fn mask_get(mask: &[u64], i: usize) -> bool {
 /// the average (a zero-valued or zero-weighted survivor is masked as a
 /// survivor but skipped by the mean) — rejection maps count rejections, not
 /// contributions.
+///
+/// The third return value (perf tier A Task 9, I5) is `true` exactly when
+/// `work[..n - rejected]` (the surviving prefix, `rejected` being the
+/// second return value) is ascending by `value()` — every rejection
+/// algorithm but `None`/`SigmaClip` sorts `work` before compacting, and the
+/// stable, order-preserving compaction that follows keeps that order in the
+/// surviving prefix (each one's own doc says so where it isn't obvious). A
+/// caller that wants a plain positional median of the survivors — not
+/// weighted, not `out_values`-based — can read it directly out of that
+/// prefix instead of re-sorting `work` a second time. Always `false` when
+/// every sample was rejected (the early return below): that branch's own
+/// median already comes from a fresh sort of `out_values`, not `work`, so
+/// there is nothing for the caller to reuse either way.
 pub fn combine_pixel_weighted(
     work: &mut [(f32, u16)],
     out_values: &[f32],
@@ -325,7 +360,7 @@ pub fn combine_pixel_weighted(
     recipe: IntegrationRecipe,
     mask: &mut [u64],
     scratch: &mut Vec<f32>,
-) -> (f32, usize) {
+) -> (f32, usize, bool) {
     debug_assert_eq!(out_values.len(), weights.len());
     debug_assert!(work.iter().all(|&(_, i)| (i as usize) < out_values.len()));
     debug_assert!(
@@ -334,14 +369,14 @@ pub fn combine_pixel_weighted(
     );
     let n = work.len();
     if n == 0 {
-        return (0.0, 0);
+        return (0.0, 0, false);
     }
-    let (kept, _sorted) = apply_rejection(work, recipe.rejection);
+    let (kept, sorted) = apply_rejection(work, recipe.rejection);
     if kept == 0 {
         scratch.clear();
         scratch.extend(work.iter().map(|&(_, i)| out_values[i as usize]));
         sort_asc(scratch);
-        return (median_sorted(scratch), n);
+        return (median_sorted(scratch), n, false);
     }
     for &(_, i) in &work[..kept] {
         mask_set(mask, i as usize);
@@ -375,7 +410,7 @@ pub fn combine_pixel_weighted(
             median_sorted(scratch)
         }
     };
-    (value, n - kept)
+    (value, n - kept, sorted)
 }
 
 /// Runs the chosen rejection algorithm in place, returning
@@ -840,6 +875,24 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
         // start) evaluates this up to ~14-90 times (widening + bisection);
         // the warm start (b) below only shrinks evaluation count ACROSS
         // `reject_linear_fit`'s outer iterations, not within one call.
+        //
+        // Perf tier A Task 9 (audit §3.3, I1/I2): both were BUILT and
+        // MEASURED — `t_i = b·i` cached once per element into a second
+        // scratch buffer and reused at the sign-test site (I1), and the
+        // sign sum split across four `i64` accumulators (I2) — and both
+        // were reverted. `t_i = b * i as f64` is a register-to-register
+        // multiply once `i` (the loop counter) and `b` (already in a
+        // register for the whole closure) are both in registers, so
+        // caching it in a `Vec` trades a near-free multiply for a store on
+        // the write side and a load on the read side; on this machine that
+        // is NOT a win. Isolated microbenchmarks
+        // (`diag_medfit_new_vs_oracle_cost` in this module's history, run
+        // at `n` = 20 and 208 with 50 000 iterations each): I1 alone 1.42–
+        // 1.55× the pre-Task-9 cost, I2 alone 1.05–1.09× (both SLOWER, not
+        // faster), combined 1.57–1.72×; the `integrate_probe` end-to-end
+        // measurement in the Task 9 report shows the same direction on the
+        // real 60-frame set. Kept here as the reasoning a future attempt at
+        // this item should read before re-trying the same shape.
         let mut rofunc = |b: f64| -> (f64, f64) {
             // Perf tier A Task 0: one evaluation, thread-local, flushed by
             // `take_rejection_counters` — see that function's doc.
@@ -851,6 +904,14 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
             let a = if m % 2 == 1 {
                 *scratch.select_nth_unstable_by(m / 2, cmp).1
             } else {
+                // I3 (perf tier A Task 9): the max of the lower partition
+                // `select_nth_unstable_by` already produced IS the lower
+                // median element — there is no cheaper way to learn it than
+                // scanning `lo` (an unsorted partition of unknown internal
+                // order; a second `select_nth_unstable_by` call to find its
+                // max would cost MORE than this linear fold, not less), so
+                // this was already the minimal shape before Task 9 and
+                // stays textually unchanged.
                 let (lo, hi, _) = scratch.select_nth_unstable_by(m / 2, cmp);
                 0.5 * (lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + *hi)
             };
@@ -2002,6 +2063,360 @@ mod tests {
         }
     }
 
+    // ── Perf tier A Task 9 (I1-I5): exact-rewrite pins ──────────────────────
+    //
+    // Oracles below are the pre-Task-9 `medfit_line`/`reject_linear_fit`
+    // bodies, copied verbatim (their own thread-locals swapped for a plain
+    // local `Vec` — irrelevant to the numbers, only to where the scratch
+    // lives) — used ONLY here, to prove I1 (`t_i = b·i` fused) and I2 (four
+    // integer sign-sum accumulators) moved zero bits.
+
+    /// Verbatim pre-Task-9 `medfit_line` (I1/I2's oracle): `rofunc`
+    /// recomputes `b * i as f64` at both the residual-build and sign-test
+    /// sites, and accumulates the sign sum into one running f64 total.
+    fn medfit_line_oracle(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
+        let n = values.len();
+        if n == 0 {
+            return (0.0, 0.0);
+        }
+        if n == 1 {
+            return (values[0], 0.0);
+        }
+        let nf = n as f64;
+        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+        for (i, &y) in values.iter().enumerate() {
+            let x = i as f64;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+        let del = nf * sxx - sx * sx;
+        if del.abs() <= f64::EPSILON {
+            return (sy / nf, 0.0);
+        }
+        let b_ls = (nf * sxy - sx * sy) / del;
+        let a_ls = (sy - b_ls * sx) / nf;
+        let mut chisq = 0.0;
+        for (i, &y) in values.iter().enumerate() {
+            let resid = y - (a_ls + b_ls * i as f64);
+            chisq += resid * resid;
+        }
+        let sigma_b = (chisq / del).sqrt();
+        if !(sigma_b > 0.0) {
+            return (a_ls, b_ls);
+        }
+
+        let mut scratch: Vec<f64> = Vec::new();
+        let mut rofunc = |b: f64| -> (f64, f64) {
+            scratch.clear();
+            scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
+            let m = scratch.len();
+            let cmp = |p: &f64, q: &f64| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal);
+            let a = if m % 2 == 1 {
+                *scratch.select_nth_unstable_by(m / 2, cmp).1
+            } else {
+                let (lo, hi, _) = scratch.select_nth_unstable_by(m / 2, cmp);
+                0.5 * (lo.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + *hi)
+            };
+            let mut sum = 0.0;
+            for (i, &y) in values.iter().enumerate() {
+                let resid = y - (a + b * i as f64);
+                if resid > 0.0 {
+                    sum += i as f64;
+                } else if resid < 0.0 {
+                    sum -= i as f64;
+                }
+            }
+            (sum, a)
+        };
+
+        let mut b1 = warm_start_b.unwrap_or(b_ls);
+        let (mut f1, a1) = rofunc(b1);
+        if f1 == 0.0 {
+            return (a1, b1);
+        }
+        let mut b2 = b1 + 3.0 * sigma_b * robust_sign(f1);
+        let (mut f2, _) = rofunc(b2);
+
+        let mut widenings = 0u32;
+        while f1 * f2 > 0.0 && widenings < 32 {
+            b2 = b1 + 2.0 * (b2 - b1);
+            f2 = rofunc(b2).0;
+            widenings += 1;
+        }
+        if f1 * f2 > 0.0 {
+            return (a_ls, b_ls);
+        }
+
+        let tol = 1e-3 * sigma_b;
+        let mut iters = 0u32;
+        let mut last_a = a1;
+        let mut last_b = b1;
+        while (b2 - b1).abs() >= tol && iters < 60 {
+            let bb = 0.5 * (b1 + b2);
+            if bb == b1 || bb == b2 {
+                break;
+            }
+            let (fb, ab) = rofunc(bb);
+            if fb == 0.0 {
+                return (ab, bb);
+            }
+            last_a = ab;
+            last_b = bb;
+            if fb * f1 >= 0.0 {
+                b1 = bb;
+                f1 = fb;
+            } else {
+                b2 = bb;
+            }
+            iters += 1;
+        }
+        (last_a, last_b)
+    }
+
+    /// Verbatim pre-Task-9 `reject_linear_fit`, calling [`medfit_line_oracle`]
+    /// instead of the production `medfit_line` — every other line (the outer
+    /// convergence loop, the dispersion/threshold math) is untouched by
+    /// I1/I2, so this exists only to carry the oracle call through the exact
+    /// same survivor-compaction loop the production routine runs.
+    fn reject_linear_fit_oracle<T: Sample>(
+        values: &mut [T],
+        sigma_low: f64,
+        sigma_high: f64,
+    ) -> (usize, bool) {
+        let n = values.len();
+        if n < 3 {
+            return (n, false);
+        }
+        sort_asc(values);
+        let mut kept = n;
+        let mut warm_start_b: Option<f64> = None;
+        let mut scratch: Vec<f64> = Vec::new();
+        for _ in 0..MAX_REJECTION_ITERS {
+            let k = kept;
+            if k < 2 {
+                break;
+            }
+            let kf = k as f64;
+            scratch.clear();
+            scratch.extend(values[..k].iter().map(|s| s.value() as f64));
+            let (a, b) = medfit_line_oracle(&scratch, warm_start_b);
+            warm_start_b = Some(b);
+
+            let mut abs_sum = 0.0;
+            let mut sabs_y = 0.0;
+            for (i, &y) in scratch.iter().enumerate() {
+                let resid = y - (a + b * i as f64);
+                abs_sum += resid.abs();
+                sabs_y += y.abs();
+            }
+            let adev = abs_sum / kf;
+            let s = LINEAR_FIT_SIGMA_SCALE * 2.0 * adev;
+            let scale = (sabs_y / kf).max(1.0);
+            if adev <= 1e-9 * scale {
+                break;
+            }
+            let lo = -sigma_low * s;
+            let hi = sigma_high * s;
+            let mut w = 0usize;
+            for i in 0..k {
+                let resid = values[i].value() as f64 - (a + b * i as f64);
+                if resid >= lo && resid <= hi {
+                    values[w] = values[i];
+                    w += 1;
+                }
+            }
+            if w == kept {
+                break;
+            }
+            if w == 0 {
+                break;
+            }
+            kept = w;
+        }
+        (kept, true)
+    }
+
+    /// I1/I2: `medfit_line` bit-identical to [`medfit_line_oracle`] over
+    /// 1 000 seeded random stacks, sizes 8..207 (the audit's own n range),
+    /// including duplicated/tied values (every third stack is built with
+    /// heavy quantization so ties are common) and a warm-started second
+    /// call (mirrors `reject_linear_fit`'s own usage).
+    #[test]
+    fn medfit_line_matches_the_pre_task_9_oracle_bit_for_bit() {
+        for seed in 0..1000u64 {
+            let mut rng = SplitMix64(0xD1B5_4A32_D192_ED03 ^ seed);
+            let n = 8 + (rng.next_u64() % 200) as usize; // 8..=207
+            let quantize = seed % 3 == 0;
+            let values: Vec<f64> = (0..n)
+                .map(|_| {
+                    let raw = 100.0 + 5.0 * next_gaussian(&mut rng);
+                    if quantize {
+                        (raw / 2.0).round() * 2.0 // coarse quantization: frequent ties
+                    } else {
+                        raw
+                    }
+                })
+                .collect();
+
+            let cold = medfit_line(&values, None);
+            let cold_oracle = medfit_line_oracle(&values, None);
+            assert_eq!(
+                (cold.0.to_bits(), cold.1.to_bits()),
+                (cold_oracle.0.to_bits(), cold_oracle.1.to_bits()),
+                "seed {seed} n {n} (cold): {cold:?} vs oracle {cold_oracle:?}"
+            );
+
+            // A warm-started second call, exactly as `reject_linear_fit`
+            // chains iterations — the seed comes from the cold call's own
+            // converged slope, so it must be identical too for this to be a
+            // meaningful second check rather than a repeat of the first.
+            let warm = medfit_line(&values, Some(cold.1));
+            let warm_oracle = medfit_line_oracle(&values, Some(cold_oracle.1));
+            assert_eq!(
+                (warm.0.to_bits(), warm.1.to_bits()),
+                (warm_oracle.0.to_bits(), warm_oracle.1.to_bits()),
+                "seed {seed} n {n} (warm): {warm:?} vs oracle {warm_oracle:?}"
+            );
+        }
+    }
+
+    /// I1/I2 on NaN-carrying input: `values` containing a NaN makes `chisq`
+    /// (and therefore `sigma_b`) NaN in BOTH the production function and the
+    /// oracle, so `!(sigma_b > 0.0)` is true and both return `(a_ls, b_ls)`
+    /// WITHOUT ever calling `rofunc` — I1/I2 touch nothing on this path, and
+    /// the pin proves it stays that way (a future change to the pre-`rofunc`
+    /// guard would be caught here).
+    #[test]
+    fn medfit_line_matches_the_oracle_on_nan_carrying_input() {
+        let cases: [&[f64]; 3] = [
+            &[1.0, 2.0, f64::NAN, 4.0, 5.0],
+            &[f64::NAN, f64::NAN, f64::NAN],
+            &[1.0, 2.0, 3.0, 4.0, f64::NAN, 6.0, 7.0, 8.0],
+        ];
+        for values in cases {
+            let a = medfit_line(values, None);
+            let b = medfit_line_oracle(values, None);
+            assert_eq!(
+                (a.0.to_bits(), a.1.to_bits()),
+                (b.0.to_bits(), b.1.to_bits()),
+                "{values:?}: {a:?} vs oracle {b:?}"
+            );
+        }
+    }
+
+    /// I1/I2 transitively, through `reject_linear_fit`: bit-identical
+    /// survivor count AND the exact same VALUES surviving, over 500 seeded
+    /// random `f32` stacks with a planted contaminated tail (so the
+    /// rejection loop actually iterates and calls `medfit_line` more than
+    /// once, exercising the warm start too).
+    #[test]
+    fn reject_linear_fit_matches_the_pre_task_9_oracle() {
+        for seed in 0..500u64 {
+            let mut rng = SplitMix64(0xA5A5_1234_5678_9ABC ^ seed);
+            let n = 20 + (rng.next_u64() % 188) as usize; // 20..=207
+            let mut values: Vec<f32> = (0..n)
+                .map(|_| (100.0 + 5.0 * next_gaussian(&mut rng)) as f32)
+                .collect();
+            // A handful of high outliers, same shape as the discrimination
+            // fixture above.
+            let n_out = 1 + (rng.next_u64() % 5) as usize;
+            for k in 0..n_out.min(n) {
+                values[k] = 300.0 + 10.0 * k as f32;
+            }
+
+            let mut a = values.clone();
+            let mut b = values;
+            let (kept_a, sorted_a) = reject_linear_fit(&mut a, 5.0, 3.5);
+            let (kept_b, sorted_b) = reject_linear_fit_oracle(&mut b, 5.0, 3.5);
+            assert_eq!(kept_a, kept_b, "seed {seed} n {n}: survivor count");
+            assert_eq!(sorted_a, sorted_b, "seed {seed} n {n}: sorted flag");
+            let bits_a: Vec<u32> = a[..kept_a].iter().map(|v| v.to_bits()).collect();
+            let bits_b: Vec<u32> = b[..kept_b].iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                bits_a, bits_b,
+                "seed {seed} n {n}: survivor values (bit-for-bit)"
+            );
+        }
+    }
+
+    /// I5: `combine_pixel_weighted`'s third return value is `true` exactly
+    /// for the rejection kinds whose survivors are known ascending by value
+    /// (every algorithm but `None`/`SigmaClip`, which never sort `work`),
+    /// and only once at least one sample survives.
+    #[test]
+    fn combine_pixel_weighted_reports_sortedness_per_rejection_kind() {
+        let make_work = || -> Vec<(f32, u16)> {
+            (0..24u16)
+                .map(|i| {
+                    (
+                        100.0 + (i % 7) as f32 + if i == 20 { 500.0 } else { 0.0 },
+                        i,
+                    )
+                })
+                .collect()
+        };
+        let out_values: Vec<f32> = (0..24).map(|i| 100.0 + (i % 7) as f32).collect();
+        let weights = vec![1.0f32; 24];
+        let cases: [(Rejection, bool); 7] = [
+            (Rejection::None, false),
+            (
+                Rejection::SigmaClip {
+                    sigma_low: 3.0,
+                    sigma_high: 3.0,
+                },
+                false,
+            ),
+            (
+                Rejection::PercentileClip {
+                    low: 0.1,
+                    high: 0.1,
+                },
+                true,
+            ),
+            (
+                Rejection::WinsorizedSigma {
+                    sigma_low: 3.0,
+                    sigma_high: 3.0,
+                },
+                true,
+            ),
+            (
+                Rejection::LinearFitClip {
+                    sigma_low: 5.0,
+                    sigma_high: 3.5,
+                },
+                true,
+            ),
+            (Rejection::MinMax { low: 1, high: 1 }, true),
+            (Rejection::Rcr { limit: 0.5 }, true),
+        ];
+        for (rejection, expect_sorted) in cases {
+            let mut work = make_work();
+            let mut mask = vec![0u64; mask_words(24)];
+            let mut scratch = Vec::new();
+            let (_, rejected, sorted) = combine_pixel_weighted(
+                &mut work,
+                &out_values,
+                &weights,
+                IntegrationRecipe::average(rejection),
+                &mut mask,
+                &mut scratch,
+            );
+            assert_eq!(
+                sorted, expect_sorted,
+                "{rejection:?}: sorted flag (rejected {rejected})"
+            );
+            if sorted {
+                let kept = work.len() - rejected;
+                assert!(
+                    work[..kept].windows(2).all(|w| w[0].0 <= w[1].0),
+                    "{rejection:?}: work[..kept] must be ascending by value when sorted=true"
+                );
+            }
+        }
+    }
     // ── WinsorizedSigma & PercentileClip carried over ───────────────────────
 
     #[test]
@@ -2542,7 +2957,7 @@ mod tests {
                     stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
                 let weights = vec![1.0f32; n];
                 let mut mask = vec![0u64; mask_words(n)];
-                let (v_w, rej_w) = combine_pixel_weighted(
+                let (v_w, rej_w, _) = combine_pixel_weighted(
                     &mut work,
                     &stack,
                     &weights,
@@ -2569,7 +2984,7 @@ mod tests {
         let mut work: Vec<(f32, u16)> = stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
         let weights = [3.0f32, 1.0, 1.0, 0.0];
         let mut mask = vec![0u64; 1];
-        let (v, rej) = combine_pixel_weighted(
+        let (v, rej, _) = combine_pixel_weighted(
             &mut work,
             &stack,
             &weights,
@@ -2588,7 +3003,7 @@ mod tests {
         let mut work: Vec<(f32, u16)> = stack.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
         let weights = [1.0f32, 100.0, 1.0, 1.0, 1.0];
         let mut mask = vec![0u64; 1];
-        let (v, rej) = combine_pixel_weighted(
+        let (v, rej, _) = combine_pixel_weighted(
             &mut work,
             &stack,
             &weights,
@@ -2609,7 +3024,7 @@ mod tests {
         let mut work: Vec<(f32, u16)> = rej.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
         let weights = [1.0f32; 5];
         let mut mask = vec![0u64; 1];
-        let (v, rejected) = combine_pixel_weighted(
+        let (v, rejected, _) = combine_pixel_weighted(
             &mut work,
             &out,
             &weights,
@@ -2636,7 +3051,7 @@ mod tests {
             &mut plain,
             IntegrationRecipe::average(Rejection::PercentileClip { low: 0.0, high: 0.0 }),
         );
-        let (v, r) = combine_pixel_weighted(
+        let (v, r, _) = combine_pixel_weighted(
             &mut work,
             &stack,
             &weights,

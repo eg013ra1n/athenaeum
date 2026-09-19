@@ -528,7 +528,7 @@ mod tests {
                 out.iter().enumerate().map(|(i, &v)| (v, i as u16)).collect();
             let weights = vec![1.0f32; n];
             let mut mask = vec![0u64; mask_words(n)];
-            let (_, rejected) = combine_pixel_weighted(
+            let (_, rejected, _) = combine_pixel_weighted(
                 &mut work,
                 &out,
                 &weights,

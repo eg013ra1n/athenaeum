@@ -12,6 +12,7 @@ use super::source::{FrameSource, RejectionBitSink, RejectionBitSource};
 use super::stats::NormalizationPair;
 use super::storage_class::StorageClass;
 use super::IntegrationError;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -668,10 +669,64 @@ impl Drop for LeafCpuTimer<'_> {
 /// pointers refilled once per row, empty when no forced source is present.
 /// `_leaf_timer` (perf tier A Task 0) exists only for its `Drop` — nothing
 /// in `process_row` ever reads it.
+///
+/// Perf tier A Task 9 (I5, audit §3.3): `local`'s `a_row`/`b_row` buffers
+/// (`width` floats each, one pair per LN-active frame) used to be a fresh
+/// `vec![0f32; width]` × 2 on EVERY leaf `init_row_state` built — the audit
+/// measured 10.4 MB per leaf here on an LN-on set, ≈0.5 M page faults per
+/// plane, since `for_each_init`'s `init` runs once per rayon LEAF, not once
+/// per OS thread (a plane's leaves far outnumber the pool's threads). `Drop`
+/// below hands those two buffers back to [`LN_ROW_BUFFERS`], this THREAD's
+/// own pool, so the next leaf the SAME thread draws (`for_each_init` never
+/// migrates a leaf's `T` to another thread) reuses the allocation instead of
+/// paying for a fresh one. Pure scratch either way — see `LN_ROW_BUFFERS`'s
+/// doc for why no stale content can ever be read.
 struct RowState<'f, 'p, 'c> {
     local: Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)>,
     forced_rows: Vec<Option<&'p [u64]>>,
     _leaf_timer: LeafCpuTimer<'c>,
+}
+
+thread_local! {
+    /// Perf tier A Task 9 (I5): this OS thread's own pool of LN row buffers
+    /// (`a_row`, `b_row`), one `(Vec<f32>, Vec<f32>)` per position in
+    /// `local_factories` — the SAME fixed order every leaf of one
+    /// `integrate_stack` call builds `RowState::local` in, so a pool slot
+    /// always corresponds to the same LN-active frame within one call.
+    /// `RowState`'s `Drop` impl returns a leaf's buffers here; the next
+    /// `init_row_state` call on this thread (the same plane, a later band,
+    /// or even a later plane/call — the buffers carry no lifetime, only
+    /// their length matters) takes them back out. Safe to reuse blindly:
+    /// `LnGrid::evaluate_row_into` (`stacking/ln/grid.rs`) unconditionally
+    /// overwrites every element of both rows (`a_row[x] = va; b_row[x] =
+    /// vb;` for every `x` in `0..ref_width`) before `process_row` ever
+    /// reads a single element back out — no value survives a leaf, only
+    /// the heap allocation does. `resize` (not `clear` + `resize`) is
+    /// enough for the same reason: growing zero-fills the new tail, but
+    /// nothing reads it before `evaluate_row_into` overwrites it either.
+    static LN_ROW_BUFFERS: RefCell<Vec<(Vec<f32>, Vec<f32>)>> = RefCell::new(Vec::new());
+}
+
+impl Drop for RowState<'_, '_, '_> {
+    fn drop(&mut self) {
+        // Perf tier A Task 9 (I5): give this leaf's LN row buffers back to
+        // this thread's own pool — skipped entirely (no thread-local touch
+        // at all) when this call has no LN factories, i.e. every Plan 4 /
+        // non-LN caller, since `self.local` is then always empty.
+        if self.local.is_empty() {
+            return;
+        }
+        LN_ROW_BUFFERS.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            for (k, (_, _, a_row, b_row)) in self.local.drain(..).enumerate() {
+                if k < pool.len() {
+                    pool[k] = (a_row, b_row);
+                } else {
+                    pool.push((a_row, b_row));
+                }
+            }
+        });
+    }
 }
 
 /// Per-frame inputs of the stacking path, all indexed by the source's frame order.
@@ -981,12 +1036,32 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         // rest of the worker's state instead of once per row. Empty (no
         // allocation at all) when no forced source is present, which is
         // every first-pass caller.
+        //
+        // Perf tier A Task 9 (I5): `a_row`/`b_row` are drawn from this
+        // thread's own `LN_ROW_BUFFERS` pool instead of freshly allocated —
+        // see that thread_local's doc and `RowState`'s `Drop` impl for the
+        // reuse contract. `local_factories`' order (and therefore each
+        // entry's pool slot) is fixed for the whole `integrate_stack` call.
         let init_row_state = || -> RowState<'f, 'p, '_> {
-            RowState {
-                local: local_factories
+            let local = LN_ROW_BUFFERS.with(|cell| {
+                let mut pool = cell.borrow_mut();
+                local_factories
                     .iter()
-                    .map(|&(i, factory)| (i, factory(), vec![0f32; width], vec![0f32; width]))
-                    .collect(),
+                    .enumerate()
+                    .map(|(k, &(i, factory))| {
+                        let (mut a_row, mut b_row) = if k < pool.len() {
+                            std::mem::replace(&mut pool[k], (Vec::new(), Vec::new()))
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        a_row.resize(width, 0.0);
+                        b_row.resize(width, 0.0);
+                        (i, factory(), a_row, b_row)
+                    })
+                    .collect()
+            });
+            RowState {
+                local,
                 forced_rows: if params.forced_rejection.is_some() {
                     vec![None; n]
                 } else {
@@ -1262,7 +1337,7 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             }
                         }
                     } else {
-                        let (val, rej_count) = combine::combine_pixel_weighted(
+                        let (val, rej_count, work_sorted) = combine::combine_pixel_weighted(
                             &mut work,
                             &out_vals,
                             params.weights,
@@ -1299,11 +1374,33 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             // survivors' median (all rejected → the median of
                             // every present value).
                             let kept = work.len() - rej_count;
-                            scratch.clear();
-                            let source = if kept > 0 { &work[..kept] } else { &work[..] };
-                            scratch.extend(source.iter().map(|&(v, _)| v));
-                            scratch.sort_by(|a, b| a.total_cmp(b));
-                            let median = scratch[scratch.len() / 2];
+                            // Perf tier A Task 9 (I5, audit §3.3): this
+                            // "median" has always been a plain positional
+                            // read — `scratch[scratch.len() / 2]`, no
+                            // odd/even averaging — of the SAME values
+                            // `work[..kept]` already holds. When
+                            // `combine_pixel_weighted` reports that prefix
+                            // already ascending by value (`work_sorted`,
+                            // true for every rejection algorithm but
+                            // `None`/`SigmaClip`, and only once something
+                            // survived), that read is `work[kept / 2].0`
+                            // directly — no second copy, no second sort.
+                            // `None`/`SigmaClip` (survivors stay in
+                            // push — i.e. frame-index — order, never
+                            // value order) and the forced-only/all-rejected
+                            // case (`kept == 0`, full `work` instead of a
+                            // prefix, no sortedness promised) keep the
+                            // original path: copy the relevant values out,
+                            // sort them, and read the same position.
+                            let median = if work_sorted && kept > 0 {
+                                work[kept / 2].0
+                            } else {
+                                scratch.clear();
+                                let source = if kept > 0 { &work[..kept] } else { &work[..] };
+                                scratch.extend(source.iter().map(|&(v, _)| v));
+                                scratch.sort_by(|a, b| a.total_cmp(b));
+                                scratch[scratch.len() / 2]
+                            };
                             for i in 0..n {
                                 if combine::mask_get(&present, i) && !combine::mask_get(&mask, i) {
                                     row_rejected[i] += 1;

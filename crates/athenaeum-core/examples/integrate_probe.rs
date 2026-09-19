@@ -551,6 +551,21 @@ fn frame_entry_shell(
 }
 
 fn main() {
+    // Perf tier A Task 9 measurement: same pattern as `measure_probe`'s and
+    // `register_probe`'s `main()` (Task 2) — the per-plane "plane
+    // integrated" event (`combine_cpu_ms`, `rejection_iters_mean`,
+    // `medfit_evals_mean`, emitted by `integration::engine`) is silent
+    // without a subscriber; examples carry none by default (library code
+    // must not install one). Installed only when `RUST_LOG` is actually
+    // set, so a plain run stays quiet and the probe's JSON keeps going to
+    // stdout unmixed; the subscriber writes to stderr.
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let program_start = Instant::now();
     let args = parse_args();
 
