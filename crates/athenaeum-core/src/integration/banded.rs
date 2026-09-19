@@ -49,6 +49,23 @@ impl PlaneKind {
         }
     }
 
+    /// Whether a band of this kind is decoded ONCE into an f32 lane at fill
+    /// time instead of once per sample on every read (Tier A Task 7, W3).
+    /// `F32Be`/`F32Le` are the two kinds a real stacking run reads over and
+    /// over per band — a materialized registered frame or a plain float32
+    /// calibrated/precal FITS (`F32Be`), and a `RegisteredSource` warp or
+    /// the decode-and-spill scratch (`F32Le`) — where every rejection pass
+    /// used to re-run `decode`/`decode_run`'s byte-swap-and-scale on the
+    /// same bytes. The narrower/scaled integer kinds and `F64Be` stay on
+    /// the raw-byte-buffer path unchanged: they are read far less often in
+    /// practice (raw camera subs, not the per-band-per-pass float hot loop)
+    /// and `decode_run`'s widening cast is already "nearly free" there (see
+    /// [`BandPlanes`]'s own doc comment).
+    #[inline]
+    fn is_lane(self) -> bool {
+        matches!(self, PlaneKind::F32Be { .. } | PlaneKind::F32Le)
+    }
+
     #[inline]
     fn decode(self, b: &[u8], idx: usize) -> f32 {
         match self {
@@ -695,14 +712,31 @@ impl BandSource {
         // thread, which would otherwise turn a bare single-frame read into a
         // new panic path for zero parallelism gained.
         if workers == 1 {
-            for (reader, buf) in self.readers.iter().zip(out.bufs.iter_mut()) {
+            // One reused raw-bytes scratch for every lane-kind (`F32Be`/
+            // `F32Le`) frame in the band — Task 7 (Tier A W3): the pread
+            // still needs a `&mut [u8]` destination, but the decode runs
+            // ONCE here instead of once per sample on every later read, and
+            // the scratch itself is dropped at the end of this call, never
+            // held alongside the lane (see [`BandPlanes`]'s doc comment).
+            let mut raw_scratch: Vec<u8> = Vec::new();
+            for (i, reader) in self.readers.iter().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(IntegrationError::Cancelled);
                 }
                 let bpp = reader.kind().bytes_per_sample();
-                buf.resize(rows * w * bpp, 0u8);
-                reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
-                on_bytes((rows * w * bpp) as u64);
+                let need = rows * w * bpp;
+                if reader.kind().is_lane() {
+                    raw_scratch.resize(need, 0u8);
+                    reader.read_exact_at(&mut raw_scratch, (y0 * w * bpp) as u64)?;
+                    let lane = &mut out.lanes[i];
+                    lane.resize(rows * w, 0.0);
+                    reader.kind().decode_run(&raw_scratch[..need], 0, lane);
+                } else {
+                    let buf = &mut out.bufs[i];
+                    buf.resize(need, 0u8);
+                    reader.read_exact_at(buf, (y0 * w * bpp) as u64)?;
+                }
+                on_bytes(need as u64);
             }
             return Ok(());
         }
@@ -711,7 +745,14 @@ impl BandSource {
         // `round_robin_groups`'s doc comment. Always produces exactly
         // `workers` non-empty groups here (having passed the `workers == 1`
         // fast path above, and `workers` never exceeds `n`).
-        let groups = round_robin_groups(self.readers.iter().zip(out.bufs.iter_mut()), workers);
+        let groups = round_robin_groups(
+            self.readers
+                .iter()
+                .zip(out.bufs.iter_mut())
+                .zip(out.lanes.iter_mut())
+                .map(|((reader, buf), lane)| (reader, buf, lane)),
+            workers,
+        );
 
         let abort = AtomicBool::new(false);
         let abort = &abort;
@@ -729,7 +770,13 @@ impl BandSource {
             let mut handles = Vec::with_capacity(workers);
             for group in groups {
                 handles.push(scope.spawn(move || -> Result<(), IntegrationError> {
-                    for (reader, buf) in group {
+                    // This worker's own raw-bytes scratch (Task 7, Tier A
+                    // W3) — reused across every lane-kind frame in its
+                    // group, same "per-WORKER pair, grown, never freed"
+                    // convention `RegisteredSource::fill_frame` already
+                    // established for its own raw/src scratch pair.
+                    let mut raw_scratch: Vec<u8> = Vec::new();
+                    for (reader, buf, lane) in group {
                         if cancel.load(Ordering::Relaxed) {
                             saw_cancel.store(true, Ordering::Relaxed);
                             return Ok(());
@@ -738,12 +785,25 @@ impl BandSource {
                             return Ok(());
                         }
                         let bpp = reader.kind().bytes_per_sample();
-                        buf.resize(rows * w * bpp, 0u8);
-                        if let Err(e) = reader.read_exact_at(buf, (y0 * w * bpp) as u64) {
-                            abort.store(true, Ordering::Relaxed);
-                            return Err(e.into());
+                        let need = rows * w * bpp;
+                        if reader.kind().is_lane() {
+                            raw_scratch.resize(need, 0u8);
+                            if let Err(e) =
+                                reader.read_exact_at(&mut raw_scratch, (y0 * w * bpp) as u64)
+                            {
+                                abort.store(true, Ordering::Relaxed);
+                                return Err(e.into());
+                            }
+                            lane.resize(rows * w, 0.0);
+                            reader.kind().decode_run(&raw_scratch[..need], 0, lane);
+                        } else {
+                            buf.resize(need, 0u8);
+                            if let Err(e) = reader.read_exact_at(buf, (y0 * w * bpp) as u64) {
+                                abort.store(true, Ordering::Relaxed);
+                                return Err(e.into());
+                            }
                         }
-                        on_bytes((rows * w * bpp) as u64);
+                        on_bytes(need as u64);
                     }
                     Ok(())
                 }));
@@ -788,8 +848,22 @@ impl BandSource {
 /// for the real, headroom-adjusted ratio), i.e. fewer read rounds. The
 /// widening happens per sample inside the parallel combine, where it is
 /// nearly free.
+///
+/// Per-frame band storage is one of two representations, chosen once per
+/// frame by `PlaneKind::is_lane` and never both at once for the same
+/// frame (Task 7, Tier A W3): `bufs[frame]` — the source's own raw bytes,
+/// decoded per sample/run by `PlaneKind::decode`/`decode_run` exactly as
+/// before — for every kind that stays on the old path, and `lanes[frame]`
+/// — already-decoded f32 — for `F32Be`/`F32Le`, filled ONCE per band
+/// (`BandSource::read_band_with_progress`'s lane arm, or
+/// `RegisteredSource::read_band_with_progress`'s `put_lane`, which already
+/// had the f32 in hand from `fill_frame` and no longer round-trips it
+/// through bytes to get it there). A lane-kind frame's `bufs[frame]` is
+/// left permanently empty (0 length, 0 capacity) — the two never grow
+/// together, so this costs no more memory than the byte buffer alone did.
 pub struct BandPlanes {
     bufs: Vec<Vec<u8>>,
+    lanes: Vec<Vec<f32>>,
     kinds: Vec<PlaneKind>,
     width: usize,
     rows: usize,
@@ -806,7 +880,12 @@ impl BandPlanes {
     /// One decoded sample. `idx` is `row_in_band * width + x`.
     #[inline]
     pub fn sample(&self, frame: usize, idx: usize) -> f32 {
-        self.kinds[frame].decode(&self.bufs[frame], idx)
+        let kind = self.kinds[frame];
+        if kind.is_lane() {
+            self.lanes[frame][idx]
+        } else {
+            kind.decode(&self.bufs[frame], idx)
+        }
     }
 
     /// Every frame's samples for one row of the band, frame-major:
@@ -815,29 +894,48 @@ impl BandPlanes {
         let w = self.width;
         assert_eq!(dst.len(), self.frame_count() * w, "decode_row_into: dst must be frame_count * width");
         for (i, kind) in self.kinds.iter().enumerate() {
-            kind.decode_run(&self.bufs[i], row_in_band * w, &mut dst[i * w..(i + 1) * w]);
+            let out = &mut dst[i * w..(i + 1) * w];
+            if kind.is_lane() {
+                out.copy_from_slice(&self.lanes[i][row_in_band * w..row_in_band * w + w]);
+            } else {
+                kind.decode_run(&self.bufs[i], row_in_band * w, out);
+            }
         }
     }
 
     /// One frame's whole band. `dst.len()` must be `rows * width`.
     pub fn decode_frame_into(&self, frame: usize, dst: &mut [f32]) {
         assert_eq!(dst.len(), self.rows * self.width, "decode_frame_into: dst must be rows * width");
-        self.kinds[frame].decode_run(&self.bufs[frame], 0, dst);
+        let kind = self.kinds[frame];
+        if kind.is_lane() {
+            dst.copy_from_slice(&self.lanes[frame]);
+        } else {
+            kind.decode_run(&self.bufs[frame], 0, dst);
+        }
     }
 
     /// A band buffer set for a source that is not a `BandSource` (a
     /// resampling source hands in its own per-frame kinds — always
     /// `PlaneKind::F32Le`, the native little-endian f32 it writes).
     pub(crate) fn with_kinds(kinds: Vec<PlaneKind>, width: usize) -> BandPlanes {
-        BandPlanes { bufs: vec![Vec::new(); kinds.len()], kinds, width, rows: 0 }
+        let n = kinds.len();
+        BandPlanes { bufs: vec![Vec::new(); n], lanes: vec![Vec::new(); n], kinds, width, rows: 0 }
     }
 
     pub(crate) fn width(&self) -> usize { self.width }
 
     pub(crate) fn set_rows(&mut self, rows: usize) { self.rows = rows; }
 
-    /// One frame's raw band buffer, for a source that fills it itself.
-    pub(crate) fn buf_mut(&mut self, frame: usize) -> &mut Vec<u8> { &mut self.bufs[frame] }
+    /// One frame's already-decoded band, moved in whole (Task 7, Tier A
+    /// W3) — `RegisteredSource::read_band_with_progress` calls this with
+    /// the f32 samples `fill_frame` already produced (a materialized read
+    /// or a warp, both f32-native), so the value never passes through
+    /// bytes to get here. `data.len()` must be `rows() * width()`; not
+    /// checked here (a `debug_assert` in the one caller is enough — this
+    /// is `pub(crate)`, not part of the public band-source contract).
+    pub(crate) fn put_lane(&mut self, frame: usize, data: Vec<f32>) {
+        self.lanes[frame] = data;
+    }
 }
 
 #[cfg(test)]
@@ -1071,6 +1169,164 @@ mod tests {
         planes.decode_frame_into(0, &mut whole);
         for i in 0..4 * 32 {
             assert_eq!(whole[i], planes.sample(0, i), "sample {i}");
+        }
+    }
+
+    /// Task 7 (Tier A W3) pin, written against the UNCHANGED code first:
+    /// `F32Be`'s band is now decoded ONCE into an f32 lane at fill time
+    /// (`BandSource::read_band_with_progress`'s lane arm) instead of once
+    /// per sample on every `sample`/`decode_row_into`/`decode_frame_into`
+    /// call. The oracle here is `PlaneKind::decode` called directly on the
+    /// file's own raw bytes — a function this task does not touch — so a
+    /// match proves the lane reproduces exactly what the untouched
+    /// per-sample decode always has, `to_bits`, for a spread of
+    /// pathological bit patterns a real calibrated/materialized frame can
+    /// legally carry: signed zero, ±Inf, a quiet AND a signalling NaN (with
+    /// a nonzero payload, positive and negative), the smallest and largest
+    /// subnormals, and the f32 extremes — plus ordinary values. Two rows,
+    /// the second a reversal of the first, so `decode_run`'s row-stride
+    /// indexing is exercised too, not just sample 0 of a single row.
+    #[test]
+    fn f32be_lane_matches_direct_decode_for_pathological_bit_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let patterns: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_0001), // quiet NaN, payload 1
+            f32::from_bits(0x7f80_0001), // signalling NaN, payload 1
+            f32::from_bits(0xffc0_0001), // negative quiet NaN, payload 1
+            f32::from_bits(0x0000_0001), // smallest positive subnormal
+            f32::from_bits(0x8000_0001), // smallest negative subnormal
+            f32::from_bits(0x007f_ffff), // largest subnormal
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            1.0,
+            -1.0,
+            12345.625,
+            -876.5,
+        ];
+        let w = patterns.len();
+        let h = 2;
+        let mut data = vec![0f32; w * h];
+        data[..w].copy_from_slice(&patterns);
+        for (x, &v) in patterns.iter().rev().enumerate() {
+            data[w + x] = v;
+        }
+        let path = f32_fixture(dir.path(), "pathological.fits", w, h, |x, y| data[y * w + x]);
+
+        let src = BandSource::open(&[path.clone()], dir.path(), 1).unwrap();
+        let mut planes = BandPlanes::new(&src);
+        src.read_band(0, h, &mut planes, 1).unwrap();
+
+        // The oracle: decode the file's own raw bytes directly, bypassing
+        // `BandPlanes`/the lane entirely — `probe_fits`/`plane_kind_for_bitpix`/
+        // `PlaneKind::decode` are all untouched by this task.
+        let (_, info) = probe_fits(&path).unwrap();
+        let kind = plane_kind_for_bitpix(info.bitpix, info.bzero, info.bscale);
+        assert!(kind.is_lane(), "fixture must exercise the lane path — got {kind:?}");
+        let raw = std::fs::read(&path).unwrap();
+        let raw_data = &raw[info.data_offset as usize..];
+
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                let want = kind.decode(raw_data, idx);
+                let got = planes.sample(0, idx);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "sample ({x},{y}): lane bit pattern {:#x} != direct-decode bit pattern {:#x}",
+                    got.to_bits(),
+                    want.to_bits(),
+                );
+            }
+        }
+
+        // decode_row_into / decode_frame_into must agree bit-for-bit too —
+        // not just the scalar `sample()` path.
+        let mut row = vec![0f32; w];
+        for y in 0..h {
+            planes.decode_row_into(y, &mut row);
+            for x in 0..w {
+                assert_eq!(row[x].to_bits(), planes.sample(0, y * w + x).to_bits(), "decode_row_into ({x},{y})");
+            }
+        }
+        let mut whole = vec![0f32; w * h];
+        planes.decode_frame_into(0, &mut whole);
+        for i in 0..w * h {
+            assert_eq!(whole[i].to_bits(), planes.sample(0, i).to_bits(), "decode_frame_into sample {i}");
+        }
+    }
+
+    /// Task 7 (Tier A W3) pin for the OTHER lane producer:
+    /// `RegisteredSource::read_band_with_progress` no longer encodes its
+    /// already-decoded f32 samples to little-endian bytes just to have
+    /// `BandPlanes` decode them straight back (`put_lane` moves the f32
+    /// `Vec` in directly) — this pins `put_lane`'s contract in isolation,
+    /// at the `BandPlanes`/`PlaneKind::F32Le` level, with no disk I/O and
+    /// no dependency on `RegisteredSource`'s own warp/materialize
+    /// machinery: whatever comes back from `sample`/`decode_row_into`/
+    /// `decode_frame_into` for an `F32Le` frame is bit-for-bit what was
+    /// put in, for the same pathological patterns as the `F32Be` pin above
+    /// (`F32Le`'s `decode` has no bzero/bscale arithmetic at all — pure
+    /// byte reassembly — so this is the direct check that `put_lane`
+    /// itself introduces no transformation, not even one `decode` would
+    /// have been a no-op for).
+    #[test]
+    fn f32le_lane_put_directly_round_trips_bit_for_bit() {
+        let patterns: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0xffc0_0001),
+            f32::from_bits(0x0000_0001),
+            f32::from_bits(0x8000_0001),
+            f32::from_bits(0x007f_ffff),
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            1.0,
+            -1.0,
+            12345.625,
+            -876.5,
+        ];
+        let w = patterns.len();
+        let h = 2;
+        let mut data = vec![0f32; w * h];
+        data[..w].copy_from_slice(&patterns);
+        for (x, &v) in patterns.iter().rev().enumerate() {
+            data[w + x] = v;
+        }
+
+        let mut planes = BandPlanes::with_kinds(vec![PlaneKind::F32Le], w);
+        planes.set_rows(h);
+        planes.put_lane(0, data.clone());
+
+        for i in 0..w * h {
+            assert_eq!(
+                planes.sample(0, i).to_bits(),
+                data[i].to_bits(),
+                "sample {i}: put_lane must round-trip bit-for-bit"
+            );
+        }
+
+        let mut row = vec![0f32; w];
+        for y in 0..h {
+            planes.decode_row_into(y, &mut row);
+            for x in 0..w {
+                assert_eq!(row[x].to_bits(), data[y * w + x].to_bits(), "decode_row_into ({x},{y})");
+            }
+        }
+        let mut whole = vec![0f32; w * h];
+        planes.decode_frame_into(0, &mut whole);
+        for i in 0..w * h {
+            assert_eq!(whole[i].to_bits(), data[i].to_bits(), "decode_frame_into sample {i}");
         }
     }
 

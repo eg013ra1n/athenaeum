@@ -461,13 +461,6 @@ impl Drop for RegisteredSource {
     }
 }
 
-fn store_f32_le(buf: &mut Vec<u8>, samples: &[f32]) {
-    buf.resize(samples.len() * 4, 0);
-    for (chunk, v) in buf.chunks_exact_mut(4).zip(samples.iter()) {
-        chunk.copy_from_slice(&v.to_le_bytes());
-    }
-}
-
 impl FrameSource for RegisteredSource {
     fn width(&self) -> usize {
         self.width
@@ -611,8 +604,15 @@ impl FrameSource for RegisteredSource {
                 return Err(IntegrationError::Cancelled);
             }
         }
-        for (i, s) in scratch.iter().enumerate() {
-            store_f32_le(out.buf_mut(i), s);
+        // Task 7 (Tier A W3): `fill_frame` already produced these as f32 —
+        // a materialized read decodes once via `PlaneReader::read_rows_
+        // with_scratch`, a warp is f32-native throughout `warp_rows` — so
+        // this used to encode them to little-endian bytes here just to
+        // have `BandPlanes::sample`/`decode_row_into`/`decode_frame_into`
+        // decode them straight back on every later read. `put_lane` moves
+        // each frame's already-decoded band in whole; no bytes, no copy.
+        for (i, s) in scratch.into_iter().enumerate() {
+            out.put_lane(i, s);
         }
         debug!(
             y0,
