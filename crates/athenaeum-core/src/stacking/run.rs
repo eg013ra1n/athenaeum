@@ -2307,20 +2307,27 @@ fn stage_forces_fresh(rerun_from: Option<Stage>, stage: Stage) -> bool {
 /// plane at a time, so the frame's own channel count (3 for this OSC
 /// frame) does not multiply in.
 pub(crate) const MEASURE_PLANES_RESIDENT: u64 = 8;
-/// Planes of one channel resident while `normalize_frame` runs: the warped
-/// target, `clean_plane`'s copy, the detector's scaled copy and the warp
-/// scratch. Kept analytic (perf tier 1 Task 3) — `ln_probe` builds the
-/// group's LN reference through the banded integration engine before it
-/// ever calls `normalize_frame`, and that reference build dominates the
-/// probe's own peak RSS, so the probe cannot isolate one frame's normalize
-/// working set. As an UPPER bound only: `ln_probe --db <copy of the dev
-/// catalog> --set 109 --group osc__NoFilter__bin1__180s --frames 3 --frame
-/// c_2025-09-14_00-55-28__-10.00_180.00s_0000_d` under `/usr/bin/time -l`,
-/// 2026-09-19, peak RSS ("maximum resident set size") 2,112,798,720 B —
-/// consistent with a 3-frame reference build (3 × 6248×4176×3-plane frames
-/// plus the banded engine's own scratch) dominating, not with a single
-/// channel's normalize.
-pub(crate) const LN_PLANES_RESIDENT: u64 = 4;
+/// Planes of one channel resident while `normalize_frame` runs: since Task
+/// 8 it keeps the `RegisteredSource` (its raw read scratch plus f32
+/// scratch) and the `BandPlanes` buffer alive across channels, plus
+/// `clean_plane`'s copy, the detector's ADU-scaled copy and rustafits' own
+/// internal maps during detection — the same shape
+/// `MEASURE_PLANES_RESIDENT` measured at 8 planes of one channel. Amended
+/// (perf tier 1 Task 3, amendment 2026-09-19) after the Task 10 acceptance
+/// run found the analytic 4 undercounted it: on the real OSC set (LDN
+/// 1272, 6248×4176, 16 GB / 10-core Mac) factor 4 admitted 10 Normalize
+/// workers for the OSC group (the pre-plan formula's own 6 did not swap),
+/// and the run swapped — `vm.swapusage` reported 10.4 GB of 11.3 GB used,
+/// per-frame `ln frame normalized` medians for that group rose from base
+/// warp 4.6 s / scale 9.6 s to 14.5 s / 19.3 s, and the whole Normalize
+/// stage took ≈ 19 min against the base's 12.5. Set to 8 to align with
+/// `MEASURE_PLANES_RESIDENT`'s measured value, so a 16 GB machine admits 4
+/// workers instead of 10. Still not directly measured with `/usr/bin/time
+/// -l` this cycle: `ln_probe` builds the group's LN reference through the
+/// banded integration engine before it ever calls `normalize_frame`, and
+/// that reference build dominates the probe's own peak RSS, so the probe
+/// cannot isolate one frame's normalize working set.
+pub(crate) const LN_PLANES_RESIDENT: u64 = 8;
 
 /// `MEASURE_PLANES_RESIDENT` planes of one w×h channel, in bytes — Measure's
 /// fan-out working set (perf tier 1 Task 3).
