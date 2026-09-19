@@ -25,13 +25,15 @@ pub enum Interpolation {
     MitchellNetravali,
 }
 
-/// One axis' taps for a sample position: `first` is the source index of
-/// tap 0, `w[..n]` the weights.
+/// One axis' tap placement for a sample position: `first` is the source
+/// index of tap 0, `n` the tap count (`= interp.taps()`). The weights
+/// themselves are written into the caller-owned buffer passed to
+/// [`taps_for`] — Task 6 (W1) dropped the embedded `[f32; 8]` so a call no
+/// longer returns (and the caller no longer copies) a 48-byte value.
 #[derive(Clone, Copy, Debug)]
 pub struct Taps {
     pub first: isize,
     pub n: usize,
-    pub w: [f32; 8],
 }
 
 impl Interpolation {
@@ -188,11 +190,12 @@ fn lanczos(d: f32, a: f32) -> f32 {
     sx * sxa
 }
 
-/// Taps for one axis at `coord` (0-based, integer = pixel centre).
-pub fn taps_for(interp: Interpolation, coord: f32) -> Taps {
+/// Taps for one axis at `coord` (0-based, integer = pixel centre). Writes
+/// the axis' weights into `w[..n]` (`n` = `interp.taps()`, the return
+/// value's `n`) and returns the tap placement.
+pub fn taps_for(interp: Interpolation, coord: f32, w: &mut [f32; 8]) -> Taps {
     let base = coord.floor();
     let frac = coord - base;
-    let mut w = [0f32; 8];
     let n = match interp {
         // Nearest rounds instead of flooring, so it carries its own base.
         Interpolation::Nearest => {
@@ -200,15 +203,13 @@ pub fn taps_for(interp: Interpolation, coord: f32) -> Taps {
             return Taps {
                 first: (coord + 0.5).floor() as isize,
                 n: 1,
-                w,
             };
         }
-        other => other.weights(frac, &mut w),
+        other => other.weights(frac, w),
     };
     Taps {
         first: base as isize + interp.first_tap_offset(),
         n,
-        w,
     }
 }
 
@@ -363,13 +364,14 @@ mod tests {
 
     #[test]
     fn taps_for_places_the_base_index() {
-        let t = taps_for(Interpolation::BicubicSpline, 10.25);
+        let mut w = [0f32; 8];
+        let t = taps_for(Interpolation::BicubicSpline, 10.25, &mut w);
         assert_eq!(t.first, 9); // floor(10.25) - 1
         assert_eq!(t.n, 4);
-        let t = taps_for(Interpolation::Lanczos3, 10.25);
+        let t = taps_for(Interpolation::Lanczos3, 10.25, &mut w);
         assert_eq!(t.first, 8); // floor - 2
         assert_eq!(t.n, 6);
-        let t = taps_for(Interpolation::Nearest, 10.75);
+        let t = taps_for(Interpolation::Nearest, 10.75, &mut w);
         assert_eq!(t.first, 11);
         assert_eq!(t.n, 1);
     }
