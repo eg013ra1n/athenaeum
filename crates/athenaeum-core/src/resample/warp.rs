@@ -775,6 +775,9 @@ mod tests {
             Interpolation::Lanczos3,
             Interpolation::Lanczos4,
             Interpolation::Bilinear,
+            Interpolation::BicubicSpline,
+            Interpolation::MitchellNetravali,
+            Interpolation::Nearest,
         ];
         for (label, linear) in canonical {
             let map = PixelMap::linear(linear).unwrap();
@@ -839,6 +842,9 @@ mod tests {
             Interpolation::Lanczos3,
             Interpolation::Lanczos4,
             Interpolation::Bilinear,
+            Interpolation::BicubicSpline,
+            Interpolation::MitchellNetravali,
+            Interpolation::Nearest,
         ] {
             let mut out = vec![0f32; rows * FW];
             warp_rows(&windowed, &map, FW, y0, rows, k, 0.3, &mut out);
