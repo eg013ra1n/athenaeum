@@ -1004,6 +1004,18 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     // via `words_per_row()` (checked equal above) — computed once here so
     // the band closure never calls back into the sink for it.
     let bit_words = w.div_ceil(64);
+    // Perf tier A Task 10: ONE `band_bits` buffer for the whole run, cap-sized
+    // like `map_low`/`map_high` above, instead of a fresh `vec![0u64; …]` per
+    // band — `None` (no allocation at all) when no sink was asked for, same
+    // "pays for nothing it didn't ask for" rule the comment below still
+    // states. Every write site only ever ORs a bit in (`bits[...] |= 1u64 <<
+    // ...`), never clears one, so the invariant this buffer depends on is
+    // "zero at the start of every band" — restored by the `fill(0)` right
+    // after each band's own `record_band` call below, checked by the
+    // `debug_assert!` right before that band's row loop starts.
+    let band_bits_buf: Option<std::sync::Mutex<Vec<u64>>> = params
+        .rejection_bits
+        .map(|_| std::sync::Mutex::new(vec![0u64; band_rows_cap * n * bit_words]));
 
     let stats = band_loop(src, pool, cancel, &progress, io, &mut out, &|job, tick| {
         let BandJob { planes, out_band, y0, rows, width } = job;
@@ -1455,23 +1467,45 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         // is no per-band bit buffer at all, not even a band-sized one, so a
         // caller that never asked for rejection bits (every Plan 4 / M2
         // caller) pays nothing for this field's existence.
+        //
+        // Perf tier A Task 10: `with_max_len(4)` on these two row-chunk
+        // iterators was tried and reverted — measured on `integrate_probe`
+        // (60 real mono frames, `--rejection linearFit --distortion off`,
+        // interleaved B/A/B/A/B/A brackets), it cost combine_ms +0.4–0.8 %
+        // and combine_cpu_ms +0.4–0.7 % on every one of three pairs, no
+        // overlap between the BEFORE and AFTER clusters — small, but a real
+        // measured loss, not noise (see the task's report). Rayon's default
+        // adaptive splitting already load-balances these bands (hundreds of
+        // rows per band on a real image) without help; forcing 4-row leaves
+        // just adds work-stealing overhead a per-row cost this large does
+        // not need. `band_bits` reuse below (no `with_max_len` involved)
+        // was NOT exercised by that probe run at all — it has no
+        // `rejection_bits` sink — so it is unmeasured by this benchmark;
+        // its own exactness holds regardless (see `band_bits_buf`'s doc).
         match params.rejection_bits {
             Some(sink) => {
-                // Fix round 1, M6: `rows * n * bit_words * 8` bytes, freshly
-                // allocated and zeroed once per band (not once per run, the
-                // way `map_low`/`map_high` above are — those get reused
-                // across bands via the outer `Mutex<Vec<_>>`; this one
-                // doesn't need to be, since it is fully consumed by
-                // `sink.record_band` before the next band starts). At 208
-                // frames, 6248px width and a ~98-row band this is ≈16 MB,
-                // reallocated ~40 times per plane — cheap next to a band's
-                // own combine, but it is peak RSS neither R-M3-7's `need`
-                // formula (drizzle's own memory refusal, Task 3) nor
-                // `stacking::paths::estimate_bytes`'s run-footprint estimate
-                // currently accounts for. Named here so whichever of those
-                // two Task 5/6 end up tightening does not have to
-                // rediscover it.
-                let mut band_bits = vec![0u64; rows * n * bit_words];
+                // Perf tier A Task 10: `band_bits_buf` is `Some` on every
+                // path that reaches this arm (it is built from the same
+                // `params.rejection_bits` this `match` is on, above) — one
+                // lock, one `rows * n * bit_words`-word slice of the per-run
+                // buffer, no fresh allocation per band any more. `fill(0)`
+                // after this band's own `record_band` call (below) restores
+                // the zero invariant for whichever band uses this slice
+                // next — the `debug_assert!` right here checks that the
+                // previous band (or the buffer's own zeroed initial
+                // allocation, for band 0) actually left it that way, since
+                // every per-pixel write site below only ever ORs a bit in
+                // and never clears one.
+                let mut bits_guard = band_bits_buf
+                    .as_ref()
+                    .expect("rejection_bits sink implies band_bits_buf")
+                    .lock()
+                    .unwrap();
+                let band_bits: &mut [u64] = &mut bits_guard[..rows * n * bit_words];
+                debug_assert!(
+                    band_bits.iter().all(|&word| word == 0),
+                    "band_bits must be zero at band start"
+                );
                 out_band
                     .par_chunks_mut(width)
                     .zip(low_band.par_chunks_mut(width))
@@ -1484,7 +1518,8 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             process_row(row_in_band, out_row, low_row, high_row, Some(bits_row), row_state);
                         },
                     );
-                sink.record_band(y0, rows, &band_bits)?;
+                sink.record_band(y0, rows, band_bits)?;
+                band_bits.fill(0);
             }
             None => {
                 out_band
@@ -3237,6 +3272,140 @@ mod tests {
             found,
             vec![(hot_idx, hot_y, hot_x)],
             "expected exactly one bit at (frame {hot_idx}, row {hot_y}, col {hot_x}): {found:?}"
+        );
+    }
+
+    /// Perf tier A Task 10: `band_bits` is now ONE buffer reused across every
+    /// band of a run (locked, sliced, `fill(0)`ed after each band's own
+    /// `record_band` call) instead of a fresh `vec![0u64; …]` per band — see
+    /// `band_bits_buf`'s doc in `integrate_stack`. This pins the invariant
+    /// that reuse depends on directly: a bit set in one band's slice must
+    /// never survive into the NEXT band that reuses the same buffer
+    /// positions. Two equal-sized bands (`h` an exact multiple of
+    /// `band_rows`, so band 1 reuses precisely the byte range band 0 used) —
+    /// a hot pixel at `row_in_band = 0` in band 0 only, nothing rejected
+    /// anywhere in band 1. A stale `fill(0)` (or one applied to the wrong
+    /// slice) would leak band 0's bit into band 1's report at the same
+    /// `(row_in_band, frame, word)` offset; this test fails release-mode
+    /// too, not just under `debug_assert!`.
+    #[test]
+    fn band_bits_buffer_is_zero_at_the_start_of_every_band() {
+        struct RecordingSink {
+            frames: usize,
+            words: usize,
+            calls: std::sync::Mutex<Vec<(usize, usize, Vec<u64>)>>,
+        }
+        impl RejectionBitSink for RecordingSink {
+            fn words_per_row(&self) -> usize {
+                self.words
+            }
+            fn frames(&self) -> usize {
+                self.frames
+            }
+            fn record_band(
+                &self,
+                y0: usize,
+                rows: usize,
+                bits: &[u64],
+            ) -> Result<(), IntegrationError> {
+                self.calls.lock().unwrap().push((y0, rows, bits.to_vec()));
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // w=16, n=4 frames of f32 ⇒ per_row = 16*4*4 + 16*8 = 384 bytes;
+        // io(4096) ⇒ band_rows = 4096/384 = 10. h=20 ⇒ exactly two 10-row
+        // bands, so band 1 reuses precisely the buffer range band 0 used.
+        let (w, h) = (16usize, 20usize);
+        let hot_idx = 3usize;
+        let (hot_x, hot_y) = (7usize, 0usize);
+        let paths = vec![
+            write(dir.path(), "a.fits", w, h, |_, _| 100.0),
+            write(dir.path(), "b.fits", w, h, |_, _| 100.0),
+            write(dir.path(), "c.fits", w, h, |_, _| 100.0),
+            write(dir.path(), "hot.fits", w, h, |x, y| {
+                if (x, y) == (hot_x, hot_y) {
+                    9000.0
+                } else {
+                    100.0
+                }
+            }),
+        ];
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 4];
+        let weights = vec![1.0f32; 4];
+        let recipe = IntegrationRecipe::average(Rejection::SigmaClip {
+            sigma_low: 3.0,
+            sigma_high: 1.0,
+        });
+        let sink = RecordingSink {
+            frames: 4,
+            words: w.div_ceil(64),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: false,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: Some(&sink),
+            forced_rejection: None,
+        };
+        let out = integrate_stack(
+            &src,
+            &params,
+            recipe,
+            &pool(),
+            &AtomicBool::new(false),
+            EngineProgress {
+                on_band: &nop(),
+                on_combine: &nop(),
+            },
+            io(4096),
+        )
+        .unwrap();
+        assert_eq!(
+            out.base.bands, 2,
+            "expected exactly two equal-sized bands, got {}",
+            out.base.bands
+        );
+        assert_eq!(
+            out.rejected_per_frame[hot_idx], 1,
+            "sanity: the hot pixel must actually be rejected, got {:?}",
+            out.rejected_per_frame
+        );
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected exactly two record_band calls");
+        let (y0_0, rows_0, bits_0) = &calls[0];
+        let (y0_1, rows_1, bits_1) = &calls[1];
+        assert_eq!((*y0_0, *rows_0), (0, 10));
+        assert_eq!((*y0_1, *rows_1), (10, 10));
+        assert_eq!(
+            bits_0.len(),
+            bits_1.len(),
+            "both bands share the same buffer slice length"
+        );
+
+        let words = w.div_ceil(64);
+        let word_of_hot = hot_idx * words + hot_x / 64;
+        assert_ne!(
+            bits_0[word_of_hot], 0,
+            "band 0 must carry the hot pixel's bit"
+        );
+
+        // The invariant under test: band 1 reuses the SAME buffer positions
+        // band 0 just used, and nothing in band 1 was rejected — so every
+        // word must read back zero, including the one band 0 just set.
+        assert!(
+            bits_1.iter().all(|&word| word == 0),
+            "band 1's slice must be all-zero at band start (buffer reuse leaked a bit from band 0): {bits_1:?}"
         );
     }
 
