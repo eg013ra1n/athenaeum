@@ -124,9 +124,10 @@ impl RegisteredSource {
     ///   [`RegisteredSource::set_plane`] instead of reopening, so a
     ///   colour group builds one grid per frame, not one per frame per
     ///   plane;
-    /// - **local normalization** — one source per frame per plane
-    ///   (`ln::normalize_frame` opens inside its own plane loop), and one
-    ///   per member for the reference build;
+    /// - **local normalization** — one source per FRAME, same pattern as
+    ///   integration above: `ln::normalize_frame` opens it once and
+    ///   re-points it at each channel with [`RegisteredSource::set_plane`]
+    ///   instead of reopening, and one per member for the reference build;
     /// - and any other caller, when its own source goes out of scope.
     ///
     /// Without it a spline map's grid would outlive the source — every

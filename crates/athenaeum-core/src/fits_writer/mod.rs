@@ -17,7 +17,13 @@ pub use xisf_writer::{write_xisf_f32, write_xisf_f32_to, xisf_keyword_value};
 /// visible (perf tier 1 Task 6). `Durable` = `sync_all` before the rename —
 /// every master, every export. `Volatile` = flush only: the run's own
 /// calibrated intermediates, which the artifact row keys on a hash and a
-/// stat, so a file lost to a crash is a cache miss, never a wrong answer.
+/// stat, so a file a crash loses or truncates is a cache miss — not a claim
+/// that it can never read back as a WRONG answer in principle: on a
+/// filesystem without ordered metadata a rename that landed before its data
+/// was flushed can, in theory, reappear at the recorded size with garbage
+/// inside it. APFS and ext4 (`data=ordered`) — the filesystems this app
+/// ships on — make that unreachable, which is what the "cache miss, not a
+/// wrong answer" claim actually rests on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
     Durable,

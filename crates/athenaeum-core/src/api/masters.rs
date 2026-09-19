@@ -212,9 +212,17 @@ struct MasterBuildProgressEvent {
     /// Bytes of source read so far / in total. `current`/`total` count
     /// bands, which say nothing about size once bands are machine-sized —
     /// except during the "combining" stage, where `current`/`total` count
-    /// rows instead and `bytes_done`/`bytes_total` are frozen at whatever
-    /// "integrating" last reported (combine reads nothing new — see
-    /// `EngineProgress::on_combine`'s doc).
+    /// rows instead and `bytes_done` is the band-start snapshot
+    /// `on_combine` quotes (see `EngineProgress::on_combine`'s doc), frozen
+    /// for that whole band's combine. On network storage, where a band's
+    /// combine overlaps the NEXT band's prefetch, that snapshot can be
+    /// LOWER than a "bytes_done" a concurrent "integrating" tick already
+    /// reported for this same build — the two callbacks run on different
+    /// threads and are not ordered against each other, only internally
+    /// monotonic each on its own. `percent` (not this field) is what stays
+    /// honest across that: `run_master_build_thread` feeds it from a
+    /// running `max_bytes_done`/`max_rows_done` pair, not from either raw
+    /// tick's numbers directly.
     bytes_done: u64,
     bytes_total: u64,
 }

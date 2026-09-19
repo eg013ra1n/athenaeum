@@ -360,8 +360,13 @@ pub struct CalibratedLightOptions {
     /// Skip the fsync before the write's rename (perf tier 1 Task 6). The
     /// stacking run sets this for its own calibrated intermediates — the
     /// `stacking_artifacts` row keys on a config hash plus (size, mtime),
-    /// so a file a crash truncates is a cache miss on the next run, never a
-    /// wrong answer — and nothing else does.
+    /// so a file a crash loses or truncates is a cache miss on the next
+    /// run. Not a claim that such a file can never read back as a WRONG
+    /// answer in principle: on a filesystem without ordered metadata a
+    /// rename that landed before its data was flushed can, in theory,
+    /// reappear at the recorded size with garbage inside it — APFS and
+    /// ext4 (`data=ordered`), what this app ships on, make that
+    /// unreachable. Nothing else sets this field.
     ///
     /// **Run-internal, never on the wire** (`#[serde(skip)]`, same reason as
     /// `keep_mosaic` above): a host command has no say in it, so a payload

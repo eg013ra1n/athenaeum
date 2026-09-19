@@ -48,7 +48,7 @@ output (6 masters raw-identical, 620 registration rows, 368 `.athln`, 528 calibr
 it shipped the instrumentation this audit is built on. Its measured effect was small and partly
 negative:
 
-| Stage | base | head (one pool, prefetch, admission fixes) |
+| Stage | base | head run 1, swapped in Normalize (one pool, prefetch, admission fixes) |
 | ----- | ---- | ---- |
 | Calibrate | 5.5 | 3.6–4.4 |
 | Measure | 10.1 | 8.0–10.3 (per-frame time ×2–2.7 at the same admission) |
@@ -56,6 +56,10 @@ negative:
 | Normalize | 12.5 | 15.4 (swap at 10 workers → fixed to 4), then ≈ 12 |
 | Integrate | 10.8 | 12.6 (prefetch overlaps two CPU phases on the same cores: read 44 → 185 s, combine 103 → 143 s, wall unchanged) |
 | Drizzle | 8.6 | 10.2 |
+
+Head run 1 is the source of every "head" number above. Two more head runs were attempted on the
+same branch and are not: run 2 overlapped a Time Machine backup partway through, so its numbers
+are not trustworthy; run 3 was cancelled by the owner before it finished.
 
 Two lessons carry into this document. First, **on a local SSD every stage is compute**: the
 measured "read" of a 208-frame band is 5.4 Gpx of bicubic warp, and the disk delivers 21 GB in
@@ -236,7 +240,7 @@ thread bands and lets every thread scan the whole source — lock-free, bit-iden
 | # | Item | Class | Gain |
 | - | ---- | ----- | ---- |
 | Z1 | Skip `map_drop` for a source pixel whose drop centre cannot reach this band (one compare on the already-computed `oy`) | a | −1 to −3 |
-| Z2 | Hoist the constant drop parallelogram for linear maps (4 of 5 `fwd.at` and 8 of 10 divisions go) | a | −0.9 to −1.3 |
+| Z2 | Hoist the constant drop parallelogram for linear maps (4 of 5 `fwd.at` and 8 of 10 divisions go) — Tier B, not Tier A: the hoisted corner arithmetic rounds differently from the per-pixel version, so this is same-math-bits-move, not bit-identical | b | −0.9 to −1.3 |
 | Z3 | Phase-indexed overlap-area table (32×32 phases × ≤ 9 entries, 111 KB; per frame for linear maps, per 256-px tile with distortion): ≈ 60–80 ops and 0 divisions per source pixel | c | **8–13× on the deposit: 8.6 → ≈ 1 min**; level preservation (R-M3-2) exact by construction; per-frame weights move ≤ 1.6 % nearest / < 0.1 % bilinear, averaging to 0.1 % / 0.007 % over 208 frames |
 | Z4 | A `turbo`-style axis-aligned kernel as a user option (the reference implementation's semantics) | c | ≈ Z3's gain with a documented approximation |
 | Z5 | Frame-major loop with three accumulator pairs for OSC (or a cached mosaic) to read each frame once | a | −0.3 (−2.7 to −5 min under TPS, whose grid is rebuilt per plane) |

@@ -324,7 +324,11 @@ fn median_by_selection(work: &mut [f32]) -> f64 {
     if n % 2 == 1 {
         upper
     } else {
-        let lower = below.iter().copied().max_by(|a, b| a.total_cmp(b)).expect("even n >= 2 has a lower half") as f64;
+        let lower = below
+            .iter()
+            .copied()
+            .max_by(|a, b| a.total_cmp(b))
+            .expect("even n >= 2 has a lower half") as f64;
         (lower + upper) / 2.0
     }
 }
@@ -671,18 +675,27 @@ mod tests {
     #[test]
     fn median_by_selection_matches_the_sorted_median() {
         let mut rng = 0x9E3779B97F4A7C15u64;
-        let mut next = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng % 10_000) as f32 * 0.37 - 1000.0 };
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 10_000) as f32 * 0.37 - 1000.0
+        };
         for n in [0usize, 1, 2, 3, 4, 101, 1000, 1001] {
             let mut v: Vec<f32> = (0..n).map(|_| next()).collect();
-            if n > 10 { v[3] = f32::NAN; v[7] = f32::NEG_INFINITY; }
+            if n > 10 {
+                v[3] = f32::NAN;
+                v[7] = f32::NEG_INFINITY;
+            }
             let mut sorted = v.clone();
             sorted.sort_unstable_by(|a, b| a.total_cmp(b));
             let expected = median_of_sorted(&sorted);
             let mut work = v.clone();
             let got = median_by_selection(&mut work);
-            assert!(got.to_bits() == expected.to_bits(), "n={n}: {got} vs {expected}");
+            assert!(
+                got.to_bits() == expected.to_bits(),
+                "n={n}: {got} vs {expected}"
+            );
         }
     }
 }
-
-
