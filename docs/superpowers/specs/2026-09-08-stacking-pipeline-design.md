@@ -23,7 +23,10 @@ pipeline's first stage.
 1. **Hybrid materialization.** Calibrated frames are written to a working
    folder; registration stores transforms, not pixels; integration, local
    normalization and drizzle resample calibrated frames on the fly, band by
-   band. Writing registered frames is opt-in.
+   band. Since perf tier A Task 6a (2026-09-19) the registered frame is WRITTEN
+   ONCE by Register and read by Normalize and Integrate instead of being
+   re-warped per band (§3.7); the on-the-fly warp remains the per-frame
+   fallback.
 2. **Incremental milestones**, each its own spec review + implementation plan:
    M1 first master light; M2 local normalization; M3 drizzle; M4 polish.
    This document is the program design; the M1 plan is written from it.
@@ -813,7 +816,10 @@ pub trait FrameSource: Sync {
 Cost on this Mac for the 208-frame mono group: ≈ 5.4 Gpx × 16 taps ≈ 87 G
 multiply-adds per pass ≈ 5–30 s of compute, against ≈ 21 GB of calibrated
 reads ≈ 100–120 s at the measured disk rate — the pass is disk-bound, which
-is the point of not writing registered frames.
+was the M1 argument for not writing registered frames. Tier A measured the
+opposite on a local SSD (the band "reads" were CPU-bound warps), so the
+registered frame is now materialized once (§3.7) and Integrate's read phase
+fell from ≈ 26 s to ≈ 7 s per plane on the reduced set.
 
 `run_banded` further gains: per-frame `(offset, scale)` normalization (the
 existing `scales` slot plus a per-frame offset), per-frame weights, an
@@ -1557,7 +1563,7 @@ manual reference path.
 │ ◉ 5 · Register  ▓▓▓▓▓▓░░ 142/208 Running │ Clamping 0.30    Max stars 2000 │
 │ ○ 6 · Local normalization [on]   Queued  │ RANSAC 1.9 px    Max RMS 2.0 px │
 │ ○ 7 · Integrate      …           Queued  │ ☐ Exclude frame on failure      │
-│ ○ 8 · Drizzle [off]  …           Off     │ ☐ Write registered frames       │
+│ ○ 8 · Drizzle [off]  …           Off     │ registered frames: always       │
 │ ○ 9 · Output         …           Queued  │ ▸ Advanced                      │
 │ Groups (2): key · camera · colour · …    │ Defaults = WBPP-equivalent      │
 ├ ▾ Frames (368) ──────────────────────────┴─────────────────────────────────┤
@@ -1578,7 +1584,8 @@ Below 1200 px the inspector drops under the board as an accordion.
 - `PipelineBoard.tsx` + `StageRow.tsx` — nine rows; row state ∈ `ready |
   blocked | stale | queued | running | done | skipped | failed`; a running
   row shows the accent bar with `current / total · percent`; optional stages
-  (LN, drizzle, registered frames) carry a toggle on the row; the summary
+  (LN, drizzle) carry a toggle on the row — registered frames are always
+  written since Task 6a, the row states it; the summary
   line is a pure function of the config (`stageSummary(stage, config)`), so
   it never disagrees with the inspector; a blocked row shows the blocker
   inline with the `→ Coverage` link, like the export mode card.
