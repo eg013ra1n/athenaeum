@@ -417,12 +417,6 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
     setUserConfig(next);
   }, [setUserConfig]);
 
-  const handleToggleWriteRegisteredFrames = useCallback((checked: boolean) => {
-    setUserConfig((prev) =>
-      prev ? { ...prev, registration: { ...prev.registration, writeRegisteredFrames: checked } } : prev,
-    );
-  }, [setUserConfig]);
-
   const handleToggleDrizzle = useCallback((checked: boolean) => {
     setUserConfig((prev) =>
       prev ? { ...prev, drizzle: { ...prev.drizzle, enabled: checked } } : prev,
@@ -1049,7 +1043,6 @@ export function StackingTab({ framesSetId, lightFrames }: StackingTabProps) {
             finishedStages={boardFinishedStages}
             selectedStage={selectedStage}
             onSelectStage={handleSelectStage}
-            onToggleWriteRegisteredFrames={handleToggleWriteRegisteredFrames}
             onToggleDrizzle={handleToggleDrizzle}
           />
           <div className="bg-surface-elevated rounded-lg p-3">

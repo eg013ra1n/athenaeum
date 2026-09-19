@@ -29,22 +29,21 @@ export interface PipelineBoardProps {
   finishedStages?: readonly Stage[] | null;
   selectedStage: BoardStage;
   onSelectStage: (stage: BoardStage) => void;
-  /** The Register row's write-registered-frames toggle. The Normalize row's
-   *  LN toggle went live in M2 Task 8 — it edits `config` directly through
-   *  the inspector panel, so that board row carries no toggle of its own. */
-  onToggleWriteRegisteredFrames: (checked: boolean) => void;
   /** The Drizzle row's on/off toggle (M3 Task 6 — live; previously
-   *  disabled with a "coming in M3" note). Same shape as
-   *  `onToggleWriteRegisteredFrames`: patches `config.drizzle.enabled`
-   *  through the draft-config path, so the preset chip flips to Custom the
-   *  same way. */
+   *  disabled with a "coming in M3" note). Patches `config.drizzle.enabled`
+   *  through the draft-config path, so the preset chip flips to Custom.
+   *  The Register row used to carry a write-registered-frames toggle of
+   *  the same shape; since Task 6a the run always writes the registered
+   *  frame (the field is inert), so that row is read-only now — see
+   *  `RegisterPanel.tsx`'s note. The Normalize row's LN toggle edits
+   *  `config` directly through the inspector panel, so it never carried
+   *  one of these either. */
   onToggleDrizzle: (checked: boolean) => void;
 }
 
 /** The nine-row pipeline board (spec §11.1). Every row's state and summary
  *  text come from the pure functions in `stageSummary.ts` — this component
- *  only lays them out and wires the two live toggles (write-registered-
- *  frames on Register, on/off on Drizzle). */
+ *  only lays them out and wires the one live toggle (on/off on Drizzle). */
 export function PipelineBoard({
   plan,
   config,
@@ -53,7 +52,6 @@ export function PipelineBoard({
   finishedStages,
   selectedStage,
   onSelectStage,
-  onToggleWriteRegisteredFrames,
   onToggleDrizzle,
 }: PipelineBoardProps) {
   return (
@@ -71,12 +69,6 @@ export function PipelineBoard({
             // registered frames" is the model: it names the ACTION, not
             // the stage).
             label: 'enabled',
-          };
-        } else if (stage === 'register') {
-          toggle = {
-            checked: config.registration.writeRegisteredFrames,
-            onChange: onToggleWriteRegisteredFrames,
-            label: 'write registered frames',
           };
         }
 

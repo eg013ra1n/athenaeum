@@ -1,8 +1,10 @@
 // Stage 5 (Register) inspector panel: the geometry mode (M4b),
 // model/distortion (including the M4c thin-plate spline and its λ, plus
 // the local distortion loop) /interpolation, clamping, star cap, RANSAC
-// tolerance/iterations, max RMS + fail-on-max-rms, write-registered-frames,
-// and the detection pair under an Advanced disclosure.
+// tolerance/iterations, max RMS + fail-on-max-rms, a note that registered
+// frames are always written (since Task 6a — `writeRegisteredFrames` is
+// kept in the config for compatibility but is inert), and the detection
+// pair under an Advanced disclosure.
 
 import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
@@ -232,12 +234,12 @@ export function RegisterPanel({ config, onChange, disabled, defaults }: Register
         label="Fail the frame when max RMS is exceeded"
       />
 
-      <Checkbox
-        checked={r.writeRegisteredFrames}
-        onChange={(checked) => patch({ writeRegisteredFrames: checked })}
-        disabled={disabled}
-        label="Write registered frames"
-      />
+      <p className="text-xs text-content-muted">
+        Registered frames are always written — Normalize and Integrate read
+        them instead of re-warping each frame. They live under the working
+        folder (<code>registered/</code>, about the size of the calibrated
+        frames) and follow the Output → cleanup policy.
+      </p>
 
       <div className="pt-2 border-t border-border/60">
         <button
