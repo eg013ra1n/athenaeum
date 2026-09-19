@@ -20,7 +20,18 @@ curl -sN "http://127.0.0.1:$PORT/api/events" > "$W/events.log" 2>/dev/null &
 SSE_PID=$!
 sleep 2
 T0=$(date +%s); echo "start $(date -u +%FT%TZ) epoch=$T0" > "$W/run.txt"
-curl -sS -X POST "http://127.0.0.1:$PORT/api/start_stacking" -H 'content-type: application/json' -d "{\"setId\":$SET_ID,\"rerunFrom\":\"calibrate\"}" >> "$W/run.txt"; echo >> "$W/run.txt"
+RESP=$(curl -sS -X POST "http://127.0.0.1:$PORT/api/start_stacking" -H 'content-type: application/json' -d "{\"setId\":$SET_ID,\"rerunFrom\":\"calibrate\"}")
+echo "$RESP" >> "$W/run.txt"; echo >> "$W/run.txt"
+# A refused start (a plan blocker such as `space`, a bad set id, a server
+# error) answers without a runId; waiting for `stacking-complete` after that
+# is a four-hour hang (checkpoint g3, 2026-09-20: 99.2 GB needed, 96.8 free).
+# Fail loudly instead, with the server's own answer.
+if ! printf '%s' "$RESP" | grep -q '"runId"'; then
+  echo "start_stacking refused for set $SET_ID: $RESP" >&2
+  kill $SSE_PID 2>/dev/null
+  pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+  exit 1
+fi
 for i in $(seq 1 480); do
   if grep -q 'stacking-complete' "$W/events.log" 2>/dev/null; then break; fi
   sleep 30
