@@ -20,6 +20,13 @@
 set -euo pipefail
 NAME="${1:?checkpoint name}"
 BASE="${2:-baseline}"
+# Both names become path components under $ACC_ROOT (and <name> feeds an
+# `rm -rf`): a bare word only — no separator, no dot, no quote.
+for n in "$NAME" "$BASE"; do
+  case "$n" in
+    ''|*[!A-Za-z0-9_-]*) echo "refusing checkpoint name '$n': letters, digits, _ and - only" >&2; exit 1 ;;
+  esac
+done
 ACC_ROOT="$HOME/.athenaeum-acc"
 TEMPLATE="$ACC_ROOT/tierA-template"
 COPY="$ACC_ROOT/tierA-$NAME"
