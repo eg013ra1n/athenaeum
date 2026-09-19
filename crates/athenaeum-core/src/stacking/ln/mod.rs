@@ -145,6 +145,19 @@ pub struct LnFrameOutcome {
     /// Wall time (ms) writing the `.athln` sidecar — once for the whole
     /// frame, not per channel.
     pub write_ms: u64,
+    /// Of `scale_ms`, how much was the target's own star detection inside
+    /// `scale::relative_scale_against` (perf tier A Task 0, audit §3.1) —
+    /// summed across every channel, same contract as `scale_ms` itself.
+    pub detect_ms: u64,
+    /// Reserved for the centroid-refine LM step Task 3 splits out of
+    /// detection; always `0` until then.
+    pub refine_ms: u64,
+    /// Of `scale_ms`, how much was the target's PSF fit at the reference's
+    /// resolved β, summed across every channel.
+    pub fit_ms: u64,
+    /// Of `scale_ms`, how much was matching + RCR (and, when on, the local
+    /// scale spline), summed across every channel.
+    pub match_ms: u64,
 }
 
 /// Per-channel target background parameters (spec §5.2/math §4.2): same
@@ -417,6 +430,12 @@ pub fn normalize_frame(
     let mut warp_ms = 0u64;
     let mut background_ms = 0u64;
     let mut scale_ms = 0u64;
+    // Perf tier A Task 0: `scale_ms`'s own sub-phase split, same
+    // accumulate-across-channels contract.
+    let mut detect_ms = 0u64;
+    let mut refine_ms = 0u64;
+    let mut fit_ms = 0u64;
+    let mut match_ms = 0u64;
 
     // Perf tier 1 Task 8: one `RegisteredSource` per FRAME, re-pointed at
     // each channel with `set_plane` (ruling R-T4-7's own reasoning, applied
@@ -536,6 +555,10 @@ pub fn normalize_frame(
             pool,
         )?;
         scale_ms += t.elapsed().as_millis() as u64;
+        detect_ms += scale_result.timings.detect_ms;
+        refine_ms += scale_result.timings.refine_ms;
+        fit_ms += scale_result.timings.fit_ms;
+        match_ms += scale_result.timings.match_ms;
         matches_total += scale_result.matches;
         scales.push(scale_result.scale);
 
@@ -633,6 +656,10 @@ pub fn normalize_frame(
         background_ms,
         scale_ms,
         write_ms,
+        detect_ms,
+        refine_ms,
+        fit_ms,
+        match_ms,
     })
 }
 

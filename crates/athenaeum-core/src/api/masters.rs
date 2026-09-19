@@ -5228,6 +5228,9 @@ mod tests {
             band_rows: 20,
             bands: 3,
             bytes_read: 5_200_000_000,
+            combine_cpu_duration: std::time::Duration::ZERO,
+            rejection_iters_total: 0,
+            medfit_evals_total: 0,
         }
     }
 

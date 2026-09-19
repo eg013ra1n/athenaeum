@@ -1293,12 +1293,20 @@ pub fn integrate_group(
             + out.base.combine_duration
             + stats_start.elapsed())
         .as_millis() as u64;
+        // Perf tier A Task 0 (audit §3.3, item I11): the plane's total
+        // pixel-stack count — every combine call, one per output pixel —
+        // is what `rejection_iters_total`/`medfit_evals_total` divide by
+        // for the means below.
+        let plane_pixels = (out.base.width * out.base.height).max(1) as f64;
         debug!(
             plane = p,
             rejected_low = out.rejected_low,
             rejected_high = out.rejected_high,
             read_ms = out.base.read_duration.as_millis() as u64,
             combine_ms = out.base.combine_duration.as_millis() as u64,
+            combine_cpu_ms = out.base.combine_cpu_duration.as_millis() as u64,
+            rejection_iters_mean = out.base.rejection_iters_total as f64 / plane_pixels,
+            medfit_evals_mean = out.base.medfit_evals_total as f64 / plane_pixels,
             duration_ms = plane_duration_ms,
             "plane integrated"
         );

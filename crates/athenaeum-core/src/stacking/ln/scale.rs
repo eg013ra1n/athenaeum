@@ -33,6 +33,7 @@
 use std::collections::HashSet;
 use std::f64::consts::{PI, SQRT_2};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{debug, warn};
 
@@ -75,7 +76,26 @@ pub const LN_LOCAL_SCALE_MIN_STARS: usize = 40;
 /// they carry.
 pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Perf tier A Task 0 (audit §3.1): wall time (ms) inside each phase of one
+/// [`relative_scale_against`] call — `detect_ms` ([`detect_seeds`] on the
+/// TARGET), `fit_ms` ([`psf_signal::fit_stars_with_beta`] on the target),
+/// `match_ms` (pairing — [`choose_pairing`]/[`ratio_sample`] — plus RCR and,
+/// when asked for, [`fit_local_scale`], all together). `refine_ms` is
+/// reserved for the centroid-refine LM step Task 3 splits out of
+/// `detect_seeds`'s own detector call; it stays `0` until then. The four
+/// never exceed the caller's own wall-clock measurement of the whole call —
+/// they cover a subset of it, with the gap being the bookkeeping between
+/// the timed sections (allocations, the fit-position `Vec` build, the
+/// `MIN_MATCHES` check).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScaleTimings {
+    pub detect_ms: u64,
+    pub refine_ms: u64,
+    pub fit_ms: u64,
+    pub match_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScaleResult {
     /// RCR location of the matched flux ratios — the global relative scale.
     pub scale: f64,
@@ -102,6 +122,28 @@ pub struct ScaleResult {
     /// local.displacement(x, y).0` (the y channel is fitted on zeros and
     /// carries nothing — see [`fit_local_scale`]).
     pub local: Option<ThinPlateSpline>,
+    /// Perf tier A Task 0: where this call's own wall time went — see
+    /// [`ScaleTimings`]'s own doc.
+    pub timings: ScaleTimings,
+}
+
+/// Hand-written (perf tier A Task 0): deliberately excludes `timings` —
+/// wall-clock telemetry, not result data. Two calls that agree on every
+/// other field (same stars, same matches, same scale) still measure
+/// different real wall times run to run, so a derived `PartialEq` including
+/// `timings` would make
+/// `relative_scale_equals_relative_scale_against_a_prepared_reference`
+/// (and any future caller comparing two otherwise-identical results) flaky.
+impl PartialEq for ScaleResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.scale == other.scale
+            && self.sigma == other.sigma
+            && self.matches == other.matches
+            && self.rejected == other.rejected
+            && self.beta == other.beta
+            && self.pass == other.pass
+            && self.local == other.local
+    }
 }
 
 /// Detect star seeds on one plane: registration's own detector for
@@ -525,7 +567,15 @@ pub fn relative_scale_against(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ScaleResult, LnError> {
     let fit_params = FitParams::default();
+
+    // Perf tier A Task 0 (audit §3.1): wall time per phase, so the LN
+    // stage's own `scale_ms` (ln/mod.rs) splits into where it actually
+    // goes instead of staying one opaque number.
+    let t = Instant::now();
     let tgt_seeds = detect_seeds(target, width, height, max_stars, pool);
+    let detect_ms = t.elapsed().as_millis() as u64;
+
+    let t = Instant::now();
     let tgt_outcome = fit_stars_with_beta(
         target,
         width,
@@ -535,7 +585,9 @@ pub fn relative_scale_against(
         &fit_params,
         pool,
     );
+    let fit_ms = t.elapsed().as_millis() as u64;
 
+    let t = Instant::now();
     // Pass 1 on the PSF-fit centroids; pass 2 (ruling R-M4c-9) on the
     // DETECTION barycentres, only when pass 1 covered too little of the
     // TARGET's own fits (review R-T5-2) — `choose_pairing` owns the whole
@@ -565,6 +617,8 @@ pub fn relative_scale_against(
     } else {
         None
     };
+    let match_ms = t.elapsed().as_millis() as u64;
+
     debug!(
         ln_scale = r.location,
         sigma = r.scale,
@@ -582,6 +636,12 @@ pub fn relative_scale_against(
         beta: prepared.outcome.beta,
         pass,
         local,
+        timings: ScaleTimings {
+            detect_ms,
+            refine_ms: 0,
+            fit_ms,
+            match_ms,
+        },
     })
 }
 
@@ -724,6 +784,49 @@ mod tests {
         .expect("the same prepared reference must match the same target");
 
         assert_eq!(via_wrapper, via_prepared);
+    }
+
+    /// Perf tier A Task 0 (audit §3.1): `detect_ms + refine_ms + fit_ms +
+    /// match_ms` must never exceed the caller's OWN wall-clock measurement
+    /// of the whole `relative_scale_against` call — `floor(a) + floor(b) <=
+    /// floor(a + b)` for any nonnegative reals, extended to four terms, so
+    /// this holds by construction as long as every timed section falls
+    /// inside the outer measurement window (which it does: the outer timer
+    /// starts before the first inner one and stops after the last). No
+    /// tolerance needed. `refine_ms` stays `0` until Task 3 splits the
+    /// centroid-refine LM step out of `detect_seeds`.
+    #[test]
+    fn scale_timings_never_exceed_the_callers_own_wall_measurement() {
+        let stars = star_grid(4);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 14);
+        let target_stars = scale_stars(&stars, 0.8);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 24);
+
+        let prepared =
+            PreparedReferenceChannel::build(&reference, WIDTH, HEIGHT, PsfModel::Moffat4, 200, None);
+
+        let t = std::time::Instant::now();
+        let r = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("a clean uniformly-scaled field must match");
+        let wall_ms = t.elapsed().as_millis() as u64;
+
+        let sum =
+            r.timings.detect_ms + r.timings.refine_ms + r.timings.fit_ms + r.timings.match_ms;
+        assert!(
+            sum <= wall_ms,
+            "timings sum {sum} exceeds the caller's own wall time {wall_ms} \
+             (detect={} refine={} fit={} match={})",
+            r.timings.detect_ms,
+            r.timings.refine_ms,
+            r.timings.fit_ms,
+            r.timings.match_ms
+        );
+        assert_eq!(
+            r.timings.refine_ms, 0,
+            "refine_ms stays 0 until Task 3 splits the centroid-refine LM step out of detection"
+        );
     }
 
     #[test]

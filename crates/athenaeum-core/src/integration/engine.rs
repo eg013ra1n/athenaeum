@@ -56,6 +56,30 @@ pub struct IntegrationOutput {
     /// padding are never read, and a flat's pass 1 reads only its central
     /// third.
     pub bytes_read: u64,
+    /// Perf tier A Task 0 (audit §3.3, item I11): CPU time (thread-seconds,
+    /// summed — not wall time) spent inside per-pixel combine work, one
+    /// `Instant` delta per rayon leaf of `integrate_stack`'s row-processing
+    /// `for_each_init` (each leaf's own `RowState::Drop`, see
+    /// `engine.rs`'s `LeafCpuTimer`), added into a shared atomic. On a
+    /// fully parallel run this approaches `combine_duration × pool
+    /// threads`; it can never exceed that bound. `Duration::ZERO` for
+    /// `run_banded`'s plain average/median combine path, which has no
+    /// per-leaf timer of its own — that path is the simple, un-rejected
+    /// master-build combine `combine_duration` already accounts for well
+    /// enough on its own.
+    pub combine_cpu_duration: std::time::Duration,
+    /// `reject_linear_fit`'s outer convergence-loop pass count, summed over
+    /// every pixel stack this call combined (perf tier A Task 0, audit
+    /// §3.3). Zero unless `Rejection::LinearFitClip` was the active
+    /// algorithm for at least one pixel. Divide by `width * height` for the
+    /// per-plane mean the "plane integrated" log line reports
+    /// (`rejection_iters_mean`).
+    pub rejection_iters_total: u64,
+    /// `medfit_line`'s own `rofunc` bracket/bisection evaluation count,
+    /// same sum-over-every-pixel-stack contract as
+    /// [`Self::rejection_iters_total`] (`medfit_evals_mean` on the same log
+    /// line).
+    pub medfit_evals_total: u64,
 }
 
 pub struct EngineProgress<'a> {
@@ -465,6 +489,13 @@ fn run_banded<S: FrameSource + ?Sized>(
     // the reads below happen after every worker has joined.
     let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
     let all_bad = AtomicUsize::new(0);
+    // Perf tier A Task 0: `combine_pixel` runs the same `apply_rejection`
+    // dispatch `combine_pixel_weighted` does, so a plain master build under
+    // `Rejection::LinearFitClip` gets real counts too — no per-leaf CPU
+    // timer on this simpler (`for_each`, no `RowState`) path, so
+    // `combine_cpu_duration` stays `Duration::ZERO` below.
+    let rejection_iters_total = AtomicU64::new(0);
+    let medfit_evals_total = AtomicU64::new(0);
 
     let stats = band_loop(src, pool, cancel, progress, io, &mut out, &|job, tick| {
         let BandJob { planes, out_band, y0, width, .. } = job;
@@ -508,6 +539,15 @@ fn run_banded<S: FrameSource + ?Sized>(
                         let (val, rej) = combine_pixel(&mut column, recipe);
                         *out_px = val;
                         if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
+                        // Perf tier A Task 0: same per-pixel-stack flush as
+                        // `integrate_stack`'s weighted path.
+                        let (iters, evals) = combine::take_rejection_counters();
+                        if iters > 0 {
+                            rejection_iters_total.fetch_add(iters, Ordering::Relaxed);
+                        }
+                        if evals > 0 {
+                            medfit_evals_total.fetch_add(evals, Ordering::Relaxed);
+                        }
                     }
                 }
                 tick();
@@ -539,6 +579,9 @@ fn run_banded<S: FrameSource + ?Sized>(
         band_rows: stats.band_rows,
         bands: stats.bands,
         bytes_read: stats.bytes_read,
+        combine_cpu_duration: std::time::Duration::ZERO,
+        rejection_iters_total: rejection_iters_total.load(Ordering::Relaxed),
+        medfit_evals_total: medfit_evals_total.load(Ordering::Relaxed),
     })
 }
 
@@ -596,16 +639,40 @@ pub type LocalNormRow<'a> = dyn FnMut(usize, &mut [f32], &mut [f32]) + 'a;
 /// single shared `Fn` + `Mutex<LnScratch>` would.
 pub type LocalNormRowFactory<'a> = dyn Fn() -> Box<LocalNormRow<'a>> + Sync + 'a;
 
+/// Perf tier A Task 0 (audit §3.3, item I11): one rayon LEAF's own CPU-time
+/// stopwatch. `start` is taken when [`RowState`] is built (`init_row_state`,
+/// once per leaf — `for_each_init`'s own contract), and `Drop` folds the
+/// elapsed time into `cpu_ns` (the `combine_cpu` atomic `integrate_stack`
+/// captures for the whole call) the moment that leaf's `RowState` goes out
+/// of scope — i.e. right after the last row that leaf's worker handles, not
+/// once per row: `for_each_init` gives a fresh `T` per leaf and drops the
+/// previous one when the next `init()` call replaces it, so this is the
+/// natural place to flush without a second explicit "leaf finished" hook.
+struct LeafCpuTimer<'c> {
+    start: std::time::Instant,
+    cpu_ns: &'c AtomicU64,
+}
+
+impl Drop for LeafCpuTimer<'_> {
+    fn drop(&mut self) {
+        let ns = self.start.elapsed().as_nanos() as u64;
+        self.cpu_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
 /// One rayon WORKER's own state for `integrate_stack`'s band loop, built by
 /// `init_row_state` and reused across every row that worker handles in the
 /// band (`for_each_init`'s contract): the per-frame local-normalization
 /// evaluators with their row buffers (M2, fix round 1 items 2 + 3), and
 /// (M4c Task 3, fix round 1) the forced-rejection row cache — `n` row
 /// pointers refilled once per row, empty when no forced source is present.
-type RowState<'f, 'p> = (
-    Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)>,
-    Vec<Option<&'p [u64]>>,
-);
+/// `_leaf_timer` (perf tier A Task 0) exists only for its `Drop` — nothing
+/// in `process_row` ever reads it.
+struct RowState<'f, 'p, 'c> {
+    local: Vec<(usize, Box<LocalNormRow<'f>>, Vec<f32>, Vec<f32>)>,
+    forced_rows: Vec<Option<&'p [u64]>>,
+    _leaf_timer: LeafCpuTimer<'c>,
+}
 
 /// Per-frame inputs of the stacking path, all indexed by the source's frame order.
 pub struct StackParams<'a, 'f> {
@@ -856,6 +923,16 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     let rejected_per_frame: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
     let samples_per_frame: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
     let all_bad = AtomicUsize::new(0);
+    // Perf tier A Task 0 (audit §3.3, item I11): nanoseconds of per-leaf
+    // combine CPU time (`LeafCpuTimer`/`RowState::Drop`) and the summed
+    // rejection-algorithm iteration/evaluation counts
+    // (`combine::take_rejection_counters`, flushed once per pixel stack
+    // right after `combine_pixel_weighted` below). Captured by the
+    // `combine` closure passed to `band_loop` below like every other atomic
+    // in this scope — `band_loop` itself never needs to know these exist.
+    let combine_cpu = AtomicU64::new(0);
+    let rejection_iters_total = AtomicU64::new(0);
+    let medfit_evals_total = AtomicU64::new(0);
     let maps = params.rejection_maps;
     // Rejection-map row storage, banded via a per-band lock (not per pixel —
     // see the loop below): full-image sized when maps are requested, or a
@@ -904,18 +981,22 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         // rest of the worker's state instead of once per row. Empty (no
         // allocation at all) when no forced source is present, which is
         // every first-pass caller.
-        let init_row_state = || -> RowState<'f, 'p> {
-            (
-                local_factories
+        let init_row_state = || -> RowState<'f, 'p, '_> {
+            RowState {
+                local: local_factories
                     .iter()
                     .map(|&(i, factory)| (i, factory(), vec![0f32; width], vec![0f32; width]))
                     .collect(),
-                if params.forced_rejection.is_some() {
+                forced_rows: if params.forced_rejection.is_some() {
                     vec![None; n]
                 } else {
                     Vec::new()
                 },
-            )
+                _leaf_timer: LeafCpuTimer {
+                    start: std::time::Instant::now(),
+                    cpu_ns: &combine_cpu,
+                },
+            }
         };
         // M3 Task 2: the whole per-row body, factored out so it can be
         // called from either of the two zip chains below (one with a 4th
@@ -935,8 +1016,8 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             low_row: &mut [f32],
                             high_row: &mut [f32],
                             mut bits_row: Option<&mut [u64]>,
-                            row_state: &mut RowState<'f, 'p>| {
-                let (local_state, forced_rows) = row_state;
+                            row_state: &mut RowState<'f, 'p, '_>| {
+                let RowState { local: local_state, forced_rows, .. } = row_state;
                 // Per-worker scratch, allocated once per ROW (not per pixel):
                 // `work`/`out_vals`/`mask` feed `combine_pixel_weighted`,
                 // `scratch` is its own reused survivor-value buffer (Task 1
@@ -1189,6 +1270,18 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             &mut mask,
                             &mut scratch,
                         );
+                        // Perf tier A Task 0: this thread's iteration/
+                        // evaluation counts for exactly this pixel stack —
+                        // zero for every rejection algorithm but
+                        // `LinearFitClip`, since only that one touches the
+                        // counters `take_rejection_counters` reads.
+                        let (iters, evals) = combine::take_rejection_counters();
+                        if iters > 0 {
+                            rejection_iters_total.fetch_add(iters, Ordering::Relaxed);
+                        }
+                        if evals > 0 {
+                            medfit_evals_total.fetch_add(evals, Ordering::Relaxed);
+                        }
                         *out_px = val;
                         // M4c Task 3: `|| forced_any` — a pixel whose only
                         // rejection is a FORCED one still needs the
@@ -1336,6 +1429,11 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
             band_rows: stats.band_rows,
             bands: stats.bands,
             bytes_read: stats.bytes_read,
+            combine_cpu_duration: std::time::Duration::from_nanos(
+                combine_cpu.load(Ordering::Relaxed),
+            ),
+            rejection_iters_total: rejection_iters_total.load(Ordering::Relaxed),
+            medfit_evals_total: medfit_evals_total.load(Ordering::Relaxed),
         },
         rejection_low: maps.then_some(map_low),
         rejection_high: maps.then_some(map_high),
@@ -2682,6 +2780,74 @@ mod tests {
         for (i, &v) in out.base.data.iter().enumerate() {
             assert!((v - c).abs() < 1e-4, "pixel {i} (row {}): {v} vs {c}", i / w);
         }
+    }
+
+    /// Perf tier A Task 0 (audit §3.3, item I11): `LinearFitClip` over 24
+    /// frames with genuine per-frame scatter (so the outer convergence loop
+    /// and `medfit_line`'s bisection actually run more than the n<2
+    /// early-out) must record real CPU time and real iteration/evaluation
+    /// counts — instrumentation only, no output number this test cares
+    /// about moves.
+    #[test]
+    fn combine_cpu_and_rejection_counters_are_recorded_for_linear_fit_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (4usize, 4usize);
+        let n = 24usize;
+        let mut paths = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = 1.0 + ((i as f32 * 37.0) % 23.0) / 23.0 * 0.6;
+            paths.push(write(dir.path(), &format!("f{i}.fits"), w, h, move |_, _| v));
+        }
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; n];
+        let weights = vec![1.0f32; n];
+        let recipe = IntegrationRecipe::average(Rejection::LinearFitClip {
+            sigma_low: 5.0,
+            sigma_high: 3.5,
+        });
+        let params = StackParams {
+            rejection: &ident,
+            output: &ident,
+            weights: &weights,
+            range_low: None,
+            range_high: None,
+            rejection_maps: false,
+            local: None,
+            local_for_rejection: false,
+            local_for_output: false,
+            rejection_bits: None,
+            forced_rejection: None,
+        };
+        let worker_pool = pool();
+        let threads = worker_pool.current_num_threads() as u32;
+        let out = integrate_stack(
+            &src,
+            &params,
+            recipe,
+            &worker_pool,
+            &AtomicBool::new(false),
+            EngineProgress { on_band: &nop(), on_combine: &nop() },
+            io(1 << 20),
+        )
+        .unwrap();
+        assert!(
+            out.base.combine_cpu_duration > std::time::Duration::ZERO,
+            "combine CPU time not recorded"
+        );
+        assert!(
+            out.base.combine_cpu_duration <= out.base.combine_duration * threads,
+            "combine CPU time {:?} exceeds wall combine time {:?} x {threads} threads",
+            out.base.combine_cpu_duration,
+            out.base.combine_duration
+        );
+        assert!(
+            out.base.rejection_iters_total > 0,
+            "reject_linear_fit's outer-loop pass count not recorded"
+        );
+        assert!(
+            out.base.medfit_evals_total > 0,
+            "medfit_line's rofunc evaluation count not recorded"
+        );
     }
 
     /// M2 Task 6, brief test (b): 24 frames share one background level plus

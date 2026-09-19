@@ -34,8 +34,14 @@ EVENTS = {
   "frame plane measured": ["read_ms","background_ms","noise_ms","detect_ms","fit_ms","duration_ms"],
   "frame stars detected": ["read_ms","detect_ms"],
   "frame registered": ["read_ms","detect_ms","align_ms","duration_ms"],
-  "ln frame normalized": ["warp_ms","background_ms","scale_ms","write_ms"],
-  "plane integrated": ["read_ms","combine_ms","duration_ms"],
+  # perf tier A Task 0: scale_ms's own sub-phase split (ScaleTimings) —
+  # ln_refine_ms stays out until Task 3 splits it out of ln_detect_ms (it
+  # is always 0, never logged).
+  "ln frame normalized": ["warp_ms","background_ms","scale_ms","ln_detect_ms","ln_fit_ms","ln_match_ms","write_ms"],
+  # perf tier A Task 0: combine_cpu_ms (thread CPU time, can exceed
+  # combine_ms under real parallelism) and the medfit iteration/evaluation
+  # means (0 unless LinearFitClip is the active rejection algorithm).
+  "plane integrated": ["read_ms","combine_ms","combine_cpu_ms","rejection_iters_mean","medfit_evals_mean","duration_ms"],
   "drizzle plane deposited": ["read_ms","deposit_ms","duration_ms"],
 }
 # only rows after the run start timestamp
@@ -46,5 +52,10 @@ for ev, keys in EVENTS.items():
     out = []
     for k in keys:
         vals = [f[k] for f in sel if isinstance(f.get(k), (int, float))]
-        if vals: out.append(f"{k}={statistics.median(vals):.0f}")
+        if not vals: continue
+        # perf tier A Task 0: the two "_mean" fields (rejection_iters_mean,
+        # medfit_evals_mean) are per-pixel means, not milliseconds — small
+        # fractional values a ".0f" would round to nothing useful.
+        fmt = "{:.2f}" if k.endswith("_mean") else "{:.0f}"
+        out.append(f"{k}=" + fmt.format(statistics.median(vals)))
     print(f"  {ev} (n={len(sel)}): " + " ".join(out))

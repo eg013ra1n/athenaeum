@@ -20,7 +20,7 @@
 
 use super::student_t;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// A stack element the rejection routines can order and read: the plain
@@ -731,6 +731,33 @@ thread_local! {
     static MEDFIT_RESIDUAL_SCRATCH: RefCell<Vec<f64>> = RefCell::new(Vec::new());
 }
 
+thread_local! {
+    // Perf tier A Task 0 (audit §3.3, item I11): this thread's own count of
+    // `reject_linear_fit`'s outer convergence-loop passes and
+    // `medfit_line`'s `rofunc` bracket/bisection evaluations since the last
+    // [`take_rejection_counters`] call. Both are read-and-reset once per
+    // PIXEL STACK (never per evaluation) by the engine, right after the
+    // `combine_pixel`/`combine_pixel_weighted` call that may have driven
+    // them — two relaxed atomic adds per pixel, not per evaluation — so a
+    // rayon worker's running total never has to be untangled from another
+    // worker's on the same thread (there is none: a `Cell` is only ever
+    // touched by the thread that owns it) or leaked across plane calls.
+    static LINEAR_FIT_ITERS: Cell<u64> = const { Cell::new(0) };
+    static MEDFIT_EVALS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Read-and-reset [`LINEAR_FIT_ITERS`]/[`MEDFIT_EVALS`] for the CALLING
+/// thread: this thread's own iteration/evaluation counts accumulated since
+/// the previous call (or since the thread started, on the first). The
+/// caller folds the pair into a shared total once per pixel stack — see the
+/// `thread_local!` block's own doc for why the reset happens here rather
+/// than being left to the next call to re-derive by subtraction.
+pub(crate) fn take_rejection_counters() -> (u64, u64) {
+    let iters = LINEAR_FIT_ITERS.with(Cell::take);
+    let evals = MEDFIT_EVALS.with(Cell::take);
+    (iters, evals)
+}
+
 #[inline]
 fn robust_sign(x: f64) -> f64 {
     if x >= 0.0 {
@@ -814,6 +841,9 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
         // the warm start (b) below only shrinks evaluation count ACROSS
         // `reject_linear_fit`'s outer iterations, not within one call.
         let mut rofunc = |b: f64| -> (f64, f64) {
+            // Perf tier A Task 0: one evaluation, thread-local, flushed by
+            // `take_rejection_counters` — see that function's doc.
+            MEDFIT_EVALS.with(|c| c.set(c.get() + 1));
             scratch.clear();
             scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
             let m = scratch.len();
@@ -911,6 +941,10 @@ fn reject_linear_fit<T: Sample>(values: &mut [T], sigma_low: f64, sigma_high: f6
     LINEAR_FIT_VALUE_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
         for _ in 0..MAX_REJECTION_ITERS {
+            // Perf tier A Task 0: one outer-loop pass, thread-local,
+            // flushed by `take_rejection_counters` — see that function's
+            // doc.
+            LINEAR_FIT_ITERS.with(|c| c.set(c.get() + 1));
             let k = kept;
             if k < 2 {
                 break;

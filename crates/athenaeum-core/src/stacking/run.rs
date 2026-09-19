@@ -7841,6 +7841,9 @@ fn run_group_normalization(
                             background_ms = outcome.background_ms,
                             scale_ms = outcome.scale_ms,
                             write_ms = outcome.write_ms,
+                            ln_detect_ms = outcome.detect_ms,
+                            ln_fit_ms = outcome.fit_ms,
+                            ln_match_ms = outcome.match_ms,
                             "ln frame normalized"
                         );
                         set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
