@@ -3811,6 +3811,9 @@ pub async fn enqueue_frame_set_send(
         // stacking-run artifact (M4d Task 1), never part of a payload.
         keep_mosaic: false,
         format,
+        // A send's calibrated output is the payload — it must survive a
+        // crash, so it stays durable like every other export/send write.
+        skip_fsync: false,
     };
     let entries =
         crate::api::frame_set_send::frame_set_entries(ctx, frame_set_id, mode, &gen_opts)?;

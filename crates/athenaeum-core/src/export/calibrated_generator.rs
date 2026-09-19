@@ -35,7 +35,7 @@ use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalC
 use crate::calibration_library::light_resolve::resolve_frame_inputs;
 use crate::export::models::{calibrated_output_filename, CalibratedLightOptions};
 use crate::fits_writer::keywords::Bayer;
-use crate::fits_writer::{write_fits_f32, Card, CardValue};
+use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::banded::probe_bitpix;
 use crate::integration::cfa::CfaGeometry;
 use crate::integration::IntegrationError;
@@ -585,6 +585,12 @@ pub fn execute_generation(
         None
     };
 
+    // Perf tier 1 Task 6: both writes below share one durability choice —
+    // `Volatile` only for the stacking run's own regenerable intermediates
+    // (`opts.skip_fsync`, set nowhere else), `Durable` for every export/send
+    // caller.
+    let durability = if opts.skip_fsync { Durability::Volatile } else { Durability::Durable };
+
     // ── The calibrated CFA mosaic (M4d Task 1, ruling R-M4d-1) ──────────────
     // A SECOND output of this same generation, written BEFORE the debayer
     // from the very buffer the debayer is about to read: one read, one
@@ -613,7 +619,7 @@ pub fn execute_generation(
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // `write_fits_f32` directly, not `write_calibrated_output`
+                // `write_fits_f32_with` directly, not `write_calibrated_output`
                 // (fix round 1, m4): the same temp-file + rename write, but
                 // no sampling xxh3 — nothing consumes a hash of the mosaic
                 // (it is a working artifact, never a payload or a catalog
@@ -622,13 +628,14 @@ pub fn execute_generation(
                 // mosaic is a run-internal artifact, never the chosen
                 // export/send container).
                 let t = Instant::now();
-                write_fits_f32(
+                write_fits_f32_with(
                     path,
                     frame.width,
                     frame.height,
                     1,
                     &frame.data,
                     &mosaic_cards,
+                    durability,
                 )
                 .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
                 write_ms += t.elapsed().as_millis() as u64;
@@ -704,6 +711,7 @@ pub fn execute_generation(
         &data,
         &cards,
         spec.format,
+        durability,
     )?;
     write_ms += t.elapsed().as_millis() as u64;
     let byte_size = std::fs::metadata(output_path)?.len();

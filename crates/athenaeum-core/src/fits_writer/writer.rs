@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::card::{format_card, Card, CardValue, FitsWriteError, BLOCK_SIZE, CARD_SIZE};
+use super::Durability;
 
 /// Format one card and append its 80-byte record(s) to `records`.
 fn push(records: &mut Vec<[u8; CARD_SIZE]>, c: Card) -> Result<(), FitsWriteError> {
@@ -80,6 +81,8 @@ pub(crate) fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// fully succeeds. Validates first (so a bad call never touches `path`), then
 /// writes to a sibling temp file and atomically renames it into place — a
 /// pre-existing good file at `path` is never truncated by a failed write.
+/// Always [`Durability::Durable`] — see [`write_fits_f32_with`] for a caller
+/// that can afford to skip the fsync.
 pub fn write_fits_f32(
     path: &Path,
     width: usize,
@@ -87,6 +90,26 @@ pub fn write_fits_f32(
     channels: usize,
     data: &[f32],
     cards: &[Card],
+) -> Result<(), FitsWriteError> {
+    write_fits_f32_with(path, width, height, channels, data, cards, Durability::Durable)
+}
+
+/// [`write_fits_f32`] with the durability as a parameter (perf tier 1 Task
+/// 6). `Durability::Durable` `sync_all`s the temp file before the rename —
+/// unchanged behavior for every master/export/send writer. `Durability::
+/// Volatile` skips the fsync: the temp-file + rename write is still atomic
+/// (a reader never observes a partial file at `path`), but a crash between
+/// the flush and the rename can lose the write entirely — acceptable only
+/// for the stacking run's own calibrated intermediates, which a cache-row
+/// hash + stat make a cache miss rather than a wrong answer when lost.
+pub fn write_fits_f32_with(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[Card],
+    durability: Durability,
 ) -> Result<(), FitsWriteError> {
     validate(width, height, channels, data.len())?;
 
@@ -101,9 +124,11 @@ pub fn write_fits_f32(
         let mut w = std::io::BufWriter::new(f);
         write_fits_f32_to(&mut w, width, height, channels, data, cards)?;
         w.flush()?;
-        // Power-loss durability: data must be on disk before the rename
-        // makes the file visible under its final name.
-        w.get_ref().sync_all()?;
+        if durability == Durability::Durable {
+            // Power-loss durability: data must be on disk before the rename
+            // makes the file visible under its final name.
+            w.get_ref().sync_all()?;
+        }
         Ok(())
     })();
 
@@ -240,5 +265,19 @@ mod tests {
         // value: None + text: None used to hit `expect("value card")`.
         let broken = Card { keyword: "GAIN".into(), value: None, comment: None, text: None, structural: false };
         assert!(crate::fits_writer::card::format_card(&broken).is_err());
+    }
+
+    #[test]
+    fn volatile_write_is_still_atomic_and_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<f32> = (0..64 * 48).map(|i| i as f32 * 0.5).collect();
+        let a = dir.path().join("durable.fits");
+        let b = dir.path().join("volatile.fits");
+        write_fits_f32_with(&a, 64, 48, 1, &data, &[], Durability::Durable).unwrap();
+        write_fits_f32_with(&b, 64, 48, 1, &data, &[], Durability::Volatile).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        // No tmp file left behind either way.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp.")).collect();
+        assert!(leftovers.is_empty());
     }
 }

@@ -46,7 +46,7 @@ use crate::duplicates::compute_xxhash;
 use crate::fits_parser::parse_fits_with_header;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::Bayer;
-use crate::fits_writer::{write_image_f32, Card, OutputFormat, XisfBounds};
+use crate::fits_writer::{write_image_f32_with, Card, Durability, OutputFormat, XisfBounds};
 use crate::integration::band_budget::MIN_BUDGET_BYTES;
 use crate::integration::banded::{BandPlanes, BandSource};
 use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
@@ -348,7 +348,10 @@ pub fn calibrate_light_compute_with(
 /// sitting at `path`. `channels` is a parameter rather than the constant `1`
 /// because a debayered frame goes out through this same door. `format`
 /// chooses the container; a calibrated light is always `ATH_CSCL`-scaled, so
-/// the XISF bounds are unconditionally [`XisfBounds::Unit`].
+/// the XISF bounds are unconditionally [`XisfBounds::Unit`]. `durability`
+/// (perf tier 1 Task 6) is the caller's own call — every export/send caller
+/// passes [`Durability::Durable`]; only the stacking run's own regenerable
+/// intermediates pass [`Durability::Volatile`].
 pub fn write_calibrated_output(
     path: &Path,
     width: usize,
@@ -357,8 +360,9 @@ pub fn write_calibrated_output(
     data: &[f32],
     cards: &[Card],
     format: OutputFormat,
+    durability: Durability,
 ) -> Result<String, IntegrationError> {
-    write_image_f32(path, width, height, channels, data, cards, format, XisfBounds::Unit)
+    write_image_f32_with(path, width, height, channels, data, cards, format, XisfBounds::Unit, durability)
         .map_err(|e| io_err(format!("writing {}: {e}", path.display())))?;
     compute_xxhash(path).map_err(|e| io_err(format!("hashing {}: {e:#}", path.display())))
 }
@@ -383,6 +387,7 @@ fn calibrate_light_inner(
         &frame.data,
         &inputs.cards,
         OutputFormat::Fits,
+        Durability::Durable,
     )?;
 
     tracing::debug!(
@@ -1173,7 +1178,7 @@ mod tests {
         // XisfBounds::Adu16 — the bounds `register_master`'s written masters
         // and `run_build`'s use).
         let dark_xisf = dir.path().join("dark_xisf.xisf");
-        write_image_f32(
+        crate::fits_writer::write_image_f32(
             &dark_xisf,
             w,
             h,
@@ -2108,6 +2113,7 @@ mod tests {
             &frame.data,
             &cfg_b.cards,
             OutputFormat::Fits,
+            Durability::Durable,
         )
         .unwrap();
 

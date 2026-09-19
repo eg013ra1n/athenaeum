@@ -357,6 +357,18 @@ pub struct CalibratedLightOptions {
     /// FITS — `PlaneReader` reads nothing else), and says so in stage 1.
     #[serde(default)]
     pub format: crate::fits_writer::OutputFormat,
+    /// Skip the fsync before the write's rename (perf tier 1 Task 6). The
+    /// stacking run sets this for its own calibrated intermediates — the
+    /// `stacking_artifacts` row keys on a config hash plus (size, mtime),
+    /// so a file a crash truncates is a cache miss on the next run, never a
+    /// wrong answer — and nothing else does.
+    ///
+    /// **Run-internal, never on the wire** (`#[serde(skip)]`, same reason as
+    /// `keep_mosaic` above): a host command has no say in it, so a payload
+    /// written by any host decodes it as `false` (durable) and an options
+    /// value serialized by this build round-trips to `false` too.
+    #[serde(skip)]
+    pub skip_fsync: bool,
 }
 
 impl Default for CalibratedLightOptions {
@@ -369,6 +381,7 @@ impl Default for CalibratedLightOptions {
             debayer_osc: true,
             keep_mosaic: false,
             format: crate::fits_writer::OutputFormat::Fits,
+            skip_fsync: false,
         }
     }
 }
@@ -397,6 +410,9 @@ impl CalibratedLightOptions {
             // wants the mosaic sets it on the resolved options itself.
             keep_mosaic: d.keep_mosaic,
             format: format.unwrap_or(d.format),
+            // Not a host argument either (see the field's own doc): the
+            // stacking run sets it on the resolved options itself.
+            skip_fsync: d.skip_fsync,
         }
     }
 }

@@ -10,8 +10,19 @@ pub mod xisf_writer;
 pub mod wcs;
 pub use card::{Card, CardValue, FitsWriteError};
 pub use stamp::stamp_extra_card;
-pub use writer::{write_fits_f32, write_fits_f32_to};
+pub use writer::{write_fits_f32, write_fits_f32_to, write_fits_f32_with};
 pub use xisf_writer::{write_xisf_f32, write_xisf_f32_to, xisf_keyword_value};
+
+/// Whether a write must survive power loss before its rename makes it
+/// visible (perf tier 1 Task 6). `Durable` = `sync_all` before the rename —
+/// every master, every export. `Volatile` = flush only: the run's own
+/// calibrated intermediates, which the artifact row keys on a hash and a
+/// stat, so a file lost to a crash is a cache miss, never a wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    Durable,
+    Volatile,
+}
 
 /// The container an output image is written in. One enum for every writer
 /// in the app — stacking masters, calibration masters, calibrated lights —
@@ -66,7 +77,9 @@ impl XisfBounds {
 }
 
 /// One image in the chosen container — the ONE place the two writers are
-/// chosen between. `bounds` only matters for XISF.
+/// chosen between. `bounds` only matters for XISF. Always
+/// [`Durability::Durable`] — see [`write_image_f32_with`] for a caller that
+/// can afford to skip the fsync.
 pub fn write_image_f32(
     path: &std::path::Path,
     width: usize,
@@ -77,10 +90,30 @@ pub fn write_image_f32(
     format: OutputFormat,
     bounds: XisfBounds,
 ) -> Result<(), card::FitsWriteError> {
+    write_image_f32_with(path, width, height, channels, data, cards, format, bounds, Durability::Durable)
+}
+
+/// [`write_image_f32`] with the durability as a parameter (perf tier 1 Task
+/// 6) — the stacking run's regenerable calibrated intermediates pass
+/// [`Durability::Volatile`]; every other caller (masters, exports, sends,
+/// Perseus) passes [`Durability::Durable`].
+pub fn write_image_f32_with(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    data: &[f32],
+    cards: &[card::Card],
+    format: OutputFormat,
+    bounds: XisfBounds,
+    durability: Durability,
+) -> Result<(), card::FitsWriteError> {
     match format {
-        OutputFormat::Fits => writer::write_fits_f32(path, width, height, channels, data, cards),
-        OutputFormat::Xisf => {
-            xisf_writer::write_xisf_f32_with(path, width, height, channels, data, cards, bounds)
+        OutputFormat::Fits => {
+            writer::write_fits_f32_with(path, width, height, channels, data, cards, durability)
         }
+        OutputFormat::Xisf => xisf_writer::write_xisf_f32_with(
+            path, width, height, channels, data, cards, bounds, durability,
+        ),
     }
 }

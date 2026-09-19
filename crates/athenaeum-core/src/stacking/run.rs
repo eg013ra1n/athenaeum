@@ -1583,6 +1583,11 @@ fn resolve_calibrate_job(
     // what sets `spec.format` from these options, so the override has to
     // land on the options it resolves from, not on a later copy.
     calibration_opts.format = crate::fits_writer::OutputFormat::Fits;
+    // Perf tier 1 Task 6: this file is regenerable — the `stacking_artifacts`
+    // row above keys on the config hash plus (size, mtime), so a file a
+    // crash truncates is a cache miss on the next run, never a wrong answer.
+    // Skipping the fsync still keeps the write atomic (tmp + rename).
+    calibration_opts.skip_fsync = true;
 
     let spec = {
         let conn = db(&rc.ctx)?.conn();

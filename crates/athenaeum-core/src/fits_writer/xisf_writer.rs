@@ -104,7 +104,7 @@ use std::path::Path;
 
 use super::card::{fmt_real, format_card, sanitize_text, Card, CardValue, FitsWriteError};
 use super::writer::{rename_replace, validate};
-use super::XisfBounds;
+use super::{Durability, XisfBounds};
 
 /// The format signature: "XISF" plus the version it declares, 1.0.0.
 const SIGNATURE: &[u8; 8] = b"XISF0100";
@@ -362,6 +362,8 @@ fn header_prefix(
 }
 
 /// The stacking convention: unit-scaled samples (`ATH_CSCL`), `bounds="0:1"`.
+/// Always [`Durability::Durable`] — see [`write_xisf_f32_with`] for a caller
+/// that can afford to skip the fsync.
 pub fn write_xisf_f32(
     path: &Path,
     width: usize,
@@ -370,15 +372,18 @@ pub fn write_xisf_f32(
     data: &[f32],
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
-    write_xisf_f32_with(path, width, height, channels, data, cards, XisfBounds::Unit)
+    write_xisf_f32_with(path, width, height, channels, data, cards, XisfBounds::Unit, Durability::Durable)
 }
 
 /// Write an XISF file at `path`, replacing any existing file only after the
 /// write fully succeeds — [`super::writer::write_fits_f32`]'s contract and
 /// mechanism exactly: validate first (so a bad call never touches `path`),
-/// write to a sibling temp file, `sync_all`, then atomically rename it into
-/// place, so a pre-existing good file is never truncated by a failed write.
-/// `bounds` is the CALLER's own knowledge — see the module docs.
+/// write to a sibling temp file, `sync_all` when `durability` asks for it,
+/// then atomically rename it into place, so a pre-existing good file is
+/// never truncated by a failed write. `bounds` is the CALLER's own
+/// knowledge — see the module docs. `durability` is perf tier 1 Task 6 —
+/// see [`super::writer::write_fits_f32_with`]'s doc for what `Volatile`
+/// means and who may pass it.
 pub fn write_xisf_f32_with(
     path: &Path,
     width: usize,
@@ -387,6 +392,7 @@ pub fn write_xisf_f32_with(
     data: &[f32],
     cards: &[Card],
     bounds: XisfBounds,
+    durability: Durability,
 ) -> Result<(), FitsWriteError> {
     validate(width, height, channels, data.len())?;
 
@@ -401,9 +407,11 @@ pub fn write_xisf_f32_with(
         let mut w = std::io::BufWriter::new(f);
         write_xisf_f32_to(&mut w, width, height, channels, data, cards, bounds)?;
         w.flush()?;
-        // Power-loss durability: data must be on disk before the rename
-        // makes the file visible under its final name.
-        w.get_ref().sync_all()?;
+        if durability == Durability::Durable {
+            // Power-loss durability: data must be on disk before the rename
+            // makes the file visible under its final name.
+            w.get_ref().sync_all()?;
+        }
         Ok(())
     })();
 
@@ -620,7 +628,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("adu.xisf");
         let data: Vec<f32> = vec![0.0, 1234.5, 40000.0, 65535.0];
-        write_xisf_f32_with(&path, 4, 1, 1, &data, &sample_cards(), XisfBounds::Adu16).unwrap();
+        write_xisf_f32_with(&path, 4, 1, 1, &data, &sample_cards(), XisfBounds::Adu16, Durability::Durable).unwrap();
         let (_, header) = split_header(&std::fs::read(&path).unwrap());
         assert!(header.contains("bounds=\"0:65535\""), "header: {header}");
         let (_meta, pixels) = astroimage::ImageConverter::read_raw(&path).unwrap();
