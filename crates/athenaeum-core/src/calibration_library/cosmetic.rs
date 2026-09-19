@@ -139,19 +139,16 @@ pub fn hot_pixel_map_from_dark(
         )));
     }
 
-    // Sort a copy for the median, then rewrite that same copy into absolute
-    // deviations and sort again for the MAD — two sorts, but only one extra
+    // Use selection to find the median, then rewrite that same copy into absolute
+    // deviations and use selection again for the MAD — O(n) for both, one extra
     // plane of memory instead of two. `total_cmp` gives a total order, so a
-    // NaN-carrying dark sorts deterministically instead of leaving the buffer
-    // in an arbitrary state.
+    // NaN-carrying dark gives the same answer the sort did.
     let mut work: Vec<f32> = data.clone();
-    work.sort_unstable_by(|a, b| a.total_cmp(b));
-    let median = median_of_sorted(&work);
+    let median = median_by_selection(&mut work);
     for v in work.iter_mut() {
         *v = (*v as f64 - median).abs() as f32;
     }
-    work.sort_unstable_by(|a, b| a.total_cmp(b));
-    let mad = median_of_sorted(&work);
+    let mad = median_by_selection(&mut work);
     drop(work);
 
     if mad == 0.0 {
@@ -310,6 +307,26 @@ pub fn apply_hot_pixel_correction(
     }
 
     replaced
+}
+
+/// `median_of_sorted`'s value without the sort: `select_nth_unstable_by`
+/// places the upper middle; the lower middle (even `n`) is the maximum of
+/// the partition below it. Same `total_cmp` order, so a NaN-carrying plane
+/// gives the same answer the sort did.
+fn median_by_selection(work: &mut [f32]) -> f64 {
+    let n = work.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mid = n / 2;
+    let (below, at, _) = work.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let upper = *at as f64;
+    if n % 2 == 1 {
+        upper
+    } else {
+        let lower = below.iter().copied().max_by(|a, b| a.total_cmp(b)).expect("even n >= 2 has a lower half") as f64;
+        (lower + upper) / 2.0
+    }
 }
 
 /// Median of an ascending slice: the middle element for an odd count, the mean
@@ -650,4 +667,22 @@ mod tests {
         assert!(map.is_empty(), "nothing clears the threshold");
         assert_eq!(map.len(), 0);
     }
+
+    #[test]
+    fn median_by_selection_matches_the_sorted_median() {
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng % 10_000) as f32 * 0.37 - 1000.0 };
+        for n in [0usize, 1, 2, 3, 4, 101, 1000, 1001] {
+            let mut v: Vec<f32> = (0..n).map(|_| next()).collect();
+            if n > 10 { v[3] = f32::NAN; v[7] = f32::NEG_INFINITY; }
+            let mut sorted = v.clone();
+            sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+            let expected = median_of_sorted(&sorted);
+            let mut work = v.clone();
+            let got = median_by_selection(&mut work);
+            assert!(got.to_bits() == expected.to_bits(), "n={n}: {got} vs {expected}");
+        }
+    }
 }
+
+
