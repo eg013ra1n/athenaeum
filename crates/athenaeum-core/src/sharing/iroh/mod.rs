@@ -67,6 +67,7 @@ use super::types::{
 use super::{FetchSink, ImportProgressSink, SharingTransport};
 use crate::sync::DedupResponder;
 
+pub(crate) mod assign;
 pub mod blobs;
 pub mod node;
 pub mod pacer;

@@ -52,6 +52,7 @@ use crate::sharing::{
 };
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
+use super::assign::{AssignmentReport, ProviderStats, SwarmFetchMode};
 use super::node::{NodeOptions, Role, SharedIrohNode};
 use super::{random_secret, BlobStore, IrohTransport};
 
@@ -2477,6 +2478,375 @@ async fn multi_fetch_with_all_dead_providers_fails_cleanly() {
     );
 
     c.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// A2a Task 7 — `SwarmFetchMode::Assigned`: our own assignment loop.
+//
+// The same three-node localhost harness as the D3 tests above, driven through
+// `fetch_collection_multi_tuned_for_test` so the test can shorten the progress
+// deadline and read the `AssignmentReport` production throws away.
+// ---------------------------------------------------------------------------
+
+/// A [`StartInfo`]-shaped node id as the assignment report keys it.
+fn endpoint_id(id: NodeId) -> EndpointId {
+    EndpointId::from_bytes(&id).expect("a node id from StartInfo is a valid endpoint id")
+}
+
+fn provider_stats(report: &AssignmentReport, id: NodeId) -> ProviderStats {
+    report
+        .per_provider
+        .get(&endpoint_id(id))
+        .cloned()
+        .expect("every provider handed to the loop appears in its report")
+}
+
+/// A provider that ACCEPTS and then trickles must not pin the fetch: the
+/// assignment loop's stall ceiling reassigns its children and the fetch
+/// finishes on the healthy provider inside a bounded time.
+///
+/// **On the trickle rate.** B is paced at 1 KB/s — two orders of magnitude
+/// below the *product's* 100 KB/s floor, which is a Settings validation rule
+/// (`api::sync::validate_upload_limit`), not a transport clamp. That is
+/// deliberate and it is the only rate that tests what this test is for: the
+/// provider emits one progress item per ~16 KiB chunk, so at the product floor
+/// the gap between two items is ~164 ms and NO stall ceiling short of ~200 ms
+/// could ever fire — and a 200 ms ceiling would be tripped by a loaded CI
+/// runner on a perfectly healthy provider. At 1 KB/s a 16 KiB chunk needs 16 s,
+/// so "no growth for 1500 ms" is unambiguous: B is the useless-but-alive peer
+/// of D4 §1(б), not a slow one.
+#[tokio::test]
+async fn assigned_fetch_reassigns_a_trickling_provider() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    const FILES: usize = 8;
+    const FILE_SIZE: usize = 256 * 1024;
+    let (pkg_dir, announce) =
+        build_many_file_package(&src.path().join("src"), "trickle", FILES, FILE_SIZE);
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // A unthrottled, B trickling — see the doc comment for the arithmetic.
+    b.set_upload_limit(1_000);
+
+    let (telemetry, seen) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let started = Instant::now();
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        c.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            vec![a_info.node_id, b_info.node_id],
+            &root.to_string(),
+            announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            Duration::from_millis(1500),
+        ),
+    )
+    .await
+    .expect("a trickling provider must not pin the fetch past the stall ceiling")
+    .expect("the healthy provider must finish the package")
+    .expect("the assigned loop always reports");
+    let elapsed = started.elapsed();
+
+    assert_package_landed(&pkg_dir, dest.path(), FILES);
+
+    let a_stats = provider_stats(&report, a_info.node_id);
+    let b_stats = provider_stats(&report, b_info.node_id);
+
+    // A carried the bulk. B cannot have completed a single child: one 256 KiB
+    // child needs 262 s at 1 KB/s and the ceiling cuts it at 1.5 s, so the
+    // remaining 8 frames + the manifest are all A's.
+    assert!(
+        a_stats.bytes > 6 * FILE_SIZE as u64,
+        "the healthy provider must have served the bulk of the package — \
+         a delivered {} B of {} B, b delivered {} B (elapsed {elapsed:?})",
+        a_stats.bytes,
+        (FILES * FILE_SIZE) as u64,
+        b_stats.bytes
+    );
+
+    // And the trickling one was stalled out rather than waited on.
+    assert!(
+        b_stats.failures >= 1,
+        "the trickling provider must have been failed out by the stall ceiling, \
+         not waited for — its stats are {b_stats:?}"
+    );
+    assert!(
+        report.stalls >= 1,
+        "the failure must be attributed to the progress deadline (a stall), not \
+         to an error the stock loop would also have caught — report {report:?}"
+    );
+
+    // The loop's own telemetry is not lossy the way the Split stream is: every
+    // attempt it made is reported, so the trickling provider IS visible here.
+    assert!(
+        tried_providers(&seen).contains(&b_info.node_id),
+        "the assignment loop must report the attempts it made on the trickling provider"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// Every provider dead (connection refused) ⇒ the loop exhausts its backoff
+/// ladder and returns Err inside a bounded time instead of spinning — and it
+/// keeps the in-flight GC tag, because the verified partial bytes are what
+/// makes the next attempt cheap.
+///
+/// **Why phase 1 is primed first.** The in-flight tag is set only after phase 1
+/// lands the root hash-seq (`multi_fetch_with_all_dead_providers_fails_cleanly`
+/// pins the other half of that contract: no phase 1, no tag). To reach the
+/// assignment loop at all with a dead provider set, the puller must already
+/// hold the root and the collection meta — so the test fetches the manifest
+/// from A while A is alive, which is exactly phase 1's request, and only then
+/// kills A. The stock `execute_get` short-circuits on `local.is_complete()`
+/// before it awaits the dial, so phase 1 then succeeds against a corpse.
+#[tokio::test]
+async fn assigned_fetch_fails_fast_when_every_provider_is_dead() {
+    let da = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    const FILES: usize = 3;
+    let (pkg_dir, announce) =
+        build_many_file_package(&src.path().join("src"), "dead", FILES, 64 * 1024);
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // Prime phase 1 (root hash-seq + collection meta) while A still answers.
+    // `write_package`'s announce carries a placeholder root hash, so point this
+    // one at the real collection hash.
+    let mut real = announce.clone();
+    real.root_hash = root.to_string();
+    let manifest_dir = tempdir().unwrap();
+    c_recv
+        .fetch_manifest(a_info.node_id, &real, manifest_dir.path())
+        .await
+        .expect("the manifest fetch primes the root hash-seq and the collection meta");
+
+    a.shutdown().await;
+
+    let (telemetry, _seen) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let started = Instant::now();
+    let res = tokio::time::timeout(
+        Duration::from_secs(120),
+        c.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            vec![a_info.node_id],
+            &root.to_string(),
+            announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            // Production's ceiling: nothing here ever connects, so the ladder,
+            // not the stall watchdog, is what bounds this test.
+            super::assign::STALL_HARD_LIMIT,
+        ),
+    )
+    .await
+    .expect("a dead swarm must fail inside the backoff ladder, never hang");
+    let elapsed = started.elapsed();
+
+    assert!(
+        res.is_err(),
+        "a fetch whose every provider is unreachable must return Err, got {res:?}"
+    );
+    // The ladder is 500 ms doubling six times ≈ 31.5 s of waiting plus the
+    // dials between the rungs. A lower bound is the honest assertion here: it
+    // fails if the loop ever gives up on the first dial (no ladder at all),
+    // and the 120 s timeout above fails if it spins.
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "the loop must walk its backoff ladder before giving up, not fail on the \
+         first dial — it gave up after {elapsed:?}"
+    );
+
+    // The partial bytes phase 1 landed stay GC-protected: a later attempt
+    // against a different holder set resumes from them. Same contract as the
+    // stock path, which is the point of keeping the tag out of the phase-2 arm.
+    assert!(
+        tag_present(c.store(), &format!("in-flight/recv/pkg/{}", root.to_hex())).await,
+        "a failed assignment loop must KEEP the in-flight tag so the verified \
+         partial bytes survive for the next attempt"
+    );
+
+    c.shutdown().await;
+}
+
+/// The mode flag: Stock and Assigned both land the identical package, and the
+/// Assigned report accounts every byte the providers' socket counters saw.
+///
+/// The report is our own bookkeeping; `sent_bytes` is iroh's socket counter on
+/// the other side of the wire. Bracketing one against the other is the only
+/// check that the loop's per-provider attribution is real rather than
+/// self-consistent — and it is what A4's ranking will be built on.
+#[tokio::test]
+async fn assigned_fetch_report_matches_provider_send_counters() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let dd = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+    let d = bind_disabled(dd.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let d_recv = d.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+    let d_info = d_recv.start().await.unwrap();
+
+    for puller in [&c, &d] {
+        puller.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+        puller.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    }
+    for provider in [&a, &b] {
+        provider.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+        provider.add_peer_ticket(&d_info.pairing_ticket).unwrap();
+    }
+
+    // 256 KiB per entry, not the D3 tests' 96 KiB: the byte-reconciliation
+    // below compares payload against total socket egress, and a provider's
+    // fixed handshake + phase-1 cost (~16 KB, measured in `SERVED_PAYLOAD_FLOOR`)
+    // is 16 % of a 96 KiB child but under 6 % of a 256 KiB one.
+    const FILES: usize = 14;
+    let (pkg_dir, announce) =
+        build_many_file_package(&src.path().join("src"), "report", FILES, 256 * 1024);
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // Arm 1: the stock Split fan-out, into puller C.
+    let stock_dest = tempdir().unwrap();
+    let (stock_telemetry, _) = recording_telemetry();
+    let stock_report = c
+        .fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            vec![a_info.node_id, b_info.node_id],
+            &root.to_string(),
+            announce.byte_size,
+            stock_dest.path(),
+            noop_fetch_sink(),
+            stock_telemetry,
+            SwarmFetchMode::Stock,
+            super::assign::STALL_HARD_LIMIT,
+        )
+        .await
+        .expect("the stock fan-out must still complete");
+    assert!(
+        stock_report.is_none(),
+        "the stock path runs upstream's loop and has no per-provider report to give"
+    );
+    assert_package_landed(&pkg_dir, stock_dest.path(), FILES);
+
+    // Arm 2: the assignment loop, into a FRESH puller D so nothing is already
+    // local — bracketed by both providers' socket counters.
+    let dest = tempdir().unwrap();
+    let (telemetry, _) = recording_telemetry();
+    let a_before = sent_bytes(&a);
+    let b_before = sent_bytes(&b);
+    let report = d
+        .fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            vec![a_info.node_id, b_info.node_id],
+            &root.to_string(),
+            announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            super::assign::STALL_HARD_LIMIT,
+        )
+        .await
+        .expect("the assigned loop must complete")
+        .expect("the assigned loop always reports");
+    let a_sent = sent_bytes(&a).saturating_sub(a_before);
+    let b_sent = sent_bytes(&b).saturating_sub(b_before);
+
+    // Both modes land the identical package: each is byte-identical to the
+    // source, so they are byte-identical to each other.
+    assert_package_landed(&pkg_dir, dest.path(), FILES);
+
+    for (name, id, sent) in [("a", a_info.node_id, a_sent), ("b", b_info.node_id, b_sent)] {
+        let stats = provider_stats(&report, id);
+        assert!(
+            stats.bytes <= sent,
+            "provider {name} cannot have delivered more payload than its socket \
+             sent: report {} B vs sent {sent} B",
+            stats.bytes
+        );
+        assert!(
+            stats.bytes * 10 >= sent * 9,
+            "provider {name}'s reported payload must account for its egress \
+             bar framing: report {} B vs sent {sent} B ({:.1} %)",
+            stats.bytes,
+            stats.bytes as f64 * 100.0 / sent.max(1) as f64
+        );
+    }
+
+    // Every collection child is attributed to exactly one provider. The
+    // collection carries FILES payload entries PLUS `manifest.ndjson`, which is
+    // an ordinary entry and an ordinary child — the hash-seq's child 0 (the
+    // collection meta) is phase 1's and is not assigned here.
+    assert_eq!(
+        report.total_children() as usize,
+        FILES + 1,
+        "every child, manifest included, must be accounted for exactly once: {report:?}"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+    d.shutdown().await;
 }
 
 /// Transfer-prepare spec §4.1: the two-dir bind keeps the device IDENTITY under

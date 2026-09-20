@@ -62,6 +62,7 @@ use crate::sharing::{FetchSink, ImportProgressSink, ProviderTelemetrySink, Shari
 use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
+use super::assign::{self, AssignmentReport, SwarmFetchMode};
 use super::pacer::UploadPacer;
 use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
@@ -2135,6 +2136,74 @@ impl SharedIrohNode {
         sink: FetchSink,
         telemetry: ProviderTelemetrySink,
     ) -> Result<()> {
+        // A2a: the assignment loop is the default and the stock `Split` fan-out
+        // stays one environment variable away (`ATHENAEUM_SWARM_FETCH=stock`),
+        // resolved once per process. Production never shortens the stall
+        // ceiling — only a test does, through
+        // [`Self::fetch_collection_multi_tuned_for_test`].
+        self.role_fetch_multi_inner(
+            role,
+            providers,
+            root_hash,
+            byte_size,
+            dest_dir,
+            sink,
+            telemetry,
+            assign::swarm_fetch_mode(),
+            assign::STALL_HARD_LIMIT,
+        )
+        .await
+        .map(|_report| ())
+    }
+
+    /// Test seam (A2a): the same swarm fetch, with the phase-2 mode and the
+    /// assignment loop's progress deadline chosen by the caller, returning the
+    /// [`AssignmentReport`] production discards.
+    ///
+    /// A test needs both: a deliberately trickling peer only trips a stall
+    /// ceiling shortened to its own patience, and the report is the only place
+    /// per-provider bytes are visible at all.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fetch_collection_multi_tuned_for_test(
+        &self,
+        role: Role,
+        providers: Vec<NodeId>,
+        root_hash: &str,
+        byte_size: u64,
+        dest_dir: &Path,
+        sink: FetchSink,
+        telemetry: ProviderTelemetrySink,
+        mode: SwarmFetchMode,
+        stall_hard_limit: std::time::Duration,
+    ) -> Result<Option<AssignmentReport>> {
+        self.role_fetch_multi_inner(
+            role,
+            providers,
+            root_hash,
+            byte_size,
+            dest_dir,
+            sink,
+            telemetry,
+            mode,
+            stall_hard_limit,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn role_fetch_multi_inner(
+        &self,
+        role: Role,
+        providers: Vec<NodeId>,
+        root_hash: &str,
+        byte_size: u64,
+        dest_dir: &Path,
+        sink: FetchSink,
+        telemetry: ProviderTelemetrySink,
+        mode: SwarmFetchMode,
+        stall_hard_limit: std::time::Duration,
+    ) -> Result<Option<AssignmentReport>> {
         let hash: Hash = root_hash
             .parse()
             .with_context(|| format!("parse collection hash {root_hash:?}"))?;
@@ -2152,7 +2221,7 @@ impl SharedIrohNode {
         // download awaits below (same discipline as `role_fetch`).
         let endpoint = self.endpoint();
         let count = ids.len();
-        blobs::fetch_collection_multi(
+        let report = blobs::fetch_collection_multi(
             &self.store,
             &endpoint,
             ids,
@@ -2162,15 +2231,18 @@ impl SharedIrohNode {
             byte_size,
             sink,
             telemetry,
+            mode,
+            stall_hard_limit,
         )
         .await?;
 
         tracing::info!(
             providers = count,
             root_hash = %hash,
+            stalls = report.as_ref().map(|r| r.stalls).unwrap_or(0),
             "iroh multi-source fetch complete"
         );
-        Ok(())
+        Ok(report)
     }
 
     async fn role_fetch_manifest(
