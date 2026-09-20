@@ -109,6 +109,33 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
 7. **Hashes.** `ln` artifacts already fold in `PSF_FIT_VERSION`; C1 bumps it (2 → 3), which
    invalidates every cached `metrics` (they must now carry the fits) and every `.athln` — the
    first Tier C run re-measures and re-normalizes every set once, as M4a did.
+8. **Per-group seeds calibration (fix round 3, ruling C-13, LEVER 2).** Fix round 2's own 13-frame
+   table (§2.3 below) found the seeds path's scale reading SAME-SIGNED higher than today's
+   detection path on every real frame, median +0.666 %, max +1.401 % — small against the 1.5 %
+   ceiling but a same-signed bias moves a master's LEVEL (spec §8's median ± 0.1 % target), so it
+   had to go. LEVER 1 (relax the seeds path's own pre-select/saturation filters to recover more of
+   the population) was measured directly (`SeedFilterBreakdown`, `--diag`) and found NOT the cause:
+   on a dense mono frame the saturation guard drops 0 seeds, the pre-select-against-the-reference-
+   tree step is the dominant nominal loss (16502 → 9198, ≈ 44 %), but widening it to `2 ×
+   match_radius_px` or removing it entirely left `matched`/`scale` unchanged to three significant
+   figures while roughly doubling `scale_ms` — the lost stars have no reference counterpart at
+   either radius, so the filter was kept as shipped in fix round 2 and LEVER 1 landed nothing.
+   LEVER 2 ships instead: `stacking::run::measure_ln_seeds_calibration`, called once per group
+   before stage 6's fan-out (skipped when every member already has a fresh cached sidecar), runs
+   BOTH `normalize_frame` paths — the seeds path and, with `fits = None`, today's detection
+   fallback — on the group's registration/geometry reference frame
+   (`RunContext::geometry_of(&group.key).reference_frame_id`) plus its two best-weighted other
+   members (`FrameWeight::normalized_mean`), writing to a throwaway sidecar under the group's own
+   `ln/` directory that is deleted immediately after (never the real `.athln` path, never a
+   `stacking_artifacts` row). `k = median(s_old / s_seeds)` over whichever of the three frames
+   produced a genuine (non-fallback) seeds-path scale; `< 2` usable frames leaves the group
+   uncalibrated (`k` omitted, never a hard failure). `normalize_frame` grew a
+   `seeds_calibration: Option<f64>` parameter: a channel that actually took the seeds path
+   multiplies its `ScaleResult::scale` by `k` before it becomes `A`; a channel that fell back to
+   detection is uncalibrated by definition (LEVER 1's own diagnostics found no bias on that path to
+   correct); a channel carrying a fitted local-scale spline (`normalization.local.localScale`)
+   skips calibration and warns once per frame — its residuals were fit against the UNCALIBRATED
+   `s`, so rescaling the global term alone would leave the two inconsistent.
 
 ### 2.3 What moves
 The relative scale `s` per frame: Measure's fit flux (native geometry, its own β) vs today's
@@ -132,6 +159,17 @@ exposed to this: it fits the reference (itself an integration of already-warped 
 target (also warped) on planes of the SAME KIND, which is why that comparison stays self-
 consistent and is kept as the baseline the seeds design (§2.2 item 3) is checked against, rather
 than being replaced.
+
+**Fix round 3 finding (ruling C-13, LEVER 2): the per-group calibration factor closes the
+remaining bias.** Re-measuring the same 13-frame table with `k` applied (§2.2 item 8): median
+|Δ| 0.666 % → 0.182 %, max |Δ| 1.401 % → 0.722 % — both comfortably inside the ruling's own
+"median ≈ 0, max ≈ 0.7 %" expectation — and, more importantly, the residual is no longer
+SAME-SIGNED: 6 of 13 frames now read below the detection baseline, 7 above (mono: −0.29, +0.27,
+−0.26, +0.01, +0.72, −0.01, −0.59, +0.38 %; OSC: +0.16, 0.00, −0.15, +0.18, −0.12 %), consistent
+with genuine per-frame scatter around zero rather than a systematic offset a master's level would
+inherit. `matches` is unaffected by design (LEVER 2 only rescales the already-matched sample, it
+does not touch pairing) — fix round 2's own shortfall against the "≥ 0.8×" bar on mono frames
+(0.70–0.77×, LEVER 1's own unsuccessful target) is unchanged by this round.
 
 ## 3. C2 — drizzle phase table
 

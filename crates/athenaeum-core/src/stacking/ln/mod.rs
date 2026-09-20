@@ -57,8 +57,9 @@ pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
 pub use scale::{
     relative_scale, relative_scale_against, relative_scale_against_with_diag,
-    relative_scale_from_seeds, relative_scale_from_seeds_with_diag, PreparedReferenceChannel,
-    ScaleMatchDiag, ScaleResult, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
+    relative_scale_from_seeds, relative_scale_from_seeds_with_breakdown,
+    relative_scale_from_seeds_with_diag, PreparedReferenceChannel, ScaleMatchDiag, ScaleResult,
+    SeedFilterBreakdown, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
 
@@ -467,6 +468,24 @@ impl<'a> LnReferenceForDetection<'a> {
 /// `reference_for_detection`'s own prepared channels by the caller
 /// (`stacking::run`'s `LnReferenceForDetection::build` call), and the
 /// seeds path never reads a target's own β at all.
+///
+/// **Fix round 3 (ruling C-13, LEVER 2):** `seeds_calibration` is a
+/// per-GROUP factor `k` — `stacking::run::measure_ln_seeds_calibration`'s
+/// own doc has the measurement — multiplied into a channel's scale ONLY
+/// when that channel actually took the seeds path (`plane_fits` matched
+/// and produced a usable [`ScaleResult`], as opposed to falling back to
+/// [`scale::relative_scale_against`]): the fallback path is uncalibrated by
+/// definition (LEVER 1's own diagnostics found no bias to correct there —
+/// only the seeds path's fitted-signal warp-dependence, ruling C-11). A
+/// channel whose scale carries a fitted local-scale spline
+/// (`scale_result.local.is_some()`, `normalization.local.localScale`) skips
+/// calibration and keeps its own uncalibrated `s` — multiplying the global
+/// term alone, without refitting the spline's own residuals against a
+/// rescaled baseline, would leave the two inconsistent; this channel warns
+/// once per frame the first time it happens. `None` (the group's
+/// calibration measurement itself found fewer than two usable frames, or
+/// the group has no calibration to run) leaves every channel exactly as
+/// before this fix round.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
@@ -479,6 +498,7 @@ pub fn normalize_frame(
     interpolation: Interpolation,
     clamping: f32,
     sidecar: &Path,
+    seeds_calibration: Option<f64>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<LnFrameOutcome, LnError> {
@@ -532,6 +552,9 @@ pub fn normalize_frame(
     // `warn!`.
     let mut frame_scale_source: &'static str = "seeds";
     let mut warned_fallback = false;
+    // Fix round 3, ruling C-13, LEVER 2: one warning per frame, not one per
+    // channel, for the local-scale-spline skip below.
+    let mut warned_local_calibration_skip = false;
 
     // Perf tier 1 Task 8: one `RegisteredSource` per FRAME, re-pointed at
     // each channel with `set_plane` (ruling R-T4-7's own reasoning, applied
@@ -692,7 +715,8 @@ pub fn normalize_frame(
                 pool,
             )
         };
-        let scale_result = match plane_fits {
+        let mut plane_from_seeds = true;
+        let mut scale_result = match plane_fits {
             Some(pf) => match scale::relative_scale_from_seeds(
                 &reference_for_detection.prepared[p],
                 pf,
@@ -708,16 +732,40 @@ pub fn normalize_frame(
             ) {
                 Ok(r) => r,
                 Err(LnError::TooFewMatches { .. }) => {
+                    plane_from_seeds = false;
                     frame_scale_source = "detected";
                     fall_back_to_detection(&mut warned_fallback)?
                 }
                 Err(e) => return Err(e),
             },
             None => {
+                plane_from_seeds = false;
                 frame_scale_source = "detected";
                 fall_back_to_detection(&mut warned_fallback)?
             }
         };
+        // Fix round 3, ruling C-13, LEVER 2: apply the group's seeds
+        // calibration factor `k` — never on a channel that fell back to
+        // detection (uncalibrated by definition, LEVER 1's diagnostics
+        // found no bias there), and never on a channel carrying a fitted
+        // local-scale spline (its residuals were fit against the
+        // UNCALIBRATED `s`; rescaling the global term alone would leave
+        // the two inconsistent — warn once per frame instead).
+        if plane_from_seeds {
+            if let Some(k) = seeds_calibration {
+                if scale_result.local.is_some() {
+                    if !warned_local_calibration_skip {
+                        tracing::warn!(
+                            frame_id = frame.frame_id,
+                            "ln: seeds calibration skipped for a channel with a fitted local-scale spline"
+                        );
+                        warned_local_calibration_skip = true;
+                    }
+                } else {
+                    scale_result.scale *= k;
+                }
+            }
+        }
         scale_ms += t.elapsed().as_millis() as u64;
         detect_ms += scale_result.timings.detect_ms;
         refine_ms += scale_result.timings.refine_ms;

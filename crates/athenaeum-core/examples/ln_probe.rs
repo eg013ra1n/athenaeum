@@ -44,8 +44,9 @@ use athenaeum_core::stacking::integrate::{
     GroupInput, LocalNormalizationConfig, NormalizationConfig, StackFrame,
 };
 use athenaeum_core::stacking::ln::{
-    background_grid, build_reference, normalize_frame, relative_scale, BackgroundParams,
-    LnFrameGrids, LnGrid, LnReferenceForDetection, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    background_grid, build_reference, normalize_frame, relative_scale,
+    relative_scale_from_seeds_with_breakdown, BackgroundParams, LnFrameGrids, LnGrid,
+    LnReferenceForDetection, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
@@ -54,7 +55,8 @@ use athenaeum_core::stacking::weights::FrameWeight;
 fn usage() -> ! {
     eprintln!(
         "usage: ln_probe --db <catalog.db> --set <id> --group <key> \
-[--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits]"
+[--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits] [--diag] \
+[--seeds-calibration <k>]"
     );
     std::process::exit(2);
 }
@@ -73,6 +75,22 @@ struct Args {
     /// with/without this flag on the SAME target frame is the task's own
     /// acceptance measurement.
     no_fits: bool,
+    /// Fix round 3 (ruling C-13, LEVER 1): print each channel's
+    /// [`athenaeum_core::stacking::ln::SeedFilterBreakdown`] — never used
+    /// by any production path, adds one extra (cheap: one more
+    /// `relative_scale_from_seeds_with_breakdown` call, not a second
+    /// detection) field to the per-channel JSON.
+    diag: bool,
+    /// Fix round 3 (ruling C-13, LEVER 2): a manual override for
+    /// `normalize_frame`'s new `seeds_calibration` parameter — the probe
+    /// measures one target frame at a time, so it does not reproduce
+    /// `stacking::run::measure_ln_seeds_calibration`'s own group-level
+    /// three-frame measurement; that `k` is obtained externally (e.g. from
+    /// two probe runs on a calibration frame, one plain and one
+    /// `--no-fits`, exactly what the production measurement itself does)
+    /// and handed in here so the probe's final `normalize_frame` call
+    /// exercises the SAME calibrated code path a real run would.
+    seeds_calibration: Option<f64>,
 }
 
 fn parse_args() -> Args {
@@ -83,11 +101,17 @@ fn parse_args() -> Args {
     let mut scale: u32 = LocalNormalizationConfig::default().scale;
     let mut frame: Option<String> = None;
     let mut no_fits = false;
+    let mut diag = false;
+    let mut seeds_calibration: Option<f64> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         if flag == "--no-fits" {
             no_fits = true;
+            continue;
+        }
+        if flag == "--diag" {
+            diag = true;
             continue;
         }
         let value = it.next().unwrap_or_else(|| usage());
@@ -98,6 +122,9 @@ fn parse_args() -> Args {
             "--frames" => frames = value.parse().unwrap_or_else(|_| usage()),
             "--scale" => scale = value.parse().unwrap_or_else(|_| usage()),
             "--frame" => frame = Some(value),
+            "--seeds-calibration" => {
+                seeds_calibration = Some(value.parse().unwrap_or_else(|_| usage()))
+            }
             _ => usage(),
         }
     }
@@ -110,6 +137,8 @@ fn parse_args() -> Args {
         scale,
         frame,
         no_fits,
+        diag,
+        seeds_calibration,
     }
 }
 
@@ -595,6 +624,7 @@ registration row for each — run stacking through Register first); found {}",
         interpolation,
         clamping,
         &sidecar_path,
+        args.seeds_calibration,
         // Perf tier A Task 12: the probe's own pool, not `None` — see the
         // `ref_backgrounds` comment above for why.
         Some(&pool),
@@ -640,6 +670,34 @@ registration row for each — run stacking through Register first); found {}",
             // report it rather than silently printing nulls if it does.
             eprintln!("channel {p}: relative_scale: {e}");
         }
+
+        // Fix round 3 (ruling C-13, LEVER 1), gated behind --diag: the
+        // seeds path's own filter-chain breakdown, computed directly
+        // (never through `normalize_frame`, which does not expose it).
+        let seed_filter_breakdown = if args.diag {
+            let plane_fits = target_fits.get(p).cloned().unwrap_or_default();
+            match relative_scale_from_seeds_with_breakdown(
+                &ref_for_detection.prepared[p],
+                &plane_fits,
+                &target.map,
+                &target_plane,
+                reference.width,
+                reference.height,
+                measure_opts.max_stars,
+                4.0,
+                0.3,
+                local_cfg.local_scale,
+                Some(&pool),
+            ) {
+                Ok((_, breakdown)) => Some(breakdown),
+                Err(e) => {
+                    eprintln!("channel {p}: seed filter breakdown: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let target_params = BackgroundParams {
             scale: args.scale,
@@ -716,6 +774,15 @@ registration row for each — run stacking through Register first); found {}",
             // `scale.rs`. Compare against `scale`/`matches` above (the
             // full-detection oracle) for the task's own before/after table.
             "measureFitsAvailable": target_fits.get(p).map(|v| v.len()),
+            // Fix round 3 (ruling C-13), only present with --diag.
+            "seedFilterBreakdown": seed_filter_breakdown.map(|b| serde_json::json!({
+                "available": b.available,
+                "inCoverage": b.in_coverage,
+                "pastSaturation": b.past_saturation,
+                "pastPreselect": b.past_preselect,
+                "fitAccepted": b.fit_accepted,
+                "matched": b.matched,
+            })),
         }));
     }
 
@@ -736,6 +803,7 @@ registration row for each — run stacking through Register first); found {}",
             "scaleSource": outcome.scale_source,
         },
         "noFits": args.no_fits,
+        "seedsCalibration": args.seeds_calibration,
         "groupBeta": group_beta_value,
         "referenceBuildMs": reference_build_ms,
         // Perf tier A Task 12: `normalize_frame`'s own per-phase timing —

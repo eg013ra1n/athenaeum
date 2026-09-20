@@ -983,10 +983,18 @@ fn choose_pairing_widened(
 /// (Measure's own acceptance already covers eccentricity/SNR on the
 /// NATIVE frame, but says nothing about the WARPED pixel the fresh fit is
 /// about to sample); (3) PRE-SELECT — keep only seeds with a reference
-/// star within `match_radius_px` of the mapped position
+/// star within `match_radius_px` of the mapped, UNFITTED position
 /// (`prepared`'s own match tree at the reference's DEFAULT β, cheap, no
-/// fit yet) — a seed with no nearby reference star can never produce a
-/// matched pair, so fitting it would be wasted PSF-fit work.
+/// fit yet). **Fix round 3, ruling C-13, LEVER 1 measured this step
+/// directly** ([`SeedFilterBreakdown`]): it is the dominant nominal loss
+/// on real frames (24-44% of Measure's own in-coverage, unsaturated
+/// seeds) — but ALSO measured that relaxing it (widening to `2 ×
+/// match_radius_px`) or removing it (fitting every in-coverage,
+/// unsaturated seed and letting [`choose_pairing_widened`] decide) leaves
+/// `matched` and `scale` UNCHANGED while costing real time — the lost
+/// stars have no reference counterpart within either radius at all, so
+/// this filter is kept at `match_radius_px`, the cheapest of the three
+/// variants measured.
 ///
 /// Survivors become [`Seed`]s (`peak`/`flux` copied from the Measure fit's
 /// own `amplitude`/`signal` — used only by [`fit_stars_with_beta`]'s
@@ -1032,7 +1040,73 @@ pub fn relative_scale_from_seeds(
         local_scale,
         pool,
     )
-    .map(|(r, _diag)| r)
+    .map(|(r, _diag, _breakdown)| r)
+}
+
+/// Fix round 3, ruling C-13, LEVER 1's own instrument: a per-STAGE count of
+/// [`relative_scale_from_seeds`]'s filter chain, so a caller can see WHICH
+/// step is responsible for the gap between Measure's own fit count and the
+/// number that ends up matched — never called by `normalize_frame` or any
+/// other production path. `available` is `fits.len()`; each later field
+/// counts survivors of one more step, in the SAME order the function itself
+/// applies them: `in_coverage` (the mapped, rounded position falls inside
+/// the reference canvas), `past_saturation` (the warped plane's own pixel
+/// value at that position clears [`SATURATION`]), `past_preselect` (a
+/// reference star sits within `match_radius_px` of the mapped, UNFITTED
+/// position, BEFORE the `max_stars` cap — ruling C-13, LEVER 1 measured
+/// this as the dominant nominal loss, 24-44% of real frames' in-coverage,
+/// unsaturated seeds, but ALSO measured that relaxing or removing it does
+/// not recover those stars — `matched` and `scale` came back unchanged
+/// whether this filter ran at `match_radius_px`, at `2 ×` it, or not at
+/// all, so the filter is kept as the cheapest of the three; the lost stars
+/// have no reference counterpart within either radius, full stop),
+/// `fit_accepted` (`fit_stars_with_beta` produced a `StarFit` for that
+/// seed — a seed can still be dropped here: the admission check in
+/// `psf_signal::fit_one`, a fit that failed to converge, or `dedupe`
+/// collapsing two seeds that walked onto the same star), `matched` (the
+/// pairing + `ratio_sample` step — [`ScaleResult::matches`] is exactly
+/// this number).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeedFilterBreakdown {
+    pub available: usize,
+    pub in_coverage: usize,
+    pub past_saturation: usize,
+    pub past_preselect: usize,
+    pub fit_accepted: usize,
+    pub matched: usize,
+}
+
+/// Diagnostic-only (ruling C-13, LEVER 1): exactly
+/// [`relative_scale_from_seeds`]'s own computation, plus the
+/// [`SeedFilterBreakdown`] the `_core` body already tallies for free.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_from_seeds_with_breakdown(
+    prepared: &PreparedReferenceChannel,
+    fits: &[StarFit],
+    map: &PixelMap,
+    target_plane: &[f32],
+    ref_width: usize,
+    ref_height: usize,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(ScaleResult, SeedFilterBreakdown), LnError> {
+    relative_scale_from_seeds_core(
+        prepared,
+        fits,
+        map,
+        target_plane,
+        ref_width,
+        ref_height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+        pool,
+    )
+    .map(|(r, _diag, breakdown)| (r, breakdown))
 }
 
 /// Diagnostic-only (mirrors [`relative_scale_against_with_diag`]'s own
@@ -1067,6 +1141,7 @@ pub fn relative_scale_from_seeds_with_diag(
         local_scale,
         pool,
     )
+    .map(|(r, diag, _breakdown)| (r, diag))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1082,23 +1157,49 @@ fn relative_scale_from_seeds_core(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
+) -> Result<(ScaleResult, Vec<ScaleMatchDiag>, SeedFilterBreakdown), LnError> {
     let default = prepared.default_prepared();
     let fit_params = FitParams::default();
+    let mut breakdown = SeedFilterBreakdown {
+        available: fits.len(),
+        ..Default::default()
+    };
 
     // Perf tier A Task 0 convention: this pre-select loop is this path's
     // own analog of `detect_seeds` (it is what decides WHAT gets fitted,
     // far cheaper than a full-frame detection) — timed into `detect_ms`
     // for the same log field the detection path reports.
+    //
+    // Fix round 3, ruling C-13, LEVER 1: `SeedFilterBreakdown` (below) DOES
+    // show this pre-select step (a reference star within `match_radius_px`
+    // of the mapped, UNFITTED seed) as the dominant nominal loss — 24-44%
+    // of Measure's own in-coverage, unsaturated fits on real catalog
+    // frames, dwarfing coverage (<1%) and saturation (0% measured)
+    // combined. But relaxing it does NOT recover those stars: measured on
+    // the real catalog, BOTH removing this filter entirely (fit every
+    // in-coverage, unsaturated seed) AND widening it to `2 × match_radius_
+    // px` left `matched` and the RCR-averaged `scale` UNCHANGED to three
+    // significant figures on every frame tried, while costing real time —
+    // fitting 16502 candidates instead of 9198 on frame 29053 moved
+    // `scale_ms` from ≈353 ms to 588 ms for zero benefit. The lost stars
+    // are not lost to an overly tight RADIUS; their mapped positions
+    // genuinely have no reference counterpart within either radius (a
+    // registration/centroid gap the fit's own `centroid_tolerance_px`
+    // cannot bridge, or a Measure detection the deeper, integrated
+    // reference never resolved as a stable star in the first place) — so
+    // this filter is kept AS IS, at `match_radius_px`, being the cheapest
+    // of the three measured variants and no less accurate than either.
     let t = Instant::now();
     let mut seeds: Vec<Seed> = Vec::with_capacity(fits.len());
     for f in fits {
         let Some((mx, my)) = map_seed_position(f, map, ref_width, ref_height) else {
             continue;
         };
+        breakdown.in_coverage += 1;
         if warped_pixel_is_saturated(target_plane, ref_width, mx.round(), my.round()) {
             continue;
         }
+        breakdown.past_saturation += 1;
         if default
             .tree
             .nearest_within(mx, my, match_radius_px)
@@ -1106,6 +1207,7 @@ fn relative_scale_from_seeds_core(
         {
             continue;
         }
+        breakdown.past_preselect += 1;
         seeds.push(Seed {
             x: mx,
             y: my,
@@ -1127,6 +1229,7 @@ fn relative_scale_from_seeds_core(
         &fit_params,
         pool,
     );
+    breakdown.fit_accepted = tgt_outcome.fits.len();
     let fit_ms = t.elapsed().as_millis() as u64;
 
     let t = Instant::now();
@@ -1140,6 +1243,7 @@ fn relative_scale_from_seeds_core(
     );
 
     let sample = ratio_sample(&default.outcome.fits, &tgt_outcome, &pairs);
+    breakdown.matched = sample.ratios.len();
     if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
             matches: sample.ratios.len(),
@@ -1182,6 +1286,7 @@ fn relative_scale_from_seeds_core(
             },
         },
         diag,
+        breakdown,
     ))
 }
 
@@ -2550,5 +2655,52 @@ mod tests {
             diag_seeds.iter().filter(|d| d.kept).count(),
             plain_seeds.matches - plain_seeds.rejected
         );
+    }
+
+    /// Fix round 3, ruling C-13, LEVER 1: [`SeedFilterBreakdown`]'s counts
+    /// must be monotonically non-increasing through the filter chain, its
+    /// `available` must equal the input length, and its `matched` must
+    /// equal the plain call's own `matches` — on a clean field every seed
+    /// clears every gate, so every stage should read the SAME count.
+    #[test]
+    fn seed_filter_breakdown_counts_the_whole_chain_and_matches_the_plain_result() {
+        let stars = star_grid(36);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 95);
+        let target_stars = scale_stars(&stars, 0.8);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 96);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            &[],
+            200,
+            None,
+        );
+        let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
+        let identity = identity_map();
+        let (plain, breakdown) = relative_scale_from_seeds_with_breakdown(
+            &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("a clean uniformly-scaled field must match");
+
+        assert_eq!(breakdown.available, fits.len());
+        assert!(breakdown.in_coverage <= breakdown.available);
+        assert!(breakdown.past_saturation <= breakdown.in_coverage);
+        assert!(breakdown.past_preselect <= breakdown.past_saturation);
+        // `fit_accepted` is NOT bounded by `past_preselect` alone in
+        // general (the `max_stars` truncation sits between them), but on
+        // this clean field with 60 stars and `max_stars = 200` the
+        // truncation never bites, so the ordinary chain inequality holds.
+        assert!(breakdown.fit_accepted <= breakdown.past_preselect);
+        assert!(breakdown.matched <= breakdown.fit_accepted);
+        assert_eq!(
+            breakdown.matched, plain.matches,
+            "the breakdown's own final count must equal the plain result's matches"
+        );
+        // On an identity map with no saturation and no crowding, every
+        // Measure-like fit should clear every gate on this clean field.
+        assert_eq!(breakdown.available, breakdown.in_coverage);
+        assert_eq!(breakdown.in_coverage, breakdown.past_saturation);
     }
 }

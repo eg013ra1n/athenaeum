@@ -8441,6 +8441,32 @@ fn run_group_normalization(
     let sidecar_paths_ref: &[PathBuf] = &sidecar_paths;
     let fits_paths_ref: &[Vec<Option<PathBuf>>] = &fits_paths;
 
+    // Fix round 3, ruling C-13, LEVER 2: a per-group calibration factor for
+    // the seeds path, measured once before the fan-out — see
+    // `measure_ln_seeds_calibration`'s own doc. Skipped entirely when every
+    // member already has a fresh cached sidecar (nothing in this group will
+    // read it this run).
+    let seeds_calibration: Option<f64> = if needs_normalize.is_empty() {
+        None
+    } else {
+        measure_ln_seeds_calibration(
+            rc,
+            group,
+            members,
+            fits_paths_ref,
+            stack_frames_ref,
+            ln_reference_ref,
+            reference_for_detection_ref,
+            ref_backgrounds_ref,
+            &ln_cfg,
+            measure_opts,
+            interpolation,
+            clamping,
+            pool_ref,
+            cancel_ref,
+        )
+    };
+
     // v0.6.3: per-frame ticks from inside the fan-out; the cached members
     // (`total - needs_normalize.len()`) count as done from the start.
     let ticker = FanOutTicker::new(
@@ -8501,6 +8527,7 @@ fn run_group_normalization(
                 interpolation,
                 clamping,
                 &sidecar_paths_ref[i],
+                seeds_calibration,
                 Some(pool_ref),
                 cancel_ref,
             )
@@ -8684,6 +8711,193 @@ fn run_group_normalization(
         excluded_frame_ids,
         sidecar_grids,
     })
+}
+
+/// Fix round 3, ruling C-13, LEVER 2: a per-group calibration factor for
+/// the seeds path. LEVER 1's own diagnostics (this fix round) measured the
+/// seeds path's filter chain directly and found neither the saturation
+/// guard nor the pre-select radius explains the matched-star shortfall on
+/// real mono frames — widening or removing the pre-select left `matched`
+/// and `scale` unchanged while costing real time, so no population fix
+/// closes the ~0.67% median bias fix round 2 (ruling C-12) measured. That
+/// bias is SAME-SIGNED across real frames (round 2's own 13-frame table),
+/// which is exactly what a per-group multiplicative correction can remove.
+///
+/// Runs [`normalize_frame`] TWICE on each of three representative group
+/// members — the group's own registration/geometry reference frame
+/// (`RunContext::geometry_of`) plus its two best-weighted OTHER members —
+/// once normally (the seeds path, when that member's own fits are usable)
+/// and once with `fits = None` (forcing today's full-detection path,
+/// [`scale::relative_scale_against`]), both writing to a THROWAWAY sidecar
+/// under the group's own `ln/` directory that is deleted immediately after
+/// — never the real per-frame `.athln` path, never a `stacking_artifacts`
+/// row, so this measurement leaves no trace in the group's cached state.
+/// `k = median(s_old / s_seeds)` over whichever of the three calibration
+/// frames produced BOTH a usable detection scale and a genuine (not itself
+/// a fallback) seeds-path scale.
+///
+/// Returns `None` — never a hard failure — when fewer than two of the
+/// three calibration frames yield a usable ratio; every member then runs
+/// through [`normalize_frame`] exactly as before this fix round (`k = 1`
+/// by omission). Logs one `info!` per group on success
+/// (`"ln seeds calibration"`, dictionary fields `stage`/`count`/`ln_scale`
+/// — see the logging spec's dictionary extension for this event) so a
+/// group's calibration factor is visible without re-running the probe.
+#[allow(clippy::too_many_arguments)]
+fn measure_ln_seeds_calibration(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+    members: &[GroupMember],
+    fits_paths: &[Vec<Option<PathBuf>>],
+    stack_frames: &[StackFrame],
+    ln_reference: &LnReference,
+    reference_for_detection: &LnReferenceForDetection<'_>,
+    ref_backgrounds: &[BackgroundGrid],
+    ln_cfg: &crate::stacking::integrate::LocalNormalizationConfig,
+    measure_opts: &MeasureOptions,
+    interpolation: Interpolation,
+    clamping: f32,
+    pool: &Arc<rayon::ThreadPool>,
+    cancel: &AtomicBool,
+) -> Option<f64> {
+    if members.is_empty() {
+        return None;
+    }
+
+    // Pick the group's registration/geometry reference frame first, then
+    // fill out to three distinct members by descending weight — the same
+    // `normalized_mean` ranking `sky_penalized_order`'s callers read
+    // elsewhere in this function. A group whose reference frame is not
+    // among `members` at all (should not happen in practice — the
+    // reference is itself a group member — but this function never fails
+    // the group over it) simply falls back to the top three by weight.
+    let reference_frame_id = rc.geometry_of(&group.key).reference_frame_id;
+    let mut calibration_indices: Vec<usize> = Vec::with_capacity(3);
+    if let Some(idx) = members
+        .iter()
+        .position(|m| m.frame_id == reference_frame_id)
+    {
+        calibration_indices.push(idx);
+    }
+    let mut by_weight: Vec<usize> = (0..members.len())
+        .filter(|i| !calibration_indices.contains(i))
+        .collect();
+    by_weight.sort_by(|&a, &b| {
+        members[b]
+            .weight
+            .normalized_mean
+            .partial_cmp(&members[a].weight.normalized_mean)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    calibration_indices.extend(
+        by_weight
+            .into_iter()
+            .take(3usize.saturating_sub(calibration_indices.len())),
+    );
+
+    let calib_dir = rc.layout.ln_dir(&group.key);
+    let mut ratios: Vec<f64> = Vec::with_capacity(calibration_indices.len());
+    for &i in &calibration_indices {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let frame_id = members[i].frame_id;
+        let planes: &[Option<PathBuf>] = fits_paths.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut fits_by_plane: Vec<Vec<psf_signal::StarFit>> = Vec::with_capacity(planes.len());
+        for path in planes {
+            let plane_fits = match path {
+                Some(p) => fits_artifact::read_fits(p).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            fits_by_plane.push(plane_fits);
+        }
+
+        let seeds_path = calib_dir.join(format!(".calib-seeds-{frame_id}.athln"));
+        let seeds_outcome = normalize_frame(
+            ln_reference,
+            reference_for_detection,
+            ref_backgrounds,
+            &stack_frames[i],
+            Some(&fits_by_plane),
+            ln_cfg,
+            measure_opts,
+            interpolation,
+            clamping,
+            &seeds_path,
+            None,
+            Some(pool),
+            cancel,
+        );
+        let _ = std::fs::remove_file(&seeds_path);
+
+        let detect_path = calib_dir.join(format!(".calib-detect-{frame_id}.athln"));
+        let detect_outcome = normalize_frame(
+            ln_reference,
+            reference_for_detection,
+            ref_backgrounds,
+            &stack_frames[i],
+            None,
+            ln_cfg,
+            measure_opts,
+            interpolation,
+            clamping,
+            &detect_path,
+            None,
+            Some(pool),
+            cancel,
+        );
+        let _ = std::fs::remove_file(&detect_path);
+
+        match (seeds_outcome, detect_outcome) {
+            (Ok(seeds), Ok(detected))
+                if seeds.scale_source == "seeds"
+                    && seeds.scale.is_finite()
+                    && seeds.scale != 0.0
+                    && detected.scale.is_finite() =>
+            {
+                let ratio = detected.scale / seeds.scale;
+                if ratio.is_finite() {
+                    ratios.push(ratio);
+                }
+            }
+            (seeds_result, detect_result) => {
+                tracing::debug!(
+                    run_id = rc.run_id,
+                    group_key = %group.key,
+                    frame_id,
+                    seeds_ok = seeds_result.is_ok(),
+                    detected_ok = detect_result.is_ok(),
+                    "ln seeds calibration: skipping a calibration frame"
+                );
+            }
+        }
+    }
+
+    if ratios.len() < 2 {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            count = ratios.len(),
+            "ln seeds calibration: too few usable calibration frames; seeds path runs uncalibrated for this group"
+        );
+        return None;
+    }
+    ratios.sort_by(|a, b| a.total_cmp(b));
+    let n = ratios.len();
+    let k = if n % 2 == 1 {
+        ratios[n / 2]
+    } else {
+        (ratios[n / 2 - 1] + ratios[n / 2]) / 2.0
+    };
+    tracing::info!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        stage = "normalize",
+        count = n,
+        ln_scale = k,
+        "ln seeds calibration"
+    );
+    Some(k)
 }
 
 /// The cache-miss half of [`run_group_normalization`]'s reference
