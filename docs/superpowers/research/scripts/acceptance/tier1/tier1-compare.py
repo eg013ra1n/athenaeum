@@ -221,7 +221,9 @@ LN_MEDIAN_TOL = 0.005  # +/- 0.5 %
 LN_SCATTER_TOL = 0.01  # <= 1 %
 DRIZZLE_LEVEL_LO = 0.998
 DRIZZLE_LEVEL_HI = 1.002
-DRIZZLE_COVERAGE_MIN = 0.999995  # "1.0" with float slack for a fraction-of-pixels count
+# Fix round 1 review: a boolean array's mean IS an exact count/N (no float rounding to slack
+# for) — the spec row is 1.0, not "1.0 with slack".
+DRIZZLE_COVERAGE_MIN = 1.0
 
 
 def die(msg):
@@ -446,6 +448,11 @@ def report_masters(head_dir, base_dir, gate):
         h_path, b_path = hp[key], bp[key]
         h_ch, b_ch = measure_master(h_path), measure_master(b_path)
         print(f"  {key}")
+        # Fix round 1 review: a plain-master channel-count mismatch must not skip this key's
+        # drizzle-level row below — that row is HEAD-only (dc["median"]/pc["median"]) and does
+        # not depend on `b_ch` matching `h_ch` at all. Each row is independent: an `if/else`
+        # here instead of a `continue`, so a base-side anomaly on the plain master never hides a
+        # perfectly computable drizzle-level number for head.
         if len(h_ch) != len(b_ch):
             print(
                 f"    FAIL channel count differs: head={len(h_ch)} base={len(b_ch)} "
@@ -454,28 +461,29 @@ def report_masters(head_dir, base_dir, gate):
             gate["median_mad"].append(False)
             gate["noise"].append(False)
             gate["fwhm"].append(False)
-            continue
-        for i, (hc, bc) in enumerate(zip(h_ch, b_ch)):
-            m_ratio = hc["median"] / bc["median"] if bc["median"] else float("nan")
-            d_ratio = hc["mad"] / bc["mad"] if bc["mad"] else float("nan")
-            n_ratio = hc["noise"] / bc["noise"] if bc["noise"] else float("nan")
-            f_ratio = hc["fwhmPx"] / bc["fwhmPx"] if bc["fwhmPx"] else float("nan")
-            m_ok = abs(pct(m_ratio)) <= MEDIAN_TOL * 100
-            d_ok = abs(pct(d_ratio)) <= MAD_TOL * 100
-            n_ok = abs(pct(n_ratio)) <= NOISE_TOL * 100
-            f_ok = abs(pct(f_ratio)) <= FWHM_TOL * 100
-            gate["median_mad"].append(m_ok and d_ok)
-            gate["noise"].append(n_ok)
-            gate["fwhm"].append(f_ok)
-            print(
-                f"    plane {i}: median ratio={m_ratio:.6f} ({pct(m_ratio):+.4f}%) {verdict(m_ok)}  "
-                f"mad ratio={d_ratio:.6f} ({pct(d_ratio):+.4f}%) {verdict(d_ok)}"
-            )
-            print(
-                f"             noise  ratio={n_ratio:.6f} ({pct(n_ratio):+.4f}%) {verdict(n_ok)}  "
-                f"fwhmPx ratio={f_ratio:.6f} ({pct(f_ratio):+.4f}%) {verdict(f_ok)}"
-            )
-        # Drizzle level (row 7, a property of HEAD alone) + coverage (row 8).
+        else:
+            for i, (hc, bc) in enumerate(zip(h_ch, b_ch)):
+                m_ratio = hc["median"] / bc["median"] if bc["median"] else float("nan")
+                d_ratio = hc["mad"] / bc["mad"] if bc["mad"] else float("nan")
+                n_ratio = hc["noise"] / bc["noise"] if bc["noise"] else float("nan")
+                f_ratio = hc["fwhmPx"] / bc["fwhmPx"] if bc["fwhmPx"] else float("nan")
+                m_ok = abs(pct(m_ratio)) <= MEDIAN_TOL * 100
+                d_ok = abs(pct(d_ratio)) <= MAD_TOL * 100
+                n_ok = abs(pct(n_ratio)) <= NOISE_TOL * 100
+                f_ok = abs(pct(f_ratio)) <= FWHM_TOL * 100
+                gate["median_mad"].append(m_ok and d_ok)
+                gate["noise"].append(n_ok)
+                gate["fwhm"].append(f_ok)
+                print(
+                    f"    plane {i}: median ratio={m_ratio:.6f} ({pct(m_ratio):+.4f}%) {verdict(m_ok)}  "
+                    f"mad ratio={d_ratio:.6f} ({pct(d_ratio):+.4f}%) {verdict(d_ok)}"
+                )
+                print(
+                    f"             noise  ratio={n_ratio:.6f} ({pct(n_ratio):+.4f}%) {verdict(n_ok)}  "
+                    f"fwhmPx ratio={f_ratio:.6f} ({pct(f_ratio):+.4f}%) {verdict(f_ok)}"
+                )
+        # Drizzle level (row 7, a property of HEAD alone) + coverage (row 8) — independent of
+        # the plain-master median/MAD/noise/FWHM block above, always evaluated.
         if key in hd:
             hd_ch = measure_master(hd[key]["path"])
             if len(hd_ch) != len(h_ch):
