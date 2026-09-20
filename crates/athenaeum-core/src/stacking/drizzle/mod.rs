@@ -148,7 +148,7 @@ pub struct DrizzleInput<'a> {
     /// only interleaved before/after brackets are comparable on a machine
     /// that drifts 10-15 % across a session), rather than through two
     /// binaries or an environment variable nothing type-checks.
-    pub force_exact_overlap: bool,
+    pub force_exact_overlap_for_measurement: bool,
 }
 
 /// Per-group drizzle statistics — the `stacking_run_groups` / provenance
@@ -355,8 +355,8 @@ struct FrameDepositCtx<'a> {
     /// Tier C item C2 (ruling C-3): where the `square` kernel gets ONE
     /// drop's output-pixel overlap areas — the exact per-pixel clip, a
     /// per-frame phase table, or a per-tile one. Resolved once per (frame,
-    /// plane) by [`resolve_square_overlap`]; it decides only the GEOMETRY
-    /// of a drop's overlap, never what is deposited or whether.
+    /// plane) by [`SquareOverlapPlan::resolve`]; it decides only the
+    /// GEOMETRY of a drop's overlap, never what is deposited or whether.
     overlap: SquareOverlap<'a>,
 }
 
@@ -396,6 +396,87 @@ enum TileSlot {
 /// cheaper and exact. Every other `(scale, dropShrink)` pair tabulates.
 fn phase_table_applies(scale: u32, drop_shrink: f64) -> bool {
     !(scale == 1 && drop_shrink == 1.0)
+}
+
+/// Owns whatever one (frame, plane)'s `square`-kernel deposit needs for
+/// its overlap arm, and hands out the borrowing [`SquareOverlap`].
+///
+/// **The ONE place the arm is decided** (fix round 2, ruling C-22). It
+/// used to be an inline expression in [`drizzle_group`], which the C2
+/// pins then re-implemented in order to drive `deposit_band` directly —
+/// so a change to the dispatch (dropping the [`phase_table_applies`]
+/// gate, say, or the refused-build fallback) could move production while
+/// every pin went on testing the old rule. Both callers now go through
+/// `resolve` + [`SquareOverlapPlan::overlap`], so such a change fails
+/// `the_phase_table_tracks_the_exact_clip_on_a_rotated_frame`, its TPS
+/// sibling and `scale_one_with_a_full_drop_keeps_the_exact_clip`.
+struct SquareOverlapPlan {
+    /// The per-frame table, when the dispatch wanted one AND it built.
+    table: Option<PhaseTable>,
+    /// Set when the dispatch resolved to the per-[`phase_table::TILE`]
+    /// arm — a distortion layer, so there is no whole-frame table to hold.
+    tiled: bool,
+}
+
+impl SquareOverlapPlan {
+    /// Resolves the arm for one (frame, plane) and builds the per-frame
+    /// table if that is the arm.
+    ///
+    /// The table is taken at the frame's own CENTRE rather than at its
+    /// origin: for a Similarity/Affine map the position does not matter at
+    /// all (the Jacobian is position-independent), and for a Homography —
+    /// the pipeline's default registration output — it centres the
+    /// projective row's variation instead of leaving it one-sided. A
+    /// refused build (a degenerate local mapping) falls back to the exact
+    /// clip, never to a wrong table.
+    fn resolve(
+        kernel: DrizzleKernel,
+        map: &PixelMap,
+        src_width: usize,
+        src_height: usize,
+        scale: u32,
+        drop_shrink: f64,
+        force_exact: bool,
+    ) -> SquareOverlapPlan {
+        if kernel != DrizzleKernel::Square
+            || force_exact
+            || !phase_table_applies(scale, drop_shrink)
+        {
+            return SquareOverlapPlan {
+                table: None,
+                tiled: false,
+            };
+        }
+        if map.distortion.is_some() {
+            return SquareOverlapPlan {
+                table: None,
+                tiled: true,
+            };
+        }
+        let table = geom::map_drop_at(
+            map,
+            (src_width as f64 - 1.0) / 2.0,
+            (src_height as f64 - 1.0) / 2.0,
+            drop_shrink,
+            scale,
+        )
+        .and_then(|q| PhaseTable::build(&q, scale, phase_table::PHASES));
+        // A linear map whose table refused to build keeps the exact clip
+        // (`tiled` stays false — there is no per-tile shape to rebuild
+        // for a map whose shape is constant).
+        SquareOverlapPlan {
+            table,
+            tiled: false,
+        }
+    }
+
+    fn overlap(&self) -> SquareOverlap<'_> {
+        match (&self.table, self.tiled) {
+            (Some(t), _) => SquareOverlap::Frame(t),
+            (None, true) => SquareOverlap::Tiled,
+            (None, false) => SquareOverlap::Exact,
+        }
+    }
 }
 
 /// The `deposit_mode` field of the `drizzle plane deposited` event
@@ -832,42 +913,18 @@ pub fn drizzle_group(
             );
             // Tier C item C2 (spec §3.2, ruling C-3): with no distortion
             // layer the mapped drop is ONE parallelogram for the whole
-            // frame, so its overlap areas tabulate once here. Taken at the
-            // frame's own CENTRE rather than at its origin: for a
-            // Similarity/Affine map the position does not matter at all
-            // (the Jacobian is position-independent), and for a Homography
-            // — the pipeline's default registration output — it centres
-            // the projective row's variation instead of leaving it
-            // one-sided. A refused build (a degenerate local mapping)
-            // falls back to the exact clip, never to a wrong table.
-            let square_table = (input.kernel == DrizzleKernel::Square
-                && !input.force_exact_overlap
-                && phase_table_applies(input.scale, input.drop_shrink)
-                && frame.map.distortion.is_none())
-            .then(|| {
-                geom::map_drop_at(
-                    frame.map,
-                    (src_width as f64 - 1.0) / 2.0,
-                    (src_height as f64 - 1.0) / 2.0,
-                    input.drop_shrink,
-                    input.scale,
-                )
-                .and_then(|q| PhaseTable::build(&q, input.scale, phase_table::PHASES))
-            })
-            .flatten();
-            let overlap = if input.kernel != DrizzleKernel::Square
-                || input.force_exact_overlap
-                || !phase_table_applies(input.scale, input.drop_shrink)
-            {
-                SquareOverlap::Exact
-            } else if let Some(table) = square_table.as_ref() {
-                SquareOverlap::Frame(table)
-            } else if frame.map.distortion.is_some() {
-                SquareOverlap::Tiled
-            } else {
-                // A linear map whose table refused to build.
-                SquareOverlap::Exact
-            };
+            // frame, so its overlap areas tabulate once here — see
+            // `SquareOverlapPlan::resolve`, which the C2 pins drive too.
+            let overlap_plan = SquareOverlapPlan::resolve(
+                input.kernel,
+                frame.map,
+                src_width,
+                src_height,
+                input.scale,
+                input.drop_shrink,
+                input.force_exact_overlap_for_measurement,
+            );
+            let overlap = overlap_plan.overlap();
             plane_overlap_modes[match overlap {
                 SquareOverlap::Exact => 0,
                 SquareOverlap::Frame(_) => 1,
@@ -1174,6 +1231,20 @@ fn deposit_band(
     // Tier C item C2 (ruling C-3): [`SquareOverlap::Tiled`]'s per-tile
     // tables, one tile ROW at a time (see the arm below). Allocated lazily
     // — the other two arms never touch either of these.
+    //
+    // MEMORY, and why it is not in `estimate_memory_bytes` (fix round 2,
+    // ruling C-22): this vector is PER BAND, i.e. per rayon worker, and a
+    // full tile row of a 6224-px-wide frame is ≈ 25 tables x 212 KB ≈
+    // 5.3 MB — so ≈ 53 MB across 10 workers, transient for the frame's own
+    // deposit and freed with the band. It is NOT counted by
+    // `estimate_memory_bytes`'s R-M3-7 refusal, deliberately: that estimate
+    // budgets the output-geometry planes and the one `I`/`W` accumulator
+    // pair, which scale with the OUTPUT (hundreds of MB to GB), and adding
+    // a term two orders of magnitude smaller — reachable only on the
+    // non-default distortion arm, and only while a band is running — would
+    // buy no refusal that the existing terms do not already make. Revisit
+    // if `PHASES` or `TILE` ever move far enough to change that ratio: at
+    // `PHASES = 128` the same row would be ≈ 21 MB per worker.
     let tiles_x = ctx.src_width.div_ceil(phase_table::TILE).max(1);
     let mut tile_row = usize::MAX;
     let mut tile_cache: Vec<TileSlot> = Vec::new();
@@ -1536,7 +1607,7 @@ mod tests {
             write_weight_map: true,
             measure,
             ram_total_bytes: None,
-            force_exact_overlap: false,
+            force_exact_overlap_for_measurement: false,
         }
     }
 
@@ -1704,27 +1775,43 @@ mod tests {
             let v = out.data[y * out_w + x];
             assert!((v - 1.0).abs() < 1e-6, "x={x} y={y} v={v}");
         }
-        // Tier C item C2 (ruling C-3): the ring around the block is no
-        // longer EMPTY. This fixture's identity map puts every mapped drop
-        // centre at an exact half-pixel phase — the single worst case for
-        // the phase table, whose nearest bin centre is 1/64 of an output
-        // pixel away — so a sliver of the drop's own area lands one pixel
-        // further out than the exact clip put it. What the pin protects is
-        // unchanged and now stated directly: essentially ALL of the drop's
-        // mass is still on the four-pixel block, and the ring's share of
-        // it is ≤ 2 % (measured 1.6 % on the edge-adjacent pixels, 0.03 %
-        // on the diagonal ones — spec §3.2's own "≤ 1.6 % per-frame weight
-        // change" figure, arrived at independently here). The VALUE there
-        // is still exactly 1.0: a sliver carries the same source pixel,
-        // not a different one.
+        // Tier C item C2 (rulings C-3/C-21): the ring around the block is
+        // no longer EMPTY. This fixture's identity map puts every mapped
+        // drop centre at an exact half-pixel phase — the single worst case
+        // for the phase table, whose nearest bin centre is
+        // `1 / (2 · PHASES)` = 1/128 of an output pixel away — so a sliver
+        // of the drop's own area lands one pixel further out than the
+        // exact clip put it. What the pin protects is unchanged and now
+        // stated directly: essentially ALL of the drop's mass is still on
+        // the four-pixel block, and the ring's share of it is ≤ 2 %
+        // (MEASURED at `PHASES = 64`: 0.787 % on the two edge-adjacent
+        // pixels, 0 on the three the drop does not reach at all — the
+        // `eprintln!` below prints both). The VALUE there is still exactly
+        // 1.0, asserted rather than claimed: a sliver carries the same
+        // source pixel, not a different one, so `I / W` at a sliver is
+        // that pixel's own value.
         let weight = out.weight.as_ref().expect("write_weight_map was on");
         let block_weight = weight[20 * out_w + 20];
         assert!(block_weight > 0.0);
         for &(x, y) in &[(19usize, 20usize), (22, 20), (20, 19), (20, 22), (19, 19)] {
             let w = weight[y * out_w + x];
+            let v = out.data[y * out_w + x];
+            eprintln!(
+                "RING ({x},{y}) w/block {:.6} v {v}",
+                w as f64 / block_weight as f64
+            );
             assert!(
                 w <= 0.02 * block_weight,
                 "x={x} y={y} weight={w} is more than a 2 % sliver of the block's {block_weight}"
+            );
+            // Fix round 2 (ruling C-22): assert the value, do not merely
+            // claim it. A sliver pixel is covered by the SAME single
+            // source pixel, so `I / W` there is that pixel's 1.0; a pixel
+            // the drop does not reach at all stays 0.
+            let want = if w > 0.0 { 1.0 } else { 0.0 };
+            assert!(
+                (v - want).abs() < 1e-6,
+                "x={x} y={y} v={v} want={want} (weight {w})"
             );
         }
     }
@@ -2126,7 +2213,8 @@ mod tests {
         // RE-PINNED, Tier C item C2 (ruling C-3): the deposit now takes a
         // drop's overlap areas from a per-phase table instead of clipping
         // every source pixel exactly, which rounds each drop's sub-pixel
-        // phase to 1/64 of an output pixel — a deliberate NUMERIC change
+        // phase to `1 / (2 · PHASES)` of an output pixel — a deliberate
+        // NUMERIC change
         // (Tier C is the numeric tier; Tier A's own bit-identity is what
         // this pin used to carry). The three pre-C2 pairs were
         // `(0x8cb227895e93f504, 0xcf5743015bcedb75)`,
@@ -2380,7 +2468,7 @@ mod tests {
             write_weight_map: false,
             measure: &measure,
             ram_total_bytes: Some(1024),
-            force_exact_overlap: false,
+            force_exact_overlap_for_measurement: false,
         };
         let err =
             drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap_err();
@@ -2425,7 +2513,7 @@ mod tests {
             write_weight_map: true,
             measure: &measure,
             ram_total_bytes: None,
-            force_exact_overlap: false,
+            force_exact_overlap_for_measurement: false,
         };
 
         let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
@@ -2447,23 +2535,31 @@ mod tests {
         // exact seam rows and their immediate neighbours, compared against
         // an unambiguously interior reference row.
         //
-        // Tier C item C2 (ruling C-3): the interior reference row is now
-        // chosen with the SAME PARITY as the seam row under test. This
+        // Tier C item C2 (rulings C-3/C-21): the interior reference row is
+        // now chosen with the SAME PARITY as the seam row under test. This
         // fixture's identity map puts every drop at an exact half-pixel
-        // phase, whose nearest phase-table bin centre is 1/64 of an output
-        // pixel away, and that residual splits a drop's area 0.884/0.916
-        // between the two output rows it covers instead of 0.9/0.9 — so
-        // even and odd output rows carry systematically different raw
-        // weight (by 3.6 %) EVERYWHERE, seam or not. That is the
-        // documented phase quantization (spec §3.2's "≤ 1.6 % per-frame
-        // weight change", per axis), not a seam defect, and it is
-        // invisible in `I / W` — which the flatness check above already
+        // phase, whose nearest phase-table bin centre is
+        // `1 / (2 · PHASES)` = 1/128 of an output pixel away, and that
+        // residual splits a drop's area 0.8921875/0.9078125 between the
+        // two output rows it covers instead of 0.9/0.9 — so even and odd
+        // output rows carry systematically different raw weight
+        // EVERYWHERE, seam or not. MEASURED at `PHASES = 64`: 0.96587 vs
+        // 0.98279 normalized, a ratio of 1.017513, i.e. **1.75 %** (it was
+        // 3.6 % at `PHASES = 32`); the `eprintln!` below prints it. That
+        // is the documented phase quantization, not a seam defect, and it
+        // is invisible in `I / W` — which the flatness check above already
         // pins to 1e-6 across every row. What this check exists for — a
         // band boundary must neither DOUBLE a row's deposit nor DROP it —
         // is unchanged and still caught: a doubled row reads 2x its
         // parity-mate's weight and a dropped one reads 0.
         let weight_map = out.weight.as_ref().expect("write_weight_map was on");
         let x = 20usize;
+        eprintln!(
+            "SEAM parity even {} odd {} ratio {:.6}",
+            weight_map[10 * out_w + x],
+            weight_map[11 * out_w + x],
+            weight_map[11 * out_w + x] as f64 / weight_map[10 * out_w + x] as f64
+        );
         for &seam in &[
             510usize, 511, 512, 513, 1022, 1023, 1024, 1025, 1534, 1535, 1536, 1537,
         ] {
@@ -2780,16 +2876,25 @@ mod tests {
             (2 * mx + 1, 2 * my + 1),
         ] {
             let v = out.data[y * out_w + x] as f64;
-            // Tier C item C2 (ruling C-3): 1e-2, not 1e-4. This fixture's
-            // maps put every drop at an exact half-pixel phase — the phase
-            // table's own worst case — so a 1.6 % sliver of the marker
-            // pixel's mass lands outside the block and the block's
-            // weighted mean moves by ≈ 0.7 % (0.4599 against 0.4667). The
-            // pin's discriminating power is untouched: the failure it
-            // exists to catch reads `background` = 0.25 here, 0.217 away
-            // from `expected`, i.e. 21x this tolerance.
+            eprintln!(
+                "MARKER ({x},{y}) v {v} expected {expected} |d| {:.6} rel {:.6}",
+                (v - expected).abs(),
+                (v - expected).abs() / expected
+            );
+            // Tier C item C2 (rulings C-3/C-21): 5e-3, not 1e-4. This
+            // fixture's maps put every drop at an exact half-pixel phase —
+            // the phase table's own worst case — so a 0.787 % sliver of
+            // the marker pixel's mass lands outside the block and the
+            // block's weighted mean moves with it. MEASURED at
+            // `PHASES = 64`, over the four block pixels: |Δ| 0.003372 /
+            // 0.001693 / 0.001693 / 0.000000, i.e. at worst **0.72 % of
+            // `expected`** (it was 1.45 % at `PHASES = 32`); the
+            // `eprintln!` above prints all four. The pin's discriminating
+            // power is untouched: the failure it exists to catch reads
+            // `background` = 0.25 here, 0.217 away from `expected` — 43x
+            // this tolerance, and 64x the largest deviation measured.
             assert!(
-                (v - expected).abs() < 1e-2,
+                (v - expected).abs() < 5e-3,
                 "x={x} y={y} v={v} expected={expected} \
                  (a stride bug reading the odd frame's 70-wide plane at the \
                  reference's width would read `background` here, not `marker`)"
@@ -2857,7 +2962,7 @@ mod tests {
                 write_weight_map: true,
                 measure: &measure,
                 ram_total_bytes: None,
-                force_exact_overlap: false,
+                force_exact_overlap_for_measurement: false,
             };
 
             let out =
@@ -2974,7 +3079,7 @@ mod tests {
             write_weight_map: true,
             measure: &measure,
             ram_total_bytes: None,
-            force_exact_overlap: false,
+            force_exact_overlap_for_measurement: false,
         };
 
         // Ground truth: the SAME evaluator `deposit_band` calls, run
@@ -3072,7 +3177,7 @@ mod tests {
             write_weight_map: true,
             measure,
             ram_total_bytes: None,
-            force_exact_overlap: false,
+            force_exact_overlap_for_measurement: false,
         }
     }
 
@@ -3256,7 +3361,7 @@ mod tests {
     // The comparison is a DELTA, not an identity — the table rounds a
     // drop's sub-pixel phase to the centre of its `1 / PHASES` bin, so the
     // drop's mass is split among its neighbours as if it sat up to
-    // `1 / (2 · PHASES)` = 1/64 of an output pixel from where it really
+    // `1 / (2 · PHASES)` = 1/128 of an output pixel from where it really
     // is. What must NOT move is (1) the total deposited mass, which is
     // what level preservation (R-M3-2) rests on, and (2) which output
     // pixels are covered at all.
@@ -3347,28 +3452,28 @@ mod tests {
         let mut i_buf = vec![0f32; out_w * out_h];
         let mut w_buf = vec![0f32; out_w * out_h];
 
-        // Resolved exactly the way `drizzle_group` resolves it, so the pin
-        // exercises the production dispatch and not a test-local copy.
-        let table =
-            (tabulated && phase_table_applies(scale, drop_shrink) && map.distortion.is_none())
-                .then(|| {
-                    geom::map_drop_at(
-                        map,
-                        (src_w as f64 - 1.0) / 2.0,
-                        (src_h as f64 - 1.0) / 2.0,
-                        drop_shrink,
-                        scale,
-                    )
-                    .and_then(|q| PhaseTable::build(&q, scale, phase_table::PHASES))
-                })
-                .flatten();
-        let gate = tabulated && phase_table_applies(scale, drop_shrink);
-        let overlap = match (gate, table.as_ref(), map.distortion.is_some()) {
-            (false, _, _) => SquareOverlap::Exact,
-            (true, Some(t), _) => SquareOverlap::Frame(t),
-            (true, None, true) => SquareOverlap::Tiled,
-            (true, None, false) => panic!("a sane linear map must tabulate"),
-        };
+        // Fix round 2 (ruling C-22): THE production resolver, not a
+        // restatement of it. `tabulated == false` is what the probe's
+        // measurement flag does, so a dispatch change — dropping the
+        // `phase_table_applies` gate, losing the refused-build fallback,
+        // routing a distortion layer to the wrong arm — moves these pins
+        // and not just production.
+        let plan = SquareOverlapPlan::resolve(
+            DrizzleKernel::Square,
+            map,
+            src_w,
+            src_h,
+            scale,
+            drop_shrink,
+            !tabulated,
+        );
+        let overlap = plan.overlap();
+        if tabulated && phase_table_applies(scale, drop_shrink) && map.distortion.is_none() {
+            assert!(
+                matches!(overlap, SquareOverlap::Frame(_)),
+                "a sane linear map must tabulate"
+            );
+        }
 
         let ctx = FrameDepositCtx {
             src,
@@ -3409,11 +3514,12 @@ mod tests {
     ///
     /// **What "coverage identical" means here.** The exact path and the
     /// table path cover the same REGION, but its one-pixel RIM is ragged
-    /// between them: a 1/64-output-pixel phase residual moves the edge of
-    /// the deposited area by that much, so a border pixel whose true edge
-    /// happens to lie within 1/64 px of a pixel boundary flips. On a
-    /// 160x120 fixture the deposited region's border is ≈ 500 pixels long,
-    /// so ≈ 500/64 ≈ 8 such flips are expected and mean nothing (in a real
+    /// between them: a `1 / (2 · PHASES)` = 1/128-output-pixel phase
+    /// residual moves the edge of the deposited area by that much, so a
+    /// border pixel whose true edge happens to lie within 1/128 px of a
+    /// pixel boundary flips. On a 160x120 fixture the deposited region's
+    /// border is ≈ 500 pixels long, so ≈ 500/128 ≈ 4 such flips are
+    /// expected and mean nothing (in a real
     /// run the covered region is the UNION over hundreds of dithered
     /// frames, whose border is defined by the outermost frame's geometry,
     /// not by one drop's last sliver). What would be a real difference —

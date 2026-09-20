@@ -305,7 +305,7 @@ fn main() {
                 write_weight_map: false,
                 measure: &measure,
                 ram_total_bytes: None,
-                force_exact_overlap: force_exact,
+                force_exact_overlap_for_measurement: force_exact,
             };
             let progress = DrizzleProgress {
                 on_frame: &|_, _| {},

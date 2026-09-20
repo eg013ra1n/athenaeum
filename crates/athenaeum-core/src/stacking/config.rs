@@ -564,6 +564,17 @@ fn clamp_tps_smoothing(value: f64) -> f64 {
 /// `StackingConfig` across this change produce different drizzled pixels,
 /// and the fingerprint is what a provenance row, a results card and a
 /// re-run comparison read to tell one run's settings from another's.
+///
+/// **One thing does go stale, and it is not an artifact.** The plan gate's
+/// memory of which frames a run EXCLUDED for local normalization
+/// (`plan::build_plan`'s `ln_runtime_excluded_by_frame`) is gated on
+/// `last_run.config_hash == hash`, deliberately — an exclusion is only
+/// trusted as "will fail again for the same reason" when it came from a run
+/// of this exact config. Moving the fingerprint therefore empties that set
+/// once, so on the FIRST plan after a bump an LN-excluded frame reverts to
+/// ordinary "no fresh `ln` artifact" staleness and is re-owed one Normalize
+/// pass. That costs those frames one pass on one plan and then settles;
+/// every stored `stacking_artifacts` row is untouched.
 pub const DRIZZLE_KERNEL_VERSION: u32 = 2;
 
 /// xxh3 of the canonical JSON of the whole resolved config — a run-level
@@ -1553,11 +1564,13 @@ mod tests {
         // And here (Tier C item C2, ruling C-3): `DRIZZLE_KERNEL_VERSION`
         // joins the hashed payload as a sibling of the config itself, so
         // the literal moves once for the phase-table deposit even though
-        // no config FIELD changed. Nothing goes stale over it — the
-        // drizzle stage has no cache and no stage subtree folds in
-        // `drizzle` (see the constant's own doc) — but two runs of the
-        // same settings across this change do produce different drizzled
-        // pixels, and the run-level fingerprint is what says so.
+        // no config FIELD changed. No stored ARTIFACT goes stale over it —
+        // the drizzle stage has no cache and no stage subtree folds in
+        // `drizzle` — but two runs of the same settings across this change
+        // do produce different drizzled pixels, and the run-level
+        // fingerprint is what says so. The one non-artifact consequence,
+        // the plan gate's LN-exclusion memory emptying for one plan, is
+        // written out on `DRIZZLE_KERNEL_VERSION`'s own doc.
         assert_eq!(default_hash, "b3240460a4cec0de");
     }
 
@@ -1582,10 +1595,15 @@ mod tests {
         );
         assert_eq!(DRIZZLE_KERNEL_VERSION, 2, "the phase-table generation");
 
+        // All FOUR cacheable stages' subtrees (fix round 2, ruling C-22 —
+        // `normalization_subtree` was missing, and LN is the stage whose
+        // hash already folds in a version constant, so it is the one a
+        // future reader is likeliest to reach for).
         for subtree in [
             calibration_subtree(&cfg),
             measurement_subtree(&cfg),
             registration_subtree(&cfg),
+            normalization_subtree(&cfg),
         ] {
             let json = serde_json::to_string(&subtree).unwrap();
             assert!(

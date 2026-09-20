@@ -7881,7 +7881,7 @@ fn process_group_output(
                         // Tier C item C2: the run always drizzles through
                         // whichever overlap arm ruling C-3 resolves to; only
                         // the `drizzle_probe` forces the exact clip.
-                        force_exact_overlap: false,
+                        force_exact_overlap_for_measurement: false,
                     };
 
                     // Fix round 1, Important I1: real per-frame progress —
