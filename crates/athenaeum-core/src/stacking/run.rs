@@ -112,6 +112,26 @@ use crate::stacking::weights::{
     MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX,
 };
 
+/// Every `fits` artifact path whose write DEGRADED (final fix wave, ruling
+/// C-30, the review's I1) — pushed immediately beside the
+/// `"fits artifact write failed; consumers will fall back"` warn that is
+/// the production signal, so a test can assert the degrade happened at all
+/// AND that it happened exactly once.
+///
+/// A test-only recorder rather than a captured log line, for the reason
+/// `stacking::register::frame::DETECT_FRAME_STARS_LOG` spells out at
+/// length: `stacking::run`'s stages execute on the run's own
+/// `stacking-run-<id>` thread (and their fan-outs on scoped worker
+/// threads), none of which inherits a `set_default`-scoped subscriber from
+/// the test thread — only a `set_global_default` would reach them, and that
+/// can be installed at most once per test binary. Logging the PATH (not a
+/// bare counter) is what lets a test filter the entries down to its own
+/// working tempdir, immune to whatever sibling tests are measuring frames
+/// at the same moment under `cargo test`'s default parallelism.
+#[cfg(test)]
+pub(crate) static FITS_WRITE_FAILURE_LOG: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Wire event for `stacking-progress`. `percent` is `100 * current / total`
 /// (`100.0` when `total == 0`); `bytes_done`/`bytes_total` describe the
 /// current STAGE's byte footprint, not the whole run's.
@@ -3181,12 +3201,49 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                         let stem = calibrated_file_stem(group, frame);
                         for (plane, plane_fits) in fits.iter().enumerate() {
                             let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
-                            fits_artifact::write_fits(&fits_path, plane_fits).map_err(|e| {
-                                RunError::Other(format!(
-                                    "fits artifact write failed: path={}: {e}",
-                                    fits_path.display()
-                                ))
-                            })?;
+                            // Final fix wave (ruling C-30, the whole-branch
+                            // review's I1): a `.athf` write failure DEGRADES,
+                            // it does not fail the run. Every consumer of
+                            // this artifact already falls back on its own —
+                            // Register to detection with a warn
+                            // (`resolve_register_fits`), Normalize to
+                            // detection (`fits_paths`' `None` arm), the plan
+                            // gate to "Measure is stale"
+                            // (`fits_artifact_fresh`) — so a full stop here
+                            // would be the ONE place in the seam that treats
+                            // a missing optimization as a correctness
+                            // failure, and it would throw away the whole
+                            // stage's real output (`metrics`, which IS
+                            // written) over a cache file. Same shape as
+                            // `.rej`'s latched write failure (M3's
+                            // `RejBitmapSet`) and the LN sidecar's per-frame
+                            // exclusion: loud, never silent, never fatal.
+                            //
+                            // The plane's `stacking_artifacts` row is SKIPPED
+                            // — never a row for a file that is not on disk.
+                            // An EXISTING row from an earlier run is left
+                            // alone on purpose: if the old file is still
+                            // there and valid (a transient rename failure),
+                            // it stays reusable; if it is gone or wrong,
+                            // `is_fresh`'s own size-on-disk check reports it
+                            // stale, which is exactly the fallback above.
+                            if let Err(e) = fits_artifact::write_fits(&fits_path, plane_fits) {
+                                #[cfg(test)]
+                                FITS_WRITE_FAILURE_LOG
+                                    .lock()
+                                    .unwrap()
+                                    .push(fits_path.clone());
+                                tracing::warn!(
+                                    run_id = rc.run_id,
+                                    group_key = %group.key,
+                                    frame_id = frame.frame_id,
+                                    plane,
+                                    path = %fits_path.display(),
+                                    error = %e,
+                                    "fits artifact write failed; consumers will fall back"
+                                );
+                                continue;
+                            }
                             let (size, modified_at) = file_identity(&fits_path)?;
                             let kind = fits_artifact::artifact_kind(plane);
                             let conn = db(&rc.ctx)?.conn();
@@ -11353,6 +11410,173 @@ mod tests {
             plan_after.groups[0].metrics_cached, 4,
             "{:?}",
             plan_after.groups[0]
+        );
+    }
+
+    /// Final fix wave (ruling C-30, the whole-branch review's I1): a `.athf`
+    /// write that CANNOT succeed degrades — the run completes, the frame
+    /// keeps its `metrics` row, and Register falls back to detection for it
+    /// (`star_source = "detected"`), exactly the way a missing or stale
+    /// artifact already behaved. Before the fix the same failure mapped to
+    /// `RunError::Other` and killed stage 3, throwing away the whole run
+    /// over a cache file every consumer already knows how to live without.
+    ///
+    /// The unwritable path is a DIRECTORY planted at one frame's own
+    /// `<stem>.p0.athf` (a path collision `write_fits`'s tmp+rename cannot
+    /// resolve: `create_dir_all(parent)` and the tmp write both succeed,
+    /// the final rename onto a directory does not) — one frame, so the
+    /// degrade fires exactly ONCE and its three siblings prove the run is
+    /// otherwise untouched. Blocking the whole `fits/<group>` directory
+    /// instead would fail all four writes and could not tell a per-plane
+    /// `continue` apart from a stage that gave up.
+    #[test]
+    fn a_fits_artifact_write_failure_degrades_to_detection() {
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started1 = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg.clone()),
+            None,
+        )
+        .expect("first run should start");
+        wait_for_run(&ctx, started1.run_id);
+        assert_eq!(
+            crate::db::stacking::get_run(&fixture.conn, started1.run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "done"
+        );
+
+        let fits_before =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
+                .unwrap();
+        assert_eq!(fits_before.len(), 4, "{fits_before:?}");
+
+        // Plant the collision: the file goes, a directory takes its name.
+        let victim_id = fits_before[0].frame_id.unwrap();
+        let victim_path = PathBuf::from(fits_before[0].path.clone().unwrap());
+        std::fs::remove_file(&victim_path).unwrap();
+        std::fs::create_dir(&victim_path).unwrap();
+
+        let failures_before = FITS_WRITE_FAILURE_LOG.lock().unwrap().len();
+
+        let started2 = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg.clone()),
+            None,
+        )
+        .expect("second run should start");
+        wait_for_run(&ctx, started2.run_id);
+        let row2 = crate::db::stacking::get_run(&fixture.conn, started2.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row2.status, "done",
+            "an unwritable fits artifact must not fail the run: {row2:?}"
+        );
+
+        // Exactly one degrade, and it is this frame's plane. Filtered to
+        // this test's own tree for the reason `FITS_WRITE_FAILURE_LOG`'s
+        // own doc gives — sibling tests measure frames concurrently under
+        // `cargo test`'s default parallelism. The prefix is the victim's
+        // own `fits/<group>` directory as the DB spells it, NOT
+        // `working.path()`: on macOS the tempdir hands out `/var/folders/…`
+        // while everything the run writes carries the canonical
+        // `/private/var/folders/…`, so a `working.path()` prefix matches
+        // nothing at all.
+        let group_fits_dir = victim_path.parent().unwrap().to_path_buf();
+        let failures: Vec<PathBuf> = {
+            let log = FITS_WRITE_FAILURE_LOG.lock().unwrap();
+            log[failures_before..]
+                .iter()
+                .filter(|p| p.starts_with(&group_fits_dir))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            failures,
+            vec![victim_path.clone()],
+            "exactly one write degraded, and it is the planted collision"
+        );
+
+        // The group still produced its master — the run did the work.
+        let groups = crate::db::stacking::list_groups(&fixture.conn, started2.run_id).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].status, "done", "{:?}", groups[0]);
+        assert!(groups[0].master_path.is_some(), "{:?}", groups[0]);
+
+        // The `metrics` row is KEPT — only the plane's `fits` row is
+        // skipped, and only for the frame whose write failed.
+        let metrics_after =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
+                .unwrap();
+        assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
+
+        // No row was written for a file that is not on disk: the victim's
+        // row is the ONE left over from run 1, and it reads STALE (the
+        // recorded size does not match what is at that path now), which is
+        // exactly the `resolve_register_fits` gate — a frame with no fresh
+        // `fits.0` registers through `detect_frame_stars`'s detection arm,
+        // `star_source = "detected"`. Its three siblings stay `"fits"`.
+        let fits_after =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
+                .unwrap();
+        assert_eq!(
+            fits_after.len(),
+            4,
+            "the skipped write leaves run 1's row in place, it does not add one: {fits_after:?}"
+        );
+        let plan_after = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg),
+        )
+        .expect("the plan should build");
+        assert_eq!(
+            plan_after.groups[0].fits_cached, 3,
+            "only the three untouched frames read fits-fresh: {:?}",
+            plan_after.groups[0]
+        );
+        assert_eq!(
+            plan_after.groups[0].metrics_cached, 4,
+            "{:?}",
+            plan_after.groups[0]
+        );
+
+        // The degraded frame is still a full member of the run: measured,
+        // included, and registered (from detection).
+        let registrations =
+            crate::registration::db::get_registration_for_frame_set(&fixture.conn, fixture.set_id)
+                .unwrap();
+        assert!(
+            registrations.iter().any(|r| r.frame_id == victim_id),
+            "the degraded frame must still be registered: {registrations:?}"
         );
     }
 
