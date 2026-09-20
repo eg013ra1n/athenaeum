@@ -1019,6 +1019,15 @@ mod tests {
     /// later change to detection, the fit region, the acceptance rules or
     /// the estimator moves at least one of them; that is the point. A task
     /// that changes one on purpose says so and rewrites the literal.
+    ///
+    /// Rewritten once, by Tier C item C3 (the Moffat LM arithmetic — one
+    /// `powf` per sample-iteration instead of three, `(1+Q)^(-β-1)` as
+    /// `(1+Q)^(-β)/(1+Q)`, `powi` at integral β). It moved `fwhm_px` by ONE
+    /// ulp, 4.122_658_320_014_302_55 → 4.122_658_320_014_304; every other
+    /// field here — the fit counts, β and `psf_signal_weight` — is
+    /// bit-identical across that change, which is why
+    /// `psf_signal::PSF_FIT_VERSION` was NOT bumped (no cached `metrics`,
+    /// `fits` or `.athln` artifact is made wrong by a last-bit FWHM).
     #[test]
     fn the_shipped_none_path_measures_exactly_these_numbers() {
         let (data, w, h) = field(7, 1.0, 0.002);
@@ -1032,7 +1041,7 @@ mod tests {
         );
         assert_eq!(c.beta, 10.0, "Auto resolves to the widest β on Gaussians");
         assert_eq!(c.psf_signal_weight, 1.387_068_045_273_481_56e-3);
-        assert_eq!(c.fwhm_px, 4.122_658_320_014_302_55);
+        assert_eq!(c.fwhm_px, 4.122_658_320_014_304);
         // The delegate equality, kept as a cheap structural check — it is
         // not the pin above. Timings are wall-clock, not measurement output,
         // so they're zeroed before the comparison (perf tier 1 Task 0).
@@ -1183,6 +1192,15 @@ mod tests {
     /// string is the pin — captured verbatim from the CURRENT (pre-task-3b)
     /// code, so any drift in any field (not just the ones this task
     /// deliberately touches) fails loudly.
+    ///
+    /// Rewritten once, by Tier C item C3 (the Moffat LM arithmetic). Of the
+    /// 22 fields exactly TWO moved, both shape aggregates over the same 150
+    /// fits: `fwhm_px` 4.121_806_182_224_867_5 → 4.121_806_182_224_867 (one
+    /// ulp) and `eccentricity` 0.095_246_020_871_035_72 →
+    /// 0.095_246_020_871_036_08 (3.8e-15 relative — a difference of
+    /// similar quantities, so it amplifies the same last-bit move).
+    /// `stars_fitted`, `beta`, `tflux`, `m_star`, `n_star`,
+    /// `psf_signal_weight` and `psf_snr` are bit-identical.
     #[test]
     fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
@@ -1193,7 +1211,7 @@ mod tests {
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
-beta: 10.0, fwhm_px: 4.1218061822248675, eccentricity: 0.09524602087103572, \
+beta: 10.0, fwhm_px: 4.121806182224867, eccentricity: 0.09524602087103608, \
 tflux: 569.0781285580445, tmean_flux: 11.823163448679521, \
 mean_flux_rejected: 0, m_star: 0.0013608953886758983, \
 n_star: 0.002002734525205997, noise: 0.0019919854930511845, \
