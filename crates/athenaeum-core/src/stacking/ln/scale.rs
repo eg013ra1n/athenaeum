@@ -40,13 +40,12 @@ use tracing::{debug, warn};
 use super::LnError;
 use crate::geometry::kdtree::KdTree2;
 use crate::geometry::{
-    select_nodes, LinearKind, Pair, PixelMap, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES,
+    select_nodes, Pair, PixelMap, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES,
 };
-use crate::stacking::measure::ADU_SCALE;
 use crate::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
 };
-use crate::stacking::register::detect::{detect_stars, passes_register_cuts, Star};
+use crate::stacking::register::detect::{detect_stars, Star, SATURATION};
 use crate::stacking::register::DetectionConfig;
 
 /// Fewer surviving pairs than this and the frame cannot be trusted for
@@ -552,21 +551,28 @@ impl PreparedBeta {
 /// this hoists the far more expensive detect+fit+tree half that was left
 /// behind.
 ///
-/// **Tier C Task 2 fix round 1, ruling C-10**: comparing a target's own
-/// Moffat fit against a reference fitted at a DIFFERENT β biases the flux
-/// ratio (two different profile shapes enclose different fractions of the
-/// same star's light) — measured on a real catalog frame at ≈ 3.4 % when
-/// the target's own β sat two `AUTO_BETAS` steps from the group's. The fix
-/// is to never compare across β at all: this struct holds the reference's
-/// fit ONE detection produces, refitted at EVERY β any group member's own
-/// Measure pass used (`betas`, keyed by `f64::to_bits()` — every value in
-/// play is a small closed set of literals, `AUTO_BETAS` or a caller's
-/// `Fixed`/`Moffat4` constant, never the result of arithmetic, so bit
-/// equality is exact equality here), plus the DEFAULT β
-/// (`normalization.local.psfModel`'s own resolution, ruling C-1) other
-/// callers (the detection fallback) still use. [`relative_scale_from_fits`]
-/// looks up the TARGET's own β in `betas` instead of always reading the
-/// default.
+/// **Tier C Task 2 fix round 1, ruling C-10** (superseded by fix round 2,
+/// ruling C-12 — struct KEPT, its per-β use case retired): comparing a
+/// target's own Moffat fit against a reference fitted at a DIFFERENT β
+/// biases the flux ratio (two different profile shapes enclose different
+/// fractions of the same star's light) — measured on a real catalog frame
+/// at ≈ 3.4 % when the target's own β sat two `AUTO_BETAS` steps from the
+/// group's. C-10's fix was to never compare across β at all: this struct
+/// can hold the reference's fit ONE detection produces, refitted at EVERY
+/// β a caller names via `extra_betas` (`betas`, keyed by `f64::to_bits()`
+/// — every value in play is a small closed set of literals, `AUTO_BETAS`
+/// or a caller's `Fixed`/`Moffat4` constant, never the result of
+/// arithmetic, so bit equality is exact equality here), plus the DEFAULT β
+/// (`normalization.local.psfModel`'s own resolution, ruling C-1) every
+/// caller uses. **Ruling C-12 found the per-β comparison itself was never
+/// the dominant bias** (the diagnostics round traced the real ~5 %
+/// residual to a Moffat fit's `signal` not being warp-invariant) and
+/// retired the flux-comparison design that needed per-β reference fits at
+/// all — [`relative_scale_from_seeds`] always reads
+/// [`Self::default_prepared`], regardless of what β the SEED source's own
+/// fits carried. The multi-β machinery stays (a caller can still ask for
+/// extra betas and look one up via `prepared_for`), but no current
+/// production caller passes a non-empty `extra_betas` any more.
 pub struct PreparedReferenceChannel {
     /// The β [`relative_scale_against`] (detection on the warped frame)
     /// always uses — `normalization.local.psfModel`'s resolution (ruling
@@ -666,6 +672,14 @@ impl PreparedReferenceChannel {
     /// The prepared data for `beta`, when it was one of `build`'s
     /// `extra_betas` (or equalled the default) — `None` for a β this
     /// reference was never fitted at.
+    ///
+    /// No current production caller: ruling C-12 retired the per-target-β
+    /// lookup [`relative_scale_from_seeds`]'s predecessor used this for —
+    /// the seeds design always reads [`Self::default_prepared`] instead.
+    /// Kept (with a direct test) for `PreparedReferenceChannel`'s own
+    /// completeness — the ruling kept `extra_betas`/`betas` themselves for
+    /// the same reason.
+    #[allow(dead_code)]
     fn prepared_for(&self, beta: f64) -> Option<&PreparedBeta> {
         self.betas.get(&beta.to_bits())
     }
@@ -856,71 +870,49 @@ fn relative_scale_against_core(
     ))
 }
 
-/// Local `|det J|` of `map`'s FORWARD transform (native/subject → reference)
-/// at native-plane point `(x, y)` — the flux-correction factor Tier C's
-/// ruling C-1b applies to a Measure fit mapped through the registration
-/// instead of re-detected on the warped plane (see [`map_fit`]): a source
-/// star's aperture-summed flux is conserved per unit AREA under the map,
-/// not as a raw sum inside a fixed pixel footprint reported in reference
-/// pixels, so the reported flux must scale by the same factor the map
-/// scales area by. For a `Similarity` of scale `s` that factor is `s²`.
-///
-/// A `Similarity`/`Affine` map with NO distortion layer has the SAME
-/// Jacobian everywhere ([`crate::geometry::linear::Linear::det2`], exact,
-/// no extra [`PixelMap::forward_exact`] calls). A `Homography` or any
-/// distortion layer varies with position, so the Jacobian is estimated
-/// from a central finite difference of `forward_exact` at `±0.5` px
-/// (ruling R-T4-3's O(nodes) exact path — this runs once per SURVIVING
-/// fit, a few hundred to a few thousand calls per frame, never per pixel).
-fn local_det_j(map: &PixelMap, x: f64, y: f64) -> f64 {
-    if map.distortion.is_none() && map.linear.kind != LinearKind::Homography {
-        return map.linear.det2();
-    }
-    const H: f64 = 0.5;
-    let (xp, yp) = map.forward_exact(x + H, y);
-    let (xm, ym) = map.forward_exact(x - H, y);
-    let (xq, yq) = map.forward_exact(x, y + H);
-    let (xr, yr) = map.forward_exact(x, y - H);
-    let dudx = (xp - xm) / (2.0 * H);
-    let dvdx = (yp - ym) / (2.0 * H);
-    let dudy = (xq - xr) / (2.0 * H);
-    let dvdy = (yq - yr) / (2.0 * H);
-    dudx * dvdy - dudy * dvdx
-}
-
-/// Maps one Measure [`StarFit`] through `map` into the reference geometry,
-/// correcting its `signal` for the map's local area change (ruling C-1b,
-/// [`local_det_j`]). `None` when the mapped centroid falls outside
-/// `[0, ref_width) × [0, ref_height)`, or the local determinant is not a
-/// usable positive, finite number (a degenerate map at that point).
-///
-/// This is the Jacobian correction ALONE — `fit.signal * |det J|`, nothing
-/// else — kept separate from the `measure::ADU_SCALE` unit conversion
-/// [`relative_scale_from_fits`] also needs (Measure's fits are ADU-scaled;
-/// the LN reference's own fits are native-unit), so the two corrections can
-/// be pinned independently: on a `1.2×` Similarity fixture the corrected
-/// `signal` is exactly `1.44×` the raw one; on an identity map it is
-/// unchanged.
-fn map_fit(fit: &StarFit, map: &PixelMap, ref_width: usize, ref_height: usize) -> Option<StarFit> {
+/// Maps one Measure [`StarFit`]'s CENTROID (position only) through `map`
+/// into the reference geometry — ruling C-12 (Tier C Task 2 fix round 2)
+/// drops the earlier `|det J|` flux correction entirely along with the
+/// native-flux comparison it existed for (see
+/// [`relative_scale_from_seeds`]'s own doc): Measure's fits are SEEDS now,
+/// not a source of flux to correct and compare. `None` when the mapped
+/// centroid, rounded to the nearest pixel (the same rounding
+/// [`psf_signal::fit_one`] applies to a seed internally), falls outside
+/// `[0, ref_width) × [0, ref_height)`.
+fn map_seed_position(
+    fit: &StarFit,
+    map: &PixelMap,
+    ref_width: usize,
+    ref_height: usize,
+) -> Option<(f64, f64)> {
     let (mx, my) = map.forward_exact(fit.x, fit.y);
-    if !(mx >= 0.0 && mx < ref_width as f64 && my >= 0.0 && my < ref_height as f64) {
+    let (px, py) = (mx.round(), my.round());
+    if !(px >= 0.0 && py >= 0.0 && (px as usize) < ref_width && (py as usize) < ref_height) {
         return None;
     }
-    let det_j = local_det_j(map, fit.x, fit.y).abs();
-    if !(det_j.is_finite() && det_j > 0.0) {
-        return None;
-    }
-    let mut mapped = *fit;
-    mapped.x = mx;
-    mapped.y = my;
-    mapped.signal = fit.signal * det_j;
-    Some(mapped)
+    Some((mx, my))
 }
 
-/// Ruling C-2: the fits-mapped path has no detection barycentre to fall
-/// back on (there was no detection — the fits are Measure's own PSF-fit
-/// centroids), so pass 2 is a SECOND [`pair_positions`] query on the SAME
-/// mapped positions against the SAME reference tree, at `2 × radius` — the
+/// Ruling C-12's saturation guard: the ONE piece of
+/// [`register::detect::passes_register_cuts`]'s job this path still needs,
+/// applied to the WARPED plane's own pixel value at a mapped seed position
+/// (native `[0, 1]` units — [`SATURATION`]) instead of a Measure fit's
+/// NATIVE `background + amplitude`. Measure's own acceptance already
+/// covers eccentricity/SNR on the native frame — what it cannot know is
+/// whether the WARPED pixel at the mapped position is unusable (a
+/// registration shift walking a seed onto a brighter neighbour, or
+/// resampling landing on a hot/bad pixel), which would corrupt the fresh
+/// PSF fit about to run there. `px`/`py` are assumed already in-bounds
+/// (every caller gets them from [`map_seed_position`] first).
+fn warped_pixel_is_saturated(target_plane: &[f32], ref_width: usize, px: f64, py: f64) -> bool {
+    let value = target_plane[(py as usize) * ref_width + (px as usize)];
+    !(value.is_finite() && (value as f64) < SATURATION as f64)
+}
+
+/// Ruling C-2: [`relative_scale_from_seeds`] has no detection barycentre to
+/// fall back on (the seeds are Measure's own mapped positions, not a fresh
+/// detection's), so pass 2 is a SECOND [`pair_positions`] query on the SAME
+/// fitted positions against the SAME reference tree, at `2 × radius` — the
 /// wider-radius pass literally REPLACES the barycentre pass of
 /// [`choose_pairing`]; [`LN_BARYCENTRE_PASS_THRESHOLD`] keeps its name and
 /// value, and a tie keeps pass 1, exactly as [`choose_pairing`] itself.
@@ -943,156 +935,211 @@ fn choose_pairing_widened(
     }
 }
 
-/// LN's flux-ratio scale computed from Measure's OWN persisted fits (Tier C
-/// Task 2, spec §2.2.3), mapped through the frame's registration instead of
-/// re-detecting and re-fitting the warped target plane —
-/// [`relative_scale_against`]'s per-frame detect (≈ 3.9 s) and fit
-/// (≈ 1.0 s) disappear; only the pairing/RCR/local-scale tail (`match_ms`,
-/// UNCHANGED code) remains.
+/// LN's flux-ratio scale computed from Measure's OWN persisted fits, used
+/// as SEED POSITIONS ONLY (Tier C Task 2 fix round 2, ruling C-12).
 ///
-/// `fits` is Measure's accepted [`StarFit`]s for ONE plane of the frame, in
-/// NATIVE pixel coordinates and `measure::ADU_SCALE`-scaled flux units —
-/// `measure::measure_plane_with_seeds`'s own convention, the same one
-/// [`passes_register_cuts`] assumes; every fit in the list shares one β
-/// (Measure's own per-plane `fit_stars_with_beta` call). `map` is the
-/// frame's registration (subject → reference); `ref_width`/`ref_height` are
-/// the reference geometry's dimensions.
+/// **Why not compare Measure's fitted flux directly (the original Task 2
+/// design)**: the diagnostics round (ruling C-11) found the ~5 % residual
+/// that survived ruling C-10's per-β fix traces to the Moffat fit's own
+/// `signal` NOT being warp-invariant — a fit on the NATIVE calibrated frame
+/// and a fit of the IDENTICAL star on the WARPED (bicubic-interpolated)
+/// frame integrate measurably different flux, the gap growing with how
+/// undersampled the star's native PSF is relative to the resampling
+/// kernel (0.5 % on well-sampled frames, up to 19-20 % on the sharpest
+/// real frames measured). An aperture SUM over the same pixels — no fit
+/// model — conserves flux through the warp to ≤ 0.6 % even on those same
+/// frames, so the divergence is in the FIT, not the pixels. Today's
+/// [`relative_scale_against`] never hits this: both sides it compares are
+/// fits taken on a plane of the SAME kind (the reference is itself an
+/// integration of already-warped frames; the target is warped too), which
+/// is why it stays the correct, unbiased baseline this function is
+/// checked against.
 ///
-/// **Ruling C-10 (Tier C Task 2 fix round 1)**: the target is compared
-/// against the reference fitted at the TARGET's OWN β
-/// (`prepared.prepared_for(target_beta)`), never the reference's default —
-/// comparing two different Moffat profile shapes' flux measurably biases
-/// the ratio (a real catalog frame moved 3.4 % when its own β sat two
-/// `AUTO_BETAS` steps from the group's fixed default). `Err(TooFewMatches)`
-/// when `fits` is empty (no β to read) or the reference was never prepared
-/// at this β at all (`stacking::run` prepares every member β up front —
-/// this is the caller's own contract broken, not an ordinary runtime
-/// condition) — either way the caller falls back to full detection, which
-/// always uses the default β on both sides and is never biased this way.
+/// **What this function does instead**: it keeps Measure's cheap per-plane
+/// detection (skipping [`detect_seeds`]'s own expensive full-frame search)
+/// but discards every FITTED VALUE, using only the accepted stars'
+/// POSITIONS as seeds for a fresh [`fit_stars_with_beta`] call on the
+/// WARPED TARGET PLANE — exactly [`relative_scale_against`]'s own fit
+/// call, fed a pre-selected seed list instead of [`detect_seeds`]'s
+/// full-frame one. The expensive full-frame detection disappears; the PSF
+/// fit itself (now over a much smaller, pre-matched list) and the
+/// pairing/RCR/local-scale tail are the SAME code [`relative_scale_against`]
+/// runs.
 ///
-/// Per fit: (1) [`passes_register_cuts`] — the SAME saturation/
-/// eccentricity/SNR rules the detector applies, since Measure's own
-/// acceptance (centroid tolerance, residual cap, region containment) does
-/// not reject a saturated or elongated star the way registration always
-/// has; (2) [`map_fit`] — map the centroid through
-/// [`PixelMap::forward_exact`] (ruling R-T4-3), correcting `signal` for the
-/// map's local area change (ruling C-1b), dropping a fit that fails either
-/// step; (3) convert the survivor's `signal` from Measure's ADU-scaled
-/// convention to the native-unit domain the LN reference's own fits are
-/// measured in (`/ measure::ADU_SCALE`) — the reference is an integration
-/// of native calibrated pixels, never ADU-scaled, so without this step
-/// every ratio would be off by `measure::ADU_SCALE` (≈ 65535×).
+/// `fits` is Measure's accepted [`StarFit`]s for ONE plane of the frame —
+/// their POSITIONS only matter; their own β/flux never reach the result.
+/// `map` is the frame's registration (subject → reference); `target_plane`
+/// is the WARPED target plane (already in the reference geometry — the
+/// plane the caller is about to fit on) that both the saturation guard and
+/// the PSF fit itself read; `ref_width`/`ref_height` are its dimensions.
 ///
-/// Pairing is [`choose_pairing_widened`] (ruling C-2). [`ratio_sample`] /
-/// [`crate::stacking::robust::rcr`] / [`fit_local_scale`] run UNCHANGED, fed
-/// a synthetic [`FitOutcome`] built from the mapped fits — `ratio_sample`
-/// reads `signal`/`x`/`y` off it exactly as it would a detected-and-fitted
-/// target.
-pub fn relative_scale_from_fits(
+/// Per fit: (1) [`map_seed_position`] — map the centroid through
+/// [`PixelMap::forward_exact`] (ruling R-T4-3), dropping one whose mapped,
+/// rounded position falls outside `[0, ref_width) × [0, ref_height)`; (2)
+/// [`warped_pixel_is_saturated`] — a saturation guard on the WARPED
+/// plane's own pixel value at that position (native `[0, 1]` units) —
+/// this is the one piece of the OLD design's
+/// [`register::detect::passes_register_cuts`] this path still needs
+/// (Measure's own acceptance already covers eccentricity/SNR on the
+/// NATIVE frame, but says nothing about the WARPED pixel the fresh fit is
+/// about to sample); (3) PRE-SELECT — keep only seeds with a reference
+/// star within `match_radius_px` of the mapped position
+/// (`prepared`'s own match tree at the reference's DEFAULT β, cheap, no
+/// fit yet) — a seed with no nearby reference star can never produce a
+/// matched pair, so fitting it would be wasted PSF-fit work.
+///
+/// Survivors become [`Seed`]s (`peak`/`flux` copied from the Measure fit's
+/// own `amplitude`/`signal` — used only by [`fit_stars_with_beta`]'s
+/// field-level `initial_sigma` heuristic to size the fit stamp, a RATIO
+/// any unit difference between Measure's ADU-scaled fits and this native
+/// plane cancels out of), sorted brightest-first (the convention
+/// [`detect_seeds`]'s own `to_seed` documents), capped at `max_stars`, then
+/// fitted with [`fit_stars_with_beta`] at the reference's DEFAULT β —
+/// never a seed's own original Measure β, which no longer matters: this is
+/// a FRESH fit on the warped plane, at whatever β makes it comparable to
+/// the reference's own fit, exactly like [`relative_scale_against`].
+/// `Err(TooFewMatches)` when fewer than [`MIN_MATCHES`] pairs survive —
+/// the caller falls back to full detection.
+///
+/// Pairing is [`choose_pairing_widened`] (ruling C-2 — there is still no
+/// detection barycentre to fall back on: the seeds are Measure's own
+/// positions, not a fresh detection's). [`ratio_sample`] /
+/// [`crate::stacking::robust::rcr`] / [`fit_local_scale`] run UNCHANGED.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_from_seeds(
     prepared: &PreparedReferenceChannel,
     fits: &[StarFit],
     map: &PixelMap,
+    target_plane: &[f32],
     ref_width: usize,
     ref_height: usize,
+    max_stars: usize,
     match_radius_px: f64,
     rcr_limit: f64,
     local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ScaleResult, LnError> {
-    relative_scale_from_fits_core(
+    relative_scale_from_seeds_core(
         prepared,
         fits,
         map,
+        target_plane,
         ref_width,
         ref_height,
+        max_stars,
         match_radius_px,
         rcr_limit,
         local_scale,
+        pool,
     )
     .map(|(r, _diag)| r)
 }
 
-/// Diagnostic-only (Tier C Task 2 diagnostics round, ruling C-11): exactly
-/// [`relative_scale_from_fits`]'s own computation — this and it share ONE
-/// body ([`relative_scale_from_fits_core`]) — but also returning the
-/// per-match [`ScaleMatchDiag`] records. Never called by `normalize_frame`
-/// or any other production path.
+/// Diagnostic-only (mirrors [`relative_scale_against_with_diag`]'s own
+/// contract): exactly [`relative_scale_from_seeds`]'s own computation —
+/// this and it share ONE body ([`relative_scale_from_seeds_core`]) — but
+/// also returning the per-match [`ScaleMatchDiag`] records. Never called
+/// by `normalize_frame` or any other production path.
 #[allow(clippy::too_many_arguments)]
-pub fn relative_scale_from_fits_with_diag(
+pub fn relative_scale_from_seeds_with_diag(
     prepared: &PreparedReferenceChannel,
     fits: &[StarFit],
     map: &PixelMap,
+    target_plane: &[f32],
     ref_width: usize,
     ref_height: usize,
+    max_stars: usize,
     match_radius_px: f64,
     rcr_limit: f64,
     local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
-    relative_scale_from_fits_core(
+    relative_scale_from_seeds_core(
         prepared,
         fits,
         map,
+        target_plane,
         ref_width,
         ref_height,
+        max_stars,
         match_radius_px,
         rcr_limit,
         local_scale,
+        pool,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn relative_scale_from_fits_core(
+fn relative_scale_from_seeds_core(
     prepared: &PreparedReferenceChannel,
     fits: &[StarFit],
     map: &PixelMap,
+    target_plane: &[f32],
     ref_width: usize,
     ref_height: usize,
+    max_stars: usize,
     match_radius_px: f64,
     rcr_limit: f64,
     local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
-    // Every fit in a plane's list shares one β (Measure's own per-plane
-    // `fit_stars_with_beta` convention) — ruling C-10 compares against the
-    // reference fitted at exactly that β, never the default.
-    let Some(target_beta) = fits.first().map(|f| f.beta) else {
-        return Err(LnError::TooFewMatches { matches: 0 });
-    };
-    let Some(ref_beta_data) = prepared.prepared_for(target_beta) else {
-        return Err(LnError::TooFewMatches { matches: 0 });
-    };
+    let default = prepared.default_prepared();
+    let fit_params = FitParams::default();
 
-    let cuts = DetectionConfig::default();
-    let mut mapped_fits: Vec<StarFit> = Vec::with_capacity(fits.len());
+    // Perf tier A Task 0 convention: this pre-select loop is this path's
+    // own analog of `detect_seeds` (it is what decides WHAT gets fitted,
+    // far cheaper than a full-frame detection) — timed into `detect_ms`
+    // for the same log field the detection path reports.
+    let t = Instant::now();
+    let mut seeds: Vec<Seed> = Vec::with_capacity(fits.len());
     for f in fits {
-        if !passes_register_cuts(f, &cuts) {
-            continue;
-        }
-        let Some(mut mapped) = map_fit(f, map, ref_width, ref_height) else {
+        let Some((mx, my)) = map_seed_position(f, map, ref_width, ref_height) else {
             continue;
         };
-        // Measure's fits are `measure::ADU_SCALE`-scaled; the LN reference's
-        // own fits (`PreparedReferenceChannel::build`, on `LnReference`'s
-        // native-unit planes) are not — see this function's own doc.
-        mapped.signal /= ADU_SCALE as f64;
-        mapped_fits.push(mapped);
+        if warped_pixel_is_saturated(target_plane, ref_width, mx.round(), my.round()) {
+            continue;
+        }
+        if default
+            .tree
+            .nearest_within(mx, my, match_radius_px)
+            .is_none()
+        {
+            continue;
+        }
+        seeds.push(Seed {
+            x: mx,
+            y: my,
+            peak: f.amplitude,
+            flux: f.signal,
+        });
     }
-
-    let tgt_fit_positions: Vec<Option<(f64, f64)>> =
-        mapped_fits.iter().map(|f| Some((f.x, f.y))).collect();
+    seeds.sort_by(|a, b| b.flux.total_cmp(&a.flux));
+    seeds.truncate(max_stars);
+    let detect_ms = t.elapsed().as_millis() as u64;
 
     let t = Instant::now();
+    let tgt_outcome = fit_stars_with_beta(
+        target_plane,
+        ref_width,
+        ref_height,
+        &seeds,
+        default.outcome.beta,
+        &fit_params,
+        pool,
+    );
+    let fit_ms = t.elapsed().as_millis() as u64;
+
+    let t = Instant::now();
+    let tgt_fit_positions: Vec<Option<(f64, f64)>> =
+        tgt_outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
     let (pairs, pass) = choose_pairing_widened(
-        &ref_beta_data.tree,
-        &ref_beta_data.fit_of_point,
+        &default.tree,
+        &default.fit_of_point,
         &tgt_fit_positions,
         match_radius_px,
     );
 
-    let tgt_outcome = FitOutcome {
-        seeds: mapped_fits.len(),
-        beta: target_beta,
-        fits: mapped_fits,
-    };
-    let sample = ratio_sample(&ref_beta_data.outcome.fits, &tgt_outcome, &pairs);
+    let sample = ratio_sample(&default.outcome.fits, &tgt_outcome, &pairs);
     if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
             matches: sample.ratios.len(),
@@ -1114,7 +1161,7 @@ fn relative_scale_from_fits_core(
         rejected = r.rejected,
         ln_pass = pass,
         ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
-        scale_source = "fits",
+        scale_source = "seeds",
         "ln relative scale"
     );
     let diag = diag_from_sample(&sample, &r.kept);
@@ -1124,13 +1171,13 @@ fn relative_scale_from_fits_core(
             sigma: r.scale,
             matches: sample.ratios.len(),
             rejected: r.rejected,
-            beta: target_beta,
+            beta: default.outcome.beta,
             pass,
             local,
             timings: ScaleTimings {
-                detect_ms: 0,
+                detect_ms,
                 refine_ms: 0,
-                fit_ms: 0,
+                fit_ms,
                 match_ms,
             },
         },
@@ -2102,7 +2149,8 @@ mod tests {
 
     // ---- Tier C Task 2: LN from Measure's fits ---------------------------
 
-    use crate::geometry::Linear;
+    use crate::geometry::{Linear, LinearKind};
+    use crate::stacking::measure::ADU_SCALE;
 
     /// "Measure-like" fits for `target`: ADU-scaled `StarFit`s produced the
     /// same way `measure::measure_plane_with_seeds` would (detect on the
@@ -2127,41 +2175,53 @@ mod tests {
         PixelMap::linear(linear).expect("a non-degenerate similarity must invert")
     }
 
-    /// The `|det J|` pin (design's own acceptance metric): on a `1.2×`
-    /// Similarity, `map_fit` corrects `signal` by exactly `1.2² = 1.44`; on
-    /// an identity map the ratio is exactly `1`. This is the Jacobian
-    /// correction ALONE — no `ADU_SCALE` conversion, which
-    /// `relative_scale_from_fits` applies separately (see its own test
-    /// below).
+    /// Ruling C-12's own "positions-mapping" pin, replacing the retired
+    /// Jacobian-correction one (`map_fit_corrects_signal_by_the_local_
+    /// jacobian_determinant`, gone with `map_fit` itself): a seed's
+    /// centroid maps through an arbitrary linear map exactly like any
+    /// other pixel coordinate — there is no flux to correct any more — and
+    /// one whose mapped, rounded position falls outside the reference
+    /// canvas is dropped.
     #[test]
-    fn map_fit_corrects_signal_by_the_local_jacobian_determinant() {
+    fn map_seed_position_maps_through_a_similarity_and_drops_out_of_bounds() {
         let fit = fit_at(200.0, 150.0);
 
         let identity = identity_map();
-        let mapped = map_fit(&fit, &identity, WIDTH, HEIGHT).expect("must map inside bounds");
-        assert_eq!(
-            mapped.signal, fit.signal,
-            "identity map must not change signal"
-        );
-        assert_eq!(mapped.x, fit.x);
-        assert_eq!(mapped.y, fit.y);
+        let (mx, my) =
+            map_seed_position(&fit, &identity, WIDTH, HEIGHT).expect("must map inside bounds");
+        assert_eq!(mx, fit.x);
+        assert_eq!(my, fit.y);
 
         let sim = similarity_map(1.2);
-        let mapped = map_fit(&fit, &sim, WIDTH, HEIGHT).expect("must map inside bounds");
-        let ratio = mapped.signal / fit.signal;
+        let (mx, my) =
+            map_seed_position(&fit, &sim, WIDTH, HEIGHT).expect("must map inside bounds");
+        assert!((mx - fit.x * 1.2).abs() < 1e-9);
+        assert!((my - fit.y * 1.2).abs() < 1e-9);
+
+        let far = fit_at(490.0, 370.0);
         assert!(
-            (ratio - 1.44).abs() < 1e-9,
-            "ratio {ratio}, expected 1.2^2 = 1.44 to 1e-9"
+            map_seed_position(&far, &sim, WIDTH, HEIGHT).is_none(),
+            "490*1.2=588 > WIDTH must be dropped"
         );
-        assert!((mapped.x - fit.x * 1.2).abs() < 1e-9);
-        assert!((mapped.y - fit.y * 1.2).abs() < 1e-9);
     }
 
+    /// The saturation guard ruling C-12 keeps from the retired
+    /// `passes_register_cuts` call: it reads the WARPED plane's own pixel
+    /// value at the mapped position (native `[0, 1]` units,
+    /// `SATURATION = 0.95`), not anything carried on the source `StarFit`
+    /// — a non-finite pixel (a warped frame's off-canvas strip) is treated
+    /// as unusable too.
     #[test]
-    fn map_fit_drops_a_fit_that_maps_outside_the_reference_canvas() {
-        let fit = fit_at(490.0, 370.0);
-        let sim = similarity_map(1.2); // 490*1.2 = 588 > WIDTH (512)
-        assert!(map_fit(&fit, &sim, WIDTH, HEIGHT).is_none());
+    fn warped_pixel_is_saturated_reads_the_target_planes_own_value() {
+        let mut plane = vec![0.1f32; WIDTH * HEIGHT];
+        plane[150 * WIDTH + 200] = 0.99; // above SATURATION (0.95)
+        plane[151 * WIDTH + 200] = f32::NAN;
+        assert!(warped_pixel_is_saturated(&plane, WIDTH, 200.0, 150.0));
+        assert!(
+            warped_pixel_is_saturated(&plane, WIDTH, 200.0, 151.0),
+            "a non-finite pixel must also be treated as unusable"
+        );
+        assert!(!warped_pixel_is_saturated(&plane, WIDTH, 199.0, 150.0));
     }
 
     /// Ruling C-2: `choose_pairing_widened` fires its second, wider pass
@@ -2232,12 +2292,12 @@ mod tests {
     }
 
     /// DELTA pin (design §8's own acceptance metric): on a clean uniformly-
-    /// scaled field, `relative_scale_from_fits` fed Measure-like fits through
-    /// an IDENTITY map must agree with the detection oracle
+    /// scaled field, `relative_scale_from_seeds` fed Measure-like fits
+    /// (used as seed positions only) must agree with the detection oracle
     /// (`relative_scale_against`, run on the identical two rendered planes)
     /// within 0.5%, matching at least 80% as many stars.
     #[test]
-    fn relative_scale_from_fits_matches_the_detection_oracle_within_half_a_percent() {
+    fn relative_scale_from_seeds_matches_the_detection_oracle_within_half_a_percent() {
         let stars = star_grid(31);
         let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 71);
         let target_stars = scale_stars(&stars, 0.8);
@@ -2260,33 +2320,34 @@ mod tests {
 
         let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
         let identity = identity_map();
-        let from_fits =
-            relative_scale_from_fits(&prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
-                .expect("mapped Measure-like fits on the same field must also match");
+        let from_seeds = relative_scale_from_seeds(
+            &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("seeds from Measure-like fits on the same field must also match");
 
-        let rel = (from_fits.scale - oracle.scale).abs() / oracle.scale.abs();
+        let rel = (from_seeds.scale - oracle.scale).abs() / oracle.scale.abs();
         assert!(
             rel < 0.005,
             "scale {} vs oracle {} ({:.4}% off)",
-            from_fits.scale,
+            from_seeds.scale,
             oracle.scale,
             rel * 100.0
         );
         assert!(
-            from_fits.matches as f64 >= 0.8 * oracle.matches as f64,
+            from_seeds.matches as f64 >= 0.8 * oracle.matches as f64,
             "matched {} vs oracle's {}",
-            from_fits.matches,
+            from_seeds.matches,
             oracle.matches
         );
     }
 
     #[test]
-    fn relative_scale_from_fits_reports_scale_source_fits() {
+    fn relative_scale_from_seeds_reports_scale_source_seeds() {
         // A dedicated tracing capture would need this module's own
         // subscriber (register/detect.rs's own tests already show the
         // pattern); simplest to just confirm the call succeeds and returns
         // a sane result — `scale_source` on the emitted event is a
-        // constant literal ("fits") checked by inspection, not re-derived
+        // constant literal ("seeds") checked by inspection, not re-derived
         // at runtime by anything this function returns.
         let stars = star_grid(32);
         let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 72);
@@ -2303,41 +2364,37 @@ mod tests {
         );
         let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
         let identity = identity_map();
-        let r =
-            relative_scale_from_fits(&prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
-                .expect("a clean field must match");
+        let r = relative_scale_from_seeds(
+            &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("a clean field must match");
         assert!((r.scale - 1.0 / 1.1).abs() < 0.02, "scale {}", r.scale);
     }
 
-    /// **Ruling C-10 (Tier C Task 2 fix round 1).** Before this fix,
-    /// `relative_scale_from_fits` always compared the target against the
-    /// reference's DEFAULT β, regardless of what β Measure had actually
-    /// fitted the target's own persisted stars at — this test (then named
-    /// `a_target_beta_far_from_the_references_moves_the_scale_more_than_
-    /// the_matched_case`) measured that bias at ≈ 2.84 % on this exact
-    /// synthetic field for a target β two `AUTO_BETAS` steps from the
-    /// reference's, matching the real catalog's ≈ 3.4 % (frame 29053 of set
-    /// 204, task-2-report.md) — comparing two different Moffat profile
-    /// shapes' flux is not the same measurement. The fix: the reference is
-    /// now prepared at EVERY member β a group uses
-    /// (`PreparedReferenceChannel::build`'s `extra_betas`), and
-    /// `relative_scale_from_fits` matches the target against ITS OWN β's
-    /// reference fit. This test is KEPT as the pin (per the fix-round
-    /// instruction), now asserting the mismatch is GONE: a target fitted at
-    /// a distant β must recover the SAME scale a same-beta oracle would, to
-    /// numerical precision — not the several-percent bias the unprepared
-    /// version of this function produced here.
+    /// **Ruling C-12 (Tier C Task 2 fix round 2)**, the "per-β test becomes
+    /// a 'seeds at one β' test" — this test replaces
+    /// `a_target_beta_far_from_the_references_default_is_no_longer_biased`
+    /// (ruling C-10's own pin). The diagnostics round (ruling C-11) found
+    /// C-10's per-β reference fix never closed the real ~5% residual — the
+    /// actual cause was a Moffat fit's `signal` not being warp-invariant —
+    /// so `relative_scale_from_seeds` now throws the source fits' own β
+    /// away entirely and always re-fits at the reference's DEFAULT β on
+    /// the warped plane. Two source fit lists that differ ONLY in their
+    /// own β (10.0 vs 4.0 — the exact mismatch C-10 needed a per-β
+    /// reference to fix) must therefore produce numerically IDENTICAL
+    /// results: a seed carries position only, so the source fit's β is
+    /// invisible to this function. `PreparedReferenceChannel::build` is
+    /// still exercised at a non-default β here — ruling C-12's own "keep
+    /// C-10's structure" — even though no production caller passes a
+    /// non-empty `extra_betas` any more; `prepared_for` has no caller
+    /// outside this test.
     #[test]
-    fn a_target_beta_far_from_the_references_default_is_no_longer_biased() {
+    fn seeds_at_one_beta_are_immune_to_the_sources_own_beta() {
         let stars = star_grid(34);
         let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 91);
         let target_stars = scale_stars(&stars, 0.8);
         let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 92);
 
-        // The reference is prepared at BOTH the group's default beta (10.0,
-        // ruling C-1) AND the target's own, distant beta (4.0, ruling
-        // C-10) — exactly what `stacking::run` now does for every member
-        // beta in a group.
         let prepared = PreparedReferenceChannel::build(
             &reference,
             WIDTH,
@@ -2347,51 +2404,20 @@ mod tests {
             200,
             None,
         );
-        let identity = identity_map();
-
-        // Matched case (target fitted at the reference's own default,
-        // 10.0) — unaffected by this fix, numerically exact against a
-        // same-beta oracle, exactly as before.
-        let oracle_10 = relative_scale_against(
-            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
-        )
-        .expect("a clean uniformly-scaled field must match");
-        let matched_fits = measure_like_fits(&target, WIDTH, HEIGHT, 10.0);
-        let matched = relative_scale_from_fits(
-            &prepared,
-            &matched_fits,
-            &identity,
-            WIDTH,
-            HEIGHT,
-            4.0,
-            0.3,
-            false,
-        )
-        .expect("matched-beta fits must also match");
-        let matched_rel = (matched.scale - oracle_10.scale).abs() / oracle_10.scale.abs();
         assert!(
-            matched_rel < 1e-6,
-            "matched-beta case should be numerically exact: {:.9}",
-            matched_rel
+            prepared.prepared_for(4.0).is_some(),
+            "extra_betas must still be reachable"
         );
+        assert!(prepared.prepared_for(999.0).is_none());
 
-        // The FORMERLY-mismatched case: the target's own fits at 4.0, two
-        // AUTO_BETAS steps from the reference's default (10.0) — the exact
-        // real-catalog scenario. `relative_scale_against` only ever
-        // compares at ITS OWN prepared reference's default beta, so the
-        // same-beta oracle for THIS comparison needs a separate reference
-        // whose default IS 4.0.
-        let prepared_at_4 = PreparedReferenceChannel::build(
-            &reference,
-            WIDTH,
-            HEIGHT,
-            PsfModel::Fixed(4.0),
-            &[],
-            200,
-            None,
-        );
-        let oracle_4 = relative_scale_against(
-            &prepared_at_4,
+        let identity = identity_map();
+        let seeds_at_10 = measure_like_fits(&target, WIDTH, HEIGHT, 10.0);
+        let seeds_at_4 = measure_like_fits(&target, WIDTH, HEIGHT, 4.0);
+
+        let from_10 = relative_scale_from_seeds(
+            &prepared,
+            &seeds_at_10,
+            &identity,
             &target,
             WIDTH,
             HEIGHT,
@@ -2401,31 +2427,47 @@ mod tests {
             false,
             None,
         )
-        .expect("a clean uniformly-scaled field must match");
-        let target_fits_at_4 = measure_like_fits(&target, WIDTH, HEIGHT, 4.0);
-        let fixed = relative_scale_from_fits(
+        .expect("matched-beta seeds must succeed");
+        let from_4 = relative_scale_from_seeds(
             &prepared,
-            &target_fits_at_4,
+            &seeds_at_4,
             &identity,
+            &target,
             WIDTH,
             HEIGHT,
+            200,
             4.0,
             0.3,
             false,
+            None,
         )
-        .expect("the reference was prepared at this beta too (extra_betas), so this must match");
-        let fixed_rel = (fixed.scale - oracle_4.scale).abs() / oracle_4.scale.abs();
+        .expect("a source beta far from the default must no longer matter");
+
+        // Not `< 1e-6`: `measure_like_fits` at β 10 vs β 4 converge to
+        // slightly different CENTROIDS for the same pixel data (a
+        // different assumed profile shape shifts the least-squares
+        // optimum by a tiny amount), so the two seed lists this feeds
+        // `relative_scale_from_seeds` are not bit-identical positions —
+        // measured at ≈ 8.8e-5 relative on this fixture. `1e-3` is three
+        // orders of magnitude above that measurement and four below the
+        // several-percent bias ruling C-10 needed a per-β reference to
+        // fix, so it is still a real "the source beta no longer matters"
+        // pin, not a loosened one.
+        let rel = (from_4.scale - from_10.scale).abs() / from_10.scale.abs();
         assert!(
-            fixed_rel < 1e-6,
-            "a target beta two AUTO_BETAS steps from the default must now match a \
-             same-beta oracle to numerical precision, not the ~2.84% this measured \
-             before ruling C-10: {:.9}",
-            fixed_rel
+            rel < 1e-3,
+            "the source fits' own beta must be invisible to the seeds path: {:.9}",
+            rel
         );
+        assert_eq!(
+            from_10.beta, 10.0,
+            "the fit always runs at the reference's own default beta"
+        );
+        assert_eq!(from_4.beta, 10.0);
     }
 
     #[test]
-    fn relative_scale_from_fits_is_too_few_matches_on_an_empty_list() {
+    fn relative_scale_from_seeds_is_too_few_matches_on_an_empty_list() {
         let stars = star_grid(33);
         let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 73);
         let prepared = PreparedReferenceChannel::build(
@@ -2438,18 +2480,29 @@ mod tests {
             None,
         );
         let identity = identity_map();
-        let err =
-            relative_scale_from_fits(&prepared, &[], &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
-                .expect_err("no fits at all cannot produce 20 matched pairs");
+        let target = vec![0.0f32; WIDTH * HEIGHT];
+        let err = relative_scale_from_seeds(
+            &prepared,
+            &[],
+            &identity,
+            &target,
+            WIDTH,
+            HEIGHT,
+            200,
+            4.0,
+            0.3,
+            false,
+            None,
+        )
+        .expect_err("no fits at all cannot produce 20 matched pairs");
         assert!(matches!(err, LnError::TooFewMatches { matches: 0 }));
     }
 
-    /// Diagnostics round (ruling C-11): the `_with_diag` variants must be
-    /// bit-for-bit the SAME computation as the plain ones (they share one
-    /// `_core` body) — this pins that refactor, not any new behavior. Also
-    /// checks the diag vec's own internal consistency: its length is the
-    /// pre-RCR match count, and the number of `kept` entries is
-    /// `matches - rejected`.
+    /// The `_with_diag` variants must be bit-for-bit the SAME computation
+    /// as the plain ones (they share one `_core` body) — this pins that
+    /// refactor, not any new behavior. Also checks the diag vec's own
+    /// internal consistency: its length is the pre-RCR match count, and
+    /// the number of `kept` entries is `matches - rejected`.
     #[test]
     fn with_diag_variants_match_the_plain_ones_and_the_diag_vec_is_self_consistent() {
         let stars = star_grid(35);
@@ -2483,18 +2536,19 @@ mod tests {
 
         let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
         let identity = identity_map();
-        let plain_fits =
-            relative_scale_from_fits(&prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
-                .expect("mapped fits must match");
-        let (diag_fits_result, diag_fits) = relative_scale_from_fits_with_diag(
-            &prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false,
+        let plain_seeds = relative_scale_from_seeds(
+            &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("seeds must match");
+        let (diag_seeds_result, diag_seeds) = relative_scale_from_seeds_with_diag(
+            &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
         )
         .expect("the diag variant must succeed identically");
-        assert_eq!(plain_fits, diag_fits_result);
-        assert_eq!(diag_fits.len(), plain_fits.matches);
+        assert_eq!(plain_seeds, diag_seeds_result);
+        assert_eq!(diag_seeds.len(), plain_seeds.matches);
         assert_eq!(
-            diag_fits.iter().filter(|d| d.kept).count(),
-            plain_fits.matches - plain_fits.rejected
+            diag_seeds.iter().filter(|d| d.kept).count(),
+            plain_seeds.matches - plain_seeds.rejected
         );
     }
 }

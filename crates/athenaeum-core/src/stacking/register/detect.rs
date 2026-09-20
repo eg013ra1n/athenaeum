@@ -143,22 +143,33 @@ pub fn detect_stars(
 
 /// This detector's own saturation / eccentricity / SNR cuts (the filter
 /// chain [`detect_stars`] applies above), applied instead to an already
-/// completed PSF fit (Tier C Task 2, spec §2.2.3) — shared by Task 2 (LN
-/// maps Measure's fits through the registration instead of re-detecting on
-/// the warped frame) and Task 3 (Register reuses Measure's fits for mono
-/// frames). Measure's own acceptance (`psf_signal::accept`: centroid
-/// tolerance, residual cap, region containment) does not reject a
-/// saturated or elongated star the way this module always has, so a
-/// caller that wants to treat a `StarFit` list as if it had come through
-/// this detector needs this rule applied explicitly.
+/// completed PSF fit (Tier C Task 2, spec §2.2.3) — originally shared by
+/// Task 2 (LN maps Measure's fits through the registration instead of
+/// re-detecting on the warped frame) and the still-pending Task 3
+/// (Register reuses Measure's fits for mono frames). Measure's own
+/// acceptance (`psf_signal::accept`: centroid tolerance, residual cap,
+/// region containment) does not reject a saturated or elongated star the
+/// way this module always has, so a caller that wants to treat a
+/// `StarFit` list as if it had come through this detector needs this rule
+/// applied explicitly.
+///
+/// **Fix round 2, ruling C-12**: Task 2's own LN path no longer calls this
+/// — the diagnostics round (ruling C-11) found a Moffat fit's `signal` is
+/// not warp-invariant (a fit on the native frame and a fit of the same
+/// star on the warped frame integrate measurably different flux, worse
+/// for undersampled stars), so LN now uses Measure's fits as SEED
+/// POSITIONS ONLY and re-fits on the warped plane
+/// (`stacking::ln::scale::relative_scale_from_seeds`), guarding against a
+/// saturated WARPED pixel directly instead of re-checking the (irrelevant,
+/// now-discarded) native flux this function was built to validate. Kept,
+/// with its own tests intact, for Task 3's still-pending reuse — a mono
+/// Register fit genuinely wants this exact rule.
 ///
 /// `fit`'s `background`/`amplitude` are assumed `measure::ADU_SCALE`-scaled
 /// — [`measure::measure_plane_with_seeds`] fits at exactly that scale
 /// (the same convention `saturation` below already uses), so a `StarFit`
 /// read back from a `fits` artifact needs no further conversion for this
-/// check alone (a caller comparing its FLUX against the LN reference's own
-/// native-unit fits handles that separately — see
-/// [`crate::stacking::ln::scale::relative_scale_from_fits`]).
+/// check alone.
 ///
 /// [`StarFit`] carries no raw detector SNR (there was no detection here —
 /// the fit already exists), so this uses `1 / residual` as a proxy:
@@ -168,6 +179,7 @@ pub fn detect_stars(
 /// numerically identical to `astroimage`'s own per-star SNR, but it cuts
 /// the same population: a fit whose noise is a large fraction of its own
 /// signal.
+#[allow(dead_code)]
 pub(crate) fn passes_register_cuts(fit: &StarFit, cfg: &DetectionConfig) -> bool {
     let saturation = (SATURATION * ADU_SCALE) as f64;
     if fit.background + fit.amplitude >= saturation {

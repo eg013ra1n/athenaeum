@@ -8206,21 +8206,6 @@ fn run_group_normalization(
         .and_then(|mg| mg.beta)
         .unwrap_or(4.0);
 
-    // Perf tier C Task 2 fix round 1 (ruling C-10): the FULL distinct set
-    // of this group's members' own per-plane betas — a target compared
-    // against a reference fitted at a DIFFERENT beta measurably biases the
-    // flux ratio (two Moffat profile shapes enclose different fractions of
-    // the same star's light; measured on a real catalog frame at ≈ 3.4 %
-    // when the gap was two `AUTO_BETAS` steps), so `normalize_frame` must
-    // never compare across beta. `group_beta` (the median, ruling C-1a) is
-    // always one of these values by construction.
-    let mut member_betas: Vec<f64> = members
-        .iter()
-        .flat_map(|m| m.measurement.channels.iter().map(|c| c.beta))
-        .collect();
-    member_betas.sort_by(|a, b| a.total_cmp(b));
-    member_betas.dedup();
-
     // Fix round 1, item 6: computed ONCE per group, not once per frame.
     // I2 (final fix wave): also hoists the reference-side star detection +
     // PSF fit + match tree (`prepared`), so `normalize_frame`'s
@@ -8233,9 +8218,12 @@ fn run_group_normalization(
     // now prefers over re-detecting) were fitted at the group β too, so
     // fitting the reference at anything else would reintroduce exactly the
     // β mismatch `psf_signal::fit_stars_with_beta`'s own doc warns against.
-    // `Moffat4` (or any future explicit choice) is untouched. `member_betas`
-    // (ruling C-10) is threaded through as `extra_betas` so the reference is
-    // ALSO fitted at every other member's own beta, not just the default.
+    // `Moffat4` (or any future explicit choice) is untouched. No
+    // `extra_betas` any more (fix round 2, ruling C-12 retired fix round
+    // 1's per-member-beta preparation — the diagnostics round traced the
+    // real bias to the fit itself, not a beta mismatch, and
+    // `relative_scale_from_seeds` always fits at this one default beta
+    // regardless of what beta a seed source's own fits carry).
     let reference_psf = match ln_cfg.psf_model {
         psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
         other => other,
@@ -8243,7 +8231,7 @@ fn run_group_normalization(
     let reference_for_detection = LnReferenceForDetection::build(
         &ln_reference,
         reference_psf,
-        &member_betas,
+        &[],
         measure_opts.max_stars,
         Some(&rc.ctx.image_pool),
     );
@@ -8584,9 +8572,9 @@ fn run_group_normalization(
     };
 
     // Perf tier C Task 2: how many of this group's freshly-normalized
-    // frames used Measure's persisted fits rather than falling back to
-    // detection — logged once per group below.
-    let mut fits_sourced_count = 0usize;
+    // frames used Measure's persisted fits as seed positions rather than
+    // falling back to detection — logged once per group below.
+    let mut seeds_sourced_count = 0usize;
     for (pos, res) in results.into_iter().enumerate() {
         let member_idx = needs_normalize[pos];
         let frame_id = members[member_idx].frame_id;
@@ -8646,8 +8634,8 @@ fn run_group_normalization(
                             scale_source = outcome.scale_source,
                             "ln frame normalized"
                         );
-                        if outcome.scale_source == "fits" {
-                            fits_sourced_count += 1;
+                        if outcome.scale_source == "seeds" {
+                            seeds_sourced_count += 1;
                         }
                         set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
                         sidecar_grids.insert(frame_id, grids);
@@ -8675,8 +8663,8 @@ fn run_group_normalization(
             run_id = rc.run_id,
             group_key = %group.key,
             stage = "normalize",
-            count = fits_sourced_count,
-            "ln: frames normalized from measured fits"
+            count = seeds_sourced_count,
+            "ln: frames normalized from measured seeds"
         );
     }
 

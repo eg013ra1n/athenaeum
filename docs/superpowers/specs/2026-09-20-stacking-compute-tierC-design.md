@@ -74,22 +74,34 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
    reference uses the same reference either way. Ruling C-1: the group β replaces the reference
    frame's β as `normalization.local.psfModel = auto`'s resolved value; `moffat4`/`gaussian`
    unchanged.
-3. **Map, don't re-detect.** `normalize_frame` loads the target's `fits` artifact, maps each fit's
-   position through `frame.map` (`PixelMap::forward_exact`, ruling R-T4-3 — the O(nodes) path, a
-   few thousand calls per frame) into the reference geometry, corrects the flux by `|det J|` of
-   the map's linear part at that point (a non-unit determinant appears under M4b native/
-   cross-scale registration; for a same-rig Similarity it is `s²`), and hands the mapped list to
-   the existing matcher → RCR path with NO change to `relative_scale_against`'s math. Fits whose
-   mapped position falls outside the reference's coverage, or which fail Register's own
-   saturation/eccentricity/SNR cuts (`register/detect.rs` constants, applied to the reused fits
-   exactly as the detector applied them), are dropped before matching.
+3. **Map positions, refit on the warped plane — do NOT compare fitted flux (fix round 2, ruling
+   C-12).** The first implementation of this item mapped each fit's position through `frame.map`
+   and corrected the flux by `|det J|` of the map's linear part, comparing that corrected flux
+   directly against the reference's own fit. A diagnostics round (ruling C-11) measured that
+   design at up to ~20% bias on real undersampled frames and traced it to §2.3's own H2 finding
+   below — the fix drops flux comparison entirely. `relative_scale_from_seeds` instead: maps each
+   fit's centroid through `frame.map` (`PixelMap::forward_exact`, ruling R-T4-3 — position only,
+   no `|det J|` correction, since there is no flux to correct any more), drops one whose mapped,
+   rounded position falls outside the reference's coverage or whose value on the WARPED target
+   plane fails a saturation guard (native `[0, 1]` units, `register::detect::SATURATION` — the one
+   piece of the old cuts this path still needs, since Measure's own acceptance already covers
+   eccentricity/SNR on the native frame but says nothing about the warped pixel a fresh fit is
+   about to sample), pre-selects against the reference's own match tree (a seed with no nearby
+   reference star can never produce a matched pair), then RE-FITS every survivor on the WARPED
+   target plane at the reference's DEFAULT β (`psf_signal::fit_stars_with_beta`) — the SAME fit
+   call `relative_scale_against` makes, just fed a pre-selected seed list instead of a full-frame
+   `detect_seeds` one. The existing matcher → RCR path runs with NO change to its own math, fed
+   this fresh fit outcome instead of a detected one.
 4. **The LN reference** (an integration of the group's best `referenceFrames`) has no Measure
    fits — it is not a frame. It keeps its own detection + fit (once per group, `NoiseRelative`
    seeds, the group β) — that is one detection per group instead of one per frame.
-5. **The barycentre second pass** (R-T5-2) has no detection barycentres to fall back on; it is
-   replaced by a second matching pass at a wider radius (`2 × LN_MATCH_RADIUS_PX`) on the same
-   mapped fits when pass 1 covers < `LN_BARYCENTRE_PASS_THRESHOLD` of the target's fits. Ruling
-   C-2: the wider-radius pass replaces the barycentre pass; the constant keeps its name and value.
+5. **The barycentre second pass** (R-T5-2) has no detection barycentres to fall back on — the
+   seeds are Measure's own mapped positions, not a fresh detection's, whether or not the fit that
+   follows is on the target's own flux (the original design) or a fresh warped-plane fit (ruling
+   C-12's own fix); it is replaced by a second matching pass at a wider radius
+   (`2 × LN_MATCH_RADIUS_PX`) on the same mapped fits when pass 1 covers <
+   `LN_BARYCENTRE_PASS_THRESHOLD` of the target's fits. Ruling C-2: the wider-radius pass replaces
+   the barycentre pass; the constant keeps its name and value.
 6. **Fallback.** A frame with no `fits` artifact (an old catalog, a cleanup) or fewer than
    `LN_MIN_MATCHED_STARS` mapped fits inside coverage falls back to today's warped detection with
    one `warn!(frame_id, path, "ln: no measured fits, detecting on the warped frame")` — never a
@@ -104,6 +116,22 @@ warped-frame fit flux (reference geometry, the reference's β). The audit's esti
 differ by the interpolation kernel's flux non-conservation (< 0.3 % at bicubic B-spline) and the
 β difference (< 0.5 %); `s` is a RATIO against the same reference so the systematic part cancels
 across the group; the per-frame scatter is what RCR already absorbs. Acceptance §7 measures it.
+
+**Fix round 2 finding (ruling C-11/C-12): the audit's estimate above was wrong by roughly an
+order of magnitude on real frames.** A diagnostics round measured that a Moffat fit's own `signal`
+is NOT warp-invariant — fitting the IDENTICAL star on the native calibrated frame versus on the
+same frame warped into the reference geometry (bicubic B-spline) integrates measurably different
+flux, growing with how undersampled the star's native PSF is relative to the resampling kernel:
+~0.5% on well-sampled real frames, up to ~19–20% on the sharpest ones in the acceptance catalog.
+An aperture SUM over the same pixels — no fit model involved — conserves flux through the warp to
+≤ 0.6% on the SAME frames, so the divergence sits entirely in what the FIT extracts, not in the
+pixels; a same-star-set control (restricting a full-detection oracle to exactly the population
+`relative_scale_from_seeds`'s own pre-select would keep) moved the RCR location by only 0.3–1.3%,
+ruling out sample selection as the dominant cause. Today's `relative_scale_against` was never
+exposed to this: it fits the reference (itself an integration of already-warped frames) and the
+target (also warped) on planes of the SAME KIND, which is why that comparison stays self-
+consistent and is kept as the baseline the seeds design (§2.2 item 3) is checked against, rather
+than being replaced.
 
 ## 3. C2 — drizzle phase table
 

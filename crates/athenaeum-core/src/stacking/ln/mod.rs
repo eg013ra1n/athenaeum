@@ -57,14 +57,14 @@ pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
 pub use scale::{
     relative_scale, relative_scale_against, relative_scale_against_with_diag,
-    relative_scale_from_fits, relative_scale_from_fits_with_diag, PreparedReferenceChannel,
+    relative_scale_from_seeds, relative_scale_from_seeds_with_diag, PreparedReferenceChannel,
     ScaleMatchDiag, ScaleResult, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
 
 /// Perf tier C Task 2: how many times [`normalize_frame`] fell back to full
 /// detection (`scale::relative_scale_against`) because a plane had no
-/// usable `fits` artifact or [`scale::relative_scale_from_fits`] itself
+/// usable `fits` artifact or [`scale::relative_scale_from_seeds`] itself
 /// came back `TooFewMatches` — one count per FRAME (a multi-channel OSC
 /// frame that falls back on any one of its planes counts once), mirroring
 /// [`crate::integration::registered_source::fallback_counters`]'s own
@@ -193,9 +193,10 @@ pub struct LnFrameOutcome {
     /// Of `scale_ms`, how much was matching + RCR (and, when on, the local
     /// scale spline), summed across every channel.
     pub match_ms: u64,
-    /// Perf tier C Task 2: `"fits"` when every channel's relative scale came
-    /// from Measure's persisted fits ([`scale::relative_scale_from_fits`]);
-    /// `"detected"` when at least one channel fell back to full detection
+    /// Perf tier C Task 2: `"seeds"` when every channel's relative scale
+    /// came from Measure's persisted fits used as seed positions
+    /// ([`scale::relative_scale_from_seeds`]); `"detected"` when at least
+    /// one channel fell back to full detection
     /// ([`scale::relative_scale_against`]) — a frame's own log/summary is
     /// one value, so a mixed OSC frame reads as the worst case.
     pub scale_source: &'static str,
@@ -346,17 +347,17 @@ impl<'a> LnReferenceForDetection<'a> {
     /// [`normalize_frame`]'s own `relative_scale_against` calls use, so the
     /// prepared reference channel's DEFAULT beta matches what a direct
     /// (unhoisted) `relative_scale` call on this reference would have
-    /// produced. `extra_betas` (Tier C Task 2 fix round 1, ruling C-10) is
-    /// the group's OTHER member betas — the distinct
-    /// `ChannelMeasurement.beta` values among the group's included members
-    /// — ALSO prepared on every plane, so [`scale::relative_scale_from_fits`]
-    /// can match a target at its own beta instead of always the default
-    /// one (comparing two different Moffat profile shapes' flux measurably
-    /// biases the ratio — see that function's own doc). `pool` (perf tier 1
-    /// Task 2 fix round 1, item 3) is threaded straight to
-    /// [`scale::PreparedReferenceChannel::build`] — this runs once per
-    /// group, not once per frame, but it is still real detect+fit work,
-    /// now up to `1 + extra_betas.len()` fits per plane.
+    /// produced. `extra_betas` (Tier C Task 2 fix round 1, ruling C-10; its
+    /// own use case retired by fix round 2, ruling C-12 — see
+    /// [`scale::PreparedReferenceChannel`]'s own doc) still fans through to
+    /// [`scale::PreparedReferenceChannel::build`] for every plane, but
+    /// `stacking::run` now always calls this with an empty slice:
+    /// [`scale::relative_scale_from_seeds`] always fits at the reference's
+    /// DEFAULT beta regardless of what beta the seed source's own fits
+    /// carry, so there is no longer a reason to prepare any other one.
+    /// `pool` (perf tier 1 Task 2 fix round 1, item 3) is threaded straight
+    /// to [`scale::PreparedReferenceChannel::build`] — this runs once per
+    /// group, not once per frame.
     pub fn build(
         reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
@@ -439,27 +440,33 @@ impl<'a> LnReferenceForDetection<'a> {
 /// which the caller (already checking its own cancel flag right after the
 /// fan-out that calls this) does not need to interpret specially.
 ///
-/// **Perf tier C Task 2** (spec §2.2.3, fix round 1 ruling C-10): `fits` is
+/// **Perf tier C Task 2** (spec §2.2.3, fix round 2 ruling C-12): `fits` is
 /// Measure's own accepted [`StarFit`]s for this frame, one list per plane
 /// (`fits[p]` — `None` or a plane with fewer than [`scale::MIN_MATCHES`]
-/// entries means "treat this plane as if there were no fits at all"),
-/// mapped through `frame.map` and matched — AT THE FITS' OWN β, never a
-/// group default — instead of re-detecting on the warped `target` plane
-/// ([`scale::relative_scale_from_fits`]) — the detect+fit cost
-/// (`detect_ms`/`fit_ms`, together ≈ 95 % of `scale_ms` before this task)
-/// disappears for a plane whose fits are usable. A plane with no usable
-/// fits, or whose `relative_scale_from_fits` call itself comes back
-/// [`LnError::TooFewMatches`] (including "the reference was never prepared
-/// at this frame's own β" — `stacking::run` prepares every group member's
-/// β up front, so this is a caller-contract miss, not an ordinary runtime
-/// condition), falls back to today's [`scale::relative_scale_against`] on
-/// the warped `target` plane — never a failure, and the master is still an
-/// honest LN master — with exactly ONE `warn!` for the whole frame (not one
-/// per plane) the first time any channel needs it. There is no `group_beta`
-/// parameter: the reference's default β (ruling C-1) and every extra β a
-/// group's members use (ruling C-10) are both already baked into
+/// entries means "treat this plane as if there were no fits at all"), used
+/// as SEED POSITIONS ONLY — mapped through `frame.map`, pre-selected
+/// against the reference's own match tree, and re-fitted fresh on the
+/// warped `target` plane at the reference's DEFAULT β
+/// ([`scale::relative_scale_from_seeds`]) — instead of running a full
+/// detection search there. The expensive full-frame
+/// detection (`detect_ms`, most of `scale_ms` before this task)
+/// disappears for a plane whose fits are usable; the PSF fit itself still
+/// runs, now over a much smaller, pre-matched seed list. Ruling C-11's
+/// diagnostics found the earlier design (comparing Measure's own fitted
+/// flux, mapped and Jacobian-corrected, against the reference directly)
+/// biased by up to ~20% on undersampled real frames — a Moffat fit's own
+/// `signal` is not warp-invariant, so this task now discards Measure's
+/// fitted VALUES entirely and keeps only the positions. A plane with no
+/// usable fits, or whose `relative_scale_from_seeds` call itself comes
+/// back [`LnError::TooFewMatches`], falls back to today's
+/// [`scale::relative_scale_against`] on the warped `target` plane — never
+/// a failure, and the master is still an honest LN master — with exactly
+/// ONE `warn!` for the whole frame (not one per plane) the first time any
+/// channel needs it. There is no `group_beta` parameter: the reference's
+/// default β (ruling C-1) is already baked into
 /// `reference_for_detection`'s own prepared channels by the caller
-/// (`stacking::run`'s `LnReferenceForDetection::build` call).
+/// (`stacking::run`'s `LnReferenceForDetection::build` call), and the
+/// seeds path never reads a target's own β at all.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
@@ -518,11 +525,12 @@ pub fn normalize_frame(
     let mut refine_ms = 0u64;
     let mut fit_ms = 0u64;
     let mut match_ms = 0u64;
-    // Perf tier C Task 2: "fits" only while every channel so far used
-    // Measure's persisted fits; the first channel that falls back to
-    // detection flips this for the whole frame (a mixed OSC frame reads as
-    // the worst case) and fires the ONE per-frame fallback `warn!`.
-    let mut frame_scale_source: &'static str = "fits";
+    // Perf tier C Task 2: "seeds" only while every channel so far used
+    // Measure's persisted fits as seed positions; the first channel that
+    // falls back to detection flips this for the whole frame (a mixed OSC
+    // frame reads as the worst case) and fires the ONE per-frame fallback
+    // `warn!`.
+    let mut frame_scale_source: &'static str = "seeds";
     let mut warned_fallback = false;
 
     // Perf tier 1 Task 8: one `RegisteredSource` per FRAME, re-pointed at
@@ -648,13 +656,15 @@ pub fn normalize_frame(
         // `LnReferenceForDetection::build` — `relative_scale_against` only
         // re-detects/re-fits the TARGET, not the reference, on every call.
         //
-        // Perf tier C Task 2: a plane with a usable `fits` list (Measure's
-        // own accepted stars, mapped through `frame.map`) skips detection
-        // and the PSF fit entirely (`scale::relative_scale_from_fits`);
+        // Perf tier C Task 2 (ruling C-12): a plane with a usable `fits`
+        // list (Measure's own accepted stars, mapped through `frame.map`
+        // and used as SEED POSITIONS ONLY) skips the expensive full-frame
+        // detection but still runs the PSF fit itself, over that
+        // pre-selected seed list (`scale::relative_scale_from_seeds`);
         // anything else — no fits for this plane, or that call itself
-        // reporting too few matches after the map/cuts — falls back to the
-        // full-detection path on the warped `target` plane, with exactly
-        // one `warn!` for the whole frame.
+        // reporting too few matches after mapping/pre-selection — falls
+        // back to the full-detection path on the warped `target` plane,
+        // with exactly one `warn!` for the whole frame.
         let t = Instant::now();
         let plane_fits = fits
             .and_then(|f| f.get(p))
@@ -683,15 +693,18 @@ pub fn normalize_frame(
             )
         };
         let scale_result = match plane_fits {
-            Some(pf) => match scale::relative_scale_from_fits(
+            Some(pf) => match scale::relative_scale_from_seeds(
                 &reference_for_detection.prepared[p],
                 pf,
                 &frame.map,
+                &target,
                 reference.width,
                 reference.height,
+                measure.max_stars,
                 4.0,
                 0.3,
                 cfg.local_scale,
+                pool,
             ) {
                 Ok(r) => r,
                 Err(LnError::TooFewMatches { .. }) => {
