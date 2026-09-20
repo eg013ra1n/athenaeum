@@ -66,16 +66,18 @@
 //! want: a stalled peer is not necessarily a dead one, and closing its
 //! connection would make the next attempt pay a fresh handshake.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId};
+use iroh_blobs::api::blobs::Blobs;
 use iroh_blobs::api::remote::{GetProgressItem, Remote};
 use iroh_blobs::api::Store;
 use iroh_blobs::get::Stats;
-use iroh_blobs::protocol::{ChunkRanges, GetRequest};
+use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::util::connection_pool::{ConnectionPool, Options as PoolOptions};
 use iroh_blobs::Hash;
 use n0_future::StreamExt as _;
@@ -119,6 +121,31 @@ const MIN_BACKOFF_SLEEP: Duration = Duration::from_millis(10);
 /// already consumed would ask `timeout` for `Duration::ZERO` and busy-poll the
 /// stream.
 const MIN_WATCHDOG_SLICE: Duration = Duration::from_millis(50);
+
+/// D4 §4.5: hedging may spend about 5 % extra bytes (the gRPC hedging budget).
+pub(crate) const HEDGE_BUDGET_RATIO: f64 = 0.05;
+
+/// D4 §4.5: hedge once an assignment has run longer than
+/// `max(p95 of recent completions, this × expected)`. The p95 rule is Dean &
+/// Barroso's; the multiplier is Boxo's `MessageLatencyMultiplier`.
+pub(crate) const HEDGE_EXPECTED_MULTIPLIER: f64 = 2.0;
+
+/// How many recent completions the p95 is taken over (D4 §4.5).
+const HEDGE_COMPLETION_WINDOW: usize = 32;
+
+/// EWMA smoothing for per-provider goodput, with a `min(1/n, α)` warm-up so the
+/// first samples are not dragged toward a cold zero (D4 §6 — explicitly
+/// "настроечное", a tuning value with no authority behind it).
+const GOODPUT_ALPHA: f64 = 0.25;
+
+/// How often an un-hedged assignment re-evaluates whether it may hedge.
+///
+/// OURS, not the design's: the design sketches one `sleep_until(hedge_at)`, but
+/// `hedge_at` cannot be computed until the child's SIZE is known, and the size
+/// is only known once bytes have flowed. A refused budget must not disqualify a
+/// child permanently either, or one momentary shortfall strands it on a useless
+/// peer for the rest of the run. So the arm decision is a poll, not a one-shot.
+const HEDGE_REEVALUATE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Environment override for [`swarm_fetch_mode`].
 const SWARM_FETCH_ENV: &str = "ATHENAEUM_SWARM_FETCH";
@@ -193,11 +220,14 @@ pub(crate) struct ProviderStats {
 pub(crate) struct AssignmentReport {
     pub per_provider: HashMap<EndpointId, ProviderStats>,
     pub stalls: u32,
-    /// Task 8's; reported as `0` here so the shape does not move when hedging
-    /// lands.
-    #[allow(dead_code)]
+    /// Hedges ARMED during the run.
     pub hedges: u32,
-    #[allow(dead_code)]
+    /// DUPLICATE bytes hedging actually cost: the part of each hedge's charge
+    /// that was not refunded, i.e. bytes some peer sent that another peer had
+    /// already sent. This is the quantity [`HEDGE_BUDGET_RATIO`] is a budget
+    /// FOR, and it is deliberately not "bytes a hedge delivered" — a hedge that
+    /// wins delivers the half its primary never would have and duplicates
+    /// nothing, so counting its delivery as a cost would libel the mechanism.
     pub hedge_bytes: u64,
 }
 
@@ -213,6 +243,95 @@ impl AssignmentReport {
     }
 }
 
+/// The last [`HEDGE_COMPLETION_WINDOW`] assignment durations, for the p95 half
+/// of the hedge trigger.
+#[derive(Debug, Default)]
+pub(crate) struct CompletionWindow(VecDeque<Duration>);
+
+impl CompletionWindow {
+    fn record(&mut self, elapsed: Duration) {
+        if self.0.len() == HEDGE_COMPLETION_WINDOW {
+            self.0.pop_front();
+        }
+        self.0.push_back(elapsed);
+    }
+
+    /// The 95th percentile of the window, or `None` while it is empty.
+    ///
+    /// Nearest-rank on the sorted sample: with one completion the p95 IS that
+    /// completion, which is the honest answer — a single data point cannot say
+    /// anything about a tail, and the trigger's other half (2 × expected) is
+    /// what carries the early run.
+    pub(crate) fn p95(&self) -> Option<Duration> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = self.0.iter().copied().collect();
+        sorted.sort_unstable();
+        let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+        Some(sorted[rank.saturating_sub(1).min(sorted.len() - 1)])
+    }
+}
+
+/// The gRPC-shaped token bucket that keeps hedging from turning a degraded
+/// network into a byte storm (D4 §4.5).
+///
+/// **It starts FULL.** The design says what the bucket EARNS
+/// ([`HEDGE_BUDGET_RATIO`] × the bytes of every completed child) and what it is
+/// capped at ([`HEDGE_BUDGET_RATIO`] × the whole collection), but not where it
+/// starts; a bucket that starts empty can never pay for the very first hedge,
+/// which is the one that matters on a package whose first assignment lands on a
+/// useless peer. Starting full is also what a token bucket means everywhere
+/// else, and the cap still bounds the total spend.
+#[derive(Debug)]
+pub(crate) struct HedgeBudget {
+    tokens: f64,
+    cap: f64,
+}
+
+impl HedgeBudget {
+    fn new(total_bytes: u64) -> Self {
+        let cap = HEDGE_BUDGET_RATIO * total_bytes as f64;
+        Self { tokens: cap, cap }
+    }
+
+    /// A completed child refills the bucket, never past the cap.
+    fn earn(&mut self, bytes: u64) {
+        self.tokens = (self.tokens + HEDGE_BUDGET_RATIO * bytes as f64).min(self.cap);
+    }
+
+    /// D4 §4.5: hedge only while the bucket is over half full AND can pay for
+    /// this hedge's whole range. The half rule is the storm brake — it stops
+    /// hedging long before the budget is actually exhausted, so a degraded run
+    /// cannot ride the bucket to zero one hedge at a time.
+    fn try_charge(&mut self, bytes: u64) -> bool {
+        let want = bytes as f64;
+        if self.tokens > self.cap / 2.0 && self.tokens >= want {
+            self.tokens -= want;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Give back the part of a charge that never became a duplicate byte.
+    fn refund(&mut self, bytes: u64) {
+        self.tokens = (self.tokens + bytes as f64).min(self.cap);
+    }
+}
+
+/// The run-wide hedge ledger: one budget, one completion window, and the report
+/// counters. Behind one mutex, never held across an await.
+#[derive(Debug)]
+struct HedgeLedger {
+    budget: HedgeBudget,
+    completions: CompletionWindow,
+    hedges: u32,
+    hedge_bytes: u64,
+}
+
+type Ledger = Arc<Mutex<HedgeLedger>>;
+
 /// Knobs for one assignment run.
 #[derive(Clone)]
 pub(crate) struct AssignmentOptions {
@@ -220,10 +339,13 @@ pub(crate) struct AssignmentOptions {
     /// [`STALL_HARD_LIMIT`]; tests shorten it so a deliberately trickling peer
     /// trips it inside a test's patience.
     pub stall_hard_limit: Duration,
-    /// Task 8. Read nowhere yet — the seam, so hedging is an extension of this
-    /// module rather than a rewrite of it.
-    #[allow(dead_code)]
+    /// A2b: race a second assignment for the back half of a slow child's
+    /// missing range, under [`HedgeBudget`].
     pub hedging: bool,
+    /// The collection's announced payload size — the base of the hedge
+    /// budget's cap ([`HEDGE_BUDGET_RATIO`] × this). Zero disables hedging by
+    /// arithmetic: a zero cap can never admit a charge.
+    pub total_bytes: u64,
     /// Per-provider attempt telemetry, the same sink the stock path feeds from
     /// the download stream's `TryProvider`/`ProviderFailed` items.
     pub telemetry: ProviderTelemetrySink,
@@ -265,14 +387,54 @@ struct ProviderState {
     failures: u32,
     next_try: Option<Instant>,
     inflight: u32,
+    /// The most recent `TransferFault::Failed` cause, and when it was recorded
+    /// — so a run that exhausts its ladder can say WHY rather than only that it
+    /// did. A stall records no cause (its cause is the deadline itself).
+    last_error: Option<String>,
+    last_error_at: Option<Instant>,
     /// Stalls this provider caused — a strict subset of `stats.failures`, kept
     /// beside the reported stats because [`ProviderStats`]' shape is the
     /// brief's and a stall is a swarm-wide figure, not a per-provider one.
     stalls: u32,
+    /// Smoothed goodput in bytes/sec over this provider's COMPLETED transfers,
+    /// and how many samples it has. The hedge trigger's `expected` divides by
+    /// it; a provider with no completed transfer has none, and borrows the
+    /// median of the providers that do.
+    goodput: Option<f64>,
+    goodput_samples: u32,
     stats: ProviderStats,
 }
 
 type States = Arc<Mutex<HashMap<EndpointId, ProviderState>>>;
+
+/// A claimed assignment slot on one provider, released on drop.
+///
+/// The claim has to be structural rather than a paired call: a child task can be
+/// ABORTED mid-transfer (the first error in the run drops the `JoinSet`), and a
+/// hand-written `release_inflight` after the await would simply never run, so
+/// the provider would look permanently busier than it is to every later pick.
+struct InflightGuard {
+    states: States,
+    provider: EndpointId,
+}
+
+impl InflightGuard {
+    fn provider(&self) -> EndpointId {
+        self.provider
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .states
+            .lock()
+            .expect("assignment states mutex poisoned");
+        if let Some(st) = guard.get_mut(&self.provider) {
+            st.inflight = st.inflight.saturating_sub(1);
+        }
+    }
+}
 
 /// Fetch every `children` entry of the hash-sequence rooted at `root` from
 /// `providers`, one assignment at a time per child, with a progress deadline.
@@ -309,7 +471,18 @@ pub(crate) async fn fetch_children_assigned(
     // provider, which is the whole reason to pool at all.
     let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, PoolOptions::default());
     let remote: Remote = store.remote().clone();
+    let blobs: Blobs = store.blobs().clone();
     let providers = Arc::new(providers);
+
+    // One hedge ledger for the run: the budget, the p95 window and the report
+    // counters. `total_bytes` is the collection's announced payload size, so
+    // the cap is 5 % of what this fetch is worth — not of what one child is.
+    let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
+        budget: HedgeBudget::new(opts.total_bytes),
+        completions: CompletionWindow::default(),
+        hedges: 0,
+        hedge_bytes: 0,
+    }));
 
     let states: States = Arc::new(Mutex::new(
         providers
@@ -337,7 +510,9 @@ pub(crate) async fn fetch_children_assigned(
             set.spawn(run_child(
                 pool.clone(),
                 remote.clone(),
+                blobs.clone(),
                 Arc::clone(&states),
+                Arc::clone(&ledger),
                 Arc::clone(&providers),
                 root,
                 index,
@@ -346,21 +521,64 @@ pub(crate) async fn fetch_children_assigned(
             ));
         }
         match set.join_next().await {
-            Some(res) => res??,
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(e))) => return Err(fail_with_report(&states, root, e)),
+            Some(Err(join)) => {
+                return Err(fail_with_report(
+                    &states,
+                    root,
+                    anyhow::Error::new(join).context("assignment task panicked"),
+                ))
+            }
             None => break,
         }
     }
 
-    let report = report_from(&states);
+    let report = report_from_with_ledger(&states, &ledger);
     tracing::debug!(
         root_hash = %root,
         count = child_count,
         providers = report.per_provider.len(),
         stalls = report.stalls,
+        hedges = report.hedges,
         bytes = report.total_bytes(),
         "assignment loop finished"
     );
     Ok(report)
+}
+
+/// Log the per-provider picture the run ended on, and give the caller's error
+/// the provider fault that most recently explained it.
+///
+/// A bare "every provider exhausted" says nothing a user or a log reader can
+/// act on; the swarm's own last real cause (a refused dial, a reset stream)
+/// does, and it is already on the state we are about to drop.
+fn fail_with_report(states: &States, root: Hash, err: anyhow::Error) -> anyhow::Error {
+    let report = report_from(states);
+    let cause = last_failure_cause(states);
+    tracing::error!(
+        root_hash = %root,
+        providers = report.per_provider.len(),
+        stalls = report.stalls,
+        bytes = report.total_bytes(),
+        count = report.total_children(),
+        error = %cause.as_deref().unwrap_or("no provider reported an error (every failure was a stall)"),
+        "assignment loop failed"
+    );
+    match cause {
+        Some(c) => err.context(format!("last provider fault: {c}")),
+        None => err,
+    }
+}
+
+/// The most recently recorded `TransferFault::Failed` cause across providers.
+fn last_failure_cause(states: &States) -> Option<String> {
+    let guard = states.lock().expect("assignment states mutex poisoned");
+    guard
+        .values()
+        .filter_map(|st| Some((st.last_error_at?, st.last_error.clone()?)))
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, cause)| cause)
 }
 
 /// One child: pick a provider, transfer what is still missing, repeat until the
@@ -369,7 +587,9 @@ pub(crate) async fn fetch_children_assigned(
 async fn run_child(
     pool: ConnectionPool,
     remote: Remote,
+    blobs: Blobs,
     states: States,
+    ledger: Ledger,
     providers: Arc<Vec<EndpointId>>,
     root: Hash,
     index: u64,
@@ -380,7 +600,10 @@ async fn run_child(
         .child(index, ChunkRanges::all())
         .build(root);
     let mut rounds = 0u32;
-    loop {
+    // Set when a hedge wins: the rest of this child goes to the provider that
+    // just proved it can move bytes, not back to the one we gave up on.
+    let mut forced: Option<EndpointId> = None;
+    'child: loop {
         // Recomputed EVERY round, so a reassignment asks the next provider only
         // for the bytes still missing — the byte-level resume upstream gets for
         // free and we must not lose.
@@ -393,7 +616,7 @@ async fn run_child(
         }
         let missing = local.missing();
 
-        let Some(provider) = claim_provider(&states, &providers) else {
+        let Some(claim) = claim_provider(&states, &providers, forced.take()) else {
             // Every provider is in backoff. Wait for the earliest of them and
             // try again — bounded, never a spin.
             rounds += 1;
@@ -414,11 +637,89 @@ async fn run_child(
             continue;
         };
 
+        let provider = claim.provider();
         (opts.telemetry)(ProviderEvent::Trying(*provider.as_bytes()));
         let started = Instant::now();
-        let outcome = transfer_once(&pool, &remote, provider, missing, opts.stall_hard_limit).await;
+
+        // ── the race ────────────────────────────────────────────────────────
+        // The primary keeps the whole missing range. A hedge, once the trigger
+        // and the budget allow one, takes the BACK half of what is still
+        // missing from a different provider; whichever side finishes, the other
+        // is dropped, which resets its QUIC stream (see the module doc).
+        let primary_progress = Arc::new(AtomicU64::new(0));
+        let mut primary = Box::pin(transfer_once(
+            pool.clone(),
+            remote.clone(),
+            provider,
+            missing,
+            opts.stall_hard_limit,
+            Arc::clone(&primary_progress),
+        ));
+        let mut hedge: Option<HedgeRun> = None;
+        let outcome = loop {
+            let armed = hedge.is_some();
+            let step = tokio::select! {
+                r = &mut primary => Step::Primary(r),
+                r = poll_slot(hedge.as_mut().map(|h| &mut h.fut)) => Step::Hedge(r),
+                _ = tokio::time::sleep(HEDGE_REEVALUATE_INTERVAL),
+                    if !armed && opts.hedging => Step::Reevaluate,
+            };
+            match step {
+                Step::Primary(r) => {
+                    if let Some(h) = hedge.take() {
+                        settle_hedge_loser(&ledger, &h, h.progress.load(Ordering::Relaxed));
+                        tracing::debug!(
+                            child = index,
+                            loser = %h.provider.fmt_short(),
+                            refunded_bytes = h.charge.saturating_sub(h.progress.load(Ordering::Relaxed).min(h.charge)),
+                            "swarm hedge loser cancelled"
+                        );
+                    }
+                    break r;
+                }
+                Step::Hedge(r) => {
+                    let h = hedge.take().expect("the hedge branch only runs when armed");
+                    match r {
+                        Ok(stats) => {
+                            record_success(&states, h.provider, &stats, h.started.elapsed());
+                            // The hedge won its half. Cancel the primary — it is
+                            // the loser — and refund whatever of the charged
+                            // back range the primary had NOT duplicated.
+                            drop(primary);
+                            let moved = primary_progress.load(Ordering::Relaxed);
+                            let duplicated = moved.saturating_sub(h.split_at).min(h.charge);
+                            settle_hedge_loser(&ledger, &h, duplicated);
+                            tracing::debug!(
+                                child = index,
+                                loser = %provider.fmt_short(),
+                                refunded_bytes = h.charge.saturating_sub(duplicated),
+                                "swarm hedge loser cancelled"
+                            );
+                            // D4 §4.5: the rest of the child goes to the hedge's
+                            // provider, not back to the one we just gave up on.
+                            forced = Some(h.provider);
+                            continue 'child;
+                        }
+                        Err(fault) => {
+                            // A failed hedge is the hedge's provider's problem,
+                            // never the child's: the primary is still running.
+                            record_failure(&states, h.provider, &fault, h.started.elapsed());
+                            (opts.telemetry)(ProviderEvent::Failed(*h.provider.as_bytes()));
+                            settle_hedge_loser(&ledger, &h, fault.bytes().min(h.charge));
+                        }
+                    }
+                }
+                Step::Reevaluate => {
+                    hedge = try_arm_hedge(
+                        &pool, &remote, &blobs, &states, &ledger, &providers, &opts, root, index,
+                        hash, provider, started,
+                    )
+                    .await;
+                }
+            }
+        };
         let elapsed = started.elapsed();
-        release_inflight(&states, provider);
+        drop(claim);
 
         match outcome {
             // A completed `execute_get` means the requested range is decoded,
@@ -429,6 +730,7 @@ async fn run_child(
             // incomplete one fails loudly there rather than passing silently.
             Ok(stats) => {
                 record_success(&states, provider, &stats, elapsed);
+                note_completion(&ledger, elapsed, stats.payload_bytes_read);
                 tracing::debug!(
                     root_hash = %root,
                     child = index,
@@ -470,18 +772,223 @@ async fn run_child(
     }
 }
 
+/// A hedge assignment in flight beside its primary.
+struct HedgeRun {
+    provider: EndpointId,
+    fut: BoxedTransfer,
+    progress: Arc<AtomicU64>,
+    /// Bytes charged to the budget when this hedge was armed — the size of the
+    /// back range it asked for.
+    charge: u64,
+    /// The byte offset the back range starts at, so the primary's own progress
+    /// can be turned into "how much of the charged range did it duplicate".
+    split_at: u64,
+    started: Instant,
+    /// Keeps the hedge provider's assignment slot claimed for as long as the
+    /// hedge runs; released structurally when this struct drops.
+    _claim: InflightGuard,
+}
+
+type BoxedTransfer =
+    std::pin::Pin<Box<dyn std::future::Future<Output = TransferResult> + Send + 'static>>;
+type TransferResult = std::result::Result<Stats, TransferFault>;
+
+/// What one turn of the race produced.
+enum Step {
+    Primary(TransferResult),
+    Hedge(TransferResult),
+    Reevaluate,
+}
+
+/// Await an optional future, or never.
+///
+/// Borrowing the slot only for the duration of the `select!` is what lets the
+/// handler bodies take the hedge out of it afterwards; dropping THIS future
+/// does not drop the boxed transfer it is polling, which is exactly right — a
+/// hedge survives every turn of the loop until someone takes it.
+async fn poll_slot(slot: Option<&mut BoxedTransfer>) -> TransferResult {
+    match slot {
+        Some(f) => f.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A completed assignment: refill the budget and widen the p95 sample.
+fn note_completion(ledger: &Ledger, elapsed: Duration, bytes: u64) {
+    let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
+    l.completions.record(elapsed);
+    l.budget.earn(bytes);
+}
+
+/// Settle a hedge: give back the part of its charge that never became a
+/// duplicate byte.
+///
+/// `duplicated` is how much of the CHARGED range the loser actually moved —
+/// the hedge's own progress when the primary won, or the primary's progress
+/// past the split point when the hedge won. A hedge that wins outright against
+/// a primary still below the split therefore costs nothing, which is the honest
+/// answer: nothing was fetched twice.
+fn settle_hedge_loser(ledger: &Ledger, hedge: &HedgeRun, duplicated: u64) {
+    let duplicated = duplicated.min(hedge.charge);
+    let refund = hedge.charge - duplicated;
+    let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
+    l.budget.refund(refund);
+    // What the bucket did NOT get back is what hedging actually cost.
+    l.hedge_bytes = l.hedge_bytes.saturating_add(duplicated);
+}
+
+/// Decide whether to hedge this assignment, and start one if so.
+///
+/// Returns `None` for every "not yet": size not known, nothing missing, no
+/// goodput to judge by, still inside the deadline, no second provider, or the
+/// budget refusing. The caller simply asks again.
+#[allow(clippy::too_many_arguments)]
+async fn try_arm_hedge(
+    pool: &ConnectionPool,
+    remote: &Remote,
+    blobs: &Blobs,
+    states: &States,
+    ledger: &Ledger,
+    providers: &[EndpointId],
+    opts: &AssignmentOptions,
+    root: Hash,
+    index: u64,
+    hash: Hash,
+    primary: EndpointId,
+    started: Instant,
+) -> Option<HedgeRun> {
+    // What is still missing, from the progress truth (`store.observe`) rather
+    // than from the primary's stream.
+    // The local bitfield carries no size until the store flushes its first
+    // batch, i.e. until a whole 16 KiB leaf has arrived — 0.3 s at 50 KB/s,
+    // 16 s at 1 KB/s. We do NOT work around that: without a size there is no
+    // midpoint to split at, and a peer delivering nothing at all is the STALL
+    // CEILING's case, not the hedge's. The two rules divide the space between
+    // them — the ceiling handles "not moving", the hedge handles "moving, but
+    // far too slowly for this swarm".
+    let bitfield = blobs.observe(hash).await.ok()?;
+    let size = bitfield.size();
+    if size == 0 || bitfield.is_complete() {
+        return None;
+    }
+    let present = bitfield.total_bytes();
+    let missing_bytes = size.saturating_sub(present);
+    if missing_bytes == 0 {
+        return None;
+    }
+
+    // Is it late? `expected` is what this provider's own measured goodput says
+    // the rest should take; the p95 is what recent assignments actually took.
+    //
+    // Measured consequence, worth knowing before reading a log: because the
+    // deadline is the LARGER of the two and `expected` divides by the
+    // provider's OWN goodput, a CONSISTENTLY slow peer earns protection from
+    // hedging as soon as it completes one transfer — it is never late by its
+    // own standard. A 50 KB/s peer with 256 KiB left gets a 10.5 s deadline. An
+    // instrumented run of 21 children showed 388 refusals on this branch
+    // against 6 hedges armed. That is D4 §4.5 as written, not a defect: hedging
+    // is for the TAIL, and a uniformly slow peer is the stall ceiling's and
+    // A4's ranking problem, not the hedge's.
+    let goodput = ewma_goodput(states, primary)?;
+    let expected = Duration::from_secs_f64((missing_bytes as f64 / goodput.max(1.0)).min(86_400.0));
+    let p95 = ledger
+        .lock()
+        .expect("hedge ledger mutex poisoned")
+        .completions
+        .p95();
+    let deadline = p95
+        .unwrap_or(Duration::ZERO)
+        .max(expected.mul_f64(HEDGE_EXPECTED_MULTIPLIER));
+    if started.elapsed() < deadline {
+        return None;
+    }
+
+    // Somebody else has to be able to take it.
+    let others: Vec<EndpointId> = providers
+        .iter()
+        .copied()
+        .filter(|p| *p != primary)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    let claim = claim_provider(states, &others, None)?;
+
+    // The back half of what is still missing. The primary reads forward from
+    // the start, so the present bytes are a prefix and the split is a byte
+    // offset; intersecting with the real missing set keeps that an assumption
+    // we do not have to rely on.
+    let split_at = present + missing_bytes / 2;
+    let missing_ranges = ChunkRanges::bytes(0..size) - bitfield.ranges.clone();
+    let back = missing_ranges & ChunkRanges::bytes(split_at..size);
+    if back.is_empty() {
+        return None;
+    }
+    let charge = size.saturating_sub(split_at);
+
+    if !ledger
+        .lock()
+        .expect("hedge ledger mutex poisoned")
+        .budget
+        .try_charge(charge)
+    {
+        return None;
+    }
+
+    let hedge_provider = claim.provider();
+    let request = GetRequest::builder().child(index, back).build(root);
+    let progress = Arc::new(AtomicU64::new(0));
+    let fut: BoxedTransfer = Box::pin(transfer_once(
+        pool.clone(),
+        remote.clone(),
+        hedge_provider,
+        request,
+        opts.stall_hard_limit,
+        Arc::clone(&progress),
+    ));
+    {
+        let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
+        l.hedges = l.hedges.saturating_add(1);
+    }
+    (opts.telemetry)(ProviderEvent::Trying(*hedge_provider.as_bytes()));
+    tracing::debug!(
+        child = index,
+        child_hash = %hash,
+        provider = %primary.fmt_short(),
+        hedge_provider = %hedge_provider.fmt_short(),
+        missing_bytes,
+        expected_ms = expected.as_millis() as u64,
+        p95_ms = p95.unwrap_or(Duration::ZERO).as_millis() as u64,
+        bytes = charge,
+        "swarm hedge armed"
+    );
+    Some(HedgeRun {
+        provider: hedge_provider,
+        fut,
+        progress,
+        charge,
+        split_at,
+        started: Instant::now(),
+        _claim: claim,
+    })
+}
+
 /// One `execute_get` with a progress watchdog.
 ///
 /// Returns as soon as the request completes, errors, or goes
-/// `stall_hard_limit` without its `bytes_read` growing. In the stall case the
+/// `stall_hard_limit` without its `bytes_read` growing. `progress` mirrors the
+/// running payload-byte count so a caller that drops this future can still see
+/// how far it got. Takes its pool and remote by value so the future is
+/// `'static` and can be boxed beside a sibling in a `select!`. In the stall case the
 /// `GetProgress` stream is dropped on the way out, which resets the QUIC stream
 /// — see the module doc's cancellation note for why that is enough.
 async fn transfer_once(
-    pool: &ConnectionPool,
-    remote: &Remote,
+    pool: ConnectionPool,
+    remote: Remote,
     provider: EndpointId,
     request: GetRequest,
     stall_hard_limit: Duration,
+    progress: Arc<AtomicU64>,
 ) -> std::result::Result<Stats, TransferFault> {
     let conn = pool
         .get_or_connect(provider)
@@ -494,8 +1001,8 @@ async fn transfer_once(
     // `ConnectionRef` derefs to the pooled `Connection` and holds the pool's
     // permit; it stays alive for the whole transfer and is dropped with this
     // function, releasing the permit while leaving the connection warm.
-    let progress = remote.execute_get((*conn).clone(), request);
-    let mut stream = std::pin::pin!(progress.stream());
+    let get = remote.execute_get((*conn).clone(), request);
+    let mut stream = std::pin::pin!(get.stream());
 
     let mut last_bytes = 0u64;
     let mut last_growth = Instant::now();
@@ -508,6 +1015,11 @@ async fn transfer_once(
                 if b > last_bytes {
                     last_bytes = b;
                     last_growth = Instant::now();
+                    // Published so the caller can still read this assignment's
+                    // progress after it has CANCELLED it — a cancelled future
+                    // returns nothing, and the refund needs to know how much of
+                    // the charged range the loser actually moved.
+                    progress.store(b, Ordering::Relaxed);
                 }
             }
             Ok(Some(GetProgressItem::Done(stats))) => return Ok(stats),
@@ -540,13 +1052,35 @@ async fn transfer_once(
 /// Picking and incrementing must be atomic together: two children that both
 /// observe an idle provider before either increments would both pile onto it,
 /// which is exactly the imbalance the least-loaded rule exists to prevent.
-fn claim_provider(states: &States, providers: &[EndpointId]) -> Option<EndpointId> {
-    let mut guard = states.lock().expect("assignment states mutex poisoned");
-    let chosen = pick_provider(&guard, providers, Instant::now())?;
-    if let Some(st) = guard.get_mut(&chosen) {
-        st.inflight += 1;
-    }
-    Some(chosen)
+fn claim_provider(
+    states: &States,
+    providers: &[EndpointId],
+    forced: Option<EndpointId>,
+) -> Option<InflightGuard> {
+    let chosen = {
+        let mut guard = states.lock().expect("assignment states mutex poisoned");
+        // A forced pick (the winner of a hedge) skips ranking but NOT the
+        // backoff gate: a provider that has since been evicted is not a
+        // sensible place to send the rest of the child.
+        let now = Instant::now();
+        let forced = forced.filter(|p| {
+            guard
+                .get(p)
+                .is_some_and(|st| !st.next_try.is_some_and(|t| t > now))
+        });
+        let chosen = match forced {
+            Some(p) => p,
+            None => pick_provider(&guard, providers, now)?,
+        };
+        if let Some(st) = guard.get_mut(&chosen) {
+            st.inflight += 1;
+        }
+        chosen
+    };
+    Some(InflightGuard {
+        states: Arc::clone(states),
+        provider: chosen,
+    })
 }
 
 /// A2's provider choice: among the providers not in backoff, the least loaded;
@@ -588,13 +1122,6 @@ fn earliest_wait(states: &States) -> Duration {
         .max(MIN_BACKOFF_SLEEP)
 }
 
-fn release_inflight(states: &States, provider: EndpointId) {
-    let mut guard = states.lock().expect("assignment states mutex poisoned");
-    if let Some(st) = guard.get_mut(&provider) {
-        st.inflight = st.inflight.saturating_sub(1);
-    }
-}
-
 fn record_success(states: &States, provider: EndpointId, stats: &Stats, elapsed: Duration) {
     let mut guard = states.lock().expect("assignment states mutex poisoned");
     if let Some(st) = guard.get_mut(&provider) {
@@ -605,7 +1132,37 @@ fn record_success(states: &States, provider: EndpointId, stats: &Stats, elapsed:
         st.stats.bytes += stats.payload_bytes_read;
         st.stats.children += 1;
         st.stats.elapsed += elapsed;
+        // Goodput EWMA, warm-started so the first samples are not diluted by a
+        // cold value: α = min(1/n, GOODPUT_ALPHA), n counting this sample.
+        let secs = elapsed.as_secs_f64().max(1e-6);
+        let sample = stats.payload_bytes_read as f64 / secs;
+        st.goodput_samples = st.goodput_samples.saturating_add(1);
+        st.goodput = Some(match st.goodput {
+            None => sample,
+            Some(prev) => {
+                let alpha = (1.0 / st.goodput_samples as f64).min(GOODPUT_ALPHA);
+                prev * (1.0 - alpha) + sample * alpha
+            }
+        });
     }
+}
+
+/// This provider's smoothed goodput, or — for one that has completed nothing —
+/// the median of the providers that have measured one.
+///
+/// D4 §4.5 is explicit that an entirely unmeasured swarm does NOT hedge: with
+/// no idea what "fast" means here, every assignment would look late.
+fn ewma_goodput(states: &States, provider: EndpointId) -> Option<f64> {
+    let guard = states.lock().expect("assignment states mutex poisoned");
+    if let Some(g) = guard.get(&provider).and_then(|st| st.goodput) {
+        return Some(g);
+    }
+    let mut measured: Vec<f64> = guard.values().filter_map(|st| st.goodput).collect();
+    if measured.is_empty() {
+        return None;
+    }
+    measured.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(measured[measured.len() / 2])
 }
 
 /// Record a failed attempt and, if this provider has now failed
@@ -628,6 +1185,9 @@ fn record_failure(states: &States, provider: EndpointId, fault: &TransferFault, 
     st.stats.elapsed += elapsed;
     if fault.is_stall() {
         st.stalls += 1;
+    } else if let TransferFault::Failed { error, .. } = fault {
+        st.last_error = Some(format!("{error:#}"));
+        st.last_error_at = Some(now);
     }
     if st.next_try.is_some_and(|t| t > now) {
         return; // another child already escalated this window
@@ -637,6 +1197,14 @@ fn record_failure(states: &States, provider: EndpointId, fault: &TransferFault, 
         let rung = (st.failures - EVICT_AFTER_FAILURES).min(BACKOFF_MAX_RUNGS - 1);
         st.next_try = Some(now + BACKOFF_BASE * 2u32.pow(rung));
     }
+}
+
+fn report_from_with_ledger(states: &States, ledger: &Ledger) -> AssignmentReport {
+    let mut report = report_from(states);
+    let l = ledger.lock().expect("hedge ledger mutex poisoned");
+    report.hedges = l.hedges;
+    report.hedge_bytes = l.hedge_bytes;
+    report
 }
 
 fn report_from(states: &States) -> AssignmentReport {
@@ -824,6 +1392,132 @@ mod tests {
         assert!(g[&a].next_try.is_none(), "a success clears the backoff");
         assert_eq!(g[&a].failures, 0, "and resets the consecutive count");
         assert_eq!(g[&a].stats.children, 1);
+    }
+
+    /// The bucket starts FULL, refuses below half, refuses a charge it cannot
+    /// cover, refunds, and never earns past the cap.
+    #[test]
+    fn hedge_budget_starts_full_refuses_below_half_and_refunds() {
+        // 1 MiB collection ⇒ cap = 52 428.8 tokens (5 %).
+        let total = 1024 * 1024u64;
+        let cap = HEDGE_BUDGET_RATIO * total as f64;
+        let mut b = HedgeBudget::new(total);
+        assert_eq!(b.tokens, cap, "a token bucket starts full");
+
+        // A charge just under half the cap leaves it above half ⇒ admitted.
+        assert!(
+            b.try_charge((cap * 0.4) as u64),
+            "the first hedge is payable"
+        );
+        assert!(b.tokens > cap / 2.0);
+
+        // The next one would take it below half — the half rule is checked
+        // BEFORE the charge, so this is admitted and lands under half...
+        assert!(b.try_charge((cap * 0.4) as u64));
+        assert!(b.tokens < cap / 2.0);
+        // ...and now nothing more is admitted, however small.
+        assert!(
+            !b.try_charge(1),
+            "below half the cap the bucket refuses even a one-byte hedge — that \
+             is the storm brake, not the exhaustion check"
+        );
+
+        // A refund puts it back over half and reopens hedging.
+        b.refund((cap * 0.4) as u64);
+        assert!(b.tokens > cap / 2.0);
+        assert!(b.try_charge(1), "a refund reopens the gate");
+
+        // Earning never exceeds the cap.
+        b.earn(u64::MAX / 2);
+        assert_eq!(b.tokens, cap, "the bucket cannot earn past its cap");
+
+        // And a charge bigger than the whole bucket is refused outright.
+        assert!(
+            !b.try_charge((cap * 2.0) as u64),
+            "a hedge the budget cannot cover is refused even with a full bucket"
+        );
+    }
+
+    /// A package too small for its own hedge can never hedge: the cap is a
+    /// fraction of the COLLECTION, so one child's half-range can exceed it.
+    #[test]
+    fn hedge_budget_refuses_when_one_hedge_exceeds_the_whole_cap() {
+        // 6 children of 512 KiB ⇒ cap = 157 286; half a child = 262 144.
+        let total = 6 * 512 * 1024u64;
+        let mut b = HedgeBudget::new(total);
+        assert!(
+            !b.try_charge(256 * 1024),
+            "half a 512 KiB child is 262 144 bytes against a 157 286 cap — no \
+             hedge on this package is ever affordable"
+        );
+    }
+
+    #[test]
+    fn completion_window_keeps_the_last_32_and_reports_the_nearest_rank_p95() {
+        let mut w = CompletionWindow::default();
+        assert_eq!(w.p95(), None, "an empty window has no opinion");
+
+        w.record(Duration::from_millis(7));
+        assert_eq!(
+            w.p95(),
+            Some(Duration::from_millis(7)),
+            "one sample IS its own p95 — the honest answer for n = 1"
+        );
+
+        // 1..=100 ms, so only the last 32 (69..=100) survive; the nearest-rank
+        // p95 of 32 sorted samples is index ceil(0.95*32)-1 = 30 ⇒ 99 ms.
+        let mut w = CompletionWindow::default();
+        for ms in 1..=100u64 {
+            w.record(Duration::from_millis(ms));
+        }
+        assert_eq!(w.0.len(), HEDGE_COMPLETION_WINDOW);
+        assert_eq!(w.p95(), Some(Duration::from_millis(99)));
+        assert!(
+            !w.0.contains(&Duration::from_millis(68)),
+            "samples older than the window must be gone, not merely outvoted"
+        );
+    }
+
+    /// Goodput is smoothed per provider, and a provider that has completed
+    /// nothing borrows the median of those that have — with no measurement
+    /// anywhere, there is no hedge (D4 §4.5).
+    #[test]
+    fn goodput_ewma_warms_up_and_falls_back_to_the_median() {
+        let (a, b, c) = (id(1), id(2), id(3));
+        let states: States = Arc::new(Mutex::new(states_of(vec![
+            (a, ProviderState::default()),
+            (b, ProviderState::default()),
+            (c, ProviderState::default()),
+        ])));
+        assert_eq!(
+            ewma_goodput(&states, a),
+            None,
+            "an unmeasured swarm does not hedge"
+        );
+
+        // a: 1000 B in 1 s ⇒ 1000 B/s on the first sample (no cold start).
+        let mut stats = Stats::default();
+        stats.counters.payload_bytes_read = 1000;
+        record_success(&states, a, &stats, Duration::from_secs(1));
+        assert_eq!(ewma_goodput(&states, a), Some(1000.0));
+
+        // A second, much faster sample moves it by α = min(1/2, 0.25) = 0.25.
+        let mut fast = Stats::default();
+        fast.counters.payload_bytes_read = 5000;
+        record_success(&states, a, &fast, Duration::from_secs(1));
+        let g = ewma_goodput(&states, a).unwrap();
+        assert!(
+            (g - (1000.0 * 0.75 + 5000.0 * 0.25)).abs() < 1e-6,
+            "the EWMA must smooth, not jump: {g}"
+        );
+
+        // b measured, c not ⇒ c borrows the median of {a, b}.
+        record_success(&states, b, &stats, Duration::from_secs(1));
+        let median = ewma_goodput(&states, c).expect("c borrows a median");
+        assert!(
+            median == 1000.0 || (median - g).abs() < 1e-6,
+            "the fallback must be one of the measured values, got {median}"
+        );
     }
 
     #[test]

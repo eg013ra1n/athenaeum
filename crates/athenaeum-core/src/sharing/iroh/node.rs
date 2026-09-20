@@ -1214,6 +1214,14 @@ impl SharedIrohNode {
     /// per-provider progress items are best-effort and lossy on this iroh-blobs
     /// version (see [`blobs::fetch_collection_multi`]), so a swarm test that
     /// asserts on telemetry alone is asserting on a sample, not on reality.
+    /// Test hook (A2b Step 1): a clone of the live endpoint, so a test can dial
+    /// providers itself and drive `store.remote()` directly — the only way to
+    /// prove what the store tolerates below the assignment loop.
+    #[cfg(test)]
+    pub(crate) fn endpoint_for_test(&self) -> Endpoint {
+        self.endpoint()
+    }
+
     #[cfg(test)]
     pub(crate) fn counters_snapshot_for_test(&self) -> TransportCounters {
         TransportCounters::snapshot(&self.endpoint())
@@ -2236,12 +2244,22 @@ impl SharedIrohNode {
         )
         .await?;
 
-        tracing::info!(
-            providers = count,
-            root_hash = %hash,
-            stalls = report.as_ref().map(|r| r.stalls).unwrap_or(0),
-            "iroh multi-source fetch complete"
-        );
+        // `stalls` is the assignment loop's figure; the stock fan-out has no
+        // such notion, so it is reported as absent rather than as a `0` a log
+        // reader would take for "nothing stalled".
+        match report.as_ref() {
+            Some(r) => tracing::info!(
+                providers = count,
+                root_hash = %hash,
+                stalls = r.stalls,
+                "iroh multi-source fetch complete"
+            ),
+            None => tracing::info!(
+                providers = count,
+                root_hash = %hash,
+                "iroh multi-source fetch complete"
+            ),
+        }
         Ok(report)
     }
 

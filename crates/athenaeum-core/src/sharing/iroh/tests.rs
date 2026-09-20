@@ -37,6 +37,8 @@ use std::time::Duration;
 use iroh::{EndpointId, RelayMode};
 use iroh_blobs::api::Store;
 use iroh_blobs::format::collection::Collection;
+use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
+use iroh_blobs::util::connection_pool::{ConnectionPool, Options as PoolOptions};
 use iroh_blobs::Hash;
 use tempfile::tempdir;
 use tokio::sync::mpsc::Receiver;
@@ -2620,6 +2622,13 @@ async fn assigned_fetch_reassigns_a_trickling_provider() {
 /// keeps the in-flight GC tag, because the verified partial bytes are what
 /// makes the next attempt cheap.
 ///
+/// **On the bound.** The brief says "≈ 32 s", which is the ladder's own
+/// `0.5 + 1 + 2 + 4 + 8 + 16` of WAITING and omits the dial between each rung:
+/// the connection pool's `connect_timeout` is 1 s (iroh-util 0.6.0's default)
+/// and there are seven or so of them, so the honest figure is ≈ 40 s. Measured
+/// at 38-41 s on this machine; the 60 s bound below is that plus room for a
+/// loaded runner, not the brief's number plus a guess.
+///
 /// **Why phase 1 is primed first.** The in-flight tag is set only after phase 1
 /// lands the root hash-seq (`multi_fetch_with_all_dead_providers_fails_cleanly`
 /// pins the other half of that contract: no phase 1, no tag). To reach the
@@ -2669,7 +2678,7 @@ async fn assigned_fetch_fails_fast_when_every_provider_is_dead() {
     let dest = tempdir().unwrap();
     let started = Instant::now();
     let res = tokio::time::timeout(
-        Duration::from_secs(120),
+        Duration::from_secs(60),
         c.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             vec![a_info.node_id],
@@ -2847,6 +2856,717 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
     b.shutdown().await;
     c.shutdown().await;
     d.shutdown().await;
+}
+
+/// The Assigned path's aggregate progress is a well-formed series.
+///
+/// It is summed from the per-file `store.observe()` observers (D4 T7 — the get
+/// streams' own `Progress` never leaves the assignment loop) and emitted by a
+/// ticker that is aborted AND JOINED before the terminal 100 % event, so the
+/// series can only go forwards and can only end at the announced total. The
+/// providers are paced so the fetch outlives a few ticker intervals; without
+/// that, a localhost fetch would emit the terminal event alone and the
+/// monotonicity claim would be vacuous.
+#[tokio::test]
+async fn assigned_fetch_batch_progress_is_monotonic_and_ends_at_the_total() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    const FILES: usize = 12;
+    let (pkg_dir, announce) =
+        build_many_file_package(&src.path().join("src"), "batch", FILES, 256 * 1024);
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // ~3 MiB at 2 MB/s per provider ⇒ the fetch spans several 300 ms ticks.
+    a.set_upload_limit(2_000_000);
+    b.set_upload_limit(2_000_000);
+
+    let (sink, events) = recording_sink();
+    let (telemetry, _) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    c.fetch_collection_multi_tuned_for_test(
+        Role::Recv,
+        vec![a_info.node_id, b_info.node_id],
+        &root.to_string(),
+        announce.byte_size,
+        dest.path(),
+        sink,
+        telemetry,
+        SwarmFetchMode::Assigned,
+        super::assign::STALL_HARD_LIMIT,
+    )
+    .await
+    .expect("the fetch must complete")
+    .expect("the assigned loop always reports");
+    assert_package_landed(&pkg_dir, dest.path(), FILES);
+
+    let batches: Vec<(u64, u64)> = events
+        .lock()
+        .expect("sink mutex poisoned")
+        .iter()
+        .filter_map(|e| match e {
+            FetchEvent::Batch {
+                bytes_done,
+                bytes_total,
+            } => Some((*bytes_done, *bytes_total)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !batches.is_empty(),
+        "the Assigned path must emit aggregate progress, not only per-file events"
+    );
+    for pair in batches.windows(2) {
+        assert!(
+            pair[1].0 >= pair[0].0,
+            "the batch series must never go backwards: {} then {} in {batches:?}",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+    assert!(
+        batches.iter().all(|(done, _)| *done <= announce.byte_size),
+        "no tick may exceed the announced total: {batches:?}"
+    );
+    assert!(
+        batches
+            .iter()
+            .all(|(_, total)| *total == announce.byte_size),
+        "every tick must quote the same announced total: {batches:?}"
+    );
+    assert_eq!(
+        batches.last().expect("non-empty").0,
+        announce.byte_size,
+        "the LAST event must be the terminal 100 % one — a ticker tick landing \
+         after it would mean the abort was never joined: {batches:?}"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// A2b Task 8 — hedging (D4 §4.5 T4).
+//
+// Every one of these uses THREE providers, two healthy and one useless. That is
+// not decoration: the hedge budget's cap is 5 % of the COLLECTION, and tokens
+// only refill as children complete, so a swarm split evenly between one fast
+// and one slow provider parks `tokens` at exactly `cap / 2` — the strict `>`
+// in the half rule then refuses every hedge, for arithmetic reasons rather than
+// policy ones. A third provider puts two thirds of the children on healthy
+// peers and takes the decision off that knife edge. It is reported as a design
+// observation, not worked around in the code.
+// ---------------------------------------------------------------------------
+
+/// Bind three nodes, pair them, serve `files × size` from the two healthy ones
+/// and return everything the hedge tests need.
+struct HedgeRig {
+    fast_a: Arc<SharedIrohNode>,
+    fast_b: Arc<SharedIrohNode>,
+    slow: Arc<SharedIrohNode>,
+    puller: Arc<SharedIrohNode>,
+    providers: Vec<NodeId>,
+    slow_id: NodeId,
+    root: Hash,
+    announce: PackageAnnounce,
+    pkg_dir: PathBuf,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+async fn hedge_rig(prefix: &str, files: usize, size: usize, slow_rate: u64) -> HedgeRig {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let ds = tempdir().unwrap();
+    let dp = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let s = bind_disabled(ds.path()).await;
+    let p = bind_disabled(dp.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let s_out = s.handle(Role::Out);
+    let p_recv = p.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let s_info = s_out.start().await.unwrap();
+    let p_info = p_recv.start().await.unwrap();
+
+    for t in [
+        &a_info.pairing_ticket,
+        &b_info.pairing_ticket,
+        &s_info.pairing_ticket,
+    ] {
+        p.add_peer_ticket(t).unwrap();
+    }
+    for provider in [&a, &b, &s] {
+        provider.add_peer_ticket(&p_info.pairing_ticket).unwrap();
+    }
+
+    let (pkg_dir, announce) = build_many_file_package(&src.path().join("src"), prefix, files, size);
+    for out in [&a_out, &b_out, &s_out] {
+        out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    }
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // The useless-but-alive peer of D4 §1(б): it accepts, and then dribbles.
+    // Below the product's 100 KB/s floor on purpose — that floor is a Settings
+    // validation rule (`api::sync::validate_upload_limit`), not a transport
+    // clamp, and a peer that is merely slow cannot test a deadline.
+    s.set_upload_limit(slow_rate);
+
+    HedgeRig {
+        providers: vec![a_info.node_id, b_info.node_id, s_info.node_id],
+        slow_id: s_info.node_id,
+        fast_a: a,
+        fast_b: b,
+        slow: s,
+        puller: p,
+        root,
+        announce,
+        pkg_dir,
+        _dirs: vec![da, db, ds, dp, src],
+    }
+}
+
+impl HedgeRig {
+    async fn shutdown(self) {
+        self.fast_a.shutdown().await;
+        self.fast_b.shutdown().await;
+        self.slow.shutdown().await;
+        self.puller.shutdown().await;
+    }
+}
+
+/// A provider that goes slow MID-TRANSFER triggers a hedge well before the
+/// stall ceiling, and the fetch finishes on the healthy peers.
+///
+/// **This is D4 §1(б)'s scenario, and it is the only one the trigger can see.**
+/// The rule is `max(p95, HEDGE_EXPECTED_MULTIPLIER × expected)` with
+/// `expected = missing / ewma_goodput(THIS provider)`, so a peer that is
+/// UNIFORMLY slow is never late by its own standard — an instrumented run of a
+/// constantly-throttled peer refused 388 hedges on exactly that branch, because
+/// the peer had completed the tiny `manifest.ndjson` child and thereby measured
+/// itself at its own crawl. The design's own example is the laptop that "woke
+/// up but is sitting on a mobile uplink": fast history, slow now. So this test
+/// builds that — every provider paced the same to begin with, and the victim
+/// dropped to 1 KB/s once the transfer is under way, which makes `expected`
+/// tiny against what it has already proved it can do and the hedge immediate.
+///
+/// The discriminator is `report.stalls == 0`: the 60 s ceiling never fired, so
+/// whatever rescued the children was the hedge.
+#[tokio::test]
+async fn hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
+    const FILES: usize = 12;
+    const FILE_SIZE: usize = 1024 * 1024;
+    // Everyone at 4 MB/s to start: the fetch then spans seconds rather than
+    // finishing before the victim can be throttled, and the victim measures a
+    // healthy goodput for itself first.
+    let rig = hedge_rig("hedge-slow", FILES, FILE_SIZE, 4_000_000).await;
+    rig.fast_a.set_upload_limit(4_000_000);
+    rig.fast_b.set_upload_limit(4_000_000);
+
+    let (telemetry, _) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let dest_path = dest.path().to_path_buf();
+    let puller = Arc::clone(&rig.puller);
+    let providers = rig.providers.clone();
+    let root = rig.root.to_string();
+    let byte_size = rig.announce.byte_size;
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        puller
+            .fetch_collection_multi_tuned_for_test(
+                Role::Recv,
+                providers,
+                &root,
+                byte_size,
+                &dest_path,
+                noop_fetch_sink(),
+                telemetry,
+                SwarmFetchMode::Assigned,
+                // The brief's ceiling: long enough that it cannot be what
+                // rescues the fetch.
+                Duration::from_secs(60),
+            )
+            .await
+    });
+
+    // The uplink collapses mid-transfer.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    rig.slow.set_upload_limit(1_000);
+
+    let report = tokio::time::timeout(Duration::from_secs(60), task)
+        .await
+        .expect("a hedged fetch must not wait out the stall ceiling")
+        .expect("the fetch task panicked")
+        .expect("the fetch must complete")
+        .expect("the assigned loop always reports");
+    let elapsed = started.elapsed();
+
+    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "hedging must finish the package early — it took {elapsed:?} (report {report:?})"
+    );
+    assert!(
+        report.hedges >= 1,
+        "at least one assignment must have been hedged: {report:?}"
+    );
+    assert_eq!(
+        report.stalls, 0,
+        "the 60 s ceiling must not be what rescued this fetch — hedging must \
+         have got there first: {report:?}"
+    );
+
+    rig.shutdown().await;
+}
+
+/// The loser is REALLY cancelled: the slow provider's own socket send counter
+/// stays under one child's worth, where an uncancelled primary would have gone
+/// on streaming every child it was assigned.
+///
+/// Sizing is what gives this teeth (see the test above for why it is what it
+/// is). The slow peer holds roughly a third of the 13 children — about 4 MiB —
+/// and is paced at 50 KB/s, so delivering them would take some 84 s and put
+/// ~4 MiB through its socket. Cancelled at the hedge it sends a couple of
+/// hundred KB. The bound below sits between those two populations.
+#[tokio::test]
+async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
+    const FILES: usize = 12;
+    const FILE_SIZE: usize = 1024 * 1024;
+    let rig = hedge_rig("hedge-cancel", FILES, FILE_SIZE, 50_000).await;
+
+    let (telemetry, _) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let slow_before = sent_bytes(&rig.slow);
+    let started = Instant::now();
+    let report = tokio::time::timeout(
+        Duration::from_secs(60),
+        rig.puller.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            rig.providers.clone(),
+            &rig.root.to_string(),
+            rig.announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            Duration::from_secs(60),
+        ),
+    )
+    .await
+    .expect("the fetch must not hang")
+    .expect("the fetch must complete")
+    .expect("the assigned loop always reports");
+    let elapsed = started.elapsed();
+    let slow_sent = sent_bytes(&rig.slow).saturating_sub(slow_before);
+
+    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
+    assert!(
+        report.hedges >= 1,
+        "the test needs a hedge to have fired: {report:?}"
+    );
+
+    // THE cancel oracle: the loser's own socket counter, never our telemetry.
+    assert!(
+        slow_sent < (FILE_SIZE as u64) + SERVED_PAYLOAD_FLOOR,
+        "a cancelled primary must stop sending — the slow provider put \
+         {slow_sent} B on the wire in {elapsed:?}, which is more than the one \
+         child ({FILE_SIZE} B) + floor ({SERVED_PAYLOAD_FLOOR} B) a working \
+         cancel allows"
+    );
+
+    // And hedging did not double the package.
+    let total = rig.announce.byte_size;
+    assert!(
+        report.hedge_bytes <= (total as f64 * 0.6) as u64,
+        "hedge deliveries must stay a minority of the package: {} B of {total} B",
+        report.hedge_bytes
+    );
+
+    rig.shutdown().await;
+}
+
+/// The bucket keeps a storm bounded: a peer that strands four or five children
+/// at once does NOT produce one hedge per stranded child.
+///
+/// **On the brief's `hedges <= 1`: measured, and it is not a property of this
+/// design.** Stranding all twelve children at once produces twelve hedges, and
+/// that is correct — a hedge that WINS is refunded in full, because the primary
+/// it cancelled was still below the split and duplicated nothing, so it costs
+/// the bucket nothing and legitimately re-opens the gate for the next child.
+/// The budget does not meter how OFTEN a useful hedge is taken; it meters the
+/// extra BYTES, which is what gRPC's 5 % rule is about. So this test asserts
+/// the byte bound, and asserting it end to end is also what pins the refund
+/// rule: without refunds, twelve hedges of half a megabyte each would be six
+/// megabytes of duplication against a 630 KB cap. The admission arithmetic
+/// itself — `tokens > cap / 2 && tokens >= charge`, the cap, the refund — is
+/// pinned exactly and deterministically by `assign.rs`'s own unit tests.
+///
+/// **A regime note worth keeping.** "The budget refuses every hedge AND the run
+/// still finishes quickly" is not reachable: the three rules interlock. A peer
+/// slow enough for the budget's charge to stay above the cap is a peer whose
+/// missing range never shrinks, which means it is barely moving, which means
+/// the store never learns the blob's size — and then the hedge is not refused
+/// by the budget, it is never evaluated, and the STALL CEILING is what rescues
+/// the child. That is the division of labour, not a gap.
+#[tokio::test]
+async fn hedge_budget_stops_a_storm() {
+    const FILES: usize = 12;
+    const FILE_SIZE: usize = 1024 * 1024;
+    let rig = hedge_rig("hedge-budget", FILES, FILE_SIZE, 4_000_000).await;
+    rig.fast_a.set_upload_limit(4_000_000);
+    rig.fast_b.set_upload_limit(4_000_000);
+
+    let (telemetry, _) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let dest_path = dest.path().to_path_buf();
+    let puller = Arc::clone(&rig.puller);
+    let providers = rig.providers.clone();
+    let root = rig.root.to_string();
+    let byte_size = rig.announce.byte_size;
+    let task = tokio::spawn(async move {
+        puller
+            .fetch_collection_multi_tuned_for_test(
+                Role::Recv,
+                providers,
+                &root,
+                byte_size,
+                &dest_path,
+                noop_fetch_sink(),
+                telemetry,
+                SwarmFetchMode::Assigned,
+                Duration::from_secs(60),
+            )
+            .await
+    });
+
+    // The storm: every child the slow peer holds is stranded at the same
+    // instant, so every one of them reaches its hedge deadline together.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    rig.slow.set_upload_limit(1_000);
+
+    let report = tokio::time::timeout(Duration::from_secs(60), task)
+        .await
+        .expect("the fetch must not hang")
+        .expect("the fetch task panicked")
+        .expect("the fetch must complete")
+        .expect("the assigned loop always reports");
+
+    let report_cap_basis = rig.announce.byte_size;
+    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
+    assert!(
+        report.hedges >= 1,
+        "the test is only meaningful if hedging engaged at all: {report:?}"
+    );
+    // THE guarantee. `hedge_bytes` is what hedging DUPLICATED — every charge
+    // the bucket did not get back — and the budget's whole job is to keep that
+    // near `HEDGE_BUDGET_RATIO` of the package. The cumulative figure may reach
+    // roughly twice the cap over a long run, because completed children refill
+    // the bucket as they go; anything beyond that means charges are not being
+    // refunded, i.e. hedges are duplicating whole ranges.
+    let cap = (report_cap_basis as f64 * 0.05) as u64;
+    assert!(
+        report.hedge_bytes <= 2 * cap,
+        "hedging must stay inside its byte budget — it duplicated {} B against \
+         a {cap} B cap (2x allowed for refills) over {} hedges: {report:?}",
+        report.hedge_bytes,
+        report.hedges
+    );
+
+    rig.shutdown().await;
+}
+
+/// The stall ceiling and the hedge budget are independent rules: with the
+/// budget unable to pay for a single hedge, the ceiling still fires and still
+/// reassigns the child.
+#[tokio::test]
+async fn stall_ceiling_is_independent_of_the_hedge_budget() {
+    const FILES: usize = 6;
+    const FILE_SIZE: usize = 512 * 1024;
+    // 1 KB/s, not 50: at 50 KB/s a 16 KiB chunk lands every 0.33 s, so a
+    // 1500 ms progress deadline correctly never fires — that peer is slow, not
+    // stuck. The ceiling's case is a peer that moves NOTHING for the window,
+    // and at 1 KB/s one chunk takes 16 s.
+    let rig = hedge_rig("hedge-ceiling", FILES, FILE_SIZE, 1_000).await;
+
+    let (telemetry, _) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let report = tokio::time::timeout(
+        Duration::from_secs(90),
+        rig.puller.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            rig.providers.clone(),
+            &rig.root.to_string(),
+            rig.announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            Duration::from_millis(1500),
+        ),
+    )
+    .await
+    .expect("the fetch must not hang")
+    .expect("the fetch must complete")
+    .expect("the assigned loop always reports");
+
+    assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
+    // Hedging is ON and its budget is exhausted by construction...
+    assert_eq!(report.hedges, 0, "the budget must have refused every hedge");
+    // ...and the deadline rule still did its own job.
+    let slow = report
+        .per_provider
+        .get(&endpoint_id(rig.slow_id))
+        .cloned()
+        .expect("the slow provider appears in the report");
+    assert!(
+        slow.failures >= 1,
+        "the 1500 ms progress deadline must still fail the trickling provider \
+         out with the hedge budget exhausted: {slow:?}"
+    );
+    assert!(
+        report.stalls >= 1,
+        "and that failure must be attributed to the deadline: {report:?}"
+    );
+
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// A2b Task 8 Step 1 — the HARD GATE for hedging.
+//
+// A hedge is a second transfer of part of a blob another transfer is already
+// fetching. Everything above it is pointless unless the store tolerates two
+// concurrent `import_bao` writers on ONE hash. iroh-blobs routes both through
+// the same per-hash entity (`HashContext`), writes leaves at their own offsets
+// and ORs the bitfield — so this SHOULD hold, but "should" is not a gate.
+// ---------------------------------------------------------------------------
+
+/// The collection entry named `name`, as the puller learns it from phase 1.
+async fn child_hash_of(store: &Store, root: Hash, name: &str) -> Hash {
+    let collection = Collection::load(root, store)
+        .await
+        .expect("the puller must be able to load the collection after phase 1");
+    let found = collection.iter().find(|(n, _)| n == name).map(|(_, h)| *h);
+    found.unwrap_or_else(|| panic!("collection has no entry {name}"))
+}
+
+/// Run `front` against provider A and `back` against provider B at the same
+/// time, on the SAME blob, and return once both are done.
+async fn two_range_gets(
+    puller: &Arc<SharedIrohNode>,
+    a: NodeId,
+    b: NodeId,
+    front: GetRequest,
+    back: GetRequest,
+) {
+    let pool = ConnectionPool::new(
+        puller.endpoint_for_test(),
+        iroh_blobs::ALPN,
+        PoolOptions::default(),
+    );
+    let conn_a = pool
+        .get_or_connect(EndpointId::from_bytes(&a).unwrap())
+        .await
+        .expect("dial provider A");
+    let conn_b = pool
+        .get_or_connect(EndpointId::from_bytes(&b).unwrap())
+        .await
+        .expect("dial provider B");
+    let remote = puller.store().remote().clone();
+    let ga = remote.execute_get((*conn_a).clone(), front);
+    let gb = remote.execute_get((*conn_b).clone(), back);
+    let (ra, rb) = tokio::join!(ga, gb);
+    ra.expect("the front-half get must succeed");
+    rb.expect("the back-half get must succeed");
+}
+
+/// Two DISJOINT range gets on one blob, from two providers at once, leave the
+/// blob complete and byte-correct. This is the gate: without it, hedging has to
+/// become deadline-only (cancel and reassign the whole missing range).
+#[tokio::test]
+async fn two_disjoint_range_gets_on_one_blob_verify() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    // ONE 4 MiB payload, served by both.
+    const SIZE: usize = 4 * 1024 * 1024;
+    let (pkg_dir, announce) = build_many_file_package(&src.path().join("src"), "split", 1, SIZE);
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // Phase 1 only: the puller learns the entry names and child hashes, and
+    // holds NONE of the payload.
+    let mut real = announce.clone();
+    real.root_hash = root.to_string();
+    let manifest_dir = tempdir().unwrap();
+    c_recv
+        .fetch_manifest(a_info.node_id, &real, manifest_dir.path())
+        .await
+        .expect("phase 1 (root hash-seq + collection meta) must land");
+    let hash = child_hash_of(c.store(), root, "frame_00.fits").await;
+
+    // Split at the chunk-count midpoint. A BLAKE3 chunk is 1024 bytes, so a
+    // 4 MiB blob is 4096 chunks and the midpoint is chunk 2048 — also a whole
+    // number of 16 KiB verification groups, so neither half straddles one.
+    let mid = (SIZE as u64 / 1024) / 2;
+    let front = GetRequest::blob_ranges(hash, ChunkRanges::chunks(..mid));
+    let back = GetRequest::blob_ranges(hash, ChunkRanges::chunks(mid..));
+    two_range_gets(&c, a_info.node_id, b_info.node_id, front, back).await;
+
+    // The store must now consider the blob whole...
+    let remote = c.store().remote().clone();
+    let local = remote
+        .local_for_request(GetRequest::blob_ranges(hash, ChunkRanges::all()))
+        .await
+        .expect("local_for_request");
+    assert!(
+        local.is_complete(),
+        "two disjoint writers must leave the blob COMPLETE — it is not, so the \
+         hedge cannot split a range and must cancel-and-reassign instead"
+    );
+
+    // ...and the bytes must be the source's, not a seam of two half-writes.
+    let landed = dc.path().join("rejoined.fits");
+    c.store()
+        .blobs()
+        .export(hash, &landed)
+        .await
+        .expect("a blob the store calls complete must export");
+    assert_eq!(
+        xxh3_of(&pkg_dir.join("frame_00.fits")),
+        xxh3_of(&landed),
+        "the rejoined halves must hash-match the source byte for byte"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// The case the hedge actually creates: the halves OVERLAP, because the primary
+/// keeps its whole-blob request and may cross the midpoint before the hedge
+/// finishes. Same store, same entry, same verified bytes — this pins that an
+/// overlapping second writer is idempotent rather than corrupting.
+#[tokio::test]
+async fn overlapping_range_gets_on_one_blob_verify() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    const SIZE: usize = 4 * 1024 * 1024;
+    let (pkg_dir, announce) = build_many_file_package(&src.path().join("src"), "overlap", 1, SIZE);
+    a_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    let mut real = announce.clone();
+    real.root_hash = root.to_string();
+    let manifest_dir = tempdir().unwrap();
+    c_recv
+        .fetch_manifest(a_info.node_id, &real, manifest_dir.path())
+        .await
+        .expect("phase 1 must land");
+    let hash = child_hash_of(c.store(), root, "frame_00.fits").await;
+
+    // A asked for EVERYTHING (the primary's request), B for the back half (the
+    // hedge's) — so every chunk from the midpoint on is written twice.
+    let mid = (SIZE as u64 / 1024) / 2;
+    let whole = GetRequest::blob_ranges(hash, ChunkRanges::all());
+    let back = GetRequest::blob_ranges(hash, ChunkRanges::chunks(mid..));
+    two_range_gets(&c, a_info.node_id, b_info.node_id, whole, back).await;
+
+    let remote = c.store().remote().clone();
+    let local = remote
+        .local_for_request(GetRequest::blob_ranges(hash, ChunkRanges::all()))
+        .await
+        .expect("local_for_request");
+    assert!(
+        local.is_complete(),
+        "an overlapping second writer must not leave the blob incomplete"
+    );
+    let landed = dc.path().join("overlapped.fits");
+    c.store()
+        .blobs()
+        .export(hash, &landed)
+        .await
+        .expect("export");
+    assert_eq!(
+        xxh3_of(&pkg_dir.join("frame_00.fits")),
+        xxh3_of(&landed),
+        "two writers of the SAME verified chunks must be idempotent, not a seam"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
 }
 
 /// Transfer-prepare spec §4.1: the two-dir bind keeps the device IDENTITY under

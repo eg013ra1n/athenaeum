@@ -1290,7 +1290,9 @@ pub(crate) async fn fetch_collection_multi(
                 children,
                 AssignmentOptions {
                     stall_hard_limit,
-                    hedging: false,
+                    // A2b: hedging is on by default for the swarm fetch.
+                    hedging: true,
+                    total_bytes: byte_size,
                     telemetry,
                 },
             )
@@ -1307,9 +1309,14 @@ pub(crate) async fn fetch_collection_multi(
         }
     };
 
-    // The ticker never ends by itself: abort it before draining the observers.
+    // The ticker never ends by itself: abort it before draining the observers —
+    // and AWAIT the abort. `abort()` only requests cancellation, so without the
+    // join a tick already past its `sleep` could still call the sink after the
+    // terminal 100 % event below, and the caller would see the batch series go
+    // backwards at the very end.
     for h in batch_ticker.0.drain(..) {
         h.abort();
+        let _ = h.await;
     }
     // Happy path: drain (await) each observer so its terminal completion event
     // is emitted — then the now-empty guards drop harmlessly.
