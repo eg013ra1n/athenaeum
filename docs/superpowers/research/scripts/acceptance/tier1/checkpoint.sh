@@ -4,7 +4,7 @@
 # worktree's own release build, extracted, and byte/stage-compared against
 # an earlier checkpoint.
 #
-#   checkpoint.sh <name> [base-name]
+#   checkpoint.sh <name> [base-name] [--numeric]
 #
 # <name> names the copy .athenaeum-acc/tierA-<name> — always a FRESH `cp -R`
 # of .athenaeum-acc/tierA-template (never the template itself, never a
@@ -12,14 +12,31 @@
 # compare against, default "baseline" (.athenaeum-acc/tierA-baseline — the
 # Tier A ruler, run 5 on main 548eeec3, recorded in the plan's ledger).
 #
+# --numeric (anywhere in argv) runs tier1-compare.py's Tier C numeric-delta
+# mode (spec §8's tolerance table) INSTEAD OF the default byte-identity
+# compare — Tier C changes outputs on purpose, so identity is the wrong
+# gate for it. The two compare modes take the checkpoints in opposite
+# argument order (numeric ratios are head/base; identity's positional
+# order is base/head, kept for backward compatibility) — this script
+# handles that, callers don't need to know it. Default (no --numeric)
+# behavior is completely unchanged.
+#
 # Refuses to START (before touching anything) while Time Machine is backing
 # up or a cargo/rustc process from another session is alive — either one
 # would distort a wall-clock measurement. Picks the first free port from
 # 8950 up, so a leftover server from an earlier checkpoint attempt never
 # collides with this one.
 set -euo pipefail
-NAME="${1:?checkpoint name}"
-BASE="${2:-baseline}"
+NUMERIC=0
+POS=()
+for a in "$@"; do
+  case "$a" in
+    --numeric) NUMERIC=1 ;;
+    *) POS+=("$a") ;;
+  esac
+done
+NAME="${POS[1]:?checkpoint name}"
+BASE="${POS[2]:-baseline}"
 # Both names become path components under $ACC_ROOT (and <name> feeds an
 # `rm -rf`): a bare word only — no separator, no dot, no quote.
 for n in "$NAME" "$BASE"; do
@@ -78,7 +95,20 @@ export ATH_ACC_EXTRA_PATHS="${ATH_ACC_EXTRA_PATHS:-$HOME/Pictures}"
 zsh "$SCRIPTS/tier1/tier1-run.sh" "$REPO" "$COPY" "$PORT" 204
 
 python3 "$SCRIPTS/tier1/tier1-extract.py" "$COPY" > "$COPY/extract.txt"
-python3 "$SCRIPTS/tier1/tier1-compare.py" "$BASE_DIR" "$COPY" > "$COPY/compare.txt"
+# --numeric's own compare exits non-zero on a spec-§8 FAIL (the default
+# identity compare never does — it only prints "DIFFERENCES FOUND" and
+# returns 0) — run it with `set +e` so a numeric FAIL still gets its report
+# printed below instead of aborting the script under `set -e`, and carry
+# the exit code through to this script's own so a caller can tell PASS from
+# FAIL without grepping compare.txt.
+set +e
+if [ "$NUMERIC" = "1" ]; then
+  python3 "$SCRIPTS/tier1/tier1-compare.py" --numeric "$COPY" "$BASE_DIR" > "$COPY/compare.txt"
+else
+  python3 "$SCRIPTS/tier1/tier1-compare.py" "$BASE_DIR" "$COPY" > "$COPY/compare.txt"
+fi
+COMPARE_STATUS=$?
+set -e
 
 echo
 echo "== $COPY/extract.txt =="
@@ -86,3 +116,5 @@ cat "$COPY/extract.txt"
 echo
 echo "== $COPY/compare.txt (vs $BASE_DIR) =="
 cat "$COPY/compare.txt"
+
+exit $COMPARE_STATUS
