@@ -8206,6 +8206,21 @@ fn run_group_normalization(
         .and_then(|mg| mg.beta)
         .unwrap_or(4.0);
 
+    // Perf tier C Task 2 fix round 1 (ruling C-10): the FULL distinct set
+    // of this group's members' own per-plane betas — a target compared
+    // against a reference fitted at a DIFFERENT beta measurably biases the
+    // flux ratio (two Moffat profile shapes enclose different fractions of
+    // the same star's light; measured on a real catalog frame at ≈ 3.4 %
+    // when the gap was two `AUTO_BETAS` steps), so `normalize_frame` must
+    // never compare across beta. `group_beta` (the median, ruling C-1a) is
+    // always one of these values by construction.
+    let mut member_betas: Vec<f64> = members
+        .iter()
+        .flat_map(|m| m.measurement.channels.iter().map(|c| c.beta))
+        .collect();
+    member_betas.sort_by(|a, b| a.total_cmp(b));
+    member_betas.dedup();
+
     // Fix round 1, item 6: computed ONCE per group, not once per frame.
     // I2 (final fix wave): also hoists the reference-side star detection +
     // PSF fit + match tree (`prepared`), so `normalize_frame`'s
@@ -8218,7 +8233,9 @@ fn run_group_normalization(
     // now prefers over re-detecting) were fitted at the group β too, so
     // fitting the reference at anything else would reintroduce exactly the
     // β mismatch `psf_signal::fit_stars_with_beta`'s own doc warns against.
-    // `Moffat4` (or any future explicit choice) is untouched.
+    // `Moffat4` (or any future explicit choice) is untouched. `member_betas`
+    // (ruling C-10) is threaded through as `extra_betas` so the reference is
+    // ALSO fitted at every other member's own beta, not just the default.
     let reference_psf = match ln_cfg.psf_model {
         psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
         other => other,
@@ -8226,6 +8243,7 @@ fn run_group_normalization(
     let reference_for_detection = LnReferenceForDetection::build(
         &ln_reference,
         reference_psf,
+        &member_betas,
         measure_opts.max_stars,
         Some(&rc.ctx.image_pool),
     );
@@ -8461,14 +8479,18 @@ fn run_group_normalization(
             // wrong version — the same signal an artifact row that outlived
             // its file always produces) is handed to `normalize_frame` as
             // an empty list, which is its own "fall back to detection for
-            // this plane" case, never a hard failure here.
+            // this plane" case, never a hard failure here. Fix round 1:
+            // the read failure itself is logged at `debug!`, not `warn!` —
+            // `normalize_frame`'s own ONE fallback `warn!` per frame is the
+            // user-facing signal; a second WARN here for the same event
+            // would make a frame warn twice.
             let planes: &[Option<PathBuf>] =
                 fits_paths_ref.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
             let mut fits_by_plane: Vec<Vec<psf_signal::StarFit>> = Vec::with_capacity(planes.len());
             for path in planes {
                 let plane_fits = match path {
                     Some(p) => fits_artifact::read_fits(p).unwrap_or_else(|e| {
-                        tracing::warn!(
+                        tracing::debug!(
                             frame_id = member_ids_ref.get(i).copied().unwrap_or_default(),
                             path = %p.display(),
                             error = %e,
@@ -8486,7 +8508,6 @@ fn run_group_normalization(
                 ref_backgrounds_ref,
                 &stack_frames_ref[i],
                 Some(&fits_by_plane),
-                group_beta,
                 &ln_cfg,
                 measure_opts,
                 interpolation,

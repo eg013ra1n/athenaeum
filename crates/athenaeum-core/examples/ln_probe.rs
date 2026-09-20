@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use athenaeum_core::db::stacking::{find_artifact, list_frame_rows, list_runs};
 use athenaeum_core::db::Database;
@@ -43,8 +44,9 @@ use athenaeum_core::stacking::integrate::{
     GroupInput, LocalNormalizationConfig, NormalizationConfig, StackFrame,
 };
 use athenaeum_core::stacking::ln::{
-    background_grid, build_reference, normalize_frame, relative_scale, BackgroundParams,
-    LnFrameGrids, LnGrid, LnReferenceForDetection, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    background_grid, build_reference, normalize_frame, relative_scale, relative_scale_against,
+    BackgroundParams, LnFrameGrids, LnGrid, LnReferenceForDetection, PreparedReferenceChannel,
+    DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
@@ -492,12 +494,49 @@ registration row for each — run stacking through Register first); found {}",
         .flat_map(|f| f.measurement.channels.iter().map(|c| c.beta))
         .collect();
     let group_beta_value = group_beta(&group_betas);
+    // Fix round 1 (ruling C-10): the FULL distinct set of candidate betas,
+    // so the reference is prepared at every one of them, not just the
+    // default — the same computation `stacking::run`'s stage 6 does before
+    // calling `LnReferenceForDetection::build`.
+    let mut distinct_betas = group_betas.clone();
+    distinct_betas.sort_by(|a, b| a.total_cmp(b));
+    distinct_betas.dedup();
     let reference_psf = match local_cfg.psf_model {
         PsfModel::Auto => PsfModel::Fixed(group_beta_value),
         other => other,
     };
-    let ref_for_detection =
-        LnReferenceForDetection::build(&reference, reference_psf, measure_opts.max_stars, None);
+    // Fix round 1, item (c): the reference build's own wall time, plus a
+    // throwaway SECOND build at zero extra betas (the base detect + one
+    // fit) so the difference, divided by the extra-beta count, estimates
+    // the per-beta fit-only cost THIS run's reference actually paid —
+    // reported in the JSON below.
+    let build_start = Instant::now();
+    let ref_for_detection = LnReferenceForDetection::build(
+        &reference,
+        reference_psf,
+        &distinct_betas,
+        measure_opts.max_stars,
+        None,
+    );
+    let reference_build_ms = build_start.elapsed().as_millis() as u64;
+    let baseline_start = Instant::now();
+    let _baseline_ref_for_detection = LnReferenceForDetection::build(
+        &reference,
+        reference_psf,
+        &[],
+        measure_opts.max_stars,
+        None,
+    );
+    let reference_build_baseline_ms = baseline_start.elapsed().as_millis() as u64;
+    let extra_betas_prepared = distinct_betas.len().saturating_sub(1);
+    let per_extra_beta_ms = if extra_betas_prepared > 0 {
+        Some(
+            reference_build_ms.saturating_sub(reference_build_baseline_ms)
+                / extra_betas_prepared as u64,
+        )
+    } else {
+        None
+    };
     let ref_params = BackgroundParams {
         scale: args.scale,
         ..DEFAULT_PARAMS
@@ -579,7 +618,6 @@ registration row for each — run stacking through Register first); found {}",
         &ref_backgrounds,
         target,
         fits_arg,
-        group_beta_value,
         &local_cfg,
         &measure_opts,
         interpolation,
@@ -630,6 +668,46 @@ registration row for each — run stacking through Register first); found {}",
             // report it rather than silently printing nulls if it does.
             eprintln!("channel {p}: relative_scale: {e}");
         }
+
+        // Fix round 1's own real-frame validation: a SAME-BETA oracle —
+        // detect + fit the target FRESH, at the TARGET's own measured beta
+        // (not the group's default) — against a reference ALSO fitted at
+        // that exact beta. This is the true apples-to-apples comparison for
+        // "does the fits-routing itself introduce bias" (ruling C-10's own
+        // question), independent of whether choosing a different beta
+        // shifts the absolute scale on real (non-ideal-Moffat) data — which
+        // `--no-fits`'s own oracle (always at the reference's DEFAULT beta)
+        // conflates with the routing question on a real catalog frame whose
+        // own beta differs from the group's.
+        let target_own_beta = target_fits
+            .get(p)
+            .and_then(|fits| fits.first())
+            .map(|f| f.beta);
+        let same_beta_oracle = target_own_beta.map(|beta| {
+            let prepared_same_beta = PreparedReferenceChannel::build(
+                &ref_for_detection.sanitized_planes[p],
+                reference.width,
+                reference.height,
+                PsfModel::Fixed(beta),
+                &[],
+                measure_opts.max_stars,
+                Some(&pool),
+            );
+            (
+                beta,
+                relative_scale_against(
+                    &prepared_same_beta,
+                    &sanitized_target,
+                    reference.width,
+                    reference.height,
+                    measure_opts.max_stars,
+                    4.0,
+                    0.3,
+                    local_cfg.local_scale,
+                    Some(&pool),
+                ),
+            )
+        });
 
         let target_params = BackgroundParams {
             scale: args.scale,
@@ -687,6 +765,14 @@ registration row for each — run stacking through Register first); found {}",
         // local-scale spline), so the fields are read through a borrow.
         let scale_ok = scale_result.ok();
         let scale_ok = scale_ok.as_ref();
+        let (same_beta_oracle_beta, same_beta_oracle_result) = match &same_beta_oracle {
+            Some((beta, result)) => (Some(*beta), Some(result)),
+            None => (None, None),
+        };
+        if let Some(Err(e)) = same_beta_oracle_result {
+            eprintln!("channel {p}: same-beta oracle: {e}");
+        }
+        let same_beta_oracle_ok = same_beta_oracle_result.and_then(|r| r.as_ref().ok());
         per_channel.push(serde_json::json!({
             "channel": p,
             "scale": scale_ok.map(|r| r.scale),
@@ -699,6 +785,13 @@ registration row for each — run stacking through Register first); found {}",
             "cellsRejected": target_bg.invalid_cells,
             "residualBefore": median_abs(&before),
             "residualAfter": median_abs(&after),
+            // Fix round 1's real-frame validation (see the comment above
+            // `same_beta_oracle`'s own construction).
+            "sameBetaOracle": {
+                "beta": same_beta_oracle_beta,
+                "scale": same_beta_oracle_ok.map(|r| r.scale),
+                "matches": same_beta_oracle_ok.map(|r| r.matches),
+            },
         }));
     }
 
@@ -720,6 +813,10 @@ registration row for each — run stacking through Register first); found {}",
         },
         "noFits": args.no_fits,
         "groupBeta": group_beta_value,
+        "distinctBetas": distinct_betas,
+        "referenceBuildMs": reference_build_ms,
+        "referenceBuildBaselineMs": reference_build_baseline_ms,
+        "perExtraBetaMs": per_extra_beta_ms,
         // Perf tier A Task 12: `normalize_frame`'s own per-phase timing —
         // `run.rs` logs these via `tracing::debug!` on every real run, but
         // this probe calls `normalize_frame` directly and prints its own

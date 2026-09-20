@@ -343,14 +343,23 @@ pub struct LnReferenceForDetection<'a> {
 impl<'a> LnReferenceForDetection<'a> {
     /// `psf`/`max_stars` are the group's own LN config — the SAME values
     /// [`normalize_frame`]'s own `relative_scale_against` calls use, so the
-    /// prepared reference channel matches what a direct (unhoisted)
-    /// `relative_scale` call on this reference would have produced. `pool`
-    /// (perf tier 1 Task 2 fix round 1, item 3) is threaded straight to
+    /// prepared reference channel's DEFAULT beta matches what a direct
+    /// (unhoisted) `relative_scale` call on this reference would have
+    /// produced. `extra_betas` (Tier C Task 2 fix round 1, ruling C-10) is
+    /// the group's OTHER member betas — the distinct
+    /// `ChannelMeasurement.beta` values among the group's included members
+    /// — ALSO prepared on every plane, so [`scale::relative_scale_from_fits`]
+    /// can match a target at its own beta instead of always the default
+    /// one (comparing two different Moffat profile shapes' flux measurably
+    /// biases the ratio — see that function's own doc). `pool` (perf tier 1
+    /// Task 2 fix round 1, item 3) is threaded straight to
     /// [`scale::PreparedReferenceChannel::build`] — this runs once per
-    /// group, not once per frame, but it is still real detect+fit work.
+    /// group, not once per frame, but it is still real detect+fit work,
+    /// now up to `1 + extra_betas.len()` fits per plane.
     pub fn build(
         reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
+        extra_betas: &[f64],
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> LnReferenceForDetection<'a> {
@@ -379,6 +388,7 @@ impl<'a> LnReferenceForDetection<'a> {
                     reference.width,
                     reference.height,
                     psf,
+                    extra_betas,
                     max_stars,
                     pool,
                 )
@@ -428,24 +438,27 @@ impl<'a> LnReferenceForDetection<'a> {
 /// which the caller (already checking its own cancel flag right after the
 /// fan-out that calls this) does not need to interpret specially.
 ///
-/// **Perf tier C Task 2** (spec §2.2.3): `fits` is Measure's own accepted
-/// [`StarFit`]s for this frame, one list per plane (`fits[p]` — `None`
-/// or a plane with fewer than [`scale::MIN_MATCHES`] entries means "treat
-/// this plane as if there were no fits at all"), mapped through
-/// `frame.map` and matched instead of re-detecting on the warped `target`
-/// plane ([`scale::relative_scale_from_fits`]) — the detect+fit cost
+/// **Perf tier C Task 2** (spec §2.2.3, fix round 1 ruling C-10): `fits` is
+/// Measure's own accepted [`StarFit`]s for this frame, one list per plane
+/// (`fits[p]` — `None` or a plane with fewer than [`scale::MIN_MATCHES`]
+/// entries means "treat this plane as if there were no fits at all"),
+/// mapped through `frame.map` and matched — AT THE FITS' OWN β, never a
+/// group default — instead of re-detecting on the warped `target` plane
+/// ([`scale::relative_scale_from_fits`]) — the detect+fit cost
 /// (`detect_ms`/`fit_ms`, together ≈ 95 % of `scale_ms` before this task)
 /// disappears for a plane whose fits are usable. A plane with no usable
 /// fits, or whose `relative_scale_from_fits` call itself comes back
-/// [`LnError::TooFewMatches`], falls back to today's
-/// [`scale::relative_scale_against`] on the warped `target` plane — never a
-/// failure, and the master is still an honest LN master — with exactly ONE
-/// `warn!` for the whole frame (not one per plane) the first time any
-/// channel needs it. `group_beta` is the group's own resolved β (Tier C
-/// ruling C-1/C-1a) — already baked into `reference_for_detection`'s own
-/// prepared channels by the caller (`stacking::run`'s
-/// `LnReferenceForDetection::build` call), so nothing here re-derives it;
-/// it is accepted for provenance/consistency only.
+/// [`LnError::TooFewMatches`] (including "the reference was never prepared
+/// at this frame's own β" — `stacking::run` prepares every group member's
+/// β up front, so this is a caller-contract miss, not an ordinary runtime
+/// condition), falls back to today's [`scale::relative_scale_against`] on
+/// the warped `target` plane — never a failure, and the master is still an
+/// honest LN master — with exactly ONE `warn!` for the whole frame (not one
+/// per plane) the first time any channel needs it. There is no `group_beta`
+/// parameter: the reference's default β (ruling C-1) and every extra β a
+/// group's members use (ruling C-10) are both already baked into
+/// `reference_for_detection`'s own prepared channels by the caller
+/// (`stacking::run`'s `LnReferenceForDetection::build` call).
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
@@ -453,7 +466,6 @@ pub fn normalize_frame(
     ref_backgrounds: &[BackgroundGrid],
     frame: &StackFrame,
     fits: Option<&[Vec<StarFit>]>,
-    group_beta: f64,
     cfg: &LocalNormalizationConfig,
     measure: &MeasureOptions,
     interpolation: Interpolation,
@@ -462,10 +474,6 @@ pub fn normalize_frame(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<LnFrameOutcome, LnError> {
-    debug_assert!(
-        group_beta.is_finite(),
-        "normalize_frame: group_beta must be a finite psf beta"
-    );
     let channels = reference.planes.len();
     if frame.measurement.channels.len() != channels {
         return Err(LnError::Other(format!(
@@ -835,7 +843,7 @@ mod tests {
         ];
         let reference = reference_with_planes(planes);
         let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
+            LnReferenceForDetection::build(&reference, PsfModel::default(), &[], 50, None);
         assert_eq!(for_detection.sanitized_planes.len(), 2);
         for (p, plane) in for_detection.sanitized_planes.iter().enumerate() {
             assert!(
@@ -855,7 +863,7 @@ mod tests {
         let location = median_of_finite(&plane);
 
         let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
+            LnReferenceForDetection::build(&reference, PsfModel::default(), &[], 50, None);
         assert_eq!(for_detection.sanitized_planes.len(), 1);
         match &for_detection.sanitized_planes[0] {
             Cow::Owned(v) => {

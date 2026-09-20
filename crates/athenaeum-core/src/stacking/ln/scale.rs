@@ -30,7 +30,7 @@
 //! ([`fit_local_scale`]) that `ln::normalize_frame` samples on the stride
 //! grid as `A(x, y) = s + spline(x, y)`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::{PI, SQRT_2};
 use std::sync::Arc;
 use std::time::Instant;
@@ -349,8 +349,12 @@ struct RatioSample {
     ref_idx: Vec<usize>,
 }
 
+/// `ref_fits` is the REFERENCE outcome's own fit list — Tier C ruling C-10:
+/// the caller picks WHICH beta's reference fits to read (the default's, for
+/// the detection fallback; the target's own, for [`relative_scale_from_fits`]),
+/// so this function itself stays beta-agnostic — it only ever indexes `[r]`.
 fn ratio_sample(
-    prepared: &PreparedReferenceChannel,
+    ref_fits: &[StarFit],
     tgt_outcome: &FitOutcome,
     pairs: &[(usize, usize)],
 ) -> RatioSample {
@@ -360,7 +364,7 @@ fn ratio_sample(
         ref_idx: Vec::with_capacity(pairs.len()),
     };
     for &(r, t) in pairs {
-        let rf = &prepared.outcome.fits[r];
+        let rf = &ref_fits[r];
         let (flux_ref, flux_tgt) = (rf.signal, tgt_outcome.fits[t].signal);
         if flux_ref > 0.0 && flux_tgt > 0.0 {
             out.ratios.push(flux_ref / flux_tgt);
@@ -465,6 +469,28 @@ fn fit_local_scale(
     spline
 }
 
+/// One β's worth of prepared reference data — the fit outcome plus the
+/// match tree over its own centroids (`fit_of_point` is the identity, kept
+/// explicit so pass 1 and pass 2 share one [`pair_positions`]).
+struct PreparedBeta {
+    outcome: FitOutcome,
+    tree: KdTree2,
+    fit_of_point: Vec<usize>,
+}
+
+impl PreparedBeta {
+    fn from_outcome(outcome: FitOutcome) -> PreparedBeta {
+        let fit_positions: Vec<Option<(f64, f64)>> =
+            outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
+        let (tree, fit_of_point) = tree_over(&fit_positions);
+        PreparedBeta {
+            outcome,
+            tree,
+            fit_of_point,
+        }
+    }
+}
+
 /// The reference side of [`relative_scale`] (detection + PSF fit + the
 /// built match tree), computed ONCE PER GROUP instead of once per frame
 /// (final fix wave, I2): the LN reference plane is immutable for a group's
@@ -472,58 +498,124 @@ fn fit_local_scale(
 /// EVERY call — `LnReferenceForDetection` (`ln/mod.rs`) already hoists the
 /// group-level sanitized copy for this exact reason (fix round 1, item 6);
 /// this hoists the far more expensive detect+fit+tree half that was left
-/// behind. `outcome.fits[i].signal`/`outcome.beta` are what
-/// [`relative_scale_against`] reads; `tree` is built from the same fits'
-/// centroids, exactly as [`relative_scale`]'s own body used to build it
-/// inline.
+/// behind.
+///
+/// **Tier C Task 2 fix round 1, ruling C-10**: comparing a target's own
+/// Moffat fit against a reference fitted at a DIFFERENT β biases the flux
+/// ratio (two different profile shapes enclose different fractions of the
+/// same star's light) — measured on a real catalog frame at ≈ 3.4 % when
+/// the target's own β sat two `AUTO_BETAS` steps from the group's. The fix
+/// is to never compare across β at all: this struct holds the reference's
+/// fit ONE detection produces, refitted at EVERY β any group member's own
+/// Measure pass used (`betas`, keyed by `f64::to_bits()` — every value in
+/// play is a small closed set of literals, `AUTO_BETAS` or a caller's
+/// `Fixed`/`Moffat4` constant, never the result of arithmetic, so bit
+/// equality is exact equality here), plus the DEFAULT β
+/// (`normalization.local.psfModel`'s own resolution, ruling C-1) other
+/// callers (the detection fallback) still use. [`relative_scale_from_fits`]
+/// looks up the TARGET's own β in `betas` instead of always reading the
+/// default.
 pub struct PreparedReferenceChannel {
-    outcome: FitOutcome,
-    /// Tree over every accepted fit's PSF centroid; point index IS the fit
-    /// index (`fit_of_point` is the identity — kept explicit so pass 1 and
-    /// pass 2 share one [`pair_positions`]).
-    tree: KdTree2,
-    fit_of_point: Vec<usize>,
+    /// The β [`relative_scale_against`] (detection on the warped frame)
+    /// always uses — `normalization.local.psfModel`'s resolution (ruling
+    /// C-1: the group β when `Auto`).
+    default_beta: f64,
+    betas: HashMap<u64, PreparedBeta>,
     /// Ruling R-M4c-9's pass-2 side of the same reference: a tree over the
-    /// DETECTION barycentres the accepted fits came from, with the map back
-    /// to fit indices. Built here rather than lazily per frame for exactly
-    /// the reason the fit tree is (I2): the reference is immutable for a
-    /// group's whole fan-out.
+    /// DETECTION barycentres the DEFAULT-β accepted fits came from, with
+    /// the map back to fit indices. There is only one — the barycentre
+    /// pass is the detection fallback's own mechanism, which only ever
+    /// compares at the default β (see [`relative_scale_against`]).
     barycentre_tree: KdTree2,
     barycentre_of_point: Vec<usize>,
 }
 
 impl PreparedReferenceChannel {
     /// `reference` is one channel's row-major `width × height` plane
-    /// (already in the reference geometry); `psf`/`max_stars` are the
-    /// SAME values a direct [`relative_scale`] call on this reference would
-    /// use. `pool` (perf tier 1 Task 2 fix round 1, item 3): the
-    /// reference-side detect+fit this hoists once per group is real
-    /// parallel work — routed to `image_pool` when the caller has one
+    /// (already in the reference geometry); `default_psf`/`max_stars` are
+    /// the SAME values a direct [`relative_scale`] call on this reference
+    /// would use — `default_psf` resolves the DEFAULT β (ruling C-1).
+    /// `extra_betas` (ruling C-10) are the group's OTHER member betas to
+    /// ALSO prepare — a subset of `AUTO_BETAS`, so at most 4 total; a value
+    /// already equal to the resolved default is not refitted twice. `pool`
+    /// (perf tier 1 Task 2 fix round 1, item 3): the reference-side
+    /// detect+fit this hoists once per group is real parallel work —
+    /// routed to `image_pool` when the caller has one
     /// (`LnReferenceForDetection::build`, itself called from `run.rs` with
     /// `rc.ctx.image_pool` in scope), `None` from the probe/tests.
     pub fn build(
         reference: &[f32],
         width: usize,
         height: usize,
-        psf: PsfModel,
+        default_psf: PsfModel,
+        extra_betas: &[f64],
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> PreparedReferenceChannel {
         let fit_params = FitParams::default();
         let ref_seeds = detect_seeds(reference, width, height, max_stars, pool);
-        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, pool);
-        let fit_positions: Vec<Option<(f64, f64)>> =
-            outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
-        let (tree, fit_of_point) = tree_over(&fit_positions);
-        let barycentres = link_barycentres(&outcome.fits, &ref_seeds, &fit_params);
+        let default_outcome = fit_stars(
+            reference,
+            width,
+            height,
+            &ref_seeds,
+            default_psf,
+            &fit_params,
+            pool,
+        );
+        let default_beta = default_outcome.beta;
+
+        let barycentres = link_barycentres(&default_outcome.fits, &ref_seeds, &fit_params);
         let (barycentre_tree, barycentre_of_point) = tree_over(&barycentres);
+
+        let mut betas: HashMap<u64, PreparedBeta> = HashMap::new();
+        betas.insert(
+            default_beta.to_bits(),
+            PreparedBeta::from_outcome(default_outcome),
+        );
+        for &beta in extra_betas {
+            if betas.contains_key(&beta.to_bits()) {
+                continue;
+            }
+            let outcome = fit_stars_with_beta(
+                reference,
+                width,
+                height,
+                &ref_seeds,
+                beta,
+                &fit_params,
+                pool,
+            );
+            betas.insert(beta.to_bits(), PreparedBeta::from_outcome(outcome));
+        }
+
         PreparedReferenceChannel {
-            outcome,
-            tree,
-            fit_of_point,
+            default_beta,
+            betas,
             barycentre_tree,
             barycentre_of_point,
         }
+    }
+
+    /// The DEFAULT β's prepared data — always present (`build` inserts it
+    /// unconditionally).
+    fn default_prepared(&self) -> &PreparedBeta {
+        self.betas
+            .get(&self.default_beta.to_bits())
+            .expect("PreparedReferenceChannel::build always inserts the default beta")
+    }
+
+    /// This channel's default β — `normalization.local.psfModel`'s own
+    /// resolution (ruling C-1).
+    pub fn default_beta(&self) -> f64 {
+        self.default_beta
+    }
+
+    /// The prepared data for `beta`, when it was one of `build`'s
+    /// `extra_betas` (or equalled the default) — `None` for a β this
+    /// reference was never fitted at.
+    fn prepared_for(&self, beta: f64) -> Option<&PreparedBeta> {
+        self.betas.get(&beta.to_bits())
     }
 }
 
@@ -570,6 +662,7 @@ pub fn relative_scale_against(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ScaleResult, LnError> {
     let fit_params = FitParams::default();
+    let default = prepared.default_prepared();
 
     // Perf tier A Task 0 (audit §3.1): wall time per phase, so the LN
     // stage's own `scale_ms` (ln/mod.rs) splits into where it actually
@@ -584,7 +677,7 @@ pub fn relative_scale_against(
         width,
         height,
         &tgt_seeds,
-        prepared.outcome.beta,
+        default.outcome.beta,
         &fit_params,
         pool,
     );
@@ -598,8 +691,8 @@ pub fn relative_scale_against(
     let tgt_fit_positions: Vec<Option<(f64, f64)>> =
         tgt_outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
     let (pairs, pass) = choose_pairing(
-        &prepared.tree,
-        &prepared.fit_of_point,
+        &default.tree,
+        &default.fit_of_point,
         &tgt_fit_positions,
         &prepared.barycentre_tree,
         &prepared.barycentre_of_point,
@@ -607,7 +700,7 @@ pub fn relative_scale_against(
         match_radius_px,
     );
 
-    let sample = ratio_sample(prepared, &tgt_outcome, &pairs);
+    let sample = ratio_sample(&default.outcome.fits, &tgt_outcome, &pairs);
     if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
             matches: sample.ratios.len(),
@@ -637,7 +730,7 @@ pub fn relative_scale_against(
         sigma: r.scale,
         matches: sample.ratios.len(),
         rejected: r.rejected,
-        beta: prepared.outcome.beta,
+        beta: default.outcome.beta,
         pass,
         local,
         timings: ScaleTimings {
@@ -746,9 +839,22 @@ fn choose_pairing_widened(
 /// `fits` is Measure's accepted [`StarFit`]s for ONE plane of the frame, in
 /// NATIVE pixel coordinates and `measure::ADU_SCALE`-scaled flux units —
 /// `measure::measure_plane_with_seeds`'s own convention, the same one
-/// [`passes_register_cuts`] assumes. `map` is the frame's registration
-/// (subject → reference); `ref_width`/`ref_height` are the reference
-/// geometry's dimensions.
+/// [`passes_register_cuts`] assumes; every fit in the list shares one β
+/// (Measure's own per-plane `fit_stars_with_beta` call). `map` is the
+/// frame's registration (subject → reference); `ref_width`/`ref_height` are
+/// the reference geometry's dimensions.
+///
+/// **Ruling C-10 (Tier C Task 2 fix round 1)**: the target is compared
+/// against the reference fitted at the TARGET's OWN β
+/// (`prepared.prepared_for(target_beta)`), never the reference's default —
+/// comparing two different Moffat profile shapes' flux measurably biases
+/// the ratio (a real catalog frame moved 3.4 % when its own β sat two
+/// `AUTO_BETAS` steps from the group's fixed default). `Err(TooFewMatches)`
+/// when `fits` is empty (no β to read) or the reference was never prepared
+/// at this β at all (`stacking::run` prepares every member β up front —
+/// this is the caller's own contract broken, not an ordinary runtime
+/// condition) — either way the caller falls back to full detection, which
+/// always uses the default β on both sides and is never biased this way.
 ///
 /// Per fit: (1) [`passes_register_cuts`] — the SAME saturation/
 /// eccentricity/SNR rules the detector applies, since Measure's own
@@ -768,11 +874,6 @@ fn choose_pairing_widened(
 /// a synthetic [`FitOutcome`] built from the mapped fits — `ratio_sample`
 /// reads `signal`/`x`/`y` off it exactly as it would a detected-and-fitted
 /// target.
-///
-/// `Err(LnError::TooFewMatches)` exactly as [`relative_scale_against`] — the
-/// caller ([`super::normalize_frame`]) falls back to full detection on that
-/// error, or when `fits` itself has too few survivors to bother calling
-/// this at all.
 pub fn relative_scale_from_fits(
     prepared: &PreparedReferenceChannel,
     fits: &[StarFit],
@@ -783,6 +884,16 @@ pub fn relative_scale_from_fits(
     rcr_limit: f64,
     local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
+    // Every fit in a plane's list shares one β (Measure's own per-plane
+    // `fit_stars_with_beta` convention) — ruling C-10 compares against the
+    // reference fitted at exactly that β, never the default.
+    let Some(target_beta) = fits.first().map(|f| f.beta) else {
+        return Err(LnError::TooFewMatches { matches: 0 });
+    };
+    let Some(ref_beta_data) = prepared.prepared_for(target_beta) else {
+        return Err(LnError::TooFewMatches { matches: 0 });
+    };
+
     let cuts = DetectionConfig::default();
     let mut mapped_fits: Vec<StarFit> = Vec::with_capacity(fits.len());
     for f in fits {
@@ -804,18 +915,18 @@ pub fn relative_scale_from_fits(
 
     let t = Instant::now();
     let (pairs, pass) = choose_pairing_widened(
-        &prepared.tree,
-        &prepared.fit_of_point,
+        &ref_beta_data.tree,
+        &ref_beta_data.fit_of_point,
         &tgt_fit_positions,
         match_radius_px,
     );
 
     let tgt_outcome = FitOutcome {
         seeds: mapped_fits.len(),
-        beta: prepared.outcome.beta,
+        beta: target_beta,
         fits: mapped_fits,
     };
-    let sample = ratio_sample(prepared, &tgt_outcome, &pairs);
+    let sample = ratio_sample(&ref_beta_data.outcome.fits, &tgt_outcome, &pairs);
     if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
             matches: sample.ratios.len(),
@@ -845,7 +956,7 @@ pub fn relative_scale_from_fits(
         sigma: r.scale,
         matches: sample.ratios.len(),
         rejected: r.rejected,
-        beta: prepared.outcome.beta,
+        beta: target_beta,
         pass,
         local,
         timings: ScaleTimings {
@@ -876,7 +987,8 @@ pub fn relative_scale(
     rcr_limit: f64,
     local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
-    let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars, None);
+    let prepared =
+        PreparedReferenceChannel::build(reference, width, height, psf, &[], max_stars, None);
     relative_scale_against(
         &prepared,
         target,
@@ -987,6 +1099,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
+            &[],
             200,
             None,
         );
@@ -1014,8 +1127,15 @@ mod tests {
         let target_stars = scale_stars(&stars, 0.8);
         let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 24);
 
-        let prepared =
-            PreparedReferenceChannel::build(&reference, WIDTH, HEIGHT, PsfModel::Moffat4, 200, None);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            &[],
+            200,
+            None,
+        );
 
         let t = std::time::Instant::now();
         let r = relative_scale_against(
@@ -1952,6 +2072,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
+            &[],
             200,
             None,
         );
@@ -1961,7 +2082,7 @@ mod tests {
         )
         .expect("the detection oracle must match a clean uniformly-scaled field");
 
-        let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.outcome.beta);
+        let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
         let identity = identity_map();
         let from_fits =
             relative_scale_from_fits(&prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
@@ -2000,10 +2121,11 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
+            &[],
             200,
             None,
         );
-        let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.outcome.beta);
+        let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
         let identity = identity_map();
         let r =
             relative_scale_from_fits(&prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
@@ -2011,52 +2133,54 @@ mod tests {
         assert!((r.scale - 1.0 / 1.1).abs() < 0.02, "scale {}", r.scale);
     }
 
-    /// The spec's own accepted-approximation risk, reproduced at the unit
-    /// level and CALIBRATED against a real catalog measurement (task-2
-    /// report): Measure resolves EACH FRAME's own `Auto` β independently
-    /// (`measure_frame_with_fits`), which can land far from the GROUP's
-    /// fixed β `normalize_frame` now uses for the reference (ruling C-1).
-    /// Unlike the matched-beta pin above (whose `measure_like_fits` call
-    /// deliberately fits the target at the REFERENCE's own β — the best
-    /// case), this fits it at a DIFFERENT, DISTANT one, modeling a real
-    /// frame whose own Auto pick landed two `AUTO_BETAS` steps away.
-    /// Measured on the real LDN1272-test acceptance catalog (frame 29053 of
-    /// set 204): target β 4.0 vs group β 10.0 moved `scale` by ≈ 3.4 %
-    /// against the oracle — ABOVE the design's own "< 0.5 % between
-    /// ADJACENT candidates" estimate, because 4.0 and 10.0 are two steps
-    /// apart, not adjacent. This pin confirms the same DIRECTION (a
-    /// mismatched β moves the scale more than a matched one) reproduces on
-    /// a clean synthetic field, so the real-catalog number is a real,
-    /// bounded effect of the accepted β approximation — not a bug in the
-    /// mapping/cuts/unit-conversion code, which the matched-beta pin above
-    /// already exercises on the SAME code path at < 0.5 %.
+    /// **Ruling C-10 (Tier C Task 2 fix round 1).** Before this fix,
+    /// `relative_scale_from_fits` always compared the target against the
+    /// reference's DEFAULT β, regardless of what β Measure had actually
+    /// fitted the target's own persisted stars at — this test (then named
+    /// `a_target_beta_far_from_the_references_moves_the_scale_more_than_
+    /// the_matched_case`) measured that bias at ≈ 2.84 % on this exact
+    /// synthetic field for a target β two `AUTO_BETAS` steps from the
+    /// reference's, matching the real catalog's ≈ 3.4 % (frame 29053 of set
+    /// 204, task-2-report.md) — comparing two different Moffat profile
+    /// shapes' flux is not the same measurement. The fix: the reference is
+    /// now prepared at EVERY member β a group uses
+    /// (`PreparedReferenceChannel::build`'s `extra_betas`), and
+    /// `relative_scale_from_fits` matches the target against ITS OWN β's
+    /// reference fit. This test is KEPT as the pin (per the fix-round
+    /// instruction), now asserting the mismatch is GONE: a target fitted at
+    /// a distant β must recover the SAME scale a same-beta oracle would, to
+    /// numerical precision — not the several-percent bias the unprepared
+    /// version of this function produced here.
     #[test]
-    fn a_target_beta_far_from_the_references_moves_the_scale_more_than_the_matched_case() {
+    fn a_target_beta_far_from_the_references_default_is_no_longer_biased() {
         let stars = star_grid(34);
         let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 91);
         let target_stars = scale_stars(&stars, 0.8);
         let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 92);
 
-        // The reference is fitted at a FIXED beta (simulating ruling C-1's
-        // group beta), and the oracle always re-fits the target at exactly
-        // that beta (relative_scale_against's own contract) — so the oracle
-        // itself is never exposed to any beta mismatch.
+        // The reference is prepared at BOTH the group's default beta (10.0,
+        // ruling C-1) AND the target's own, distant beta (4.0, ruling
+        // C-10) — exactly what `stacking::run` now does for every member
+        // beta in a group.
         let prepared = PreparedReferenceChannel::build(
             &reference,
             WIDTH,
             HEIGHT,
             PsfModel::Fixed(10.0),
+            &[4.0],
             200,
             None,
         );
-        let oracle = relative_scale_against(
+        let identity = identity_map();
+
+        // Matched case (target fitted at the reference's own default,
+        // 10.0) — unaffected by this fix, numerically exact against a
+        // same-beta oracle, exactly as before.
+        let oracle_10 = relative_scale_against(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
         )
         .expect("a clean uniformly-scaled field must match");
-
-        // Matched case: Measure-like fits at the SAME beta as the reference.
         let matched_fits = measure_like_fits(&target, WIDTH, HEIGHT, 10.0);
-        let identity = identity_map();
         let matched = relative_scale_from_fits(
             &prepared,
             &matched_fits,
@@ -2068,15 +2192,44 @@ mod tests {
             false,
         )
         .expect("matched-beta fits must also match");
-        let matched_rel = (matched.scale - oracle.scale).abs() / oracle.scale.abs();
+        let matched_rel = (matched.scale - oracle_10.scale).abs() / oracle_10.scale.abs();
+        assert!(
+            matched_rel < 1e-6,
+            "matched-beta case should be numerically exact: {:.9}",
+            matched_rel
+        );
 
-        // Mismatched case: Measure-like fits at a DISTANT beta (two
-        // AUTO_BETAS steps away, mirroring the real 4.0-vs-10.0 catalog
-        // frame).
-        let mismatched_fits = measure_like_fits(&target, WIDTH, HEIGHT, 4.0);
-        let mismatched = relative_scale_from_fits(
+        // The FORMERLY-mismatched case: the target's own fits at 4.0, two
+        // AUTO_BETAS steps from the reference's default (10.0) — the exact
+        // real-catalog scenario. `relative_scale_against` only ever
+        // compares at ITS OWN prepared reference's default beta, so the
+        // same-beta oracle for THIS comparison needs a separate reference
+        // whose default IS 4.0.
+        let prepared_at_4 = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Fixed(4.0),
+            &[],
+            200,
+            None,
+        );
+        let oracle_4 = relative_scale_against(
+            &prepared_at_4,
+            &target,
+            WIDTH,
+            HEIGHT,
+            200,
+            4.0,
+            0.3,
+            false,
+            None,
+        )
+        .expect("a clean uniformly-scaled field must match");
+        let target_fits_at_4 = measure_like_fits(&target, WIDTH, HEIGHT, 4.0);
+        let fixed = relative_scale_from_fits(
             &prepared,
-            &mismatched_fits,
+            &target_fits_at_4,
             &identity,
             WIDTH,
             HEIGHT,
@@ -2084,24 +2237,14 @@ mod tests {
             0.3,
             false,
         )
-        .expect("mismatched-beta fits must also match");
-        let mismatched_rel = (mismatched.scale - oracle.scale).abs() / oracle.scale.abs();
-        // Measured once (this exact synthetic field): matched_rel ≈ 4.6e-10
-        // (numerically exact — same stars, same beta, fit twice),
-        // mismatched_rel ≈ 2.84 % — the same order of magnitude as the
-        // real catalog's ≈ 3.4 %, confirming the mechanism.
-
+        .expect("the reference was prepared at this beta too (extra_betas), so this must match");
+        let fixed_rel = (fixed.scale - oracle_4.scale).abs() / oracle_4.scale.abs();
         assert!(
-            matched_rel < 0.005,
-            "matched-beta case should stay under 0.5%: {:.4}%",
-            matched_rel * 100.0
-        );
-        assert!(
-            mismatched_rel > matched_rel,
-            "a beta two AUTO_BETAS steps away must move the scale MORE than the matched case \
-             (matched {:.4}%, mismatched {:.4}%)",
-            matched_rel * 100.0,
-            mismatched_rel * 100.0
+            fixed_rel < 1e-6,
+            "a target beta two AUTO_BETAS steps from the default must now match a \
+             same-beta oracle to numerical precision, not the ~2.84% this measured \
+             before ruling C-10: {:.9}",
+            fixed_rel
         );
     }
 
@@ -2114,6 +2257,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
+            &[],
             200,
             None,
         );
