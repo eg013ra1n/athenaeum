@@ -52,7 +52,8 @@ pub mod reference;
 pub mod scale;
 
 pub use background::{
-    background_grid, BackgroundGrid, BackgroundParams, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    background_grid, BackgroundGrid, BackgroundParams, DEFAULT_PARAMS, LN_BACKGROUND_VERSION,
+    LN_BIN, TARGET_DEVIATION_SIGMA,
 };
 pub use calibration::{
     calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
@@ -294,8 +295,33 @@ fn target_background_params(scale: u32) -> BackgroundParams {
 /// when there is no finite pixel at all — the fully-invalid background-grid
 /// refusal upstream (fix round 1, item 3) means this is never the only
 /// signal of that case reaching a caller.
-fn median_of_finite(plane: &[f32]) -> f64 {
-    let mut finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
+///
+/// Perf tier C item C5 (L4): taken from the SAME 1/16 stratified sample
+/// (`integration::stats::stratified_sample` — rows `0, 4, 8, …`, the four
+/// row phases covering all four column phases) that `measure`'s own
+/// normalization statistics already run on, not from the whole plane. This
+/// value is a PLACE-HOLDER — it fills a warped frame's off-canvas strip so
+/// the detector underneath `relative_scale` has something finite to read,
+/// and rides the sidecar as [`LnGrid::location_ref`]/`location_tgt` — so
+/// the 1/16 sample's own ≈ 1.25 σ/√(n/16) sampling error is four orders
+/// below anything that depends on it, while the full-plane version paid a
+/// 26 M-element `filter().collect()` (≈ 104 MB) and a selection over it for
+/// every channel of every frame.
+///
+/// `width`/`height` are the plane's own geometry, needed to walk the
+/// stratified grid; a `plane` shorter than `width · height`, or one whose
+/// stratified indices happen to hold nothing finite while the rest of it
+/// does, falls back to the full finite scan rather than answering `NaN` —
+/// "no finite pixel anywhere" stays the only way this returns `NaN`.
+fn median_of_finite(plane: &[f32], width: usize, height: usize) -> f64 {
+    let mut finite: Vec<f32> = if width.saturating_mul(height) <= plane.len() {
+        crate::integration::stats::stratified_sample(plane, width, height)
+    } else {
+        Vec::new()
+    };
+    if finite.is_empty() {
+        finite = plane.iter().copied().filter(|v| v.is_finite()).collect();
+    }
     if finite.is_empty() {
         return f64::NAN;
     }
@@ -450,7 +476,7 @@ impl<'a> LnReferenceForDetection<'a> {
         let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
         let mut locations = Vec::with_capacity(reference.planes.len());
         for plane in &reference.planes {
-            let location = median_of_finite(plane);
+            let location = median_of_finite(plane, reference.width, reference.height);
             let sanitized: Cow<'a, [f32]> = if plane.iter().all(|v| v.is_finite()) {
                 Cow::Borrowed(plane.as_slice())
             } else {
@@ -728,7 +754,7 @@ pub fn normalize_frame(
         // Fix round 1, item 7: the median over FINITE pixels only — see
         // `median_of_finite`'s own doc for why a NaN-laden plane still needs
         // this even though `total_cmp`-based sorting never panics on NaN.
-        let location_tgt = median_of_finite(&target);
+        let location_tgt = median_of_finite(&target, reference.width, reference.height);
         background_ms += t.elapsed().as_millis() as u64;
 
         // Fix round 1, item 6: sanitize `target` IN PLACE for detection —
@@ -1004,7 +1030,11 @@ mod tests {
         ];
         plane[5] = f32::NAN;
         let reference = reference_with_planes(vec![plane.clone()]);
-        let location = median_of_finite(&plane);
+        // 4x3 is `reference_with_planes`' own geometry — the same one
+        // `LnReferenceForDetection::build` below hands the function, so the
+        // expected replacement value is computed exactly as the code under
+        // test computes it (perf tier C item C5: from the stratified sample).
+        let location = median_of_finite(&plane, 4, 3);
 
         let for_detection =
             LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
@@ -1036,8 +1066,17 @@ mod tests {
     /// arithmetic bit for bit — comparing against an `f64`-arithmetic
     /// average would fail on rounding alone, which is not what this pin is
     /// checking.
+    ///
+    /// Perf tier C item C5 (L4) re-pins it on the FULL-SCAN FALLBACK arm,
+    /// which is where that bit-exact contract still lives: the geometry
+    /// passed here (`len + 1` by 1) is deliberately bigger than the plane,
+    /// so the stratified sample is skipped and the whole plane is scanned.
+    /// The stratified arm is a SAMPLE and cannot be bit-equal to a
+    /// whole-plane median by construction — the two pins below cover it,
+    /// one for what it reads and one for how far it may land from the
+    /// full-plane answer.
     #[test]
-    fn median_of_finite_matches_a_naive_sort_based_median() {
+    fn median_of_finite_falls_back_to_the_full_scan_and_matches_a_naive_sort_based_median() {
         fn naive_median_of_finite(plane: &[f32]) -> f64 {
             let mut finite: Vec<f32> = plane.iter().copied().filter(|v| v.is_finite()).collect();
             if finite.is_empty() {
@@ -1055,8 +1094,8 @@ mod tests {
         }
 
         let cases: Vec<Vec<f32>> = vec![
-            vec![3.0, 1.0, 2.0],                       // odd count
-            vec![1.0, 2.0, 2.0, 2.0, 3.0, 4.0],         // even count, ties at the median
+            vec![3.0, 1.0, 2.0],                // odd count
+            vec![1.0, 2.0, 2.0, 2.0, 3.0, 4.0], // even count, ties at the median
             vec![
                 1.0,
                 f32::NAN,
@@ -1066,13 +1105,13 @@ mod tests {
                 f32::NEG_INFINITY,
                 4.0,
             ], // NaN/+-Inf mixed in among finite values
-            vec![5.0, 5.0, 5.0, 5.0],                   // all ties
+            vec![5.0, 5.0, 5.0, 5.0],           // all ties
             vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY], // nothing finite
-            vec![],                                     // empty plane
+            vec![],                             // empty plane
         ];
 
         for plane in cases {
-            let got = median_of_finite(&plane);
+            let got = median_of_finite(&plane, plane.len() + 1, 1);
             let want = naive_median_of_finite(&plane);
             if want.is_nan() {
                 assert!(got.is_nan(), "plane {plane:?}: expected NaN, got {got}");
@@ -1084,6 +1123,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Perf tier C item C5 (L4): the value comes from the 1/16 stratified
+    /// sample (`stats::stratified_sample` — rows `0, 4, 8, …`, in row `y`
+    /// the columns starting at `(y/4) % 4` and stepping by 4), NOT from
+    /// the whole plane. Pinned on a plane built so the two answers cannot
+    /// coincide: every stratified index holds `1.0` and every other pixel
+    /// `100.0`, so the full-plane median is `100.0` and the stratified one
+    /// `1.0`. A regression back to the whole-plane scan reads `100.0`
+    /// here, silently costing a 26 M-element `filter().collect()` per
+    /// channel per frame.
+    #[test]
+    fn median_of_finite_is_taken_from_the_stratified_sample() {
+        let (w, h) = (64usize, 48usize);
+        let mut plane = vec![100.0f32; w * h];
+        crate::integration::stats::for_each_stratified(w, h, |i| plane[i] = 1.0);
+        assert_eq!(median_of_finite(&plane, w, h), 1.0);
+        // …and the fallback arm, on the same plane, still sees the whole
+        // thing (the stratified pixels are 1/16 of it, so the full median
+        // is 100.0).
+        assert_eq!(median_of_finite(&plane, w * h + 1, 1), 100.0);
+    }
+
+    /// Perf tier C item C5 (L4), the DELTA pin: on a real-shaped plane —
+    /// a sky level with a gradient, noise and stars — the stratified
+    /// median must land within 0.1 % of the whole-plane one. That is the
+    /// bar the brief sets, and it is what licenses the substitution: this
+    /// value is only ever a place-holder for a warped frame's off-canvas
+    /// strip (so the detector has something finite to read) and the
+    /// sidecar's `location_ref`/`location_tgt` record of it.
+    #[test]
+    fn median_of_finite_from_the_stratified_sample_is_within_a_thousandth_of_the_full_plane() {
+        let (w, h) = (1024usize, 768usize);
+        let mut rng = crate::geometry::ransac::SplitMix64(0xC5_1234);
+        let mut plane = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let bg = 0.10 * (1.0 + 0.25 * (x as f32 / w as f32) + 0.15 * (y as f32 / h as f32));
+                let mut n = 0f64;
+                for _ in 0..4 {
+                    n += rng.next_f64() - 0.5;
+                }
+                plane[y * w + x] = bg + 0.002 * (n as f32);
+            }
+        }
+        for _ in 0..4000 {
+            let i = rng.below(w * h);
+            plane[i] += 0.02 + 0.5 * rng.next_f64() as f32;
+        }
+        // A warped frame's off-canvas strip, the case this value exists for.
+        for y in 0..h {
+            for x in 0..24 {
+                plane[y * w + x] = f32::NAN;
+            }
+        }
+
+        let stratified = median_of_finite(&plane, w, h);
+        let full = median_of_finite(&plane, w * h + 1, 1);
+        let rel = (stratified - full).abs() / full.abs();
+        assert!(
+            rel <= 1e-3,
+            "the stratified median {stratified} is {rel:.3e} away from the full-plane {full}, \
+             past the 1e-3 bar"
+        );
     }
 
     // ---- M4c ruling R-M4c-8: the `A` grid from the local scale spline --

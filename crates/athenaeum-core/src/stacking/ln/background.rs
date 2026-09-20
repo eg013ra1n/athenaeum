@@ -28,6 +28,22 @@
 //!
 //! `invalid_cells` is a per-frame count for the caller (Task 5) to log as
 //! `ln_cells_rejected` — this module does not log it itself.
+//!
+//! **Perf tier C item C5 (ruling C-5): the cell statistics are taken on a
+//! [`LN_BIN`]×`LN_BIN` reduction of the plane, not the plane itself.** The
+//! mesh is unchanged — node `(i, j)` still sits at `(i·stride, j·stride)`
+//! in FULL-resolution pixels, which is what [`super::grid::LnGrid`], its
+//! B-spline evaluator and the integration engine's row evaluator index, and
+//! what the `.athln` sidecar's layout is — only what is measured INSIDE
+//! each cell moves: [`clip_and_bin`] applies the pre-C5 hot-pixel and
+//! clipping rules per SOURCE pixel and averages the survivors of each 4×4
+//! block, and the cell loop gathers those blocks (`stride / LN_BIN` of them
+//! per cell edge at the default scale: 32, not 128). The model lives on a
+//! 128-px stride, so a 32-px-stride input carries it with room to spare.
+//! The node values move at the 1e-3 relative level and the `.athln`
+//! sidecars move with them — that is what [`LN_BACKGROUND_VERSION`] is for,
+//! and what this module's own delta pins against the verbatim pre-C5
+//! oracle measure.
 
 use std::sync::Arc;
 
@@ -39,14 +55,46 @@ use crate::integration::stats::{mad_about, median_in_place, MAD_TO_SIGMA};
 /// Deviation multiple (in MAD-sigma) a pixel must exceed its local window
 /// median by before the hot-pixel pass replaces it.
 const HOT_PIXEL_SIGMA: f32 = 5.0;
-/// A cell whose window holds more than this many pixels is subsampled 2×2
+/// A cell whose window holds more than this many SAMPLES is subsampled 2×2
 /// before the iterative clip (§ algorithm step 3) — cheap without
 /// materially changing the robust statistics on a scale/8 mesh's largest
-/// cells (128×128 at the default scale).
+/// cells. Since perf tier C item C5 a "sample" is a [`LN_BIN`]×`LN_BIN`
+/// BIN, not a pixel, so the threshold bites `LN_BIN²` later in plane
+/// terms: the default scale's 128×128-px cell is 32×32 = 1 024 bins and no
+/// longer subsamples at all (it used to, at 16 384 pixels), while the
+/// largest scale the config offers (4096 → stride 512) still does at
+/// 128×128 = 16 384 bins.
 const CELL_SUBSAMPLE_THRESHOLD: usize = 4096;
 /// Iterative per-cell median±sigma clipping stops after this many rounds
 /// even if the kept set has not yet stabilized.
 const MAX_SIGMA_CLIP_ROUNDS: usize = 5;
+
+/// Perf tier C item C5 (ruling C-5): the plane is reduced
+/// `LN_BIN`×`LN_BIN` (mean of the surviving pixels of each block, see
+/// [`clip_and_bin`]) before any cell statistic is taken. The background is
+/// modelled on a `scale/8` = 128-px node mesh, so a 32-px-stride input
+/// carries it with room to spare, and the cell loop then reads 16× fewer
+/// samples. The MESH itself is untouched — see [`background_grid`]'s own
+/// windowing comment.
+pub const LN_BIN: usize = 4;
+
+/// How many of a bin's `LN_BIN²` source pixels must survive
+/// [`clip_and_bin`]'s hot-pixel/clip rule for the bin to carry a value at
+/// all; below it the bin is `NaN` and [`gather_cell`] drops it. Half the
+/// block: a bin built from a handful of survivors is a star's edge, not a
+/// background sample.
+const LN_BIN_MIN_FINITE: usize = 8;
+
+/// The background model's own version (perf tier C item C5), folded into
+/// the `ln` and `ln_reference` artifact hashes — and NOTHING else — by
+/// [`crate::stacking::config::normalization_subtree`]. Neither the
+/// measurement nor the registration hash moves with it, and it is not part
+/// of the whole-config run fingerprint: the node values this module
+/// produces are stored in `.athln` sidecars and nowhere upstream of them.
+/// `2` is the [`LN_BIN`]-binned model; `1` was the full-resolution one
+/// M2–perf-tier-A shipped, so the FIRST run after this re-normalizes every
+/// set once, on purpose.
+pub const LN_BACKGROUND_VERSION: u32 = 2;
 
 /// Tunables for [`background_grid`] (math §4.2). `scale` is the LN scale
 /// (1024 in M2 → stride 128); `deviation_sigma` is 3.0 for the reference
@@ -122,13 +170,17 @@ struct CellScratch {
 /// clamped to the plane's last pixel first, see the module doc). See the
 /// module doc for the clipping thresholds' meaning and algorithm steps.
 ///
-/// `pool` (perf tier A Task 12) runs `clean_plane`'s two passes and this
+/// Since perf tier C item C5 the cell's samples are the
+/// [`LN_BIN`]×`LN_BIN` bins [`clip_and_bin`] produced, not the plane's own
+/// pixels — see the module doc and [`clip_and_bin`]'s.
+///
+/// `pool` (perf tier A Task 12) runs [`clip_and_bin`]'s reduction and this
 /// function's own per-cell loop on the caller's pool when given one — see
 /// each site's own doc for why every one of those loops is exact under
-/// parallel order: `clean_plane`'s two passes are elementwise (each pixel's
-/// output depends only on the read-only input plane and constants, never on
-/// another pixel's output), and a cell's statistics are a pure function of
-/// that cell's own gathered samples, read by no other cell. `None` does NOT
+/// parallel order: each output bin is a pure function of its own source
+/// pixels and the read-only input plane (never of another bin's output),
+/// and a cell's statistics are a pure function of that cell's own gathered
+/// samples, read by no other cell. `None` does NOT
 /// mean serial: a rayon parallel iterator called outside an explicit
 /// `ThreadPool::install` still runs on rayon's own lazily-initialized
 /// GLOBAL pool (sized by `available_parallelism`, invisible to the
@@ -147,7 +199,19 @@ pub fn background_grid(
     let (gw, gh) = LnGrid::grid_dims(width, height, stride);
     let cell_count = gw * gh;
 
-    if width == 0 || height == 0 || plane.len() < width.saturating_mul(height) || cell_count == 0 {
+    // `width < LN_BIN || height < LN_BIN` joins the pre-existing degenerate
+    // inputs (perf tier C item C5): a plane thinner than ONE bin on either
+    // axis reduces to an empty scratch, so no cell could be measured from
+    // it — report that the way the other degenerate cases already are,
+    // all-invalid, which every caller already treats as "refuse" (see
+    // `BackgroundGrid`'s own doc and `ln/mod.rs`'s `invalid_cells == gw *
+    // gh` check). Unreachable from the pipeline: an LN plane is a
+    // reference-geometry frame, thousands of pixels on a side.
+    if width < LN_BIN
+        || height < LN_BIN
+        || plane.len() < width.saturating_mul(height)
+        || cell_count == 0
+    {
         return BackgroundGrid {
             gw,
             gh,
@@ -159,7 +223,8 @@ pub fn background_grid(
     // Every pass below reads only `plane[..width * height]` — a longer
     // input's tail is ignored everywhere, not just here.
     let plane = &plane[..width * height];
-    let cleaned = clean_plane(plane, width, height, p, pool);
+    let (binned, bw, bh) = clip_and_bin(plane, width, height, p, pool);
+    debug_assert_eq!(binned.len(), bw * bh);
 
     let half = stride / 2;
     let half_hi = stride - half; // symmetric for even stride; keeps total width == stride for odd stride too
@@ -169,7 +234,7 @@ pub fn background_grid(
     // replaces used) so it can run as one indexed parallel iterator: each
     // cell's window bounds (`node_x`/`node_y`/`x0`/`x1`/`y0`/`y1`) are pure
     // functions of `idx`/the constants above, and `gather_cell` +
-    // `robust_cell_level` read only `cleaned` (read-only, shared) and the
+    // `robust_cell_level` read only `binned` (read-only, shared) and the
     // cell's own `CellScratch` (never another cell's) — no cell's
     // computation can observe another's result, so the order they run in
     // cannot change any cell's `(level, ok)`. `collect()` on an
@@ -195,7 +260,34 @@ pub fn background_grid(
                 let x0 = node_x.saturating_sub(half);
                 let x1 = (node_x + half_hi).min(width);
 
-                gather_cell(&cleaned, width, x0, x1, y0, y1, &mut scratch.samples);
+                // Perf tier C item C5: the MESH is unchanged — node `(i,
+                // j)` still sits at `(i·stride, j·stride)` in
+                // FULL-resolution pixels, which is what `LnGrid`,
+                // `grid.rs`'s B-spline evaluator and the integration
+                // engine's row evaluator all index, and what the `.athln`
+                // sidecar's layout is. Only the STATISTICS inside the cell
+                // move: the same full-resolution window, mapped onto the
+                // binned scratch by taking the bins whose CENTRES fall
+                // inside it — i.e. rounding each edge to the nearest bin
+                // boundary (`+ LN_BIN/2` then floor), not flooring the low
+                // edge and ceiling the high one. For a window whose edges
+                // are multiples of `LN_BIN` the two agree exactly, and
+                // every scale the pipeline offers is such a case (`stride`
+                // and `half` are both multiples of `LN_BIN` for
+                // `scale ∈ [256, 4096]`); they differ only where `x0`/`x1`
+                // are NOT — the clamped trailing node and the plane's own
+                // right/bottom edge — and there the floor/ceil pair
+                // silently widens the window by up to `LN_BIN - 1` px on
+                // EACH side, which shifts the cell's own centre. Measured
+                // on the `vertical_gradient` fixture: floor/ceil moved the
+                // trailing cell 2.0e-3 off the unbinned oracle (0.07455 vs
+                // 0.0747, a window centred 2 rows low), rounding 6.7e-4.
+                let bx0 = ((x0 + LN_BIN / 2) / LN_BIN).min(bw);
+                let bx1 = ((x1 + LN_BIN / 2) / LN_BIN).min(bw);
+                let by0 = ((y0 + LN_BIN / 2) / LN_BIN).min(bh);
+                let by1 = ((y1 + LN_BIN / 2) / LN_BIN).min(bh);
+
+                gather_cell(&binned, bw, bx0, bx1, by0, by1, &mut scratch.samples);
                 robust_cell_level(&mut scratch.samples, &mut scratch.dev, p)
             })
             .collect::<Vec<(f32, bool)>>()
@@ -238,90 +330,141 @@ fn high_clip_threshold(p: &BackgroundParams) -> f32 {
     p.high_clip_rel
 }
 
-/// Steps 1–2 of the algorithm: a hot-pixel-corrected, clipped copy of
-/// `plane`. Values excluded by the clip are `NaN` in the returned copy;
-/// everything else is either the original value or its hot-pixel
-/// replacement. The only transient full-plane allocation beyond the
-/// returned copy is the small per-candidate hot-pixel window (at most
-/// `(2·hot_radius+1)²` samples), built only for pixels past the high clip.
+/// Steps 1–2 of the algorithm FUSED into perf tier C item C5's reduction
+/// (ruling C-5): one pass over the plane that yields the
+/// `LN_BIN`×`LN_BIN`-binned scratch the cell loop reads — with no
+/// full-resolution intermediate copy at all, where the pre-C5 `clean_plane`
+/// allocated and wrote a whole second plane (≈ 104 MB on a 26 Mpx frame)
+/// and then walked it twice more.
 ///
-/// Both passes run on `pool` (perf tier A Task 12) when given one, in ONE
-/// `install` call. Pass 1 (hot-pixel correction) is exact under any row
-/// split: pixel `(x, y)`'s candidacy test and its replacement window both
-/// read ONLY `plane` (read-only, shared, never mutated by this function)
-/// and constants (`p`, `high_thresh`) — never `cleaned`'s own OUTPUT at any
-/// other position — and write only `cleaned[y*width + x]`, so no row's
-/// computation can observe or be observed by another row's write; splitting
-/// `cleaned` into per-row chunks (`par_chunks_mut(width)`) therefore
-/// produces the identical `cleaned` a serial row-by-row pass would, for any
-/// row order. Pass 2 (the low/high clip) is a pure elementwise threshold
-/// against the two constants `p.low_clip`/`high_thresh` — again no pixel
-/// reads another's value — so parallelizing it (`par_iter_mut`) is exact
-/// for the same reason.
-fn clean_plane(
+/// **The per-SOURCE-pixel rule is the pre-C5 one, unchanged and in the same
+/// order** — spec §6's "clip-then-bin": (1) a finite pixel past the high
+/// clip is a hot-pixel candidate, and its `(2·hot_radius+1)²` window of the
+/// ORIGINAL plane (never of any partially-written output — the old pass
+/// read `plane` too, which is exactly what made it exact under any row
+/// split) gives `med`/`mad`; the pixel becomes `med` when it exceeds `med +
+/// HOT_PIXEL_SIGMA · MAD_TO_SIGMA · mad`, and otherwise keeps its own value
+/// (a saturated star CORE, whose neighbourhood is bright too, is not a hot
+/// pixel). (2) The resulting value is kept only when it is finite and
+/// inside `[low_clip, high_clip]`. So a star core and anything else past
+/// the high clip is ABSENT from its bin rather than averaged into it — the
+/// other order (bin first, clip the bin) would let one saturated pixel drag
+/// a whole 4×4 block 50 % above the sky and hand the cell's iterative clip
+/// a contaminated sample to reject, inflating the rejected fraction that
+/// decides whether the cell is valid at all.
+///
+/// The surviving values of each block are then averaged (`f64`
+/// accumulation in a fixed row-major order — deterministic, and a mean of
+/// ≤ 16 `f32`s in `[4.5e-5, 0.85]` loses nothing to it); a block with fewer
+/// than [`LN_BIN_MIN_FINITE`] survivors is `NaN`, which [`gather_cell`]
+/// drops exactly as it drops a clipped pixel today.
+///
+/// **Edge remainder**: `bw = width / LN_BIN`, `bh = height / LN_BIN` — the
+/// trailing `width % LN_BIN` columns and `height % LN_BIN` rows (at most 3
+/// of each) are DROPPED, not averaged into a short bin. A partial bin would
+/// need a survivor rule of its own and would carry up to 4× a full bin's
+/// variance, in exchange for a strip that is 0.07 % of a 4096-px axis, at
+/// the very edge of a surface sampled every 128 px; the edge cell still
+/// gathers ~1 000 whole bins either way.
+///
+/// **Deviation thresholds are NOT re-derived.** `HOT_PIXEL_SIGMA` still
+/// judges a FULL-resolution pixel against a full-resolution window here, so
+/// nothing about it moved. `deviation_sigma`/[`TARGET_DEVIATION_SIGMA`], in
+/// [`robust_cell_level`], now clip binned values whose noise is ≈ `LN_BIN`×
+/// lower — but the bound they scale is that same sample's OWN MAD, so the
+/// clip is self-consistent and scale-free by construction; widening them by
+/// `LN_BIN` to preserve the pre-C5 ABSOLUTE bound was measured against the
+/// unbinned oracle and is the worse of the two (task 7's report has both
+/// numbers), because it re-admits the star wings the per-cell clip exists
+/// to remove.
+///
+/// Parallel over OUTPUT bin rows (`par_chunks_mut(bw)`): every output bin
+/// is a pure function of its own `LN_BIN` source rows plus the read-only
+/// `plane`, so no bin can observe another's result and the reduction is
+/// exact under any row order — the same argument the two passes it replaces
+/// carried, and the module's own with/without-a-pool pin still proves it.
+/// The hot-pixel window is one per WORKER (`for_each_init`) instead of a
+/// fresh `Vec` per candidate.
+fn clip_and_bin(
     plane: &[f32],
     width: usize,
     height: usize,
     p: &BackgroundParams,
     pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Vec<f32> {
+) -> (Vec<f32>, usize, usize) {
     let high_thresh = high_clip_threshold(p);
-
-    let mut cleaned = plane.to_vec();
+    let bw = width / LN_BIN;
+    let bh = height / LN_BIN;
+    let mut binned = vec![f32::NAN; bw * bh];
 
     let mut body = || {
-        cleaned
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| {
-                let base = y * width;
-                for (x, o) in row.iter_mut().enumerate() {
-                    let v = plane[base + x];
-                    if !(v.is_finite() && v > high_thresh) {
-                        continue;
-                    }
-                    let x0 = x.saturating_sub(p.hot_radius);
-                    let x1 = (x + p.hot_radius).min(width - 1);
-                    let y0 = y.saturating_sub(p.hot_radius);
-                    let y1 = (y + p.hot_radius).min(height - 1);
-                    let mut window: Vec<f32> = Vec::with_capacity((x1 - x0 + 1) * (y1 - y0 + 1));
-                    for wy in y0..=y1 {
-                        for wx in x0..=x1 {
-                            let wv = plane[wy * width + wx];
-                            if wv.is_finite() {
-                                window.push(wv);
+        binned.par_chunks_mut(bw).enumerate().for_each_init(
+            Vec::<f32>::new,
+            |window, (by, row)| {
+                for (bx, out) in row.iter_mut().enumerate() {
+                    let mut sum = 0f64;
+                    let mut count = 0usize;
+                    for dy in 0..LN_BIN {
+                        let y = by * LN_BIN + dy;
+                        let base = y * width;
+                        for dx in 0..LN_BIN {
+                            let x = bx * LN_BIN + dx;
+                            let v = plane[base + x];
+                            let mut w = v;
+                            if v.is_finite() && v > high_thresh {
+                                let x0 = x.saturating_sub(p.hot_radius);
+                                let x1 = (x + p.hot_radius).min(width - 1);
+                                let y0 = y.saturating_sub(p.hot_radius);
+                                let y1 = (y + p.hot_radius).min(height - 1);
+                                window.clear();
+                                for wy in y0..=y1 {
+                                    for wx in x0..=x1 {
+                                        let wv = plane[wy * width + wx];
+                                        if wv.is_finite() {
+                                            window.push(wv);
+                                        }
+                                    }
+                                }
+                                if !window.is_empty() {
+                                    let med = median_in_place(window);
+                                    let mad = mad_about(window, med);
+                                    if v > med + HOT_PIXEL_SIGMA * MAD_TO_SIGMA * mad {
+                                        w = med;
+                                    }
+                                }
+                            }
+                            if w.is_finite() && w >= p.low_clip && w <= high_thresh {
+                                sum += w as f64;
+                                count += 1;
                             }
                         }
                     }
-                    if window.is_empty() {
-                        continue;
-                    }
-                    let med = median_in_place(&mut window);
-                    let mad = mad_about(&window, med);
-                    let thresh = med + HOT_PIXEL_SIGMA * MAD_TO_SIGMA * mad;
-                    if v > thresh {
-                        *o = med;
-                    }
+                    *out = if count >= LN_BIN_MIN_FINITE {
+                        (sum / count as f64) as f32
+                    } else {
+                        f32::NAN
+                    };
                 }
-            });
-
-        cleaned.par_iter_mut().for_each(|v| {
-            if !v.is_finite() || *v < p.low_clip || *v > high_thresh {
-                *v = f32::NAN;
-            }
-        });
+            },
+        );
     };
     match pool {
         Some(pl) => pl.install(body),
         None => body(),
     }
 
-    cleaned
+    (binned, bw, bh)
 }
 
-/// The window's finite pixels, stride-2 subsampled (both axes) when the
+/// The window's finite samples, stride-2 subsampled (both axes) when the
 /// window itself (before filtering to finite) holds more than
-/// [`CELL_SUBSAMPLE_THRESHOLD`] pixels — written into `out` (perf tier A
+/// [`CELL_SUBSAMPLE_THRESHOLD`] of them — since perf tier C item C5 the
+/// caller passes the BINNED scratch and its own width, so a "sample" here
+/// is a `LN_BIN`×`LN_BIN` bin (`NaN` when [`clip_and_bin`] found too few
+/// survivors in it, dropped by the same finite filter that used to drop a
+/// clipped pixel); the pre-C5 `background_grid_unbinned_reference` passes
+/// the full-resolution cleaned plane and gets the pixel reading. Written
+/// into `out` (perf tier A
 /// Task 12: cleared, then filled, in place) instead of returning a fresh
 /// `Vec`. `out` is the caller's per-cell [`CellScratch::samples`] — the
 /// push sequence (same row-major stride-stepped order as before) is
@@ -396,6 +539,13 @@ fn gather_cell(
 /// reason already given above: every later read of `kept` (the `dev`
 /// fill, the next round's `retain` predicate, the final
 /// `median_in_place`) only cares about VALUES, never position.
+///
+/// Since perf tier C item C5 the "samples" a production call sees are
+/// [`LN_BIN`]×`LN_BIN` bins rather than pixels, so `rejection_limit` is a
+/// fraction of a ~16× smaller population — but it is a FRACTION, and the
+/// deviation bound it works with is scaled by that same population's own
+/// MAD, so neither number is re-derived; see [`clip_and_bin`]'s doc and
+/// `the_cell_deviation_sigmas_are_not_re_derived_for_the_binned_plane`.
 ///
 /// Returns `(level, true)` when the kept set holds after clipping
 /// stabilizes (or hits the round cap) with no more than `rejection_limit`
@@ -1024,6 +1174,24 @@ mod tests {
         stars: usize,
         seed: u64,
     ) -> Vec<f32> {
+        noisy_sky_with(width, height, base, sigma, stars, seed, false)
+    }
+
+    /// `uniform_peaks` swaps the faint-dominated power law for a UNIFORM
+    /// peak draw over `[0.02, 0.62]` with one star in eleven saturated —
+    /// a field carrying a mean star peak of 3× the sky, which no real one
+    /// does. Only `the_binned_backgrounds_star_flux_bias_grows_with_crowding`
+    /// uses it, to characterise where the reduction's limit is.
+    #[allow(clippy::too_many_arguments)]
+    fn noisy_sky_with(
+        width: usize,
+        height: usize,
+        base: f32,
+        sigma: f32,
+        stars: usize,
+        seed: u64,
+        uniform_peaks: bool,
+    ) -> Vec<f32> {
         let mut rng = crate::geometry::ransac::SplitMix64(seed);
         let mut plane = vec![0f32; width * height];
         for y in 0..height {
@@ -1041,12 +1209,29 @@ mod tests {
         for k in 0..stars {
             let cx = rng.below(width) as f32;
             let cy = rng.below(height) as f32;
-            let peak = if k % 11 == 0 {
+            // Faint-dominated, the way a real field is: a power law over
+            // the peak (most stars a few percent of sky, a handful bright,
+            // one in forty saturated past the high clip). A UNIFORM peak
+            // distribution — the first cut of this fixture — puts a mean
+            // star peak of 3× the sky into the field, which is a flux
+            // level no sky frame carries; the crowding characterisation
+            // test below keeps that case, honestly labelled.
+            let peak = if uniform_peaks {
+                if k % 11 == 0 {
+                    1.1
+                } else {
+                    0.02 + 0.6 * rng.next_f64() as f32
+                }
+            } else if k % 40 == 0 {
                 1.1
             } else {
-                0.02 + 0.6 * rng.next_f64() as f32
+                (0.004 / (rng.next_f64().max(1e-3)).powf(0.55) as f32).min(0.5)
             };
-            let r = 1.5 + 2.5 * rng.next_f64() as f32;
+            let r = if uniform_peaks {
+                1.5 + 2.5 * rng.next_f64() as f32
+            } else {
+                1.2 + 1.3 * rng.next_f64() as f32
+            };
             let x0 = (cx as isize - 8).max(0) as usize;
             let x1 = ((cx as isize + 8) as usize).min(width - 1);
             let y0 = (cy as isize - 8).max(0) as usize;
@@ -1063,7 +1248,7 @@ mod tests {
         plane
     }
 
-    fn c5_fixtures() -> Vec<C5Fixture> {
+    fn c5_m2_fixtures() -> Vec<C5Fixture> {
         let scale256 = BackgroundParams {
             scale: 256,
             ..DEFAULT_PARAMS
@@ -1155,6 +1340,17 @@ mod tests {
                 plane: vec![0.0f32; 128 * 128],
                 params: scale256,
             },
+        ]
+    }
+
+    /// The two fixtures the M2 set does not contain: a NOISY sky at the
+    /// production scale (1024 → stride 128), at the reference plane's
+    /// `deviation_sigma` (3.0) and at a target plane's
+    /// [`TARGET_DEVIATION_SIGMA`] (3.2). A flat or perfectly linear plane
+    /// cannot tell a median of pixels from a median of 4×4 means; this is
+    /// the only fixture where the question C5 asks has an answer.
+    fn c5_noisy_fixtures() -> Vec<C5Fixture> {
+        vec![
             C5Fixture {
                 name: "noisy_sky_reference_sigma",
                 width: 1024,
@@ -1193,41 +1389,64 @@ mod tests {
         (worst, worst_at)
     }
 
+    /// `(max |relative|, mean signed relative, mean |relative|)`.
+    fn relative_deviation_stats(got: &BackgroundGrid, oracle: &BackgroundGrid) -> (f64, f64, f64) {
+        const FLOOR: f64 = 1e-3;
+        let n = got.cells.len().max(1) as f64;
+        let (mut worst, mut signed, mut absolute) = (0f64, 0f64, 0f64);
+        for (&g, &o) in got.cells.iter().zip(oracle.cells.iter()) {
+            let rel = ((g as f64) - (o as f64)) / (o as f64).abs().max(FLOOR);
+            worst = worst.max(rel.abs());
+            signed += rel;
+            absolute += rel.abs();
+        }
+        (worst, signed / n, absolute / n)
+    }
+
+    fn assert_same_mesh_and_validity(got: &BackgroundGrid, oracle: &BackgroundGrid, name: &str) {
+        assert_eq!(
+            (got.gw, got.gh),
+            (oracle.gw, oracle.gh),
+            "{name}: the MESH is a cross-module contract (LnGrid/grid.rs/the integration \
+             engine's row evaluator all index it, and it IS the .athln layout) — C5 must \
+             not move it"
+        );
+        assert_eq!(
+            got.invalid_cells, oracle.invalid_cells,
+            "{name}: the binned reduction must flag the same number of cells invalid"
+        );
+    }
+
     /// Perf tier C item C5 (ruling C-5), the DELTA pin: the shipped
     /// [`background_grid`] models the background from a `LN_BIN`×`LN_BIN`
     /// reduction of the plane instead of the plane itself, so its node
     /// values are NOT bit-identical to the pre-C5 code's — they must stay
-    /// within 1e-3 RELATIVE of it, and the per-cell validity flags must be
-    /// the same cells, on every M2 LN fixture plus a noisy sky at the
-    /// production scale. The oracle is
+    /// within 1e-3 RELATIVE of it, with the same mesh and the same
+    /// per-cell validity flags, on every M2 LN fixture. The oracle is
     /// [`unbinned_reference::background_grid_unbinned_reference`], a
     /// verbatim copy of the pre-C5 function.
     ///
-    /// The test also asserts that at least one fixture MOVED: a pin whose
-    /// tolerance a no-op would satisfy proves nothing about the code it
-    /// claims to cover.
+    /// Measured at the time of writing (task 7's report has the table):
+    /// `flat_plane_with_stars` 0, `vertical_gradient` 6.695e-4,
+    /// `mostly_star_cell` 0, `trailing_node_overshoot` 0,
+    /// `gradient_star_field_with_a_nan_and_an_inf` 1.474e-4,
+    /// `entirely_below_the_low_clip` 0. The four zeros are not a sign that
+    /// nothing happens — those planes are flat or saturated inside every
+    /// cell, where a mean of 16 and a median of 16·N agree exactly — which
+    /// is precisely why this pin also runs the noisy sky next door.
+    ///
+    /// The test asserts that at least one fixture MOVED: a tolerance a
+    /// no-op satisfies proves nothing about the code it claims to cover.
     #[test]
     fn the_binned_background_tracks_the_unbinned_oracle_within_a_thousandth() {
         const TOLERANCE: f64 = 1e-3;
         let mut any_moved = false;
-        for f in c5_fixtures() {
+        for f in c5_m2_fixtures() {
             let oracle = unbinned_reference::background_grid_unbinned_reference(
                 &f.plane, f.width, f.height, &f.params, None,
             );
             let got = background_grid(&f.plane, f.width, f.height, &f.params, None);
-
-            assert_eq!(
-                (got.gw, got.gh),
-                (oracle.gw, oracle.gh),
-                "{}: the MESH is a cross-module contract (LnGrid/grid.rs/the engine's row \
-                 evaluator all index it) and C5 must not move it",
-                f.name
-            );
-            assert_eq!(
-                got.invalid_cells, oracle.invalid_cells,
-                "{}: the binned reduction must flag the same number of cells invalid",
-                f.name
-            );
+            assert_same_mesh_and_validity(&got, &oracle, f.name);
 
             let (worst, at) = max_relative_deviation(&got, &oracle);
             if worst > 0.0 {
@@ -1246,6 +1465,207 @@ mod tests {
             any_moved,
             "no fixture's node values moved at all — `background_grid` is still the unbinned \
              path and this pin is vacuous"
+        );
+    }
+
+    /// The same DELTA pin on a NOISY sky, with its own bar and its own
+    /// reasoning (perf tier C item C5). On a plane that has a noise floor
+    /// the two paths are two SAMPLE estimators over partly different pixel
+    /// subsets, not two ways of computing one number: at the production
+    /// stride the oracle subsamples its 128×128-px cell 2× ([`
+    /// CELL_SUBSAMPLE_THRESHOLD`], 16 384 > 4 096) and medians 4 096
+    /// pixels, while the binned path medians 1 024 bins built from ALL
+    /// 16 384. Their difference therefore has a floor of roughly
+    /// `0.017 · σ_noise / sky` per cell (1 σ) — 3.4e-4 at these fixtures'
+    /// 2 % noise — with no defect anywhere; a grid of ~50 cells reaches
+    /// ≈ 3 σ of that. Measured with ZERO stars in the field, i.e. pure
+    /// estimator difference: 7.342e-4. With the fixtures' 900 faint stars:
+    /// 7.808e-4 (reference σ) and 1.009e-3 (target σ).
+    ///
+    /// The bar is 2e-3 ≈ 6 σ of that floor — a real regression bar (a
+    /// doubling of the star-flux bias, or any systematic shift, trips it)
+    /// rather than a rubber stamp, and deliberately NOT the M2 fixtures'
+    /// 1e-3, which measures a different thing: those planes carry no noise
+    /// at all.
+    #[test]
+    fn the_binned_background_on_a_noisy_sky_stays_inside_the_estimator_difference() {
+        const TOLERANCE: f64 = 2e-3;
+        for f in c5_noisy_fixtures() {
+            let oracle = unbinned_reference::background_grid_unbinned_reference(
+                &f.plane, f.width, f.height, &f.params, None,
+            );
+            let got = background_grid(&f.plane, f.width, f.height, &f.params, None);
+            assert_same_mesh_and_validity(&got, &oracle, f.name);
+
+            let (worst, at) = max_relative_deviation(&got, &oracle);
+            assert!(
+                worst > 0.0,
+                "{}: a noisy sky must not come out bit-identical — the binned path is not live",
+                f.name
+            );
+            assert!(
+                worst <= TOLERANCE,
+                "{}: max relative deviation {worst:.3e} at cell {at} (binned {} vs oracle {}) \
+                 exceeds {TOLERANCE:.0e}",
+                f.name,
+                got.cells[at],
+                oracle.cells[at]
+            );
+        }
+    }
+
+    /// The threshold decision of perf tier C item C5, pinned with the
+    /// measurement that made it. [`robust_cell_level`]'s
+    /// `deviation_sigma`/[`TARGET_DEVIATION_SIGMA`] now clip BINNED values,
+    /// whose noise is ≈ [`LN_BIN`]× lower than the pixels' — so either they
+    /// stay as they are (the clip is relative to the sample's own MAD, so
+    /// it is scale-free and needs no re-derivation) or they are widened by
+    /// `LN_BIN` to preserve the pre-C5 ABSOLUTE bound. Measured against the
+    /// unbinned oracle on the noisy skies, as-is is the closer of the two
+    /// on all three statistics:
+    ///
+    /// | fixture | as-is max / bias | ×`LN_BIN` max / bias |
+    /// | ------- | ---------------- | -------------------- |
+    /// | reference σ | 7.808e-4 / +1.847e-4 | 9.479e-4 / +2.417e-4 |
+    /// | target σ | 1.009e-3 / +1.797e-4 | 1.115e-3 / +2.167e-4 |
+    ///
+    /// The mechanism is visible in the sign: widening the bound re-admits
+    /// the star wings the per-cell clip exists to remove, so every cell
+    /// reads HIGH. So the sigmas stay at 3.0/3.2 — this test is what says
+    /// so, and what a future "shouldn't these scale with the binning?"
+    /// has to argue against.
+    #[test]
+    fn the_cell_deviation_sigmas_are_not_re_derived_for_the_binned_plane() {
+        for f in c5_noisy_fixtures() {
+            let oracle = unbinned_reference::background_grid_unbinned_reference(
+                &f.plane, f.width, f.height, &f.params, None,
+            );
+            let as_is = background_grid(&f.plane, f.width, f.height, &f.params, None);
+            let widened = background_grid(
+                &f.plane,
+                f.width,
+                f.height,
+                &BackgroundParams {
+                    deviation_sigma: f.params.deviation_sigma * LN_BIN as f32,
+                    ..f.params
+                },
+                None,
+            );
+            let (a_max, a_bias, a_abs) = relative_deviation_stats(&as_is, &oracle);
+            let (w_max, w_bias, w_abs) = relative_deviation_stats(&widened, &oracle);
+            assert!(
+                a_max < w_max && a_bias.abs() < w_bias.abs() && a_abs < w_abs,
+                "{}: widening the deviation sigma by LN_BIN was expected to be the WORSE \
+                 approximation of the unbinned oracle on all three statistics — \
+                 as-is (max {a_max:.3e}, bias {a_bias:+.3e}, mean|d| {a_abs:.3e}) vs \
+                 widened (max {w_max:.3e}, bias {w_bias:+.3e}, mean|d| {w_abs:.3e})",
+                f.name
+            );
+        }
+    }
+
+    /// The measured LIMIT of the C5 reduction, recorded as a
+    /// characterisation pin rather than a quality bar (the project's own
+    /// ecc-audit pattern): **the binned model's deviation from the
+    /// unbinned one grows with how much star FLUX the field carries**,
+    /// because binning smears a star's wings *below* the per-cell
+    /// rejection bound instead of letting the clip remove them outright,
+    /// while the unbinned path judges every pixel on its own.
+    ///
+    /// Measured (max relative deviation from the oracle, 1024×768 at the
+    /// production scale): a faint-dominated field of 2 000 stars reads
+    /// 1.077e-3, while a flux-saturated one — uniform peaks in
+    /// `[0.02, 0.62]`, one in eleven saturated, a mean star peak of 3× the
+    /// sky, which no real frame carries — reads 1.595e-3 at 900 stars and
+    /// 3.333e-2 at 2 000, where it also puts `invalid_cells` at 36 against
+    /// the oracle's 8.
+    ///
+    /// This test asserts the ORDERING, not those numbers: the
+    /// flux-saturated field must deviate MORE than the faint one at the
+    /// same star count, by a clear margin. If a future change removes the
+    /// sensitivity, this fails and someone re-measures rather than
+    /// discovering it on a real crowded field.
+    #[test]
+    fn the_binned_backgrounds_star_flux_bias_grows_with_crowding() {
+        let (w, h) = (1024usize, 768usize);
+        let measure = |uniform: bool, stars: usize| {
+            let plane = noisy_sky_with(w, h, 0.10, 0.002, stars, 0xC5_0001, uniform);
+            let oracle = unbinned_reference::background_grid_unbinned_reference(
+                &plane,
+                w,
+                h,
+                &DEFAULT_PARAMS,
+                None,
+            );
+            let got = background_grid(&plane, w, h, &DEFAULT_PARAMS, None);
+            (
+                max_relative_deviation(&got, &oracle).0,
+                got.invalid_cells,
+                oracle.invalid_cells,
+            )
+        };
+
+        let (faint, faint_inv, faint_oracle_inv) = measure(false, 900);
+        let (loaded, loaded_inv, loaded_oracle_inv) = measure(true, 900);
+        assert!(
+            loaded > 1.5 * faint,
+            "a flux-saturated field must deviate clearly more than a faint-dominated one at              the same star count: {loaded:.3e} (invalid {loaded_inv} vs oracle              {loaded_oracle_inv}) is not >1.5x {faint:.3e} (invalid {faint_inv} vs oracle              {faint_oracle_inv})"
+        );
+        // And the faint field — the realistic one — stays inside the noisy
+        // fixtures' own bar even at more than twice their star count.
+        let (dense_faint, _, _) = measure(false, 2000);
+        assert!(
+            dense_faint <= 2e-3,
+            "a faint-dominated field at 2000 stars must stay inside the noisy fixtures' 2e-3:              {dense_faint:.3e}"
+        );
+    }
+
+    /// Perf tier C item C5's edge-remainder ruling: `width % LN_BIN`
+    /// columns and `height % LN_BIN` rows are DROPPED rather than averaged
+    /// into a short bin (see [`clip_and_bin`]'s doc). A plane too thin to
+    /// hold ONE whole bin on either axis therefore has nothing to measure,
+    /// and joins the module's other degenerate inputs as all-invalid —
+    /// which every caller already treats as "refuse" — instead of silently
+    /// returning a zero surface that looks measured.
+    #[test]
+    fn a_plane_thinner_than_one_bin_is_fully_invalid() {
+        for (w, h) in [(3usize, 64usize), (64, 3), (2, 2)] {
+            let plane = vec![0.10f32; w * h];
+            let g = background_grid(
+                &plane,
+                w,
+                h,
+                &BackgroundParams {
+                    scale: 256,
+                    ..DEFAULT_PARAMS
+                },
+                None,
+            );
+            assert_eq!(
+                g.invalid_cells,
+                g.gw * g.gh,
+                "{w}x{h}: a plane thinner than LN_BIN={LN_BIN} must report every cell invalid"
+            );
+            assert!(g.cells.iter().all(|&v| v == 0.0), "{w}x{h}: {:?}", g.cells);
+        }
+        // And one pixel MORE than a whole bin on both axes is measured
+        // normally — the guard is the thin-plane case, not a size floor.
+        let plane = vec![0.10f32; 5 * 5];
+        let g = background_grid(
+            &plane,
+            5,
+            5,
+            &BackgroundParams {
+                scale: 256,
+                ..DEFAULT_PARAMS
+            },
+            None,
+        );
+        assert_eq!(g.invalid_cells, 0, "{:?}", g.cells);
+        assert!(
+            g.cells.iter().all(|&c| (c - 0.10).abs() < 1e-6),
+            "{:?}",
+            g.cells
         );
     }
 }
