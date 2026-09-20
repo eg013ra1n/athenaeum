@@ -85,9 +85,9 @@ use crate::stacking::master_cards::{
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
-    build_plan, is_fresh, measurement_hash_for, normalization_hash_for, registration_hash_for,
-    registration_row_is_fresh, wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork,
-    PlanMaster, Stage,
+    build_plan, fits_artifact_fresh, is_fresh, measurement_hash_for, normalization_hash_for,
+    registration_hash_for, registration_row_is_fresh, wants_cfa_mosaic, HashMemo,
+    LnReferencePayload, MasterWork, PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -2987,7 +2987,15 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         // Freshness check (skipped entirely under a Measure-or-earlier
         // `rerun_from`): a `metrics` artifact whose hash matches this
         // frame's CURRENT stage-1 hash is reused straight from
-        // `payload_json`, never re-measured.
+        // `payload_json` — but ONLY when every one of its planes' `fits`
+        // rows is ALSO fresh (Tier C Task 1 fix round 1, the same
+        // `fits_artifact_fresh` rule `plan.rs`'s own gate uses): a
+        // `metrics`-only hit (a `fits` file removed by hand between runs)
+        // is re-measured, which rewrites BOTH artifacts for that frame —
+        // never a partial "keep the stale metrics, hope Task 2 falls back"
+        // outcome. Without this a plain run (no `rerun_from`) could never
+        // heal a missing `fits` file on its own; only "Re-run from Measure"
+        // would.
         let group_measurable = to_measure.len();
         let mut needing_measure: Vec<(usize, GroupFrame, PathBuf)> = Vec::new();
         for (idx, frame, path) in to_measure {
@@ -3014,9 +3022,29 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                         if let Some(payload) = &row.payload_json {
                             match serde_json::from_str::<FrameMeasurement>(payload) {
                                 Ok(m) => {
-                                    entries[idx].measurement = Some(m);
-                                    entries[idx].cached_metrics = true;
-                                    reused = true;
+                                    let fits_fresh = {
+                                        let conn = db(&rc.ctx)?.conn();
+                                        fits_artifact_fresh(
+                                            &conn,
+                                            rc.set_id,
+                                            &group.key,
+                                            frame.frame_id,
+                                            Some(payload.as_str()),
+                                            &expected_hash,
+                                        )?
+                                    };
+                                    if fits_fresh {
+                                        entries[idx].measurement = Some(m);
+                                        entries[idx].cached_metrics = true;
+                                        reused = true;
+                                    } else {
+                                        tracing::debug!(
+                                            run_id = rc.run_id,
+                                            frame_id = frame.frame_id,
+                                            "cached metrics found but its fits sidecar is missing \
+                                             or stale; re-measuring"
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -10431,6 +10459,167 @@ mod tests {
         assert_eq!(
             plan_after_delete.groups[0].metrics_cached, 4,
             "metrics itself is untouched by the fits deletion"
+        );
+    }
+
+    /// Tier C Task 1 fix round 1: a PLAIN run (`rerun_from: None`) must heal
+    /// a missing `fits` file on its own — before this fix `stage_measure`'s
+    /// own reuse decision checked only the `metrics` hash, so it kept
+    /// reusing the stale metrics forever and only "Re-run from Measure"
+    /// would notice. Two full `start_stacking` runs on the real pipeline
+    /// (`CleanupPolicy::KeepAll` so nothing sweeps `fits`/`metrics` between
+    /// them): the first measures every frame; one frame's `.athf` file is
+    /// then deleted (its DB row and its `metrics` row are untouched); a
+    /// plain second run re-measures ONLY that frame (its `metrics` row is
+    /// rewritten — `created_at` moves — while the other three are byte-for-
+    /// byte the same row) and its `fits` files come back, and `build_plan`
+    /// reads Measure as fresh again afterwards.
+    #[test]
+    fn measure_heals_a_missing_fits_sidecar_on_a_plain_rerun() {
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.cleanup = CleanupPolicy::KeepAll;
+
+        let started1 = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg.clone()),
+            None,
+        )
+        .expect("first run should start");
+        wait_for_run(&ctx, started1.run_id);
+        let row1 = crate::db::stacking::get_run(&fixture.conn, started1.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row1.status, "done", "{row1:?}");
+
+        let metrics_before =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
+                .unwrap();
+        assert_eq!(metrics_before.len(), 4, "{metrics_before:?}");
+        let fits_before =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
+                .unwrap();
+        assert_eq!(fits_before.len(), 4, "{fits_before:?}");
+        let created_before: HashMap<i64, String> = metrics_before
+            .iter()
+            .map(|a| (a.frame_id.unwrap(), a.created_at.clone()))
+            .collect();
+
+        // Delete one frame's persisted `.athf` FILE — its DB rows (metrics
+        // AND the fits row itself) are untouched.
+        let victim_id = fits_before[0].frame_id.unwrap();
+        let victim_path = fits_before[0].path.clone().unwrap();
+        std::fs::remove_file(&victim_path).unwrap();
+
+        let plan_before = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg.clone()),
+        )
+        .expect("the plan should build");
+        assert!(
+            plan_before.stale_stages.contains(&Stage::Measure),
+            "{:?}",
+            plan_before.stale_stages
+        );
+        assert_eq!(
+            plan_before.groups[0].fits_cached, 3,
+            "only the three untouched frames read fits-fresh: {:?}",
+            plan_before.groups[0]
+        );
+        assert_eq!(
+            plan_before.groups[0].metrics_cached, 4,
+            "metrics itself is untouched by the fits deletion: {:?}",
+            plan_before.groups[0]
+        );
+
+        // A PLAIN second run — no `rerun_from` — must heal it on its own.
+        let started2 = start_stacking(
+            ctx.clone(),
+            Arc::new(Recording::new()),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            fixture.set_id,
+            Some(cfg.clone()),
+            None,
+        )
+        .expect("second run should start");
+        wait_for_run(&ctx, started2.run_id);
+        let row2 = crate::db::stacking::get_run(&fixture.conn, started2.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.status, "done", "{row2:?}");
+
+        let metrics_after =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
+                .unwrap();
+        assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
+        for a in &metrics_after {
+            let fid = a.frame_id.unwrap();
+            let before = created_before.get(&fid).unwrap();
+            if fid == victim_id {
+                assert_ne!(
+                    &a.created_at, before,
+                    "the victim frame's metrics row must have been rewritten"
+                );
+            } else {
+                assert_eq!(
+                    &a.created_at, before,
+                    "an untouched frame's metrics row must not be recreated"
+                );
+            }
+        }
+
+        let fits_after =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
+                .unwrap();
+        assert_eq!(fits_after.len(), 4, "{fits_after:?}");
+        assert!(
+            Path::new(&victim_path).exists(),
+            "the deleted fits file must have been rewritten"
+        );
+
+        let plan_after = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg),
+        )
+        .expect("the plan should build");
+        assert!(
+            !plan_after.stale_stages.contains(&Stage::Measure),
+            "a plain run must heal the missing fits file on its own: {:?}",
+            plan_after.stale_stages
+        );
+        assert_eq!(
+            plan_after.groups[0].fits_cached, 4,
+            "{:?}",
+            plan_after.groups[0]
+        );
+        assert_eq!(
+            plan_after.groups[0].metrics_cached, 4,
+            "{:?}",
+            plan_after.groups[0]
         );
     }
 

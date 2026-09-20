@@ -537,9 +537,11 @@ pub(crate) fn normalization_hash_for(
 /// row missing `path`/`size` (an artifact recorded before the pixel phase
 /// ever wrote anything, or one some other kind stores without a path) is
 /// NEVER assumed fresh — "we don't know" is "stale", not "trust the hash
-/// alone". A `metrics` artifact has no equivalent disk check: it may be
-/// `payload_json`-only with no file to verify (see the `Measure` staleness
-/// check in [`build_plan`], which compares only the hash).
+/// alone". A `metrics` artifact has no equivalent disk check of its own: it
+/// may be `payload_json`-only with no file to verify — its sibling `fits`
+/// rows are what carries a file for Measure to check (see
+/// [`fits_artifact_fresh`]; the `Measure` staleness check in [`build_plan`]
+/// requires both).
 ///
 /// `pub(crate)`: `run.rs`'s calibrate stage (Task 6) calls this SAME rule to
 /// decide whether an existing `calibrated` artifact can be reused instead of
@@ -552,6 +554,44 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
             .as_deref()
             .and_then(|p| std::fs::metadata(p).ok())
             .is_some_and(|meta| Some(meta.len() as i64) == artifact.size)
+}
+
+/// Whether every one of a frame's `fits.<plane>` rows is fresh against
+/// `expected_hash` (Tier C Task 1 fix round 1) — the plane count is decoded
+/// from the frame's cached `metrics` payload (a JSON parse, never pixel
+/// I/O), never resolved when there is no payload to read one from.
+/// `pub(crate)`: shared by this module's own per-frame staleness loop
+/// (`build_plan`) AND `stage_measure`'s reuse decision (`stacking::run`) —
+/// one rule, two callers, the same pattern [`is_fresh`] itself follows for
+/// `calibrated`. A frame whose `metrics` payload is missing, unparseable, or
+/// reports zero channels reads as NOT fresh — there is nothing to check
+/// plane counts against.
+pub(crate) fn fits_artifact_fresh(
+    conn: &Connection,
+    frames_set_id: i64,
+    group_key: &str,
+    frame_id: i64,
+    metrics_payload: Option<&str>,
+    expected_hash: &str,
+) -> Result<bool, ApiError> {
+    let Some(planes) = metrics_payload
+        .and_then(|json| serde_json::from_str::<FrameMeasurement>(json).ok())
+        .map(|m| m.channels.len())
+    else {
+        return Ok(false);
+    };
+    if planes == 0 {
+        return Ok(false);
+    }
+    for plane in 0..planes {
+        let kind = fits_artifact::artifact_kind(plane);
+        let plane_fresh = find_artifact(conn, frames_set_id, group_key, &kind, Some(frame_id))?
+            .is_some_and(|row| is_fresh(&row, expected_hash));
+        if !plane_fresh {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether this group's stage 1 also keeps the calibrated CFA mosaic beside
@@ -1808,54 +1848,45 @@ pub fn build_plan(
                 calibrate_stale = true;
             }
 
-            let metrics_fresh = match (&metrics_artifact, &current_calib_hash) {
-                (Some(row), Some(hash)) => row.config_hash == measurement_hash_for(&cfg, hash),
+            // Computed once and reused for both the `metrics` hash compare
+            // and the `fits` check below (fix round 1 — this used to call
+            // `measurement_hash_for` a second time for `fits_fresh`).
+            let expected_measurement_hash: Option<String> = current_calib_hash
+                .as_deref()
+                .map(|hash| measurement_hash_for(&cfg, hash));
+            let metrics_fresh = match (&metrics_artifact, &expected_measurement_hash) {
+                (Some(row), Some(hash)) => &row.config_hash == hash,
                 _ => false,
             };
             if metrics_fresh {
                 metrics_cached += 1;
             }
 
-            // Tier C Task 1: the frame's Measure output is fully cached only
-            // when its `metrics` row AND every one of its planes' `fits`
-            // rows are fresh — the two are written together from
-            // `PSF_FIT_VERSION` 3 on, so a `metrics`-only hit (an old
+            // Tier C Task 1 (fix round 1): the frame's Measure output is
+            // fully cached only when its `metrics` row AND every one of its
+            // planes' `fits` rows are fresh — the two are written together
+            // from `PSF_FIT_VERSION` 3 on, so a `metrics`-only hit (an old
             // catalog re-measured before this task shipped, or a `fits`
             // file removed by hand) is honestly reported as needing Measure
             // again, the same way Task 6a's `registered` artifact is
-            // checked independently of `calibrated`. The plane count comes
-            // from the cached `metrics` payload itself (a JSON parse, not
-            // pixel I/O) — never resolved when `metrics` is already stale,
-            // since the frame is being re-measured regardless.
-            let mut fits_fresh = false;
-            if metrics_fresh {
-                let plane_count = metrics_artifact
-                    .as_ref()
-                    .and_then(|row| row.payload_json.as_deref())
-                    .and_then(|json| serde_json::from_str::<FrameMeasurement>(json).ok())
-                    .map(|m| m.channels.len());
-                if let (Some(planes), Some(hash)) = (plane_count, &current_calib_hash) {
-                    if planes > 0 {
-                        let expected = measurement_hash_for(&cfg, hash);
-                        fits_fresh = true;
-                        for plane in 0..planes {
-                            let kind = fits_artifact::artifact_kind(plane);
-                            let plane_fresh = find_artifact(
-                                conn,
-                                frames_set_id,
-                                &g.key,
-                                &kind,
-                                Some(f.frame_id),
-                            )?
-                            .is_some_and(|row| is_fresh(&row, &expected));
-                            if !plane_fresh {
-                                fits_fresh = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            // checked independently of `calibrated`. `fits_artifact_fresh`
+            // is the SAME rule `stage_measure`'s own reuse decision calls.
+            let fits_fresh = if metrics_fresh {
+                fits_artifact_fresh(
+                    conn,
+                    frames_set_id,
+                    &g.key,
+                    f.frame_id,
+                    metrics_artifact
+                        .as_ref()
+                        .and_then(|row| row.payload_json.as_deref()),
+                    expected_measurement_hash
+                        .as_deref()
+                        .expect("metrics_fresh implies a resolved hash"),
+                )?
+            } else {
+                false
+            };
             if fits_fresh {
                 fits_cached += 1;
             }
