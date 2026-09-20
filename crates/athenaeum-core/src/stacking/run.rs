@@ -12784,6 +12784,175 @@ mod tests {
         );
     }
 
+    /// Tier C Task 3 fix round 2 (ruling C-18, item 5, follow-up): the
+    /// floor `resolve_register_fits` applies before handing a fit-derived
+    /// star list downstream — below `align::MIN_INLIERS` it must return
+    /// `None` (proven here to actually reach a real, non-empty detection
+    /// when that `None` is handed to `detect_frame_stars`, on a real
+    /// star-containing field — not just "the resolver declined", which
+    /// alone would not rule out a broken caller silently treating the
+    /// refusal as "no stars anywhere"); at exactly `MIN_INLIERS` it must be
+    /// admitted whole. No DB access beyond a real `frames_set` row (the FK
+    /// `stacking_artifacts.frames_set_id` requires one) and one real
+    /// calibrated frame — `resolve_register_fits` itself needs no group,
+    /// run or plan machinery.
+    #[test]
+    fn resolve_register_fits_floors_below_min_inliers_and_admits_at_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let fixture_conn = rusqlite::Connection::open(&db_path).expect("open fixture connection");
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, "floor-fixture");
+
+        // A real `frames` row (`stacking_artifacts.frame_id` FKs to it) —
+        // `add_light_with_field` writes a RAW 16-bit light, which is the
+        // wrong shape for `detect_frame_stars` (it expects a CALIBRATED
+        // float32 frame in native `[0, 1]` units, the same convention
+        // `register::frame::tests::pair()` uses); the catalog row is all
+        // that's needed from it, so its file is overwritten below with a
+        // genuinely calibrated-shaped star field at the SAME path.
+        let date_obs = date_obs_at(0);
+        let spec = star_light_spec("f0", &date_obs);
+        let (frame_id, calibrated_path) = test_fixtures::add_light_with_field(
+            &fixture,
+            &spec,
+            &shifted_stars(0.0, 0.0),
+            600.0,
+            5.0,
+            101,
+        );
+        // BASE_STARS (ten stars, "well above the required >= 8" per its own
+        // doc comment), re-amplituded into native `[0, 1]` units — proof
+        // that the below-floor branch below reaches an ACTUAL detection on
+        // a real field, not a stub.
+        let native_stars: Vec<(f64, f64, f64)> = shifted_stars(0.0, 0.0)
+            .into_iter()
+            .map(|(x, y, _)| (x, y, 0.3))
+            .collect();
+        let mut plane = crate::test_support::gaussian_field(
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+            &native_stars,
+            1.6,
+            0.08,
+        );
+        crate::test_support::add_noise(&mut plane, 0.002, 101);
+        crate::fits_writer::write_fits_f32(
+            &calibrated_path,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+            1,
+            &plane,
+            &[],
+        )
+        .unwrap();
+
+        let cfg = StackingConfig::default();
+        let rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            fixture.set_id,
+            "floor-fixture",
+            cfg.clone(),
+            Vec::new(),
+            WorkingLayout::new(fixture.dir.path(), "floor-fixture"),
+            fixture.dir.path().to_path_buf(),
+            HashMap::new(),
+        );
+
+        let group_key = "mono__floor_test";
+        let calibrated_hash = "floor-test-calibrated-hash";
+        let expected_hash = measurement_hash_for(&cfg, calibrated_hash);
+
+        // A fixed-value fit that survives `passes_register_cuts` on its
+        // own — the same shape `detect::tests::good_fit()` pins — repeated
+        // at distinct positions.
+        let good_fit_at = |i: usize| psf_signal::StarFit {
+            x: 10.0 + i as f64 * 4.0,
+            y: 10.0 + i as f64 * 3.0,
+            background: 100.0,
+            amplitude: 5000.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            fwtm_x: 6.0,
+            fwtm_y: 6.0,
+            theta: 0.0,
+            beta: 4.0,
+            residual: 0.02,
+            signal: 40000.0,
+            area: 28.0,
+        };
+
+        let seed_fits = |fits: &[psf_signal::StarFit]| {
+            let path = fixture
+                .dir
+                .path()
+                .join(format!("floor-{}.athf", fits.len()));
+            fits_artifact::write_fits(&path, fits).unwrap();
+            let size = std::fs::metadata(&path).unwrap().len() as i64;
+            crate::db::stacking::upsert_artifact(
+                &fixture.conn,
+                &crate::db::stacking::NewArtifact {
+                    frames_set_id: fixture.set_id,
+                    frame_id: Some(frame_id),
+                    group_key,
+                    kind: &fits_artifact::artifact_kind(0),
+                    path: Some(path.to_str().unwrap()),
+                    config_hash: &expected_hash,
+                    size: Some(size),
+                    modified_at: None,
+                    payload_json: None,
+                },
+            )
+            .unwrap();
+        };
+
+        // Below the floor: MIN_INLIERS - 1 fits, every one individually
+        // cut-surviving (only their COUNT is short).
+        let below: Vec<psf_signal::StarFit> =
+            (0..align::MIN_INLIERS - 1).map(good_fit_at).collect();
+        seed_fits(&below);
+        let resolved = resolve_register_fits(&rc, group_key, frame_id, 1, calibrated_hash);
+        assert!(
+            resolved.is_none(),
+            "a {}-star list below MIN_INLIERS ({}) must be refused",
+            below.len(),
+            align::MIN_INLIERS
+        );
+
+        // The caller's own fallback: `None` handed to `detect_frame_stars`
+        // must reach a REAL detection on the star-containing field, not
+        // silently return an empty list.
+        let detected = detect_frame_stars(
+            &calibrated_path,
+            &cfg.registration,
+            None,
+            resolved.as_deref(),
+        )
+        .unwrap();
+        assert!(
+            !detected.stars.is_empty(),
+            "the detection fallback must find the field's real stars, not return empty"
+        );
+        assert!(
+            detected.stars.len() >= align::MIN_INLIERS,
+            "the real field carries well above MIN_INLIERS stars: {}",
+            detected.stars.len()
+        );
+
+        // At exactly the floor: MIN_INLIERS fits must be admitted whole
+        // (the fits path, not detection).
+        let at_floor: Vec<psf_signal::StarFit> = (0..align::MIN_INLIERS).map(good_fit_at).collect();
+        seed_fits(&at_floor);
+        let resolved_at_floor = resolve_register_fits(&rc, group_key, frame_id, 1, calibrated_hash);
+        assert_eq!(
+            resolved_at_floor.as_ref().map(Vec::len),
+            Some(align::MIN_INLIERS),
+            "exactly MIN_INLIERS fits must be admitted whole: {resolved_at_floor:?}"
+        );
+    }
+
     #[test]
     fn registration_rows_are_written_and_reused() {
         let tmp = tempfile::tempdir().unwrap();
