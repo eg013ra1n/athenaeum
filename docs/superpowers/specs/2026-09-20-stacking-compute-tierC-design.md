@@ -220,3 +220,12 @@ flow untouched; C-5 `LN_BIN = 4`; C-6 mono-only fit reuse in Register, OSC keeps
 detection; C-7 (process) one implementer at a time, interleaved before/after measurement for
 every timing, the product-build checkpoint as the arbiter, an honest revert with numbers when an
 item measures ≤ 0 (Tier A's rulings R-TA-8/9 carried over).
+
+**C-1a** (Task 1, plan ledger): the group β is the LOWER median of the members' `Auto` β's
+(`psf_signal::group_beta`, sorted, index `(n-1)/2`), not their mean — a plain average of two
+adjacent `AUTO_BETAS` candidates (e.g. `4.0`/`6.0` → `5.0`) is not a value `Auto`'s own search
+ever produces, and Task 2's `PsfModel::Fixed(beta)` fits at exactly this number. "Members" means
+every frame stage 3 actually measured (fresh or reused from a cached `metrics` row) — every
+channel of every such frame contributes one β observation, not narrowed to `included` (weighing/
+selection happens after Auto has already resolved a β for each channel). A group that measured
+no frame at all records no β (`None`).

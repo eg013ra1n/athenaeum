@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::integration::stats::median_in_place;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum PsfModel {
     /// Fit the brightest `AUTO_SAMPLE` seeds with every β in `AUTO_BETAS`
@@ -21,6 +21,17 @@ pub enum PsfModel {
     #[default]
     Auto,
     Moffat4,
+    /// One β for a whole run/group, resolved once (Tier C ruling C-1/C-1a:
+    /// [`group_beta`] over the group's measured members' own `Auto` picks).
+    /// INTERNAL ONLY — never on the config wire: `#[serde(skip)]` makes a
+    /// stored document that somehow carried it fail to decode as this
+    /// variant (an unrecognized name, exactly as if it did not exist) and
+    /// makes an attempt to *serialize* it a loud `Error::custom` rather than
+    /// a silent wrong config. `get_stacking_config`/every preset only ever
+    /// round-trip `Auto`/`Moffat4`; `#[derive(Eq)]` is dropped from this
+    /// enum because `f64` has no total order.
+    #[serde(skip)]
+    Fixed(f64),
 }
 
 pub const AUTO_BETAS: [f64; 4] = [2.5, 4.0, 6.0, 10.0];
@@ -41,7 +52,12 @@ pub const AUTO_SAMPLE: usize = 64;
 ///
 /// 1 = the fixed `5σ` stamp with the `0.85·r` centre rule (M1-M3).
 /// 2 = the adaptive sampling region + `inner_margin` (M4a Task 2).
-pub const PSF_FIT_VERSION: u32 = 2;
+/// 3 = no change to what a fit accepts — bumped so every cached `metrics`
+/// artifact is treated as stale until it comes with a sibling `fits`
+/// artifact (Tier C Task 1, spec §2.2.7): the two are written together from
+/// this version on, and a document from before it never carries `fits` at
+/// all.
+pub const PSF_FIT_VERSION: u32 = 3;
 
 /// A detection to fit: centroid, background-subtracted peak and flux.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -602,6 +618,10 @@ pub fn fit_stars(
     let sigma0 = initial_sigma(seeds);
     let beta = match model {
         PsfModel::Moffat4 => 4.0,
+        // Tier C Task 1: a caller-resolved β (the group β, or any other
+        // fixed value) is fit exactly like `Moffat4`'s fixed 4.0 — the
+        // `Auto` search below never runs for it.
+        PsfModel::Fixed(b) => b,
         PsfModel::Auto => {
             let sample = &seeds[..seeds.len().min(AUTO_SAMPLE)];
             let mut best: Option<(f64, f64)> = None; // (median residual, β)
@@ -655,6 +675,27 @@ pub fn fit_stars_with_beta(
         beta,
         seeds: seeds.len(),
     }
+}
+
+/// One β for a whole group (Tier C ruling C-1/C-1a): the LOWER median of the
+/// group's measured members' own `Auto`-resolved β so the result is always
+/// one of [`AUTO_BETAS`] — a plain mean of e.g. `4.0` and `6.0` would give
+/// `5.0`, a candidate `Auto` never fits at. `betas` is expected non-empty
+/// (a group that reached this call measured at least one frame); an empty
+/// slice returns `4.0` (the same fallback `Auto`'s own search uses when no
+/// candidate accepts ≥ 8 fits) rather than panicking — this is a reporting
+/// path, not a precondition the pipeline enforces upstream.
+///
+/// Recorded only — nothing consumes the resolved β yet (Tier C Task 2 will
+/// hand it to the LN reference build and to every mapped fit's flux
+/// correction as `PsfModel::Fixed`).
+pub fn group_beta(betas: &[f64]) -> f64 {
+    if betas.is_empty() {
+        return 4.0;
+    }
+    let mut sorted = betas.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted[(sorted.len() - 1) / 2]
 }
 
 pub const PSFSW_NUM: f64 = 5.326e-6;
@@ -1411,6 +1452,63 @@ mod tests {
             "\"moffat4\""
         );
         assert_eq!(PsfModel::default(), PsfModel::Auto);
+    }
+
+    /// Tier C Task 1: `Fixed` is INTERNAL — it must error rather than
+    /// silently write something onto the config wire, and a config that
+    /// somehow carried its spelling must not decode as it either.
+    #[test]
+    fn psf_model_fixed_never_reaches_the_wire() {
+        assert!(
+            serde_json::to_string(&PsfModel::Fixed(6.0)).is_err(),
+            "a skipped variant must refuse to serialize, not silently drop the payload"
+        );
+        // Its own would-be spelling reads as an unknown variant, exactly as
+        // if `Fixed` were not declared at all.
+        assert!(serde_json::from_str::<PsfModel>("{\"fixed\":6.0}").is_err());
+    }
+
+    #[test]
+    fn fit_stars_with_fixed_model_uses_the_given_beta_verbatim() {
+        let seeds = vec![Seed {
+            x: 10.0,
+            y: 10.0,
+            peak: 1.0,
+            flux: 6.0,
+        }];
+        let data = vec![0.0f32; 20 * 20];
+        let a = fit_stars(
+            &data,
+            20,
+            20,
+            &seeds,
+            PsfModel::Fixed(7.5),
+            &FitParams::default(),
+            None,
+        );
+        let b = fit_stars_with_beta(&data, 20, 20, &seeds, 7.5, &FitParams::default(), None);
+        assert_eq!(a.beta, 7.5);
+        assert_eq!(a.beta, b.beta);
+    }
+
+    #[test]
+    fn group_beta_is_the_lower_median_and_always_an_auto_candidate() {
+        // Odd count: the exact middle.
+        assert_eq!(group_beta(&[2.5, 4.0, 6.0]), 4.0);
+        // Even count: the LOWER of the two middle values, not their mean —
+        // a plain average (5.0) is not a candidate `Auto` ever fits at.
+        assert_eq!(group_beta(&[4.0, 6.0]), 4.0);
+        // One element: itself.
+        assert_eq!(group_beta(&[10.0]), 10.0);
+        // All equal.
+        assert_eq!(group_beta(&[6.0, 6.0, 6.0, 6.0]), 6.0);
+        // Order independence.
+        assert_eq!(group_beta(&[10.0, 2.5, 6.0, 4.0]), 4.0);
+        // The result is always literally one of `AUTO_BETAS`, whatever the
+        // input mix (the whole point of "lower median" over "mean").
+        assert!(AUTO_BETAS.contains(&group_beta(&[2.5, 4.0, 6.0, 10.0])));
+        // Empty: the documented fallback, not a panic.
+        assert_eq!(group_beta(&[]), 4.0);
     }
 
     use crate::test_support::add_noise;

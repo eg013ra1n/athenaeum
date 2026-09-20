@@ -79,7 +79,17 @@ tpsSmoothing: number,
  * refitting the distortion around it. Needs a distortion model to
  * refit, so it is a no-op with `distortion: off`.
  */
-localDistortion: boolean, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, writeRegisteredFrames: boolean, };
+localDistortion: boolean, interpolation: Interpolation, clampingThreshold: number, maxStars: number, ransacTolerancePx: number, ransacMaxIterations: number, maxRmsPx: number, failOnMaxRms: boolean, detection: DetectionConfig, 
+/**
+ * Vestigial since perf tier A Task 6a: the registered artifact became
+ * the run's REQUIRED per-frame output (Normalize/Integrate read it in
+ * place of re-warping) and is now written unconditionally — this
+ * field no longer gates that write. Kept in the schema/UI (the
+ * `RegisterPanel` "Write registered frames" toggle) only because
+ * removing it is a command-surface change out of that task's scope; it
+ * has no observable effect any more.
+ */
+writeRegisteredFrames: boolean, };
 
 export type OutputNormalization = "none" | "additive" | "additiveWithScaling" | "multiplicative" | "multiplicativeWithScaling";
 
@@ -308,6 +318,13 @@ export type PlanBlocker = { code: string, message: string, };
 
 export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, cameras: Array<string>, exposureS: number | null, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
 /**
+ * Tier C Task 1: frames (of `frame_count`) whose `metrics` row AND
+ * every one of its planes' `fits` rows are all fresh — a subset of
+ * `metrics_cached` in practice (see [`build_plan`]'s own doc on the
+ * per-frame loop), never counted when `metrics` itself is stale.
+ */
+fitsCached: number, 
+/**
  * Frames (of `included_count`) whose `.athln` sidecar already exists on
  * disk (spec §9.3, M2) — `0` when local normalization is off. A
  * PRESENCE check, not a hash-verified freshness one: see the doc on
@@ -379,7 +396,15 @@ export type StackingRunGroupRow = { id: number, runId: number, groupKey: string,
  * this row's `width`/`height` as that anchor's size, not the actual
  * master's.
  */
-width: number | null, height: number | null, exposure: number | null, frameCount: number, includedCount: number, masterPath: string | null, drizzlePath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, statsJson: string | null, status: string, error: string | null, };
+width: number | null, height: number | null, exposure: number | null, frameCount: number, includedCount: number, masterPath: string | null, drizzlePath: string | null, rejectionLowPath: string | null, rejectionHighPath: string | null, statsJson: string | null, status: string, error: string | null, 
+/**
+ * Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
+ * once from its members' own `Auto` picks — `psf_signal::group_beta`,
+ * always one of `psf_signal::AUTO_BETAS`. `None` for a run predating
+ * this task, or a group that measured no frame at all. Nothing reads
+ * this yet (Task 2 will).
+ */
+beta: number | null, };
 
 export type StackingRunFrameRow = { id: number, runId: number, groupId: number, frameId: number, included: boolean, exclusionReason: string | null, weight: number | null, weightChannelsJson: string | null, metricsJson: string | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, };
 
@@ -460,7 +485,15 @@ weightMapPath: string | null,
  * The drizzle stage's own per-group stats, `Some` exactly when
  * `drizzle_path` is.
  */
-drizzle: DrizzleStats | null, frames: Array<SummaryFrame>, };
+drizzle: DrizzleStats | null, 
+/**
+ * Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
+ * from its members' own `Auto` picks — always one of
+ * `psf_signal::AUTO_BETAS`. `None` when the group measured no frame at
+ * all, or on a summary written before this task. `#[serde(default)]`,
+ * see `SummaryFrame::ln_scale`'s own doc for the convention.
+ */
+beta: number | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 
@@ -494,7 +527,13 @@ isDefault: boolean, updatedAt: string | null, };
 
 export type StackingPaths = { working: PathSetting, output: PathSetting, };
 
-export type WorkUsage = { calibratedBytes: number, registeredBytes: number, lnBytes: number, runsBytes: number, 
+export type WorkUsage = { calibratedBytes: number, registeredBytes: number, lnBytes: number, 
+/**
+ * Tier C Task 1: bytes under `fits/` — the persisted per-plane star
+ * fits, cached like `metrics` (no file of its own) but WITH a file
+ * behind each row, so it earns a byte counter `metrics` never needed.
+ */
+fitsBytes: number, runsBytes: number, 
 /**
  * M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
  * (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.

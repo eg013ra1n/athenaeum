@@ -2402,6 +2402,17 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Perf tier C Task 1 (ruling C-1/C-1a, spec §2.2.2): the group β Measure
+    // resolves once per group from its members' own `Auto` picks (the
+    // lower median, always one of `psf_signal::AUTO_BETAS`) — Task 2 will
+    // use it to fit the LN reference and every mapped fit at one shared β.
+    // `NULL` for a run predating this task, or a group whose stage 3
+    // measured no frame at all (`psf_signal::group_beta` is never called
+    // for it).
+    if !column_exists(conn, "stacking_run_groups", "beta")? {
+        conn.execute("ALTER TABLE stacking_run_groups ADD COLUMN beta REAL", [])?;
+    }
+
     // ── Foreign-key child columns ────────────────────────────────────────────
     //
     // SQLite indexes the PARENT side of a foreign key automatically and the

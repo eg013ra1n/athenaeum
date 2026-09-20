@@ -90,6 +90,12 @@ pub struct StackingRunGroupRow {
     pub stats_json: Option<String>,
     pub status: String,
     pub error: Option<String>,
+    /// Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
+    /// once from its members' own `Auto` picks — `psf_signal::group_beta`,
+    /// always one of `psf_signal::AUTO_BETAS`. `None` for a run predating
+    /// this task, or a group that measured no frame at all. Nothing reads
+    /// this yet (Task 2 will).
+    pub beta: Option<f64>,
 }
 
 fn row_to_group(r: &Row) -> rusqlite::Result<StackingRunGroupRow> {
@@ -113,12 +119,13 @@ fn row_to_group(r: &Row) -> rusqlite::Result<StackingRunGroupRow> {
         stats_json: r.get(16)?,
         status: r.get(17)?,
         error: r.get(18)?,
+        beta: r.get(19)?,
     })
 }
 
 const GROUP_COLUMNS: &str = "id, run_id, group_key, instrume, color_mode, filter, binning, width, \
     height, exposure, frame_count, included_count, master_path, drizzle_path, rejection_low_path, \
-    rejection_high_path, stats_json, status, error";
+    rejection_high_path, stats_json, status, error, beta";
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -320,6 +327,9 @@ pub struct GroupUpdate<'a> {
     pub stats_json: Option<&'a str>,
     pub status: Option<&'a str>,
     pub error: Option<&'a str>,
+    /// Perf tier C Task 1: the resolved group β, written once at the end of
+    /// stage 3 alongside `included_count` — see [`StackingRunGroupRow::beta`].
+    pub beta: Option<f64>,
 }
 
 pub struct NewFrameRow<'a> {
@@ -516,6 +526,7 @@ pub fn update_group(conn: &Connection, group_id: i64, u: &GroupUpdate<'_>) -> Re
     set_field!("stats_json", u.stats_json);
     set_field!("status", u.status);
     set_field!("error", u.error);
+    set_field!("beta", u.beta);
 
     if sets.is_empty() {
         return Ok(());

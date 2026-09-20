@@ -763,7 +763,8 @@ fn main() {
                         &measure_opts,
                         Some(&pool),
                         SeedSource::Fast,
-                    );
+                    )
+                    .channel;
                     let full_m = measure_plane_with_seeds(
                         &lum,
                         w,
@@ -771,7 +772,8 @@ fn main() {
                         &measure_opts,
                         Some(&pool),
                         SeedSource::Full,
-                    );
+                    )
+                    .channel;
                     let fast_within = within_half_px_fraction(&fast_xy, &full_xy);
                     let full_within = within_half_px_fraction(&full_xy, &fast_xy);
                     eprintln!(

@@ -386,7 +386,9 @@ seed_detector {:?} sensitivity {}",
 
         let channels: Vec<ChannelMeasurement> = planes
             .iter()
-            .map(|plane| measure_plane_with_seeds(plane, width, height, &opts, None, args.seed))
+            .map(|plane| {
+                measure_plane_with_seeds(plane, width, height, &opts, None, args.seed).channel
+            })
             .collect();
         let duration_ms = start.elapsed().as_millis() as u64;
 

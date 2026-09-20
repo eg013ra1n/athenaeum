@@ -35,9 +35,11 @@ use crate::stacking::config::{
     registration_subtree, resolve_config, stage_hash, CleanupPolicy, ReferenceMode, SourceIdentity,
     StackingConfig,
 };
+use crate::stacking::fits_artifact;
 use crate::stacking::groups::{
     group_frames, median_f64, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
 };
+use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
@@ -161,6 +163,11 @@ pub struct PlanGroup {
     pub total_exposure_s: f64,
     pub calibrated_cached: usize,
     pub metrics_cached: usize,
+    /// Tier C Task 1: frames (of `frame_count`) whose `metrics` row AND
+    /// every one of its planes' `fits` rows are all fresh — a subset of
+    /// `metrics_cached` in practice (see [`build_plan`]'s own doc on the
+    /// per-frame loop), never counted when `metrics` itself is stale.
+    pub fits_cached: usize,
     /// Frames (of `included_count`) whose `.athln` sidecar already exists on
     /// disk (spec §9.3, M2) — `0` when local normalization is off. A
     /// PRESENCE check, not a hash-verified freshness one: see the doc on
@@ -1739,6 +1746,7 @@ pub fn build_plan(
         };
         let mut calibrated_cached = 0usize;
         let mut metrics_cached = 0usize;
+        let mut fits_cached = 0usize;
         let mut ln_cached = 0usize;
         let mut included_count = 0usize;
         // M4d Task 1 (fix round 1, I2): with Bayer drizzle on, stage 1 owes
@@ -1806,7 +1814,52 @@ pub fn build_plan(
             };
             if metrics_fresh {
                 metrics_cached += 1;
-            } else if !is_excluded {
+            }
+
+            // Tier C Task 1: the frame's Measure output is fully cached only
+            // when its `metrics` row AND every one of its planes' `fits`
+            // rows are fresh — the two are written together from
+            // `PSF_FIT_VERSION` 3 on, so a `metrics`-only hit (an old
+            // catalog re-measured before this task shipped, or a `fits`
+            // file removed by hand) is honestly reported as needing Measure
+            // again, the same way Task 6a's `registered` artifact is
+            // checked independently of `calibrated`. The plane count comes
+            // from the cached `metrics` payload itself (a JSON parse, not
+            // pixel I/O) — never resolved when `metrics` is already stale,
+            // since the frame is being re-measured regardless.
+            let mut fits_fresh = false;
+            if metrics_fresh {
+                let plane_count = metrics_artifact
+                    .as_ref()
+                    .and_then(|row| row.payload_json.as_deref())
+                    .and_then(|json| serde_json::from_str::<FrameMeasurement>(json).ok())
+                    .map(|m| m.channels.len());
+                if let (Some(planes), Some(hash)) = (plane_count, &current_calib_hash) {
+                    if planes > 0 {
+                        let expected = measurement_hash_for(&cfg, hash);
+                        fits_fresh = true;
+                        for plane in 0..planes {
+                            let kind = fits_artifact::artifact_kind(plane);
+                            let plane_fresh = find_artifact(
+                                conn,
+                                frames_set_id,
+                                &g.key,
+                                &kind,
+                                Some(f.frame_id),
+                            )?
+                            .is_some_and(|row| is_fresh(&row, &expected));
+                            if !plane_fresh {
+                                fits_fresh = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if fits_fresh {
+                fits_cached += 1;
+            }
+            if !(metrics_fresh && fits_fresh) && !is_excluded {
                 measure_stale = true;
             }
 
@@ -1890,6 +1943,7 @@ pub fn build_plan(
             total_exposure_s: g.total_exposure_s,
             calibrated_cached,
             metrics_cached,
+            fits_cached,
             ln_cached,
             anchor_width,
             anchor_height,
@@ -3889,6 +3943,56 @@ mod tests {
         .unwrap();
     }
 
+    /// A minimal, genuinely-parseable `metrics` artifact payload (Tier C
+    /// Task 1): the plan gate now decodes it to learn a frame's plane count
+    /// before checking its `fits` rows, so a placeholder `"{}"` (which
+    /// `FrameMeasurement` — no `#[serde(default)]` on the struct itself —
+    /// fails to parse) would read as "can't tell, so stale" no matter what
+    /// `fits` rows exist. Values beyond the channel count are irrelevant to
+    /// every test that uses this: `build_plan` never opens a calibrated or
+    /// measured file's actual pixels.
+    fn minimal_metrics_payload(channels: usize) -> String {
+        serde_json::to_string(&FrameMeasurement {
+            width: 1,
+            height: 1,
+            channels: vec![crate::stacking::measure::ChannelMeasurement::default(); channels],
+            duration_ms: 0,
+        })
+        .expect("FrameMeasurement always serializes")
+    }
+
+    /// One (frame, plane)'s `fits` artifact (Tier C Task 1) — a real,
+    /// genuinely-written `.athf` file (empty fit list; `build_plan` never
+    /// reads its content, only `hash` + `size` via `is_fresh`) so a fixture
+    /// that wants Measure to read as fresh has one to point at, the same
+    /// convention [`seed_registered_artifact`] follows for `registered`.
+    fn seed_fits_artifact(
+        f: &test_fixtures::Fixture,
+        group_key: &str,
+        frame_id: i64,
+        plane: usize,
+        hash: &str,
+    ) {
+        let path = f.dir.path().join(format!("f{frame_id}.p{plane}.athf"));
+        fits_artifact::write_fits(&path, &[]).expect("fits artifact write");
+        let size = std::fs::metadata(&path).unwrap().len() as i64;
+        crate::db::stacking::upsert_artifact(
+            &f.conn,
+            &crate::db::stacking::NewArtifact {
+                frames_set_id: f.set_id,
+                frame_id: Some(frame_id),
+                group_key,
+                kind: &fits_artifact::artifact_kind(plane),
+                path: Some(path.to_str().unwrap()),
+                config_hash: hash,
+                size: Some(size),
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+    }
+
     /// The fresh path, end to end: every frame gets a matching `calibrated`
     /// artifact (real file, recorded size), a matching `metrics` artifact,
     /// a previous run whose `stacking_run_frames` rows include all three
@@ -3977,10 +4081,15 @@ mod tests {
                     config_hash: &metrics_hash,
                     size: None,
                     modified_at: None,
-                    payload_json: Some("{}"),
+                    payload_json: Some(&minimal_metrics_payload(1)),
                 },
             )
             .unwrap();
+            // Tier C Task 1: the plan gate now requires the matching `fits`
+            // row(s) too — a `metrics`-only hit reads as stale (see
+            // `build_plan`'s per-frame loop) — so this "nothing stale" fixture
+            // needs one to stay fresh.
+            seed_fits_artifact(&f, &group_key, gf.frame_id, 0, &metrics_hash);
         }
 
         // A previous run that registered all three frames (the new rule's

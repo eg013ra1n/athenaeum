@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::prefilter::{self, SeedPrefilter};
-use super::psf_signal::{self, FitParams, PsfModel, Seed};
+use super::psf_signal::{self, FitParams, PsfModel, Seed, StarFit};
 use super::structure::{self, SeedDetector, StructureParams};
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{self, LocationScale, ScaleEstimator, CLIP_HI, CLIP_LO};
@@ -230,6 +230,19 @@ impl FrameMeasurement {
     }
 }
 
+/// One plane's [`ChannelMeasurement`] plus the [`StarFit`]s the PSF fitter
+/// accepted for it (Tier C Task 1, spec §2.2.1) — `measure_plane` and
+/// `measure_frame`/`measure_frame_with_seeds` keep discarding `fits`
+/// exactly as they always have (they return `channel` alone); the one new
+/// caller that wants both is [`measure_frame_with_fits`], which Measure's
+/// stage 3 uses to persist `fits` as the on-disk `fits` artifact
+/// (`stacking::fits_artifact`) beside `metrics`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaneMeasurement {
+    pub channel: ChannelMeasurement,
+    pub fits: Vec<StarFit>,
+}
+
 /// Which detector seeds a plane's PSF fits (spec §4.1 uses `Fast`; the
 /// Checkpoint B probe's `--seeds full` cross-checks against the slower,
 /// two-pass detector to see whether the choice moves the measurement).
@@ -257,11 +270,13 @@ pub fn measure_plane(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> ChannelMeasurement {
-    measure_plane_with_seeds(data, w, h, opts, pool, SeedSource::Fast)
+    measure_plane_with_seeds(data, w, h, opts, pool, SeedSource::Fast).channel
 }
 
 /// As `measure_plane`, but the seeds handed to the PSF fitter come from the
-/// chosen detector instead of always `detect_fast_data`.
+/// chosen detector instead of always `detect_fast_data`, and the fitter's
+/// accepted [`StarFit`]s ride alongside the measurement (Tier C Task 1)
+/// instead of being dropped after `signal_totals`/`frame_shape` read them.
 pub fn measure_plane_with_seeds(
     data: &[f32],
     w: usize,
@@ -269,7 +284,7 @@ pub fn measure_plane_with_seeds(
     opts: &MeasureOptions,
     pool: Option<&Arc<rayon::ThreadPool>>,
     seed_source: SeedSource,
-) -> ChannelMeasurement {
+) -> PlaneMeasurement {
     let scaled: Vec<f32> = data.iter().map(|v| v * ADU_SCALE).collect();
 
     // The background model and the noise σ are measured FIRST, and on the
@@ -499,9 +514,10 @@ pub fn measure_plane_with_seeds(
     } else {
         0.0
     };
-    ChannelMeasurement {
+    let stars_fitted = outcome.fits.len();
+    let channel = ChannelMeasurement {
         stars_detected,
-        stars_fitted: outcome.fits.len(),
+        stars_fitted,
         beta: outcome.beta,
         fwhm_px,
         eccentricity,
@@ -536,6 +552,10 @@ pub fn measure_plane_with_seeds(
             detect_ms,
             fit_ms,
         },
+    };
+    PlaneMeasurement {
+        channel,
+        fits: outcome.fits,
     }
 }
 
@@ -558,10 +578,37 @@ pub fn measure_frame_with_seeds(
     cancel: &AtomicBool,
     seed_source: SeedSource,
 ) -> Result<FrameMeasurement, IntegrationError> {
+    measure_frame_inner(path, opts, pool, cancel, seed_source).map(|(m, _)| m)
+}
+
+/// As `measure_frame`, but also returns every plane's accepted [`StarFit`]s
+/// (Tier C Task 1), indexed like `FrameMeasurement::channels` — `fits[i]`
+/// is what fed `channels[i]`. The one caller that needs them today is
+/// Measure's own stage 3 (`stacking::run`), which persists each plane's
+/// list as the on-disk `fits` artifact beside `metrics`; every other
+/// `measure_frame`/`measure_frame_with_seeds` caller is untouched by this
+/// function's existence.
+pub fn measure_frame_with_fits(
+    path: &Path,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+) -> Result<(FrameMeasurement, Vec<Vec<StarFit>>), IntegrationError> {
+    measure_frame_inner(path, opts, pool, cancel, SeedSource::Fast)
+}
+
+fn measure_frame_inner(
+    path: &Path,
+    opts: &MeasureOptions,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+    seed_source: SeedSource,
+) -> Result<(FrameMeasurement, Vec<Vec<StarFit>>), IntegrationError> {
     let start = Instant::now();
     let reader = PlaneReader::open(path)?;
     let (w, h) = (reader.width(), reader.height());
     let mut channels = Vec::with_capacity(reader.channels());
+    let mut fits_by_plane: Vec<Vec<StarFit>> = Vec::with_capacity(reader.channels());
     for plane in 0..reader.channels() {
         if cancel.load(Ordering::Relaxed) {
             return Err(IntegrationError::Cancelled);
@@ -570,7 +617,8 @@ pub fn measure_frame_with_seeds(
         let data = reader.read_plane(plane)?;
         let read_ms = t.elapsed().as_millis() as u64;
         let _span = tracing::debug_span!("measure_plane", path = %path.display(), plane).entered();
-        let mut m = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
+        let pm = measure_plane_with_seeds(&data, w, h, opts, pool, seed_source);
+        let mut m = pm.channel;
         m.timings.read_ms = read_ms;
         debug!(
             path = %path.display(),
@@ -595,13 +643,17 @@ pub fn measure_frame_with_seeds(
             "frame plane measured"
         );
         channels.push(m);
+        fits_by_plane.push(pm.fits);
     }
-    Ok(FrameMeasurement {
-        width: w,
-        height: h,
-        channels,
-        duration_ms: start.elapsed().as_millis() as u64,
-    })
+    Ok((
+        FrameMeasurement {
+            width: w,
+            height: h,
+            channels,
+            duration_ms: start.elapsed().as_millis() as u64,
+        },
+        fits_by_plane,
+    ))
 }
 
 #[cfg(test)]
@@ -713,7 +765,7 @@ mod tests {
         let (data, w, h) = field(7, 1.0, 0.002);
         let opts = MeasureOptions::default();
         let a = measure_plane(&data, w, h, &opts, None);
-        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
+        let b = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel;
         let stars_fitted = a.stars_fitted;
         assert_eq!(without_timings(a), without_timings(b));
         assert!(stars_fitted > 0, "fixture should fit stars: {stars_fitted}");
@@ -833,6 +885,51 @@ mod tests {
         ));
     }
 
+    /// Tier C Task 1: `measure_plane_with_seeds` hands back the same fits
+    /// count `ChannelMeasurement::stars_fitted` reports, and
+    /// `measure_frame_with_fits` indexes them per plane exactly like
+    /// `FrameMeasurement::channels` — the shape Measure's stage 3 relies on
+    /// to write one `.athf` file per plane. `measure_frame` (the discarding
+    /// path every other caller still uses) measures byte-identically to the
+    /// fits-returning one.
+    #[test]
+    fn measure_plane_and_frame_expose_the_accepted_fits() {
+        let (data, w, h) = field(7, 1.0, 0.002);
+        let opts = MeasureOptions::default();
+        let pm = measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast);
+        assert_eq!(pm.fits.len(), pm.channel.stars_fitted);
+        assert!(!pm.fits.is_empty(), "fixture should fit stars");
+
+        let r = data;
+        let g: Vec<f32> = r.iter().map(|v| v * 0.5).collect();
+        let b = r.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "rgb.fits", &[&r, &g, &b], w, h);
+        let frame_opts = MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            ..MeasureOptions::default()
+        };
+        let (m, fits) =
+            measure_frame_with_fits(&path, &frame_opts, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(fits.len(), m.channels.len());
+        for (channel, plane_fits) in m.channels.iter().zip(&fits) {
+            assert_eq!(channel.stars_fitted, plane_fits.len());
+        }
+        // `measure_frame` (the discarding path every other caller still
+        // uses) measures identically — timings and `duration_ms` are
+        // wall-clock, not measurement output (same convention as
+        // `without_timings` above), so they're zeroed before comparing.
+        fn without_frame_timings(mut f: FrameMeasurement) -> FrameMeasurement {
+            for c in &mut f.channels {
+                c.timings = MeasureTimings::default();
+            }
+            f.duration_ms = 0;
+            f
+        }
+        let discarding = measure_frame(&path, &frame_opts, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(without_frame_timings(discarding), without_frame_timings(m));
+    }
+
     #[test]
     fn a_starless_plane_measures_with_zero_weight() {
         let (w, h) = (256, 256);
@@ -941,14 +1038,9 @@ mod tests {
         // so they're zeroed before the comparison (perf tier 1 Task 0).
         assert_eq!(
             without_timings(c),
-            without_timings(measure_plane_with_seeds(
-                &data,
-                w,
-                h,
-                &opts,
-                None,
-                SeedSource::Fast
-            ))
+            without_timings(
+                measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel
+            )
         );
     }
 
@@ -1039,33 +1131,18 @@ mod tests {
         // the comparison (perf tier 1 Task 0).
         assert_eq!(
             without_timings(b),
-            without_timings(measure_plane_with_seeds(
-                &data,
-                w,
-                h,
-                &peak,
-                None,
-                SeedSource::Structure
-            ))
+            without_timings(
+                measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Structure).channel
+            )
         );
         // ... while an explicit `Full` still wins over the config.
         assert_eq!(
-            without_timings(measure_plane_with_seeds(
-                &data,
-                w,
-                h,
-                &structure,
-                None,
-                SeedSource::Full
-            )),
-            without_timings(measure_plane_with_seeds(
-                &data,
-                w,
-                h,
-                &peak,
-                None,
-                SeedSource::Full
-            ))
+            without_timings(
+                measure_plane_with_seeds(&data, w, h, &structure, None, SeedSource::Full).channel
+            ),
+            without_timings(
+                measure_plane_with_seeds(&data, w, h, &peak, None, SeedSource::Full).channel
+            )
         );
     }
 
@@ -1110,14 +1187,9 @@ mod tests {
     fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
         let opts = MeasureOptions::default();
-        let m = without_timings(measure_plane_with_seeds(
-            &data,
-            w,
-            h,
-            &opts,
-            None,
-            SeedSource::Fast,
-        ));
+        let m = without_timings(
+            measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel,
+        );
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \

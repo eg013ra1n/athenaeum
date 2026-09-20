@@ -59,6 +59,7 @@
 
 pub mod config;
 pub mod drizzle;
+pub mod fits_artifact;
 pub mod groups;
 pub mod integrate;
 pub mod ln;

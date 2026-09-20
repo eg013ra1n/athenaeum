@@ -54,6 +54,15 @@ impl WorkingLayout {
         self.root.join("ln")
     }
 
+    /// `root/fits` — the parent of every group's persisted star-fits
+    /// subdirectory (Tier C Task 1, spec §2.2.1): one `.athf` file per
+    /// (frame, plane), the fits Measure's PSF fitter accepted, cached like
+    /// `metrics` (same hash, same `CleanupWhat::All`-only sweep) but with a
+    /// file on disk behind each row.
+    pub fn fits_root(&self) -> PathBuf {
+        self.root.join("fits")
+    }
+
     /// `root/runs` — one JSON snapshot per run (see [`Self::run_json`]).
     pub fn runs_root(&self) -> PathBuf {
         self.root.join("runs")
@@ -74,6 +83,22 @@ impl WorkingLayout {
     /// `root/ln/<group_key>` — stage-6 local-normalization intermediates.
     pub fn ln_dir(&self, group_key: &str) -> PathBuf {
         self.ln_root().join(group_key)
+    }
+
+    /// `root/fits/<group_key>` — one group's persisted star-fits files.
+    pub fn fits_dir(&self, group_key: &str) -> PathBuf {
+        self.fits_root().join(group_key)
+    }
+
+    /// `root/fits/<group_key>/<stem>.p<plane>.athf` — one PLANE's persisted
+    /// fits (Tier C Task 1): `stem` is the SAME collision-safe stem
+    /// [`crate::stacking::run::calibrated_file_stem`] gave the calibrated
+    /// file (the same convention `registered_file_name` follows for its
+    /// own naming), `plane` the 0-based [`crate::integration::plane_reader::PlaneReader`]
+    /// index.
+    pub fn fits_path(&self, group_key: &str, stem: &str, plane: usize) -> PathBuf {
+        self.fits_dir(group_key)
+            .join(format!("{stem}.p{plane}.athf"))
     }
 
     /// `root/ln/<group_key>/reference.fits` — the group's chosen local-
@@ -500,6 +525,13 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Tier C Task 1: the flat per-plane byte estimate [`estimate_bytes`] uses
+/// for the `fits` artifact — the midpoint of the spec's own "≈ 200-400 KB
+/// per plane" figure (`fits_artifact.rs`'s module doc), not a measured
+/// average over real star counts (a starless plane's file is a few dozen
+/// bytes, a rich one several times this).
+const FITS_ARTIFACT_ESTIMATE_BYTES: u64 = 300_000;
+
 /// Inputs to [`estimate_bytes`]: the groups a run would integrate, and the
 /// output toggles that change how much gets written (whether registered
 /// frames are kept on disk, whether rejection maps are written alongside the
@@ -573,6 +605,13 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
             .map(|f| planes * f.width.max(0) as u64 * f.height.max(0) as u64 * 4)
             .sum();
         total += calibrated_bytes;
+
+        // Tier C Task 1: one `.athf` file per (frame, plane), a small flat
+        // constant against a star-count-independent budget — the spec's own
+        // "≈ 200-400 KB per plane" estimate, taken at its midpoint. Every
+        // group's frames get measured whether or not this run's caches hit,
+        // so this term is unconditional, like `calibrated_bytes` above.
+        total += g.frames.len() as u64 * planes * FITS_ARTIFACT_ESTIMATE_BYTES;
 
         // Fix round 2 (ruling R-TA-6 M5): `max_w`/`max_h` — the group's
         // largest member's native geometry, the SAME approximation the
@@ -650,6 +689,10 @@ pub struct WorkUsage {
     pub calibrated_bytes: u64,
     pub registered_bytes: u64,
     pub ln_bytes: u64,
+    /// Tier C Task 1: bytes under `fits/` — the persisted per-plane star
+    /// fits, cached like `metrics` (no file of its own) but WITH a file
+    /// behind each row, so it earns a byte counter `metrics` never needed.
+    pub fits_bytes: u64,
     pub runs_bytes: u64,
     /// M3 Task 2: bytes under `rej/` — per-run rejection-bitmap temporaries
     /// (spec §6.2, ruling R-M3-8), never a `stacking_artifacts` row.
@@ -672,6 +715,7 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
     let calibrated_bytes = crate::api::sync::dir_size_bytes(&layout.calibrated_root());
     let registered_bytes = crate::api::sync::dir_size_bytes(&layout.registered_root());
     let ln_bytes = crate::api::sync::dir_size_bytes(&layout.ln_root());
+    let fits_bytes = crate::api::sync::dir_size_bytes(&layout.fits_root());
     let runs_bytes = crate::api::sync::dir_size_bytes(&layout.runs_root());
     let rej_bytes = crate::api::sync::dir_size_bytes(&layout.rej_root());
     let previews_bytes = crate::api::sync::dir_size_bytes(&layout.previews_root());
@@ -679,12 +723,14 @@ pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
         calibrated_bytes,
         registered_bytes,
         ln_bytes,
+        fits_bytes,
         runs_bytes,
         rej_bytes,
         previews_bytes,
         total_bytes: calibrated_bytes
             + registered_bytes
             + ln_bytes
+            + fits_bytes
             + runs_bytes
             + rej_bytes
             + previews_bytes,
@@ -721,6 +767,17 @@ pub enum CleanupWhat {
 /// not on the calibrated file's identity, so a re-calibration after this
 /// cleanup regenerates a byte-identical frame and the kept row is a valid
 /// cache hit for it. Only `All` — "delete everything" — drops it.
+///
+/// `fits` (the `"fits.<plane>"` kind strings, Tier C Task 1) follows
+/// `metrics` for the same reason and stays out of this list too, even
+/// though — unlike `metrics` — it DOES have a file behind it: the two are
+/// written together and share `metrics`' hash, so an `Intermediates`
+/// cleanup that kept `metrics` but dropped `fits` would make the very next
+/// plan-gate check see a fresh `metrics` row with no matching `fits` row
+/// and correctly re-measure anyway (see `plan.rs`'s Measure staleness) —
+/// keeping `fits` alongside it just avoids paying that re-measure for
+/// nothing. Its directory (`fits/`) is removed only under `All`, alongside
+/// `metrics`' own drop.
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "registered",
     "calibrated",
@@ -768,6 +825,10 @@ pub fn cleanup_work(
             // an intermediate, so clearing intermediates must not throw the
             // Results cards' thumbnails away.
             dirs.push(layout.previews_root());
+            // Tier C Task 1: `fits/` follows `metrics` — see
+            // `INTERMEDIATE_ARTIFACT_KINDS`'s own doc for why both survive
+            // `Intermediates` and drop only here.
+            dirs.push(layout.fits_root());
         }
     }
 
@@ -1237,7 +1298,12 @@ mod tests {
             large_scale: false,
             drizzle_bayer: false,
         };
-        let expected = 2 * 400 + 1 * 1200 + (400 * 3) + (1200 * 3);
+        // Tier C Task 1: the fits term is a flat per-(frame, plane) add-on,
+        // unconditional and independent of every other toggle — 2 mono
+        // frames (1 plane) + 1 OSC frame (3 planes) at
+        // `FITS_ARTIFACT_ESTIMATE_BYTES` each.
+        let fits_term = (2 * 1 + 1 * 3) * FITS_ARTIFACT_ESTIMATE_BYTES;
+        let expected = 2 * 400 + 1 * 1200 + (400 * 3) + (1200 * 3) + fits_term;
         assert_eq!(estimate_bytes(&inputs), expected);
     }
 

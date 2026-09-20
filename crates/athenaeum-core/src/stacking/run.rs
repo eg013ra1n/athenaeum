@@ -67,6 +67,7 @@ use crate::stacking::config::{CleanupPolicy, ReferenceMode, StackingConfig};
 use crate::stacking::drizzle::{
     drizzle_group, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
 };
+use crate::stacking::fits_artifact;
 use crate::stacking::groups::{group_frames, set_slug, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::integrate::{
     included_after_min_weight, integrate_group, large_scale_passes, GroupInput, GroupProgress,
@@ -81,7 +82,7 @@ use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
     write_drizzled_master, write_master_light, MasterCardInputs, WrittenDrizzle,
 };
-use crate::stacking::measure::{measure_frame, FrameMeasurement, MeasureOptions};
+use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, is_fresh, measurement_hash_for, normalization_hash_for, registration_hash_for,
@@ -91,6 +92,7 @@ use crate::stacking::plan::{
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
+use crate::stacking::psf_signal;
 use crate::stacking::register::align::{SeedKind, SeedPolicy};
 use crate::stacking::register::frame::{
     detect_frame_stars, identity_registration, reference_stars, register_detected, to_record,
@@ -281,6 +283,12 @@ pub(crate) struct RunContext {
     /// directly: the per-group INCLUDED frames' calibrated paths,
     /// measurements and `PixelMap`s all live here.
     pub(crate) measured: HashMap<String, Vec<MeasuredFrame>>,
+    /// Group key -> that group's stage 3 summary beyond the per-frame list
+    /// above (Tier C Task 1) — today just the resolved group β. Built at
+    /// the same point as the `measured` entry for that group; a group
+    /// never in this map measured no frame at all (or the run never
+    /// reached stage 3).
+    pub(crate) measured_groups: HashMap<String, MeasuredGroup>,
     /// The run's chosen reference (stage 4) — `None` until stage 4 runs.
     pub(crate) reference_frame_id: Option<i64>,
     /// The reference frame's own calibrated file (stage 4 looks this up from
@@ -898,6 +906,7 @@ pub fn start_stacking(
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
         measured: HashMap::new(),
+        measured_groups: HashMap::new(),
         reference_frame_id: None,
         reference_calibrated: None,
         reference_width: 0,
@@ -2263,6 +2272,21 @@ pub(crate) struct MeasuredFrame {
     cached_ln: bool,
 }
 
+/// Stage 3's per-group summary beyond the per-frame [`MeasuredFrame`] list
+/// (Tier C Task 1, ruling C-1/C-1a) — one entry per group in
+/// `RunContext::measured_groups`, built at the same point stage 3 inserts
+/// into `RunContext::measured`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MeasuredGroup {
+    /// The group β: the lower median of every measured member's own `Auto`
+    /// pick ([`psf_signal::group_beta`]), always one of
+    /// [`psf_signal::AUTO_BETAS`]. `None` when the group measured no
+    /// frame at all. Nothing reads this yet — Task 2 will hand it to the
+    /// LN reference build and to every mapped fit's flux correction as
+    /// `PsfModel::Fixed`.
+    pub beta: Option<f64>,
+}
+
 /// One frame's stage 5 outcome. `cached: true` means an existing
 /// `registration_results` row was reused verbatim (ruling 10) — no
 /// `register_frame` call, no `upsert_registration` write; `record` is the
@@ -3061,7 +3085,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
             let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
             let ticker_ref = &ticker;
             let results = fan_out(items, admission_n, cancel_ref, move |(frame_id, path)| {
-                let out = measure_frame(&path, &opts, Some(pool_ref), cancel_ref)
+                let out = measure_frame_with_fits(&path, &opts, Some(pool_ref), cancel_ref)
                     .map_err(|e| format!("measurement failed: {e}"));
                 ticker_ref.tick(Some(frame_id));
                 out
@@ -3085,7 +3109,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                             "frame excluded"
                         );
                     }
-                    Some(Ok(m)) => {
+                    Some(Ok((m, fits))) => {
                         let calib_hash = {
                             let conn = db(&rc.ctx)?.conn();
                             rc.memo.calibration_hash_checked(&conn, &cfg, frame)?
@@ -3108,6 +3132,39 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                                     size: None,
                                     modified_at: None,
                                     payload_json: Some(&payload),
+                                },
+                            )?;
+                        }
+                        // Tier C Task 1 (spec §2.2.1): persist every plane's
+                        // accepted star fits beside `metrics`, one
+                        // `.athf` file and one `stacking_artifacts` row per
+                        // plane, keyed on the SAME `expected_hash` — the two
+                        // are a product of the same computation and share
+                        // its staleness (see `plan.rs`'s per-frame loop).
+                        let stem = calibrated_file_stem(group, frame);
+                        for (plane, plane_fits) in fits.iter().enumerate() {
+                            let fits_path = rc.layout.fits_path(&group.key, &stem, plane);
+                            fits_artifact::write_fits(&fits_path, plane_fits).map_err(|e| {
+                                RunError::Other(format!(
+                                    "fits artifact write failed: path={}: {e}",
+                                    fits_path.display()
+                                ))
+                            })?;
+                            let (size, modified_at) = file_identity(&fits_path)?;
+                            let kind = fits_artifact::artifact_kind(plane);
+                            let conn = db(&rc.ctx)?.conn();
+                            upsert_artifact(
+                                &conn,
+                                &NewArtifact {
+                                    frames_set_id: rc.set_id,
+                                    frame_id: Some(frame.frame_id),
+                                    group_key: &group.key,
+                                    kind: &kind,
+                                    path: fits_path.to_str(),
+                                    config_hash: &expected_hash,
+                                    size: Some(size),
+                                    modified_at: Some(&modified_at),
+                                    payload_json: None,
                                 },
                             )?;
                         }
@@ -3205,6 +3262,42 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
         }
 
         let included_count = entries.iter().filter(|e| e.included).count();
+
+        // Perf tier C Task 1 (ruling C-1/C-1a): one β for the whole group,
+        // the lower median of every MEASURED member's own `Auto` pick —
+        // every channel of every frame this stage actually measured
+        // (fresh or reused from a cached `metrics` row), never narrowed to
+        // `included` (weighing/selection happens above, over the SAME
+        // `Auto` β regardless of which frames end up combined). `None`
+        // when the group measured nothing at all. Recorded only — nothing
+        // consumes it yet (Task 2 will).
+        let group_beta_value: Option<f64> = {
+            let betas: Vec<f64> = entries
+                .iter()
+                .filter_map(|e| e.measurement.as_ref())
+                .flat_map(|m| m.channels.iter().map(|c| c.beta))
+                .collect();
+            if betas.is_empty() {
+                None
+            } else {
+                Some(psf_signal::group_beta(&betas))
+            }
+        };
+        rc.measured_groups.insert(
+            group.key.clone(),
+            MeasuredGroup {
+                beta: group_beta_value,
+            },
+        );
+        if let Some(beta) = group_beta_value {
+            tracing::debug!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                beta,
+                "stacking group beta resolved"
+            );
+        }
+
         {
             let conn = db(&rc.ctx)?.conn();
             let group_id = *rc.group_ids.get(&group.key).ok_or_else(|| {
@@ -3230,6 +3323,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     &GroupUpdate {
                         included_count: Some(included_count as i64),
                         status: Some("skipped"),
+                        beta: group_beta_value,
                         ..Default::default()
                     },
                 )?;
@@ -3240,6 +3334,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     group_id,
                     &GroupUpdate {
                         included_count: Some(included_count as i64),
+                        beta: group_beta_value,
                         ..Default::default()
                     },
                 )?;
@@ -5735,6 +5830,12 @@ fn push_summary_group(
             .map(|g| g.reference_frame_id)
     });
 
+    // Perf tier C Task 1: whatever stage 3 resolved for this group, if
+    // anything — `None` for a group `push_summary_group` is called for
+    // before stage 3 ever ran for it (there is no such call site today,
+    // but this reads honestly either way).
+    let beta = rc.measured_groups.get(&group.key).and_then(|mg| mg.beta);
+
     rc.summary.groups.push(SummaryGroup {
         key: group.key.clone(),
         frame_count: group.frames.len(),
@@ -5749,6 +5850,7 @@ fn push_summary_group(
         drizzle_path,
         weight_map_path,
         drizzle,
+        beta,
         frames,
     });
 }
@@ -8815,6 +8917,7 @@ pub(crate) fn test_context(
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
         measured: HashMap::new(),
+        measured_groups: HashMap::new(),
         reference_frame_id: None,
         reference_calibrated: None,
         reference_width: 0,
@@ -10167,6 +10270,167 @@ mod tests {
         assert_eq!(
             before, after,
             "a fresh metrics artifact must not be recreated"
+        );
+    }
+
+    /// Perf tier C Task 1: stage 3 writes one `fits.0` artifact per frame
+    /// (this fixture's mono field, one plane) alongside `metrics`, each
+    /// readable back with `read_fits` and matching that frame's own
+    /// `stars_fitted`; the group row's `beta` is `psf_signal::group_beta`
+    /// of the members' own `Auto` picks; a second run reads both as
+    /// cached; deleting one frame's `.athf` file (not its DB row) makes
+    /// the plan gate report Measure stale for that frame, even though its
+    /// `metrics` row is untouched.
+    #[test]
+    fn measure_writes_fits_artifacts_and_the_group_beta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+
+        let build = |run_id: i64, group_ids: HashMap<String, i64>| {
+            test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg.clone(),
+                plan_groups.clone(),
+                layout.clone(),
+                output_dir.clone(),
+                group_ids,
+            )
+        };
+
+        let (run_id1, group_ids1) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc1 = build(run_id1, group_ids1);
+        run_stages_for_test(&mut rc1, Stage::Measure).unwrap();
+
+        let metrics =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
+                .unwrap();
+        assert_eq!(metrics.len(), 4, "{metrics:?}");
+        let fits_rows =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
+                .unwrap();
+        assert_eq!(
+            fits_rows.len(),
+            4,
+            "one fits.0 row per frame (mono, one plane): {fits_rows:?}"
+        );
+
+        let mut betas: Vec<f64> = Vec::new();
+        for metrics_row in &metrics {
+            let frame_id = metrics_row.frame_id.expect("metrics row has a frame_id");
+            let m: FrameMeasurement =
+                serde_json::from_str(metrics_row.payload_json.as_deref().unwrap()).unwrap();
+            assert_eq!(m.channels.len(), 1, "mono fixture: one channel");
+            betas.push(m.channels[0].beta);
+
+            let fits_row = fits_rows
+                .iter()
+                .find(|a| a.frame_id == Some(frame_id))
+                .unwrap_or_else(|| panic!("no fits.0 row for frame {frame_id}"));
+            assert_eq!(fits_row.config_hash, metrics_row.config_hash);
+            let fits =
+                fits_artifact::read_fits(Path::new(fits_row.path.as_deref().unwrap())).unwrap();
+            assert_eq!(
+                fits.len(),
+                m.channels[0].stars_fitted,
+                "read_fits must return exactly the frame's stars_fitted count"
+            );
+        }
+
+        let expected_beta = psf_signal::group_beta(&betas);
+        let groups_after = crate::db::stacking::list_groups(&fixture.conn, run_id1).unwrap();
+        assert_eq!(groups_after.len(), 1);
+        assert_eq!(
+            groups_after[0].beta,
+            Some(expected_beta),
+            "the group row's beta must be group_beta() of the members' own Auto picks"
+        );
+
+        // A second run: everything reads as cached, `fits_cached` included.
+        let plan = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Measure),
+            "{:?}",
+            plan.stale_stages
+        );
+        assert_eq!(plan.groups[0].fits_cached, plan.groups[0].frame_count);
+
+        let (run_id2, group_ids2) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc2 = build(run_id2, group_ids2);
+        run_stages_for_test(&mut rc2, Stage::Measure).unwrap();
+        let fits_rows2 =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
+                .unwrap();
+        assert_eq!(
+            fits_rows2.iter().map(|a| &a.created_at).collect::<Vec<_>>(),
+            fits_rows.iter().map(|a| &a.created_at).collect::<Vec<_>>(),
+            "a fresh fits artifact must not be recreated"
+        );
+
+        // Delete one frame's `.athf` FILE (not its DB row): `metrics` for
+        // that frame is untouched, but Measure must still read as stale for
+        // it — the pair, not either row alone, decides freshness.
+        let victim = fits_rows[0].path.as_deref().unwrap();
+        std::fs::remove_file(victim).unwrap();
+        let plan_after_delete = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            plan_after_delete.stale_stages.contains(&Stage::Measure),
+            "a fits file removed by hand must make Measure stale even though metrics survives: {:?}",
+            plan_after_delete.stale_stages
+        );
+        assert_eq!(
+            plan_after_delete.groups[0].fits_cached, 3,
+            "only the untouched three frames still read fits-fresh"
+        );
+        assert_eq!(
+            plan_after_delete.groups[0].metrics_cached, 4,
+            "metrics itself is untouched by the fits deletion"
         );
     }
 
