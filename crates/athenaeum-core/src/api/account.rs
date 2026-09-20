@@ -169,6 +169,9 @@ fn map_client_err(e: AccountClientError) -> ApiError {
         // Fixed, actionable message so the rename UI can suggest a suffix.
         AccountClientError::DuplicateName => ApiError::Invalid("name already in use".into()),
         AccountClientError::BadRequest(m) => ApiError::Invalid(m),
+        AccountClientError::Forbidden => {
+            ApiError::Forbidden("The account's role may not perform this action.".into())
+        }
         AccountClientError::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }

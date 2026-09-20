@@ -236,17 +236,24 @@ impl CollabClient {
 
     /// The hub's snapshot-signing pubkey (base64). Fetched once and pinned.
     pub async fn collab_pubkey(&self) -> Result<String, AccountClientError> {
-        let wire: PubkeyWire = self.get_json("/collab/pubkey", None, "collab pubkey").await?;
+        let wire: PubkeyWire = self
+            .get_json("/collab/pubkey", None, "collab pubkey")
+            .await?;
         Ok(wire.pubkey)
     }
 
     pub async fn my_projects(&self, token: &str) -> Result<Vec<MyProjectWire>, AccountClientError> {
-        self.get_json("/me/projects", Some(token), "my projects").await
+        self.get_json("/me/projects", Some(token), "my projects")
+            .await
     }
 
     /// Public page (no token) — target/members for the cache.
-    pub async fn project_page(&self, id_or_slug: &str) -> Result<ProjectPageWire, AccountClientError> {
-        self.get_json(&format!("/projects/{id_or_slug}"), None, "project page").await
+    pub async fn project_page(
+        &self,
+        id_or_slug: &str,
+    ) -> Result<ProjectPageWire, AccountClientError> {
+        self.get_json(&format!("/projects/{id_or_slug}"), None, "project page")
+            .await
     }
 
     pub async fn membership_snapshot(
@@ -404,9 +411,10 @@ impl CollabClient {
     /// packages the device holds right now (an empty slice is a real
     /// statement: "I hold nothing here any more"). 204 → Ok; 401 →
     /// `Unauthorized`; 403 (the caller's role may not hold packages, e.g.
-    /// `send`-only) and any other status surface via `unexpected` as
-    /// `Network`, never `Unauthorized` — the caller treats 403 as an expected
-    /// outcome, not a dead token.
+    /// `send`-only) → `Forbidden` — a role fact, never folded into
+    /// `Unauthorized`; any other status surfaces via `unexpected` as
+    /// `Network`. `Forbidden` is a mapping local to THIS method — no other
+    /// client call produces it.
     pub async fn report_have_set(
         &self,
         token: &str,
@@ -424,6 +432,7 @@ impl CollabClient {
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
+            StatusCode::FORBIDDEN => Err(AccountClientError::Forbidden),
             s => Err(unexpected(s, resp).await),
         }
     }
@@ -452,10 +461,12 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/me/projects"))
             .and(header("authorization", "Bearer tok"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                "id": "p-1", "slug": "m101", "title": "M 101", "dataRole": "send_receive",
-                "coordinator": true, "requireApproval": true, "pendingAnnouncements": 2
-            }])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": "p-1", "slug": "m101", "title": "M 101", "dataRole": "send_receive",
+                    "coordinator": true, "requireApproval": true, "pendingAnnouncements": 2
+                }])),
+            )
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
@@ -602,9 +613,14 @@ mod tests {
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
-        let err = client.announce("tok", "p-1", &sample_announce_req()).await.unwrap_err();
+        let err = client
+            .announce("tok", "p-1", &sample_announce_req())
+            .await
+            .unwrap_err();
         match err {
-            AccountClientError::Network(msg) => assert!(msg.contains("closed"), "closed msg: {msg}"),
+            AccountClientError::Network(msg) => {
+                assert!(msg.contains("closed"), "closed msg: {msg}")
+            }
             other => panic!("expected Network for 409, got {other:?}"),
         }
 
@@ -617,7 +633,10 @@ mod tests {
             .mount(&server2)
             .await;
         let client2 = CollabClient::new(server2.uri()).unwrap();
-        let err2 = client2.announce("tok", "p-1", &sample_announce_req()).await.unwrap_err();
+        let err2 = client2
+            .announce("tok", "p-1", &sample_announce_req())
+            .await
+            .unwrap_err();
         match err2 {
             AccountClientError::Network(msg) => {
                 assert!(msg.contains("already announced"), "dup msg: {msg}")
@@ -635,7 +654,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
-        let err = client.announce("tok", "p-1", &sample_announce_req()).await.unwrap_err();
+        let err = client
+            .announce("tok", "p-1", &sample_announce_req())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, AccountClientError::Unauthorized),
             "401 must map to Unauthorized, got {err:?}"
@@ -682,7 +704,10 @@ mod tests {
         assert_eq!(anns[0].holders[0].display_name, "Vilen");
         // T7: the holder's self-reported relay url decodes (fed into the download
         // dial hint); a holder that reports no relay defaults to `None`.
-        assert_eq!(anns[0].holders[0].relay_url.as_deref(), Some("https://holder-relay.example.org/"));
+        assert_eq!(
+            anns[0].holders[0].relay_url.as_deref(),
+            Some("https://holder-relay.example.org/")
+        );
         assert_eq!(anns[0].holders[1].relay_url, None);
         assert_eq!(anns[0].holders[1].last_seen_at, None);
         assert_eq!(anns[0].supersedes, vec!["ann-0".to_string()]);
@@ -744,7 +769,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
-        let err = client.approve_announcement("tok", "ann-1").await.unwrap_err();
+        let err = client
+            .approve_announcement("tok", "ann-1")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, AccountClientError::Network(_)),
             "403 body-less must map to Network, got {err:?}"
@@ -781,7 +809,10 @@ mod tests {
         let err = client.report_have("tok", "ann-1").await.unwrap_err();
         match err {
             AccountClientError::Network(msg) => {
-                assert!(msg.contains("device token required"), "message surfaced: {msg}")
+                assert!(
+                    msg.contains("device token required"),
+                    "message surfaced: {msg}"
+                )
             }
             other => panic!("expected Network for 400 (not Unauthorized), got {other:?}"),
         }
@@ -816,7 +847,13 @@ mod tests {
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
-        let err = client.report_have_set("tok", "proj-1", &[]).await.unwrap_err();
-        assert!(!matches!(err, AccountClientError::Unauthorized), "403 = role, not a dead token: {err:?}");
+        let err = client
+            .report_have_set("tok", "proj-1", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AccountClientError::Forbidden),
+            "403 = role, not a dead token: {err:?}"
+        );
     }
 }

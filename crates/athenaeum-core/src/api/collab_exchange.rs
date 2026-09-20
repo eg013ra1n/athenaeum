@@ -248,34 +248,64 @@ fn manifest_fully_local(
     Ok(true)
 }
 
+/// Outcome of [`package_fully_held`]. `NotComplete` and `NoManifest` are the
+/// ORDINARY course of a package still in flight or never retained; only
+/// `ManifestNotCovered` — locally `complete` yet missing payload the retained
+/// manifest promises — is the anomaly worth a `warn!` at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldState {
+    /// `local_status == "complete"` and every manifest record resolves to a
+    /// locally-held contribution — this device can actually serve it.
+    Held,
+    /// `local_status != "complete"` — still downloading, failed, or never
+    /// started. Ordinary; not logged above `debug!`.
+    NotComplete,
+    /// `local_status == "complete"` but no manifest was ever retained
+    /// (`manifest_ndjson` is `NULL`). Ordinary for a row that pre-dates
+    /// manifest retention or was never fully received; not logged above
+    /// `debug!`.
+    NoManifest,
+    /// `local_status == "complete"` AND a manifest is retained, but
+    /// [`manifest_fully_local`] found a record with no locally-held payload.
+    /// This SHOULD NOT happen — it means the row claims completeness the
+    /// content doesn't back up — so the call site warns.
+    ManifestNotCovered,
+}
+
 /// The have-report completeness gate (F1): local status is `complete` AND the
 /// retained manifest's every record resolves to a locally-held contribution
 /// ([`manifest_fully_local`]) — the same predicate [`reconstruct_serve_dir`]
 /// enforces before it will serve a package. Shared by the post-ingest hook
 /// ([`report_have_after_ingest`]) and the auto-sync pass's full-set report
-/// ([`held_package_ids_for_project`]), so both agree on what "held" means. A
-/// row with no retained manifest (never fully received) is never held.
-fn package_fully_held(conn: &rusqlite::Connection, row: &PackageRow) -> Result<bool> {
+/// ([`held_package_ids_for_project`]), so both agree on what "held" means.
+/// Returns a [`HeldState`] rather than a bare bool so callers can tell the
+/// ordinary "not held yet" cases from the complete-but-uncovered anomaly and
+/// log each at its own level — one predicate, two log levels.
+fn package_fully_held(conn: &rusqlite::Connection, row: &PackageRow) -> Result<HeldState> {
     if row.local_status != "complete" {
-        return Ok(false);
+        return Ok(HeldState::NotComplete);
     }
     let Some(bytes) = row.manifest_ndjson.as_deref() else {
-        return Ok(false);
+        return Ok(HeldState::NoManifest);
     };
     let records = parse_manifest_bytes(bytes)?;
-    manifest_fully_local(conn, &row.project_id, &records)
+    if manifest_fully_local(conn, &row.project_id, &records)? {
+        Ok(HeldState::Held)
+    } else {
+        Ok(HeldState::ManifestNotCovered)
+    }
 }
 
 /// Every package of `project_id` this device currently fully holds
-/// ([`package_fully_held`]) — the body of the auto-sync pass's
-/// `PUT /projects/{id}/have` re-confirmation.
+/// ([`package_fully_held`] == [`HeldState::Held`]) — the body of the
+/// auto-sync pass's `PUT /projects/{id}/have` re-confirmation.
 pub(crate) fn held_package_ids_for_project(
     conn: &rusqlite::Connection,
     project_id: &str,
 ) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     for row in list_packages(conn, project_id)? {
-        if package_fully_held(conn, &row)? {
+        if package_fully_held(conn, &row)? == HeldState::Held {
             ids.push(row.package_id);
         }
     }
@@ -695,6 +725,9 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
         E::SecondPrimary(m) | E::DeviceConflict(m) => ApiError::Conflict(m),
         E::PeerValidation(m) | E::BadRequest(m) => ApiError::Invalid(m),
         E::DuplicateName => ApiError::Invalid("name already in use".into()),
+        E::Forbidden => {
+            ApiError::Forbidden("The account's role may not perform this action.".into())
+        }
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }
@@ -1060,16 +1093,29 @@ pub async fn report_have_after_ingest(
         // Gate (F1): only advertise a package we can ACTUALLY fully serve. The
         // post-ingest hook fires even after a partial/failed ingest, so without
         // this the hub would list us as a holder that per-frame-fails every
-        // requester.
-        let fully_held = package_fully_held(&conn, &row)
+        // requester. `ManifestNotCovered` is the anomaly (complete, yet the
+        // content doesn't back it up) and warrants a `warn!`; the other two
+        // non-held states are the ordinary course of a package still in
+        // flight and only `debug!`.
+        let held = package_fully_held(&conn, &row)
             .map_err(|e| ApiError::Internal(format!("package fully-held check: {e:#}")))?;
-        if !fully_held {
-            tracing::debug!(
-                package_id,
-                local_status = %row.local_status,
-                "report_have skipped: package not fully held"
-            );
-            return Ok(());
+        match held {
+            HeldState::Held => {}
+            HeldState::ManifestNotCovered => {
+                tracing::warn!(
+                    package_id,
+                    "report_have skipped: retained manifest not fully covered by local payloads"
+                );
+                return Ok(());
+            }
+            HeldState::NotComplete | HeldState::NoManifest => {
+                tracing::debug!(
+                    package_id,
+                    local_status = %row.local_status,
+                    "report_have skipped: package not fully held"
+                );
+                return Ok(());
+            }
         }
         row.announcement_id
     };
@@ -1090,11 +1136,17 @@ pub async fn report_have_after_ingest(
 /// [`run_auto_sync_pass`]). An empty held set is still sent: "I hold nothing
 /// here any more" is a real statement that clears stale rows on the hub.
 ///
-/// Signed out ⇒ `Ok(0)`, nothing to report. A 403 (the caller's role may not
-/// hold packages, e.g. a `send`-only member) is EXPECTED on every pass for
-/// such a member, not a failure — logged at `debug!` and folded into `Ok(0)`;
-/// a dead token (401) propagates as the usual `SignedOut` mapping; any other
-/// error is returned for the caller to log and step over.
+/// Signed out ⇒ `Ok(0)`, nothing to report. A 403
+/// ([`AccountClientError::Forbidden`](crate::account::AccountClientError))
+/// is folded into `Ok(0)` at `debug!` rather than treated as a failure — the
+/// caller is only ever a coordinator or a `send_receive` member (the role
+/// gate above never lets a plain `send` member reach this call at all, see
+/// [`run_auto_sync_pass`]'s `role_allows` check), so a 403 here means either a
+/// `send`-role COORDINATOR (coordinators pass the gate regardless of
+/// `data_role`) or a hub-side refusal for some other reason — not the common
+/// case the gate already filters out, but still not a caller-actionable
+/// failure. A dead token (401) propagates as the usual `SignedOut` mapping;
+/// any other error is returned for the caller to log and step over.
 pub async fn report_held_set(ctx: &ServiceContext, project_id: &str) -> Result<usize, ApiError> {
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
         return Ok(0);
@@ -1106,20 +1158,19 @@ pub async fn report_held_set(ctx: &ServiceContext, project_id: &str) -> Result<u
             .map_err(|e| ApiError::Internal(format!("held package ids: {e:#}")))?
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
-    match client.report_have_set(&token, project_id, &package_ids).await {
+    match client
+        .report_have_set(&token, project_id, &package_ids)
+        .await
+    {
         Ok(()) => {
             tracing::info!(project_id, count = package_ids.len(), "held set reported");
             Ok(package_ids.len())
         }
-        // `report_have_set` maps every non-200/204/401 status through
-        // `unexpected()`, which formats as "hub returned 403 Forbidden…" — the
-        // only signal that distinguishes a role refusal from any other hub
-        // failure, since the client doesn't grow its own variant for it
-        // (mirrors `report_have`'s shape, by design — see its doc comment).
-        Err(crate::account::AccountClientError::Network(msg)) if msg.starts_with("hub returned 403") => {
+        Err(crate::account::AccountClientError::Forbidden) => {
             tracing::debug!(
                 project_id,
-                "held-set report forbidden by role; expected for a send-only member"
+                count = package_ids.len(),
+                "held set report forbidden"
             );
             Ok(0)
         }
@@ -2577,14 +2628,15 @@ where
 
         // A1: re-confirm the FULL held set every pass — even when auto_on is
         // false below, because a holder still holds. NOT gated on auto_on;
-        // gated on role_allows alone (a role that may not hold packages gets
-        // its own 403 handling inside `report_held_set`, not a skip here).
+        // gated on role_allows alone (a 403 — a role that may not hold
+        // packages — gets its own handling inside `report_held_set`, not a
+        // skip here; see that function's doc for who can even reach it).
         if role_allows {
             if let Err(e) = report_held_set(ctx, &project.project_id).await {
                 tracing::warn!(
                     project_id = %project.project_id,
-                    error = %format!("{e}"),
-                    "held-set report failed; continuing"
+                    error = %e,
+                    "held set report failed"
                 );
             }
         }
@@ -5839,7 +5891,15 @@ mod tests {
             let conn = db(&ctx).unwrap().conn();
             // auto_replicate = false: a holder still holds.
             seed_project_with(&conn, PROJECT, "send_receive", false, false);
-            seed_received_package(&conn, &landing, PROJECT, HELD, "Alice", "published", b"payload");
+            seed_received_package(
+                &conn,
+                &landing,
+                PROJECT,
+                HELD,
+                "Alice",
+                "published",
+                b"payload",
+            );
             let mut downloading = base_package(PENDING, PROJECT, "Alice");
             downloading.local_status = "downloading".to_string();
             upsert_package(&conn, &downloading).unwrap();
@@ -5856,6 +5916,55 @@ mod tests {
             outcome.projects, 0,
             "auto-off project isn't counted as swept, even though it reported"
         );
+    }
+
+    /// R1: a 403 from the hub (the caller's role may not hold packages) is not
+    /// a failure at the `report_held_set` level — it folds into `Ok(0)`.
+    #[tokio::test]
+    async fn report_held_set_403_returns_ok_zero() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PROJECT: &str = "p-forbidden";
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/projects/{PROJECT}/have")))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+
+        let count = report_held_set(&ctx, PROJECT).await.unwrap();
+        assert_eq!(count, 0, "a 403 folds into Ok(0), not an error");
+    }
+
+    /// An empty held set is still PUT — "I hold nothing here any more" is a
+    /// real statement that clears stale rows on the hub, not a no-op.
+    #[tokio::test]
+    async fn report_held_set_puts_empty_array_when_nothing_is_held() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PROJECT: &str = "p-empty";
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/projects/{PROJECT}/have")))
+            .and(body_json(serde_json::json!({ "packageIds": [] })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+
+        let count = report_held_set(&ctx, PROJECT).await.unwrap();
+        assert_eq!(count, 0);
     }
 
     /// The worker's own announcement refresh CONSUMES the state diffs (they are

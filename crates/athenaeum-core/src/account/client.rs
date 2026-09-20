@@ -44,6 +44,8 @@ pub enum AccountClientError {
     DuplicateName,
     /// 400 elsewhere — malformed request (e.g. bad pubkey, bad code shape).
     BadRequest(String),
+    /// 403 — the account's role may not perform this action.
+    Forbidden,
     /// Transport / unexpected-status / decode failure.
     Network(String),
 }
@@ -59,6 +61,9 @@ impl std::fmt::Display for AccountClientError {
             }
             AccountClientError::DuplicateName => {
                 f.write_str("name already in use by another device")
+            }
+            AccountClientError::Forbidden => {
+                f.write_str("the account's role may not perform this action")
             }
             AccountClientError::SecondPrimary(m)
             | AccountClientError::DeviceConflict(m)
@@ -162,8 +167,12 @@ impl HubClient {
                 .await
                 .map_err(|e| AccountClientError::Network(format!("decode verify response: {e}"))),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
-            StatusCode::BAD_REQUEST => Err(AccountClientError::BadRequest(body_message(resp).await)),
-            StatusCode::CONFLICT => Err(AccountClientError::DeviceConflict(body_message(resp).await)),
+            StatusCode::BAD_REQUEST => {
+                Err(AccountClientError::BadRequest(body_message(resp).await))
+            }
+            StatusCode::CONFLICT => {
+                Err(AccountClientError::DeviceConflict(body_message(resp).await))
+            }
             s => Err(unexpected(s, resp).await),
         }
     }
@@ -206,9 +215,7 @@ impl HubClient {
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
-            StatusCode::NOT_FOUND => {
-                Err(AccountClientError::BadRequest("no such device".into()))
-            }
+            StatusCode::NOT_FOUND => Err(AccountClientError::BadRequest("no such device".into())),
             s => Err(unexpected(s, resp).await),
         }
     }
@@ -234,7 +241,9 @@ impl HubClient {
             StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
             StatusCode::CONFLICT => Err(AccountClientError::DuplicateName),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
-            StatusCode::BAD_REQUEST => Err(AccountClientError::BadRequest(body_message(resp).await)),
+            StatusCode::BAD_REQUEST => {
+                Err(AccountClientError::BadRequest(body_message(resp).await))
+            }
             StatusCode::NOT_FOUND => Err(AccountClientError::BadRequest("no such device".into())),
             s => Err(unexpected(s, resp).await),
         }
@@ -352,7 +361,13 @@ mod tests {
         let client = HubClient::new(server.uri()).unwrap();
         client.request_otp("a@b.com").await.unwrap();
         let resp = client
-            .verify("a@b.com", "123456", "cHVia2V5", "test-device", DeviceCapability::Athenaeum)
+            .verify(
+                "a@b.com",
+                "123456",
+                "cHVia2V5",
+                "test-device",
+                DeviceCapability::Athenaeum,
+            )
             .await
             .unwrap();
         assert_eq!(resp.device_token, "tok-secret-123");
@@ -418,12 +433,21 @@ mod tests {
 
         let client = HubClient::new(server.uri()).unwrap();
         let err = client
-            .verify("a@b.com", "123456", "cHVia2V5", "test-device", DeviceCapability::Athenaeum)
+            .verify(
+                "a@b.com",
+                "123456",
+                "cHVia2V5",
+                "test-device",
+                DeviceCapability::Athenaeum,
+            )
             .await
             .unwrap_err();
         match err {
             AccountClientError::DeviceConflict(msg) => {
-                assert!(msg.contains("already registered"), "message surfaced: {msg}");
+                assert!(
+                    msg.contains("already registered"),
+                    "message surfaced: {msg}"
+                );
             }
             other => panic!("expected DeviceConflict, got {other:?}"),
         }
@@ -440,7 +464,10 @@ mod tests {
             .await;
 
         let client = HubClient::new(server.uri()).unwrap();
-        client.rename_device("tok", "dev-1", "Observatory Mac").await.unwrap();
+        client
+            .rename_device("tok", "dev-1", "Observatory Mac")
+            .await
+            .unwrap();
     }
 
     /// Sync 2C: a name that collides with another active device in the account
@@ -459,7 +486,10 @@ mod tests {
             .await;
 
         let client = HubClient::new(server.uri()).unwrap();
-        let err = client.rename_device("tok", "dev-1", "Observatory Mac").await.unwrap_err();
+        let err = client
+            .rename_device("tok", "dev-1", "Observatory Mac")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, AccountClientError::DuplicateName),
             "409 on rename must map to DuplicateName, got {err:?}"
@@ -478,7 +508,10 @@ mod tests {
             .await;
 
         let client = HubClient::new(server.uri()).unwrap();
-        let err = client.rename_device("stale", "dev-1", "New Name").await.unwrap_err();
+        let err = client
+            .rename_device("stale", "dev-1", "New Name")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, AccountClientError::Unauthorized),
             "401 on rename must map to Unauthorized, got {err:?}"
@@ -495,8 +528,14 @@ mod tests {
             device_id: "dev-1".to_string(),
         };
         let debug = format!("{resp:?}");
-        assert!(!debug.contains("super-secret-live-token"), "token leaked into Debug: {debug}");
-        assert!(debug.contains("dev-1"), "device_id should still be visible: {debug}");
+        assert!(
+            !debug.contains("super-secret-live-token"),
+            "token leaked into Debug: {debug}"
+        );
+        assert!(
+            debug.contains("dev-1"),
+            "device_id should still be visible: {debug}"
+        );
     }
 
     /// T7: `PUT /devices/self/address` reports this device's endpoint address —
@@ -542,7 +581,10 @@ mod tests {
             .await;
 
         let client = HubClient::new(server.uri()).unwrap();
-        let err = client.put_device_address("stale", None, &[]).await.unwrap_err();
+        let err = client
+            .put_device_address("stale", None, &[])
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, AccountClientError::Unauthorized),
             "401 on address report must map to Unauthorized, got {err:?}"
@@ -590,10 +632,19 @@ mod tests {
         assert_eq!(devices[2].last_seen_at, None);
         // T7: the first device carries a self-reported endpoint address; the
         // others (no `endpointAddr` key) default to `None` — old-hub compat.
-        let rep = devices[0].endpoint_addr.as_ref().expect("dev-1 reported an address");
-        assert_eq!(rep.home_relay_url.as_deref(), Some("https://relay1.example.org/"));
+        let rep = devices[0]
+            .endpoint_addr
+            .as_ref()
+            .expect("dev-1 reported an address");
+        assert_eq!(
+            rep.home_relay_url.as_deref(),
+            Some("https://relay1.example.org/")
+        );
         assert_eq!(rep.direct_addrs, vec!["192.168.1.5:1234".to_string()]);
-        assert_eq!(devices[1].endpoint_addr, None, "a device that never reported → None");
+        assert_eq!(
+            devices[1].endpoint_addr, None,
+            "a device that never reported → None"
+        );
         assert_eq!(devices[2].endpoint_addr, None);
     }
 }
