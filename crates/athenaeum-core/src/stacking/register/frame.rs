@@ -768,10 +768,36 @@ mod tests {
     /// a hand-built fixture.
     #[test]
     fn fit_derived_stars_align_within_tolerance_of_detected_stars() {
+        // The fixture's own known truth: `pair()` builds the subject as
+        // `subject = R(ROT_DEG)·(reference - centre) + centre + (DX, DY)`,
+        // so the RECOVERED alignment (subject -> reference, a plain
+        // similarity with NO centre of its own) is
+        // `reference = R(-ROT_DEG)·subject + [centre - R(-ROT_DEG)·(centre
+        // + (DX, DY))]` — a rotation of `-ROT_DEG` (pivot-independent, the
+        // SAME sign convention every other `pair()`-based test in this
+        // module pins, e.g. `registers_a_shifted_rotated_subject_onto_
+        // the_reference`), but a translation that is NOT simply
+        // `(-DX, -DY)` once the pivot (the frame's own centre) is not the
+        // origin — the naive `(-DX, -DY)` reading was fix round 1's own
+        // first attempt at this pin and measurably wrong (observed
+        // (-10.86, 10.89) against a claimed truth of (-6, 4) on this exact
+        // fixture); this derivation reproduces the observed value.
+        const DX: f64 = 6.0;
+        const DY: f64 = -4.0;
+        const ROT_DEG: f64 = 1.2;
         let dir = tempfile::tempdir().unwrap();
-        let (r, s, _) = pair(dir.path(), 31, 6.0, -4.0, 1.2, 1);
+        let (r, s, _) = pair(dir.path(), 31, DX, DY, ROT_DEG, 1);
         let cfg = RegistrationConfig::default();
         let reference = reference_stars(&r, &cfg, None, None).unwrap();
+        let true_rotation_deg = -ROT_DEG;
+        let true_translation = {
+            let (cx, cy) = (reference.width as f64 / 2.0, reference.height as f64 / 2.0);
+            let theta = true_rotation_deg.to_radians();
+            let (sin_t, cos_t) = theta.sin_cos();
+            let (tx, ty) = (cx + DX, cy + DY);
+            let rotated = (cos_t * tx - sin_t * ty, sin_t * tx + cos_t * ty);
+            (cx - rotated.0, cy - rotated.1)
+        };
 
         let detected = detect_frame_stars(&s, &cfg, None, None).unwrap();
         assert!(!detected.stars.is_empty(), "fixture must detect stars");
@@ -826,25 +852,71 @@ mod tests {
             detected_align.inliers,
             fits_align.inliers
         );
+
+        // Fix round 1 (ruling C-18, item 3): rms/inliers alone are
+        // offset-blind — a wrong translation or rotation that happens to
+        // land the same number of stars within the RANSAC tolerance would
+        // still pass those two checks. Assert the recovered geometry
+        // itself, both against the fixture's own known truth and against
+        // each other.
+        const TRANSLATION_TOL_PX: f64 = 0.15;
+        const ROTATION_TOL_DEG: f64 = 0.05;
+        for (source, a) in [("detected", &detected_align), ("fits", &fits_align)] {
+            assert!(
+                (a.translation.0 - true_translation.0).abs() < TRANSLATION_TOL_PX
+                    && (a.translation.1 - true_translation.1).abs() < TRANSLATION_TOL_PX,
+                "{source}: translation {:?} vs truth {:?}",
+                a.translation,
+                true_translation
+            );
+            assert!(
+                (a.rotation_deg - true_rotation_deg).abs() < ROTATION_TOL_DEG,
+                "{source}: rotation {} vs truth {}",
+                a.rotation_deg,
+                true_rotation_deg
+            );
+        }
+        assert!(
+            (fits_align.translation.0 - detected_align.translation.0).abs() < TRANSLATION_TOL_PX
+                && (fits_align.translation.1 - detected_align.translation.1).abs()
+                    < TRANSLATION_TOL_PX,
+            "translation must agree between the two star sources: detected {:?} vs fits {:?}",
+            detected_align.translation,
+            fits_align.translation
+        );
+        assert!(
+            (fits_align.rotation_deg - detected_align.rotation_deg).abs() < ROTATION_TOL_DEG,
+            "rotation must agree between the two star sources: detected {} vs fits {}",
+            detected_align.rotation_deg,
+            fits_align.rotation_deg
+        );
     }
 
     /// The fits path is a genuine shortcut, not a slower detour dressed up
-    /// as one: no pixel PLANE is ever read when `fits` is `Some` — only the
-    /// header (`PlaneReader::open`'s `probe_fits`, for `width`/`height`).
-    /// Pinned by construction: [`stars_from_fits`] takes no `&[f32]`
-    /// argument at all, so there is no code path left that could read one.
+    /// as one — pinned STRUCTURALLY (fix round 1, ruling C-18, item 4)
+    /// rather than by a timing bound (a `read_ms` threshold is inherently
+    /// flaky on a loaded CI runner and proves nothing about WHICH code ran,
+    /// only how long it took). The subject file here is FLAT — no stars at
+    /// all, confirmed by [`empty_and_flat_planes_yield_no_stars`] to detect
+    /// as an empty list — so a real detection could only return `[]`. If
+    /// [`detect_frame_stars`] instead returns EXACTLY [`stars_from_fits`]'s
+    /// own output for a synthetic fits list, the fits path is structurally
+    /// the only thing that could have produced it.
     #[test]
-    fn detect_frame_stars_with_fits_never_reads_a_pixel_plane() {
+    fn detect_frame_stars_with_fits_returns_exactly_the_fit_derived_list() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, s, refs) = pair(dir.path(), 32, 0.0, 0.0, 0.0, 1);
+        let (w, h) = (64usize, 64usize);
+        let flat = vec![0.05f32; w * h];
+        let path = dir.path().join("blank.fits");
+        write_fits_f32(&path, w, h, 1, &flat, &[]).unwrap();
+
         let cfg = RegistrationConfig::default();
-        let fits: Vec<StarFit> = refs
-            .iter()
-            .map(|&(x, y, a)| StarFit {
-                x,
-                y,
+        let fits: Vec<StarFit> = (0..5)
+            .map(|i| StarFit {
+                x: 10.0 + i as f64 * 5.0,
+                y: 20.0 + i as f64 * 3.0,
                 background: 0.0,
-                amplitude: (a as f64) * ADU_SCALE_FOR_TEST,
+                amplitude: 5000.0,
                 fwhm_x: 3.0,
                 fwhm_y: 3.0,
                 fwtm_x: 6.0,
@@ -852,27 +924,26 @@ mod tests {
                 theta: 0.0,
                 beta: 4.0,
                 residual: 0.01,
-                signal: (a as f64) * ADU_SCALE_FOR_TEST * 20.0,
+                signal: 40000.0 + i as f64 * 1000.0,
                 area: 28.0,
             })
             .collect();
-        let out = detect_frame_stars(&s, &cfg, None, Some(&fits)).unwrap();
-        assert_eq!(out.stars.len(), fits.len().min(cfg.max_stars));
-        // `read_ms` is the HEADER open only, not a full-plane read — a
-        // 640x480 plane is ~1.2 MB and would show up as at least
-        // low-single-digit milliseconds on any real filesystem; the header
-        // open is microseconds. A loose bound (not a strict `== 0`, which
-        // would be flaky on a slow CI runner) still tells the two apart.
-        assert!(
-            out.read_ms <= 5,
-            "fits-path read_ms should be a header open only, got {}",
+        let expected = stars_from_fits(&fits, &cfg.detection, cfg.max_stars);
+        assert!(!expected.is_empty(), "fixture fits must survive the cuts");
+
+        let out = detect_frame_stars(&path, &cfg, None, Some(&fits)).unwrap();
+        assert_eq!(
+            out.stars, expected,
+            "a flat field cannot have produced anything but the fit-derived list"
+        );
+        // `read_ms` is a report line only now (fix round 1, item 4) — not
+        // asserted. It should still be a header-only `PlaneReader::open`
+        // (microseconds), never a full-plane read, but timing is not a
+        // structural proof and the assertion above is.
+        eprintln!(
+            "detect_frame_stars_with_fits_returns_exactly_the_fit_derived_list: \
+             read_ms={} (report only)",
             out.read_ms
         );
     }
-
-    /// `crate::stacking::measure::ADU_SCALE` — duplicated as a plain
-    /// constant rather than imported, since this test only needs its
-    /// numeric value to build a plausible `StarFit.amplitude`/`signal`
-    /// pair, not the module's own scaling contract.
-    const ADU_SCALE_FOR_TEST: f64 = 65535.0;
 }

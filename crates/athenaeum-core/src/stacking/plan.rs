@@ -446,24 +446,49 @@ pub(crate) fn measurement_hash_for(cfg: &StackingConfig, calibrated_hash: &str) 
 /// Stage 5 (registration) config-hash for one frame against a given
 /// reference: `registration_subtree` keyed on the reference frame's identity
 /// (`"ref:<id>"`, distinguishing a reference CHANGE from a reference whose
-/// own calibration merely changed), the reference's own stage-1 hash, and
-/// this frame's stage-1 hash.
+/// own calibration merely changed), the reference's own stage-1 hash, this
+/// frame's stage-1 hash, and — Tier C Task 3 fix round 1 (ruling C-18) —
+/// this frame's own MEASUREMENT hash.
+///
+/// Ruling C-18: Register now reads a mono frame's `fits.0` artifact
+/// (`stacking::register::detect::stars_from_fits`), and that artifact's
+/// CONTENT moves with `measurement.maxStars`/`detectionSigma`/
+/// `seedDetector`/`seedPrefilter`/`structure` — none of which
+/// `registration_subtree` carries (it serializes only `cfg.registration` +
+/// `PSF_FIT_VERSION`). Without this fold-in, changing `measurement.maxStars`
+/// rewrote every `.athf` (Measure's own hash follows it) while the plan
+/// gate still reported Register cached and a run reused stale registration
+/// rows built from fits the file on disk no longer matched — exactly the
+/// failure ruling C-17 fixed for Normalize's own read of the same artifact
+/// (`normalization_hash_for`), fixed here identically: the SAME
+/// `measurement_hash_for(cfg, frame_calibrated_hash)` value, empty-string
+/// skipped as "not recorded" rather than folded in as some other frame's.
+///
+/// The invalidation is uniform across BOTH mono and OSC frames, even though
+/// only mono frames ever actually read the `fits` artifact (OSC keeps the
+/// luminance detection, ruling C-6): a per-plane-count hash (folding the
+/// measurement hash in for mono only) would split this rule into two cases
+/// every caller has to get right for the SAME field, in exchange for
+/// sparing an OSC frame's `registration_results` row an invalidation it
+/// never needed — a far smaller cost than a second hash-construction path.
 pub(crate) fn registration_hash_for(
     cfg: &StackingConfig,
     reference_frame_id: i64,
     reference_calibrated_hash: &str,
     frame_calibrated_hash: &str,
+    frame_measurement_hash: &str,
 ) -> String {
     let reference_token = format!("ref:{reference_frame_id}");
-    stage_hash(
-        &registration_subtree(cfg),
-        &[
-            reference_token.as_str(),
-            reference_calibrated_hash,
-            frame_calibrated_hash,
-        ],
-        &[],
-    )
+    let mut upstream: Vec<String> = vec![
+        reference_token,
+        reference_calibrated_hash.to_string(),
+        frame_calibrated_hash.to_string(),
+    ];
+    if !frame_measurement_hash.is_empty() {
+        upstream.push(format!("measure:{frame_measurement_hash}"));
+    }
+    let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
+    stage_hash(&registration_subtree(cfg), &upstream_refs, &[])
 }
 
 /// The group's LN reference artifact payload (fix round 1, item 5, spec
@@ -644,6 +669,32 @@ pub(crate) fn fits_artifact_fresh(
     else {
         return Ok(false);
     };
+    fits_artifact_fresh_for_planes(
+        conn,
+        frames_set_id,
+        group_key,
+        frame_id,
+        planes,
+        expected_hash,
+    )
+}
+
+/// [`fits_artifact_fresh`]'s own per-plane freshness loop, with the plane
+/// count supplied directly instead of decoded from a `metrics` payload —
+/// pulled out (Tier C Task 3 fix round 1, ruling C-18, item 8) so a caller
+/// that already knows a frame's plane count as a plain `usize` (stage 5's
+/// `resolve_register_fits` in `stacking::run`, from `MeasuredFrame::planes`
+/// — never from a stored JSON payload) can reuse the EXACT freshness rule
+/// the plan gate applies, rather than a hand-rolled `find_artifact` +
+/// `is_fresh` pair that could quietly drift from it.
+pub(crate) fn fits_artifact_fresh_for_planes(
+    conn: &Connection,
+    frames_set_id: i64,
+    group_key: &str,
+    frame_id: i64,
+    planes: usize,
+    expected_hash: &str,
+) -> Result<bool, ApiError> {
     if planes == 0 {
         return Ok(false);
     }
@@ -1174,11 +1225,15 @@ fn compute_register_stale(
         let Some(frame_calib_hash) = memo.calibration_hash(conn, cfg, f) else {
             return Ok(true);
         };
+        // Ruling C-18: the same measurement hash `stacking::run` folds in
+        // when it builds this frame's registration row.
+        let frame_measurement_hash = measurement_hash_for(cfg, &frame_calib_hash);
         let expected = registration_hash_for(
             cfg,
             reference_frame_id,
             reference_calib_hash,
             &frame_calib_hash,
+            &frame_measurement_hash,
         );
         let Some(row) = by_frame.get(&frame_id) else {
             return Ok(true);
@@ -4254,7 +4309,14 @@ mod tests {
         let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
         for gf in &groups[0].frames {
             let frame_hash = calib_hashes.get(&gf.frame_id).unwrap();
-            let expected = registration_hash_for(&cfg, ids[0], &reference_hash, frame_hash);
+            let frame_measurement_hash = metrics_hashes.get(&gf.frame_id).unwrap();
+            let expected = registration_hash_for(
+                &cfg,
+                ids[0],
+                &reference_hash,
+                frame_hash,
+                frame_measurement_hash,
+            );
             let is_reference = gf.frame_id == ids[0];
             let rec = RegistrationRecord {
                 frames_set_id: f.set_id,
@@ -4410,6 +4472,60 @@ mod tests {
         assert_ne!(ln(&cfg, ""), ln(&cfg, &measurement));
     }
 
+    /// Ruling C-18 (Tier C Task 3 fix round 1): `registration_hash_for`
+    /// must follow the MEASURE seed config too, for exactly the reason
+    /// `the_ln_hashes_follow_the_measure_seed_config` above pins for
+    /// Normalize — Register now reads the same `.athf` artifact for a mono
+    /// frame (`stacking::register::detect::stars_from_fits`), and
+    /// `registration_subtree` carries only `cfg.registration` +
+    /// `PSF_FIT_VERSION`, neither of which reacts to `measurement.
+    /// seedDetector`/`maxStars`/`detectionSigma`/`seedPrefilter`/
+    /// `structure`.
+    #[test]
+    fn the_registration_hash_follows_the_measure_seed_config() {
+        use crate::stacking::structure::SeedDetector;
+
+        let cfg = StackingConfig::default();
+        let calibrated = "calibrated-hash";
+        let reference_calibrated = "reference-calibrated-hash";
+        let measurement = measurement_hash_for(&cfg, calibrated);
+
+        let reg = |cfg: &StackingConfig, measurement: &str| {
+            registration_hash_for(cfg, 7, reference_calibrated, calibrated, measurement)
+        };
+
+        // Same config, same inputs -> the same hash, twice.
+        assert_eq!(reg(&cfg, &measurement), reg(&cfg, &measurement));
+
+        // A changed Measure SEED config moves the measurement hash ...
+        let mut seed_cfg = cfg.clone();
+        seed_cfg.measurement.seed_detector = match cfg.measurement.seed_detector {
+            SeedDetector::Peak => SeedDetector::Structure,
+            SeedDetector::Structure => SeedDetector::Peak,
+        };
+        let seed_measurement = measurement_hash_for(&seed_cfg, calibrated);
+        assert_ne!(
+            measurement, seed_measurement,
+            "sanity: the measurement hash itself must follow seedDetector"
+        );
+
+        // ... and the registration hash must move with it, even though
+        // `cfg.registration` itself is untouched.
+        assert_ne!(
+            reg(&seed_cfg, &seed_measurement),
+            reg(&cfg, &measurement),
+            "a changed seedDetector must invalidate the registration hash"
+        );
+
+        // The seam is the folded VALUE, not the subtree.
+        assert_ne!(reg(&cfg, "other-measurement"), reg(&cfg, &measurement));
+
+        // An EMPTY measurement hash ("not recorded") is its own state,
+        // shared by the gate's `None` and the run's `String::new()`.
+        assert_eq!(reg(&cfg, ""), reg(&cfg, ""));
+        assert_ne!(reg(&cfg, ""), reg(&cfg, &measurement));
+    }
+
     /// Fix round 1, item 5: `ln_cached`/`stale_stages`'s `Normalize` entry
     /// must react to a REAL config change, not just artifact presence on
     /// disk — verified via the `ln_reference` artifact's stored
@@ -4516,7 +4632,14 @@ mod tests {
         let mut registration_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
             let frame_hash = calib_hashes.get(&gf.frame_id).unwrap();
-            let expected = registration_hash_for(&cfg, ids[0], &reference_calib_hash, frame_hash);
+            let frame_measurement_hash = metrics_hashes.get(&gf.frame_id).unwrap();
+            let expected = registration_hash_for(
+                &cfg,
+                ids[0],
+                &reference_calib_hash,
+                frame_hash,
+                frame_measurement_hash,
+            );
             registration_hashes.insert(gf.frame_id, expected.clone());
             let is_reference = gf.frame_id == ids[0];
             let rec = RegistrationRecord {
@@ -4817,7 +4940,14 @@ mod tests {
         let mut registration_hashes: HashMap<i64, String> = HashMap::new();
         for &frame_id in &ids[..2] {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let expected = registration_hash_for(&cfg, ids[0], &reference_calib_hash, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let expected = registration_hash_for(
+                &cfg,
+                ids[0],
+                &reference_calib_hash,
+                frame_hash,
+                &frame_measurement_hash,
+            );
             registration_hashes.insert(frame_id, expected.clone());
             let is_reference = frame_id == ids[0];
             let rec = RegistrationRecord {
@@ -5201,7 +5331,14 @@ mod tests {
         let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
         for &frame_id in &ids[..2] {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let expected = registration_hash_for(&cfg, ids[0], &reference_hash, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let expected = registration_hash_for(
+                &cfg,
+                ids[0],
+                &reference_hash,
+                frame_hash,
+                &frame_measurement_hash,
+            );
             let is_reference = frame_id == ids[0];
             let rec = RegistrationRecord {
                 frames_set_id: f.set_id,
@@ -5280,7 +5417,14 @@ mod tests {
         let reference_hash = calib_hashes.get(&ids[0]).unwrap().clone();
         for &frame_id in &ids {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let expected = registration_hash_for(&cfg, ids[0], &reference_hash, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let expected = registration_hash_for(
+                &cfg,
+                ids[0],
+                &reference_hash,
+                frame_hash,
+                &frame_measurement_hash,
+            );
             let is_reference = frame_id == ids[0];
             let rec = RegistrationRecord {
                 frames_set_id: f.set_id,
@@ -5376,8 +5520,14 @@ mod tests {
         let reference_hash = calib_hashes.get(&group_reference).unwrap().clone();
         for &frame_id in &ids {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let expected =
-                registration_hash_for(&cfg, group_reference, &reference_hash, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let expected = registration_hash_for(
+                &cfg,
+                group_reference,
+                &reference_hash,
+                frame_hash,
+                &frame_measurement_hash,
+            );
             let is_reference = frame_id == group_reference;
             let rec = RegistrationRecord {
                 frames_set_id: f.set_id,
@@ -5489,7 +5639,14 @@ mod tests {
         let reference_hash = calib_hashes.get(&switched_to).unwrap().clone();
         for &frame_id in &ids {
             let frame_hash = calib_hashes.get(&frame_id).unwrap();
-            let expected = registration_hash_for(&cfg, switched_to, &reference_hash, frame_hash);
+            let frame_measurement_hash = measurement_hash_for(&cfg, frame_hash);
+            let expected = registration_hash_for(
+                &cfg,
+                switched_to,
+                &reference_hash,
+                frame_hash,
+                &frame_measurement_hash,
+            );
             let is_reference = frame_id == switched_to;
             let rec = RegistrationRecord {
                 frames_set_id: f.set_id,

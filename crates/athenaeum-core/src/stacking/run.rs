@@ -85,15 +85,17 @@ use crate::stacking::master_cards::{
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
-    build_plan, fits_artifact_fresh, is_fresh, measurement_hash_for, normalization_hash_for,
-    registration_hash_for, registration_row_is_fresh, seeds_calibration_hash_for, wants_cfa_mosaic,
-    HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
+    build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
+    measurement_hash_for, normalization_hash_for, registration_hash_for, registration_row_is_fresh,
+    seeds_calibration_hash_for, wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork,
+    PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
 };
 use crate::stacking::psf_signal;
-use crate::stacking::register::align::{SeedKind, SeedPolicy};
+use crate::stacking::register::align::{self, SeedKind, SeedPolicy};
+use crate::stacking::register::detect::stars_from_fits;
 use crate::stacking::register::frame::{
     detect_frame_stars, identity_registration, reference_stars, register_detected, to_record,
     DetectedStars, ReferenceStars,
@@ -3996,11 +3998,13 @@ fn registration_gate_and_hint(
 /// this only warns about a genuine mono fallback, never an OSC frame that
 /// was never a candidate for reuse.
 ///
-/// Best-effort: a DB error, a missing/stale row, or an unreadable file all
-/// return `None` with exactly one `warn!` naming why (spec's own
-/// requirement) — reuse is an optimization, never a correctness
-/// requirement, so nothing here ever fails the stage; the caller's
-/// existing detection path is always the fallback.
+/// Best-effort: a DB error, a missing/stale row, an unreadable file, or a
+/// cut+truncated star list below [`align::MIN_INLIERS`] (fix round 1,
+/// ruling C-18, item 5) all return `None` with exactly one `warn!` naming
+/// why (`run_id`/`group_key`/`frame_id`, fix round 1 item 7) — reuse is an
+/// optimization, never a correctness requirement, so nothing here ever
+/// fails the stage; the caller's existing detection path is always the
+/// fallback.
 fn resolve_register_fits(
     rc: &RunContext,
     group_key: &str,
@@ -4013,6 +4017,51 @@ fn resolve_register_fits(
     }
     let expected_hash = measurement_hash_for(&rc.config, calibrated_hash);
     let kind = fits_artifact::artifact_kind(0);
+
+    // Ruling C-18, item 8: the SAME per-plane freshness rule the plan gate
+    // applies (`plan::fits_artifact_fresh`/`fits_artifact_fresh_for_planes`)
+    // — never a hand-rolled `find_artifact` + `is_fresh` pair that could
+    // quietly drift from it. `planes` is already known to be 1 here, so
+    // this checks exactly the one `fits.0` row.
+    let fresh = (|| -> Result<bool, RunError> {
+        let conn = db(&rc.ctx)?.conn();
+        Ok(fits_artifact_fresh_for_planes(
+            &conn,
+            rc.set_id,
+            group_key,
+            frame_id,
+            planes,
+            &expected_hash,
+        )?)
+    })();
+    let fresh = match fresh {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            // `RunError` carries no `Display`, only `Debug` — the same
+            // convention every other `RunError`-typed warn in this file
+            // already follows (`error = ?e`).
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key,
+                frame_id,
+                error = ?e,
+                "register: fits artifact lookup failed; detecting"
+            );
+            return None;
+        }
+    };
+    if !fresh {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key,
+            frame_id,
+            "register: no fresh fits artifact; detecting"
+        );
+        return None;
+    }
+
+    // The freshness check above only answers yes/no — a second, separate
+    // lookup gets the row's own `path` to actually read the file.
     let row = (|| -> Result<Option<crate::db::stacking::StackingArtifactRow>, RunError> {
         let conn = db(&rc.ctx)?.conn();
         Ok(crate::db::stacking::find_artifact(
@@ -4023,13 +4072,12 @@ fn resolve_register_fits(
             Some(frame_id),
         )?)
     })();
-    let row = match row {
-        Ok(row) => row,
+    let path = match row {
+        Ok(row) => row.and_then(|r| r.path),
         Err(e) => {
-            // `RunError` carries no `Display`, only `Debug` — the same
-            // convention every other `RunError`-typed warn in this file
-            // already follows (`error = ?e`).
             tracing::warn!(
+                run_id = rc.run_id,
+                group_key,
                 frame_id,
                 error = ?e,
                 "register: fits artifact lookup failed; detecting"
@@ -4037,29 +4085,56 @@ fn resolve_register_fits(
             return None;
         }
     };
-    let Some(row) = row.filter(|r| is_fresh(r, &expected_hash)) else {
-        tracing::warn!(frame_id, "register: no fresh fits artifact; detecting");
-        return None;
-    };
-    let Some(path) = row.path.as_deref() else {
+    let Some(path) = path else {
         tracing::warn!(
+            run_id = rc.run_id,
+            group_key,
             frame_id,
             "register: fits artifact row has no path; detecting"
         );
         return None;
     };
-    match fits_artifact::read_fits(Path::new(path)) {
-        Ok(fits) => Some(fits),
+    let fits = match fits_artifact::read_fits(Path::new(&path)) {
+        Ok(fits) => fits,
         Err(e) => {
             tracing::warn!(
+                run_id = rc.run_id,
+                group_key,
                 frame_id,
-                path,
+                path = %path,
                 error = %e,
                 "register: fits artifact unreadable; detecting"
             );
-            None
+            return None;
         }
+    };
+
+    // Ruling C-18, item 5: a floor on the CUT+TRUNCATED list, not the raw
+    // fits count — `stars_from_fits` may drop most of a frame's fits to
+    // saturation/eccentricity/SNR cuts, and a star list too short to ever
+    // reach `align::MIN_INLIERS` matched pairs is no better than no reuse
+    // at all. This runs the SAME cut+truncate `detect_frame_stars`'s own
+    // fits branch will (a cheap, allocation-only pass over an in-memory
+    // `Vec`, no I/O) to judge it here rather than handing a doomed list
+    // downstream and discovering the alignment failure only after RANSAC.
+    let usable = stars_from_fits(
+        &fits,
+        &rc.config.registration.detection,
+        rc.config.registration.max_stars,
+    )
+    .len();
+    if usable < align::MIN_INLIERS {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key,
+            frame_id,
+            count = usable,
+            "register: fits artifact has too few usable stars after cuts; detecting"
+        );
+        return None;
     }
+
+    Some(fits)
 }
 
 /// [`resolve_register_fits`] for a frame identified only by `frame_id` —
@@ -4162,8 +4237,18 @@ fn register_group_pass(
             let conn = db(&rc.ctx)?.conn();
             rc.memo.calibration_hash_checked(&conn, &cfg, &frame)?
         };
-        let expected_hash =
-            registration_hash_for(&cfg, reference_frame_id, reference_hash, &frame_hash);
+        // Ruling C-18: the same measurement hash `plan.rs`'s
+        // `compute_register_stale` folds in — must match, or the gate and
+        // the run disagree about whether a stored registration row is
+        // fresh.
+        let frame_measurement_hash = measurement_hash_for(&cfg, &frame_hash);
+        let expected_hash = registration_hash_for(
+            &cfg,
+            reference_frame_id,
+            reference_hash,
+            &frame_hash,
+            &frame_measurement_hash,
+        );
 
         let mut reused: Option<RegisteredFrameOutcome> = None;
         if persist && !force_fresh {
@@ -5059,12 +5144,18 @@ fn two_pass_refine(
                                 // other reference read is rather than left
                                 // stubbed, but it costs nothing when the
                                 // branch never runs.
+                                // Fix round 1, item 6: `0`, not `1` — an
+                                // unresolvable frame must never default to
+                                // "mono" (which would wrongly make it
+                                // eligible for fits reuse); `0 != 1` fails
+                                // `resolve_register_fits`'s own planes check
+                                // and falls back to detection instead.
                                 let planes = rc
                                     .measured
                                     .get(&group.key)
                                     .and_then(|v| v.get(new_idx))
                                     .map(|e| e.planes)
-                                    .unwrap_or(1);
+                                    .unwrap_or(0);
                                 let fits = resolve_register_fits(
                                     rc,
                                     &group.key,

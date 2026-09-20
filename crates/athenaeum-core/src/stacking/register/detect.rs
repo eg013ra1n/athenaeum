@@ -210,12 +210,21 @@ const FWHM_TO_SIGMA: f64 = 2.354_820_045_030_949_3;
 /// itself returns: [`passes_register_cuts`] applied per fit (this
 /// detector's own saturation/eccentricity/SNR cuts — Measure's own
 /// acceptance does not reject those the way this module always has),
-/// sorted brightest-first by [`StarFit::signal`], truncated to
-/// `max_stars`. Mono frames only — a single-plane frame's luminance IS the
-/// measured plane, so the fitted centroid already IS the plane's own
-/// detection; an OSC (multi-plane) frame has no single luminance fit to
-/// reuse this way (the caller decides mono vs OSC — see
-/// [`crate::stacking::register::frame::detect_frame_stars`]).
+/// sorted brightest-first, truncated to `max_stars`. Mono frames only — a
+/// single-plane frame's luminance IS the measured plane, so the fitted
+/// centroid already IS the plane's own detection; an OSC (multi-plane)
+/// frame has no single luminance fit to reuse this way (the caller decides
+/// mono vs OSC — see [`crate::stacking::register::frame::detect_frame_stars`]).
+///
+/// Fix round 1 (ruling C-18, item 2): [`Star::flux`] is `fit.signal /
+/// ADU_SCALE`, NOT the raw `fit.signal` — [`StarFit`]'s fields are
+/// ADU-scaled (`measure::measure_plane_with_seeds` fits at exactly that
+/// scale, the same convention [`passes_register_cuts`]'s own saturation
+/// check above already uses), while [`detect_stars`] stores `s.flux /
+/// ADU_SCALE`, the NATIVE `[0, 1]`-ish domain. A fit-derived star that
+/// skipped the division would carry a flux ~65535× too large — silently
+/// wrong for any caller that reads `Star.flux` absolutely rather than as a
+/// same-list ranking key (`ln::scale::to_seed` does exactly that).
 pub(crate) fn stars_from_fits(
     fits: &[StarFit],
     cfg: &DetectionConfig,
@@ -229,7 +238,7 @@ pub(crate) fn stars_from_fits(
             Star {
                 x: fit.x,
                 y: fit.y,
-                flux: fit.signal,
+                flux: fit.signal / ADU_SCALE as f64,
                 sigma: (sx > 0.0 && sy > 0.0).then_some((sx, sy)),
             }
         })
@@ -587,7 +596,18 @@ mod tests {
         assert_eq!(stars.len(), 1);
         let s = &stars[0];
         assert_eq!((s.x, s.y), (fit.x, fit.y));
-        assert_eq!(s.flux, fit.signal);
+        // Ruling C-18, item 2: native domain (`fit.signal / ADU_SCALE`),
+        // the SAME domain `detect_stars` stores (`s.flux / ADU_SCALE`) —
+        // not the raw ADU-scaled `fit.signal`, which `ln::scale::to_seed`
+        // (and any other caller reading `Star.flux` absolutely, not just
+        // as a same-list ranking key) would otherwise read ~65535x too
+        // large.
+        assert_eq!(s.flux, fit.signal / ADU_SCALE as f64);
+        assert!(
+            s.flux < 2.0,
+            "a fit-derived flux must be native-domain like a detected one, not ADU-scaled: {}",
+            s.flux
+        );
         let (sx, sy) = s.sigma.expect("a well-formed fwhm carries a sigma");
         assert!((sx - fit.fwhm_x / FWHM_TO_SIGMA).abs() < 1e-12);
         assert!((sy - fit.fwhm_y / FWHM_TO_SIGMA).abs() < 1e-12);
@@ -629,7 +649,10 @@ mod tests {
         };
         let stars = stars_from_fits(&[dim, bright, mid], &DetectionConfig::default(), 2);
         assert_eq!(stars.len(), 2);
-        assert_eq!(stars[0].flux, 90.0);
-        assert_eq!(stars[1].flux, 50.0);
+        // Native domain (ruling C-18, item 2) — divided by `ADU_SCALE`,
+        // but the ORDER (and which two of the three survive truncation)
+        // is unaffected by that positive monotonic rescale.
+        assert_eq!(stars[0].flux, 90.0 / ADU_SCALE as f64);
+        assert_eq!(stars[1].flux, 50.0 / ADU_SCALE as f64);
     }
 }
