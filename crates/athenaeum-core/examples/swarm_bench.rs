@@ -36,6 +36,14 @@
 //! elapsed_multi_ms }`) and prints the same line. `RUST_LOG`-gated
 //! subscriber like the other probes; examples are exempt from the
 //! zero-`println!` rule.
+//!
+//! Scratch cost: at the default `--files 12 --size-mb 32` each of the two
+//! runs (`single`, `multi`) writes 384 MB of source payload PLUS a copy
+//! into its own package dir (`write_package` copies, it never moves) — call
+//! it ~1.5 GB total for both runs — plus three iroh blob stores (one per
+//! node). All of it lands under the OS temp dir via `tempfile::tempdir()`
+//! and is removed when those guards drop at the end of `main`; scale
+//! roughly linearly with `--files` x `--size-mb`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,17 +117,56 @@ async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
         .expect("bind relay-disabled node")
 }
 
+/// splitmix64 (Vigna): a tiny, fast, non-cryptographic PRNG step used only to
+/// fill bench payload files with well-mixed bytes — never anything security
+/// sensitive.
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// `size` well-mixed bytes, unique to this `(prefix, i)` pair. Seeded from
+/// `xxh3_64("{prefix}:{i}")` and stepped with `splitmix64_next` per output
+/// byte, so unlike a simple `(i, j)` arithmetic ramp there is no fixed
+/// relationship between two files' streams (a constant phase shift would let
+/// `multi[i]` collide with `single[i + k]` for some `k` once `files` is large
+/// enough to wrap the ramp's period — see `build_many_file_package`'s doc
+/// comment).
+fn fill_pattern(prefix: &str, i: usize, size: usize) -> Vec<u8> {
+    let mut state = xxhash_rust::xxh3::xxh3_64(format!("{prefix}:{i}").as_bytes());
+    let mut bytes = Vec::with_capacity(size);
+    let mut word = 0u64;
+    let mut left = 0u32;
+    for _ in 0..size {
+        if left == 0 {
+            word = splitmix64_next(&mut state);
+            left = 8;
+        }
+        bytes.push((word & 0xFF) as u8);
+        word >>= 8;
+        left -= 1;
+    }
+    bytes
+}
+
 /// Copied from `sharing::iroh::tests::build_many_file_package` (that module
 /// is `#[cfg(test)]`-only and invisible to an example), with one change: the
-/// byte pattern is also seeded from `prefix`. The original helper's pattern
-/// depends only on the file index, so two calls with different `prefix`es
-/// but the same `files`/`size` produce BYTE-IDENTICAL payload blobs — which
-/// iroh-blobs content-addresses, so the second run's fetch would find every
-/// child already in the puller's local store and finish in milliseconds,
-/// measuring a cache hit instead of a real transfer (the first version of
-/// this probe did exactly that: a 4 ms "multi" run). Mixing `prefix` into
-/// the pattern gives each run's package its own blob content, hence its own
-/// collection hash, with nothing to dedupe against.
+/// byte pattern is also seeded from `prefix` via [`fill_pattern`]. The
+/// original helper's pattern depends only on the file index, so two calls
+/// with different `prefix`es but the same `files`/`size` produce
+/// BYTE-IDENTICAL payload blobs — which iroh-blobs content-addresses, so the
+/// second run's fetch would find every child already in the puller's local
+/// store and finish in milliseconds, measuring a cache hit instead of a real
+/// transfer (the first version of this probe did exactly that: a 4 ms
+/// "multi" run). A first fix (folding `prefix` into a linear ramp) was still
+/// a constant phase shift of the SAME 251-period sequence — `multi[i]` was
+/// byte-identical to `single[i + 107]`, harmless at `--files 12` but a
+/// renewed dedupe hole at `--files >= 108`. `fill_pattern` instead derives
+/// each file's stream from a hash of `(prefix, i)`, so no two files across
+/// any two runs can coincide regardless of `--files`.
 fn build_many_file_package(
     src_root: &Path,
     prefix: &str,
@@ -127,16 +174,11 @@ fn build_many_file_package(
     size: usize,
 ) -> (PathBuf, PackageAnnounce) {
     std::fs::create_dir_all(src_root).unwrap();
-    let seed: u64 = prefix
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64));
     let mut records = Vec::with_capacity(files);
     for i in 0..files {
         let name = format!("frame_{i:04}.fits");
         let payload = src_root.join(&name);
-        let bytes: Vec<u8> = (0..size)
-            .map(|j| ((j as u64 + i as u64 * 97 + seed) % 251) as u8)
-            .collect();
+        let bytes = fill_pattern(prefix, i, size);
         std::fs::write(&payload, &bytes).unwrap();
         let byte_size = std::fs::metadata(&payload).unwrap().len();
         let xxh3 = package::xxh3_full_file(&payload).unwrap();
@@ -318,11 +360,9 @@ async fn main() {
 
     std::fs::create_dir_all(&args.out).expect("create --out dir");
     let out_path = args.out.join(format!("{}.json", args.label));
-    std::fs::write(
-        &out_path,
-        serde_json::to_string_pretty(&report).expect("serialize report"),
-    )
-    .expect("write bench json");
+    let mut body = serde_json::to_string_pretty(&report).expect("serialize report");
+    body.push('\n');
+    std::fs::write(&out_path, body).expect("write bench json");
 
     println!("{report}");
     println!("wrote {}", out_path.display());
