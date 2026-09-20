@@ -2341,6 +2341,86 @@ mod tests {
         }
     }
 
+    /// Perf tier C, C4/I7: the rejection loop stops on the FIRST iteration
+    /// that rejects nothing. That iteration IS the confirming pass — it runs
+    /// a full `medfit_line` and a full filter sweep to learn that the
+    /// survivor set has stopped moving — and the loop never runs a second
+    /// one. Observed through `LINEAR_FIT_ITERS` (read by
+    /// [`take_rejection_counters`]), which ticks once per outer pass.
+    ///
+    /// C4's brief expected this exit still to be missing ("today it runs one
+    /// more to confirm"); it has been in the loop since the linear-fit
+    /// clipper first shipped (`e8512317`), as `if w == kept { break; }`, so
+    /// I7 is a no-op and this pin is all that is new. Measured while
+    /// establishing that: over 1 000 seeded stacks (n ∈ {8, 20, 50, 100,
+    /// 200}, contaminated and clean) the final iteration rejected 0 samples
+    /// on 1 000 of 1 000, mean 2.36 outer iterations, max 11 — the exit
+    /// fires, `MAX_REJECTION_ITERS` never does.
+    #[test]
+    fn reject_linear_fit_stops_on_the_first_iteration_that_rejects_nothing() {
+        // (a) One gross outlier over an otherwise flat stack: pass 1 rejects
+        // it, pass 2 sees a zero-dispersion survivor set and stops. Two
+        // passes — not three.
+        let mut one_outlier: Vec<f32> = vec![100.0; 29];
+        one_outlier.push(1000.0);
+        let _ = take_rejection_counters();
+        let (kept, _) = reject_linear_fit(&mut one_outlier, 5.0, 3.5);
+        let (iters, _) = take_rejection_counters();
+        assert_eq!(kept, 29, "the single outlier is the only sample rejected");
+        assert_eq!(
+            iters, 2,
+            "pass 1 rejects, pass 2 confirms and exits — a third pass would mean the exit is gone"
+        );
+
+        // (b) A stack nothing is rejected from at all: the very first pass is
+        // the confirming one, so the loop makes exactly ONE pass.
+        let mut ramp: Vec<f32> = (0..20).map(|i| 100.0 + i as f32).collect();
+        let n = ramp.len();
+        let _ = take_rejection_counters();
+        let (kept, _) = reject_linear_fit(&mut ramp, 5.0, 3.5);
+        let (iters, _) = take_rejection_counters();
+        assert_eq!(kept, n, "a clean ramp loses nothing");
+        assert_eq!(iters, 1, "nothing rejected on pass 1 ⇒ no second pass");
+
+        // (c) The same two implications over a seeded family, so the pin is
+        // not two hand-picked fixtures: the loop always terminates by the
+        // exit (never by `MAX_REJECTION_ITERS`), and a stack that loses
+        // nothing costs exactly one pass.
+        let mut saw_untouched = false;
+        let mut saw_rejecting = false;
+        for seed in 0..200u64 {
+            let mut rng = SplitMix64(0x0C4E_11A7_0000_0001 ^ seed);
+            let n = 20 + (rng.next_u64() % 60) as usize;
+            let mut values: Vec<f32> = (0..n)
+                .map(|_| (100.0 + 5.0 * next_gaussian(&mut rng)) as f32)
+                .collect();
+            if seed % 3 == 0 {
+                values[0] = 400.0; // a hot pixel on a third of the stacks
+            }
+            let _ = take_rejection_counters();
+            let (kept, _) = reject_linear_fit(&mut values, 5.0, 3.5);
+            let (iters, _) = take_rejection_counters();
+            assert!(
+                iters >= 1 && (iters as usize) < MAX_REJECTION_ITERS,
+                "seed {seed} n {n}: {iters} passes — the loop must end on its own exit"
+            );
+            if kept == n {
+                saw_untouched = true;
+                assert_eq!(iters, 1, "seed {seed} n {n}: nothing rejected ⇒ one pass");
+            } else {
+                saw_rejecting = true;
+            }
+        }
+        assert!(
+            saw_untouched,
+            "the family must contain a stack nothing is rejected from"
+        );
+        assert!(
+            saw_rejecting,
+            "the family must contain a stack samples ARE rejected from"
+        );
+    }
+
     /// I5: `combine_pixel_weighted`'s third return value is `true` exactly
     /// for the rejection kinds whose survivors are known ascending by value
     /// (every algorithm but `None`/`SigmaClip`, which never sort `work`),
