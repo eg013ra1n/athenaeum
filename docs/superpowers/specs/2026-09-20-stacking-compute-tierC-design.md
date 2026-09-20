@@ -273,7 +273,7 @@ still pay the clip.
 ### 3.2 Design
 For a **linear** map (Similarity/Affine/Homography without distortion) the mapped drop is one
 parallelogram for the whole frame; only its sub-pixel phase `(fx, fy) = frac(to_output(centre))`
-varies. Tabulate once per frame: for a `PHASES × PHASES` grid of phases (`PHASES = 32`), the
+varies. Tabulate once per frame: for a `PHASES × PHASES` grid of phases (`PHASES = 64`, ruling C-21 — the plan's 2 % per-pixel bound is unreachable at 32), the
 overlap area of the parallelogram at that phase with each of the ≤ 9 (3×3 at `scale = 2`, ≤ 16 at
 `scale = 3`) output pixels its bounding box touches — `32 × 32 × 9 × f32 = 37 KB` per frame,
 computed with the SAME `clip_area` the per-pixel path uses (so the table's entries are exactly
@@ -290,7 +290,7 @@ quantization. **What moves:** a pixel's phase is rounded to `1/32` of an output 
 area split among the neighbours differs from the exact clip by at most the area swept by a
 `1/32`-pixel shift — the audit measured the per-frame weight change at ≤ 1.6 % (nearest) /
 < 0.1 % (bilinear) and the master-level change at 0.1 % / 0.007 % over 208 frames. Ruling C-3:
-`PHASES = 32`, one table per frame for linear maps and per 256-px tile under distortion; the exact
+`PHASES = 64` (C-21), one table per frame for linear maps and per 256-px tile under distortion; the exact
 clip stays as the reference path under `#[cfg(test)]` and as the runtime path for `scale = 1` with
 `dropShrink = 1.0` (there the table is a 1×1 identity — not worth a build).
 
@@ -378,12 +378,19 @@ Full measurement: `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-
 ## 6. C5 — LN background on a binned plane (L3, L4)
 
 `background_grid` models the background on a `scale/8 = 128` px node mesh; it reads the full
-26 Mpx plane. C5: clip-then-bin the plane 4×4 (mean of the 16 finite pixels, NaN if fewer than 8
-are finite) before `clean_plane`'s passes and the cell loop — the model lives on a 128-px stride,
+26 Mpx plane. C5: `clip_and_bin` — the per-source-pixel hot-pixel and `[low_clip, high_clip]` passes of the
+retired `clean_plane` run at FULL resolution, and the survivors are binned 4×4 (mean of the finite
+pixels, NaN if fewer than 8 of 16 are finite) before the cell loop — the model lives on a 128-px stride,
 so a 32-px-stride input carries it; `median_of_finite` (the placeholder value) from the existing
-1/16 stratified sample. Both change the node values at the 1e-3 relative level (the binned mean
+1/16 stratified sample. Both change the node values at the 1e-3 relative level on the M2 fixtures (the binned mean
 is a smoother estimator than the per-pixel median inside a 128-px cell); the `.athln` sidecars
-move accordingly. Ruling C-5: `LN_BIN = 4`, applied to the reference model and every target
+move accordingly. Measured (Task 7): `A` identical on every real frame; `B` moves by 9e-4 of sky
+at the median but single nodes flip validity in `robust_cell_level`'s hard gate (a 16× smaller
+population of 4× quieter means near `rejection_limit`) and, neighbour-filled, move by up to
+0.44·sky — one frame's local offset, rejected by the linear fit at n ≥ 20 (ruling C-28 makes C-3
+measure it at master level: `ln_cells_rejected` per group and the worst node's neighbourhood).
+The cell deviation sigmas (3.0 / 3.2) are NOT re-derived for the binned plane — widening them by
+`LN_BIN` re-admits star wings and measures worse on every fixture — and are pinned. Ruling C-5: `LN_BIN = 4`, applied to the reference model and every target
 identically.
 
 ## 7. C6 — Register reuses Measure's fits for mono frames (D2)
@@ -411,8 +418,8 @@ the external reference's masters of the same frames (the M-run harness:
 | Rejected fraction (linear fit) vs baseline | ± 0.3 pp (baseline 2.985 / 2.733 %) |
 | Per-frame weights: Spearman ρ vs baseline | ≥ 0.99; top-20 overlap ≥ 18/20 |
 | LN relative scale `s` per frame vs baseline | median ratio 1 ± 0.5 %, scatter ≤ 1 % |
-| Drizzled master level vs undrizzled (R-M3-2) | 0.998–1.002 (baseline 0.9987–0.99999) |
-| Drizzle coverage | 1.0 on every plane |
+| Drizzled master level vs undrizzled (R-M3-2) | 0.998–1.002 (baseline 0.9987–0.99999; the bound is ABSOLUTE and the OSC-red baseline sits AT it, 0.998007 — ruling C-20: reported as FAIL with the relative delta beside it, never re-sized) |
+| Drizzle coverage | 1.0 on every plane (a data fact on the reduced set — ruling C-23: the mono footprint leaves 0.65 % of the OSC reference geometry's corners uncovered and the OSC blue plane has 2 edge zeros; reported as FAIL, and C-3 compares the zero SET against an exact-overlap drizzle instead) |
 | Wall (interleaved with a fresh baseline re-run, R-TA-9) | reported, target ≤ 16 min |
 
 Each item lands behind its own config-hash bump (the stage whose artifacts it moves) and its
@@ -422,11 +429,43 @@ regression is caught at the fixture level, not only at the acceptance run.
 ## 9. Rulings (proposed, decided at plan time)
 
 C-1 group β = median of the members' Auto β; C-2 wider-radius pass replaces the barycentre pass;
-C-3 `PHASES = 32`, per frame for linear maps, per 256-px tile under distortion; C-4 LM control
+C-3 `PHASES = 32` (superseded by C-21: 64), per frame for linear maps, per 256-px tile under distortion; C-4 LM control
 flow untouched; C-5 `LN_BIN = 4`; C-6 mono-only fit reuse in Register, OSC keeps luminance
 detection; C-7 (process) one implementer at a time, interleaved before/after measurement for
 every timing, the product-build checkpoint as the arbiter, an honest revert with numbers when an
 item measures ≤ 0 (Tier A's rulings R-TA-8/9 carried over).
+
+**C-19** (controller, 2026-09-20): the Tier C ruler is `.athenaeum-acc/tierA-baseline` — the
+Tier A acceptance proved `tierA-tierA` byte-identical to it on every artifact the numeric compare
+reads (four masters, 565 registration rows, 197 `.athln` sidecars, 302 calibrated frames); the
+`tierA-tierA` tree itself was lost to a harness invocation error (`bash` on a zsh script shifted
+the positional parse — the script now re-execs under zsh and refuses name == base).
+
+**C-20** (C-1): the drizzle-level row's bound is absolute and the OSC-red baseline sits at it; a
+FAIL by 1e-5 there is a gate-placement fact, reported with the relative delta, never re-sized.
+
+**C-21** (Task 4): `PHASES = 64`. The plan's 2 % per-pixel bound against the exact clip is the
+gate; at 32 the residual scales as 1/PHASES to 2.2–2.5 %, at 64 to 1.0–1.6 %. The default
+per-frame arm builds one 212 KB table per (frame, plane) in ≈ 0.8 ms; the tiled arm pays ≈ one
+build per tile per band (−76 % → −62 %, non-default path).
+
+**C-23** (C-2): the two coverage FAILs are data facts (mono edge wedges, two OSC-blue edge
+pixels), unchanged by the phase table (the probe's exact and tabulated arms agree to six
+decimals); C-3 compares the mono weight map's zero set against an exact-overlap drizzle.
+
+**C-24** (Task 5): `PSF_FIT_VERSION` stays 3 — the fitter's outputs moved by at most 1 ulp of
+`fwhm_px` and 3.8e-15 of eccentricity with iteration counts identical on 180 solves; a bump would
+re-measure and re-normalize every set for a last-bit move. The `metrics` artifact carries
+`fwhm_px`, so a cached pre-C3 row and a fresh one differ in the last bit.
+
+**C-27** (Task 7): the M2 fixtures keep the brief's 1e-3 node bar; fixtures with a noise floor
+carry 2e-3 — ≈ 2.7× the measured star-free estimator difference (7.342e-4, two sample
+estimators over different pixel subsets), a derived bar for a quantity 1e-3 cannot describe,
+not a loosening. The discarded uniform-peak fixture stays live as the crowding characterisation.
+
+**C-28** (Task 7 review): C-3 runs on the final numeric head; the review's doc/test minors land in
+the acceptance docs commit; C-3's read adds `ln_cells_rejected` per group, the worst-B-node
+neighbourhood on the master, the coverage zero-set comparison and the FWHM last-bit note.
 
 **C-26** (Task 6, coordinator): C4 is reverted. `medfit_line`'s warm bracket measured 0.946x
 evaluations and 0.966x `combine_cpu_ms` on real data — a ≈ 3 % combine gain does not buy a
