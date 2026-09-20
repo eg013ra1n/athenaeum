@@ -538,12 +538,25 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Tier C Task 1: the flat per-plane byte estimate [`estimate_bytes`] uses
-/// for the `fits` artifact — the midpoint of the spec's own "≈ 200-400 KB
-/// per plane" figure (`fits_artifact.rs`'s module doc), not a measured
-/// average over real star counts (a starless plane's file is a few dozen
-/// bytes, a rich one several times this).
-const FITS_ARTIFACT_ESTIMATE_BYTES: u64 = 300_000;
+/// The flat per-plane byte estimate [`estimate_bytes`] uses for the `fits`
+/// artifact (Tier C Task 1), MEASURED (final fix wave, ruling C-30, the
+/// whole-branch review's M3) rather than guessed: every `.athf` the Tier C
+/// acceptance run left behind — 407 plane-files over the reduced set
+/// `LDN1272-test` (92 mono frames at one plane, 105 OSC frames at three) —
+/// is median 325 KB, mean 340 KB, p90 407 KB, max 882 KB, 133 MiB in
+/// total. 350 KB is that mean rounded up, so a typical group is not
+/// under-counted; the term itself is what the `space` blocker refuses on,
+/// where over-estimating is the safe direction.
+///
+/// It stays a flat constant, not a star-count model: the spread above is
+/// real (a starless plane's file is a few dozen bytes, a rich one several
+/// times the median) but the whole term is ≈ 0.3 % of one group's
+/// calibrated footprint — 133 MiB beside 50 GB on that same set — so the
+/// precision that would buy is not worth a per-frame prediction the plan
+/// gate cannot make without measuring. It superseded the spec's own
+/// "≈ 200-400 KB per plane" midpoint (300 KB), which under-counted the
+/// measured mean by 13 %.
+const FITS_ARTIFACT_ESTIMATE_BYTES: u64 = 350_000;
 
 /// Inputs to [`estimate_bytes`]: the groups a run would integrate, and the
 /// output toggles that change how much gets written (whether registered
@@ -577,9 +590,10 @@ pub struct EstimateInputs<'a> {
 
 /// Rough byte estimate for a run's working+output footprint: every group
 /// contributes its calibrated frames (one float32 plane per frame, three
-/// planes for OSC, each frame at its OWN native geometry), one master plus
-/// (when maps are written) two rejection maps, and — when registered frames
-/// are also kept — one registered artifact per frame. The registered term
+/// planes for OSC, each frame at its OWN native geometry), one
+/// [`FITS_ARTIFACT_ESTIMATE_BYTES`] `fits` artifact per (frame, plane),
+/// one master plus (when maps are written) two rejection maps, and — when
+/// registered frames are also kept — one registered artifact per frame. The registered term
 /// (fix round 2, ruling R-TA-6 M5) and the master/maps term both use the
 /// group's LARGEST member's native geometry as a stand-in for the reference
 /// geometry (owner decision 2026-09-10: a group's members can carry
@@ -1327,6 +1341,56 @@ mod tests {
         let fits_term = (2 * 1 + 1 * 3) * FITS_ARTIFACT_ESTIMATE_BYTES;
         let expected = 2 * 400 + 1 * 1200 + (400 * 3) + (1200 * 3) + fits_term;
         assert_eq!(estimate_bytes(&inputs), expected);
+    }
+
+    /// M3 (final fix wave, ruling C-30): the `fits` term's VALUE, not just
+    /// its shape — `estimate_counts_planes_and_maps` above computes its own
+    /// expectation FROM the constant, so it would follow any edit of it
+    /// silently. This pins the measured number itself (see
+    /// [`FITS_ARTIFACT_ESTIMATE_BYTES`]'s doc for the 407-file measurement
+    /// behind it) and that the term is added unconditionally, per PLANE,
+    /// with no toggle able to remove it — the failure the review's M3
+    /// reported as "the estimate omits `fits/`".
+    #[test]
+    fn the_fits_term_is_the_measured_per_plane_size() {
+        assert_eq!(
+            FITS_ARTIFACT_ESTIMATE_BYTES, 350_000,
+            "the measured mean over the Tier C acceptance run's 407 .athf files, rounded up"
+        );
+
+        // Zero-area frames strip every geometry-driven term, so whatever is
+        // left IS the fits term — and it must be there with every toggle
+        // off, drizzle included.
+        let mono = vec![group(ColorMode::Mono, 4, 0, 0)];
+        let osc = vec![group(ColorMode::Osc, 4, 0, 0)];
+        fn all_off(groups: &[IntegrationGroup]) -> EstimateInputs<'_> {
+            EstimateInputs {
+                groups,
+                write_registered: false,
+                write_maps: false,
+                drizzle: None,
+                large_scale: false,
+                drizzle_bayer: false,
+            }
+        }
+        assert_eq!(
+            estimate_bytes(&all_off(&mono)),
+            4 * FITS_ARTIFACT_ESTIMATE_BYTES,
+            "one .athf per mono frame"
+        );
+        assert_eq!(
+            estimate_bytes(&all_off(&osc)),
+            4 * 3 * FITS_ARTIFACT_ESTIMATE_BYTES,
+            "three .athf per OSC frame — per PLANE, not per frame"
+        );
+
+        // And it scales with the frame count, so a bigger set is refused
+        // earlier rather than later.
+        let one = vec![group(ColorMode::Mono, 1, 0, 0)];
+        assert_eq!(
+            estimate_bytes(&all_off(&mono)) - estimate_bytes(&all_off(&one)),
+            3 * FITS_ARTIFACT_ESTIMATE_BYTES
+        );
     }
 
     #[test]
