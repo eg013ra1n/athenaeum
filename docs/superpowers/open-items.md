@@ -202,6 +202,21 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking compute Tier A (2026-09-19/20)
+
+- **Owed test**: the Register stage's cache-hit REWRITE batch (registered artifacts missing/stale)
+  ticks progress through its own `FanOutTicker` (fix wave `ab80a804`, review I2); no automated test
+  pins that composition (rewrite ticker → main ticker, never exceeding the total). Add one when
+  `run.rs`'s progress tests are next touched (Tier C Task 2 lands in the same stage).
+- **Owner smokes**: the Register panel note replacing the "Write registered frames" toggle
+  (`dc9f6287`); the plan gate's `space` refusal wording on a small working folder (the registered
+  artifacts now count — ≈ the calibrated footprint again).
+- **Owner decision owed**: the rustafits submodule (its own public repo) carries pre-existing
+  third-party product names in comments/docs (`background.rs`, `mod.rs`, `metrics.rs`,
+  `stretch.rs`, `fits.rs`, the CLI) — does the 2026-09-19 no-names rule extend to it?
+- **Nothing pushed**: `main` (Tier A merged), `perf/stacking-tierA`, rustafits
+  `perf/stacking-kernels` — push on the owner's word.
+
 ### Settings redesign (2026-09-18)
 
 Spec `docs/superpowers/specs/2026-09-18-settings-redesign-design.md`, plan

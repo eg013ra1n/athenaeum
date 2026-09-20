@@ -264,7 +264,7 @@ fn drop_half_diag_at(
 /// coordinate — the same degenerate non-finite case every other caller
 /// of [`map_drop`] already falls back on.
 ///
-/// M1 fix wave: this bound itself samples through [`PixelMap::
+/// M4 fix wave: this bound itself samples through [`PixelMap::
 /// forward_exact`], but the real per-pixel deposit `deposit_band` skips
 /// against maps through the grid-cached `ForwardEval` instead (built once
 /// per frame, evaluated once per pixel — the O(nodes) exact path is only
