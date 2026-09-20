@@ -189,6 +189,10 @@ required-features = ["render", "solver"]
 name = "xisf_convert_probe"
 required-features = ["render"]
 
+[[example]]
+name = "drizzle_probe"
+required-features = ["render", "solver"]
+
 [dev-dependencies]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }

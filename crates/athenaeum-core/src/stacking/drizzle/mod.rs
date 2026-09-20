@@ -23,6 +23,7 @@
 //! in reference geometry.
 
 pub mod geom;
+pub mod phase_table;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +38,7 @@ use crate::geometry::{ForwardEval, PixelMap};
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::NormalizationPair;
 use crate::integration::IntegrationError;
+use crate::stacking::drizzle::phase_table::PhaseTable;
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::LnFrameGrids;
 use crate::stacking::measure::{measure_plane, MeasureOptions};
@@ -138,6 +140,15 @@ pub struct DrizzleInput<'a> {
     /// always passes `None`; tests inject a small value to exercise the
     /// refusal without needing a huge geometry.
     pub ram_total_bytes: Option<u64>,
+    /// Forces the exact per-pixel clip everywhere, even where Tier C item
+    /// C2's phase table would apply (ruling C-3). **The run never sets
+    /// this** — `stacking::run` passes `false` and there is no config key
+    /// for it. It exists so the `drizzle_probe` can time the two overlap
+    /// arms against each other INTERLEAVED in one process (ruling R-TA-9:
+    /// only interleaved before/after brackets are comparable on a machine
+    /// that drifts 10-15 % across a session), rather than through two
+    /// binaries or an environment variable nothing type-checks.
+    pub force_exact_overlap: bool,
 }
 
 /// Per-group drizzle statistics — the `stacking_run_groups` / provenance
@@ -341,6 +352,163 @@ struct FrameDepositCtx<'a> {
     /// `None` is the debayered deposit (`src` is already `plane`'s own
     /// interpolated plane, every pixel contributes).
     cfa: Option<BayerPattern>,
+    /// Tier C item C2 (ruling C-3): where the `square` kernel gets ONE
+    /// drop's output-pixel overlap areas — the exact per-pixel clip, a
+    /// per-frame phase table, or a per-tile one. Resolved once per (frame,
+    /// plane) by [`resolve_square_overlap`]; it decides only the GEOMETRY
+    /// of a drop's overlap, never what is deposited or whether.
+    overlap: SquareOverlap<'a>,
+}
+
+/// Tier C item C2 (spec §3.2, ruling C-3): the three ways one drop's
+/// output-pixel overlap areas are obtained. Every arm feeds the SAME
+/// accumulation path in [`deposit_band`] — the frame weight, the
+/// normalized sample, the `.rej` verdict, the LN grid and the CFA routing
+/// are all resolved above the dispatch and applied once.
+#[derive(Clone, Copy)]
+enum SquareOverlap<'a> {
+    /// The exact Sutherland-Hodgman clip per source pixel — M1..M4d's own
+    /// path, kept as the runtime path for `scale == 1 && dropShrink == 1.0`
+    /// (ruling C-3: the table would be a 1x1 identity there, not worth a
+    /// build) and as the oracle every C2 pin measures against.
+    Exact,
+    /// One table for the whole frame: with no distortion layer the mapped
+    /// drop is one parallelogram, so only its sub-pixel phase varies.
+    Frame(&'a PhaseTable),
+    /// Rebuilt per [`phase_table::TILE`]-pixel source tile from the map's
+    /// local Jacobian — a distortion layer varies the drop's shape across
+    /// the frame.
+    Tiled,
+}
+
+/// One source tile's table under [`SquareOverlap::Tiled`]: not built yet,
+/// refused by [`PhaseTable::build`] (a degenerate local mapping — that
+/// tile deposits through the exact clip instead), or built.
+enum TileSlot {
+    Empty,
+    Refused,
+    Built(PhaseTable),
+}
+
+/// Whether the phase table applies at all (ruling C-3): at `scale == 1`
+/// with an unshrunk drop the mapped drop of an identity-ish map is one
+/// whole output pixel, the table degenerates, and the exact clip is both
+/// cheaper and exact. Every other `(scale, dropShrink)` pair tabulates.
+fn phase_table_applies(scale: u32, drop_shrink: f64) -> bool {
+    !(scale == 1 && drop_shrink == 1.0)
+}
+
+/// The `deposit_mode` field of the `drizzle plane deposited` event
+/// (Tier C item C2): which overlap arm this plane's frames took —
+/// `exact`, `table`, `tiled`, `mixed` when a plane used more than one,
+/// and `none` when no frame was deposited at all (every frame's weight
+/// was zero, or the group is empty).
+fn overlap_mode_label(counts: &[usize; 3]) -> &'static str {
+    match (counts[0] > 0, counts[1] > 0, counts[2] > 0) {
+        (true, false, false) => "exact",
+        (false, true, false) => "table",
+        (false, false, true) => "tiled",
+        (false, false, false) => "none",
+        _ => "mixed",
+    }
+}
+
+/// Accumulates one drop-to-output-pixel overlap. The ONE place `ib`/`wb`
+/// are written, shared by both overlap arms (the exact clip and the phase
+/// table) so the weight and coverage bookkeeping exists once.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn deposit_cell(
+    ib: &mut [f32],
+    wb: &mut [f32],
+    out_w: usize,
+    y0: usize,
+    y1: usize,
+    px: i64,
+    py: i64,
+    aw: f32,
+    nd: f32,
+) {
+    if px < 0 || px as usize >= out_w || py < y0 as i64 || py >= y1 as i64 {
+        return;
+    }
+    let idx = (py - y0 as i64) as usize * out_w + px as usize;
+    ib[idx] += aw * nd;
+    wb[idx] += aw;
+}
+
+/// [`SquareOverlap::Exact`]: map the drop's four corners and clip it
+/// against every output pixel of its own bounding box (M1's path,
+/// unchanged).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn deposit_exact(
+    ib: &mut [f32],
+    wb: &mut [f32],
+    out_w: usize,
+    y0: usize,
+    y1: usize,
+    ctx: &FrameDepositCtx<'_>,
+    x: usize,
+    y: usize,
+    wf: f64,
+    nd: f32,
+) {
+    let corners = geom::drop_corners(x, y, ctx.drop_shrink);
+    let Some((quad, bbox)) = geom::map_drop(&ctx.fwd, &corners, ctx.scale) else {
+        return;
+    };
+    let (bx0, by0, bx1, by1) = bbox;
+    let px0 = bx0.max(0);
+    let px1 = bx1.min(out_w as i64 - 1);
+    let py0 = by0.max(y0 as i64);
+    let py1 = by1.min(y1 as i64 - 1);
+    for py in py0..=py1 {
+        for px in px0..=px1 {
+            let a = geom::clip_area(&quad, px, py);
+            if a > 0.0 {
+                deposit_cell(ib, wb, out_w, y0, y1, px, py, (a * wf) as f32, nd);
+            }
+        }
+    }
+}
+
+/// [`SquareOverlap::Frame`]/[`SquareOverlap::Tiled`]: the drop's mapped
+/// centre `(ox, oy)` splits into an integer output pixel and a sub-pixel
+/// phase; the table answers "which neighbours, how much area" for that
+/// phase with no clip and no division.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn deposit_tabulated(
+    ib: &mut [f32],
+    wb: &mut [f32],
+    out_w: usize,
+    y0: usize,
+    y1: usize,
+    table: &PhaseTable,
+    ox: f64,
+    oy: f64,
+    wf: f64,
+    nd: f32,
+) {
+    let cxf = ox.floor();
+    let cyf = oy.floor();
+    let (cells, areas) = table.lookup(ox - cxf, oy - cyf);
+    let cx = cxf as i64;
+    let cy = cyf as i64;
+    for (&(dx, dy), &a) in cells.iter().zip(areas.iter()) {
+        deposit_cell(
+            ib,
+            wb,
+            out_w,
+            y0,
+            y1,
+            cx + dx as i64,
+            cy + dy as i64,
+            (a as f64 * wf) as f32,
+            nd,
+        );
+    }
 }
 
 /// Per plane, per included frame, banded forward deposition (rulings
@@ -495,6 +663,11 @@ pub fn drizzle_group(
         // event can report its own split, not the group's running total.
         let mut plane_read = std::time::Duration::ZERO;
         let mut plane_deposit = std::time::Duration::ZERO;
+        // Tier C item C2: how many of this plane's frames deposited
+        // through the exact clip / a per-frame table / per-tile tables —
+        // reported as `deposit_mode` on the plane event so a run can be
+        // told to have taken the tabulated path without a profiler.
+        let mut plane_overlap_modes = [0usize; 3];
 
         for frame in input.frames {
             // Cancel checked once per frame (perf shape) — the band loop
@@ -657,6 +830,50 @@ pub fn drizzle_group(
                 input.drop_shrink,
                 input.scale,
             );
+            // Tier C item C2 (spec §3.2, ruling C-3): with no distortion
+            // layer the mapped drop is ONE parallelogram for the whole
+            // frame, so its overlap areas tabulate once here. Taken at the
+            // frame's own CENTRE rather than at its origin: for a
+            // Similarity/Affine map the position does not matter at all
+            // (the Jacobian is position-independent), and for a Homography
+            // — the pipeline's default registration output — it centres
+            // the projective row's variation instead of leaving it
+            // one-sided. A refused build (a degenerate local mapping)
+            // falls back to the exact clip, never to a wrong table.
+            let square_table = (input.kernel == DrizzleKernel::Square
+                && !input.force_exact_overlap
+                && phase_table_applies(input.scale, input.drop_shrink)
+                && frame.map.distortion.is_none())
+            .then(|| {
+                geom::map_drop_at(
+                    frame.map,
+                    (src_width as f64 - 1.0) / 2.0,
+                    (src_height as f64 - 1.0) / 2.0,
+                    input.drop_shrink,
+                    input.scale,
+                )
+                .and_then(|q| PhaseTable::build(&q, input.scale, phase_table::PHASES))
+            })
+            .flatten();
+            let overlap = if input.kernel != DrizzleKernel::Square
+                || input.force_exact_overlap
+                || !phase_table_applies(input.scale, input.drop_shrink)
+            {
+                SquareOverlap::Exact
+            } else if let Some(table) = square_table.as_ref() {
+                SquareOverlap::Frame(table)
+            } else if frame.map.distortion.is_some() {
+                SquareOverlap::Tiled
+            } else {
+                // A linear map whose table refused to build.
+                SquareOverlap::Exact
+            };
+            plane_overlap_modes[match overlap {
+                SquareOverlap::Exact => 0,
+                SquareOverlap::Frame(_) => 1,
+                SquareOverlap::Tiled => 2,
+            }] += 1;
+
             let ctx = FrameDepositCtx {
                 src: &src,
                 src_width,
@@ -676,6 +893,7 @@ pub fn drizzle_group(
                 w,
                 plane: c,
                 cfa: frame.cfa.map(|s| s.pattern),
+                overlap,
             };
 
             let deposit_start = Instant::now();
@@ -744,6 +962,7 @@ pub fn drizzle_group(
             bytes = plane_bytes_read,
             read_ms = plane_read.as_millis() as u64,
             deposit_ms = plane_deposit.as_millis() as u64,
+            deposit_mode = overlap_mode_label(&plane_overlap_modes),
             "drizzle plane deposited"
         );
     }
@@ -952,6 +1171,13 @@ fn deposit_band(
     // kernels for one isolated drop.
     let scale_sq = ctx.scale as f64 * ctx.scale as f64;
 
+    // Tier C item C2 (ruling C-3): [`SquareOverlap::Tiled`]'s per-tile
+    // tables, one tile ROW at a time (see the arm below). Allocated lazily
+    // — the other two arms never touch either of these.
+    let tiles_x = ctx.src_width.div_ceil(phase_table::TILE).max(1);
+    let mut tile_row = usize::MAX;
+    let mut tile_cache: Vec<TileSlot> = Vec::new();
+
     for y in sy0..=sy1 {
         let row_off = y * ctx.src_width;
         for x in sx0..=sx1 {
@@ -1039,21 +1265,69 @@ fn deposit_band(
 
             match ctx.kernel {
                 DrizzleKernel::Square => {
-                    let corners = geom::drop_corners(x, y, ctx.drop_shrink);
-                    if let Some((quad, bbox)) = geom::map_drop(&ctx.fwd, &corners, ctx.scale) {
-                        let (bx0, by0, bx1, by1) = bbox;
-                        let px0 = bx0.max(0);
-                        let px1 = bx1.min(out_w as i64 - 1);
-                        let py0 = by0.max(y0 as i64);
-                        let py1 = by1.min(y1 as i64 - 1);
-                        for py in py0..=py1 {
-                            for px in px0..=px1 {
-                                let a = geom::clip_area(&quad, px, py);
-                                if a > 0.0 {
-                                    let aw = (a * ctx.w as f64) as f32;
-                                    let idx = (py - y0 as i64) as usize * out_w + px as usize;
-                                    ib[idx] += aw * nd;
-                                    wb[idx] += aw;
+                    // Tier C item C2 (spec §3.2, ruling C-3): the three
+                    // arms differ ONLY in where `(cells, areas)` come
+                    // from. Everything that decides WHAT is deposited —
+                    // the CFA colour routing, the `.rej` verdict, the LN
+                    // grid or the global pair, the frame weight `wf` and
+                    // the finite guards — is resolved above this match and
+                    // applied once; both arms end in the same
+                    // `deposit_cell`.
+                    let wf = ctx.w as f64;
+                    match ctx.overlap {
+                        SquareOverlap::Exact => {
+                            deposit_exact(ib, wb, out_w, y0, y1, ctx, x, y, wf, nd);
+                        }
+                        SquareOverlap::Frame(table) => {
+                            let ox = geom::to_output(u, ctx.scale);
+                            deposit_tabulated(ib, wb, out_w, y0, y1, table, ox, oy, wf, nd);
+                        }
+                        SquareOverlap::Tiled => {
+                            // The tile the local Jacobian is taken at. The
+                            // cache holds a whole tile ROW: this scan is
+                            // row-major, so caching only the CURRENT tile
+                            // would rebuild every column's table once per
+                            // SOURCE ROW (≈ 25 rebuilds a row on a 6 k-wide
+                            // frame) instead of once per tile. `y` only
+                            // ever increases, so a changed tile row can
+                            // drop the whole previous row.
+                            let ty = y / phase_table::TILE;
+                            if ty != tile_row {
+                                tile_row = ty;
+                                tile_cache.clear();
+                                tile_cache.resize_with(tiles_x, || TileSlot::Empty);
+                            }
+                            let tx = (x / phase_table::TILE).min(tiles_x - 1);
+                            if matches!(tile_cache[tx], TileSlot::Empty) {
+                                let cx = (tx * phase_table::TILE + phase_table::TILE / 2)
+                                    .min(ctx.src_width.saturating_sub(1))
+                                    as f64;
+                                let cy = (ty * phase_table::TILE + phase_table::TILE / 2)
+                                    .min(ctx.src_height.saturating_sub(1))
+                                    as f64;
+                                tile_cache[tx] = match geom::map_drop_at(
+                                    ctx.map,
+                                    cx,
+                                    cy,
+                                    ctx.drop_shrink,
+                                    ctx.scale,
+                                )
+                                .and_then(|q| PhaseTable::build(&q, ctx.scale, phase_table::PHASES))
+                                {
+                                    Some(t) => TileSlot::Built(t),
+                                    None => TileSlot::Refused,
+                                };
+                            }
+                            match &tile_cache[tx] {
+                                TileSlot::Built(table) => {
+                                    let ox = geom::to_output(u, ctx.scale);
+                                    deposit_tabulated(ib, wb, out_w, y0, y1, table, ox, oy, wf, nd);
+                                }
+                                // A degenerate local mapping: this tile
+                                // keeps the exact clip rather than
+                                // depositing nothing.
+                                TileSlot::Empty | TileSlot::Refused => {
+                                    deposit_exact(ib, wb, out_w, y0, y1, ctx, x, y, wf, nd);
                                 }
                             }
                         }
@@ -1262,6 +1536,7 @@ mod tests {
             write_weight_map: true,
             measure,
             ram_total_bytes: None,
+            force_exact_overlap: false,
         }
     }
 
@@ -1421,15 +1696,36 @@ mod tests {
         input.scale = 2;
         input.drop_shrink = 1.0;
 
+        input.write_weight_map = true;
+
         let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
         let out_w = W * 2;
         for &(x, y) in &[(20usize, 20usize), (21, 20), (20, 21), (21, 21)] {
             let v = out.data[y * out_w + x];
             assert!((v - 1.0).abs() < 1e-6, "x={x} y={y} v={v}");
         }
+        // Tier C item C2 (ruling C-3): the ring around the block is no
+        // longer EMPTY. This fixture's identity map puts every mapped drop
+        // centre at an exact half-pixel phase — the single worst case for
+        // the phase table, whose nearest bin centre is 1/64 of an output
+        // pixel away — so a sliver of the drop's own area lands one pixel
+        // further out than the exact clip put it. What the pin protects is
+        // unchanged and now stated directly: essentially ALL of the drop's
+        // mass is still on the four-pixel block, and the ring's share of
+        // it is ≤ 2 % (measured 1.6 % on the edge-adjacent pixels, 0.03 %
+        // on the diagonal ones — spec §3.2's own "≤ 1.6 % per-frame weight
+        // change" figure, arrived at independently here). The VALUE there
+        // is still exactly 1.0: a sliver carries the same source pixel,
+        // not a different one.
+        let weight = out.weight.as_ref().expect("write_weight_map was on");
+        let block_weight = weight[20 * out_w + 20];
+        assert!(block_weight > 0.0);
         for &(x, y) in &[(19usize, 20usize), (22, 20), (20, 19), (20, 22), (19, 19)] {
-            let v = out.data[y * out_w + x];
-            assert_eq!(v, 0.0, "x={x} y={y} v={v}");
+            let w = weight[y * out_w + x];
+            assert!(
+                w <= 0.02 * block_weight,
+                "x={x} y={y} weight={w} is more than a 2 % sliver of the block's {block_weight}"
+            );
         }
     }
 
@@ -1826,10 +2122,26 @@ mod tests {
         // Recorded against the unmodified driver; re-run after Z1/Z5 to
         // confirm the checksums do not move (task 11 report has the run
         // log for both sides).
+        //
+        // RE-PINNED, Tier C item C2 (ruling C-3): the deposit now takes a
+        // drop's overlap areas from a per-phase table instead of clipping
+        // every source pixel exactly, which rounds each drop's sub-pixel
+        // phase to 1/64 of an output pixel — a deliberate NUMERIC change
+        // (Tier C is the numeric tier; Tier A's own bit-identity is what
+        // this pin used to carry). The three pre-C2 pairs were
+        // `(0x8cb227895e93f504, 0xcf5743015bcedb75)`,
+        // `(0x9427361e0439f161, 0x82f2ad1c84dd72c6)` and
+        // `(0x502542b82e474955, 0x2a811e20249d5d31)`; the SIZE of the move
+        // is pinned separately and quantitatively by
+        // `the_phase_table_tracks_the_exact_clip_on_a_rotated_frame`. What
+        // this pin still guards is unchanged and is why it is not deleted:
+        // the driver must be DETERMINISTIC — same input, same bytes, band
+        // parallelism and all (both values below were captured twice, on
+        // separate runs, identical).
         let expected: [(u64, u64); 3] = [
-            (0x8cb227895e93f504, 0xcf5743015bcedb75), // 1 deg
-            (0x9427361e0439f161, 0x82f2ad1c84dd72c6), // 5 deg
-            (0x502542b82e474955, 0x2a811e20249d5d31), // 30 deg
+            (0x55b2eb71dd060899, 0xf91233f30df26760), // 1 deg
+            (0x830588d5d083ad47, 0xb4c714f38cdb3dc9), // 5 deg
+            (0x8e4c7c798be423c9, 0xc2cd2f6c50af020e), // 30 deg
         ];
 
         for (deg, (want_data, want_weight)) in [1.0_f64, 5.0, 30.0].into_iter().zip(expected) {
@@ -2059,6 +2371,7 @@ mod tests {
             write_weight_map: false,
             measure: &measure,
             ram_total_bytes: Some(1024),
+            force_exact_overlap: false,
         };
         let err =
             drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap_err();
@@ -2103,6 +2416,7 @@ mod tests {
             write_weight_map: true,
             measure: &measure,
             ram_total_bytes: None,
+            force_exact_overlap: false,
         };
 
         let out = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
@@ -2123,12 +2437,28 @@ mod tests {
         // Minor 6: the weight map must be FLAT (no doubling, no gap) at the
         // exact seam rows and their immediate neighbours, compared against
         // an unambiguously interior reference row.
+        //
+        // Tier C item C2 (ruling C-3): the interior reference row is now
+        // chosen with the SAME PARITY as the seam row under test. This
+        // fixture's identity map puts every drop at an exact half-pixel
+        // phase, whose nearest phase-table bin centre is 1/64 of an output
+        // pixel away, and that residual splits a drop's area 0.884/0.916
+        // between the two output rows it covers instead of 0.9/0.9 — so
+        // even and odd output rows carry systematically different raw
+        // weight (by 3.6 %) EVERYWHERE, seam or not. That is the
+        // documented phase quantization (spec §3.2's "≤ 1.6 % per-frame
+        // weight change", per axis), not a seam defect, and it is
+        // invisible in `I / W` — which the flatness check above already
+        // pins to 1e-6 across every row. What this check exists for — a
+        // band boundary must neither DOUBLE a row's deposit nor DROP it —
+        // is unchanged and still caught: a doubled row reads 2x its
+        // parity-mate's weight and a dropped one reads 0.
         let weight_map = out.weight.as_ref().expect("write_weight_map was on");
         let x = 20usize;
-        let reference = weight_map[10 * out_w + x];
         for &seam in &[
             510usize, 511, 512, 513, 1022, 1023, 1024, 1025, 1534, 1535, 1536, 1537,
         ] {
+            let reference = weight_map[(10 + seam % 2) * out_w + x];
             let v = weight_map[seam * out_w + x];
             assert!(
                 (v - reference).abs() < 1e-6,
@@ -2243,6 +2573,11 @@ mod tests {
             pair,
             w: 1.0,
             plane: 0,
+            // Tier C item C2: this pin measures the RAW mass the exact
+            // clip deposits against the tabulated kernel's, so it stays on
+            // the exact arm — the phase table's own mass invariant is
+            // pinned separately (`every_phase_row_sums_to_the_drops_own_area`).
+            overlap: SquareOverlap::Exact,
         };
         deposit_band(&mut ib_sq, &mut wb_sq, 0, out_w, &ctx_sq);
         let mass_sq: f64 = wb_sq.iter().map(|&v| v as f64).sum();
@@ -2269,6 +2604,11 @@ mod tests {
             pair,
             w: 1.0,
             plane: 0,
+            // Tier C item C2: this pin measures the RAW mass the exact
+            // clip deposits against the tabulated kernel's, so it stays on
+            // the exact arm — the phase table's own mass invariant is
+            // pinned separately (`every_phase_row_sums_to_the_drops_own_area`).
+            overlap: SquareOverlap::Exact,
         };
         deposit_band(&mut ib_c, &mut wb_c, 0, out_w, &ctx_c);
         let mass_c: f64 = wb_c.iter().map(|&v| v as f64).sum();
@@ -2431,8 +2771,16 @@ mod tests {
             (2 * mx + 1, 2 * my + 1),
         ] {
             let v = out.data[y * out_w + x] as f64;
+            // Tier C item C2 (ruling C-3): 1e-2, not 1e-4. This fixture's
+            // maps put every drop at an exact half-pixel phase — the phase
+            // table's own worst case — so a 1.6 % sliver of the marker
+            // pixel's mass lands outside the block and the block's
+            // weighted mean moves by ≈ 0.7 % (0.4599 against 0.4667). The
+            // pin's discriminating power is untouched: the failure it
+            // exists to catch reads `background` = 0.25 here, 0.217 away
+            // from `expected`, i.e. 21x this tolerance.
             assert!(
-                (v - expected).abs() < 1e-4,
+                (v - expected).abs() < 1e-2,
                 "x={x} y={y} v={v} expected={expected} \
                  (a stride bug reading the odd frame's 70-wide plane at the \
                  reference's width would read `background` here, not `marker`)"
@@ -2500,6 +2848,7 @@ mod tests {
                 write_weight_map: true,
                 measure: &measure,
                 ram_total_bytes: None,
+                force_exact_overlap: false,
             };
 
             let out =
@@ -2616,6 +2965,7 @@ mod tests {
             write_weight_map: true,
             measure: &measure,
             ram_total_bytes: None,
+            force_exact_overlap: false,
         };
 
         // Ground truth: the SAME evaluator `deposit_band` calls, run
@@ -2713,6 +3063,7 @@ mod tests {
             write_weight_map: true,
             measure,
             ram_total_bytes: None,
+            force_exact_overlap: false,
         }
     }
 
@@ -2888,5 +3239,370 @@ mod tests {
             }
             other => panic!("expected a BadInput refusal, got {other:?}"),
         }
+    }
+
+    // ── Tier C item C2 (spec §3.2, ruling C-3): the phase table against
+    // the exact clip it replaces.
+    //
+    // The comparison is a DELTA, not an identity — the table rounds a
+    // drop's sub-pixel phase to the centre of its `1 / PHASES` bin, so the
+    // drop's mass is split among its neighbours as if it sat up to
+    // `1 / (2 · PHASES)` = 1/64 of an output pixel from where it really
+    // is. What must NOT move is (1) the total deposited mass, which is
+    // what level preservation (R-M3-2) rests on, and (2) which output
+    // pixels are covered at all.
+    //
+    // These call `deposit_band` directly rather than `drizzle_group`: the
+    // overlap arm is a per-(frame, plane) property of `FrameDepositCtx`,
+    // and driving it from here lets the SAME source, map and geometry run
+    // once through each arm with no global switch (which, with the band
+    // loop on a rayon pool, could not be made race-free anyway). ──
+
+    /// The bar pins (c) and (d) hold ONE FRAME's tabulated plane to,
+    /// against the exact clip, per pixel.
+    ///
+    /// **Measured, not chosen.** The deviation is the phase residual
+    /// (≤ `1 / (2 · PHASES)` of an output pixel) multiplied by the local
+    /// RELATIVE gradient, so it peaks on star wings — where a Gaussian's
+    /// relative gradient is `r / σ²` per pixel — and scales as `1 /
+    /// PHASES`. Measured on these two fixtures (max over every covered
+    /// pixel):
+    ///
+    /// | `PHASES` | rotated 1° | tps |
+    /// | -------- | ---------- | --- |
+    /// | 16 | 4.04 % | 4.64 % |
+    /// | 32 (ruling C-3) | 2.17 % | 2.55 % |
+    /// | 64 | 1.09 % | 1.63 % |
+    ///
+    /// Not a fixture-size artefact: at the M3 fixtures' own 64x48 the
+    /// rotated case still reads 2.13 %. The Tier C plan's Task 4 checklist
+    /// names 2 %, which `PHASES = 32` does not reach and `PHASES = 64`
+    /// does; ruling C-3 fixes `PHASES = 32`, so the CONSTANT stands and
+    /// the bar here is the measurement with headroom. What the acceptance
+    /// actually reads is unaffected — this is ONE frame's deposit, and a
+    /// group's master is the weighted mean over a hundred frames at
+    /// effectively uncorrelated phases, so the per-pixel deviation
+    /// averages down by `1/sqrt(N)` (the plane LEVEL, which does not
+    /// average at all, is already 1.3e-5 here against spec §8's 2e-3 bar).
+    /// Flagged for the controller in the task report with the table above.
+    const C2_MAX_PIXEL_DEVIATION: f64 = 0.03;
+
+    /// A structured mono field — a sky pedestal, a smooth large-scale
+    /// gradient and a handful of Gaussian stars. Deliberately NOT uniform:
+    /// on a flat field every area split gives the same `I / W` and the
+    /// phase quantization is invisible, so a uniform fixture would pin
+    /// nothing. The stars are the realistic worst case (the steepest local
+    /// gradient a calibrated light carries).
+    fn structured_field(w: usize, h: usize) -> Vec<f32> {
+        let mut v = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (xf, yf) = (x as f64, y as f64);
+                v[y * w + x] =
+                    (100.0 + 25.0 * (xf / 11.0).sin() * (yf / 13.0).cos() + 0.05 * xf) as f32;
+            }
+        }
+        // A deterministic scatter of stars, sigma 1.8 px.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..40 {
+            let cx = (next() % (w as u64 - 12) + 6) as f64;
+            let cy = (next() % (h as u64 - 12) + 6) as f64;
+            let amp = 200.0 + (next() % 3000) as f64;
+            for y in (cy as usize).saturating_sub(6)..(cy as usize + 7).min(h) {
+                for x in (cx as usize).saturating_sub(6)..(cx as usize + 7).min(w) {
+                    let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+                    v[y * w + x] += (amp * (-r2 / (2.0 * 1.8 * 1.8)).exp()) as f32;
+                }
+            }
+        }
+        v
+    }
+
+    /// Deposits one whole plane band by band through `deposit_band` with
+    /// the given overlap arm, returning `(I, W)` in output geometry.
+    #[allow(clippy::too_many_arguments)]
+    fn deposit_whole_plane(
+        map: &PixelMap,
+        src: &[f32],
+        src_w: usize,
+        src_h: usize,
+        ref_w: usize,
+        ref_h: usize,
+        scale: u32,
+        drop_shrink: f64,
+        tabulated: bool,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let out_w = ref_w * scale as usize;
+        let out_h = ref_h * scale as usize;
+        let mut i_buf = vec![0f32; out_w * out_h];
+        let mut w_buf = vec![0f32; out_w * out_h];
+
+        // Resolved exactly the way `drizzle_group` resolves it, so the pin
+        // exercises the production dispatch and not a test-local copy.
+        let table =
+            (tabulated && phase_table_applies(scale, drop_shrink) && map.distortion.is_none())
+                .then(|| {
+                    geom::map_drop_at(
+                        map,
+                        (src_w as f64 - 1.0) / 2.0,
+                        (src_h as f64 - 1.0) / 2.0,
+                        drop_shrink,
+                        scale,
+                    )
+                    .and_then(|q| PhaseTable::build(&q, scale, phase_table::PHASES))
+                })
+                .flatten();
+        let gate = tabulated && phase_table_applies(scale, drop_shrink);
+        let overlap = match (gate, table.as_ref(), map.distortion.is_some()) {
+            (false, _, _) => SquareOverlap::Exact,
+            (true, Some(t), _) => SquareOverlap::Frame(t),
+            (true, None, true) => SquareOverlap::Tiled,
+            (true, None, false) => panic!("a sane linear map must tabulate"),
+        };
+
+        let ctx = FrameDepositCtx {
+            src,
+            src_width: src_w,
+            src_height: src_h,
+            ref_width: ref_w,
+            ref_height: ref_h,
+            map,
+            fwd: map.forward_eval(),
+            half_diag: geom::drop_bound_half_diag(map, src_w, src_h, drop_shrink, scale),
+            scale,
+            drop_shrink,
+            kernel: DrizzleKernel::Square,
+            kernel_table: None,
+            rej: None,
+            ln: None,
+            pair: NormalizationPair::IDENTITY,
+            w: 1.0,
+            plane: 0,
+            cfa: None,
+            overlap,
+        };
+        for (band_idx, (ib, wb)) in i_buf
+            .chunks_mut(DRIZZLE_BAND_ROWS * out_w)
+            .zip(w_buf.chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+            .enumerate()
+        {
+            deposit_band(ib, wb, band_idx, out_w, &ctx);
+        }
+        map.release_grids();
+        (i_buf, w_buf)
+    }
+
+    /// Compares the two arms' `I / W` planes.
+    ///
+    /// Returns `(max relative per-pixel deviation, level ratio,
+    /// coverage_exact, coverage_table, real coverage differences)`.
+    ///
+    /// **What "coverage identical" means here.** The exact path and the
+    /// table path cover the same REGION, but its one-pixel RIM is ragged
+    /// between them: a 1/64-output-pixel phase residual moves the edge of
+    /// the deposited area by that much, so a border pixel whose true edge
+    /// happens to lie within 1/64 px of a pixel boundary flips. On a
+    /// 160x120 fixture the deposited region's border is ≈ 500 pixels long,
+    /// so ≈ 500/64 ≈ 8 such flips are expected and mean nothing (in a real
+    /// run the covered region is the UNION over hundreds of dithered
+    /// frames, whose border is defined by the outermost frame's geometry,
+    /// not by one drop's last sliver). What would be a real difference —
+    /// and is what this counts — is a hole punched INSIDE the covered
+    /// region, or coverage appearing well OUTSIDE it: a pixel whose
+    /// coverage differs while it sits in the strict interior (all four
+    /// neighbours covered) or the strict exterior (no neighbour covered)
+    /// of the exact arm's own covered set.
+    fn compare_arms(
+        exact: &(Vec<f32>, Vec<f32>),
+        table: &(Vec<f32>, Vec<f32>),
+        out_w: usize,
+    ) -> (f64, f64, usize, usize, usize) {
+        let (ie, we) = exact;
+        let (it, wt) = table;
+        let out_h = ie.len() / out_w;
+        let covered_exact = |x: i64, y: i64| -> bool {
+            if x < 0 || y < 0 || x as usize >= out_w || y as usize >= out_h {
+                return false;
+            }
+            we[y as usize * out_w + x as usize] > 0.0
+        };
+        let mut max_rel = 0.0f64;
+        let mut sum_e = 0.0f64;
+        let mut sum_t = 0.0f64;
+        let mut cov_e = 0usize;
+        let mut cov_t = 0usize;
+        let mut cov_diff = 0usize;
+        for idx in 0..ie.len() {
+            let (x, y) = ((idx % out_w) as i64, (idx / out_w) as i64);
+            let ce = we[idx] > 0.0;
+            let ct = wt[idx] > 0.0;
+            cov_e += ce as usize;
+            cov_t += ct as usize;
+            if ce != ct {
+                let neighbours = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)];
+                let on_rim = if ce {
+                    // Lost: fine only where the exact arm's own coverage
+                    // already ended — i.e. not in the strict interior.
+                    !neighbours.iter().all(|&(nx, ny)| covered_exact(nx, ny))
+                } else {
+                    // Gained: fine only next to the exact arm's coverage.
+                    neighbours.iter().any(|&(nx, ny)| covered_exact(nx, ny))
+                };
+                if !on_rim {
+                    cov_diff += 1;
+                }
+                continue;
+            }
+            if !ce {
+                continue;
+            }
+            let ve = (ie[idx] / we[idx]) as f64;
+            let vt = (it[idx] / wt[idx]) as f64;
+            sum_e += ve;
+            sum_t += vt;
+            if ve.abs() > 0.0 {
+                let rel = (vt - ve).abs() / ve.abs();
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+        }
+        (max_rel, sum_t / sum_e, cov_e, cov_t, cov_diff)
+    }
+
+    /// Pin (c): the M3 rotation fixtures at 1°/5°/30°, scale 2,
+    /// `dropShrink` 0.9 — the tabulated plane must track the exact one to
+    /// within [`C2_MAX_PIXEL_DEVIATION`] per pixel, hold the plane level to
+    /// 1 ± 1e-3, and cover the same region (see [`compare_arms`] on what
+    /// "same" means at its rim).
+    #[test]
+    fn the_phase_table_tracks_the_exact_clip_on_a_rotated_frame() {
+        const W: usize = 160;
+        const H: usize = 120;
+        let src = structured_field(W, H);
+        for &deg in &[1.0_f64, 5.0, 30.0] {
+            let map = rotation_about_centre(deg, W as f64 / 2.0, H as f64 / 2.0);
+            let exact = deposit_whole_plane(&map, &src, W, H, W, H, 2, 0.9, false);
+            let table = deposit_whole_plane(&map, &src, W, H, W, H, 2, 0.9, true);
+            let (max_rel, level, cov_e, cov_t, cov_diff) = compare_arms(&exact, &table, W * 2);
+            assert_eq!(
+                cov_diff, 0,
+                "deg {deg}: {cov_diff} output pixels differ in COVERAGE away from the covered region's own rim ({cov_e} exact vs {cov_t} tabulated)"
+            );
+            eprintln!(
+                "C2 pin (c) deg {deg}: max |Δ| {:.4} %, level {level:.9}, coverage {cov_e} vs {cov_t}",
+                max_rel * 100.0
+            );
+            assert!(
+                max_rel <= C2_MAX_PIXEL_DEVIATION,
+                "deg {deg}: max per-pixel deviation {:.4} % exceeds {:.1} %",
+                max_rel * 100.0,
+                C2_MAX_PIXEL_DEVIATION * 100.0
+            );
+            assert!(
+                (level - 1.0).abs() <= 1e-3,
+                "deg {deg}: plane level ratio {level} outside 1 ± 1e-3"
+            );
+        }
+    }
+
+    /// Pin (d): the same bounds with a distortion layer, i.e. through the
+    /// per-[`phase_table::TILE`] arm. The fixture is deliberately wider
+    /// and taller than one tile (3 x 2 of them) so the tile-row cache, the
+    /// tile-crossing rebuild and the local-Jacobian estimate are all
+    /// exercised rather than collapsing onto a single table.
+    #[test]
+    fn the_phase_table_tracks_the_exact_clip_on_a_tps_frame() {
+        use crate::geometry::{DistortionModel, ThinPlateSpline};
+        const W: usize = 600;
+        const H: usize = 400;
+        assert!(
+            W > 2 * phase_table::TILE && H > phase_table::TILE,
+            "the fixture must span several tiles"
+        );
+
+        let mut nodes: Vec<(f64, f64)> = Vec::new();
+        for gy in 0..4 {
+            for gx in 0..5 {
+                nodes.push((40.0 + gx as f64 * 130.0, 40.0 + gy as f64 * 105.0));
+            }
+        }
+        // A smooth several-pixel displacement field — the scale M4c's own
+        // real registrations fit, not a pathological one.
+        let dx: Vec<f64> = nodes
+            .iter()
+            .map(|&(x, y)| 2.5 * (x / 180.0).sin() + 0.8 * (y / 140.0).cos())
+            .collect();
+        let dy: Vec<f64> = nodes
+            .iter()
+            .map(|&(x, y)| 2.0 * (y / 160.0).cos() - 0.7 * (x / 200.0).sin())
+            .collect();
+        let ndx: Vec<f64> = dx.iter().map(|v| -v).collect();
+        let ndy: Vec<f64> = dy.iter().map(|v| -v).collect();
+        let forward = ThinPlateSpline::fit(&nodes, &dx, &dy, 0.0).expect("20-node fit");
+        let inverse = ThinPlateSpline::fit(&nodes, &ndx, &ndy, 0.0).expect("20-node fit");
+        let model = DistortionModel::tps(forward, inverse, [0.0, 0.0, W as f64, H as f64]);
+        let map = PixelMap::with_distortion_model(Linear::identity(), model).unwrap();
+
+        let src = structured_field(W, H);
+        let exact = deposit_whole_plane(&map, &src, W, H, W, H, 2, 0.9, false);
+        let table = deposit_whole_plane(&map, &src, W, H, W, H, 2, 0.9, true);
+        let (max_rel, level, cov_e, cov_t, cov_diff) = compare_arms(&exact, &table, W * 2);
+        assert_eq!(
+            cov_diff, 0,
+            "tps: {cov_diff} output pixels differ in COVERAGE away from the covered region's own rim ({cov_e} exact vs {cov_t} tabulated)"
+        );
+        eprintln!(
+            "C2 pin (d) tps: max |Δ| {:.4} %, level {level:.9}, coverage {cov_e} vs {cov_t}",
+            max_rel * 100.0
+        );
+        assert!(
+            max_rel <= C2_MAX_PIXEL_DEVIATION,
+            "tps: max per-pixel deviation {:.4} % exceeds {:.1} %",
+            max_rel * 100.0,
+            C2_MAX_PIXEL_DEVIATION * 100.0
+        );
+        assert!(
+            (level - 1.0).abs() <= 1e-3,
+            "tps: plane level ratio {level} outside 1 ± 1e-3"
+        );
+    }
+
+    /// Ruling C-3's own carve-out: at `scale == 1` with an unshrunk drop
+    /// the deposit stays on the exact clip, so a default-geometry drizzle
+    /// is bit-for-bit what M3 produced.
+    #[test]
+    fn scale_one_with_a_full_drop_keeps_the_exact_clip() {
+        assert!(!phase_table_applies(1, 1.0));
+        assert!(phase_table_applies(1, 0.9));
+        assert!(phase_table_applies(2, 1.0));
+        assert!(phase_table_applies(3, 0.8));
+
+        const W: usize = 96;
+        const H: usize = 72;
+        let src = structured_field(W, H);
+        let map = rotation_about_centre(7.0, W as f64 / 2.0, H as f64 / 2.0);
+        // `tabulated = true` asks for the table; the gate refuses it at
+        // `scale == 1` with a full drop and hands back `Exact`, so the two
+        // runs must be BIT-identical — not merely close, which is what
+        // every other C2 pin measures.
+        let forced_exact = deposit_whole_plane(&map, &src, W, H, W, H, 1, 1.0, false);
+        let through_gate = deposit_whole_plane(&map, &src, W, H, W, H, 1, 1.0, true);
+        assert_eq!(forced_exact.0, through_gate.0, "I buffer");
+        assert_eq!(forced_exact.1, through_gate.1, "W buffer");
+        // And a shrunk drop at the same scale DOES tabulate — otherwise
+        // the assertion above would pass for the wrong reason.
+        let shrunk_exact = deposit_whole_plane(&map, &src, W, H, W, H, 1, 0.9, false);
+        let shrunk_table = deposit_whole_plane(&map, &src, W, H, W, H, 1, 0.9, true);
+        assert_ne!(
+            shrunk_exact.1, shrunk_table.1,
+            "at dropShrink 0.9 the gate must let the table through"
+        );
     }
 }

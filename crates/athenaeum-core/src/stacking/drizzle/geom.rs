@@ -119,23 +119,130 @@ pub fn map_drop(
         quad.reverse();
     }
 
+    Some((quad, quad_bbox(&quad)))
+}
+
+/// The integer bounding box, in output pixels, of a mapped drop — the
+/// pixels whose `[i - 0.5, i + 0.5]` extent overlaps `quad`'s coordinate
+/// span with POSITIVE length, inclusive on both ends (see [`map_drop`]'s
+/// own doc for why the rule is `strict_ceil`/`strict_floor` rather than
+/// `round` or a bare `floor(v + 0.5)`).
+///
+/// Extracted (Tier C item C2) so [`super::phase_table::PhaseTable::build`]
+/// clips against EXACTLY the pixel set the exact per-pixel path would
+/// visit, rather than a restatement of the rule that could drift from it.
+/// Not clamped to any output extent, and possibly empty (`x_max < x_min`)
+/// for a degenerate quad — callers intersect with their own bounds.
+pub fn quad_bbox(quad: &Quad) -> (i64, i64, i64, i64) {
     let mut x_lo = f64::INFINITY;
     let mut x_hi = f64::NEG_INFINITY;
     let mut y_lo = f64::INFINITY;
     let mut y_hi = f64::NEG_INFINITY;
-    for &(x, y) in &quad {
+    for &(x, y) in quad {
         x_lo = x_lo.min(x);
         x_hi = x_hi.max(x);
         y_lo = y_lo.min(y);
         y_hi = y_hi.max(y);
     }
-    let bbox = (
+    (
         strict_ceil(x_lo - 0.5),
         strict_ceil(y_lo - 0.5),
         strict_floor(x_hi + 0.5),
         strict_floor(y_hi + 0.5),
-    );
-    Some((quad, bbox))
+    )
+}
+
+/// A convex quad's unsigned area (shoelace) — the drop-area invariant
+/// [`super::phase_table::PhaseTable`] every phase row must sum to (ruling
+/// R-M3-2).
+pub fn quad_area(quad: &Quad) -> f64 {
+    signed_area(quad).abs()
+}
+
+/// ONE source pixel's drop, mapped into OUTPUT coordinates and translated
+/// so its mapped CENTRE sits at the origin — the parallelogram
+/// [`super::phase_table::PhaseTable::build`] tabulates (Tier C item C2,
+/// spec §3.2, ruling C-3). Counter-clockwise, like [`map_drop`]'s output,
+/// so [`clip_area`]'s half-plane clipping reads it the same way.
+///
+/// Two arms, exactly as ruling C-3 draws them:
+///
+/// * **No distortion layer** — the drop's four corners and its centre go
+///   through [`PixelMap::forward_exact`] and the corners are taken
+///   RELATIVE to the mapped centre. For a Similarity/Affine map that is
+///   position-independent and therefore exact for every pixel of the
+///   frame; for a Homography it is the drop's true mapped shape AT `(x,
+///   y)`, which the caller evaluates once at the frame centre so the
+///   projective row's own (measured 1e-8..1e-7 per pixel on real fits,
+///   i.e. ≈ 0.1 % of the drop's shape across a 6 k-pixel frame) variation
+///   is centred rather than one-sided.
+/// * **With a distortion layer** — the LOCAL Jacobian at `(x, y)` by
+///   central differences of [`PixelMap::forward_exact`] at a one-pixel
+///   step, scaled into output units (`to_output` has constant slope
+///   `scale`), applied to the drop's `(±h, ±h)` corner offsets. The caller
+///   rebuilds per [`super::phase_table::TILE`]-pixel tile, so the in-tile
+///   error is the map's Jacobian variation over half a tile.
+///
+/// Uses [`PixelMap::forward_exact`], never a grid-cached [`ForwardEval`]
+/// (ruling R-T4-3): this runs once per frame or once per tile — a few
+/// hundred evaluations — not once per pixel, so the `O(nodes)` spline path
+/// costs nothing measurable and no displacement grid is built or held for
+/// it (ruling R-T4-6 is untouched).
+///
+/// `None` when any evaluation is non-finite — the caller then keeps the
+/// exact per-pixel clip, which has its own non-finite fallback.
+pub fn map_drop_at(map: &PixelMap, x: f64, y: f64, drop_shrink: f64, scale: u32) -> Option<Quad> {
+    debug_assert!(scale >= 1, "drizzle scale must be >= 1 (R-M3-10), got 0");
+    let h = drop_shrink / 2.0;
+    let s = scale as f64;
+
+    let (cu, cv) = map.forward_exact(x, y);
+    if !cu.is_finite() || !cv.is_finite() {
+        return None;
+    }
+
+    let offsets: [(f64, f64); 4] = if map.distortion.is_none() {
+        let mut out = [(0.0, 0.0); 4];
+        for (i, &(dx, dy)) in [(-h, -h), (h, -h), (h, h), (-h, h)].iter().enumerate() {
+            let (u, v) = map.forward_exact(x + dx, y + dy);
+            if !u.is_finite() || !v.is_finite() {
+                return None;
+            }
+            // `to_output` is affine with slope `scale`, so the DIFFERENCE
+            // of two output coordinates is `scale` times the difference of
+            // the reference ones — the `(s - 1) / 2` shift cancels and
+            // never has to be applied to an offset.
+            out[i] = (s * (u - cu), s * (v - cv));
+        }
+        out
+    } else {
+        // Central differences at a one-pixel step (spec §3.2): the local
+        // Jacobian `d(reference) / d(subject)`, then scaled to output
+        // units. Central rather than one-sided so the tile centre's
+        // estimate is second-order accurate in the step.
+        let (uxp, vxp) = map.forward_exact(x + 1.0, y);
+        let (uxm, vxm) = map.forward_exact(x - 1.0, y);
+        let (uyp, vyp) = map.forward_exact(x, y + 1.0);
+        let (uym, vym) = map.forward_exact(x, y - 1.0);
+        let j = [
+            [s * (uxp - uxm) / 2.0, s * (uyp - uym) / 2.0],
+            [s * (vxp - vxm) / 2.0, s * (vyp - vym) / 2.0],
+        ];
+        if j.iter().flatten().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let mut out = [(0.0, 0.0); 4];
+        for (i, &(dx, dy)) in [(-h, -h), (h, -h), (h, h), (-h, h)].iter().enumerate() {
+            out[i] = (j[0][0] * dx + j[0][1] * dy, j[1][0] * dx + j[1][1] * dy);
+        }
+        out
+    };
+
+    let mut quad: Quad = offsets;
+    if signed_area(&quad) < 0.0 {
+        quad.reverse();
+    }
+    Some(quad)
 }
 
 /// Safety margin (output pixels) [`drop_bound_half_diag`] adds on top of

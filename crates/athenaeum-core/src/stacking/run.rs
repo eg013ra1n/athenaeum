@@ -7878,6 +7878,10 @@ fn process_group_output(
                         write_weight_map: drizzle_cfg.write_weight_map,
                         measure: measure_opts,
                         ram_total_bytes: None,
+                        // Tier C item C2: the run always drizzles through
+                        // whichever overlap arm ruling C-3 resolves to; only
+                        // the `drizzle_probe` forces the exact clip.
+                        force_exact_overlap: false,
                     };
 
                     // Fix round 1, Important I1: real per-frame progress —

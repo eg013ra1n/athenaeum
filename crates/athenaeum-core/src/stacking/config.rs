@@ -539,15 +539,44 @@ fn clamp_tps_smoothing(value: f64) -> f64 {
     value
 }
 
+/// The drizzle deposit kernel's own generation (Tier C item C2, spec
+/// `2026-09-20-stacking-compute-tierC-design.md` §3, ruling C-3).
+///
+/// * `1` — M3..M4d: the exact Sutherland-Hodgman clip of every source
+///   pixel's mapped drop against every output pixel it touches.
+/// * `2` — Tier C: the same clip, tabulated over a `PHASES x PHASES` grid
+///   of sub-pixel phases (per frame for a linear map, per 256-px source
+///   tile under distortion). Level-preserving by construction; the drop's
+///   mass is split among its neighbours as if the drop sat up to 1/64 of
+///   an output pixel from where it really is.
+///
+/// **Why it rides [`config_hash`] and no [`stage_hash`].** The drizzle
+/// stage has no cache: it re-runs from the calibrated frames on every run,
+/// so there is no stored artifact for a version bump to invalidate and no
+/// per-stage subtree that folds in `drizzle` at all (the four are
+/// calibration/measurement/registration/normalization). What the constant
+/// DOES have to move is the run-level fingerprint — two runs of the same
+/// `StackingConfig` across this change produce different drizzled pixels,
+/// and the fingerprint is what a provenance row, a results card and a
+/// re-run comparison read to tell one run's settings from another's.
+pub const DRIZZLE_KERNEL_VERSION: u32 = 2;
+
 /// xxh3 of the canonical JSON of the whole resolved config — a run-level
 /// fingerprint, distinct from the per-stage [`stage_hash`] below. Goes
 /// through `serde_json::to_value` before stringifying (the same
 /// sorted-object-keys canonicalization `stage_hash` relies on — this
 /// workspace's `serde_json` has no `preserve_order` feature), so a field
 /// reorder inside any config type never changes the fingerprint.
+///
+/// Carries [`DRIZZLE_KERNEL_VERSION`] beside the config (see that
+/// constant's doc for why it belongs here and in no stage hash).
 pub fn config_hash(cfg: &StackingConfig) -> String {
     let value = serde_json::to_value(cfg).expect("StackingConfig always serializes");
-    let json = serde_json::to_string(&value).expect("a serde_json::Value always serializes");
+    let payload = serde_json::json!({
+        "config": value,
+        "drizzleKernelVersion": DRIZZLE_KERNEL_VERSION,
+    });
+    let json = serde_json::to_string(&payload).expect("a serde_json::Value always serializes");
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
 }
 
@@ -1515,6 +1544,49 @@ mod tests {
         // locally before the push that moved it — CI caught it — which is
         // the reminder to run `stacking::config` whenever a config struct
         // gains a field.
-        assert_eq!(default_hash, "648d0ead30d4e5b9");
+        //
+        // And here (Tier C item C2, ruling C-3): `DRIZZLE_KERNEL_VERSION`
+        // joins the hashed payload as a sibling of the config itself, so
+        // the literal moves once for the phase-table deposit even though
+        // no config FIELD changed. Nothing goes stale over it — the
+        // drizzle stage has no cache and no stage subtree folds in
+        // `drizzle` (see the constant's own doc) — but two runs of the
+        // same settings across this change do produce different drizzled
+        // pixels, and the run-level fingerprint is what says so.
+        assert_eq!(default_hash, "b3240460a4cec0de");
+    }
+
+    /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part
+    /// of the run-level fingerprint and of NO stage hash — a future reader
+    /// must not be able to drop it from `config_hash` without a red test,
+    /// and must not be able to sneak it into a stage subtree either (which
+    /// would invalidate every cached calibrated/measured/registered frame
+    /// for a change that touches none of them).
+    #[test]
+    fn the_drizzle_kernel_version_rides_the_fingerprint_and_no_stage_hash() {
+        let cfg = StackingConfig::default();
+        let bare = serde_json::to_string(
+            &serde_json::to_value(&cfg).expect("StackingConfig always serializes"),
+        )
+        .unwrap();
+        let bare_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(bare.as_bytes()));
+        assert_ne!(
+            config_hash(&cfg),
+            bare_hash,
+            "config_hash must fold in DRIZZLE_KERNEL_VERSION, not hash the config alone"
+        );
+        assert_eq!(DRIZZLE_KERNEL_VERSION, 2, "the phase-table generation");
+
+        for subtree in [
+            calibration_subtree(&cfg),
+            measurement_subtree(&cfg),
+            registration_subtree(&cfg),
+        ] {
+            let json = serde_json::to_string(&subtree).unwrap();
+            assert!(
+                !json.contains("drizzleKernelVersion"),
+                "no stage subtree may carry the drizzle kernel version: {json}"
+            );
+        }
     }
 }
