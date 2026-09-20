@@ -791,6 +791,15 @@ pub enum CleanupWhat {
 /// keeping `fits` alongside it just avoids paying that re-measure for
 /// nothing. Its directory (`fits/`) is removed only under `All`, alongside
 /// `metrics`' own drop.
+///
+/// `ln_calibration` (the group's seeds calibration, Tier C Task 2 fix round
+/// 4) is the third deliberate omission, on `metrics`' own reasoning: it is a
+/// payload row with no file, it costs ≈ 45 s of real measurement to produce,
+/// and its hash keys on the calibration frames' registration hashes and the
+/// group's LN reference hash — none of which an `Intermediates` cleanup
+/// changes. The LN reference is rebuilt byte-identically from the same
+/// inputs, so the stored `k` is still a measurement of exactly this group
+/// against exactly this reference. Only `All` drops it.
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "registered",
     "calibrated",

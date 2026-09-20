@@ -310,6 +310,10 @@ pub fn measure_seeds_calibration(
             return None;
         }
         let Some(frame) = frames.get(i) else { continue };
+        // Recorded whether or not its two arms go on to produce a ratio:
+        // `frame_ids` is the SAMPLE, and the sample is what the group's
+        // `ln_calibration` hash keys on. A frame that failed is still one
+        // the measurement asked about.
         frame_ids.push(frame.frame_id);
         on_progress(done, total, frame.frame_id);
 
