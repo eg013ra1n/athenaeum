@@ -1,0 +1,10 @@
+{
+  "elapsed_multi_ms": 3852,
+  "elapsed_single_ms": 4546,
+  "files": 12,
+  "iroh": "1.2.0",
+  "label": "after",
+  "multi_two_providers_mb_s": 99.66770509401748,
+  "single_mb_s": 84.45371504799704,
+  "size_mb": 32
+}

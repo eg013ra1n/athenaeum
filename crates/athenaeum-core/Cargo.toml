@@ -72,7 +72,7 @@ async-trait = "0.1"
 # `sharing::iroh` transport (Perseus needs it). Default features keep the
 # pure-Rust `tls-ring` crypto backend (no cmake/aws-lc-rs) — ARM-friendly, pulls
 # no rustafits/solver/native-heavy deps.
-iroh = "=1.0.3"
+iroh = "=1.2.0"
 iroh-blobs = "=0.103.0"
 # Addressing ticket (EndpointTicket) used as the out-of-band pairing_ticket;
 # pinned to iroh's 1.x ticket crate. Transitive under iroh-blobs, named directly
