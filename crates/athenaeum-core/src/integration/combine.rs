@@ -802,89 +802,15 @@ fn robust_sign(x: f64) -> f64 {
     }
 }
 
-/// Half-width, in least-squares slope standard errors `σ_b`, of the bracket
-/// [`medfit_line`] opens around its seed. A COLD call (no warm start) keeps
-/// the pre-C4 value and is bit-identical to its pre-C4 self; it is also
-/// measured to be near its own optimum, since the robust slope sits
-/// `|b_root − b_ls|` p50 = 2.5·σ_b from the least-squares seed — `3·σ_b`
-/// brackets barely over half of all cold calls in one probe, and shrinking
-/// it would buy one bisection at the price of two evaluations on the rest.
-const MEDFIT_COLD_BRACKET_SIGMAS: f64 = 3.0;
-
-/// How many times narrower a WARM [`medfit_line`] bracket starts than the
-/// cold one (perf tier C, C4/I8): `3·σ_b / 2³ = 0.375·σ_b`. The previous
-/// outer iteration's converged slope is close enough to this one's that the
-/// wide bracket only bought bisections — each halving of the starting width
-/// is one evaluation saved, since the tolerance it bisects down to is fixed
-/// (`1e-3·σ_b`; I9, which would have loosened it, was dropped because the
-/// R-M4a-17 dispersion calibration rests on it).
-///
-/// Measured, not assumed. The slope movement between two outer iterations
-/// over 4 000 seeded stacks (n ∈ {8, 20, 50, 100, 200}, 70 % pure noise and
-/// the rest carrying hot pixels / a trail / a cold pixel) is `|Δb|`
-/// p50 = 0.22·σ_b, p90 = 0.93·σ_b — so a bracket much under `σ_b` pays for
-/// itself, and one far under it starts buying widenings back. Swept over
-/// the 1 500 stacks of the pins' own families, as a fraction of the
-/// evaluations the unchanged `3·σ_b` bracket costs:
-///
-/// | half-width | evaluations | different roots | worse fit | worst Δadev | mean Δadev |
-/// | ---- | ---- | ---- | ---- | ---- | ---- |
-/// | 0.75·σ_b | 0.933 | 29 | 71 | 8.5e-2 | +8.3e-5 |
-/// | 0.5·σ_b | 0.907 | 77 | 613 | 5.7e-3 | +7.6e-6 |
-/// | **0.375·σ_b** | **0.919** | **40** | **141** | **1.5e-3** | **−2.5e-6** |
-/// | 0.25·σ_b | 0.902 | 81 | 615 | 3.1e-3 | −6.1e-7 |
-/// | 0.1875·σ_b | 0.920 | 50 | 232 | 2.4e-2 | +2.0e-5 |
-/// | 0.125·σ_b | 0.910 | 84 | 614 | 3.1e-3 | −2.3e-6 |
-///
-/// (counts out of 1 000 warm calls; `Δadev` is the relative change in the
-/// mean absolute deviation of the returned line — the objective the fit
-/// minimizes. No candidate changed a single survivor of the 1 500 stacks,
-/// and the rejected fraction over the population was 2.9912 % for every
-/// one of them, the unchanged bracket included.)
-///
-/// A POWER-OF-TWO fraction of the cold bracket specifically. The bisection
-/// stops when the bracket is under `tol`, so its FINAL width is
-/// `h₀ / 2^⌈log₂(h₀/tol)⌉` — a function of `h₀/tol`, not of `tol` alone. At
-/// `3·σ_b/2^k` that final width is the cold bracket's own 0.73·tol and a
-/// warm call is no coarser than a cold one; at 0.5, 0.25 or 0.125·σ_b it is
-/// 0.98·tol, and the warm line comes back the worse fit on 61 % of calls
-/// instead of 14 % — a systematic coarsening rather than a coin flip, even
-/// though the amount involved (mean Δadev ~1e-6) is far below anything
-/// downstream can see. Widening x2 keeps the alignment, walking the bracket
-/// back up through `3·σ_b/4` and `/2` to `3·σ_b` exactly.
-///
-/// The same sweep is why the width is a multiple of the CURRENT call's
-/// `σ_b` rather than a width carried over from the previous call (the shape
-/// C4's brief first proposed): `σ_b` collapses between outer iterations as
-/// the extreme samples leave the survivor set, so a width in absolute slope
-/// units is stale by the time it is used — simulated at 1.00x, i.e. no gain
-/// at all.
-const MEDFIT_WARM_BRACKET_SHIFT: u32 = 3;
-
-/// Widenings a bracket may take before `medfit_line` gives up and falls back
-/// to the least-squares line. The cold path's own pre-C4 bound; a warm call
-/// is allowed [`MEDFIT_WARM_BRACKET_SHIFT`] more, which is exactly the
-/// number it spends walking its narrower start back up to the cold bracket,
-/// so a warm call can never resolve LESS than a cold one would.
-const MEDFIT_WIDENINGS: u32 = 32;
-
 /// Minimum-absolute-deviation line `y = a + b·i` over `values[i]` (math
 /// reference §3.4): the classic median/bisection method. Seeds the search
 /// from `warm_start_b` when given (the caller's previous iteration's
 /// converged slope — fix round 1, ruling R-M4a-16: after the first
 /// iteration the bracket collapses to a handful of evaluations instead of
 /// walking out from the least-squares slope every time) or the
-/// least-squares slope otherwise. The bracket half-width always uses the
+/// least-squares slope otherwise; the bracket half-width always uses the
 /// least-squares slope standard error `σ_b` of the CURRENT survivors,
-/// regardless of which slope seeded `b1`, but its MULTIPLE of `σ_b` follows
-/// the seed (perf tier C, C4/I8): a cold call opens the full
-/// [`MEDFIT_COLD_BRACKET_SIGMAS`] bracket, a warm one that shifted right by
-/// [`MEDFIT_WARM_BRACKET_SHIFT`] — the previous iteration's converged slope
-/// is close enough to this one's that the wide bracket only bought
-/// bisections — with that many extra widenings on top of
-/// [`MEDFIT_WIDENINGS`], so a warm call can never resolve LESS than a cold
-/// one would.
-/// Walks the slope that zeroes the
+/// regardless of which slope seeded `b1`. Walks the slope that zeroes the
 /// residual-sign functional `f(b) = Σ x_i · sgn(y_i − median(y − b·x) −
 /// b·x_i)` by bracketing a sign change and bisecting to it; the intercept is
 /// the median of the residuals at the converged slope. A single extreme
@@ -904,6 +830,56 @@ const MEDFIT_WIDENINGS: u32 = 32;
 /// Never panics on degenerate input: fewer than 2 samples, a zero-dispersion
 /// (perfect-line) fit, or a sign functional that cannot be bracketed within
 /// 32 widenings all fall back to the least-squares line.
+///
+/// # The warm bracket: BUILT, MEASURED and REVERTED (perf tier C, C4/I8)
+///
+/// A warm call re-derives the whole `3·σ_b` bracket around the previous
+/// rejection iteration's converged slope and bisects all the way back down
+/// to `1e-3·σ_b`; C4 proposed opening it narrower. It was implemented
+/// (`3·σ_b/8` plus three extra widenings, which walk the bracket back up to
+/// the cold one exactly), pinned and measured on real data, then reverted
+/// under ruling C-26: a ≈ 3 % combine gain does not buy a numeric change to
+/// the rejection kernel, and C4's own bar — `medfit_evals_mean` ≤ 0.5× — was
+/// missed rather than met. Recorded here, beside tier A Task 9's own
+/// reverted items below, so the same shape is not re-proposed:
+///
+/// - It DOES work, just not enough. `medfit_evals_mean` 0.946× and
+///   `combine_cpu_ms` 0.966× on 60 real mono frames (`integrate_probe
+///   --limit 60 --rejection linearFit`, interleaved B/A x5, A below B on 4
+///   of 5 pairs), ≈ 9 s per run.
+/// - ≤ 0.5× is unreachable by ANY change confined to the warm bracket. The
+///   outer loop runs ~1.6 iterations per pixel stack on a real plane, so the
+///   COLD first call — which must not move, it is the only one with no prior
+///   slope — is about half of all evaluations: free warm calls would still
+///   land near 0.63×.
+/// - C4's premise ("≈ 4 halvings instead of 12 on a warm start") is false.
+///   The slope MOVES between iterations as the extreme samples leave the
+///   survivor set: `|Δb|` p50 = 216 tolerances, p90 = 929 (4 000 seeded
+///   stacks, n ∈ {8, 20, 50, 100, 200}). A bracket narrow enough for 4
+///   halvings misses the root almost always and pays two evaluations per
+///   widening to find it again.
+/// - A half-width CARRIED from the previous call (the item's drafted shape)
+///   is worth exactly nothing — simulated at 1.00×. `σ_b` collapses between
+///   iterations, so a width in absolute slope units is stale when it is
+///   used; only a multiple of the CURRENT call's `σ_b` is scale-free.
+/// - Any narrower bracket re-rolls a dice that is not free: 40 of 1 000 warm
+///   calls converge to a genuinely DIFFERENT root. That is inherent to the
+///   estimator, not to the change — `f` is an integer-valued step function
+///   whose zero set is a plateau, so the minimum-absolute-deviation line is
+///   not unique and both roots are equally valid (the warm line's own
+///   objective was on average 2.5e-6 BELOW the cold line's, never 0.151 %
+///   above it) — but it moves ~2 000 of 26 M rejection decisions per plane,
+///   which is a numeric change to every master built at n ≥ 20.
+/// - And the width would have to be a power-of-two fraction of `3·σ_b`: the
+///   bisection's FINAL width is `h₀ / 2^⌈log₂(h₀/tol)⌉`, so the nominal
+///   optimum `0.25·σ_b` (0.902×) ends on a 0.98·tol bracket against the cold
+///   path's 0.73·tol and returns the coarser of the two lines on 61 % of
+///   calls instead of 14 %.
+///
+/// The tolerance itself is not the lever either: loosening it was C4's I9,
+/// dropped on purpose because the R-M4a-17 dispersion calibration rests on
+/// it. The measurement lives in
+/// `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-6-report.md`.
 pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
     let n = values.len();
     if n == 0 {
@@ -1008,31 +984,11 @@ pub(crate) fn medfit_line(values: &[f64], warm_start_b: Option<f64>) -> (f64, f6
             // further widening/bisection would only walk away from it.
             return (a1, b1);
         }
-        // C4/I8: a warm seed opens a bracket `2^MEDFIT_WARM_BRACKET_SHIFT`
-        // times narrower than the cold `3·σ_b`, and is allowed that many
-        // extra widenings — which walk it right back up to the cold bracket
-        // and beyond, so no separate fallback is needed and a warm call can
-        // never bracket less than a cold one. The cold arm's expression is
-        // unchanged down to its floating-point shape — including the
-        // widening's `b1 + 2·(b2 − b1)` rather than an equivalent
-        // `b1 + 2h·dir`, which is NOT the same rounding when `|b1| ≫ h` — so
-        // a cold call stays bit-identical.
-        let warm = warm_start_b.is_some();
-        let half_width = if warm {
-            MEDFIT_COLD_BRACKET_SIGMAS / (1u32 << MEDFIT_WARM_BRACKET_SHIFT) as f64
-        } else {
-            MEDFIT_COLD_BRACKET_SIGMAS
-        };
-        let mut b2 = b1 + half_width * sigma_b * robust_sign(f1);
+        let mut b2 = b1 + 3.0 * sigma_b * robust_sign(f1);
         let (mut f2, _) = rofunc(b2);
 
         let mut widenings = 0u32;
-        let widening_cap = if warm {
-            MEDFIT_WIDENINGS + MEDFIT_WARM_BRACKET_SHIFT
-        } else {
-            MEDFIT_WIDENINGS
-        };
-        while f1 * f2 > 0.0 && widenings < widening_cap {
+        while f1 * f2 > 0.0 && widenings < 32 {
             b2 = b1 + 2.0 * (b2 - b1);
             f2 = rofunc(b2).0;
             widenings += 1;
@@ -2157,28 +2113,18 @@ mod tests {
         }
     }
 
-    // ── The cold-bracket reference (tier A Task 9 I1-I5, tier C C4) ───────
+    // ── Perf tier A Task 9 (I1-I5): exact-rewrite pins ──────────────────────
     //
-    // The two functions below are the `medfit_line`/`reject_linear_fit`
-    // bodies as they stood BEFORE both of those cycles, copied verbatim
-    // (`medfit_line`'s thread-local scratch swapped for a plain local `Vec`
-    // — irrelevant to the numbers, only to where the scratch lives). One
-    // copy serves both cycles because tier A Task 9 landed no change inside
-    // `medfit_line` at all: I1/I2 were built, measured slower and reverted,
-    // I3 was already minimal, so the pre-Task-9 and pre-C4 texts are the same
-    // text. They prove, respectively, that I1 (`t_i = b·i` fused) and I2
-    // (four integer sign-sum accumulators) moved zero bits, and that C4's
-    // warm bracket moves nothing a cold call would have decided.
+    // Oracles below are the pre-Task-9 `medfit_line`/`reject_linear_fit`
+    // bodies, copied verbatim (their own thread-locals swapped for a plain
+    // local `Vec` — irrelevant to the numbers, only to where the scratch
+    // lives) — used ONLY here, to prove I1 (`t_i = b·i` fused) and I2 (four
+    // integer sign-sum accumulators) moved zero bits.
 
-    /// The pre-Task-9 / pre-C4 `medfit_line`: `rofunc` recomputes
-    /// `b * i as f64` at both the residual-build and sign-test sites and
-    /// accumulates the sign sum into one running f64 total, and EVERY call —
-    /// warm-seeded or not — opens the full `3·σ_b` bracket.
-    ///
-    /// It ticks `MEDFIT_EVALS` exactly as production does, so a test can
-    /// price its evaluations against production's through
-    /// [`take_rejection_counters`] by running the two in sequence.
-    fn medfit_line_cold_reference(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
+    /// Verbatim pre-Task-9 `medfit_line` (I1/I2's oracle): `rofunc`
+    /// recomputes `b * i as f64` at both the residual-build and sign-test
+    /// sites, and accumulates the sign sum into one running f64 total.
+    fn medfit_line_oracle(values: &[f64], warm_start_b: Option<f64>) -> (f64, f64) {
         let n = values.len();
         if n == 0 {
             return (0.0, 0.0);
@@ -2213,7 +2159,6 @@ mod tests {
 
         let mut scratch: Vec<f64> = Vec::new();
         let mut rofunc = |b: f64| -> (f64, f64) {
-            MEDFIT_EVALS.with(|c| c.set(c.get() + 1));
             scratch.clear();
             scratch.extend(values.iter().enumerate().map(|(i, &y)| y - b * i as f64));
             let m = scratch.len();
@@ -2280,15 +2225,12 @@ mod tests {
         (last_a, last_b)
     }
 
-    /// The pre-Task-9 / pre-C4 `reject_linear_fit`, calling
-    /// [`medfit_line_cold_reference`] instead of the production
-    /// `medfit_line` — every other line (the outer convergence loop, the
-    /// dispersion/threshold math) is untouched by both cycles, so this
-    /// exists only to carry the reference line fit through the exact same
-    /// survivor-compaction loop the production routine runs. C4 changed the
-    /// BRACKET inside `medfit_line`, not one line of this loop, so the two
-    /// differ in exactly the way the C4 pins measure.
-    fn reject_linear_fit_cold_reference<T: Sample>(
+    /// Verbatim pre-Task-9 `reject_linear_fit`, calling [`medfit_line_oracle`]
+    /// instead of the production `medfit_line` — every other line (the outer
+    /// convergence loop, the dispersion/threshold math) is untouched by
+    /// I1/I2, so this exists only to carry the oracle call through the exact
+    /// same survivor-compaction loop the production routine runs.
+    fn reject_linear_fit_oracle<T: Sample>(
         values: &mut [T],
         sigma_low: f64,
         sigma_high: f64,
@@ -2309,7 +2251,7 @@ mod tests {
             let kf = k as f64;
             scratch.clear();
             scratch.extend(values[..k].iter().map(|s| s.value() as f64));
-            let (a, b) = medfit_line_cold_reference(&scratch, warm_start_b);
+            let (a, b) = medfit_line_oracle(&scratch, warm_start_b);
             warm_start_b = Some(b);
 
             let mut abs_sum = 0.0;
@@ -2346,173 +2288,58 @@ mod tests {
         (kept, true)
     }
 
-    /// One stack of the pin family below: `n` samples of N(100, 5), every
-    /// third stack coarsely quantized so ties are frequent.
-    fn medfit_pin_stack(seed: u64) -> Vec<f64> {
-        let mut rng = SplitMix64(0xD1B5_4A32_D192_ED03 ^ seed);
-        let n = 8 + (rng.next_u64() % 200) as usize; // 8..=207
-        let quantize = seed % 3 == 0;
-        (0..n)
-            .map(|_| {
-                let raw = 100.0 + 5.0 * next_gaussian(&mut rng);
-                if quantize {
-                    (raw / 2.0).round() * 2.0 // coarse quantization: frequent ties
-                } else {
-                    raw
-                }
-            })
-            .collect()
-    }
-
-    /// Least-squares slope and its standard error `σ_b`, the scale
-    /// `medfit_line`'s bracket and its `tol = 1e-3·σ_b` are both expressed
-    /// in — recomputed here so a pin can state a bound in units of the
-    /// tolerance rather than of an arbitrary absolute slope.
-    fn ls_slope_and_sigma(values: &[f64]) -> (f64, f64) {
-        let nf = values.len() as f64;
-        let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
-        for (i, &y) in values.iter().enumerate() {
-            let x = i as f64;
-            sx += x;
-            sy += y;
-            sxx += x * x;
-            sxy += x * y;
-        }
-        let del = nf * sxx - sx * sx;
-        let b_ls = (nf * sxy - sx * sy) / del;
-        let a_ls = (sy - b_ls * sx) / nf;
-        let mut chisq = 0.0;
-        for (i, &y) in values.iter().enumerate() {
-            let resid = y - (a_ls + b_ls * i as f64);
-            chisq += resid * resid;
-        }
-        (b_ls, (chisq / del).sqrt())
-    }
-
-    /// I1/I2 and C4's cold path in one pin: a COLD `medfit_line` call is
-    /// bit-identical to [`medfit_line_cold_reference`] over 1 000 seeded
-    /// random stacks, sizes 8..207 (the audit's own n range), ties included.
-    ///
-    /// C4 narrowed the bracket a WARM call opens and left the cold one
-    /// untouched down to its floating-point shape, so this pin covers both:
-    /// the `rofunc` internals I1/I2 were about are exercised identically by
-    /// either seed, and the cold arm is the one C4 promises has not moved a
-    /// bit. The warm arm is
-    /// [`medfit_line_warm_bracket_is_as_good_a_fit_as_the_cold_bracket`].
+    /// I1/I2: `medfit_line` bit-identical to [`medfit_line_oracle`] over
+    /// 1 000 seeded random stacks, sizes 8..207 (the audit's own n range),
+    /// including duplicated/tied values (every third stack is built with
+    /// heavy quantization so ties are common) and a warm-started second
+    /// call (mirrors `reject_linear_fit`'s own usage).
     #[test]
-    fn medfit_line_cold_path_matches_the_cold_reference_bit_for_bit() {
+    fn medfit_line_matches_the_pre_task_9_oracle_bit_for_bit() {
         for seed in 0..1000u64 {
-            let values = medfit_pin_stack(seed);
-            let n = values.len();
+            let mut rng = SplitMix64(0xD1B5_4A32_D192_ED03 ^ seed);
+            let n = 8 + (rng.next_u64() % 200) as usize; // 8..=207
+            let quantize = seed % 3 == 0;
+            let values: Vec<f64> = (0..n)
+                .map(|_| {
+                    let raw = 100.0 + 5.0 * next_gaussian(&mut rng);
+                    if quantize {
+                        (raw / 2.0).round() * 2.0 // coarse quantization: frequent ties
+                    } else {
+                        raw
+                    }
+                })
+                .collect();
+
             let cold = medfit_line(&values, None);
-            let reference = medfit_line_cold_reference(&values, None);
+            let cold_oracle = medfit_line_oracle(&values, None);
             assert_eq!(
                 (cold.0.to_bits(), cold.1.to_bits()),
-                (reference.0.to_bits(), reference.1.to_bits()),
-                "seed {seed} n {n} (cold): {cold:?} vs reference {reference:?}"
+                (cold_oracle.0.to_bits(), cold_oracle.1.to_bits()),
+                "seed {seed} n {n} (cold): {cold:?} vs oracle {cold_oracle:?}"
+            );
+
+            // A warm-started second call, exactly as `reject_linear_fit`
+            // chains iterations — the seed comes from the cold call's own
+            // converged slope, so it must be identical too for this to be a
+            // meaningful second check rather than a repeat of the first.
+            let warm = medfit_line(&values, Some(cold.1));
+            let warm_oracle = medfit_line_oracle(&values, Some(cold_oracle.1));
+            assert_eq!(
+                (warm.0.to_bits(), warm.1.to_bits()),
+                (warm_oracle.0.to_bits(), warm_oracle.1.to_bits()),
+                "seed {seed} n {n} (warm): {warm:?} vs oracle {warm_oracle:?}"
             );
         }
     }
 
-    /// C4/I8: a WARM `medfit_line` call brackets `b_prev ± 0.375·σ_b` instead
-    /// of `± 3·σ_b`, so it bisects a different sequence of midpoints and
-    /// converges to a different point — usually of the same tolerance
-    /// window, sometimes of another one entirely. This pin measures both,
-    /// and bounds the only thing that is actually a promise: that the line
-    /// it lands on is as good a minimum-absolute-deviation fit as the cold
-    /// bracket's.
-    ///
-    /// The seed is built the way `reject_linear_fit` builds one — the
-    /// converged slope of the FULL stack, fed to a fit of the stack minus its
-    /// top samples, i.e. exactly what the second outer iteration does.
-    ///
-    /// Measured over the 1 000 stacks: 960 land within two tolerances of the
-    /// cold bracket's answer (`tol = 1e-3·σ_b`) and 40 (4.0 %) converge to a
-    /// genuinely DIFFERENT root. That is not a defect and not a rounding
-    /// artifact: `f(b) = Σ xᵢ·sgn(…)` is an integer-valued step function
-    /// whose zero set is a plateau, so the minimum-absolute-deviation line
-    /// is genuinely NOT unique — the cold bracket's pick was never the
-    /// canonical one, it is whichever crossing a `3·σ_b`-wide bisection
-    /// happened to walk into, while the narrow bracket finds the crossing
-    /// nearest the previous iteration's slope. What matters is that neither
-    /// is the WORSE line, and it is not: the warm line's mean absolute
-    /// deviation — the objective both are minimizing — is above the cold
-    /// line's on 141 of 1 000 calls, never by more than 0.151 %, and on
-    /// average 2.5e-6 BELOW it. Downstream this changes nothing: see
-    /// [`reject_linear_fit_survivors_match_the_cold_bracket_reference`], 0
-    /// of 1 500 stacks with a different survivor.
-    #[test]
-    fn medfit_line_warm_bracket_is_as_good_a_fit_as_the_cold_bracket() {
-        let mut within_two_tolerances = 0usize;
-        let mut different_roots = 0usize;
-        let mut worst_adev_rel = 0.0f64;
-        let mut warm_worse = 0usize;
-        let mut calls = 0usize;
-        for seed in 0..1000u64 {
-            let mut values = medfit_pin_stack(seed);
-            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = values.len();
-            // Iteration 1: a cold fit of the whole stack (bit-identical
-            // either way — the pin above), then drop the top samples the way
-            // a rejection pass would and refit warm.
-            let (_, b0) = medfit_line(&values, None);
-            let survivors = &values[..n - (n / 20).max(1)];
-            let (_, sigma_b) = ls_slope_and_sigma(survivors);
-            if !(sigma_b > 0.0) {
-                continue; // the exact-line guard returns before bracketing
-            }
-            let tol = 1e-3 * sigma_b;
-            let warm = medfit_line(survivors, Some(b0));
-            let reference = medfit_line_cold_reference(survivors, Some(b0));
-            calls += 1;
-            if (warm.1 - reference.1).abs() <= 2.0 * tol {
-                within_two_tolerances += 1;
-            } else {
-                different_roots += 1;
-            }
-            // The objective both lines minimize, evaluated on the same data.
-            let adev = |line: (f64, f64)| -> f64 {
-                survivors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &y)| (y - (line.0 + line.1 * i as f64)).abs())
-                    .sum::<f64>()
-                    / survivors.len() as f64
-            };
-            let (warm_adev, reference_adev) = (adev(warm), adev(reference));
-            if warm_adev > reference_adev {
-                warm_worse += 1;
-            }
-            worst_adev_rel =
-                worst_adev_rel.max((warm_adev - reference_adev).abs() / reference_adev.max(1e-12));
-        }
-        assert!(
-            worst_adev_rel <= 0.01,
-            "the warm bracket's line is {:.3} % off the cold bracket's own objective (measured 0.151 % worst)",
-            100.0 * worst_adev_rel
-        );
-        assert!(
-            warm_worse * 2 <= calls,
-            "the warm bracket returned the worse fit on {warm_worse} of {calls} calls — a systematic coarsening, not the coin flip a dyadic bracket width gives (measured 141)"
-        );
-        assert!(
-            different_roots * 5 <= calls,
-            "{different_roots} of {calls} calls landed on a different root — over the 20 % bar (measured 40, 4.0 %)"
-        );
-        assert!(
-            within_two_tolerances + different_roots == calls,
-            "bookkeeping"
-        );
-    }
-
-    /// I1/I2 and C4 on NaN-carrying input: `values` containing a NaN makes `chisq`
+    /// I1/I2 on NaN-carrying input: `values` containing a NaN makes `chisq`
     /// (and therefore `sigma_b`) NaN in BOTH the production function and the
     /// oracle, so `!(sigma_b > 0.0)` is true and both return `(a_ls, b_ls)`
     /// WITHOUT ever calling `rofunc` — I1/I2 touch nothing on this path, and
     /// the pin proves it stays that way (a future change to the pre-`rofunc`
     /// guard would be caught here).
     #[test]
-    fn medfit_line_matches_the_cold_reference_on_nan_carrying_input() {
+    fn medfit_line_matches_the_oracle_on_nan_carrying_input() {
         let cases: [&[f64]; 3] = [
             &[1.0, 2.0, f64::NAN, 4.0, 5.0],
             &[f64::NAN, f64::NAN, f64::NAN],
@@ -2520,23 +2347,22 @@ mod tests {
         ];
         for values in cases {
             let a = medfit_line(values, None);
-            let b = medfit_line_cold_reference(values, None);
+            let b = medfit_line_oracle(values, None);
             assert_eq!(
                 (a.0.to_bits(), a.1.to_bits()),
                 (b.0.to_bits(), b.1.to_bits()),
-                "{values:?}: {a:?} vs reference {b:?}"
+                "{values:?}: {a:?} vs oracle {b:?}"
             );
         }
     }
 
-    /// The pin families for `reject_linear_fit`: the 500 contaminated stacks
-    /// tier A Task 9 used (a planted bright tail, n = 20..207) followed by
-    /// 1 000 stacks shaped like a real plane instead — sizes the pipeline
-    /// actually integrates at, 70 % of them pure noise and the rest carrying
-    /// hot pixels, a satellite trail or a cold pixel, which is the mix the
-    /// C4 constants were swept against.
-    fn reject_pin_stacks() -> Vec<Vec<f32>> {
-        let mut out = Vec::with_capacity(1500);
+    /// I1/I2 transitively, through `reject_linear_fit`: bit-identical
+    /// survivor count AND the exact same VALUES surviving, over 500 seeded
+    /// random `f32` stacks with a planted contaminated tail (so the
+    /// rejection loop actually iterates and calls `medfit_line` more than
+    /// once, exercising the warm start too).
+    #[test]
+    fn reject_linear_fit_matches_the_pre_task_9_oracle() {
         for seed in 0..500u64 {
             let mut rng = SplitMix64(0xA5A5_1234_5678_9ABC ^ seed);
             let n = 20 + (rng.next_u64() % 188) as usize; // 20..=207
@@ -2549,118 +2375,20 @@ mod tests {
             for k in 0..n_out.min(n) {
                 values[k] = 300.0 + 10.0 * k as f32;
             }
-            out.push(values);
-        }
-        let sizes = [8usize, 20, 50, 100, 200];
-        for seed in 0..1000u64 {
-            let n = sizes[(seed as usize) % sizes.len()];
-            let mut rng = SplitMix64(0x51ED_2701_ABCD_0001 ^ seed);
-            let mut values: Vec<f32> = (0..n)
-                .map(|_| (100.0 + 5.0 * next_gaussian(&mut rng)) as f32)
-                .collect();
-            match seed % 10 {
-                0 => {
-                    // hot pixels / cosmic rays
-                    let k = 1 + (rng.next_u64() % 4) as usize;
-                    for j in 0..k.min(n) {
-                        values[j] = 300.0 + 10.0 * j as f32;
-                    }
-                }
-                1 => {
-                    // a satellite trail: several moderate positives
-                    let k = 1 + (rng.next_u64() % 6) as usize;
-                    for j in 0..k.min(n) {
-                        values[j] = 130.0 + 4.0 * j as f32;
-                    }
-                }
-                2 => {
-                    values[0] = 20.0; // a cold pixel, and one hot
-                    values[n - 1] = 400.0;
-                }
-                _ => {} // pure noise, as most of a plane is
-            }
-            out.push(values);
-        }
-        out
-    }
 
-    /// C4/I8 through `reject_linear_fit`, and I1/I2 transitively: the warm
-    /// bracket must not move which samples survive.
-    ///
-    /// It is allowed to — the converged slope is a different point of the
-    /// same tolerance window, so a sample sitting exactly on a rejection
-    /// threshold could fall the other way — which is why the bar is a rate
-    /// (identical survivors on ≥ 99.9 % of stacks, and never a survivor
-    /// count more than one apart) rather than bit-for-bit equality. Measured
-    /// over the 1 500 stacks of [`reject_pin_stacks`]: 0 stacks differ in
-    /// any way, and the rejected fraction over the whole population is
-    /// identical to four decimals. The `sorted` flag is a contract of the
-    /// routine, not a measurement, so it is still asserted exactly.
-    #[test]
-    fn reject_linear_fit_survivors_match_the_cold_bracket_reference() {
-        let stacks = reject_pin_stacks();
-        let total = stacks.len();
-        let mut differing = 0usize;
-        for (i, values) in stacks.iter().enumerate() {
-            let n = values.len();
             let mut a = values.clone();
-            let mut b = values.clone();
+            let mut b = values;
             let (kept_a, sorted_a) = reject_linear_fit(&mut a, 5.0, 3.5);
-            let (kept_b, sorted_b) = reject_linear_fit_cold_reference(&mut b, 5.0, 3.5);
-            assert_eq!(sorted_a, sorted_b, "stack {i} n {n}: sorted flag");
-            assert!(
-                (kept_a as i64 - kept_b as i64).abs() <= 1,
-                "stack {i} n {n}: survivor counts {kept_a} vs {kept_b} — more than one sample apart"
-            );
+            let (kept_b, sorted_b) = reject_linear_fit_oracle(&mut b, 5.0, 3.5);
+            assert_eq!(kept_a, kept_b, "seed {seed} n {n}: survivor count");
+            assert_eq!(sorted_a, sorted_b, "seed {seed} n {n}: sorted flag");
             let bits_a: Vec<u32> = a[..kept_a].iter().map(|v| v.to_bits()).collect();
             let bits_b: Vec<u32> = b[..kept_b].iter().map(|v| v.to_bits()).collect();
-            if bits_a != bits_b {
-                differing += 1;
-            }
+            assert_eq!(
+                bits_a, bits_b,
+                "seed {seed} n {n}: survivor values (bit-for-bit)"
+            );
         }
-        assert!(
-            differing * 1000 <= total,
-            "{differing} of {total} stacks kept different survivors — over the 0.1 % bar (measured 0)"
-        );
-    }
-
-    /// C4/I8's reason to exist: the narrow warm bracket must actually cost
-    /// fewer `medfit_line` evaluations, counted by `MEDFIT_EVALS` (which
-    /// [`medfit_line_cold_reference`] ticks the same way production does, so
-    /// the two are priced on one scale) over the same 1 500 stacks.
-    ///
-    /// Measured: 30.15 evaluations per stack against the cold bracket's
-    /// 32.81, i.e. 0.919x. The bar is set at 0.95x — loose enough not to
-    /// fail on a fixture reshuffle, tight enough that a bracket change which
-    /// stopped paying for itself would be caught.
-    ///
-    /// C4's brief asked for ≤ 0.5x, which is unreachable by ANY change
-    /// confined to the warm bracket: the outer loop runs ~2 iterations per
-    /// stack, so the first call of each — cold, and untouched by C4 — is
-    /// about half of all evaluations, and free warm calls would still only
-    /// reach ~0.5x. The rest are bisections of a window that cannot be
-    /// widened without loosening `tol`, which I9 dropped on purpose.
-    #[test]
-    fn reject_linear_fit_warm_bracket_cuts_medfit_evaluations() {
-        let stacks = reject_pin_stacks();
-        let mut reference_evals = 0u64;
-        let mut production_evals = 0u64;
-        for values in &stacks {
-            let mut a = values.clone();
-            let mut b = values.clone();
-            let _ = take_rejection_counters();
-            let _ = reject_linear_fit_cold_reference(&mut b, 5.0, 3.5);
-            let (_, evals) = take_rejection_counters();
-            reference_evals += evals;
-            let _ = reject_linear_fit(&mut a, 5.0, 3.5);
-            let (_, evals) = take_rejection_counters();
-            production_evals += evals;
-        }
-        let ratio = production_evals as f64 / reference_evals as f64;
-        assert!(
-            ratio <= 0.95,
-            "warm bracket costs {ratio:.3}x the cold bracket's evaluations ({production_evals} vs {reference_evals}) — measured 0.905x"
-        );
     }
 
     /// Perf tier C, C4/I7: the rejection loop stops on the FIRST iteration
