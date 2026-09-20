@@ -136,6 +136,34 @@ struct CellScratch {
 /// `psf_signal::fit_all`'s own doc states. Either way the RESULT is
 /// bit-identical (the module's own pin proves it) — `pool` only changes
 /// whose workers do the work, never what they compute.
+///
+/// **Reading the plane 4×4-BINNED was tried and MEASURED OUT** (perf tier C
+/// item C5, ruling C-29, 2026-09-20 — do not re-propose it). `clip_and_bin`
+/// fused `clean_plane`'s two passes into a `LN_BIN = 4` reduction
+/// (clip-then-bin: the hot-pixel rescue and the `[low_clip, high_clip]`
+/// clip applied per SOURCE pixel exactly as below, then the survivors of
+/// each 4×4 block averaged) and had the cell loop gather bins instead of
+/// pixels. It is genuinely much faster — `background_ms` 83 → 15 on a 4-wide
+/// pool, 73 → 10 on a 10-wide one, per mono frame — and it cost ≈ 104 MB of
+/// transient allocation per channel less. It was reverted anyway:
+///
+/// On the FULL 197-frame acceptance set the `B` grid it produces moves by
+/// **2.4e-3 of sky at the MEDIAN node** (mono; OSC green/blue 1.2–1.6e-3),
+/// p99 1.4e-2, with single nodes reaching 4× sky through the hard validity
+/// gate and `ln_cells_rejected` up by a median of 1 (max 10) per frame.
+/// That carries into the masters: mono master MAD **+1.88 %** and OSC blue
+/// FWHM **+2.67 %**, against the tier's own 1 % bars, with medians drifting
+/// to ±0.07 %. A three-frame probe had reported a median node move of 9e-4
+/// — it **understated the full-group move by ≈ 2.5×**, which is the process
+/// lesson as much as the numeric one.
+///
+/// The cause is not the validity gate and cannot be fixed by softening it:
+/// the difference between a mean of 16 binned pixels and the per-pixel
+/// median of a 128-px cell lives in the MEDIAN of the distribution on a
+/// crowded sky (binning smears star flux *below* the per-cell rejection
+/// bound instead of letting the clip remove it), not only in the tail. The
+/// whole item was worth ≈ 0.4 min of a 14-minute run. Full measurement:
+/// `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-7-report.md`.
 pub fn background_grid(
     plane: &[f32],
     width: usize,
