@@ -385,10 +385,17 @@ fn gather_cell(
 /// would have (same `kept` contents, same `med`), just in whatever order
 /// `kept` happens to be in at that moment — irrelevant to the median it
 /// computes. `retain` vs the old `filter().collect()`: both keep exactly
-/// the elements passing the same predicate and drop the rest — `retain`
-/// preserves the relative order of survivors (a stable filter), which
-/// `filter().collect()` also did, so the two are the same permutation of
-/// the same surviving multiset, not just the same set.
+/// the elements passing the same predicate and drop the rest, so the two
+/// always agree on the same SET of survivors. M1 fix wave correction:
+/// that is as far as the equivalence goes — `retain` is a stable filter,
+/// but it runs on `kept` AFTER this same round's `median_in_place(kept)`
+/// has already reordered it in place (`select_nth_unstable_by` is not a
+/// stable sort), so the survivors' RELATIVE ORDER here need not match
+/// whatever order a fresh `filter().collect()` over an unscrambled copy
+/// would have produced. That permutation difference is harmless for the
+/// reason already given above: every later read of `kept` (the `dev`
+/// fill, the next round's `retain` predicate, the final
+/// `median_in_place`) only cares about VALUES, never position.
 ///
 /// Returns `(level, true)` when the kept set holds after clipping
 /// stabilizes (or hits the round cap) with no more than `rejection_limit`

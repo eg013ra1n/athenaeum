@@ -707,6 +707,25 @@ thread_local! {
     static LN_ROW_BUFFERS: RefCell<Vec<(Vec<f32>, Vec<f32>)>> = RefCell::new(Vec::new());
 }
 
+/// Perf tier A M1 fix wave: hands this THREAD's own [`LN_ROW_BUFFERS`] pool
+/// back to the allocator. `stacking::integrate::integrate_planes` runs this
+/// once per GROUP (guarded on the group actually being LN-active, so a
+/// non-LN caller never touches the thread-local at all) via
+/// `rayon::ThreadPool::broadcast`, which calls a closure once on every
+/// worker thread — the only way to reach every thread's own copy of a
+/// `thread_local!`. Safe unconditionally, and changes no output number: the
+/// pool holds pure scratch (see the thread_local's own doc — every element
+/// is fully overwritten before `process_row` reads it back), so dropping it
+/// only changes whether the NEXT `init_row_state` call on that thread has to
+/// reallocate, never what it computes.
+pub(crate) fn release_ln_row_buffers() {
+    LN_ROW_BUFFERS.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        pool.clear();
+        pool.shrink_to_fit();
+    });
+}
+
 impl Drop for RowState<'_, '_, '_> {
     fn drop(&mut self) {
         // Perf tier A Task 9 (I5): give this leaf's LN row buffers back to
@@ -1518,6 +1537,22 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                             process_row(row_in_band, out_row, low_row, high_row, Some(bits_row), row_state);
                         },
                     );
+                // M5 fix wave: `?` short-circuits BEFORE `fill(0)` on an
+                // `Err`, so a failing band never re-zeroes `band_bits` —
+                // safe for three independent reasons. (1) The buffer is
+                // owned by `band_bits_buf`, itself owned by this
+                // `integrate_stack` call; an `Err` here propagates out of
+                // the call and the buffer is dropped with it, so there is
+                // no "next band" on this buffer to see the stale bits. (2)
+                // The production sink (`RejBitmapSet`) latches its first
+                // write failure and every later `record_band` call becomes
+                // a no-op returning `Ok(())` — even a caller that somehow
+                // kept driving bands after an error would stop writing
+                // real bits, not read them back dirty. (3) The
+                // `debug_assert!` above (band start) would itself catch a
+                // regression in either of the first two guarantees — a
+                // reused, unzeroed buffer fails loudly in debug builds
+                // before this arm does any per-pixel work.
                 sink.record_band(y0, rows, band_bits)?;
                 band_bits.fill(0);
             }

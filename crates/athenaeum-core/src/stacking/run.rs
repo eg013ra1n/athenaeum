@@ -3966,6 +3966,14 @@ fn register_group_pass(
             // what the previous round's `ensure_registered_artifact` did
             // and what made a from-scratch backfill add minutes to this
             // stage.
+            // I2 fix wave: a rewrite-needed item's pixel work (warp +
+            // write) has NOT happened yet — it must not count as done
+            // here, or the Register row reads 100 % for the whole rewrite
+            // batch below. Only a truly fresh reused item (or a Failed
+            // outcome, which has no pixel work left to do) is counted
+            // immediately; a rewrite item is counted when the rewrite
+            // fan-out's own ticker ticks it.
+            let mut needs_rewrite = false;
             if let RegisteredFrameOutcome::Aligned { map, record, .. } = &outcome {
                 let hash = record.config_hash.as_deref().unwrap_or_default();
                 let fresh = registered_artifact_is_fresh(rc, &group.key, frame.frame_id, hash)
@@ -3979,6 +3987,7 @@ fn register_group_pass(
                         false
                     });
                 if !fresh {
+                    needs_rewrite = true;
                     let planes = rc
                         .measured
                         .get(&group.key)
@@ -3998,17 +4007,19 @@ fn register_group_pass(
             if let Some(entries) = rc.measured.get_mut(&group.key) {
                 entries[idx].registration = Some(outcome);
             }
-            progress.0 += 1;
-            rc.progress(
-                Stage::Register,
-                Some(group.key.clone()),
-                progress.0,
-                progress.1,
-                0,
-                0,
-                Some(frame.frame_id),
-                None,
-            );
+            if !needs_rewrite {
+                progress.0 += 1;
+                rc.progress(
+                    Stage::Register,
+                    Some(group.key.clone()),
+                    progress.0,
+                    progress.1,
+                    0,
+                    0,
+                    Some(frame.frame_id),
+                    None,
+                );
+            }
         } else {
             // M4b Task 2: resolved only for the frames this pass will
             // actually register, so a fully cached group pays nothing for
@@ -4125,18 +4136,38 @@ fn register_group_pass(
     // SAME way as the main fan-out below — no per-frame `rc` access, so it
     // never fights the main batch over `&mut RunContext`. Registration
     // itself is already known (`map`/`rec`); only the pixel work runs
-    // here. ──
+    // here.
+    //
+    // I2 fix wave: this batch used to report NOTHING while it ran — the
+    // `reused` loop above counted every reused frame (rewrite-needed or
+    // not) as done up front, so the Register row sat at 100 % for the
+    // whole rewrite (0.43 s mono / 1.26 s OSC per frame). It no longer
+    // does that (see the loop's own comment); this batch gets its own
+    // ticker instead, continuing from the SAME `progress.0` the main
+    // batch's ticker below picks up from, so the two compose into one
+    // running count. ──
     if !needs_artifact_rewrite.is_empty() {
         let pool_ref = &rc.ctx.image_pool;
         let out_dir_ref = &out_dir;
         let reference_name_ref = &reference_name;
         let group_ref = group;
         let cancel_ref: &AtomicBool = &rc.cancel;
+        let rewrite_ticker = FanOutTicker::new(
+            rc,
+            Stage::Register,
+            Some(group.key.clone()),
+            progress.0,
+            progress.1,
+            0,
+            0,
+        );
+        let rewrite_ticker_ref = &rewrite_ticker;
         let rewrite_results = fan_out(
             needs_artifact_rewrite,
             admission_n,
             cancel_ref,
             move |item: ArtifactRewriteItem| -> Result<(i64, RegistrationRecord, Option<PathBuf>), String> {
+                let frame_id = item.frame_id;
                 let stem = calibrated_file_stem(group_ref, &item.frame);
                 let out = out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
                 let written = write_one_registered_frame(
@@ -4151,7 +4182,7 @@ fn register_group_pass(
                     Some(pool_ref),
                     &out,
                 );
-                match written {
+                let result = match written {
                     Ok(()) => Ok((item.frame_id, item.rec, Some(out))),
                     Err(e) => {
                         tracing::warn!(
@@ -4162,10 +4193,13 @@ fn register_group_pass(
                         );
                         Ok((item.frame_id, item.rec, None))
                     }
-                }
+                };
+                rewrite_ticker_ref.tick(Some(frame_id));
+                result
             },
         );
         rc.check_cancel()?;
+        progress.0 = rewrite_ticker.done();
         for res in rewrite_results {
             match res {
                 None => return Err(RunError::Cancelled),

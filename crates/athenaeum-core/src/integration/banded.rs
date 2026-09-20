@@ -930,10 +930,18 @@ impl BandPlanes {
     /// W3) — `RegisteredSource::read_band_with_progress` calls this with
     /// the f32 samples `fill_frame` already produced (a materialized read
     /// or a warp, both f32-native), so the value never passes through
-    /// bytes to get here. `data.len()` must be `rows() * width()`; not
-    /// checked here (a `debug_assert` in the one caller is enough — this
-    /// is `pub(crate)`, not part of the public band-source contract).
+    /// bytes to get here. `data.len()` must be `rows() * width()` — M1 fix
+    /// wave correction: the one caller carries no `debug_assert` of its
+    /// own (it never did), so the check is HERE instead, test-only cost.
     pub(crate) fn put_lane(&mut self, frame: usize, data: Vec<f32>) {
+        debug_assert_eq!(
+            data.len(),
+            self.rows * self.width,
+            "put_lane: frame {frame}'s band is {} samples, expected rows({}) * width({})",
+            data.len(),
+            self.rows,
+            self.width,
+        );
         self.lanes[frame] = data;
     }
 }

@@ -263,6 +263,17 @@ fn drop_half_diag_at(
 /// moment any ONE of the 29 samples maps to a non-finite output
 /// coordinate — the same degenerate non-finite case every other caller
 /// of [`map_drop`] already falls back on.
+///
+/// M1 fix wave: this bound itself samples through [`PixelMap::
+/// forward_exact`], but the real per-pixel deposit `deposit_band` skips
+/// against maps through the grid-cached `ForwardEval` instead (built once
+/// per frame, evaluated once per pixel — the O(nodes) exact path is only
+/// affordable at 29-samples-per-frame, not width x height-per-frame). The
+/// two can disagree by the displacement grid's own interpolation error
+/// against the exact evaluator, which is ≪ 0.1 px (the TPS hold-out rms
+/// cited above) — well inside [`DEPOSIT_SKIP_MARGIN_PX`], so the bound
+/// measured here still covers the drop shape `deposit_band` actually
+/// evaluates.
 pub fn drop_bound_half_diag(
     map: &PixelMap,
     width: usize,

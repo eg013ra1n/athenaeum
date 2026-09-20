@@ -755,6 +755,18 @@ pub(crate) fn integrate_planes<'g>(
         output_pairs_out.push(output_pairs);
     }
 
+    // Perf tier A M1 fix wave: this call's own LN row-buffer pool (one
+    // `(Vec<f32>, Vec<f32>)` per frame, per WORKER thread) is done growing
+    // the moment the last plane above returns — release it now rather than
+    // letting it sit resident for the rest of the process. Guarded on `ln`
+    // itself (not, say, `local_for_output || local_for_rejection`): a
+    // non-LN call's `RowState::local` is always empty and its `Drop` never
+    // touches the thread-local (see its own doc), so the broadcast would
+    // find nothing to clear — skip the cross-thread round trip entirely.
+    if ln.is_some() {
+        pool.broadcast(|_| crate::integration::engine::release_ln_row_buffers());
+    }
+
     Ok((outputs, output_pairs_out))
 }
 
