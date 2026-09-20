@@ -493,7 +493,20 @@ drizzle: DrizzleStats | null,
  * all, or on a summary written before this task. `#[serde(default)]`,
  * see `SummaryFrame::ln_scale`'s own doc for the convention.
  */
-beta: number | null, frames: Array<SummaryFrame>, };
+beta: number | null, 
+/**
+ * Perf tier C Task 2 fix round 4 (ruling C-14 item 2): the group's own
+ * per-CHANNEL seeds calibration `k` — the factor stage 6 measured once
+ * for the whole group and multiplied into every seeds-path channel's
+ * `A`. One entry per plane of the group's LN reference, `1.0` for a
+ * channel that could not be calibrated (too few usable ratios, or a
+ * median outside its band). `None` when local normalization did not
+ * run for this group at all, when the calibration could not be
+ * measured, and on a summary written before this field existed.
+ * `#[serde(default)]`, see [`SummaryFrame::ln_scale`]'s own doc for
+ * the convention.
+ */
+seedsCalibration: Array<number> | null, frames: Array<SummaryFrame>, };
 
 export type StageTiming = { stage: Stage, durationMs: number, };
 

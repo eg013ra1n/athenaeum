@@ -30,7 +30,7 @@
 //! ([`fit_local_scale`]) that `ln::normalize_frame` samples on the stride
 //! grid as `A(x, y) = s + spline(x, y)`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::f64::consts::{PI, SQRT_2};
 use std::sync::Arc;
 use std::time::Instant;
@@ -520,28 +520,6 @@ fn fit_local_scale(
     spline
 }
 
-/// One β's worth of prepared reference data — the fit outcome plus the
-/// match tree over its own centroids (`fit_of_point` is the identity, kept
-/// explicit so pass 1 and pass 2 share one [`pair_positions`]).
-struct PreparedBeta {
-    outcome: FitOutcome,
-    tree: KdTree2,
-    fit_of_point: Vec<usize>,
-}
-
-impl PreparedBeta {
-    fn from_outcome(outcome: FitOutcome) -> PreparedBeta {
-        let fit_positions: Vec<Option<(f64, f64)>> =
-            outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
-        let (tree, fit_of_point) = tree_over(&fit_positions);
-        PreparedBeta {
-            outcome,
-            tree,
-            fit_of_point,
-        }
-    }
-}
-
 /// The reference side of [`relative_scale`] (detection + PSF fit + the
 /// built match tree), computed ONCE PER GROUP instead of once per frame
 /// (final fix wave, I2): the LN reference plane is immutable for a group's
@@ -551,51 +529,42 @@ impl PreparedBeta {
 /// this hoists the far more expensive detect+fit+tree half that was left
 /// behind.
 ///
-/// **Tier C Task 2 fix round 1, ruling C-10** (superseded by fix round 2,
-/// ruling C-12 — struct KEPT, its per-β use case retired): comparing a
-/// target's own Moffat fit against a reference fitted at a DIFFERENT β
-/// biases the flux ratio (two different profile shapes enclose different
-/// fractions of the same star's light) — measured on a real catalog frame
-/// at ≈ 3.4 % when the target's own β sat two `AUTO_BETAS` steps from the
-/// group's. C-10's fix was to never compare across β at all: this struct
-/// can hold the reference's fit ONE detection produces, refitted at EVERY
-/// β a caller names via `extra_betas` (`betas`, keyed by `f64::to_bits()`
-/// — every value in play is a small closed set of literals, `AUTO_BETAS`
-/// or a caller's `Fixed`/`Moffat4` constant, never the result of
-/// arithmetic, so bit equality is exact equality here), plus the DEFAULT β
-/// (`normalization.local.psfModel`'s own resolution, ruling C-1) every
-/// caller uses. **Ruling C-12 found the per-β comparison itself was never
-/// the dominant bias** (the diagnostics round traced the real ~5 %
-/// residual to a Moffat fit's `signal` not being warp-invariant) and
-/// retired the flux-comparison design that needed per-β reference fits at
-/// all — [`relative_scale_from_seeds`] always reads
-/// [`Self::default_prepared`], regardless of what β the SEED source's own
-/// fits carried. The multi-β machinery stays (a caller can still ask for
-/// extra betas and look one up via `prepared_for`), but no current
-/// production caller passes a non-empty `extra_betas` any more.
+/// **One β, deliberately** (Tier C Task 2 fix round 4, the review's M2).
+/// Ruling C-10 briefly gave this struct a map of per-β prepared fits, on
+/// the theory that comparing a target's own Moffat fit against a reference
+/// fitted at a DIFFERENT β was the source of the seeds path's bias. The
+/// diagnostics round (ruling C-11) measured that theory dead — the real
+/// residual is a Moffat fit's `signal` not being warp-invariant — and
+/// ruling C-12 retired the flux comparison that needed per-β reference
+/// fits at all: [`relative_scale_from_seeds`] re-fits the target on the
+/// WARPED plane at this reference's OWN β, whatever β the seed source's
+/// fits carried. The map survived three rounds with no production caller
+/// and an `#[allow(dead_code)]` lookup; it is gone.
 pub struct PreparedReferenceChannel {
-    /// The β [`relative_scale_against`] (detection on the warped frame)
-    /// always uses — `normalization.local.psfModel`'s resolution (ruling
-    /// C-1: the group β when `Auto`).
-    default_beta: f64,
-    betas: HashMap<u64, PreparedBeta>,
+    /// The β both [`relative_scale_against`] (detection on the warped
+    /// frame) and [`relative_scale_from_seeds`] fit the target at —
+    /// `normalization.local.psfModel`'s resolution (ruling C-1: the group
+    /// β when `Auto`).
+    beta: f64,
+    /// The reference's own accepted fits at [`Self::beta`], plus the match
+    /// tree over their centroids (`fit_of_point` is the identity, kept
+    /// explicit so pass 1 and pass 2 share one [`pair_positions`]).
+    outcome: FitOutcome,
+    tree: KdTree2,
+    fit_of_point: Vec<usize>,
     /// Ruling R-M4c-9's pass-2 side of the same reference: a tree over the
-    /// DETECTION barycentres the DEFAULT-β accepted fits came from, with
-    /// the map back to fit indices. There is only one — the barycentre
-    /// pass is the detection fallback's own mechanism, which only ever
-    /// compares at the default β (see [`relative_scale_against`]).
+    /// DETECTION barycentres the accepted fits came from, with the map
+    /// back to fit indices. The barycentre pass is the detection
+    /// fallback's own mechanism (see [`relative_scale_against`]).
     barycentre_tree: KdTree2,
     barycentre_of_point: Vec<usize>,
 }
 
 impl PreparedReferenceChannel {
     /// `reference` is one channel's row-major `width × height` plane
-    /// (already in the reference geometry); `default_psf`/`max_stars` are
+    /// (already in the reference geometry); `psf`/`max_stars` are
     /// the SAME values a direct [`relative_scale`] call on this reference
-    /// would use — `default_psf` resolves the DEFAULT β (ruling C-1).
-    /// `extra_betas` (ruling C-10) are the group's OTHER member betas to
-    /// ALSO prepare — a subset of `AUTO_BETAS`, so at most 4 total; a value
-    /// already equal to the resolved default is not refitted twice. `pool`
+    /// would use — `psf` resolves the β (ruling C-1). `pool`
     /// (perf tier 1 Task 2 fix round 1, item 3): the reference-side
     /// detect+fit this hoists once per group is real parallel work —
     /// routed to `image_pool` when the caller has one
@@ -605,83 +574,36 @@ impl PreparedReferenceChannel {
         reference: &[f32],
         width: usize,
         height: usize,
-        default_psf: PsfModel,
-        extra_betas: &[f64],
+        psf: PsfModel,
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> PreparedReferenceChannel {
         let fit_params = FitParams::default();
         let ref_seeds = detect_seeds(reference, width, height, max_stars, pool);
-        let default_outcome = fit_stars(
-            reference,
-            width,
-            height,
-            &ref_seeds,
-            default_psf,
-            &fit_params,
-            pool,
-        );
-        let default_beta = default_outcome.beta;
+        let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, pool);
+        let beta = outcome.beta;
 
-        let barycentres = link_barycentres(&default_outcome.fits, &ref_seeds, &fit_params);
+        let barycentres = link_barycentres(&outcome.fits, &ref_seeds, &fit_params);
         let (barycentre_tree, barycentre_of_point) = tree_over(&barycentres);
 
-        let mut betas: HashMap<u64, PreparedBeta> = HashMap::new();
-        betas.insert(
-            default_beta.to_bits(),
-            PreparedBeta::from_outcome(default_outcome),
-        );
-        for &beta in extra_betas {
-            if betas.contains_key(&beta.to_bits()) {
-                continue;
-            }
-            let outcome = fit_stars_with_beta(
-                reference,
-                width,
-                height,
-                &ref_seeds,
-                beta,
-                &fit_params,
-                pool,
-            );
-            betas.insert(beta.to_bits(), PreparedBeta::from_outcome(outcome));
-        }
+        let fit_positions: Vec<Option<(f64, f64)>> =
+            outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
+        let (tree, fit_of_point) = tree_over(&fit_positions);
 
         PreparedReferenceChannel {
-            default_beta,
-            betas,
+            beta,
+            outcome,
+            tree,
+            fit_of_point,
             barycentre_tree,
             barycentre_of_point,
         }
     }
 
-    /// The DEFAULT β's prepared data — always present (`build` inserts it
-    /// unconditionally).
-    fn default_prepared(&self) -> &PreparedBeta {
-        self.betas
-            .get(&self.default_beta.to_bits())
-            .expect("PreparedReferenceChannel::build always inserts the default beta")
-    }
-
-    /// This channel's default β — `normalization.local.psfModel`'s own
-    /// resolution (ruling C-1).
+    /// This channel's β — `normalization.local.psfModel`'s own resolution
+    /// (ruling C-1).
     pub fn default_beta(&self) -> f64 {
-        self.default_beta
-    }
-
-    /// The prepared data for `beta`, when it was one of `build`'s
-    /// `extra_betas` (or equalled the default) — `None` for a β this
-    /// reference was never fitted at.
-    ///
-    /// No current production caller: ruling C-12 retired the per-target-β
-    /// lookup [`relative_scale_from_seeds`]'s predecessor used this for —
-    /// the seeds design always reads [`Self::default_prepared`] instead.
-    /// Kept (with a direct test) for `PreparedReferenceChannel`'s own
-    /// completeness — the ruling kept `extra_betas`/`betas` themselves for
-    /// the same reason.
-    #[allow(dead_code)]
-    fn prepared_for(&self, beta: f64) -> Option<&PreparedBeta> {
-        self.betas.get(&beta.to_bits())
+        self.beta
     }
 }
 
@@ -786,7 +708,6 @@ fn relative_scale_against_core(
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     let fit_params = FitParams::default();
-    let default = prepared.default_prepared();
 
     // Perf tier A Task 0 (audit §3.1): wall time per phase, so the LN
     // stage's own `scale_ms` (ln/mod.rs) splits into where it actually
@@ -801,7 +722,7 @@ fn relative_scale_against_core(
         width,
         height,
         &tgt_seeds,
-        default.outcome.beta,
+        prepared.beta,
         &fit_params,
         pool,
     );
@@ -815,8 +736,8 @@ fn relative_scale_against_core(
     let tgt_fit_positions: Vec<Option<(f64, f64)>> =
         tgt_outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
     let (pairs, pass) = choose_pairing(
-        &default.tree,
-        &default.fit_of_point,
+        &prepared.tree,
+        &prepared.fit_of_point,
         &tgt_fit_positions,
         &prepared.barycentre_tree,
         &prepared.barycentre_of_point,
@@ -824,7 +745,7 @@ fn relative_scale_against_core(
         match_radius_px,
     );
 
-    let sample = ratio_sample(&default.outcome.fits, &tgt_outcome, &pairs);
+    let sample = ratio_sample(&prepared.outcome.fits, &tgt_outcome, &pairs);
     if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
             matches: sample.ratios.len(),
@@ -846,7 +767,7 @@ fn relative_scale_against_core(
         rejected = r.rejected,
         ln_pass = pass,
         ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
-        scale_source = "detected",
+        ln_scale_source = "detected",
         "ln relative scale"
     );
     let diag = diag_from_sample(&sample, &r.kept);
@@ -856,7 +777,7 @@ fn relative_scale_against_core(
             sigma: r.scale,
             matches: sample.ratios.len(),
             rejected: r.rejected,
-            beta: default.outcome.beta,
+            beta: prepared.beta,
             pass,
             local,
             timings: ScaleTimings {
@@ -1158,7 +1079,6 @@ fn relative_scale_from_seeds_core(
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>, SeedFilterBreakdown), LnError> {
-    let default = prepared.default_prepared();
     let fit_params = FitParams::default();
     let mut breakdown = SeedFilterBreakdown {
         available: fits.len(),
@@ -1200,7 +1120,7 @@ fn relative_scale_from_seeds_core(
             continue;
         }
         breakdown.past_saturation += 1;
-        if default
+        if prepared
             .tree
             .nearest_within(mx, my, match_radius_px)
             .is_none()
@@ -1225,7 +1145,7 @@ fn relative_scale_from_seeds_core(
         ref_width,
         ref_height,
         &seeds,
-        default.outcome.beta,
+        prepared.beta,
         &fit_params,
         pool,
     );
@@ -1236,13 +1156,13 @@ fn relative_scale_from_seeds_core(
     let tgt_fit_positions: Vec<Option<(f64, f64)>> =
         tgt_outcome.fits.iter().map(|f| Some((f.x, f.y))).collect();
     let (pairs, pass) = choose_pairing_widened(
-        &default.tree,
-        &default.fit_of_point,
+        &prepared.tree,
+        &prepared.fit_of_point,
         &tgt_fit_positions,
         match_radius_px,
     );
 
-    let sample = ratio_sample(&default.outcome.fits, &tgt_outcome, &pairs);
+    let sample = ratio_sample(&prepared.outcome.fits, &tgt_outcome, &pairs);
     breakdown.matched = sample.ratios.len();
     if sample.ratios.len() < MIN_MATCHES {
         return Err(LnError::TooFewMatches {
@@ -1265,7 +1185,7 @@ fn relative_scale_from_seeds_core(
         rejected = r.rejected,
         ln_pass = pass,
         ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
-        scale_source = "seeds",
+        ln_scale_source = "seeds",
         "ln relative scale"
     );
     let diag = diag_from_sample(&sample, &r.kept);
@@ -1275,7 +1195,7 @@ fn relative_scale_from_seeds_core(
             sigma: r.scale,
             matches: sample.ratios.len(),
             rejected: r.rejected,
-            beta: default.outcome.beta,
+            beta: prepared.beta,
             pass,
             local,
             timings: ScaleTimings {
@@ -1309,8 +1229,7 @@ pub fn relative_scale(
     rcr_limit: f64,
     local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
-    let prepared =
-        PreparedReferenceChannel::build(reference, width, height, psf, &[], max_stars, None);
+    let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars, None);
     relative_scale_against(
         &prepared,
         target,
@@ -1421,7 +1340,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );
@@ -1454,7 +1372,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );
@@ -2197,7 +2114,7 @@ mod tests {
 
             let (gw, gh) = super::super::LnGrid::grid_dims(WIDTH, HEIGHT, STRIDE);
             let (a, used) =
-                super::super::a_grid(Some(spline), r.scale, gw, gh, STRIDE, WIDTH, HEIGHT);
+                super::super::a_grid(Some(spline), r.scale, 1.0, gw, gh, STRIDE, WIDTH, HEIGHT);
             assert!(
                 used,
                 "seed {seed}: the spurious surface sits far inside the safety band, so what \
@@ -2413,7 +2330,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );
@@ -2447,11 +2363,11 @@ mod tests {
     }
 
     #[test]
-    fn relative_scale_from_seeds_reports_scale_source_seeds() {
+    fn relative_scale_from_seeds_reports_ln_scale_source_seeds() {
         // A dedicated tracing capture would need this module's own
         // subscriber (register/detect.rs's own tests already show the
         // pattern); simplest to just confirm the call succeeds and returns
-        // a sane result — `scale_source` on the emitted event is a
+        // a sane result — `ln_scale_source` on the emitted event is a
         // constant literal ("seeds") checked by inspection, not re-derived
         // at runtime by anything this function returns.
         let stars = star_grid(32);
@@ -2463,7 +2379,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );
@@ -2488,11 +2403,12 @@ mod tests {
     /// own β (10.0 vs 4.0 — the exact mismatch C-10 needed a per-β
     /// reference to fix) must therefore produce numerically IDENTICAL
     /// results: a seed carries position only, so the source fit's β is
-    /// invisible to this function. `PreparedReferenceChannel::build` is
-    /// still exercised at a non-default β here — ruling C-12's own "keep
-    /// C-10's structure" — even though no production caller passes a
-    /// non-empty `extra_betas` any more; `prepared_for` has no caller
-    /// outside this test.
+    /// invisible to this function. The reference itself is prepared at a
+    /// β (10.0) that neither source list agrees with, so a leak of the
+    /// source's own β would show up as a difference between the two
+    /// results — ruling C-14's removal of C-10's per-β machinery (the
+    /// review's M2) leaves this pin as the thing that guards the property
+    /// that machinery existed for.
     #[test]
     fn seeds_at_one_beta_are_immune_to_the_sources_own_beta() {
         let stars = star_grid(34);
@@ -2505,15 +2421,9 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Fixed(10.0),
-            &[4.0],
             200,
             None,
         );
-        assert!(
-            prepared.prepared_for(4.0).is_some(),
-            "extra_betas must still be reachable"
-        );
-        assert!(prepared.prepared_for(999.0).is_none());
 
         let identity = identity_map();
         let seeds_at_10 = measure_like_fits(&target, WIDTH, HEIGHT, 10.0);
@@ -2580,7 +2490,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );
@@ -2619,7 +2528,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );
@@ -2673,7 +2581,6 @@ mod tests {
             WIDTH,
             HEIGHT,
             PsfModel::Moffat4,
-            &[],
             200,
             None,
         );

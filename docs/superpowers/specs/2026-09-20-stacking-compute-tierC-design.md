@@ -109,7 +109,8 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
 7. **Hashes.** `ln` artifacts already fold in `PSF_FIT_VERSION`; C1 bumps it (2 → 3), which
    invalidates every cached `metrics` (they must now carry the fits) and every `.athln` — the
    first Tier C run re-measures and re-normalizes every set once, as M4a did.
-8. **Per-group seeds calibration (fix round 3, ruling C-13, LEVER 2).** Fix round 2's own 13-frame
+8. **Per-group seeds calibration (fix round 3, ruling C-13, LEVER 2; re-specified by fix round 4,
+   ruling C-14).** Fix round 2's own 13-frame
    table (§2.3 below) found the seeds path's scale reading SAME-SIGNED higher than today's
    detection path on every real frame, median +0.666 %, max +1.401 % — small against the 1.5 %
    ceiling but a same-signed bias moves a master's LEVEL (spec §8's median ± 0.1 % target), so it
@@ -120,22 +121,67 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
    match_radius_px` or removing it entirely left `matched`/`scale` unchanged to three significant
    figures while roughly doubling `scale_ms` — the lost stars have no reference counterpart at
    either radius, so the filter was kept as shipped in fix round 2 and LEVER 1 landed nothing.
-   LEVER 2 ships instead: `stacking::run::measure_ln_seeds_calibration`, called once per group
-   before stage 6's fan-out (skipped when every member already has a fresh cached sidecar), runs
-   BOTH `normalize_frame` paths — the seeds path and, with `fits = None`, today's detection
-   fallback — on the group's registration/geometry reference frame
-   (`RunContext::geometry_of(&group.key).reference_frame_id`) plus its two best-weighted other
-   members (`FrameWeight::normalized_mean`), writing to a throwaway sidecar under the group's own
-   `ln/` directory that is deleted immediately after (never the real `.athln` path, never a
-   `stacking_artifacts` row). `k = median(s_old / s_seeds)` over whichever of the three frames
-   produced a genuine (non-fallback) seeds-path scale; `< 2` usable frames leaves the group
-   uncalibrated (`k` omitted, never a hard failure). `normalize_frame` grew a
-   `seeds_calibration: Option<f64>` parameter: a channel that actually took the seeds path
-   multiplies its `ScaleResult::scale` by `k` before it becomes `A`; a channel that fell back to
-   detection is uncalibrated by definition (LEVER 1's own diagnostics found no bias on that path to
-   correct); a channel carrying a fitted local-scale spline (`normalization.local.localScale`)
-   skips calibration and warns once per frame — its residuals were fit against the UNCALIBRATED
-   `s`, so rescaling the global term alone would leave the two inconsistent.
+   LEVER 2 ships instead — `stacking::ln::calibration`, driven once per group by
+   `stacking::run::measure_ln_seeds_calibration` before stage 6's fan-out.
+
+   **The sample** is the group's registration/geometry reference frame
+   (`RunContext::geometry_of(&group.key).reference_frame_id`) plus its six best-weighted OTHER
+   members (`FrameWeight::normalized_mean`, ties broken on the frame id so two runs over the same
+   catalog pick the same frames): `SEEDS_CALIBRATION_FRAMES = 7`. Fix round 3 used three, which
+   ruling C-14 raised after the review observed that a 3-sample median of a bias spanning
+   +0.1…+1.4 % across a group carries roughly ±0.3 % of common-mode sampling error — and that
+   error lands directly on the master's median, the ±0.1 % row this whole item exists to protect.
+   **The honest cost**: each calibration frame runs BOTH arms of `normalize_frame`, and the
+   detection arm is the ≈ 6 s per-frame path the seeds design replaces, so the measurement is
+   ≈ 7 × 6 s ≈ 45 s per group (a little more with the seeds arm's own ≈ 0.4 s). Against it: the
+   seeds path saves ≈ 2.5 s on every one of a group's 90–160 frames, i.e. ≈ 4–7 min. The run emits
+   a `stacking-progress` message (`"calibrating the seeds path · frame i/7"`) while it happens, so
+   the Normalize row says what it is doing instead of appearing stalled. A group whose members are
+   ALL cache hits pays nothing: the measurement runs only when a fresh stored calibration is
+   missing AND at least one member would be re-normalized anyway.
+
+   **`k` is per CHANNEL** (`SeedsCalibration { frame_ids, k }`): for each calibration frame the
+   measurement collects `s_detected / s_seeds` per channel — only from channels whose SEEDS arm
+   genuinely took the seeds path, since a channel that fell back compared detection against
+   detection — and takes the MEDIAN per channel (odd `n` the natural middle, even `n` the LOWER of
+   the two middles: an interpolated mid-point is not one of the measured ratios). A channel with
+   fewer than `SEEDS_CALIBRATION_MIN_RATIOS = 3` usable ratios runs uncalibrated (`k = 1`), with
+   ONE `warn!` for the whole group. A median outside `1 ± SEEDS_CALIBRATION_BAND` (`0.03`, four
+   times the largest per-frame bias ever measured for this path) is REFUSED outright — `warn!`,
+   `k = 1` for that channel — rather than applied or clamped: a factor beyond that band is not a
+   seeds-path bias, and applying it would move the master's level by more than the defect it
+   claims to correct. Channels are independent: an OSC group's blue plane being refused says
+   nothing about its red.
+
+   **Determinism.** The measurement's inputs are hashed as the group's own `ln_calibration`
+   artifact (`seeds_calibration_hash_for`: the normalization subtree, the group's LN reference
+   hash, and the calibration frames' ids + registration hashes), and its RESULT — the frame ids and
+   the per-channel `k` rounded to 1e-6 — is folded into every member's `normalization_hash_for`.
+   A changed `k` therefore invalidates the whole group's sidecars rather than leaving a group
+   mixing frames normalized at two different factors; a re-registered calibration frame
+   re-measures `k` and, through the same fold, re-normalizes the group. The plan gate reads the
+   stored `ln_calibration` payload and hashes with it, so it and the run agree about what "fresh"
+   means without the gate ever measuring anything. The value is also recorded per frame
+   (`LnArtifactPayload::seeds_calibration`, beside `ln_scale_source`) and per group in the run
+   summary (`SummaryGroup::seedsCalibration`).
+
+   **Application.** `normalize_frame` takes `seeds_calibration: Option<&[f64]>` (one entry per
+   channel; a short slice or `None` reads as `k = 1`). A channel that actually took the seeds path
+   is calibrated; a channel that fell back to detection is not, by definition — LEVER 1's own
+   diagnostics found no bias on that path to correct. A channel carrying a fitted local-scale
+   spline (`normalization.local.localScale`) IS calibrated, by scaling the SAMPLED `A` surface —
+   `A(x, y) = k · (s + spline(x, y))`, with `B = B_ref − A·B_tgt` following from the scaled `A` —
+   rather than being skipped as fix round 3 did: the spline is a residual AROUND `s`, so scaling
+   the whole sampled value keeps the two consistent by construction, and leaving such a channel
+   uncalibrated was the larger inconsistency. `a_grid`'s safety band is measured on the UNSCALED
+   deviation, which for `k > 0` is the identical test, so no surface's accept/refuse verdict moves
+   because `k` exists.
+
+   **Which path a channel took is recorded**, and the calibration's own detection arm is told
+   apart from a genuine fallback: `normalize_frame`'s seed input is
+   `LnScaleSeeds::{Measured, NoFits, ForcedDetection}`, and only the first two make a detection run
+   warn ("no measured fits, detecting on the warped frame") or count as a fallback. The
+   calibration's seven detection runs are the POINT of the call, not a defect to report.
 
 ### 2.3 What moves
 The relative scale `s` per frame: Measure's fit flux (native geometry, its own β) vs today's
@@ -159,6 +205,17 @@ exposed to this: it fits the reference (itself an integration of already-warped 
 target (also warped) on planes of the SAME KIND, which is why that comparison stays self-
 consistent and is kept as the baseline the seeds design (§2.2 item 3) is checked against, rather
 than being replaced.
+
+**Why a residual bias exists at all — a plausible mechanism (fix round 4, the review's M5).** The
+seeds path and the detection path fit the SAME warped plane at the SAME β; what differs is where
+each fit's `initial_sigma` comes from. `detect_seeds` hands the fitter a detection's own
+`peak`/`flux` measured ON THE WARPED PLANE, while the seeds path copies Measure's `amplitude`/
+`signal`, measured on the NATIVE one — and the field-level `initial_sigma` heuristic those two
+numbers feed sizes the fit stamp. A stamp sized from native photometry is systematically a little
+different from one sized from warped photometry on exactly the undersampled frames where the warp
+changes a fit's integrated flux most (the H2 finding above), which is the shape of the residual
+`k` absorbs. This is stated as a mechanism, not a measurement: nothing in fix round 3 or 4 isolated
+it, and the per-group factor removes the bias whatever its cause.
 
 **Fix round 3 finding (ruling C-13, LEVER 2): the per-group calibration factor closes the
 remaining bias.** Re-measuring the same 13-frame table with `k` applied (§2.2 item 8): median

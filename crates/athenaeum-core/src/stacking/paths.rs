@@ -114,6 +114,19 @@ impl WorkingLayout {
         self.ln_dir(group_key).join(format!("{stem}.athln"))
     }
 
+    /// `root/ln/<group_key>/calib` — the seeds calibration's own scratch
+    /// directory (perf tier C Task 2 fix round 4, the review's M4). Its
+    /// `.athln` files are throwaways measured and deleted inside one
+    /// `ln::measure_seeds_calibration` call; a SUBDIRECTORY, not the `ln`
+    /// dir itself, so nothing that walks a group's real sidecars can ever
+    /// see one. It lives under the working folder (rather than the system
+    /// temp dir) on purpose: same volume, same free-space accounting and
+    /// same permissions as the real sidecars it is a stand-in for, and a
+    /// crashed run leaves it for the group's own cleanup to sweep.
+    pub fn ln_calibration_scratch_dir(&self, group_key: &str) -> PathBuf {
+        self.ln_dir(group_key).join("calib")
+    }
+
     /// `root/rej` — the parent of every run's rejection-bitmap tree (M3
     /// Task 2, spec §6.2, ruling R-M3-8). Unlike the other three `_root`
     /// accessors above, `.rej` files are per-RUN temporaries, not cached

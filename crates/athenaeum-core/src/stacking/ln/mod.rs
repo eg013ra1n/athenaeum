@@ -46,12 +46,18 @@ use crate::stacking::measure::MeasureOptions;
 use crate::stacking::psf_signal::StarFit;
 
 pub mod background;
+pub mod calibration;
 pub mod grid;
 pub mod reference;
 pub mod scale;
 
 pub use background::{
     background_grid, BackgroundGrid, BackgroundParams, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+};
+pub use calibration::{
+    calibration_k, measure_seeds_calibration, select_calibration_frames, CalibrationMeasurement,
+    ChannelCalibration, ChannelOutcome, SeedsCalibration, SEEDS_CALIBRATION_BAND,
+    SEEDS_CALIBRATION_FRAMES, SEEDS_CALIBRATION_MIN_RATIOS,
 };
 pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
@@ -62,6 +68,53 @@ pub use scale::{
     SeedFilterBreakdown, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
+
+/// What [`normalize_frame`] is given to seed the relative-scale step with
+/// (perf tier C Task 2 fix round 4, ruling C-14 item 3).
+///
+/// The distinction that matters is between the two ways a frame ends up on
+/// the full-detection path: [`Self::NoFits`] is the GENUINE fallback (this
+/// frame's Measure artifact is missing or unusable — one `warn!`, counted),
+/// while [`Self::ForcedDetection`] is the seeds calibration asking for that
+/// path ON PURPOSE, as one arm of its own measurement. Before this
+/// distinction existed the calibration's three detection runs per group
+/// fired the fallback `warn!` and bumped the fallback counter, which made
+/// both the log line and the run pin that counts fallbacks lie (the review's
+/// I1/I2).
+pub enum LnScaleSeeds<'a> {
+    /// Measure's accepted [`StarFit`]s, one list per plane. A plane with
+    /// fewer than [`scale::MIN_MATCHES`] entries — or whose
+    /// [`scale::relative_scale_from_seeds`] call itself comes back
+    /// `TooFewMatches` — falls back to detection exactly like
+    /// [`Self::NoFits`], warning and counting once for the whole frame.
+    Measured(&'a [Vec<StarFit>]),
+    /// No fits at all for this frame (an old catalog, a cleanup): the
+    /// genuine fallback.
+    NoFits,
+    /// The seeds calibration's own detection arm: full detection, silent,
+    /// never counted as a fallback.
+    ForcedDetection,
+}
+
+impl LnScaleSeeds<'_> {
+    /// This plane's usable seed fits, or `None` when the plane must take
+    /// the detection path.
+    fn plane_fits(&self, plane: usize) -> Option<&[StarFit]> {
+        match self {
+            LnScaleSeeds::Measured(fits) => fits
+                .get(plane)
+                .filter(|pf| pf.len() >= scale::MIN_MATCHES)
+                .map(|pf| pf.as_slice()),
+            LnScaleSeeds::NoFits | LnScaleSeeds::ForcedDetection => None,
+        }
+    }
+
+    /// Whether a detection run under this input is a FALLBACK (loud,
+    /// counted) rather than the point of the call.
+    fn detection_is_a_fallback(&self) -> bool {
+        !matches!(self, LnScaleSeeds::ForcedDetection)
+    }
+}
 
 /// Perf tier C Task 2: how many times [`normalize_frame`] fell back to full
 /// detection (`scale::relative_scale_against`) because a plane had no
@@ -199,8 +252,23 @@ pub struct LnFrameOutcome {
     /// ([`scale::relative_scale_from_seeds`]); `"detected"` when at least
     /// one channel fell back to full detection
     /// ([`scale::relative_scale_against`]) — a frame's own log/summary is
-    /// one value, so a mixed OSC frame reads as the worst case.
-    pub scale_source: &'static str,
+    /// one value, so a mixed OSC frame reads as the worst case. Named
+    /// `ln_scale_source` (fix round 4, ruling C-14 item 4) after the
+    /// logging dictionary's own `ln_` prefix rule, and to keep it clearly
+    /// apart from `stacking::groups::GroupFrame::scale_source`, which is
+    /// M4b's PIXEL-scale provenance and an unrelated thing.
+    pub ln_scale_source: &'static str,
+    /// Each channel's own final relative scale — the constant term of that
+    /// channel's `A`, with the group's seeds calibration already applied
+    /// (`scale` above is their mean). Indexed like the LN reference's
+    /// planes.
+    pub channel_scales: Vec<f64>,
+    /// Per channel, whether its scale came from the seeds path (`true`) or
+    /// from full detection (`false`). The seeds calibration reads this to
+    /// decide which channels contribute a ratio — a channel that fell back
+    /// compared detection against detection and has nothing to say about
+    /// the seeds path's own bias.
+    pub channel_from_seeds: Vec<bool>,
 }
 
 /// Per-channel target background parameters (spec §5.2/math §4.2): same
@@ -245,10 +313,26 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 /// One channel's `A` grid (ruling R-M4c-8): the global `scale` at every
 /// node, or — when `local` carries the local scale spline
 /// [`scale::fit_local_scale`] produced — that spline sampled at each
-/// node's OWN pixel, `A(i, j) = scale + spline(i·stride, j·stride).0`.
+/// node's OWN pixel, `A(i, j) = k · (scale + spline(i·stride, j·stride).0)`.
 /// Node `(i, j)` sits at `(i·stride, j·stride)` ([`LnGrid`]'s own mesh
 /// convention), which is where the `B` term and the band loop's B-spline
 /// both read it.
+///
+/// `k` is the group's seeds calibration for THIS channel (fix round 4,
+/// ruling C-14 item 5 — the review's M6), `1.0` for a channel that took
+/// the detection path or a group with no calibration. It scales the
+/// SAMPLED surface, not just its constant term: fix round 3 skipped
+/// calibration on a channel carrying a spline, reasoning that the spline's
+/// residuals had been fitted against an uncalibrated `s` — but the spline
+/// is a residual AROUND `scale`, so scaling the whole sampled value
+/// (`k·scale + k·displacement`) keeps the two consistent by construction,
+/// and leaving such a channel uncalibrated was the larger inconsistency
+/// (its `A` would sit a measured fraction of a percent away from every
+/// other channel's). The safety band is checked on the UNSCALED deviation
+/// `|displacement|` against `LN_LOCAL_SCALE_MAX_DEVIATION · |scale|`, which
+/// for `k > 0` is the identical test as checking the scaled surface against
+/// `k·scale` — so no surface's accept/refuse verdict moves because `k`
+/// exists.
 ///
 /// The trailing node on each axis overshoots the plane by design
 /// (`LnGrid::node_count` makes the mesh REACH the last pixel, so its last
@@ -275,13 +359,14 @@ fn median_of_finite(plane: &[f32]) -> f64 {
 fn a_grid(
     local: Option<&ThinPlateSpline>,
     scale: f64,
+    k: f64,
     gw: usize,
     gh: usize,
     stride: usize,
     ref_width: usize,
     ref_height: usize,
 ) -> (Vec<f32>, bool) {
-    let constant = || (vec![scale as f32; gw * gh], false);
+    let constant = || (vec![(scale * k) as f32; gw * gh], false);
     let Some(spline) = local else {
         return constant();
     };
@@ -295,7 +380,7 @@ fn a_grid(
             if !v.is_finite() || (v - scale).abs() > band {
                 return constant();
             }
-            a.push(v as f32);
+            a.push((v * k) as f32);
         }
     }
     (a, true)
@@ -346,23 +431,19 @@ pub struct LnReferenceForDetection<'a> {
 impl<'a> LnReferenceForDetection<'a> {
     /// `psf`/`max_stars` are the group's own LN config — the SAME values
     /// [`normalize_frame`]'s own `relative_scale_against` calls use, so the
-    /// prepared reference channel's DEFAULT beta matches what a direct
-    /// (unhoisted) `relative_scale` call on this reference would have
-    /// produced. `extra_betas` (Tier C Task 2 fix round 1, ruling C-10; its
-    /// own use case retired by fix round 2, ruling C-12 — see
-    /// [`scale::PreparedReferenceChannel`]'s own doc) still fans through to
-    /// [`scale::PreparedReferenceChannel::build`] for every plane, but
-    /// `stacking::run` now always calls this with an empty slice:
+    /// prepared reference channel's beta matches what a direct (unhoisted)
+    /// `relative_scale` call on this reference would have produced.
+    /// (Ruling C-10's per-β reference fits, retired by ruling C-12 and
+    /// removed outright in fix round 4 — the review's M2 — used to take an
+    /// `extra_betas` slice here; every caller passed an empty one, since
     /// [`scale::relative_scale_from_seeds`] always fits at the reference's
-    /// DEFAULT beta regardless of what beta the seed source's own fits
-    /// carry, so there is no longer a reason to prepare any other one.
+    /// own beta regardless of what beta the seed source's fits carry.)
     /// `pool` (perf tier 1 Task 2 fix round 1, item 3) is threaded straight
     /// to [`scale::PreparedReferenceChannel::build`] — this runs once per
     /// group, not once per frame.
     pub fn build(
         reference: &'a LnReference,
         psf: crate::stacking::psf_signal::PsfModel,
-        extra_betas: &[f64],
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> LnReferenceForDetection<'a> {
@@ -391,7 +472,6 @@ impl<'a> LnReferenceForDetection<'a> {
                     reference.width,
                     reference.height,
                     psf,
-                    extra_betas,
                     max_stars,
                     pool,
                 )
@@ -441,10 +521,11 @@ impl<'a> LnReferenceForDetection<'a> {
 /// which the caller (already checking its own cancel flag right after the
 /// fan-out that calls this) does not need to interpret specially.
 ///
-/// **Perf tier C Task 2** (spec §2.2.3, fix round 2 ruling C-12): `fits` is
-/// Measure's own accepted [`StarFit`]s for this frame, one list per plane
-/// (`fits[p]` — `None` or a plane with fewer than [`scale::MIN_MATCHES`]
-/// entries means "treat this plane as if there were no fits at all"), used
+/// **Perf tier C Task 2** (spec §2.2.3, fix round 2 ruling C-12): `seeds`
+/// carries Measure's own accepted [`StarFit`]s for this frame, one list per
+/// plane ([`LnScaleSeeds::Measured`] — a plane with fewer than
+/// [`scale::MIN_MATCHES`] entries is treated as if there were no fits at
+/// all), used
 /// as SEED POSITIONS ONLY — mapped through `frame.map`, pre-selected
 /// against the reference's own match tree, and re-fitted fresh on the
 /// warped `target` plane at the reference's DEFAULT β
@@ -463,28 +544,28 @@ impl<'a> LnReferenceForDetection<'a> {
 /// [`scale::relative_scale_against`] on the warped `target` plane — never
 /// a failure, and the master is still an honest LN master — with exactly
 /// ONE `warn!` for the whole frame (not one per plane) the first time any
-/// channel needs it. There is no `group_beta` parameter: the reference's
-/// default β (ruling C-1) is already baked into
+/// channel needs it, and none at all under
+/// [`LnScaleSeeds::ForcedDetection`], which asks for that path on purpose.
+/// There is no `group_beta` parameter: the reference's
+/// β (ruling C-1) is already baked into
 /// `reference_for_detection`'s own prepared channels by the caller
 /// (`stacking::run`'s `LnReferenceForDetection::build` call), and the
 /// seeds path never reads a target's own β at all.
 ///
-/// **Fix round 3 (ruling C-13, LEVER 2):** `seeds_calibration` is a
-/// per-GROUP factor `k` — `stacking::run::measure_ln_seeds_calibration`'s
-/// own doc has the measurement — multiplied into a channel's scale ONLY
-/// when that channel actually took the seeds path (`plane_fits` matched
-/// and produced a usable [`ScaleResult`], as opposed to falling back to
+/// **Fix round 4 (ruling C-14):** `seeds_calibration` is the group's own
+/// per-CHANNEL factor — `ln::calibration`'s module doc has the measurement
+/// — applied to a channel's `A` ONLY when that channel actually took the
+/// seeds path (as opposed to falling back to
 /// [`scale::relative_scale_against`]): the fallback path is uncalibrated by
 /// definition (LEVER 1's own diagnostics found no bias to correct there —
 /// only the seeds path's fitted-signal warp-dependence, ruling C-11). A
-/// channel whose scale carries a fitted local-scale spline
-/// (`scale_result.local.is_some()`, `normalization.local.localScale`) skips
-/// calibration and keeps its own uncalibrated `s` — multiplying the global
-/// term alone, without refitting the spline's own residuals against a
-/// rescaled baseline, would leave the two inconsistent; this channel warns
-/// once per frame the first time it happens. `None` (the group's
-/// calibration measurement itself found fewer than two usable frames, or
-/// the group has no calibration to run) leaves every channel exactly as
+/// channel carrying a fitted local-scale spline is calibrated too, by
+/// scaling the SAMPLED `A` surface rather than its constant term alone
+/// (ruling C-14 item 5 — see [`a_grid`]); fix round 3 skipped such a
+/// channel, which left it a measured fraction of a percent away from every
+/// other channel of the same group. A shorter slice than the reference has
+/// planes, or `None` (the group's calibration was cancelled or could not be
+/// measured at all), reads as `k = 1` — every channel exactly as it was
 /// before this fix round.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
@@ -492,13 +573,13 @@ pub fn normalize_frame(
     reference_for_detection: &LnReferenceForDetection<'_>,
     ref_backgrounds: &[BackgroundGrid],
     frame: &StackFrame,
-    fits: Option<&[Vec<StarFit>]>,
+    seeds: LnScaleSeeds<'_>,
     cfg: &LocalNormalizationConfig,
     measure: &MeasureOptions,
     interpolation: Interpolation,
     clamping: f32,
     sidecar: &Path,
-    seeds_calibration: Option<f64>,
+    seeds_calibration: Option<&[f64]>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<LnFrameOutcome, LnError> {
@@ -532,6 +613,7 @@ pub fn normalize_frame(
 
     let mut grids = Vec::with_capacity(channels);
     let mut scales = Vec::with_capacity(channels);
+    let mut from_seeds_per_channel = Vec::with_capacity(channels);
     let mut matches_total = 0usize;
     let mut cells_rejected_total = 0usize;
     // Per-phase wall time, accumulated ACROSS channels — one number per
@@ -552,9 +634,6 @@ pub fn normalize_frame(
     // `warn!`.
     let mut frame_scale_source: &'static str = "seeds";
     let mut warned_fallback = false;
-    // Fix round 3, ruling C-13, LEVER 2: one warning per frame, not one per
-    // channel, for the local-scale-spline skip below.
-    let mut warned_local_calibration_skip = false;
 
     // Perf tier 1 Task 8: one `RegisteredSource` per FRAME, re-pointed at
     // each channel with `set_plane` (ruling R-T4-7's own reasoning, applied
@@ -689,11 +768,16 @@ pub fn normalize_frame(
         // back to the full-detection path on the warped `target` plane,
         // with exactly one `warn!` for the whole frame.
         let t = Instant::now();
-        let plane_fits = fits
-            .and_then(|f| f.get(p))
-            .filter(|pf| pf.len() >= scale::MIN_MATCHES);
+        let plane_fits = seeds.plane_fits(p);
+        // Ruling C-14 item 3: only a GENUINE fallback is loud and counted.
+        // The seeds calibration's own detection arm
+        // (`LnScaleSeeds::ForcedDetection`) runs this same code because
+        // detection IS what it asked for — warning there would report a
+        // defect that did not happen, and counting it would make the run
+        // pin that counts fallbacks pass no matter what.
+        let detection_is_a_fallback = seeds.detection_is_a_fallback();
         let fall_back_to_detection = |warned_fallback: &mut bool| -> Result<ScaleResult, LnError> {
-            if !*warned_fallback {
+            if detection_is_a_fallback && !*warned_fallback {
                 tracing::warn!(
                     frame_id = frame.frame_id,
                     path = %frame.path.display(),
@@ -716,7 +800,7 @@ pub fn normalize_frame(
             )
         };
         let mut plane_from_seeds = true;
-        let mut scale_result = match plane_fits {
+        let scale_result = match plane_fits {
             Some(pf) => match scale::relative_scale_from_seeds(
                 &reference_for_detection.prepared[p],
                 pf,
@@ -744,35 +828,31 @@ pub fn normalize_frame(
                 fall_back_to_detection(&mut warned_fallback)?
             }
         };
-        // Fix round 3, ruling C-13, LEVER 2: apply the group's seeds
-        // calibration factor `k` — never on a channel that fell back to
-        // detection (uncalibrated by definition, LEVER 1's diagnostics
-        // found no bias there), and never on a channel carrying a fitted
-        // local-scale spline (its residuals were fit against the
-        // UNCALIBRATED `s`; rescaling the global term alone would leave
-        // the two inconsistent — warn once per frame instead).
-        if plane_from_seeds {
-            if let Some(k) = seeds_calibration {
-                if scale_result.local.is_some() {
-                    if !warned_local_calibration_skip {
-                        tracing::warn!(
-                            frame_id = frame.frame_id,
-                            "ln: seeds calibration skipped for a channel with a fitted local-scale spline"
-                        );
-                        warned_local_calibration_skip = true;
-                    }
-                } else {
-                    scale_result.scale *= k;
-                }
-            }
-        }
+        // Ruling C-14 item 1: the group's own per-CHANNEL calibration
+        // factor, and only for a channel that actually took the seeds path
+        // — the detection path is uncalibrated by definition (LEVER 1's
+        // diagnostics found no bias there to correct). A channel carrying
+        // a local-scale spline is calibrated too, by scaling the sampled
+        // surface in `a_grid` (ruling C-14 item 5), so `k` never has to be
+        // folded into `ScaleResult::scale` itself — which stays exactly
+        // what the measurement produced.
+        let k = if plane_from_seeds {
+            seeds_calibration
+                .and_then(|ks| ks.get(p).copied())
+                .filter(|k| k.is_finite() && *k > 0.0)
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let channel_scale = scale_result.scale * k;
         scale_ms += t.elapsed().as_millis() as u64;
         detect_ms += scale_result.timings.detect_ms;
         refine_ms += scale_result.timings.refine_ms;
         fit_ms += scale_result.timings.fit_ms;
         match_ms += scale_result.timings.match_ms;
         matches_total += scale_result.matches;
-        scales.push(scale_result.scale);
+        scales.push(channel_scale);
+        from_seeds_per_channel.push(plane_from_seeds);
 
         let ref_bg = &ref_backgrounds[p];
         // Fix round 1, item 8: a real length check, not just the
@@ -803,6 +883,7 @@ pub fn normalize_frame(
         let (a, local_used) = a_grid(
             scale_result.local.as_ref(),
             scale_result.scale,
+            k,
             expected_gw,
             expected_gh,
             stride,
@@ -812,13 +893,13 @@ pub fn normalize_frame(
         if let Some(spline) = scale_result.local.as_ref() {
             if local_used {
                 tracing::debug!(
-                    ln_scale = scale_result.scale,
+                    ln_scale = channel_scale,
                     ln_local_nodes = spline.nodes.len(),
                     "local scale: A sampled from the spline"
                 );
             } else {
                 tracing::warn!(
-                    ln_scale = scale_result.scale,
+                    ln_scale = channel_scale,
                     ln_local_nodes = spline.nodes.len(),
                     "local scale: the sampled A grid left the safety band around the global scale; A stays the global scale"
                 );
@@ -840,7 +921,7 @@ pub fn normalize_frame(
             gh: expected_gh,
             a,
             b,
-            global_scale: scale_result.scale,
+            global_scale: channel_scale,
             location_ref: reference_for_detection.locations[p],
             location_tgt,
         });
@@ -872,7 +953,9 @@ pub fn normalize_frame(
         refine_ms,
         fit_ms,
         match_ms,
-        scale_source: frame_scale_source,
+        ln_scale_source: frame_scale_source,
+        channel_scales: scales,
+        channel_from_seeds: from_seeds_per_channel,
     })
 }
 
@@ -905,7 +988,7 @@ mod tests {
         ];
         let reference = reference_with_planes(planes);
         let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::default(), &[], 50, None);
+            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
         assert_eq!(for_detection.sanitized_planes.len(), 2);
         for (p, plane) in for_detection.sanitized_planes.iter().enumerate() {
             assert!(
@@ -925,7 +1008,7 @@ mod tests {
         let location = median_of_finite(&plane);
 
         let for_detection =
-            LnReferenceForDetection::build(&reference, PsfModel::default(), &[], 50, None);
+            LnReferenceForDetection::build(&reference, PsfModel::default(), 50, None);
         assert_eq!(for_detection.sanitized_planes.len(), 1);
         match &for_detection.sanitized_planes[0] {
             Cow::Owned(v) => {
@@ -1043,7 +1126,7 @@ mod tests {
     #[test]
     fn a_grid_without_a_spline_is_the_constant_global_scale() {
         let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
-        let (a, used) = a_grid(None, TEST_SCALE, gw, gh, GRID_STRIDE, GRID_W, GRID_H);
+        let (a, used) = a_grid(None, TEST_SCALE, 1.0, gw, gh, GRID_STRIDE, GRID_W, GRID_H);
         assert!(!used, "no spline means no local scale");
         assert_eq!(a.len(), gw * gh);
         assert!(
@@ -1062,6 +1145,7 @@ mod tests {
         let (a, used) = a_grid(
             Some(&spline),
             TEST_SCALE,
+            1.0,
             gw,
             gh,
             GRID_STRIDE,
@@ -1101,6 +1185,7 @@ mod tests {
         let (a, used) = a_grid(
             Some(&spline),
             TEST_SCALE,
+            1.0,
             gw,
             gh,
             GRID_STRIDE,
@@ -1204,5 +1289,304 @@ mod tests {
                 "channel {p}: warped target differs between the per-channel-reopen shape and set_plane"
             );
         }
+    }
+
+    // ---- Perf tier C Task 2 fix round 4 (ruling C-14) -------------------
+
+    /// Ruling C-14 item 5 (the review's M6): a channel carrying a fitted
+    /// local-scale spline is calibrated by scaling the SAMPLED surface, not
+    /// by being skipped. Every node must come out at `k · (s + spline)` —
+    /// the constant term AND the residual — and the safety band's verdict
+    /// must not move because `k` exists (it is measured on the UNSCALED
+    /// deviation, which for `k > 0` is the identical test).
+    #[test]
+    fn a_grid_scales_the_whole_sampled_surface_by_the_calibration_factor() {
+        let (gw, gh) = LnGrid::grid_dims(GRID_W, GRID_H, GRID_STRIDE);
+        let spline = linear_residual_spline(1.0);
+        let k = 0.9933;
+
+        let (plain, plain_used) = a_grid(
+            Some(&spline),
+            TEST_SCALE,
+            1.0,
+            gw,
+            gh,
+            GRID_STRIDE,
+            GRID_W,
+            GRID_H,
+        );
+        let (scaled, scaled_used) = a_grid(
+            Some(&spline),
+            TEST_SCALE,
+            k,
+            gw,
+            gh,
+            GRID_STRIDE,
+            GRID_W,
+            GRID_H,
+        );
+        assert!(
+            plain_used && scaled_used,
+            "both surfaces are inside the band"
+        );
+
+        for j in 0..gh {
+            let y = (j * GRID_STRIDE).min(GRID_H - 1) as f64;
+            for i in 0..gw {
+                let x = (i * GRID_STRIDE).min(GRID_W - 1) as f64;
+                let want = (k * (TEST_SCALE + spline.displacement(x, y).0)) as f32;
+                assert_eq!(
+                    scaled[j * gw + i],
+                    want,
+                    "node ({i}, {j}) must be k*(s + spline), not k*s + spline"
+                );
+                // And it is genuinely the whole surface that moved, not
+                // just its constant term: the RESIDUAL scales too.
+                let plain_residual = plain[j * gw + i] as f64 - TEST_SCALE;
+                let scaled_residual = scaled[j * gw + i] as f64 - k * TEST_SCALE;
+                if plain_residual.abs() > 1e-6 {
+                    assert!(
+                        (scaled_residual - k * plain_residual).abs() < 1e-6,
+                        "node ({i}, {j}): residual {scaled_residual} is not k*{plain_residual}"
+                    );
+                }
+            }
+        }
+
+        // A surface the band refuses is refused whatever `k` is — and the
+        // fallback constant is the CALIBRATED one.
+        let wild = linear_residual_spline(30.0);
+        let (fallback, used) = a_grid(
+            Some(&wild),
+            TEST_SCALE,
+            k,
+            gw,
+            gh,
+            GRID_STRIDE,
+            GRID_W,
+            GRID_H,
+        );
+        assert!(!used, "the band verdict must not depend on k");
+        assert!(
+            fallback.iter().all(|&v| v == (TEST_SCALE * k) as f32),
+            "the refused-surface fallback is the CALIBRATED constant"
+        );
+    }
+
+    /// Ruling C-14 item 7: end to end through `normalize_frame`, the
+    /// written `.athln` must carry `A = k·s` and `B = B_ref − A·B_tgt` —
+    /// read back with the real [`LnFrameGrids::read`], not by inspecting
+    /// the in-memory grids. The pin compares an uncalibrated run against a
+    /// calibrated one over the SAME frame and reference, so `s` and `B_tgt`
+    /// are identical between them and `k` is the only thing that moved.
+    #[test]
+    fn the_written_sidecar_carries_the_calibrated_a_and_a_matching_b() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::resample::Interpolation;
+        use crate::stacking::measure::FrameMeasurement;
+        use crate::stacking::test_fixtures::synthetic_star_field;
+        use crate::stacking::weights::FrameWeight;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        const K: f64 = 0.9933;
+
+        // 10x6 stars on a jittered grid, the same field family
+        // `ln::scale`'s own tests use — comfortably past `MIN_MATCHES`.
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                let amp = 0.10 + ((row * 10 + col) % 9) as f64 * 0.02;
+                stars.push((x, y, amp));
+            }
+        }
+        let reference_plane = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        // The target is the same field a little fainter, so the measured
+        // relative scale is a real number rather than exactly 1.
+        let target_stars: Vec<(f64, f64, f64)> =
+            stars.iter().map(|&(x, y, a)| (x, y, a * 0.9)).collect();
+        let target_plane = synthetic_star_field(W, H, &target_stars, 4.2, 0.002, 12);
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target.fits");
+        write_fits_f32(&target_path, W, H, 1, &target_plane, &[]).unwrap();
+
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![reference_plane],
+            frames_used: Vec::new(),
+        };
+        let cfg = LocalNormalizationConfig {
+            enabled: true,
+            scale: 256,
+            ..LocalNormalizationConfig::default()
+        };
+        let measure = crate::stacking::measure::MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            max_stars: 200,
+            ..Default::default()
+        };
+        let for_detection =
+            LnReferenceForDetection::build(&reference, PsfModel::Moffat4, measure.max_stars, None);
+        let ref_bg = vec![background_grid(
+            &reference.planes[0],
+            W,
+            H,
+            &BackgroundParams {
+                scale: cfg.scale,
+                ..DEFAULT_PARAMS
+            },
+            None,
+        )];
+
+        let frame = StackFrame {
+            path: target_path.clone(),
+            map: PixelMap::linear(Linear::identity()).unwrap(),
+            measurement: FrameMeasurement {
+                width: W,
+                height: H,
+                channels: vec![Default::default()],
+                duration_ms: 0,
+            },
+            weight: FrameWeight {
+                channels: vec![1.0],
+                normalized: vec![1.0],
+                mean: 1.0,
+                normalized_mean: 1.0,
+                missing: None,
+            },
+            exposure_s: 180.0,
+            date_obs: None,
+            frame_id: 1,
+            registered_path: None,
+        };
+        let cancel = AtomicBool::new(false);
+
+        let run = |k: Option<&[f64]>, name: &str| -> (LnFrameOutcome, LnFrameGrids) {
+            let sidecar = dir.path().join(format!("{name}.athln"));
+            let fits: Vec<Vec<StarFit>> = vec![Vec::new()];
+            let outcome = normalize_frame(
+                &reference,
+                &for_detection,
+                &ref_bg,
+                &frame,
+                // No usable fits: the channel takes the DETECTION path,
+                // which this pin deliberately exercises — `k` is applied
+                // by `normalize_frame` to whatever the scale step produced
+                // (the seeds/detection distinction is the CALLER's, tested
+                // by the run pin; here the arithmetic is the subject).
+                LnScaleSeeds::Measured(&fits),
+                &cfg,
+                &measure,
+                Interpolation::BicubicBSpline,
+                0.3,
+                &sidecar,
+                k,
+                None,
+                &cancel,
+            )
+            .expect("a clean synthetic field must normalize");
+            let grids = LnFrameGrids::read(&sidecar).expect("the sidecar reads back");
+            (outcome, grids)
+        };
+
+        let (plain, plain_grids) = run(None, "plain");
+        // A channel that fell back to detection is NOT calibrated (the
+        // fallback path has no measured bias to correct) — so this pin
+        // first establishes that, then measures the arithmetic on the
+        // seeds-path side by handing the scale through directly.
+        assert_eq!(plain.ln_scale_source, "detected");
+        assert_eq!(plain.channel_from_seeds, vec![false]);
+        let (_calibrated, calibrated_grids) = run(Some(&[K]), "calibrated");
+        assert_eq!(
+            calibrated_grids.channels[0].a, plain_grids.channels[0].a,
+            "a detection-path channel must be left uncalibrated"
+        );
+
+        // Now the seeds path, where `k` does apply: measure the target's
+        // own fits and hand them in.
+        let (_, target_fits) = crate::stacking::measure::measure_frame_with_fits(
+            &target_path,
+            &measure,
+            None,
+            &cancel,
+        )
+        .expect("measuring the target's own fits");
+        let seeds_run = |k: Option<&[f64]>, name: &str| -> (LnFrameOutcome, LnFrameGrids) {
+            let sidecar = dir.path().join(format!("{name}.athln"));
+            let outcome = normalize_frame(
+                &reference,
+                &for_detection,
+                &ref_bg,
+                &frame,
+                LnScaleSeeds::Measured(&target_fits),
+                &cfg,
+                &measure,
+                Interpolation::BicubicBSpline,
+                0.3,
+                &sidecar,
+                k,
+                None,
+                &cancel,
+            )
+            .expect("a clean synthetic field must normalize");
+            let grids = LnFrameGrids::read(&sidecar).expect("the sidecar reads back");
+            (outcome, grids)
+        };
+        let (seeds_plain, seeds_plain_grids) = seeds_run(None, "seeds-plain");
+        assert_eq!(seeds_plain.ln_scale_source, "seeds");
+        assert_eq!(seeds_plain.channel_from_seeds, vec![true]);
+        let (seeds_k, seeds_k_grids) = seeds_run(Some(&[K]), "seeds-calibrated");
+
+        let s = seeds_plain.channel_scales[0];
+        assert_eq!(
+            seeds_k.channel_scales[0],
+            s * K,
+            "the reported channel scale is k*s"
+        );
+        let a_plain = &seeds_plain_grids.channels[0].a;
+        let a_k = &seeds_k_grids.channels[0].a;
+        assert!(
+            a_k.iter().all(|&v| v == (s * K) as f32),
+            "A = k*s at every node"
+        );
+        assert_eq!(
+            seeds_k_grids.channels[0].global_scale,
+            s * K,
+            "the sidecar's own global scale carries k too"
+        );
+
+        // B = B_ref - A*B_tgt: the target background term is the SAME in
+        // both runs (nothing about `k` touches the background model), so
+        // the distance from B_ref scales by exactly the ratio of the two
+        // `A`s.
+        let b_plain = &seeds_plain_grids.channels[0].b;
+        let b_k = &seeds_k_grids.channels[0].b;
+        let ratio = (a_k[0] / a_plain[0]) as f64;
+        assert!((ratio - K).abs() < 1e-6, "the A ratio is k: {ratio} vs {K}");
+        let mut checked = 0usize;
+        for (i, (&br, (&bp, &bk))) in ref_bg[0]
+            .cells
+            .iter()
+            .zip(b_plain.iter().zip(b_k.iter()))
+            .enumerate()
+        {
+            let d_plain = (br - bp) as f64; // = A_plain * B_tgt
+            let d_k = (br - bk) as f64; // = A_k     * B_tgt
+            if d_plain.abs() < 1e-6 {
+                continue;
+            }
+            assert!(
+                (d_k - ratio * d_plain).abs() <= 1e-5 * d_plain.abs().max(1.0),
+                "cell {i}: B_ref - B moved by {d_k}, expected {} (= k * {d_plain})",
+                ratio * d_plain
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the B pin must have checked real cells");
     }
 }

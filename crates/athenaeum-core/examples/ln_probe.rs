@@ -43,10 +43,11 @@ use athenaeum_core::stacking::groups::{group_frames, GroupFrame, IntegrationGrou
 use athenaeum_core::stacking::integrate::{
     GroupInput, LocalNormalizationConfig, NormalizationConfig, StackFrame,
 };
+use athenaeum_core::stacking::ln::calibration as ln_calibration;
 use athenaeum_core::stacking::ln::{
     background_grid, build_reference, normalize_frame, relative_scale,
     relative_scale_from_seeds_with_breakdown, BackgroundParams, LnFrameGrids, LnGrid,
-    LnReferenceForDetection, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
+    LnReferenceForDetection, LnScaleSeeds, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
@@ -56,7 +57,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: ln_probe --db <catalog.db> --set <id> --group <key> \
 [--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits] [--diag] \
-[--seeds-calibration <k>]"
+[--seeds-calibration <k0[,k1,k2]>] [--measure-calibration]"
     );
     std::process::exit(2);
 }
@@ -81,16 +82,24 @@ struct Args {
     /// `relative_scale_from_seeds_with_breakdown` call, not a second
     /// detection) field to the per-channel JSON.
     diag: bool,
-    /// Fix round 3 (ruling C-13, LEVER 2): a manual override for
-    /// `normalize_frame`'s new `seeds_calibration` parameter — the probe
-    /// measures one target frame at a time, so it does not reproduce
-    /// `stacking::run::measure_ln_seeds_calibration`'s own group-level
-    /// three-frame measurement; that `k` is obtained externally (e.g. from
-    /// two probe runs on a calibration frame, one plain and one
-    /// `--no-fits`, exactly what the production measurement itself does)
-    /// and handed in here so the probe's final `normalize_frame` call
-    /// exercises the SAME calibrated code path a real run would.
-    seeds_calibration: Option<f64>,
+    /// Fix round 4 (ruling C-14): a manual override for `normalize_frame`'s
+    /// `seeds_calibration` parameter — one value per CHANNEL, comma
+    /// separated (`0.993` for a mono group, `0.994,0.995,0.996` for an OSC
+    /// one; a single value is broadcast to every channel). Combined with
+    /// `--measure-calibration` below this is the hold-out measurement: work
+    /// `k` out on the calibration frames, then hand it to a run over frames
+    /// that were NOT part of that sample.
+    seeds_calibration: Option<Vec<f64>>,
+    /// Fix round 4 (ruling C-14): run `ln::measure_seeds_calibration` over
+    /// this group exactly as `stacking::run` does — the same
+    /// `select_calibration_frames` sample, both `normalize_frame` arms per
+    /// frame, the same per-channel median and band guard — and print the
+    /// per-channel `k`, the frames it used and its wall time. The probe
+    /// then continues with its ordinary single-frame run, using whatever
+    /// `--seeds-calibration` says (NOT the measured value: the deliverable
+    /// is a HOLD-OUT residual, so the target frame must be able to sit
+    /// outside the calibration sample).
+    measure_calibration: bool,
 }
 
 fn parse_args() -> Args {
@@ -102,7 +111,8 @@ fn parse_args() -> Args {
     let mut frame: Option<String> = None;
     let mut no_fits = false;
     let mut diag = false;
-    let mut seeds_calibration: Option<f64> = None;
+    let mut measure_calibration = false;
+    let mut seeds_calibration: Option<Vec<f64>> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -114,6 +124,10 @@ fn parse_args() -> Args {
             diag = true;
             continue;
         }
+        if flag == "--measure-calibration" {
+            measure_calibration = true;
+            continue;
+        }
         let value = it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--db" => db = Some(value.into()),
@@ -123,7 +137,14 @@ fn parse_args() -> Args {
             "--scale" => scale = value.parse().unwrap_or_else(|_| usage()),
             "--frame" => frame = Some(value),
             "--seeds-calibration" => {
-                seeds_calibration = Some(value.parse().unwrap_or_else(|_| usage()))
+                let parsed: Vec<f64> = value
+                    .split(',')
+                    .map(|v| v.trim().parse::<f64>().unwrap_or_else(|_| usage()))
+                    .collect();
+                if parsed.is_empty() {
+                    usage();
+                }
+                seeds_calibration = Some(parsed);
             }
             _ => usage(),
         }
@@ -138,6 +159,7 @@ fn parse_args() -> Args {
         frame,
         no_fits,
         diag,
+        measure_calibration,
         seeds_calibration,
     }
 }
@@ -526,17 +548,13 @@ registration row for each — run stacking through Register first); found {}",
         PsfModel::Auto => PsfModel::Fixed(group_beta_value),
         other => other,
     };
-    // Ruling C-12 (fix round 2): no `extra_betas` any more —
-    // `relative_scale_from_seeds` always fits at the reference's own
-    // default beta, so there is nothing else worth preparing.
+    // Ruling C-12 (fix round 2): one prepared beta and no other —
+    // `relative_scale_from_seeds` always fits at the reference's own beta,
+    // so there is nothing else worth preparing (ruling C-14 removed the
+    // unused per-beta machinery outright).
     let build_start = Instant::now();
-    let ref_for_detection = LnReferenceForDetection::build(
-        &reference,
-        reference_psf,
-        &[],
-        measure_opts.max_stars,
-        None,
-    );
+    let ref_for_detection =
+        LnReferenceForDetection::build(&reference, reference_psf, measure_opts.max_stars, None);
     let reference_build_ms = build_start.elapsed().as_millis() as u64;
     let ref_params = BackgroundParams {
         scale: args.scale,
@@ -560,6 +578,100 @@ registration row for each — run stacking through Register first); found {}",
             )
         })
         .collect();
+
+    // Fix round 4 (ruling C-14): the group's own seeds calibration, run
+    // through the SAME `ln::measure_seeds_calibration` production uses —
+    // the same seven-frame sample, both arms per frame, the same
+    // per-channel median and band guard. Printed and NOT applied: the
+    // deliverable is a HOLD-OUT residual, so `--seeds-calibration` decides
+    // what the single-frame run below is normalized with.
+    let mut measured_calibration = serde_json::Value::Null;
+    let calibration_scratch =
+        tempfile::tempdir().expect("create a tempdir for the calibration scratch");
+    if args.measure_calibration {
+        let reference_frame_id = list_runs(&conn, args.set_id, 1)
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .and_then(|r| r.reference_frame_id)
+            .unwrap_or(-1);
+        let member_weights: Vec<(i64, f64)> = candidates
+            .iter()
+            .map(|c| (c.frame.frame_id, c.weight))
+            .collect();
+        let indices = ln_calibration::select_calibration_frames(
+            reference_frame_id,
+            &member_weights,
+            ln_calibration::SEEDS_CALIBRATION_FRAMES,
+        );
+        eprintln!(
+            "calibration sample ({} frames, reference {reference_frame_id}): {:?}",
+            indices.len(),
+            indices
+                .iter()
+                .map(|&i| candidates[i].frame.frame_id)
+                .collect::<Vec<_>>()
+        );
+        // This acceptance catalog predates Task 1's `fits` artifact, so the
+        // probe measures each calibration frame's fits itself — the same
+        // `measure_frame_with_fits` stage 3 calls. Production reads a
+        // cached `.athf` instead, so that time is reported SEPARATELY and
+        // subtracted from the calibration's own wall time below.
+        let fits_ms = std::cell::Cell::new(0u128);
+        let load_fits = |i: usize| -> Vec<Vec<athenaeum_core::stacking::psf_signal::StarFit>> {
+            let t = Instant::now();
+            let out =
+                measure_frame_with_fits(&stack_frames[i].path, &measure_opts, Some(&pool), &cancel)
+                    .map(|(_, fits)| fits)
+                    .unwrap_or_default();
+            fits_ms.set(fits_ms.get() + t.elapsed().as_millis());
+            out
+        };
+        let started = Instant::now();
+        let measured = ln_calibration::measure_seeds_calibration(
+            &reference,
+            &ref_for_detection,
+            &ref_backgrounds,
+            &stack_frames,
+            &indices,
+            &load_fits,
+            &local_cfg,
+            &measure_opts,
+            interpolation,
+            clamping,
+            &calibration_scratch.path().join("calib"),
+            Some(&pool),
+            &cancel,
+            &|done, total, frame_id| {
+                eprintln!("calibration: frame {}/{total} (id {frame_id})", done + 1);
+            },
+        );
+        let total_ms = started.elapsed().as_millis();
+        match measured {
+            Some(m) => {
+                let k = m.calibration();
+                eprintln!(
+                    "calibration: k = {:?} in {:.1} s ({:.1} s of which is measuring fits this \
+catalog has no artifact for)",
+                    k.k,
+                    total_ms as f64 / 1000.0,
+                    fits_ms.get() as f64 / 1000.0
+                );
+                measured_calibration = serde_json::json!({
+                    "frameIds": k.frame_ids,
+                    "k": k.k,
+                    "channels": m.channels.iter().map(|c| serde_json::json!({
+                        "k": c.k,
+                        "samples": c.samples,
+                        "outcome": format!("{:?}", c.outcome),
+                    })).collect::<Vec<_>>(),
+                    "wallMs": total_ms as u64,
+                    "loadFitsMs": fits_ms.get() as u64,
+                    "netMs": total_ms.saturating_sub(fits_ms.get()) as u64,
+                });
+            }
+            None => eprintln!("calibration: no measurement (cancelled or no scratch directory)"),
+        }
+    }
 
     // The target frame: the named stem, or the first candidate (index 0 of
     // `stack_frames`, matching this probe's own ordering — the brief's
@@ -607,24 +719,34 @@ registration row for each — run stacking through Register first); found {}",
                 std::process::exit(1);
             },
         );
-    let fits_arg = if args.no_fits {
-        None
+    let seeds_arg = if args.no_fits {
+        LnScaleSeeds::NoFits
     } else {
-        Some(target_fits.as_slice())
+        LnScaleSeeds::Measured(target_fits.as_slice())
     };
+    // Fix round 4 (ruling C-14): `k` is per channel; a single value on the
+    // command line is broadcast, a shorter list leaves the rest at 1.0
+    // (`normalize_frame`'s own contract for a short slice).
+    let seeds_calibration: Option<Vec<f64>> = args.seeds_calibration.as_ref().map(|ks| {
+        if ks.len() == 1 {
+            vec![ks[0]; channels]
+        } else {
+            ks.clone()
+        }
+    });
 
     let outcome = normalize_frame(
         &reference,
         &ref_for_detection,
         &ref_backgrounds,
         target,
-        fits_arg,
+        seeds_arg,
         &local_cfg,
         &measure_opts,
         interpolation,
         clamping,
         &sidecar_path,
-        args.seeds_calibration,
+        seeds_calibration.as_deref(),
         // Perf tier A Task 12: the probe's own pool, not `None` — see the
         // `ref_backgrounds` comment above for why.
         Some(&pool),
@@ -800,10 +922,11 @@ registration row for each — run stacking through Register first); found {}",
             "matches": outcome.matches,
             "cellsRejected": outcome.cells_rejected,
             "path": outcome.sidecar.display().to_string(),
-            "scaleSource": outcome.scale_source,
+            "lnScaleSource": outcome.ln_scale_source,
         },
         "noFits": args.no_fits,
-        "seedsCalibration": args.seeds_calibration,
+        "seedsCalibration": seeds_calibration,
+        "measuredCalibration": measured_calibration,
         "groupBeta": group_beta_value,
         "referenceBuildMs": reference_build_ms,
         // Perf tier A Task 12: `normalize_frame`'s own per-phase timing —

@@ -39,6 +39,7 @@ use crate::stacking::fits_artifact;
 use crate::stacking::groups::{
     group_frames, median_f64, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
 };
+use crate::stacking::ln::SeedsCalibration;
 use crate::stacking::measure::FrameMeasurement;
 use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
@@ -520,12 +521,51 @@ pub(crate) fn normalization_hash_for(
     registration_hash: &str,
     reference_member_ids: &[i64],
     reference_hash: &str,
+    calibration: Option<&SeedsCalibration>,
 ) -> String {
     let mut upstream: Vec<String> = vec!["register".to_string(), registration_hash.to_string()];
     upstream.extend(reference_member_ids.iter().map(|id| format!("ln_ref:{id}")));
     if !reference_hash.is_empty() {
         upstream.push(format!("ln_reference_hash:{reference_hash}"));
     }
+    if let Some(c) = calibration {
+        upstream.extend(c.frame_ids.iter().map(|id| format!("ln_calib_frame:{id}")));
+        // Rounded to 1e-6 (ruling C-14 item 2): `k` is a median of measured
+        // ratios, so the last bits of an f64 carry no meaning — but the
+        // hash must still move when `k` moves by anything a master's level
+        // could notice (1e-6 is four orders below the ±0.1 % median row the
+        // whole calibration exists to protect).
+        upstream.extend(
+            c.k.iter()
+                .enumerate()
+                .map(|(channel, k)| format!("ln_calib_k:{channel}:{:.6}", k)),
+        );
+    }
+    let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
+    stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
+}
+
+/// The group's `ln_calibration` artifact hash (ruling C-14 item 2): what
+/// the seeds calibration was MEASURED from, as opposed to what it produced.
+/// Folding the calibration frames' own registration hashes in is what makes
+/// a re-registered calibration frame re-measure `k` — and, through
+/// [`normalization_hash_for`] above, invalidate the whole group's sidecars
+/// rather than leaving a group with frames normalized at two different `k`
+/// (the review's I3). `reference_hash` is the group's LN reference: `k` is
+/// a ratio measured AGAINST that reference, so a rebuilt reference is a
+/// different measurement.
+pub(crate) fn seeds_calibration_hash_for(
+    cfg: &StackingConfig,
+    reference_hash: &str,
+    calibration_frames: &[(i64, &str)],
+) -> String {
+    let mut upstream: Vec<String> = vec![format!("ln_reference_hash:{reference_hash}")];
+    upstream.extend(
+        calibration_frames
+            .iter()
+            .enumerate()
+            .map(|(rank, (id, reg))| format!("ln_calib:{rank}:{id}:{reg}")),
+    );
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
@@ -1784,6 +1824,25 @@ pub fn build_plan(
         } else {
             None
         };
+        // Perf tier C Task 2 fix round 4 (ruling C-14 item 2): the group's
+        // measured seeds calibration is part of every member's own LN hash,
+        // so this gate has to read the SAME stored value the run will use.
+        // A group with no `ln_calibration` row yet (a catalog normalized
+        // before this existed, or one whose calibration could not be
+        // measured) hashes with `None`, which is exactly what `run.rs` does
+        // in that case — the two sides stay in step without this gate ever
+        // running a measurement of its own. The row's own freshness is NOT
+        // re-derived here (it keys on the calibration frames' registration
+        // hashes, which this gate would have to rank by weight to know):
+        // whatever the last run stored is what its sidecars were written
+        // under, which is the question this gate is asking.
+        let ln_calibration: Option<SeedsCalibration> = if local_normalization_active {
+            find_artifact(conn, frames_set_id, &g.key, "ln_calibration", None)?
+                .and_then(|row| row.payload_json)
+                .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
+        } else {
+            None
+        };
         let mut calibrated_cached = 0usize;
         let mut metrics_cached = 0usize;
         let mut fits_cached = 0usize;
@@ -1925,6 +1984,7 @@ pub fn build_plan(
                                     &frame_registration_hash,
                                     &ref_info.reference_member_ids,
                                     &ref_info.reference_hash,
+                                    ln_calibration.as_ref(),
                                 );
                                 is_fresh(row, &expected)
                             }
@@ -4339,7 +4399,8 @@ mod tests {
             hashes.sort_unstable();
             hashes.join(",")
         };
-        let reference_hash = normalization_hash_for(&cfg, &combined, &reference_member_ids, "");
+        let reference_hash =
+            normalization_hash_for(&cfg, &combined, &reference_member_ids, "", None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -4370,6 +4431,7 @@ mod tests {
                 &registration_hashes[&gf.frame_id],
                 &reference_member_ids,
                 &reference_hash,
+                None,
             );
             let sidecar_path = f.dir.path().join(format!("f{}.athln", gf.frame_id));
             std::fs::write(&sidecar_path, [0u8]).unwrap();
@@ -4632,7 +4694,8 @@ mod tests {
             hashes.sort_unstable();
             hashes.join(",")
         };
-        let reference_hash = normalization_hash_for(&cfg, &combined, &reference_member_ids, "");
+        let reference_hash =
+            normalization_hash_for(&cfg, &combined, &reference_member_ids, "", None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -4664,6 +4727,7 @@ mod tests {
                 &registration_hashes[&frame_id],
                 &reference_member_ids,
                 &reference_hash,
+                None,
             );
             let sidecar_path = f.dir.path().join(format!("f{frame_id}.athln"));
             std::fs::write(&sidecar_path, [0u8]).unwrap();

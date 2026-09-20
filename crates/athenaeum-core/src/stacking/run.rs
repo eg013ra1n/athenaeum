@@ -74,9 +74,9 @@ use crate::stacking::integrate::{
     GroupStats, StackFrame,
 };
 use crate::stacking::ln::{
-    background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
+    self, background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
     write_reference, BackgroundGrid, BackgroundParams, LnFrameGrids, LnReference,
-    LnReferenceForDetection, DEFAULT_PARAMS,
+    LnReferenceForDetection, LnScaleSeeds, DEFAULT_PARAMS,
 };
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
@@ -86,8 +86,8 @@ use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, Measur
 use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, is_fresh, measurement_hash_for, normalization_hash_for,
-    registration_hash_for, registration_row_is_fresh, wants_cfa_mosaic, HashMemo,
-    LnReferencePayload, MasterWork, PlanMaster, Stage,
+    registration_hash_for, registration_row_is_fresh, seeds_calibration_hash_for, wants_cfa_mosaic,
+    HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -317,6 +317,12 @@ pub(crate) struct RunContext {
     /// number whichever mode the run is in and the M1–M4a behaviour is
     /// reproduced exactly; in `native` mode each group carries its own.
     pub(crate) group_geometry: HashMap<String, GroupGeometry>,
+    /// Perf tier C Task 2 fix round 4 (ruling C-14 item 2): each group's
+    /// measured seeds calibration, recorded by stage 6 and read by
+    /// [`push_summary_group`] so the run's provenance says what `k` its
+    /// sidecars were written under. Absent for a group whose LN never ran,
+    /// or one whose calibration could not be measured at all.
+    pub(crate) group_seeds_calibration: HashMap<String, ln::SeedsCalibration>,
     /// M3 Task 5, fix round 1 (Minor M6): incremented once per group that
     /// actually reaches an attempt at `drizzle_group` (i.e. drizzle is on
     /// AND the group's `RejBitmapSet` — when wanted — was created
@@ -912,6 +918,7 @@ pub fn start_stacking(
         reference_width: 0,
         reference_height: 0,
         group_geometry: HashMap::new(),
+        group_seeds_calibration: HashMap::new(),
         drizzle_attempted: 0,
         dry_pass_stars: HashMap::new(),
         #[cfg(test)]
@@ -5864,6 +5871,14 @@ fn push_summary_group(
     // but this reads honestly either way).
     let beta = rc.measured_groups.get(&group.key).and_then(|mg| mg.beta);
 
+    // Perf tier C Task 2 fix round 4 (ruling C-14 item 2): the group's own
+    // per-channel seeds calibration, `None` for a group whose LN never ran
+    // or whose calibration could not be measured.
+    let seeds_calibration = rc
+        .group_seeds_calibration
+        .get(&group.key)
+        .map(|c| c.k.clone());
+
     rc.summary.groups.push(SummaryGroup {
         key: group.key.clone(),
         frame_count: group.frames.len(),
@@ -5879,6 +5894,7 @@ fn push_summary_group(
         weight_map_path,
         drizzle,
         beta,
+        seeds_calibration,
         frames,
     });
 }
@@ -7916,6 +7932,19 @@ struct LnArtifactPayload {
     scale: f64,
     matches: usize,
     cells_rejected: usize,
+    /// Perf tier C Task 2 fix round 4 (ruling C-14 items 2/3): `"seeds"` or
+    /// `"detected"` — this frame's OWN scale source, so a run pin (and a
+    /// reader of the cached row) can tell which path produced the sidecar
+    /// without a global counter that any concurrent frame could bump.
+    /// `#[serde(default)]`: a payload written before this field existed
+    /// reads as `""`, which is "not recorded", not a claim either way.
+    #[serde(default)]
+    ln_scale_source: String,
+    /// The group's seeds calibration this frame was normalized under
+    /// (ruling C-14 item 2) — recorded so a stored sidecar says what it was
+    /// written with, beside being folded into the row's own `config_hash`.
+    #[serde(default)]
+    seeds_calibration: Option<ln::SeedsCalibration>,
 }
 
 /// Sets `ln_scale`/`cached_ln` on `group_key`'s `MeasuredFrame` entry for
@@ -8068,8 +8097,13 @@ fn run_group_normalization(
     let combined_registration_hash = member_reg_hashes.join(",");
     // Fix round 1, item 2: the reference's OWN hash has no further
     // reference to fold in — `""` (see `normalization_hash_for`'s own doc).
-    let reference_hash =
-        normalization_hash_for(&cfg, &combined_registration_hash, &reference_member_ids, "");
+    let reference_hash = normalization_hash_for(
+        &cfg,
+        &combined_registration_hash,
+        &reference_member_ids,
+        "",
+        None,
+    );
 
     let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Normalize);
     let reference_path_buf = rc.layout.ln_reference_path(&group.key);
@@ -8218,12 +8252,13 @@ fn run_group_normalization(
     // now prefers over re-detecting) were fitted at the group β too, so
     // fitting the reference at anything else would reintroduce exactly the
     // β mismatch `psf_signal::fit_stars_with_beta`'s own doc warns against.
-    // `Moffat4` (or any future explicit choice) is untouched. No
-    // `extra_betas` any more (fix round 2, ruling C-12 retired fix round
-    // 1's per-member-beta preparation — the diagnostics round traced the
-    // real bias to the fit itself, not a beta mismatch, and
-    // `relative_scale_from_seeds` always fits at this one default beta
-    // regardless of what beta a seed source's own fits carry).
+    // `Moffat4` (or any future explicit choice) is untouched. There is one
+    // prepared beta and no other (fix round 2, ruling C-12 retired fix
+    // round 1's per-member-beta preparation — the diagnostics round traced
+    // the real bias to the fit itself, not a beta mismatch, and
+    // `relative_scale_from_seeds` always fits at this one beta regardless
+    // of what beta a seed source's own fits carry; fix round 4 removed the
+    // unused machinery outright, the review's M2).
     let reference_psf = match ln_cfg.psf_model {
         psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
         other => other,
@@ -8231,7 +8266,6 @@ fn run_group_normalization(
     let reference_for_detection = LnReferenceForDetection::build(
         &ln_reference,
         reference_psf,
-        &[],
         measure_opts.max_stars,
         Some(&rc.ctx.image_pool),
     );
@@ -8290,7 +8324,141 @@ fn run_group_normalization(
     }
 
     let mut sidecar_paths: Vec<PathBuf> = Vec::with_capacity(members.len());
-    let mut per_member_hash: Vec<String> = Vec::with_capacity(members.len());
+    // Perf tier C Task 2 fix round 4: each member's existing `ln` row,
+    // fetched ONCE — the calibration resolution below has to ask "is
+    // anything stale?" before the freshness loop runs, and neither pass
+    // should hit the DB a second time for the same row.
+    let mut existing_ln_rows: Vec<Option<crate::db::stacking::StackingArtifactRow>> =
+        Vec::with_capacity(members.len());
+    for m in members.iter() {
+        let stem = match group_frames_by_id.get(&m.frame_id).copied() {
+            Some(gf) => calibrated_file_stem(group, gf),
+            None => Path::new(&m.filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&m.filename)
+                .to_string(),
+        };
+        sidecar_paths.push(rc.layout.ln_sidecar_path(&group.key, &stem));
+        let existing = {
+            let conn = db(&rc.ctx)?.conn();
+            crate::db::stacking::find_artifact(
+                &conn,
+                rc.set_id,
+                &group.key,
+                "ln",
+                Some(m.frame_id),
+            )?
+        };
+        existing_ln_rows.push(existing);
+    }
+
+    // The group's seeds calibration (ruling C-14). It has to be resolved
+    // BEFORE the per-member hashes, because `k` is part of every member's
+    // own LN hash — a changed `k` must re-normalize the whole group rather
+    // than leave it mixing frames written at two different factors (the
+    // review's I3). The measurement itself is ≈ 45 s per group, so it runs
+    // only when (a) nothing fresh is stored for exactly these inputs AND
+    // (b) at least one member would be re-normalized anyway: a fully-cached
+    // group pays nothing.
+    let calibration_member_weights: Vec<(i64, f64)> = members
+        .iter()
+        .map(|m| (m.frame_id, m.weight.normalized_mean))
+        .collect();
+    let calibration_indices = ln::select_calibration_frames(
+        rc.geometry_of(&group.key).reference_frame_id,
+        &calibration_member_weights,
+        ln::SEEDS_CALIBRATION_FRAMES,
+    );
+    let calibration_frames: Vec<(i64, &str)> = calibration_indices
+        .iter()
+        .map(|&i| (members[i].frame_id, members[i].registration_hash.as_str()))
+        .collect();
+    let calibration_input_hash =
+        seeds_calibration_hash_for(&cfg, &reference_hash, &calibration_frames);
+    let ln_channels = ln_reference.planes.len();
+    let stored_calibration: Option<ln::SeedsCalibration> = if force_fresh {
+        None
+    } else {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::stacking::find_artifact(&conn, rc.set_id, &group.key, "ln_calibration", None)?
+            .filter(|row| row.config_hash == calibration_input_hash)
+            .and_then(|row| row.payload_json)
+            .and_then(|s| serde_json::from_str::<ln::SeedsCalibration>(&s).ok())
+            .filter(|c| c.k.len() == ln_channels)
+    };
+
+    let member_hashes = |calibration: Option<&ln::SeedsCalibration>| -> Vec<String> {
+        members
+            .iter()
+            .map(|m| {
+                normalization_hash_for(
+                    &cfg,
+                    &m.registration_hash,
+                    &reference_member_ids,
+                    &reference_hash,
+                    calibration,
+                )
+            })
+            .collect()
+    };
+    let mut seeds_calibration = stored_calibration.clone();
+    let mut per_member_hash: Vec<String> = member_hashes(seeds_calibration.as_ref());
+    let anything_stale = force_fresh
+        || (0..members.len()).any(|i| {
+            !existing_ln_rows[i]
+                .as_ref()
+                .is_some_and(|row| is_fresh(row, &per_member_hash[i]))
+        });
+    if anything_stale && stored_calibration.is_none() {
+        seeds_calibration = measure_ln_seeds_calibration(
+            rc,
+            group,
+            members,
+            &calibration_indices,
+            &fits_paths,
+            input.frames,
+            &ln_reference,
+            &reference_for_detection,
+            &ref_backgrounds,
+            &ln_cfg,
+            measure_opts,
+            input.interpolation,
+            input.clamping,
+            &rc.ctx.image_pool,
+            &rc.cancel,
+        );
+        // A cancelled measurement returns `None` silently (the review's
+        // M3); the run's own cancel check is what stops the group.
+        rc.check_cancel()?;
+        if let Some(c) = &seeds_calibration {
+            let payload = serde_json::to_string(c).map_err(|e| {
+                RunError::Other(format!("failed to serialize ln_calibration payload: {e}"))
+            })?;
+            let conn = db(&rc.ctx)?.conn();
+            upsert_artifact(
+                &conn,
+                &NewArtifact {
+                    frames_set_id: rc.set_id,
+                    frame_id: None,
+                    group_key: &group.key,
+                    kind: "ln_calibration",
+                    path: None,
+                    config_hash: &calibration_input_hash,
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some(&payload),
+                },
+            )?;
+            per_member_hash = member_hashes(seeds_calibration.as_ref());
+        }
+    }
+    if let Some(c) = &seeds_calibration {
+        rc.group_seeds_calibration
+            .insert(group.key.clone(), c.clone());
+    }
+    let seeds_calibration_k: Option<Vec<f64>> = seeds_calibration.as_ref().map(|c| c.k.clone());
+
     let mut needs_normalize: Vec<usize> = Vec::new();
     // M2 Task 7 (fix round 1, item 3): every member this function itself
     // VERIFIES has a READABLE `ln` artifact THIS run (a fresh cache hit
@@ -8302,44 +8470,20 @@ fn run_group_normalization(
     let mut sidecar_grids: HashMap<i64, LnFrameGrids> = HashMap::with_capacity(members.len());
 
     for (i, m) in members.iter().enumerate() {
-        let stem = match group_frames_by_id.get(&m.frame_id).copied() {
-            Some(gf) => calibrated_file_stem(group, gf),
-            None => Path::new(&m.filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&m.filename)
-                .to_string(),
-        };
-        let sidecar = rc.layout.ln_sidecar_path(&group.key, &stem);
-        // Fix round 1, item 2: folds in the group's OWN reference hash —
-        // re-registering or recalibrating ONE reference member rebuilds the
-        // reference (a new `B_ref`, a new scale anchor), which must
-        // invalidate every OTHER frame's sidecar too, not just that one
-        // member's (the id LIST alone is unchanged by a member's own
-        // re-registration, so it can't catch this on its own).
-        let frame_hash = normalization_hash_for(
-            &cfg,
-            &m.registration_hash,
-            &reference_member_ids,
-            &reference_hash,
-        );
-        sidecar_paths.push(sidecar);
-        per_member_hash.push(frame_hash.clone());
-
-        let existing = {
-            let conn = db(&rc.ctx)?.conn();
-            crate::db::stacking::find_artifact(
-                &conn,
-                rc.set_id,
-                &group.key,
-                "ln",
-                Some(m.frame_id),
-            )?
-        };
+        // Fix round 1, item 2: the hash folds in the group's OWN reference
+        // hash — re-registering or recalibrating ONE reference member
+        // rebuilds the reference (a new `B_ref`, a new scale anchor), which
+        // must invalidate every OTHER frame's sidecar too, not just that
+        // one member's (the id LIST alone is unchanged by a member's own
+        // re-registration, so it can't catch this on its own) — and, since
+        // fix round 4, the group's own seeds calibration (ruling C-14 item
+        // 2). Both were resolved above; this loop only reads them.
+        let frame_hash = &per_member_hash[i];
+        let existing = &existing_ln_rows[i];
         let fresh = !force_fresh
             && existing
                 .as_ref()
-                .is_some_and(|row| is_fresh(row, &frame_hash));
+                .is_some_and(|row| is_fresh(row, frame_hash));
         if fresh {
             let cached_payload: Option<LnArtifactPayload> = existing
                 .as_ref()
@@ -8441,31 +8585,10 @@ fn run_group_normalization(
     let sidecar_paths_ref: &[PathBuf] = &sidecar_paths;
     let fits_paths_ref: &[Vec<Option<PathBuf>>] = &fits_paths;
 
-    // Fix round 3, ruling C-13, LEVER 2: a per-group calibration factor for
-    // the seeds path, measured once before the fan-out — see
-    // `measure_ln_seeds_calibration`'s own doc. Skipped entirely when every
-    // member already has a fresh cached sidecar (nothing in this group will
-    // read it this run).
-    let seeds_calibration: Option<f64> = if needs_normalize.is_empty() {
-        None
-    } else {
-        measure_ln_seeds_calibration(
-            rc,
-            group,
-            members,
-            fits_paths_ref,
-            stack_frames_ref,
-            ln_reference_ref,
-            reference_for_detection_ref,
-            ref_backgrounds_ref,
-            &ln_cfg,
-            measure_opts,
-            interpolation,
-            clamping,
-            pool_ref,
-            cancel_ref,
-        )
-    };
+    // Ruling C-14 item 1: the group's per-CHANNEL factors, resolved (from
+    // the cache or by measurement) above the freshness loop, since they are
+    // part of every member's own LN hash.
+    let seeds_calibration_ref: Option<&[f64]> = seeds_calibration_k.as_deref();
 
     // v0.6.3: per-frame ticks from inside the fan-out; the cached members
     // (`total - needs_normalize.len()`) count as done from the start.
@@ -8521,13 +8644,13 @@ fn run_group_normalization(
                 reference_for_detection_ref,
                 ref_backgrounds_ref,
                 &stack_frames_ref[i],
-                Some(&fits_by_plane),
+                LnScaleSeeds::Measured(&fits_by_plane),
                 &ln_cfg,
                 measure_opts,
                 interpolation,
                 clamping,
                 &sidecar_paths_ref[i],
-                seeds_calibration,
+                seeds_calibration_ref,
                 Some(pool_ref),
                 cancel_ref,
             )
@@ -8614,6 +8737,8 @@ fn run_group_normalization(
                     scale: outcome.scale,
                     matches: outcome.matches,
                     cells_rejected: outcome.cells_rejected,
+                    ln_scale_source: outcome.ln_scale_source.to_string(),
+                    seeds_calibration: seeds_calibration.clone(),
                 })
                 .map_err(|e| RunError::Other(format!("failed to serialize ln payload: {e}")))?;
                 {
@@ -8658,10 +8783,10 @@ fn run_group_normalization(
                             ln_detect_ms = outcome.detect_ms,
                             ln_fit_ms = outcome.fit_ms,
                             ln_match_ms = outcome.match_ms,
-                            scale_source = outcome.scale_source,
+                            ln_scale_source = outcome.ln_scale_source,
                             "ln frame normalized"
                         );
-                        if outcome.scale_source == "seeds" {
+                        if outcome.ln_scale_source == "seeds" {
                             seeds_sourced_count += 1;
                         }
                         set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
@@ -8713,41 +8838,27 @@ fn run_group_normalization(
     })
 }
 
-/// Fix round 3, ruling C-13, LEVER 2: a per-group calibration factor for
-/// the seeds path. LEVER 1's own diagnostics (this fix round) measured the
-/// seeds path's filter chain directly and found neither the saturation
-/// guard nor the pre-select radius explains the matched-star shortfall on
-/// real mono frames — widening or removing the pre-select left `matched`
-/// and `scale` unchanged while costing real time, so no population fix
-/// closes the ~0.67% median bias fix round 2 (ruling C-12) measured. That
-/// bias is SAME-SIGNED across real frames (round 2's own 13-frame table),
-/// which is exactly what a per-group multiplicative correction can remove.
+/// Perf tier C Task 2 fix round 4 (ruling C-14): the group's per-CHANNEL
+/// seeds calibration `k`, measured once per group. `ln::calibration` owns
+/// the measurement itself (the frame selection, both `normalize_frame`
+/// arms, the per-channel median and its band guard); this wrapper is the
+/// run-level half — reading each calibration frame's persisted fits,
+/// emitting a stage event while the measurement runs (M1: it is ≈ 45 s of
+/// work that used to show as a stalled Normalize row), and turning the
+/// per-channel verdicts into the group's log lines.
 ///
-/// Runs [`normalize_frame`] TWICE on each of three representative group
-/// members — the group's own registration/geometry reference frame
-/// (`RunContext::geometry_of`) plus its two best-weighted OTHER members —
-/// once normally (the seeds path, when that member's own fits are usable)
-/// and once with `fits = None` (forcing today's full-detection path,
-/// [`scale::relative_scale_against`]), both writing to a THROWAWAY sidecar
-/// under the group's own `ln/` directory that is deleted immediately after
-/// — never the real per-frame `.athln` path, never a `stacking_artifacts`
-/// row, so this measurement leaves no trace in the group's cached state.
-/// `k = median(s_old / s_seeds)` over whichever of the three calibration
-/// frames produced BOTH a usable detection scale and a genuine (not itself
-/// a fallback) seeds-path scale.
-///
-/// Returns `None` — never a hard failure — when fewer than two of the
-/// three calibration frames yield a usable ratio; every member then runs
-/// through [`normalize_frame`] exactly as before this fix round (`k = 1`
-/// by omission). Logs one `info!` per group on success
-/// (`"ln seeds calibration"`, dictionary fields `stage`/`count`/`ln_scale`
-/// — see the logging spec's dictionary extension for this event) so a
-/// group's calibration factor is visible without re-running the probe.
+/// `indices` points into `members`/`frames` (the two are index-aligned)
+/// and comes from `ln::select_calibration_frames`, so the caller can hash
+/// the sample BEFORE deciding whether the measurement is needed at all.
+/// `None` means no calibration was measured — a cancel (silent, the
+/// review's M3) or a scratch directory that could not be created; the
+/// caller then records nothing and the group runs uncalibrated.
 #[allow(clippy::too_many_arguments)]
 fn measure_ln_seeds_calibration(
     rc: &RunContext,
     group: &IntegrationGroup,
     members: &[GroupMember],
+    indices: &[usize],
     fits_paths: &[Vec<Option<PathBuf>>],
     stack_frames: &[StackFrame],
     ln_reference: &LnReference,
@@ -8759,145 +8870,111 @@ fn measure_ln_seeds_calibration(
     clamping: f32,
     pool: &Arc<rayon::ThreadPool>,
     cancel: &AtomicBool,
-) -> Option<f64> {
-    if members.is_empty() {
+) -> Option<ln::SeedsCalibration> {
+    if indices.is_empty() {
         return None;
     }
 
-    // Pick the group's registration/geometry reference frame first, then
-    // fill out to three distinct members by descending weight — the same
-    // `normalized_mean` ranking `sky_penalized_order`'s callers read
-    // elsewhere in this function. A group whose reference frame is not
-    // among `members` at all (should not happen in practice — the
-    // reference is itself a group member — but this function never fails
-    // the group over it) simply falls back to the top three by weight.
-    let reference_frame_id = rc.geometry_of(&group.key).reference_frame_id;
-    let mut calibration_indices: Vec<usize> = Vec::with_capacity(3);
-    if let Some(idx) = members
-        .iter()
-        .position(|m| m.frame_id == reference_frame_id)
-    {
-        calibration_indices.push(idx);
-    }
-    let mut by_weight: Vec<usize> = (0..members.len())
-        .filter(|i| !calibration_indices.contains(i))
-        .collect();
-    by_weight.sort_by(|&a, &b| {
-        members[b]
-            .weight
-            .normalized_mean
-            .partial_cmp(&members[a].weight.normalized_mean)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    calibration_indices.extend(
-        by_weight
-            .into_iter()
-            .take(3usize.saturating_sub(calibration_indices.len())),
-    );
-
-    let calib_dir = rc.layout.ln_dir(&group.key);
-    let mut ratios: Vec<f64> = Vec::with_capacity(calibration_indices.len());
-    for &i in &calibration_indices {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let frame_id = members[i].frame_id;
+    let load_fits = |i: usize| -> Vec<Vec<psf_signal::StarFit>> {
         let planes: &[Option<PathBuf>] = fits_paths.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-        let mut fits_by_plane: Vec<Vec<psf_signal::StarFit>> = Vec::with_capacity(planes.len());
-        for path in planes {
-            let plane_fits = match path {
+        planes
+            .iter()
+            .map(|path| match path {
                 Some(p) => fits_artifact::read_fits(p).unwrap_or_default(),
                 None => Vec::new(),
-            };
-            fits_by_plane.push(plane_fits);
-        }
+            })
+            .collect()
+    };
 
-        let seeds_path = calib_dir.join(format!(".calib-seeds-{frame_id}.athln"));
-        let seeds_outcome = normalize_frame(
-            ln_reference,
-            reference_for_detection,
-            ref_backgrounds,
-            &stack_frames[i],
-            Some(&fits_by_plane),
-            ln_cfg,
-            measure_opts,
-            interpolation,
-            clamping,
-            &seeds_path,
-            None,
-            Some(pool),
-            cancel,
+    // M1: the measurement is minutes of work on a real group, so it emits
+    // its own ticks — the same direct `emit_event` shape
+    // `build_and_write_ln_reference` uses, since `rc` is borrowed
+    // immutably here and `RunContext::progress` needs `&mut self`.
+    let emitter = rc.emitter.clone();
+    let (run_id, set_id, group_key) = (rc.run_id, rc.set_id, group.key.clone());
+    let total_members = members.len();
+    let on_progress = |done: usize, total: usize, frame_id: i64| {
+        emit_event(
+            emitter.as_ref(),
+            STACKING_PROGRESS_EVENT,
+            &StackingProgressEvent {
+                run_id,
+                set_id,
+                stage: Stage::Normalize,
+                group_key: Some(group_key.clone()),
+                current: 0,
+                total: total_members,
+                percent: 0.0,
+                bytes_done: 0,
+                bytes_total: 0,
+                frame_id: Some(frame_id),
+                message: Some(format!(
+                    "calibrating the seeds path · frame {}/{total}",
+                    done + 1
+                )),
+            },
         );
-        let _ = std::fs::remove_file(&seeds_path);
+    };
 
-        let detect_path = calib_dir.join(format!(".calib-detect-{frame_id}.athln"));
-        let detect_outcome = normalize_frame(
-            ln_reference,
-            reference_for_detection,
-            ref_backgrounds,
-            &stack_frames[i],
-            None,
-            ln_cfg,
-            measure_opts,
-            interpolation,
-            clamping,
-            &detect_path,
-            None,
-            Some(pool),
-            cancel,
-        );
-        let _ = std::fs::remove_file(&detect_path);
+    let measurement = ln::measure_seeds_calibration(
+        ln_reference,
+        reference_for_detection,
+        ref_backgrounds,
+        stack_frames,
+        indices,
+        &load_fits,
+        ln_cfg,
+        measure_opts,
+        interpolation,
+        clamping,
+        &rc.layout.ln_calibration_scratch_dir(&group.key),
+        Some(pool),
+        cancel,
+        &on_progress,
+    )?;
 
-        match (seeds_outcome, detect_outcome) {
-            (Ok(seeds), Ok(detected))
-                if seeds.scale_source == "seeds"
-                    && seeds.scale.is_finite()
-                    && seeds.scale != 0.0
-                    && detected.scale.is_finite() =>
-            {
-                let ratio = detected.scale / seeds.scale;
-                if ratio.is_finite() {
-                    ratios.push(ratio);
-                }
-            }
-            (seeds_result, detect_result) => {
-                tracing::debug!(
-                    run_id = rc.run_id,
-                    group_key = %group.key,
-                    frame_id,
-                    seeds_ok = seeds_result.is_ok(),
-                    detected_ok = detect_result.is_ok(),
-                    "ln seeds calibration: skipping a calibration frame"
-                );
-            }
-        }
-    }
-
-    if ratios.len() < 2 {
+    // One warn for the whole group when any channel ran short of ratios
+    // (ruling C-14 item 1), one per channel for a refused median, and one
+    // info per channel that was actually calibrated.
+    let short = measurement
+        .channels
+        .iter()
+        .filter(|c| c.outcome == ln::ChannelOutcome::TooFewRatios)
+        .map(|c| c.samples)
+        .min();
+    if let Some(count) = short {
         tracing::warn!(
             run_id = rc.run_id,
             group_key = %group.key,
-            count = ratios.len(),
-            "ln seeds calibration: too few usable calibration frames; seeds path runs uncalibrated for this group"
+            count,
+            "ln seeds calibration: too few usable calibration frames; the seeds path runs uncalibrated for this group"
         );
-        return None;
     }
-    ratios.sort_by(|a, b| a.total_cmp(b));
-    let n = ratios.len();
-    let k = if n % 2 == 1 {
-        ratios[n / 2]
-    } else {
-        (ratios[n / 2 - 1] + ratios[n / 2]) / 2.0
-    };
-    tracing::info!(
-        run_id = rc.run_id,
-        group_key = %group.key,
-        stage = "normalize",
-        count = n,
-        ln_scale = k,
-        "ln seeds calibration"
-    );
-    Some(k)
+    for (channel, c) in measurement.channels.iter().enumerate() {
+        match c.outcome {
+            ln::ChannelOutcome::Calibrated => tracing::info!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                stage = "normalize",
+                channel,
+                count = c.samples,
+                ln_scale = c.k,
+                "ln seeds calibration"
+            ),
+            ln::ChannelOutcome::OutOfBand { measured } => tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                stage = "normalize",
+                channel,
+                count = c.samples,
+                ln_scale = measured,
+                "ln seeds calibration: the measured factor left its band; this channel runs uncalibrated"
+            ),
+            ln::ChannelOutcome::TooFewRatios => {}
+        }
+    }
+
+    Some(measurement.calibration())
 }
 
 /// The cache-miss half of [`run_group_normalization`]'s reference
@@ -9293,6 +9370,7 @@ pub(crate) fn test_context(
         reference_width: 0,
         reference_height: 0,
         group_geometry: HashMap::new(),
+        group_seeds_calibration: HashMap::new(),
         drizzle_attempted: 0,
         dry_pass_stars: HashMap::new(),
         fail_after_stage: None,
@@ -13984,10 +14062,18 @@ mod tests {
     /// falls back to full detection on the warped plane
     /// (`scale::relative_scale_against`), the same honest-LN-master
     /// contract Task 6a's own registered-artifact fallback (Pin 3, above)
-    /// established for a missing `registered` artifact. Asserted via
-    /// `ln::fallback_counters`, the same style Pin 3 uses (a tracing
-    /// capture cannot be owned exclusively by one test in this binary's
-    /// parallel run — see that pin's own doc).
+    /// established for a missing `registered` artifact.
+    ///
+    /// Fix round 4 (ruling C-14 item 3, the review's I1): the pin asserts
+    /// the VICTIM FRAME'S OWN recorded scale source — `LnArtifactPayload::
+    /// ln_scale_source` on its `ln` row — and that its SIBLINGS, whose
+    /// artifacts were left alone, record `"seeds"`. The global
+    /// `ln::fallback_counters` reading this used to rest on could not tell
+    /// the victim's fallback from any other frame's, and the seeds
+    /// calibration's own forced-detection arm bumped it too, so
+    /// `fallbacks >= 1` was true no matter what the victim did. The counter
+    /// is still checked (it must have fired at least once), but it is no
+    /// longer the thing the pin rests on.
     #[test]
     fn local_normalization_falls_back_to_detection_when_a_fits_artifact_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14059,6 +14145,36 @@ mod tests {
             fallbacks >= 1,
             "deleting f0's fits artifact must trigger at least one detection fallback"
         );
+
+        // The pin itself: PER FRAME, from each one's own `ln` artifact
+        // payload. f0 (the victim) must record `"detected"`; every sibling,
+        // whose `fits` artifacts were never touched, must record `"seeds"`.
+        let ln_rows =
+            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("ln")).unwrap();
+        assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
+        let mut seen_victim = false;
+        for row in &ln_rows {
+            let payload: LnArtifactPayload = serde_json::from_str(
+                row.payload_json
+                    .as_deref()
+                    .expect("every ln row carries a payload"),
+            )
+            .expect("the ln payload decodes");
+            let frame_id = row.frame_id.expect("an ln row is per frame");
+            if frame_id == light_ids[0] {
+                seen_victim = true;
+                assert_eq!(
+                    payload.ln_scale_source, "detected",
+                    "the frame whose fits artifact was deleted must record the detection fallback"
+                );
+            } else {
+                assert_eq!(
+                    payload.ln_scale_source, "seeds",
+                    "frame {frame_id} kept its fits artifact and must record the seeds path"
+                );
+            }
+        }
+        assert!(seen_victim, "f0 must have an ln artifact of its own");
 
         let group_summary = rc
             .summary
