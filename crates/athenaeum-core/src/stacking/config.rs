@@ -648,9 +648,32 @@ fn measurement_subtree_with_fit_version(
     })
 }
 
-/// Stage 5 (registration) config subtree.
+/// Stage 5 (registration) config subtree, plus
+/// [`crate::stacking::psf_signal::PSF_FIT_VERSION`] (Tier C Task 3, ruling
+/// C-6): a mono frame's registration star list can now come straight from
+/// Measure's own accepted PSF fits (`stacking::register::detect::
+/// stars_from_fits`) instead of a fresh detection, so a fitter change —
+/// which changes what those fits SAY — has to re-register every mono set
+/// exactly the way it already re-measures and re-normalizes them (the same
+/// reasoning [`measurement_subtree`]/[`normalization_subtree`] already
+/// follow). The first run after this fold-in re-registers every set once
+/// on purpose, rewriting every `registered` artifact
+/// (perf tier A Task 6a) and re-running every downstream stage that reads
+/// it (Normalize, Integrate).
 pub fn registration_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    serde_json::json!({ "registration": cfg.registration })
+    registration_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
+}
+
+/// [`registration_subtree`] with the fitter version supplied — see
+/// [`measurement_subtree_with_fit_version`].
+fn registration_subtree_with_fit_version(
+    cfg: &StackingConfig,
+    psf_fit_version: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "registration": cfg.registration,
+        "psfFitVersion": psf_fit_version,
+    })
 }
 
 /// Stage 6 (local normalization, M2) config subtree: the whole
@@ -1166,25 +1189,29 @@ mod tests {
         );
     }
 
-    /// Ruling R-M4a-15: the PSF fitter's own behaviour is not expressible
-    /// in the config, so the artifact hashes that store fit-derived numbers
-    /// fold in [`PSF_FIT_VERSION`] instead. Both of them must: the
-    /// measurement stage stores PSFSW/TFlux/star counts, and local
-    /// normalization's `.athln` stores a PSF-flux scale measured with the
-    /// SAME fitter.
+    /// Ruling R-M4a-15 (registration folded in by Tier C Task 3, ruling
+    /// C-6): the PSF fitter's own behaviour is not expressible in the
+    /// config, so the artifact hashes that store fit-derived numbers fold
+    /// in [`PSF_FIT_VERSION`] instead. All three must: the measurement
+    /// stage stores PSFSW/TFlux/star counts, local normalization's
+    /// `.athln` stores a PSF-flux scale measured with the SAME fitter, and
+    /// registration can now build a mono frame's star list straight from
+    /// the fitter's own accepted fits.
     #[test]
-    fn both_fit_derived_subtree_hashes_follow_the_psf_fit_version() {
+    fn all_three_fit_derived_subtree_hashes_follow_the_psf_fit_version() {
         let cfg = StackingConfig::default();
         let h = |v: u32| {
             (
                 stage_hash(&measurement_subtree_with_fit_version(&cfg, v), &[], &[]),
                 stage_hash(&normalization_subtree_with_fit_version(&cfg, v), &[], &[]),
+                stage_hash(&registration_subtree_with_fit_version(&cfg, v), &[], &[]),
             )
         };
-        let (m_now, n_now) = h(PSF_FIT_VERSION);
-        let (m_old, n_old) = h(PSF_FIT_VERSION - 1);
+        let (m_now, n_now, r_now) = h(PSF_FIT_VERSION);
+        let (m_old, n_old, r_old) = h(PSF_FIT_VERSION - 1);
         assert_ne!(m_now, m_old, "the measurement hash must follow the fitter");
         assert_ne!(n_now, n_old, "the LN hash must follow the fitter");
+        assert_ne!(r_now, r_old, "the registration hash must follow the fitter");
         // And the shipped helpers are the versioned ones at the current
         // constant — not a second, drifting copy of the JSON shape.
         assert_eq!(
@@ -1196,6 +1223,11 @@ mod tests {
             stage_hash(&normalization_subtree(&cfg), &[], &[]),
             n_now,
             "normalization_subtree must hash as the current fitter version"
+        );
+        assert_eq!(
+            stage_hash(&registration_subtree(&cfg), &[], &[]),
+            r_now,
+            "registration_subtree must hash as the current fitter version"
         );
     }
 

@@ -10,12 +10,13 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::align::{align, model_name, AlignError, Alignment, DistortionFit, SeedKind, SeedPolicy};
-use super::detect::{detect_stars, luminance, Star};
+use super::detect::{detect_stars, luminance, stars_from_fits, Star};
 use super::RegistrationConfig;
 use crate::geometry::{Linear, LinearKind, PixelMap};
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::IntegrationError;
 use crate::registration::db::RegistrationRecord;
+use crate::stacking::psf_signal::StarFit;
 
 #[derive(Debug, Clone)]
 pub struct ReferenceStars {
@@ -118,11 +119,42 @@ fn read_planes(path: &Path) -> Result<(Vec<Vec<f32>>, usize, usize), Integration
     Ok((planes, w, h))
 }
 
+/// `fits`: Tier C Task 3 (spec §7, ruling C-6) — the reference frame's own
+/// Measure-accepted PSF fits for plane 0, when the caller has already
+/// established the frame is single-plane AND a fresh `fits` artifact
+/// exists for it (`stacking::run` resolves both before calling this — this
+/// function has no DB access of its own). `Some` skips the read+detect
+/// entirely in favour of [`stars_from_fits`]; `None` is today's detection,
+/// unconditionally — an OSC reference (ruling C-6) or any frame the
+/// caller could not, or chose not to, resolve fits for.
 pub fn reference_stars(
     path: &Path,
     cfg: &RegistrationConfig,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    fits: Option<&[StarFit]>,
 ) -> Result<ReferenceStars, IntegrationError> {
+    if let Some(fits) = fits {
+        let t = Instant::now();
+        let reader = PlaneReader::open(path)?;
+        let (width, height) = (reader.width(), reader.height());
+        let read_ms = t.elapsed().as_millis() as u64;
+        let t = Instant::now();
+        let stars = stars_from_fits(fits, &cfg.detection, cfg.max_stars);
+        let detect_ms = t.elapsed().as_millis() as u64;
+        debug!(
+            path = %path.display(),
+            detections = stars.len(),
+            read_ms,
+            detect_ms,
+            star_source = "fits",
+            "reference stars detected"
+        );
+        return Ok(ReferenceStars {
+            stars,
+            width,
+            height,
+        });
+    }
     let t = Instant::now();
     let (planes, width, height) = read_planes(path)?;
     let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
@@ -136,6 +168,7 @@ pub fn reference_stars(
         detections = stars.len(),
         read_ms,
         detect_ms,
+        star_source = "detected",
         "reference stars detected"
     );
     Ok(ReferenceStars {
@@ -158,16 +191,53 @@ pub fn reference_stars(
 /// this is called directly by a caller wanting fresh detections, or once
 /// per frame from inside a caching pass. [`register_detected`]'s own log
 /// line no longer repeats it (see that function's doc comment).
+///
+/// `fits`: Tier C Task 3 (spec §7, ruling C-6) — this frame's own
+/// Measure-accepted PSF fits for plane 0, when the caller has already
+/// established the frame is single-plane AND a fresh `fits` artifact
+/// exists for it (`stacking::run` resolves both — this function has no DB
+/// access of its own, mirroring [`reference_stars`]'s own `fits`
+/// parameter). `Some` reads only the file's HEADER (`PlaneReader::open`,
+/// no pixel plane) and converts the fits via [`stars_from_fits`] instead
+/// of reading+detecting; `None` is today's full detection, unconditionally
+/// — an OSC frame (ruling C-6), a stale/missing artifact, or any other
+/// caller that has not resolved fits for this path.
 pub fn detect_frame_stars(
     path: &Path,
     cfg: &RegistrationConfig,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    fits: Option<&[StarFit]>,
 ) -> Result<DetectedStars, IntegrationError> {
     #[cfg(test)]
     DETECT_FRAME_STARS_LOG
         .lock()
         .unwrap()
         .push(path.to_path_buf());
+    if let Some(fits) = fits {
+        let t = Instant::now();
+        let reader = PlaneReader::open(path)?;
+        let (width, height) = (reader.width(), reader.height());
+        let read_ms = t.elapsed().as_millis() as u64;
+        let t = Instant::now();
+        let stars = stars_from_fits(fits, &cfg.detection, cfg.max_stars);
+        let detect_ms = t.elapsed().as_millis() as u64;
+        debug!(
+            path = %path.display(),
+            detections = stars.len(),
+            read_ms,
+            detect_ms,
+            star_source = "fits",
+            "frame stars detected"
+        );
+        return Ok(DetectedStars {
+            stars,
+            width,
+            height,
+            read_ms,
+            detect_ms,
+            path: path.to_path_buf(),
+        });
+    }
     let t = Instant::now();
     let (planes, width, height) = read_planes(path)?;
     let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
@@ -181,6 +251,7 @@ pub fn detect_frame_stars(
         detections = stars.len(),
         read_ms,
         detect_ms,
+        star_source = "detected",
         "frame stars detected"
     );
     Ok(DetectedStars {
@@ -289,6 +360,12 @@ pub fn register_detected(
 /// [`register_detected`]. I/O errors and cancellation are `Err`; an
 /// alignment failure is a successful measurement of a frame that cannot be
 /// registered (`outcome: Err(AlignError)`).
+///
+/// Always detects (`fits: None` to [`detect_frame_stars`]) — this
+/// composition has no production caller in `stacking::run` (which needs
+/// the fits-resolution split below for its own caching), only tests and
+/// dev probes, so it carries no `fits` parameter of its own; a caller that
+/// wants Tier C Task 3's mono reuse calls [`detect_frame_stars`] directly.
 #[allow(clippy::too_many_arguments)]
 pub fn register_frame(
     reference: &ReferenceStars,
@@ -303,7 +380,7 @@ pub fn register_frame(
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled);
     }
-    let detected = detect_frame_stars(subject, cfg, pool)?;
+    let detected = detect_frame_stars(subject, cfg, pool, None)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(IntegrationError::Cancelled);
     }
@@ -477,7 +554,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (r, s, _) = pair(dir.path(), 21, 7.3, -4.1, 1.5, 1);
         let cfg = RegistrationConfig::default();
-        let reference = reference_stars(&r, &cfg, None).unwrap();
+        let reference = reference_stars(&r, &cfg, None, None).unwrap();
         assert!(reference.stars.len() >= 110, "{}", reference.stars.len());
         assert_eq!((reference.width, reference.height), (640, 480));
         let reg = register_frame(
@@ -547,7 +624,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (r, s, _) = pair(dir.path(), 25, 5.0, -3.0, 1.0, 1);
         let cfg = RegistrationConfig::default();
-        let reference = reference_stars(&r, &cfg, None).unwrap();
+        let reference = reference_stars(&r, &cfg, None, None).unwrap();
         let cancel = AtomicBool::new(false);
         let direct = register_frame(
             &reference,
@@ -560,7 +637,7 @@ mod tests {
             SCALE_RANGE,
         )
         .unwrap();
-        let detected = detect_frame_stars(&s, &cfg, None).unwrap();
+        let detected = detect_frame_stars(&s, &cfg, None, None).unwrap();
         let split = register_detected(
             &reference,
             &detected,
@@ -583,7 +660,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (r, s, _) = pair(dir.path(), 22, -3.0, 2.5, 0.0, 3);
         let cfg = RegistrationConfig::default();
-        let reference = reference_stars(&r, &cfg, None).unwrap();
+        let reference = reference_stars(&r, &cfg, None, None).unwrap();
         let reg = register_frame(
             &reference,
             &s,
@@ -639,7 +716,7 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         let (_, s2, _) = pair(&other, 99, 0.0, 0.0, 0.0, 1);
         let cfg = RegistrationConfig::default();
-        let reference = reference_stars(&r, &cfg, None).unwrap();
+        let reference = reference_stars(&r, &cfg, None, None).unwrap();
         let reg = register_frame(
             &reference,
             &s2,
@@ -667,7 +744,7 @@ mod tests {
     fn the_reference_row_is_the_identity() {
         let dir = tempfile::tempdir().unwrap();
         let (r, _, _) = pair(dir.path(), 24, 0.0, 0.0, 0.0, 1);
-        let reference = reference_stars(&r, &RegistrationConfig::default(), None).unwrap();
+        let reference = reference_stars(&r, &RegistrationConfig::default(), None, None).unwrap();
         let reg = identity_registration(&reference);
         let a = reg.outcome.as_ref().unwrap();
         assert_eq!(a.map.forward(10.5, 20.25), (10.5, 20.25));
@@ -677,4 +754,125 @@ mod tests {
         assert_eq!(rec.affine_a1, Some(1.0));
         assert_eq!(rec.model.as_deref(), Some("similarity"));
     }
+
+    /// Tier C Task 3 (spec §7, ruling C-6) — DELTA pin: on a mono frame,
+    /// aligning with the star list [`stars_from_fits`] builds from
+    /// Measure's own accepted PSF fits must land within the pipeline's own
+    /// tolerance of aligning with today's fresh detection — not
+    /// bit-identical (a different star LIST by design, spec §7), but close.
+    /// The subject's own fits come from
+    /// [`crate::stacking::measure::measure_frame_with_fits`] — the SAME
+    /// function stage 3 calls to produce what `stacking::run` persists as
+    /// the `fits` artifact `detect_frame_stars`'s new `fits` path reads
+    /// back, so this pin exercises the real Measure -> Register seam, not
+    /// a hand-built fixture.
+    #[test]
+    fn fit_derived_stars_align_within_tolerance_of_detected_stars() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, s, _) = pair(dir.path(), 31, 6.0, -4.0, 1.2, 1);
+        let cfg = RegistrationConfig::default();
+        let reference = reference_stars(&r, &cfg, None, None).unwrap();
+
+        let detected = detect_frame_stars(&s, &cfg, None, None).unwrap();
+        assert!(!detected.stars.is_empty(), "fixture must detect stars");
+        let detected_reg = register_detected(
+            &reference,
+            &detected,
+            &cfg,
+            None,
+            SeedPolicy::QuadFirst,
+            SCALE_RANGE,
+        );
+        let detected_align = detected_reg
+            .outcome
+            .expect("the detected-star list must register");
+
+        let measure_opts = crate::stacking::measure::MeasureOptions::default();
+        let (_, fits_by_plane) = crate::stacking::measure::measure_frame_with_fits(
+            &s,
+            &measure_opts,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(fits_by_plane.len(), 1, "the fixture is single-plane");
+
+        let fits_detected = detect_frame_stars(&s, &cfg, None, Some(&fits_by_plane[0])).unwrap();
+        assert!(
+            !fits_detected.stars.is_empty(),
+            "the fit-derived list must not be empty"
+        );
+        let fits_reg = register_detected(
+            &reference,
+            &fits_detected,
+            &cfg,
+            None,
+            SeedPolicy::QuadFirst,
+            SCALE_RANGE,
+        );
+        let fits_align = fits_reg
+            .outcome
+            .expect("the fit-derived star list must register");
+
+        assert!(
+            (fits_align.rms_px - detected_align.rms_px).abs() <= 0.05,
+            "rms_px: detected {} vs fits {}",
+            detected_align.rms_px,
+            fits_align.rms_px
+        );
+        assert!(
+            fits_align.inliers as f64 >= 0.9 * detected_align.inliers as f64,
+            "inliers: detected {} vs fits {}",
+            detected_align.inliers,
+            fits_align.inliers
+        );
+    }
+
+    /// The fits path is a genuine shortcut, not a slower detour dressed up
+    /// as one: no pixel PLANE is ever read when `fits` is `Some` — only the
+    /// header (`PlaneReader::open`'s `probe_fits`, for `width`/`height`).
+    /// Pinned by construction: [`stars_from_fits`] takes no `&[f32]`
+    /// argument at all, so there is no code path left that could read one.
+    #[test]
+    fn detect_frame_stars_with_fits_never_reads_a_pixel_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, s, refs) = pair(dir.path(), 32, 0.0, 0.0, 0.0, 1);
+        let cfg = RegistrationConfig::default();
+        let fits: Vec<StarFit> = refs
+            .iter()
+            .map(|&(x, y, a)| StarFit {
+                x,
+                y,
+                background: 0.0,
+                amplitude: (a as f64) * ADU_SCALE_FOR_TEST,
+                fwhm_x: 3.0,
+                fwhm_y: 3.0,
+                fwtm_x: 6.0,
+                fwtm_y: 6.0,
+                theta: 0.0,
+                beta: 4.0,
+                residual: 0.01,
+                signal: (a as f64) * ADU_SCALE_FOR_TEST * 20.0,
+                area: 28.0,
+            })
+            .collect();
+        let out = detect_frame_stars(&s, &cfg, None, Some(&fits)).unwrap();
+        assert_eq!(out.stars.len(), fits.len().min(cfg.max_stars));
+        // `read_ms` is the HEADER open only, not a full-plane read — a
+        // 640x480 plane is ~1.2 MB and would show up as at least
+        // low-single-digit milliseconds on any real filesystem; the header
+        // open is microseconds. A loose bound (not a strict `== 0`, which
+        // would be flaky on a slow CI runner) still tells the two apart.
+        assert!(
+            out.read_ms <= 5,
+            "fits-path read_ms should be a header open only, got {}",
+            out.read_ms
+        );
+    }
+
+    /// `crate::stacking::measure::ADU_SCALE` — duplicated as a plain
+    /// constant rather than imported, since this test only needs its
+    /// numeric value to build a plausible `StarFit.amplitude`/`signal`
+    /// pair, not the module's own scaling contract.
+    const ADU_SCALE_FOR_TEST: f64 = 65535.0;
 }

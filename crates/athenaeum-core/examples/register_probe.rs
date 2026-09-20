@@ -3,33 +3,48 @@
 //! with an external `.xdrz` alignment sidecar, write the registered frame,
 //! or compare our resampled frame with an externally registered image.
 //!
+//! Tier C Task 3 (spec §7, ruling C-6): `--fits <subject.p0.athf>` feeds a
+//! mono frame's already-persisted `fits` artifact straight to
+//! `detect_frame_stars` instead of detecting on the subject's own pixels —
+//! the same path `stacking::run`'s Register stage takes for a mono frame
+//! with a fresh artifact. `readMs`/`detectMs` on the JSON output are read
+//! straight off `detect_frame_stars`'s own measured split (the debug log's
+//! `"frame stars detected"` event carries the same numbers under
+//! `RUST_LOG`), so an interleaved B/A/B/A run with and without `--fits`
+//! reads the shortcut's cost directly, with no reliance on wall-clock
+//! bracketing around the whole probe.
+//!
 //! cargo run --release -p athenaeum-core --example register_probe -- \
-//!   <reference.fits> <subject.fits> [--xdrz <subject.xdrz>] [--write <dir>] \
+//!   <reference.fits> <subject.fits> [--fits <subject.p0.athf>] \
+//!   [--xdrz <subject.xdrz>] [--write <dir>] \
 //!   [--compare <registered.xisf>] [--model auto|similarity|affine|homography] \
 //!   [--distortion off|polynomial2|polynomial3|polynomial4|auto]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
 use athenaeum_core::geometry::PixelMap;
 use athenaeum_core::integration::plane_reader::PlaneReader;
 use athenaeum_core::resample::{warp_rows, Plane};
+use athenaeum_core::stacking::fits_artifact;
 use athenaeum_core::stacking::register::align::{model_name, SeedPolicy, SCALE_RANGE};
 use athenaeum_core::stacking::register::detect::{detect_stars, luminance, Star};
-use athenaeum_core::stacking::register::frame::{reference_stars, register_frame};
+use athenaeum_core::stacking::register::frame::{
+    detect_frame_stars, reference_stars, register_detected,
+};
 use athenaeum_core::stacking::register::writer::{
     build_registered_cards, source_cards_from_file, write_registered_frame, RegisteredCards,
 };
 use athenaeum_core::stacking::register::RegistrationConfig;
 
 fn usage() -> ! {
-    eprintln!("usage: register_probe <reference.fits> <subject.fits> [--xdrz f] [--write dir] [--compare f.xisf] [--model m] [--distortion d]");
+    eprintln!("usage: register_probe <reference.fits> <subject.fits> [--fits subject.p0.athf] [--xdrz f] [--write dir] [--compare f.xisf] [--model m] [--distortion d]");
     std::process::exit(2);
 }
 
 struct Args {
     reference: PathBuf,
     subject: PathBuf,
+    fits: Option<PathBuf>,
     xdrz: Option<PathBuf>,
     write: Option<PathBuf>,
     compare: Option<PathBuf>,
@@ -43,6 +58,7 @@ fn parse_args() -> Args {
     let mut a = Args {
         reference,
         subject,
+        fits: None,
         xdrz: None,
         write: None,
         compare: None,
@@ -51,6 +67,7 @@ fn parse_args() -> Args {
     while let Some(flag) = it.next() {
         let value = it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
+            "--fits" => a.fits = Some(value.into()),
             "--xdrz" => a.xdrz = Some(value.into()),
             "--write" => a.write = Some(value.into()),
             "--compare" => a.compare = Some(value.into()),
@@ -218,30 +235,47 @@ fn main() {
     }
 
     let args = parse_args();
-    let reference = reference_stars(&args.reference, &args.cfg, None).unwrap_or_else(|e| {
+    let reference = reference_stars(&args.reference, &args.cfg, None, None).unwrap_or_else(|e| {
         eprintln!("reference: {e}");
         std::process::exit(1);
     });
-    let reg = register_frame(
+
+    // Tier C Task 3: an optional pre-read `fits` artifact for the subject —
+    // read here (outside anything timed) so `detect_frame_stars`'s own
+    // `readMs`/`detectMs` below measure only what the fits path itself
+    // costs, not this probe's own file I/O.
+    let subject_fits = args.fits.as_deref().map(|p| {
+        fits_artifact::read_fits(p).unwrap_or_else(|e| {
+            eprintln!("--fits {}: {e}", p.display());
+            std::process::exit(1);
+        })
+    });
+    let detected = detect_frame_stars(&args.subject, &args.cfg, None, subject_fits.as_deref())
+        .unwrap_or_else(|e| {
+            eprintln!("subject: {e}");
+            std::process::exit(1);
+        });
+    let mut reg = register_detected(
         &reference,
-        &args.subject,
+        &detected,
         &args.cfg,
-        None,
-        &AtomicBool::new(false),
         None,
         SeedPolicy::QuadFirst,
         SCALE_RANGE,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("subject: {e}");
-        std::process::exit(1);
-    });
+    );
+    // `register_frame`'s own contract: its `duration_ms` is align-only, the
+    // caller adds the detect+read time back so the reported total still
+    // covers the whole frame (see `register_frame`'s doc comment).
+    reg.duration_ms += detected.read_ms + detected.detect_ms;
     let mut out = serde_json::json!({
         "reference": args.reference.display().to_string(),
         "subject": args.subject.display().to_string(),
         "referenceStars": reference.stars.len(),
         "detections": reg.detections,
         "durationMs": reg.duration_ms,
+        "readMs": detected.read_ms,
+        "detectMs": detected.detect_ms,
+        "starSource": if subject_fits.is_some() { "fits" } else { "detected" },
     });
     let a = match &reg.outcome {
         Ok(a) => a,

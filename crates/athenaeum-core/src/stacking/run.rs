@@ -3816,6 +3816,12 @@ struct PendingRegistration {
     /// that now writes the registered artifact never needs `rc` to learn
     /// whether the output filename gets the `_d` (debayered) marker.
     planes: usize,
+    /// Tier C Task 3 (ruling C-6): this frame's own stage-1 (calibration)
+    /// hash, already resolved above for `expected_hash` — kept so the
+    /// `RegisterItem` build below can derive the `fits` artifact's own
+    /// measurement hash (`measurement_hash_for`) without a second
+    /// `calibration_hash_checked` call.
+    calibrated_hash: String,
 }
 
 /// What one fan-out worker needs — the pixel-side half of a
@@ -3846,6 +3852,12 @@ struct RegisterItem {
     /// of two independently-built ones.
     expected_hash: String,
     planes: usize,
+    /// Tier C Task 3 (spec §7, ruling C-6): this frame's own fresh
+    /// `fits.0` artifact, resolved on the run thread (`resolve_register_fits`)
+    /// only when `pre.is_none()` (a `pre` hit skips `detect_frame_stars`
+    /// entirely, so reading the artifact for it would be wasted I/O) —
+    /// `None` for an OSC frame, a stale/missing artifact, or a `pre` hit.
+    fits: Option<Vec<psf_signal::StarFit>>,
 }
 
 /// Perf tier A Task 6a fix round 1 (ruling R-TA-5): a register fan-out
@@ -3973,6 +3985,101 @@ fn registration_gate_and_hint(
         _ => None,
     };
     (scale_gate, hint, policy)
+}
+
+/// Tier C Task 3 (spec §7, ruling C-6): a mono frame's own fresh `fits.0`
+/// artifact, for [`detect_frame_stars`]/[`reference_stars`] to reuse
+/// instead of detecting on the frame's own pixels a second time — Measure
+/// (stage 3) has already fitted this exact plane. `None` for a multi-plane
+/// (OSC) frame — ruling C-6, "OSC frames keep the luminance detection" —
+/// and every caller below checks `planes` before calling this at all, so
+/// this only warns about a genuine mono fallback, never an OSC frame that
+/// was never a candidate for reuse.
+///
+/// Best-effort: a DB error, a missing/stale row, or an unreadable file all
+/// return `None` with exactly one `warn!` naming why (spec's own
+/// requirement) — reuse is an optimization, never a correctness
+/// requirement, so nothing here ever fails the stage; the caller's
+/// existing detection path is always the fallback.
+fn resolve_register_fits(
+    rc: &RunContext,
+    group_key: &str,
+    frame_id: i64,
+    planes: usize,
+    calibrated_hash: &str,
+) -> Option<Vec<psf_signal::StarFit>> {
+    if planes != 1 {
+        return None;
+    }
+    let expected_hash = measurement_hash_for(&rc.config, calibrated_hash);
+    let kind = fits_artifact::artifact_kind(0);
+    let row = (|| -> Result<Option<crate::db::stacking::StackingArtifactRow>, RunError> {
+        let conn = db(&rc.ctx)?.conn();
+        Ok(crate::db::stacking::find_artifact(
+            &conn,
+            rc.set_id,
+            group_key,
+            &kind,
+            Some(frame_id),
+        )?)
+    })();
+    let row = match row {
+        Ok(row) => row,
+        Err(e) => {
+            // `RunError` carries no `Display`, only `Debug` — the same
+            // convention every other `RunError`-typed warn in this file
+            // already follows (`error = ?e`).
+            tracing::warn!(
+                frame_id,
+                error = ?e,
+                "register: fits artifact lookup failed; detecting"
+            );
+            return None;
+        }
+    };
+    let Some(row) = row.filter(|r| is_fresh(r, &expected_hash)) else {
+        tracing::warn!(frame_id, "register: no fresh fits artifact; detecting");
+        return None;
+    };
+    let Some(path) = row.path.as_deref() else {
+        tracing::warn!(
+            frame_id,
+            "register: fits artifact row has no path; detecting"
+        );
+        return None;
+    };
+    match fits_artifact::read_fits(Path::new(path)) {
+        Ok(fits) => Some(fits),
+        Err(e) => {
+            tracing::warn!(
+                frame_id,
+                path,
+                error = %e,
+                "register: fits artifact unreadable; detecting"
+            );
+            None
+        }
+    }
+}
+
+/// [`resolve_register_fits`] for a frame identified only by `frame_id` —
+/// the reference-detection call sites (`stage_register`,
+/// `register_native_groups`) know the reference's `frame_id` before they
+/// know which group it belongs to. A linear scan of `RunContext::measured`
+/// (every group, every measured frame) is fine here: this runs at most
+/// once per group per stage-5 pass, never per subject frame.
+fn resolve_reference_fits(
+    rc: &RunContext,
+    frame_id: i64,
+    calibrated_hash: &str,
+) -> Option<Vec<psf_signal::StarFit>> {
+    let (group_key, planes) = rc.measured.iter().find_map(|(key, frames)| {
+        frames
+            .iter()
+            .find(|f| f.frame.frame_id == frame_id)
+            .map(|f| (key.clone(), f.planes))
+    })?;
+    resolve_register_fits(rc, &group_key, frame_id, planes, calibrated_hash)
 }
 
 /// ONE registration pass over ONE group (M4a Task 4, ruling R-M4a-5 — the
@@ -4194,6 +4301,7 @@ fn register_group_pass(
                 hint,
                 policy,
                 planes,
+                calibrated_hash: frame_hash,
             });
         }
     }
@@ -4374,6 +4482,21 @@ fn register_group_pass(
             } else {
                 None
             };
+            // Tier C Task 3 (ruling C-6): resolved only when this item will
+            // actually reach `detect_frame_stars` below — a `pre` hit and
+            // the reference's own identity row never call it, so reading
+            // the artifact for either would be wasted I/O.
+            let fits = if pre.is_none() && !p.is_reference {
+                resolve_register_fits(
+                    rc,
+                    &group.key,
+                    p.frame.frame_id,
+                    p.planes,
+                    &p.calibrated_hash,
+                )
+            } else {
+                None
+            };
             RegisterItem {
                 frame_id: p.frame.frame_id,
                 frame: p.frame,
@@ -4385,6 +4508,7 @@ fn register_group_pass(
                 pre,
                 expected_hash: p.expected_hash,
                 planes: p.planes,
+                fits,
             }
         })
         .collect();
@@ -4427,7 +4551,10 @@ fn register_group_pass(
             let was_miss = item.pre.is_none();
             let detected: Result<Arc<DetectedStars>, IntegrationError> = match item.pre {
                 Some(d) => Ok(d),
-                None => detect_frame_stars(&item.path, reg_cfg, Some(pool_ref)).map(Arc::new),
+                None => {
+                    detect_frame_stars(&item.path, reg_cfg, Some(pool_ref), item.fits.as_deref())
+                        .map(Arc::new)
+                }
             };
             match detected {
                 Err(e) => Err(format!("registration failed: {e}")),
@@ -4890,40 +5017,71 @@ fn two_pass_refine(
         match find_frame_in_groups(&rc.plan_groups, new_frame_id) {
             None => Err("it is not in any plan group".to_string()),
             Some(new_group_frame) => {
-                // Perf tier 1 Task 9: the dry pass already detected this
-                // frame's stars moments ago, as a regular candidate, the
-                // SAME `cfg.detection`/`cfg.max_stars` a fresh
-                // `reference_stars` read below would use — reuse rather
-                // than pay for a second read+detect of the frame the pick
-                // just chose. Read here, not removed: the persisting
-                // registration pass that follows builds a `RegisterItem`
-                // for EVERY frame it registers (`rc.dry_pass_stars.remove`,
-                // this function's caller a few frames up the stack) — the
-                // reference's own item included, whether or not its dry-pass
-                // pick changed here — so the entry is still removed, just
-                // not by this lookup; `identity_registration` then ignores
-                // the `RegisterItem.pre` it carries (it takes no
-                // detections), so the removal costs nothing, it just isn't
-                // this line's job.
-                let stars = match rc.dry_pass_stars.get(&new_frame_id) {
-                    Some(cached) => Ok(ReferenceStars::from(cached.as_ref())),
-                    None => {
-                        let pool_ref = &rc.ctx.image_pool;
-                        reference_stars(&new_calibrated, &cfg.registration, Some(pool_ref))
-                            .map_err(|e| format!("its star detection failed: {e}"))
-                    }
+                // Tier C Task 3 (ruling C-6): the hash now comes FIRST (it
+                // used to follow `stars`) so a fresh mono `fits` artifact
+                // can be resolved before the fallback detection below needs
+                // it.
+                let new_hash: Result<String, String> = {
+                    let conn = db(&rc.ctx)?.conn();
+                    rc.memo
+                        .calibration_hash_checked(&conn, &cfg, &new_group_frame)
+                        .map_err(|e| format!("its calibration hash is unresolvable: {e}"))
                 };
-                match stars {
+                match new_hash {
                     Err(e) => Err(e),
-                    Ok(new_ref_stars) => {
-                        let conn = db(&rc.ctx)?.conn();
-                        match rc
-                            .memo
-                            .calibration_hash_checked(&conn, &cfg, &new_group_frame)
-                        {
-                            Ok(new_hash) => Ok((new_ref_stars, new_hash)),
-                            Err(e) => Err(format!("its calibration hash is unresolvable: {e}")),
-                        }
+                    Ok(new_hash) => {
+                        // Perf tier 1 Task 9: the dry pass already detected
+                        // this frame's stars moments ago, as a regular
+                        // candidate, the SAME `cfg.detection`/`cfg.max_stars`
+                        // a fresh `reference_stars` read below would use —
+                        // reuse rather than pay for a second read+detect of
+                        // the frame the pick just chose. Read here, not
+                        // removed: the persisting registration pass that
+                        // follows builds a `RegisterItem` for EVERY frame it
+                        // registers (`rc.dry_pass_stars.remove`, this
+                        // function's caller a few frames up the stack) — the
+                        // reference's own item included, whether or not its
+                        // dry-pass pick changed here — so the entry is still
+                        // removed, just not by this lookup;
+                        // `identity_registration` then ignores the
+                        // `RegisterItem.pre` it carries (it takes no
+                        // detections), so the removal costs nothing, it just
+                        // isn't this line's job.
+                        let stars = match rc.dry_pass_stars.get(&new_frame_id) {
+                            Some(cached) => Ok(ReferenceStars::from(cached.as_ref())),
+                            None => {
+                                let pool_ref = &rc.ctx.image_pool;
+                                // Tier C Task 3 (ruling C-6): this branch has
+                                // no test forcing it (see the doc comment
+                                // above) — a race between the dry pass and
+                                // here, not a real pipeline state — so the
+                                // fits reuse is wired the same way every
+                                // other reference read is rather than left
+                                // stubbed, but it costs nothing when the
+                                // branch never runs.
+                                let planes = rc
+                                    .measured
+                                    .get(&group.key)
+                                    .and_then(|v| v.get(new_idx))
+                                    .map(|e| e.planes)
+                                    .unwrap_or(1);
+                                let fits = resolve_register_fits(
+                                    rc,
+                                    &group.key,
+                                    new_frame_id,
+                                    planes,
+                                    &new_hash,
+                                );
+                                reference_stars(
+                                    &new_calibrated,
+                                    &cfg.registration,
+                                    Some(pool_ref),
+                                    fits.as_deref(),
+                                )
+                                .map_err(|e| format!("its star detection failed: {e}"))
+                            }
+                        };
+                        stars.map(|s| (s, new_hash))
                     }
                 }
             }
@@ -5080,10 +5238,19 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
         let geometry = rc.geometry_of(&group.key).clone();
         let mut reference_frame_id = geometry.reference_frame_id;
         let mut reference_hash = geometry.hash.clone();
+        // Tier C Task 3 (ruling C-6): `geometry.hash` IS this group's
+        // reference's own stage-1 hash already — no extra lookup needed to
+        // resolve its `fits` artifact, unlike the co-registered path above.
+        let reference_fits = resolve_reference_fits(rc, reference_frame_id, &reference_hash);
         let mut ref_stars = {
             let pool_ref = &rc.ctx.image_pool;
-            reference_stars(&geometry.calibrated, &cfg.registration, Some(pool_ref))
-                .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
+            reference_stars(
+                &geometry.calibrated,
+                &cfg.registration,
+                Some(pool_ref),
+                reference_fits.as_deref(),
+            )
+            .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
         };
         set_group_geometry(
             rc,
@@ -5246,14 +5413,11 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         .clone()
         .ok_or_else(|| RunError::Other("reference frame has no calibrated file".to_string()))?;
 
-    let mut ref_stars = {
-        let pool_ref = &rc.ctx.image_pool;
-        reference_stars(&reference_calibrated, &cfg.registration, Some(pool_ref))
-            .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
-    };
-    rc.reference_width = ref_stars.width;
-    rc.reference_height = ref_stars.height;
-
+    // Tier C Task 3 (ruling C-6): the reference's own calibration hash is
+    // resolved BEFORE the star read now (it used to follow it) so a fresh
+    // mono `fits` artifact can be looked up and handed to `reference_stars`
+    // instead of a fresh detection — `calibration_hash_checked` is memoized,
+    // so hoisting this costs nothing new.
     let reference_group_frame = find_frame_in_groups(&rc.plan_groups, reference_frame_id)
         .ok_or_else(|| RunError::Other("reference frame not found in any group".to_string()))?;
     let mut reference_hash = {
@@ -5261,6 +5425,20 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
         rc.memo
             .calibration_hash_checked(&conn, &cfg, &reference_group_frame)?
     };
+    let reference_fits = resolve_reference_fits(rc, reference_frame_id, &reference_hash);
+
+    let mut ref_stars = {
+        let pool_ref = &rc.ctx.image_pool;
+        reference_stars(
+            &reference_calibrated,
+            &cfg.registration,
+            Some(pool_ref),
+            reference_fits.as_deref(),
+        )
+        .map_err(|e| RunError::Other(format!("reference star detection failed: {e}")))?
+    };
+    rc.reference_width = ref_stars.width;
+    rc.reference_height = ref_stars.height;
 
     // M4b ruling R-M4b-5: co-registered means every group's geometry IS the
     // run-wide reference's — the measured dimensions stage 4 recorded are
@@ -11538,6 +11716,7 @@ mod tests {
             &reference_calibrated,
             &cfg.registration,
             Some(&rc.ctx.image_pool),
+            None,
         )
         .unwrap();
         // (M4b Task 3 fix round 1, m7: nothing sets `rc.reference_width`/

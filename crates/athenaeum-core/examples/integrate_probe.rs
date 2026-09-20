@@ -586,10 +586,11 @@ fn main() {
     let cancel = AtomicBool::new(false);
     let measure_opts = MeasureOptions::default();
 
-    let reference = reference_stars(&args.reference, &args.reg, Some(&pool)).unwrap_or_else(|e| {
-        eprintln!("[integrate_probe] reference: {e}");
-        std::process::exit(1);
-    });
+    let reference =
+        reference_stars(&args.reference, &args.reg, Some(&pool), None).unwrap_or_else(|e| {
+            eprintln!("[integrate_probe] reference: {e}");
+            std::process::exit(1);
+        });
 
     let mut candidates = frame_paths(&args.dir, args.osc, args.limit);
     if candidates.is_empty() {

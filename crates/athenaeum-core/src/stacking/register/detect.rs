@@ -179,7 +179,6 @@ pub fn detect_stars(
 /// numerically identical to `astroimage`'s own per-star SNR, but it cuts
 /// the same population: a fit whose noise is a large fraction of its own
 /// signal.
-#[allow(dead_code)]
 pub(crate) fn passes_register_cuts(fit: &StarFit, cfg: &DetectionConfig) -> bool {
     let saturation = (SATURATION * ADU_SCALE) as f64;
     if fit.background + fit.amplitude >= saturation {
@@ -197,6 +196,47 @@ pub(crate) fn passes_register_cuts(fit: &StarFit, cfg: &DetectionConfig) -> bool
         return false;
     }
     true
+}
+
+/// Gaussian FWHM -> sigma, `2 * sqrt(2 * ln 2)` — the same conversion
+/// rustafits' own fast detector uses for `FastStar::sx`/`sy` (`sigma_x =
+/// FWHM_x / 2.3548`), so a fit-derived star's [`Star::sigma`] carries the
+/// same per-axis meaning a freshly detected one would, for `align.rs`'s
+/// weighted pairing (`pair_projected`) to use identically either way.
+const FWHM_TO_SIGMA: f64 = 2.354_820_045_030_949_3;
+
+/// Turn one plane's accepted PSF fits (Tier C Task 3, spec §7, ruling C-6)
+/// into a registration star list, in the same shape [`detect_stars`]
+/// itself returns: [`passes_register_cuts`] applied per fit (this
+/// detector's own saturation/eccentricity/SNR cuts — Measure's own
+/// acceptance does not reject those the way this module always has),
+/// sorted brightest-first by [`StarFit::signal`], truncated to
+/// `max_stars`. Mono frames only — a single-plane frame's luminance IS the
+/// measured plane, so the fitted centroid already IS the plane's own
+/// detection; an OSC (multi-plane) frame has no single luminance fit to
+/// reuse this way (the caller decides mono vs OSC — see
+/// [`crate::stacking::register::frame::detect_frame_stars`]).
+pub(crate) fn stars_from_fits(
+    fits: &[StarFit],
+    cfg: &DetectionConfig,
+    max_stars: usize,
+) -> Vec<Star> {
+    let mut stars: Vec<Star> = fits
+        .iter()
+        .filter(|fit| passes_register_cuts(fit, cfg))
+        .map(|fit| {
+            let (sx, sy) = (fit.fwhm_x / FWHM_TO_SIGMA, fit.fwhm_y / FWHM_TO_SIGMA);
+            Star {
+                x: fit.x,
+                y: fit.y,
+                flux: fit.signal,
+                sigma: (sx > 0.0 && sy > 0.0).then_some((sx, sy)),
+            }
+        })
+        .collect();
+    stars.sort_by(|a, b| b.flux.total_cmp(&a.flux));
+    stars.truncate(max_stars);
+    stars
 }
 
 #[cfg(test)]
@@ -538,5 +578,58 @@ mod tests {
             ..good_fit()
         };
         assert!(!passes_register_cuts(&noisy, &DetectionConfig::default()));
+    }
+
+    #[test]
+    fn stars_from_fits_converts_position_flux_and_sigma() {
+        let fit = good_fit();
+        let stars = stars_from_fits(&[fit], &DetectionConfig::default(), 10);
+        assert_eq!(stars.len(), 1);
+        let s = &stars[0];
+        assert_eq!((s.x, s.y), (fit.x, fit.y));
+        assert_eq!(s.flux, fit.signal);
+        let (sx, sy) = s.sigma.expect("a well-formed fwhm carries a sigma");
+        assert!((sx - fit.fwhm_x / FWHM_TO_SIGMA).abs() < 1e-12);
+        assert!((sy - fit.fwhm_y / FWHM_TO_SIGMA).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stars_from_fits_drops_what_passes_register_cuts_would_drop() {
+        let saturated = StarFit {
+            background: 1000.0,
+            amplitude: (SATURATION * ADU_SCALE) as f64,
+            ..good_fit()
+        };
+        let elongated = StarFit {
+            fwhm_x: 10.0,
+            fwhm_y: 1.0,
+            ..good_fit()
+        };
+        let stars = stars_from_fits(
+            &[good_fit(), saturated, elongated],
+            &DetectionConfig::default(),
+            10,
+        );
+        assert_eq!(stars.len(), 1, "only the good fit must survive: {stars:?}");
+    }
+
+    #[test]
+    fn stars_from_fits_sorts_brightest_first_and_truncates() {
+        let dim = StarFit {
+            signal: 10.0,
+            ..good_fit()
+        };
+        let bright = StarFit {
+            signal: 90.0,
+            ..good_fit()
+        };
+        let mid = StarFit {
+            signal: 50.0,
+            ..good_fit()
+        };
+        let stars = stars_from_fits(&[dim, bright, mid], &DetectionConfig::default(), 2);
+        assert_eq!(stars.len(), 2);
+        assert_eq!(stars[0].flux, 90.0);
+        assert_eq!(stars[1].flux, 50.0);
     }
 }
