@@ -39,8 +39,8 @@
 | ---- | ---- |
 | `migrations/0013_governance.sql` | `project_members.gov_caps text[]`, backfill coordinators |
 | `migrations/0014_alumni.sql` | `project_alumni` table |
-| `migrations/0015_join_policy.sql` | `projects.join_policy`, `projects.default_data_role` |
-| `migrations/0016_have_soft_state.sql` | `package_announcements.publisher_device_id`, index on `have_reports.reported_at` |
+| `migrations/0016_join_policy.sql` | `projects.join_policy`, `projects.default_data_role` |
+| `migrations/0015_have_soft_state.sql` | `package_announcements.publisher_device_id`, index on `have_reports.reported_at` |
 | `src/collab_auth.rs` | `Member.gov_caps`, `GOV_CAPS`, `Member::has_cap`, `require_cap` / `require_cap_tx` |
 | `src/routes/members.rs` | `PATCH members/{account}` takes `dataRole` and/or `govCaps`; alumni row on remove/leave; leave takes `{credited}` |
 | `src/routes/join_requests.rs` | gates on `members.manage`; open door joins directly; invite door 403 |
@@ -544,7 +544,7 @@ query `SELECT display_name, data_role, joined_at, left_at, how, credited FROM pr
 ## Task 3: H3 — have-reports as soft state, publisher counts as a holder (hub)
 
 **Files:**
-- Create: `migrations/0016_have_soft_state.sql` (numbered after Task 4's 0015 — write `0016` here regardless of execution order; sqlx runs them in filename order and neither depends on the other)
+- Create: `migrations/0015_have_soft_state.sql` (execution order = filename order: Task 3 is 0015, Task 4 is 0016 — sqlx refuses a database that applied a later version before an earlier one)
 - Modify: `src/routes/announcements.rs` (announce stamps device; `report_have_set`; holder list freshness ∪ publisher), `src/routes/projects.rs:636-660` (holder counts), `src/routes/mod.rs` (route)
 - Modify: `README.md`
 - Test: `tests/have_soft_state.rs`
@@ -555,9 +555,9 @@ query `SELECT display_name, data_role, joined_at, left_at, how, credited FROM pr
 
 - [ ] **Step 1: Migration**
 
-`migrations/0016_have_soft_state.sql`:
+`migrations/0015_have_soft_state.sql`:
 ```sql
--- 0016_have_soft_state — have-reports expire unless re-confirmed; the
+-- 0015_have_soft_state — have-reports expire unless re-confirmed; the
 -- announcing device is a holder by construction.
 ALTER TABLE package_announcements ADD COLUMN IF NOT EXISTS publisher_device_id uuid REFERENCES devices (id);
 CREATE INDEX IF NOT EXISTS have_reports_reported_at ON have_reports (reported_at);
@@ -745,7 +745,7 @@ pub(crate) const HOLDER_DEVICES_SQL: &str =
 ## Task 4: H4 — the project's door (hub)
 
 **Files:**
-- Create: `migrations/0015_join_policy.sql`
+- Create: `migrations/0016_join_policy.sql`
 - Modify: `src/routes/projects.rs` (`ProjectRow`/`PROJECT_COLUMNS`/`ProjectView`/`DirectoryRow`/`DirectoryItem`/`CreateProject`/`UpdateProject`/`create_project_core`/`update_project`)
 - Modify: `src/routes/join_requests.rs:38-140` (`create_join_request`)
 - Modify: `README.md`
@@ -757,9 +757,9 @@ pub(crate) const HOLDER_DEVICES_SQL: &str =
 
 - [ ] **Step 1: Migration**
 
-`migrations/0015_join_policy.sql`:
+`migrations/0016_join_policy.sql`:
 ```sql
--- 0015_join_policy — who may come in, and which data role a newcomer gets.
+-- 0016_join_policy — who may come in, and which data role a newcomer gets.
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS join_policy text NOT NULL DEFAULT 'request';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS default_data_role text NOT NULL DEFAULT 'send';
 DO $$ BEGIN
