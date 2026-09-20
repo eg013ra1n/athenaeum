@@ -399,6 +399,34 @@ impl CollabClient {
             s => Err(unexpected(s, resp).await),
         }
     }
+
+    /// `PUT /projects/{id}/have` — re-confirm the FULL set of this project's
+    /// packages the device holds right now (an empty slice is a real
+    /// statement: "I hold nothing here any more"). 204 → Ok; 401 →
+    /// `Unauthorized`; 403 (the caller's role may not hold packages, e.g.
+    /// `send`-only) and any other status surface via `unexpected` as
+    /// `Network`, never `Unauthorized` — the caller treats 403 as an expected
+    /// outcome, not a dead token.
+    pub async fn report_have_set(
+        &self,
+        token: &str,
+        project_id: &str,
+        package_ids: &[String],
+    ) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/projects/{project_id}/have")))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "packageIds": package_ids }))
+            .send()
+            .await
+            .map_err(net)?;
+        match resp.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
+            s => Err(unexpected(s, resp).await),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -757,5 +785,38 @@ mod tests {
             }
             other => panic!("expected Network for 400 (not Unauthorized), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn report_have_set_puts_full_package_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/projects/proj-1/have"))
+            .and(header("authorization", "Bearer tok"))
+            .and(body_json(serde_json::json!({"packageIds": ["p1", "p2"]})))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = CollabClient::new(server.uri()).unwrap();
+        client
+            .report_have_set("tok", "proj-1", &["p1".to_string(), "p2".to_string()])
+            .await
+            .unwrap();
+    }
+
+    /// A 403 (the caller's role may not hold packages) is a role fact, not a
+    /// dead token — the client must not fold it into `Unauthorized`.
+    #[tokio::test]
+    async fn report_have_set_403_is_forbidden_not_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/projects/proj-1/have"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let client = CollabClient::new(server.uri()).unwrap();
+        let err = client.report_have_set("tok", "proj-1", &[]).await.unwrap_err();
+        assert!(!matches!(err, AccountClientError::Unauthorized), "403 = role, not a dead token: {err:?}");
     }
 }

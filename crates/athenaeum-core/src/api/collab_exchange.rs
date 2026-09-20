@@ -248,6 +248,40 @@ fn manifest_fully_local(
     Ok(true)
 }
 
+/// The have-report completeness gate (F1): local status is `complete` AND the
+/// retained manifest's every record resolves to a locally-held contribution
+/// ([`manifest_fully_local`]) — the same predicate [`reconstruct_serve_dir`]
+/// enforces before it will serve a package. Shared by the post-ingest hook
+/// ([`report_have_after_ingest`]) and the auto-sync pass's full-set report
+/// ([`held_package_ids_for_project`]), so both agree on what "held" means. A
+/// row with no retained manifest (never fully received) is never held.
+fn package_fully_held(conn: &rusqlite::Connection, row: &PackageRow) -> Result<bool> {
+    if row.local_status != "complete" {
+        return Ok(false);
+    }
+    let Some(bytes) = row.manifest_ndjson.as_deref() else {
+        return Ok(false);
+    };
+    let records = parse_manifest_bytes(bytes)?;
+    manifest_fully_local(conn, &row.project_id, &records)
+}
+
+/// Every package of `project_id` this device currently fully holds
+/// ([`package_fully_held`]) — the body of the auto-sync pass's
+/// `PUT /projects/{id}/have` re-confirmation.
+pub(crate) fn held_package_ids_for_project(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for row in list_packages(conn, project_id)? {
+        if package_fully_held(conn, &row)? {
+            ids.push(row.package_id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Materialize `dest_dir` from the RETAINED MANIFEST (Д2): `manifest.ndjson`
 /// byte-exact from `manifest_bytes`, then for each manifest record resolve its
 /// payload among locally-held contributions by content hash
@@ -1026,30 +1060,14 @@ pub async fn report_have_after_ingest(
         // Gate (F1): only advertise a package we can ACTUALLY fully serve. The
         // post-ingest hook fires even after a partial/failed ingest, so without
         // this the hub would list us as a holder that per-frame-fails every
-        // requester. Complete local status AND every manifest record's payload
-        // resolvable by content hash — the same predicate `reconstruct_serve_dir`
-        // enforces, checked cheaply here first.
-        if row.local_status != "complete" {
+        // requester.
+        let fully_held = package_fully_held(&conn, &row)
+            .map_err(|e| ApiError::Internal(format!("package fully-held check: {e:#}")))?;
+        if !fully_held {
             tracing::debug!(
                 package_id,
                 local_status = %row.local_status,
-                "report_have skipped: package not locally complete"
-            );
-            return Ok(());
-        }
-        let manifest_ok = match row.manifest_ndjson.as_deref() {
-            Some(bytes) => {
-                let records = parse_manifest_bytes(bytes)
-                    .map_err(|e| ApiError::Internal(format!("parse retained manifest: {e:#}")))?;
-                manifest_fully_local(&conn, &row.project_id, &records)
-                    .map_err(|e| ApiError::Internal(format!("manifest coverage check: {e:#}")))?
-            }
-            None => false,
-        };
-        if !manifest_ok {
-            tracing::warn!(
-                package_id,
-                "report_have skipped: retained manifest not fully covered by local payloads"
+                "report_have skipped: package not fully held"
             );
             return Ok(());
         }
@@ -1062,6 +1080,51 @@ pub async fn report_have_after_ingest(
         .map_err(client_err)?;
     tracing::info!(package_id, announcement_id = %announcement_id, "reported have to hub");
     Ok(())
+}
+
+/// A1: re-confirm the FULL set of this project's packages this device holds
+/// right now — `PUT /projects/{id}/have { packageIds }`. A row the hub isn't
+/// re-told about within its own window stops counting as a holder, so this
+/// runs on every auto-sync pass, including for a project whose
+/// auto-replication toggle is off (a holder still holds — see
+/// [`run_auto_sync_pass`]). An empty held set is still sent: "I hold nothing
+/// here any more" is a real statement that clears stale rows on the hub.
+///
+/// Signed out ⇒ `Ok(0)`, nothing to report. A 403 (the caller's role may not
+/// hold packages, e.g. a `send`-only member) is EXPECTED on every pass for
+/// such a member, not a failure — logged at `debug!` and folded into `Ok(0)`;
+/// a dead token (401) propagates as the usual `SignedOut` mapping; any other
+/// error is returned for the caller to log and step over.
+pub async fn report_held_set(ctx: &ServiceContext, project_id: &str) -> Result<usize, ApiError> {
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Ok(0);
+    };
+    let package_ids = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        held_package_ids_for_project(&conn, project_id)
+            .map_err(|e| ApiError::Internal(format!("held package ids: {e:#}")))?
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    match client.report_have_set(&token, project_id, &package_ids).await {
+        Ok(()) => {
+            tracing::info!(project_id, count = package_ids.len(), "held set reported");
+            Ok(package_ids.len())
+        }
+        // `report_have_set` maps every non-200/204/401 status through
+        // `unexpected()`, which formats as "hub returned 403 Forbidden…" — the
+        // only signal that distinguishes a role refusal from any other hub
+        // failure, since the client doesn't grow its own variant for it
+        // (mirrors `report_have`'s shape, by design — see its doc comment).
+        Err(crate::account::AccountClientError::Network(msg)) if msg.starts_with("hub returned 403") => {
+            tracing::debug!(
+                project_id,
+                "held-set report forbidden by role; expected for a send-only member"
+            );
+            Ok(0)
+        }
+        Err(e) => Err(client_err(e)),
+    }
 }
 
 /// **Every downloader becomes a seed** (D3 §3.4): after a successful ingest, pin
@@ -2511,6 +2574,21 @@ where
             continue;
         }
         let role_allows = role_allows_replication(&project.data_role, project.is_coordinator);
+
+        // A1: re-confirm the FULL held set every pass — even when auto_on is
+        // false below, because a holder still holds. NOT gated on auto_on;
+        // gated on role_allows alone (a role that may not hold packages gets
+        // its own 403 handling inside `report_held_set`, not a skip here).
+        if role_allows {
+            if let Err(e) = report_held_set(ctx, &project.project_id).await {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error = %format!("{e}"),
+                    "held-set report failed; continuing"
+                );
+            }
+        }
+
         let auto_on = force_auto_on || project.auto_replicate;
         if !role_allows || !auto_on {
             tracing::debug!(
@@ -5729,6 +5807,55 @@ mod tests {
             "only the named project syncs"
         );
         assert_eq!(outcome.projects, 1);
+    }
+
+    /// A1: the pass re-confirms the FULL held set — a `PUT /projects/{id}/have`
+    /// naming every package this device fully holds — for a project whose
+    /// auto-replication toggle is OFF, because a holder still holds. The
+    /// `downloading` package is not yet held and must be absent from the body;
+    /// the download seam must never fire (auto_on still gates replication).
+    #[tokio::test]
+    async fn auto_pass_reports_held_set_even_when_auto_replicate_is_off() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PROJECT: &str = "p-held";
+        const HELD: &str = "pkg-held";
+        const PENDING: &str = "pkg-pending-dl";
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/projects/{PROJECT}/have")))
+            .and(body_json(serde_json::json!({ "packageIds": [HELD] })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let landing = tmp.path().join("landing");
+        {
+            let conn = db(&ctx).unwrap().conn();
+            // auto_replicate = false: a holder still holds.
+            seed_project_with(&conn, PROJECT, "send_receive", false, false);
+            seed_received_package(&conn, &landing, PROJECT, HELD, "Alice", "published", b"payload");
+            let mut downloading = base_package(PENDING, PROJECT, "Alice");
+            downloading.local_status = "downloading".to_string();
+            upsert_package(&conn, &downloading).unwrap();
+        }
+
+        let rec = Arc::new(DownloadRecorder::default());
+        let outcome = pass_with(&ctx, &rec, None, false).await;
+
+        assert!(
+            rec.package_ids().is_empty(),
+            "auto_replicate off ⇒ never reaches the download seam"
+        );
+        assert_eq!(
+            outcome.projects, 0,
+            "auto-off project isn't counted as swept, even though it reported"
+        );
     }
 
     /// The worker's own announcement refresh CONSUMES the state diffs (they are
