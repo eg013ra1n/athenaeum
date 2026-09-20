@@ -46,14 +46,14 @@ use athenaeum_core::stacking::ln::{
     background_grid, build_reference, normalize_frame, relative_scale, BackgroundParams,
     LnFrameGrids, LnGrid, LnReferenceForDetection, DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
 };
-use athenaeum_core::stacking::measure::FrameMeasurement;
-use athenaeum_core::stacking::psf_signal::PsfModel;
+use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
+use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
 use athenaeum_core::stacking::weights::FrameWeight;
 
 fn usage() -> ! {
     eprintln!(
         "usage: ln_probe --db <catalog.db> --set <id> --group <key> \
-[--frames N] [--scale 1024] [--frame <calibrated-file-stem>]"
+[--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits]"
     );
     std::process::exit(2);
 }
@@ -65,6 +65,13 @@ struct Args {
     frames: u32,
     scale: u32,
     frame: Option<String>,
+    /// Perf tier C Task 2's own A/B flag: force the pre-Task-2 behaviour
+    /// (full detection on the warped frame, `scale::relative_scale_against`)
+    /// by handing `normalize_frame` no fits at all, instead of the target's
+    /// own Measure-style fits this probe now always computes. Interleaved
+    /// with/without this flag on the SAME target frame is the task's own
+    /// acceptance measurement.
+    no_fits: bool,
 }
 
 fn parse_args() -> Args {
@@ -74,9 +81,14 @@ fn parse_args() -> Args {
     let mut frames: u32 = LocalNormalizationConfig::default().reference_frames;
     let mut scale: u32 = LocalNormalizationConfig::default().scale;
     let mut frame: Option<String> = None;
+    let mut no_fits = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--no-fits" {
+            no_fits = true;
+            continue;
+        }
         let value = it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--db" => db = Some(value.into()),
@@ -96,6 +108,7 @@ fn parse_args() -> Args {
         frames,
         scale,
         frame,
+        no_fits,
     }
 }
 
@@ -470,12 +483,21 @@ registration row for each — run stacking through Register first); found {}",
         reference.height
     );
 
-    let ref_for_detection = LnReferenceForDetection::build(
-        &reference,
-        local_cfg.psf_model,
-        measure_opts.max_stars,
-        None,
-    );
+    // Perf tier C Task 2 (ruling C-1/C-1a): the group β — the lower median
+    // of every candidate's own Auto pick, read straight off the cached
+    // `metrics` payloads already loaded above (no re-measurement needed;
+    // this is the exact same computation `stacking::run`'s stage 3 does).
+    let group_betas: Vec<f64> = stack_frames
+        .iter()
+        .flat_map(|f| f.measurement.channels.iter().map(|c| c.beta))
+        .collect();
+    let group_beta_value = group_beta(&group_betas);
+    let reference_psf = match local_cfg.psf_model {
+        PsfModel::Auto => PsfModel::Fixed(group_beta_value),
+        other => other,
+    };
+    let ref_for_detection =
+        LnReferenceForDetection::build(&reference, reference_psf, measure_opts.max_stars, None);
     let ref_params = BackgroundParams {
         scale: args.scale,
         ..DEFAULT_PARAMS
@@ -531,11 +553,33 @@ registration row for each — run stacking through Register first); found {}",
     let sidecar_dir = tempfile::tempdir().expect("create a tempdir for the sidecar");
     let sidecar_path = sidecar_dir.path().join("probe.athln");
 
+    // Perf tier C Task 2's own acceptance input: this acceptance catalog
+    // predates Task 1, so no `fits` artifact exists on disk for the target
+    // frame — this probe produces it itself, via the SAME function Measure's
+    // own stage 3 calls (`measure_frame_with_fits`, `measure_plane_with_seeds`
+    // per plane) on the target's calibrated (native, unwarped) file. Always
+    // computed, even under `--no-fits`, so the A/B flag only changes what
+    // `normalize_frame` is HANDED, never what this probe measures outside it.
+    let (_, target_fits) =
+        measure_frame_with_fits(&target.path, &measure_opts, Some(&pool), &cancel).unwrap_or_else(
+            |e| {
+                eprintln!("measuring the target's own fits: {e}");
+                std::process::exit(1);
+            },
+        );
+    let fits_arg = if args.no_fits {
+        None
+    } else {
+        Some(target_fits.as_slice())
+    };
+
     let outcome = normalize_frame(
         &reference,
         &ref_for_detection,
         &ref_backgrounds,
         target,
+        fits_arg,
+        group_beta_value,
         &local_cfg,
         &measure_opts,
         interpolation,
@@ -672,7 +716,10 @@ registration row for each — run stacking through Register first); found {}",
             "matches": outcome.matches,
             "cellsRejected": outcome.cells_rejected,
             "path": outcome.sidecar.display().to_string(),
+            "scaleSource": outcome.scale_source,
         },
+        "noFits": args.no_fits,
+        "groupBeta": group_beta_value,
         // Perf tier A Task 12: `normalize_frame`'s own per-phase timing —
         // `run.rs` logs these via `tracing::debug!` on every real run, but
         // this probe calls `normalize_frame` directly and prints its own

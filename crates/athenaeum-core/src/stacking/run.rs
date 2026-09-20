@@ -8196,20 +8196,92 @@ fn run_group_normalization(
         }
     }
 
+    // Perf tier C Task 2 (ruling C-1): whatever stage 3 resolved for this
+    // group's members' own `Auto` picks — `None` for a group stage 3 never
+    // measured a frame for (falls back to `Auto`'s own default, same as
+    // `psf_signal::group_beta` on an empty slice).
+    let group_beta = rc
+        .measured_groups
+        .get(&group.key)
+        .and_then(|mg| mg.beta)
+        .unwrap_or(4.0);
+
     // Fix round 1, item 6: computed ONCE per group, not once per frame.
     // I2 (final fix wave): also hoists the reference-side star detection +
     // PSF fit + match tree (`prepared`), so `normalize_frame`'s
     // `relative_scale_against` call never re-detects/re-fits the
     // reference plane on every frame either.
+    //
+    // Perf tier C Task 2 (ruling C-1): `normalization.local.psfModel =
+    // Auto` resolves to the GROUP's own β instead of a fresh per-reference
+    // `Auto` search — Measure's persisted fits (which `normalize_frame`
+    // now prefers over re-detecting) were fitted at the group β too, so
+    // fitting the reference at anything else would reintroduce exactly the
+    // β mismatch `psf_signal::fit_stars_with_beta`'s own doc warns against.
+    // `Moffat4` (or any future explicit choice) is untouched.
+    let reference_psf = match ln_cfg.psf_model {
+        psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
+        other => other,
+    };
     let reference_for_detection = LnReferenceForDetection::build(
         &ln_reference,
-        ln_cfg.psf_model,
+        reference_psf,
         measure_opts.max_stars,
         Some(&rc.ctx.image_pool),
     );
 
     let group_frames_by_id: HashMap<i64, &GroupFrame> =
         group.frames.iter().map(|f| (f.frame_id, f)).collect();
+
+    // Perf tier C Task 2 (spec §2.2.3): resolve each member's per-plane
+    // `fits` artifact PATHS up front — a metadata-only DB lookup, the same
+    // shape as the `ln` artifact check below — keyed on the SAME
+    // measurement hash `stage_measure` wrote the artifact under. The FILE
+    // CONTENTS are read later, inside the fan-out closure, so a member this
+    // run reuses from a fresh `ln` cache hit (never reaches
+    // `needs_normalize`) never pays for it. `is_fresh` (a hash match plus a
+    // disk `stat`) is what makes a `.athf` deleted between Measure and
+    // Normalize read back as `None` here — the same file-gone-missing
+    // signal every other cached stage artifact uses — so a caller handed
+    // `None` for a plane falls back to detection, never a hard error.
+    let mut fits_paths: Vec<Vec<Option<PathBuf>>> = Vec::with_capacity(members.len());
+    for m in members.iter() {
+        let channels = m.measurement.channels.len();
+        let expected_hash: Option<String> = match group_frames_by_id.get(&m.frame_id).copied() {
+            Some(gf) => {
+                let calib_hash = {
+                    let conn = db(&rc.ctx)?.conn();
+                    rc.memo.calibration_hash_checked(&conn, &cfg, gf)?
+                };
+                Some(measurement_hash_for(&cfg, &calib_hash))
+            }
+            None => None,
+        };
+        let mut paths: Vec<Option<PathBuf>> = Vec::with_capacity(channels);
+        for plane in 0..channels {
+            let resolved = match &expected_hash {
+                Some(hash) => {
+                    let kind = fits_artifact::artifact_kind(plane);
+                    let row = {
+                        let conn = db(&rc.ctx)?.conn();
+                        crate::db::stacking::find_artifact(
+                            &conn,
+                            rc.set_id,
+                            &group.key,
+                            &kind,
+                            Some(m.frame_id),
+                        )?
+                    };
+                    row.filter(|r| is_fresh(r, hash))
+                        .and_then(|r| r.path.clone())
+                        .map(PathBuf::from)
+                }
+                None => None,
+            };
+            paths.push(resolved);
+        }
+        fits_paths.push(paths);
+    }
 
     let mut sidecar_paths: Vec<PathBuf> = Vec::with_capacity(members.len());
     let mut per_member_hash: Vec<String> = Vec::with_capacity(members.len());
@@ -8361,6 +8433,7 @@ fn run_group_normalization(
     let ln_reference_ref: &LnReference = &ln_reference;
     let reference_for_detection_ref: &LnReferenceForDetection = &reference_for_detection;
     let sidecar_paths_ref: &[PathBuf] = &sidecar_paths;
+    let fits_paths_ref: &[Vec<Option<PathBuf>>] = &fits_paths;
 
     // v0.6.3: per-frame ticks from inside the fan-out; the cached members
     // (`total - needs_normalize.len()`) count as done from the start.
@@ -8381,11 +8454,39 @@ fn run_group_normalization(
         admission_n,
         cancel_ref,
         move |i: usize| {
+            // Perf tier C Task 2: the fits FILE CONTENTS are read here,
+            // inside the fan-out, not in the sequential loop above that
+            // only resolved paths — a plane whose path is `None` (no fresh
+            // artifact) or whose file fails to read (deleted, truncated,
+            // wrong version — the same signal an artifact row that outlived
+            // its file always produces) is handed to `normalize_frame` as
+            // an empty list, which is its own "fall back to detection for
+            // this plane" case, never a hard failure here.
+            let planes: &[Option<PathBuf>] =
+                fits_paths_ref.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+            let mut fits_by_plane: Vec<Vec<psf_signal::StarFit>> = Vec::with_capacity(planes.len());
+            for path in planes {
+                let plane_fits = match path {
+                    Some(p) => fits_artifact::read_fits(p).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            frame_id = member_ids_ref.get(i).copied().unwrap_or_default(),
+                            path = %p.display(),
+                            error = %e,
+                            "ln: fits artifact unreadable; falling back to detection for this plane"
+                        );
+                        Vec::new()
+                    }),
+                    None => Vec::new(),
+                };
+                fits_by_plane.push(plane_fits);
+            }
             let out = normalize_frame(
                 ln_reference_ref,
                 reference_for_detection_ref,
                 ref_backgrounds_ref,
                 &stack_frames_ref[i],
+                Some(&fits_by_plane),
+                group_beta,
                 &ln_cfg,
                 measure_opts,
                 interpolation,
@@ -8461,6 +8562,10 @@ fn run_group_normalization(
         Ok(())
     };
 
+    // Perf tier C Task 2: how many of this group's freshly-normalized
+    // frames used Measure's persisted fits rather than falling back to
+    // detection — logged once per group below.
+    let mut fits_sourced_count = 0usize;
     for (pos, res) in results.into_iter().enumerate() {
         let member_idx = needs_normalize[pos];
         let frame_id = members[member_idx].frame_id;
@@ -8517,8 +8622,12 @@ fn run_group_normalization(
                             ln_detect_ms = outcome.detect_ms,
                             ln_fit_ms = outcome.fit_ms,
                             ln_match_ms = outcome.match_ms,
+                            scale_source = outcome.scale_source,
                             "ln frame normalized"
                         );
+                        if outcome.scale_source == "fits" {
+                            fits_sourced_count += 1;
+                        }
                         set_ln_summary(rc, &group.key, frame_id, Some(outcome.scale), false);
                         sidecar_grids.insert(frame_id, grids);
                     }
@@ -8538,6 +8647,16 @@ fn run_group_normalization(
                 fail_ln_frame(rc, &mut excluded_frame_ids, frame_id, msg)?;
             }
         }
+    }
+
+    if !needs_normalize.is_empty() {
+        tracing::info!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            stage = "normalize",
+            count = fits_sourced_count,
+            "ln: frames normalized from measured fits"
+        );
     }
 
     rc.progress(
@@ -13634,6 +13753,106 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
+    }
+
+    /// Perf tier C Task 2 (spec §2.2.3): a frame's `fits.<plane>` artifact
+    /// deleted strictly BETWEEN stage 3 (Measure, which just wrote it) and
+    /// stage 6 (Normalize, which reads it back) must not fail the run — it
+    /// falls back to full detection on the warped plane
+    /// (`scale::relative_scale_against`), the same honest-LN-master
+    /// contract Task 6a's own registered-artifact fallback (Pin 3, above)
+    /// established for a missing `registered` artifact. Asserted via
+    /// `ln::fallback_counters`, the same style Pin 3 uses (a tracing
+    /// capture cannot be owned exclusively by one test in this binary's
+    /// parallel run — see that pin's own doc).
+    #[test]
+    fn local_normalization_falls_back_to_detection_when_a_fits_artifact_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (1.0, 1.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, output) =
+            seed_ln_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+
+        let mut cfg = StackingConfig::default();
+        cfg.normalization.local.enabled = true;
+
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let output_dir = output.path().to_path_buf();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        assert_eq!(plan_groups.len(), 1, "{plan_groups:?}");
+        let group_key = plan_groups[0].key.clone();
+        // Extracted before `plan_groups` is moved into `test_context` below.
+        let target_frame = plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.frame_id == light_ids[0])
+            .expect("f0 must be a group member")
+            .clone();
+        let stem = calibrated_file_stem(&plan_groups[0], &target_frame);
+
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout.clone(),
+            output_dir,
+            group_ids,
+        );
+
+        run_stages_for_test(&mut rc, Stage::Register).unwrap();
+
+        let fits_path = layout.fits_path(&group_key, &stem, 0);
+        assert!(
+            fits_path.exists(),
+            "f0's fits artifact must exist right after Measure: {fits_path:?}"
+        );
+        std::fs::remove_file(&fits_path).unwrap();
+
+        let _guard = crate::stacking::ln::fallback_counters::exclusive();
+        crate::stacking::ln::fallback_counters::reset();
+        stage_output(&mut rc).unwrap();
+        let fallbacks = crate::stacking::ln::fallback_counters::FALLBACKS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fallbacks >= 1,
+            "deleting f0's fits artifact must trigger at least one detection fallback"
+        );
+
+        let group_summary = rc
+            .summary
+            .groups
+            .iter()
+            .find(|g| g.key == group_key)
+            .expect("group summary pushed");
+        let included: Vec<_> = group_summary.frames.iter().filter(|f| f.included).collect();
+        assert_eq!(
+            included.len(),
+            4,
+            "the run must still complete with every frame included: {:?}",
+            group_summary.frames
+        );
+        for f in &included {
+            assert!(f.ln_scale.is_some(), "{f:?}");
+        }
     }
 
     #[test]

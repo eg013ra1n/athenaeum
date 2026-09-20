@@ -9,6 +9,7 @@ use astroimage::ImageAnalyzer;
 
 use super::DetectionConfig;
 use crate::stacking::measure::ADU_SCALE;
+use crate::stacking::psf_signal::StarFit;
 
 /// Absolute saturation level in native `[0, 1]` units: a star whose
 /// `peak + background` reaches it has a flat top and no usable centroid.
@@ -138,6 +139,52 @@ pub fn detect_stars(
     stars.sort_by(|a, b| b.flux.total_cmp(&a.flux));
     stars.truncate(max_stars);
     stars
+}
+
+/// This detector's own saturation / eccentricity / SNR cuts (the filter
+/// chain [`detect_stars`] applies above), applied instead to an already
+/// completed PSF fit (Tier C Task 2, spec §2.2.3) — shared by Task 2 (LN
+/// maps Measure's fits through the registration instead of re-detecting on
+/// the warped frame) and Task 3 (Register reuses Measure's fits for mono
+/// frames). Measure's own acceptance (`psf_signal::accept`: centroid
+/// tolerance, residual cap, region containment) does not reject a
+/// saturated or elongated star the way this module always has, so a
+/// caller that wants to treat a `StarFit` list as if it had come through
+/// this detector needs this rule applied explicitly.
+///
+/// `fit`'s `background`/`amplitude` are assumed `measure::ADU_SCALE`-scaled
+/// — [`measure::measure_plane_with_seeds`] fits at exactly that scale
+/// (the same convention `saturation` below already uses), so a `StarFit`
+/// read back from a `fits` artifact needs no further conversion for this
+/// check alone (a caller comparing its FLUX against the LN reference's own
+/// native-unit fits handles that separately — see
+/// [`crate::stacking::ln::scale::relative_scale_from_fits`]).
+///
+/// [`StarFit`] carries no raw detector SNR (there was no detection here —
+/// the fit already exists), so this uses `1 / residual` as a proxy:
+/// [`StarFit::residual`] is `sqrt(cost/n) / amplitude`, the fit's own RMS
+/// residual as a fraction of its amplitude, so its reciprocal reads as an
+/// amplitude-to-noise ratio in the same spirit as a detector SNR — not
+/// numerically identical to `astroimage`'s own per-star SNR, but it cuts
+/// the same population: a fit whose noise is a large fraction of its own
+/// signal.
+pub(crate) fn passes_register_cuts(fit: &StarFit, cfg: &DetectionConfig) -> bool {
+    let saturation = (SATURATION * ADU_SCALE) as f64;
+    if fit.background + fit.amplitude >= saturation {
+        return false;
+    }
+    if fit.eccentricity() > cfg.max_eccentricity as f64 {
+        return false;
+    }
+    let snr = if fit.residual > 0.0 {
+        1.0 / fit.residual
+    } else {
+        f64::INFINITY
+    };
+    if snr < cfg.min_snr as f64 {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -412,5 +459,72 @@ mod tests {
                 .any(|(_, msg)| msg.contains("plane exceeds native units")),
             "non-finite values must not trip the warning, got {events:?}"
         );
+    }
+
+    /// A [`StarFit`] with every field defaulted to a "good" value — the
+    /// tests below flip exactly one field per case.
+    fn good_fit() -> StarFit {
+        StarFit {
+            x: 100.0,
+            y: 100.0,
+            background: 100.0,
+            amplitude: 5000.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            fwtm_x: 6.0,
+            fwtm_y: 6.0,
+            theta: 0.0,
+            beta: 4.0,
+            residual: 0.02,
+            signal: 40000.0,
+            area: 28.0,
+        }
+    }
+
+    #[test]
+    fn passes_register_cuts_keeps_a_good_fit() {
+        assert!(passes_register_cuts(
+            &good_fit(),
+            &DetectionConfig::default()
+        ));
+    }
+
+    #[test]
+    fn passes_register_cuts_drops_a_saturated_fit() {
+        let saturated = StarFit {
+            // background + amplitude just over `SATURATION * ADU_SCALE`.
+            background: 1000.0,
+            amplitude: (SATURATION * ADU_SCALE) as f64,
+            ..good_fit()
+        };
+        assert!(!passes_register_cuts(
+            &saturated,
+            &DetectionConfig::default()
+        ));
+    }
+
+    #[test]
+    fn passes_register_cuts_drops_an_elongated_fit() {
+        let elongated = StarFit {
+            fwhm_x: 10.0,
+            fwhm_y: 1.0,
+            ..good_fit()
+        };
+        assert!(elongated.eccentricity() > DetectionConfig::default().max_eccentricity as f64);
+        assert!(!passes_register_cuts(
+            &elongated,
+            &DetectionConfig::default()
+        ));
+    }
+
+    #[test]
+    fn passes_register_cuts_drops_a_low_snr_fit() {
+        // `1 / residual` proxy below `min_snr` (10.0 by default): a
+        // residual of 0.5 gives an "SNR" of 2.
+        let noisy = StarFit {
+            residual: 0.5,
+            ..good_fit()
+        };
+        assert!(!passes_register_cuts(&noisy, &DetectionConfig::default()));
     }
 }

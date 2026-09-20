@@ -43,6 +43,7 @@ use crate::integration::IntegrationError;
 use crate::resample::Interpolation;
 use crate::stacking::integrate::{LocalNormalizationConfig, StackFrame};
 use crate::stacking::measure::MeasureOptions;
+use crate::stacking::psf_signal::StarFit;
 
 pub mod background;
 pub mod grid;
@@ -55,9 +56,42 @@ pub use background::{
 pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
 pub use scale::{
-    relative_scale, relative_scale_against, PreparedReferenceChannel, ScaleResult,
-    LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS, LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
+    relative_scale, relative_scale_against, relative_scale_from_fits, PreparedReferenceChannel,
+    ScaleResult, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
+    LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
+
+/// Perf tier C Task 2: how many times [`normalize_frame`] fell back to full
+/// detection (`scale::relative_scale_against`) because a plane had no
+/// usable `fits` artifact or [`scale::relative_scale_from_fits`] itself
+/// came back `TooFewMatches` — one count per FRAME (a multi-channel OSC
+/// frame that falls back on any one of its planes counts once), mirroring
+/// [`crate::integration::registered_source::fallback_counters`]'s own
+/// shape and reasoning: a test asserting the specific `warn!` line would
+/// need to own a global tracing subscriber exclusively, which this test
+/// binary's parallel run cannot guarantee (Task 6a Pin 3's own doc).
+#[cfg(test)]
+pub(crate) mod fallback_counters {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    pub static FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held by every test that measures the fallback counter.
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+    pub fn exclusive() -> MutexGuard<'static, ()> {
+        EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn on_fallback() {
+        FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        FALLBACKS.store(0, Ordering::Relaxed);
+    }
+}
 
 /// Safety band on the SAMPLED local-scale surface, as a fraction of the
 /// global scale `s` (an addition to ruling R-M4c-8's own wording): a
@@ -158,6 +192,12 @@ pub struct LnFrameOutcome {
     /// Of `scale_ms`, how much was matching + RCR (and, when on, the local
     /// scale spline), summed across every channel.
     pub match_ms: u64,
+    /// Perf tier C Task 2: `"fits"` when every channel's relative scale came
+    /// from Measure's persisted fits ([`scale::relative_scale_from_fits`]);
+    /// `"detected"` when at least one channel fell back to full detection
+    /// ([`scale::relative_scale_against`]) — a frame's own log/summary is
+    /// one value, so a mixed OSC frame reads as the worst case.
+    pub scale_source: &'static str,
 }
 
 /// Per-channel target background parameters (spec §5.2/math §4.2): same
@@ -387,12 +427,33 @@ impl<'a> LnReferenceForDetection<'a> {
 /// interrupting early; a cancel noticed here surfaces as [`LnError::Other`],
 /// which the caller (already checking its own cancel flag right after the
 /// fan-out that calls this) does not need to interpret specially.
+///
+/// **Perf tier C Task 2** (spec §2.2.3): `fits` is Measure's own accepted
+/// [`StarFit`]s for this frame, one list per plane (`fits[p]` — `None`
+/// or a plane with fewer than [`scale::MIN_MATCHES`] entries means "treat
+/// this plane as if there were no fits at all"), mapped through
+/// `frame.map` and matched instead of re-detecting on the warped `target`
+/// plane ([`scale::relative_scale_from_fits`]) — the detect+fit cost
+/// (`detect_ms`/`fit_ms`, together ≈ 95 % of `scale_ms` before this task)
+/// disappears for a plane whose fits are usable. A plane with no usable
+/// fits, or whose `relative_scale_from_fits` call itself comes back
+/// [`LnError::TooFewMatches`], falls back to today's
+/// [`scale::relative_scale_against`] on the warped `target` plane — never a
+/// failure, and the master is still an honest LN master — with exactly ONE
+/// `warn!` for the whole frame (not one per plane) the first time any
+/// channel needs it. `group_beta` is the group's own resolved β (Tier C
+/// ruling C-1/C-1a) — already baked into `reference_for_detection`'s own
+/// prepared channels by the caller (`stacking::run`'s
+/// `LnReferenceForDetection::build` call), so nothing here re-derives it;
+/// it is accepted for provenance/consistency only.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_frame(
     reference: &LnReference,
     reference_for_detection: &LnReferenceForDetection<'_>,
     ref_backgrounds: &[BackgroundGrid],
     frame: &StackFrame,
+    fits: Option<&[Vec<StarFit>]>,
+    group_beta: f64,
     cfg: &LocalNormalizationConfig,
     measure: &MeasureOptions,
     interpolation: Interpolation,
@@ -401,6 +462,10 @@ pub fn normalize_frame(
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<LnFrameOutcome, LnError> {
+    debug_assert!(
+        group_beta.is_finite(),
+        "normalize_frame: group_beta must be a finite psf beta"
+    );
     let channels = reference.planes.len();
     if frame.measurement.channels.len() != channels {
         return Err(LnError::Other(format!(
@@ -444,6 +509,12 @@ pub fn normalize_frame(
     let mut refine_ms = 0u64;
     let mut fit_ms = 0u64;
     let mut match_ms = 0u64;
+    // Perf tier C Task 2: "fits" only while every channel so far used
+    // Measure's persisted fits; the first channel that falls back to
+    // detection flips this for the whole frame (a mixed OSC frame reads as
+    // the worst case) and fires the ONE per-frame fallback `warn!`.
+    let mut frame_scale_source: &'static str = "fits";
+    let mut warned_fallback = false;
 
     // Perf tier 1 Task 8: one `RegisteredSource` per FRAME, re-pointed at
     // each channel with `set_plane` (ruling R-T4-7's own reasoning, applied
@@ -567,18 +638,64 @@ pub fn normalize_frame(
         // match tree) was already prepared ONCE for the whole group by
         // `LnReferenceForDetection::build` — `relative_scale_against` only
         // re-detects/re-fits the TARGET, not the reference, on every call.
+        //
+        // Perf tier C Task 2: a plane with a usable `fits` list (Measure's
+        // own accepted stars, mapped through `frame.map`) skips detection
+        // and the PSF fit entirely (`scale::relative_scale_from_fits`);
+        // anything else — no fits for this plane, or that call itself
+        // reporting too few matches after the map/cuts — falls back to the
+        // full-detection path on the warped `target` plane, with exactly
+        // one `warn!` for the whole frame.
         let t = Instant::now();
-        let scale_result = scale::relative_scale_against(
-            &reference_for_detection.prepared[p],
-            &target,
-            reference.width,
-            reference.height,
-            measure.max_stars,
-            4.0,
-            0.3,
-            cfg.local_scale,
-            pool,
-        )?;
+        let plane_fits = fits
+            .and_then(|f| f.get(p))
+            .filter(|pf| pf.len() >= scale::MIN_MATCHES);
+        let fall_back_to_detection = |warned_fallback: &mut bool| -> Result<ScaleResult, LnError> {
+            if !*warned_fallback {
+                tracing::warn!(
+                    frame_id = frame.frame_id,
+                    path = %frame.path.display(),
+                    "ln: no measured fits, detecting on the warped frame"
+                );
+                *warned_fallback = true;
+                #[cfg(test)]
+                fallback_counters::on_fallback();
+            }
+            scale::relative_scale_against(
+                &reference_for_detection.prepared[p],
+                &target,
+                reference.width,
+                reference.height,
+                measure.max_stars,
+                4.0,
+                0.3,
+                cfg.local_scale,
+                pool,
+            )
+        };
+        let scale_result = match plane_fits {
+            Some(pf) => match scale::relative_scale_from_fits(
+                &reference_for_detection.prepared[p],
+                pf,
+                &frame.map,
+                reference.width,
+                reference.height,
+                4.0,
+                0.3,
+                cfg.local_scale,
+            ) {
+                Ok(r) => r,
+                Err(LnError::TooFewMatches { .. }) => {
+                    frame_scale_source = "detected";
+                    fall_back_to_detection(&mut warned_fallback)?
+                }
+                Err(e) => return Err(e),
+            },
+            None => {
+                frame_scale_source = "detected";
+                fall_back_to_detection(&mut warned_fallback)?
+            }
+        };
         scale_ms += t.elapsed().as_millis() as u64;
         detect_ms += scale_result.timings.detect_ms;
         refine_ms += scale_result.timings.refine_ms;
@@ -685,6 +802,7 @@ pub fn normalize_frame(
         refine_ms,
         fit_ms,
         match_ms,
+        scale_source: frame_scale_source,
     })
 }
 
