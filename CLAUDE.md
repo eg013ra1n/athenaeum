@@ -1328,6 +1328,69 @@ measures the CALIBRATED frame from scratch (PSF Signal Weight, PSF SNR,
 normalization stats — the weighting the external tool's is calibrated
 against, M4a) and caches the result as the per-frame `metrics` artifact.
 
+**Perf tier A — compute, bit-identical (2026-09-19/20)** (audit
+`docs/superpowers/research/2026-09-19-stacking-compute-audit.md`, plan
+`docs/superpowers/plans/2026-09-19-stacking-compute-tierA-plan.md`, acceptance
+`docs/superpowers/research/2026-09-20-stacking-compute-tierA-acceptance.md`,
+rulings R-TA-1…11 in the plan's ledger): fourteen tasks, every checkpoint
+byte-identical to the baseline on the four masters, 565 registration rows,
+197 `.athln` sidecars and 302 calibrated frames; the reduced set
+`LDN1272-test` (prod set 204, 92 mono + 105 OSC 180 s lights) 27.0 → 23.4 min
+against a same-evening baseline re-run (−13 %; 26.6 → 22.3 against the
+morning's cool-machine baseline). **The registered frame is a REQUIRED artifact** (Task 6a,
+owner decision 2026-09-19 — "disk as storage so nothing is computed twice"):
+`stacking_artifacts.kind = "registered"`, written by Register inside its own
+fan-out (plane at a time, `Durability::Volatile`), keyed on the registration
+config hash; Normalize and Integrate read it verbatim through
+`RegisteredSource::open_materialized` instead of re-warping per band (LN warp
+3.3 s → 0.15 s per frame, Integrate read 26 → 7 s per plane), a
+missing/unreadable/wrong-size file falls back PER FRAME to the on-the-fly warp
+with one `warn!(frame_id, path, src)`; drizzle still reads the calibrated frame
+through the forward map. Disk roughly doubles (`registered/` ≈ the
+`calibrated/` footprint, 41 GB beside 50 GB on the reduced set) and the plan
+gate counts it at REFERENCE geometry, so the `space` blocker refuses runs that
+used to start; the gate's Register staleness folds in the artifact's freshness
+(`find_artifact` + `is_fresh` per frame), so an existing catalog's first run
+and every run after `deleteRegistered`/`deleteIntermediates` reads as
+rewriting, not cached. `registration.writeRegisteredFrames` is INERT (kept
+for compat; the panel shows a note, `dc9f6287`). **Admission**:
+`REGISTER_PLANES_RESIDENT = 4` / `REGISTER_PLANES_RESIDENT_OSC = 6`, keyed on
+the batch's measured plane count (OSC register admission 6 on 16 GB);
+`MEASURE_PLANES_RESIDENT`/`LN_PLANES_RESIDENT` STAY 8 — ruling R-TA-3: the
+Measure peak (≈ 7 planes) is intrinsic to `noise_mrs`'s à-trous layers, the
+audit's "admission 4 → 6–8" is withdrawn. **New log fields** (dictionary):
+`ln_detect_ms`/`ln_fit_ms`/`ln_match_ms` on `ln frame normalized` (detection
+IS the LN scale cost — 4.8 of 6.5 s per frame before Tier C),
+`combine_cpu_ms`/`rejection_iters_mean`/`medfit_evals_mean` on `plane
+integrated`. **Measured OUT and reverted, numbers in the doc comments** (do
+not re-propose): Task 9's cached `b·i` (1.4–1.6× slower), four integer
+accumulators (1.05–1.09× slower), `sort_unstable_by` + tiebreak (1.36× slower
+than the std stable sort at n ≈ 208); Task 10's `with_max_len(4)` (+0.8 %);
+Task 3b's bit-packed `sig_mask` (CPU for memory that bought no admission);
+Task 11's mosaic cache (blows the R-M3-7 ceiling). What paid: the detector
+(rustafits `perf/stacking-kernels`: the caller's bg/noise pair, the dead
+noise map, `hfd_at`'s scratch window + static r² table + selection medians,
+parallel histograms — Register detect −45 %, LN detect −30 %), the warp's
+interior fast path (2×, all seven kernels pinned), the f32 band lane, the
+no-division `Linear::apply` for affine maps, the incremental
+`sampling_radius` ring, the parallel LN background, the drizzle band skip
+(a SAMPLED-max bound + 1 px margin — R-TA-10: a homography's Jacobian is
+position-dependent, so the origin drop alone is not a bound). **Method rules**
+(R-TA-8/9): this Mac drifts ±10–15 % across a build-heavy session — only
+INTERLEAVED before/after brackets are comparable, the product-build checkpoint
+is the arbiter (a probe under thin-LTO swung +21 % on an untouched function),
+and the acceptance total is read against a same-evening baseline re-run. The
+release probes carry `RUST_LOG`-gated subscribers (R-TA-1). **Harness**
+(`docs/superpowers/research/scripts/acceptance/`, reuse it — owner
+2026-09-18): `prepare-catalog.sh <work> [fmt] [set-id]` (`ATH_ACC_DB`, copies
+set 109's config, forces FITS/keepAll, REMOVES `paths`), `server.sh`
+(`ATH_ACC_EXTRA_PATHS`), `tier1/tier1-run.sh … SET_ID` (exits non-zero on a
+refused `start_stacking`), `tier1/checkpoint.sh <name> [base]` (refuses on
+Time Machine/cargo, bare-word names, a `paths` override; needs ≈ 135 GB
+free), `tier1-extract.py`/`tier1-compare.py`. Next: Tier C (numeric — LN from
+Measure's fits, the drizzle phase table; spec
+`docs/superpowers/specs/2026-09-20-stacking-compute-tierC-design.md`).
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,

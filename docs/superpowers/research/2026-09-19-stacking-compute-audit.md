@@ -322,6 +322,18 @@ tier-1 prefetch and pool routing on `StorageClass::Network`. Every pin stays gre
 Expected: **−8 to −10 wall min** (Measure/LN admission 4 → 6–7, Integrate 10.7 → ≈ 7, drizzle −2,
 warp −3), i.e. ≈ 49 → 39–41.
 
+**Tier A — MEASURED (2026-09-20, `docs/superpowers/research/2026-09-20-stacking-compute-tierA-acceptance.md`).**
+On the reduced set (`LDN1272-test`, 197 frames): 27.00 → 23.44 min against a same-evening baseline
+re-run (−13 %; 26.6 → 22.3 against the cool-machine morning baseline), byte-identical on every artifact. Per item: D3 −18 ms/plane detect; D4 −40 ms/plane background; D5 −4 % detect,
+residency UNCHANGED (the peak is `noise_mrs`'s three live planes — R-TA-3, admission gain
+withdrawn); D7+D11 Register detect −45 %, LN detect −30 % in the pipeline; D8 fit −1…−7 %; W1
+warp 2.0×; W3 read −8.5 % (≈ 3× per-sample sweep); W4 write −22 % (probe); I1/I2/I4 measured
+1.05–1.7× SLOWER and reverted, I3 already minimal, I5/I6 neutral; Z1 −5.8 % on a 2.45°-tilted
+sample, neutral axis-aligned; Z5 refused by the R-M3-7 ceiling; L1/L2 background −45 %. Not in
+this tier's list but the largest gain: W5 (write the warp once; owner decision 2026-09-19) —
+LN warp −96 %, Integrate read −75 %, Register +1.1 min, 41 GB. The combine estimate
+(10.7 → ≈ 7) did not materialize: kernel micro-rewrites lose on this toolchain.
+
 **Tier B — same math, bits move (≈ 1 week + one acceptance run).** D6, D10, W2, I7–I9 (+ D9), Z2
 (§3.4 — its hoisted corner arithmetic rounds differently from the per-pixel version, so it needs
 the hash-bump + acceptance re-run every other Tier B item does).
