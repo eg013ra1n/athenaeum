@@ -114,8 +114,16 @@ the LN-scale change (seeds + `k`), not to the drizzle table or the fitter. The e
 **Ruling C-28's added reads (tierC vs C-2, `c28_reads.py`):** `ln_cells_rejected` identical
 on all 197 frames; the mono `.athln` sidecars byte-identical, the OSC ones within 2e-4 of
 `A` and 3e-4 of sky in `B` (the fitter's ulp-level move through the calibration `k`); the
-worst node's 512×512 neighbourhood on the master: median ratio 1.000000, MAD 0.99994. The
-coverage zero-set comparison against an exact-overlap drizzle of the same frames is in §7.
+worst node's 512×512 neighbourhood on the master: median ratio 1.000000, MAD 0.99994.
+**Coverage zero set** (`drizzle_probe --coverage-out --ref 6248x4176`, all 92 mono frames, the
+run's own maps): the tabulated arm's union coverage mask equals the run's weight map
+`W > 0` set **pixel for pixel over 104 366 592 pixels** (XOR = 0, 680 070 zeros); the exact
+overlap differs from it by 36 pixels (23 exact-only, 13 table-only), every one at Chebyshev
+distance 1 from the footprint boundary, none nearer than 4 px to the canvas border — 3.4e-7
+of the grid. The absolute 0.993484 is therefore the 92 dithered frames' footprint on the
+co-registered canvas, not the phase table (ruling C-23 closed). Incidental: on the full group
+the deposit read −89.4 % (96.7 → 10.3 s), the per-frame table build amortising further than on
+the 10-frame bracket.
 
 ## 5. What each task delivered
 
@@ -156,18 +164,14 @@ is in the spec's §9 and the plan ledger.
   lost to it, C-19).
 - **The absolute drizzle rows need a comparative reading on a reduced set** — the level bound
   sits at the baseline's own value and coverage is a footprint fact; both are reported, not
-  re-sized, and C-3 adds the zero-set comparison against the exact overlap (owed at the time of
-  writing: `drizzle_probe` needs a per-arm mask output; see §8).
+  re-sized, and the zero-set comparison against the exact overlap (§4) is the comparative row
+  that answers what the absolute one cannot.
 - **Small gains do not buy numeric changes**: C4 (≈ 3 % of the combine) and C5 (≈ 0.4 min)
   were built, measured on real data and reverted with their numbers in the doc comments — the
   Tier A precedent (Task 9/10) applied to the numeric class.
 
 ## 8. Owed to the owner
 
-- The coverage zero-set comparison (C-23): `drizzle_probe` currently throws the pixels away,
-  so the exact-vs-table mask diff over the 92 mono frames is not yet measured; the pins and
-  the probe's coverage fraction (identical to six decimals on 10 frames) are the evidence so
-  far.
 - The push of `main` and both submodule branches — nothing is pushed.
 - The desktop click-through: nothing in the tab changed by design, but the Normalize row's
   calibration progress message (`calibrating k · frame i/7`) and the Register rows at 0 ms are
