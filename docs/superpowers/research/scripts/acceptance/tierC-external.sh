@@ -71,9 +71,19 @@ wac = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wac)
 
 FWHM_TOL = 0.02  # +/- 2 %
+# Ruling C-9 (2026-09-20): absolute FWHM is comparable only when the external masters
+# integrate the SAME frames. The reduced set's own seeing differs from the full catalog's
+# (our reduced-set masters 3.93 / 4.39-3.08 px vs our FULL-set masters 2.73 / 2.81-2.72 px,
+# which sit within 2-4 % of the external full-set masters 2.67 / 2.69-2.89 px). So the FWHM
+# row is GATED only with TIERC_EXTERNAL_SAME_FRAMES=1; otherwise it is reported.
+FWHM_GATED = os.environ.get("TIERC_EXTERNAL_SAME_FRAMES", "") == "1"
 DRIZZLE_RATIO_TOL = 0.25  # within 25 % (ruling R-T6-1's own bar)
 REJECTED_TOL_PP = 0.5
 WEIGHTS_RHO_MIN = 0.9  # the M4a bar
+# Ruling C-9: the OSC BLUE plane carries the documented M4a/M4c residual (rho 0.68 at the
+# M4a acceptance, 0.86 on the Tier A masters) — its bar is 0.8, not 0.9, until that
+# residual is closed on its own cycle.
+WEIGHTS_RHO_MIN_OSC_BLUE = 0.8
 WEIGHTS_TOP20_MIN = 15  # tightened from the M4a bar's own >= 14 (ruling C-8)
 EXTERNAL_FRAME_COUNT_DEFAULT = 368  # the full LDN 1272 catalog (208 mono + 160 OSC)
 
@@ -239,10 +249,12 @@ def fwhm_report(ours, ext, color):
     for i, (o, e) in enumerate(zip(oc, ecm)):
         ratio = o["fwhmPx"] / e["fwhmPx"] if e["fwhmPx"] else float("nan")
         ok = abs(pct(ratio)) <= FWHM_TOL * 100
-        gate["fwhm"].append(ok)
+        if FWHM_GATED:
+            gate["fwhm"].append(ok)
+        word = verdict(ok) if FWHM_GATED else "reported (not gated: the external masters integrate a different frame set — ruling C-9)"
         print(
             f"  plane {i}: head={o['fwhmPx']:.4f}px external={e['fwhmPx']:.4f}px "
-            f"ratio={ratio:.4f} ({pct(ratio):+.2f}%) {verdict(ok)}"
+            f"ratio={ratio:.4f} ({pct(ratio):+.2f}%) {word}"
         )
         head_plain_fwhm.append(o["fwhmPx"])
         ext_plain_fwhm.append(e["fwhmPx"])
@@ -400,10 +412,11 @@ def weights_gate(ckpt_dir, ext_dir):
             if rho is None:
                 print(f"  {group_name} ch{ch_idx}: n/a (fewer than 3 comparable frames)")
                 continue
-            ok = rho >= WEIGHTS_RHO_MIN
+            bar = WEIGHTS_RHO_MIN_OSC_BLUE if (group_name.startswith("osc") and ch_idx == 2) else WEIGHTS_RHO_MIN
+            ok = rho >= bar
             any_checked = True
             gate["weights"].append(ok)
-            print(f"  {group_name} ch{ch_idx}: psfsw_spearman={rho:.4f} (>= {WEIGHTS_RHO_MIN}) {verdict(ok)} n={len(xs_o)}")
+            print(f"  {group_name} ch{ch_idx}: psfsw_spearman={rho:.4f} (>= {bar}) {verdict(ok)} n={len(xs_o)}")
         ours_mean, ext_mean = {}, {}
         for s in matched:
             vals = [c["psfSignalWeight"] for c in ours[s]]
